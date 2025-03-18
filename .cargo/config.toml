@@ -1,0 +1,8 @@
+[alias]
+test_details = ["test", "--target", "aarch64-apple-darwin"]
+
+[build]
+target = "wasm32-wasip1"
+
+[target.'cfg(all(target_arch = "wasm32"))']
+runner = "viceroy run -C fastly.toml -- "
