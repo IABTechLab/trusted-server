@@ -1,0 +1,31 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = ["jason@stackpop.com"]
+cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
+description = "aslk"
+language = "rust"
+manifest_version = 3
+name = "potsi"
+service_id = "q9waEnTgJfqQV1a0cYOuo3"
+
+[scripts]
+build = """
+    cargo build --bin potsi --release --target wasm32-wasip1 --color always &&
+    ln -fs wasm32-wasip1 target/wasm32-wasi
+"""
+
+
+[local_server]
+    [local_server.backends]
+        [local_server.backends.equativ_ad_api_2] # FIX ME: must match config
+            url = "http://127.0.0.1/"
+
+    [local_server.kv_stores]
+        [[local_server.kv_stores.jevans_synth_id_counter]] # FIX ME: must match config
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.jevans_synth_id_opid]] # FIX ME: must match config
+            key = "placeholder"
+            data = "placeholder"

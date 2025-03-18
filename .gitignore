@@ -1,0 +1,22 @@
+# compiled output
+/bin
+/pkg
+/target
+
+# env
+.env
+
+# backup
+**/*.rs.bk
+src/main_*.rs
+src/*.html
+
+# OS
+.DS_Store
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
