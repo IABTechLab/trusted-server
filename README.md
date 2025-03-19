@@ -1,6 +1,6 @@
 # Trusted Server 
 
-:infomation_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute.
+:information_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute.
 
 ## Fastly
 - Create account at Fastly if you don’t have one - manage.fastly.com
