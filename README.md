@@ -1,10 +1,11 @@
-Steps to install Trusted Server 
+# Trusted Server 
 
-FASTLY COMPUTE SETUP on Mac OS 
+:infomation_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute.
 
+## Fastly
 - Create account at Fastly if you don’t have one - manage.fastly.com
-
-- Log in to the Fastly control panel. Go to Account > API tokens > Personal tokens. 
+- Log in to the Fastly control panel. 
+    - Go to Account > API tokens > Personal tokens. 
     - Click Create token
     - Name the Token
     - Choose User Token
@@ -20,53 +21,112 @@ FASTLY COMPUTE SETUP on Mac OS
     - IMPORTANT: when you enter the FQDN or IP ADDR information and click Add you need to enter a “Name” in the first field that will be referenced in your code so something like “my_ad_partner_1” 
     - 
 
-NOTE: Fastly gives you a test domain to play on but obviously you’re free to create a CNAME to your domain when you’re ready. Note that Fastly compute ONLY accepts client traffic from TLS   	- 
-- Install Brew if you don’t have it. Open terminal and paste the following and follow the prompts before and afterwards (to configure system path, etc):   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+:warning: Fastly gives you a test domain to play on but obviously you’re free to create a CNAME to your domain when you’re ready. Note that Fastly compute ONLY accepts client traffic from TLS 
 
-- Install Fastly CLI 
-	
-	brew install fastly/tap/fastly
+## Installation
 
-- Verify Installation and Version 
-	
-	fastly version 
+### Brew
 
-- Create profile and follow interactive prompt for pasting your API Token created earlier:
-	
-	fastly profile create
+:warning: Follow the prompts before and afterwards (to configure system path, etc)
 
-INSTALL RUST using asdf on Mac 
+#### Install Brew
 
-	brew install asdf
-	asdf plugin add rust
-	asdf install rust 1.83.0
-	asdf reshim
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+### Fastly CLI
 
-- Edit .zshrc profile to add path for asdf shims: 
+#### Install Fastly CLI 
+```sh
+brew install fastly/tap/fastly
+```
 
-	export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
+#### Verify Installation and Version 
+```sh
+fastly version
+```
+
+#### Create profile and follow interactive prompt for pasting your API Token created earlier:
+```sh	
+astly profile create
+```
+
+### Rust
+
+#### Install Rust with asdf
+```sh
+sbrew install asdf
+asdf plugin add rust
+asdf install rust 1.83.0
+asdf reshim
+```
+
+#### Fix path for Bash
+
+Edit ~/.bash_profile to add path for asdf shims: 
+```sh
+export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
+```
+
+#### Fix path for ZSH
+
+Edit ~/.zshrc to add path for asdf shims: 
+```sh
+export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
+```
+
+#### Other shells
+See https://asdf-vm.com/guide/getting-started.html#_2-configure-asdf
 
 
-CREATE FASTLY COMPUTE SERVICE 
+### Configure Build and
 
-- Follow prompts with information and choose Rust and an empty starter kit option
-	Fastly compute init
-
-
-CLONE PROJECT from GH
-
-git clone https://<username>@github.com/IABTechLab/trusted-server.git 
-- This will give you important files such as .tool-versions that you’ll need to run some commands 
-- Note that you’ll have to edit the following files for your setup: 
-    - fastly.toml (service ID, author, description) 
-    - Potsi.toml (KV store ID names) 
+#### Clone Project
+```sh
+git clone git@github.com:IABTechLab/trusted-server.git
+```
 
 
+### Configure
+#### Edit configuration files
+:information_source: Note that you’ll have to edit the following files for your setup:
 
+- fastly.toml (service ID, author, description) 
+- Potsi.toml (KV store ID names) 
 
-FASTLY SERVICE CONFIGURATION
+### Build
 
-- Begin in the UI at manage.fastly.com 
-- Click Compute -> Create Service
-- 
+```sh
+cargo build
+```
 
+### Deploy to Fastly
+
+```sh
+```
+
+## Devleopment
+
+#### Install viceroy for running tests
+```sh
+cargo install viceroy
+```
+
+#### Run Fastly server locally
+Review configuration for [local_server](fastly.toml#L16)
+```sh
+fastly -i compute serve
+```
+
+#### Tests
+```
+cargo test
+```
+
+:warning: if test fails `viceroy` will not display line number of the failed test. Rerun it with `cargo test_details`.
+
+#### Additional Rust Commands
+- `cargo fmt`: Ensure uniform code formatting
+- `cargo clippy`: Ensure idiomatic code
+- `cargo check`: Ensure compilation succeeds on Linux, MacOS, Windows and WebAssembly
+- `cargo bench`: Run all benchmarks
