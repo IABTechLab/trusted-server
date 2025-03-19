@@ -102,6 +102,7 @@ cargo build
 ### Deploy to Fastly
 
 ```sh
+fastly compute publish
 ```
 
 ## Devleopment
