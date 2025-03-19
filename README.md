@@ -119,7 +119,7 @@ fastly -i compute serve
 ```
 
 #### Tests
-```
+```sh
 cargo test
 ```
 
