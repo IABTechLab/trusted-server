@@ -1,10 +1,11 @@
-use crate::constants::SECRET_KEY;
-use crate::cookies::handle_request_cookies;
 use fastly::http::header;
 use fastly::Request;
 use hmac::{Hmac, Mac};
 use log;
 use sha2::Sha256;
+
+use crate::constants::{SECRET_KEY, SYNTH_HEADER_POTSI};
+use crate::cookies::handle_request_cookies;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -54,7 +55,7 @@ pub fn generate_synthetic_id(req: &Request) -> String {
 pub fn get_or_generate_synthetic_id(req: &Request) -> String {
     // First try to get existing POTSI ID from header
     if let Some(potsi) = req
-        .get_header("X-Synthetic-Potsi")
+        .get_header(SYNTH_HEADER_POTSI)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
     {
@@ -116,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
-        let req = create_test_request(vec![("X-Synthetic-Potsi", "existing_potsi_id")]);
+        let req = create_test_request(vec![(SYNTH_HEADER_POTSI, "existing_potsi_id")]);
 
         let synthetic_id = get_or_generate_synthetic_id(&req);
         assert_eq!(synthetic_id, "existing_potsi_id");

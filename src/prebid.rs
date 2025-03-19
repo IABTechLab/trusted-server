@@ -1,8 +1,10 @@
-use crate::synthetic::generate_synthetic_id;
-use fastly::http::Method;
+use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 use url;
+
+use crate::constants::{SYNTH_HEADER_FRESH, SYNTH_HEADER_POTSI};
+use crate::synthetic::generate_synthetic_id;
 
 /// Represents a request to the Prebid Server with all necessary parameters
 pub struct PrebidRequest {
@@ -29,7 +31,7 @@ impl PrebidRequest {
     pub fn new(req: &Request) -> Result<Self, Error> {
         // Get the POTSI ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
-            .get_header("X-Synthetic-Potsi")
+            .get_header(SYNTH_HEADER_POTSI)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_synthetic_id(req));
@@ -50,12 +52,12 @@ impl PrebidRequest {
 
         // Try to get domain from Referer or Origin headers, fallback to default
         let domain = req
-            .get_header("Referer")
+            .get_header(header::REFERER)
             .and_then(|h| h.to_str().ok())
             .and_then(|r| url::Url::parse(r).ok())
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .or_else(|| {
-                req.get_header("Origin")
+                req.get_header(header::ORIGIN)
                     .and_then(|h| h.to_str().ok())
                     .and_then(|o| url::Url::parse(o).ok())
                     .and_then(|u| u.host_str().map(|h| h.to_string()))
@@ -66,7 +68,7 @@ impl PrebidRequest {
 
         // Create origin with owned String
         let origin = req
-            .get_header("Origin")
+            .get_header(header::ORIGIN)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("https://{}", domain));
@@ -92,7 +94,7 @@ impl PrebidRequest {
 
         // Get and store the POTSI ID value from the incoming request
         let potsi_id = incoming_req
-            .get_header("X-Synthetic-Potsi")
+            .get_header(SYNTH_HEADER_POTSI)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
@@ -160,11 +162,11 @@ impl PrebidRequest {
             "at": 1
         });
 
-        req.set_header("Content-Type", "application/json");
+        req.set_header(header::CONTENT_TYPE, "application/json");
         req.set_header("X-Forwarded-For", &self.client_ip);
-        req.set_header("Origin", &self.origin);
-        req.set_header("X-Synthetic-Fresh", &self.synthetic_id);
-        req.set_header("X-Synthetic-Potsi", &potsi_id);
+        req.set_header(header::ORIGIN, &self.origin);
+        req.set_header(SYNTH_HEADER_FRESH, &self.synthetic_id);
+        req.set_header(SYNTH_HEADER_POTSI, &potsi_id);
 
         println!(
             "Sending prebid request with Fresh ID: {} and POTSI ID: {}",

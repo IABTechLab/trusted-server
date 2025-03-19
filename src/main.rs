@@ -7,7 +7,9 @@ use std::env;
 
 mod constants;
 mod cookies;
-use constants::*;
+use constants::{
+    BACKEND2, SYNTH_HEADER_FRESH, SYNTH_HEADER_POTSI, SYNTH_ID_COUNTER_STORE, SYNTH_ID_OPID_STORE,
+};
 mod models;
 use models::AdResponse;
 mod prebid;
@@ -21,7 +23,10 @@ use templates::HTML_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    let _settings = Settings::new();
+    let settings = Settings::new();
+
+    println!("Settings {settings:?}");
+
     futures::executor::block_on(async {
         println!(
             "FASTLY_SERVICE_VERSION: {}",
@@ -58,7 +63,7 @@ fn handle_main_page(req: Request) -> Result<Response, Error> {
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header("X-Synthetic-Potsi")
+        req.get_header(SYNTH_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
@@ -67,8 +72,8 @@ fn handle_main_page(req: Request) -> Result<Response, Error> {
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header("X-Synthetic-Fresh", &fresh_id) // Fresh ID always changes
-        .with_header("X-Synthetic-Potsi", &synthetic_id); // POTSI ID remains stable
+        .with_header(SYNTH_HEADER_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(SYNTH_HEADER_POTSI, &synthetic_id); // POTSI ID remains stable
 
     // Always set the cookie with the synthetic ID
     response.set_header(
@@ -304,14 +309,14 @@ async fn handle_prebid_test(mut req: Request) -> Result<Response, Error> {
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header("X-Synthetic-Potsi")
+        req.get_header(SYNTH_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
 
     // Set both IDs as headers
-    req.set_header("X-Synthetic-Fresh", &fresh_id);
-    req.set_header("X-Synthetic-Potsi", &synthetic_id);
+    req.set_header(SYNTH_HEADER_FRESH, &fresh_id);
+    req.set_header(SYNTH_HEADER_POTSI, &synthetic_id);
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
 

@@ -4,14 +4,30 @@ use std::str;
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
+struct AdServer {
+    backend: String,
+    server_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+struct Prebid {
+    server_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
 struct Synthetic {
     counter_store: String,
     opid_store: String,
+    secret_key: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
 pub(crate) struct Settings {
+    ad_server: AdServer,
+    prebid: Prebid,
     synthetic: Synthetic,
 }
 
