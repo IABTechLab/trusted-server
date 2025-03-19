@@ -1,6 +1,6 @@
 # Trusted Server 
 
-:information_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute.
+:information_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute and deploy it.
 
 ## Fastly
 - Create account at Fastly if you don’t have one - manage.fastly.com
@@ -85,7 +85,6 @@ See https://asdf-vm.com/guide/getting-started.html#_2-configure-asdf
 ```sh
 git clone git@github.com:IABTechLab/trusted-server.git
 ```
-
 
 ### Configure
 #### Edit configuration files
