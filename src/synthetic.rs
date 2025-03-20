@@ -4,13 +4,14 @@ use hmac::{Hmac, Mac};
 use log;
 use sha2::Sha256;
 
-use crate::constants::{SECRET_KEY, SYNTH_HEADER_POTSI};
+use crate::constants::SYNTH_HEADER_POTSI;
 use crate::cookies::handle_request_cookies;
+use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Generates a fresh synthetic_id based on request parameters
-pub fn generate_synthetic_id(req: &Request) -> String {
+pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("Unknown"));
@@ -42,7 +43,8 @@ pub fn generate_synthetic_id(req: &Request) -> String {
 
     log::info!("Input string for fresh ID: {}", input_string);
 
-    let mut mac = HmacSha256::new_from_slice(SECRET_KEY).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
+        .expect("HMAC can take key of any size");
     mac.update(input_string.as_bytes());
     let fresh_id = hex::encode(mac.finalize().into_bytes());
 
@@ -52,7 +54,7 @@ pub fn generate_synthetic_id(req: &Request) -> String {
 }
 
 /// Gets or creates a synthetic_id from the request
-pub fn get_or_generate_synthetic_id(req: &Request) -> String {
+pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
     // First try to get existing POTSI ID from header
     if let Some(potsi) = req
         .get_header(SYNTH_HEADER_POTSI)
@@ -79,7 +81,7 @@ pub fn get_or_generate_synthetic_id(req: &Request) -> String {
     }
 
     // If no existing POTSI ID found, generate a fresh one
-    let fresh_id = generate_synthetic_id(req);
+    let fresh_id = generate_synthetic_id(settings, req);
     log::info!("No existing POTSI ID found, using fresh ID: {}", fresh_id);
     fresh_id
 }
@@ -100,6 +102,8 @@ mod tests {
 
     #[test]
     fn test_generate_synthetic_id() {
+        let settings = Settings::new().unwrap();
+
         let req = create_test_request(vec![
             (&header::USER_AGENT.to_string(), "Mozilla/5.0"),
             (&header::COOKIE.to_string(), "pub_userid=12345"),
@@ -108,7 +112,7 @@ mod tests {
             (&header::ACCEPT_LANGUAGE.to_string(), "en-US,en;q=0.9"),
         ]);
 
-        let synthetic_id = generate_synthetic_id(&req);
+        let synthetic_id = generate_synthetic_id(&settings, &req);
         assert_eq!(
             synthetic_id,
             "5023f58a61668e5405a804d18662fc0b37518875cac551ed86e5e7223b541600"
@@ -117,28 +121,31 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
+        let settings = Settings::new().unwrap();
         let req = create_test_request(vec![(SYNTH_HEADER_POTSI, "existing_potsi_id")]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
         assert_eq!(synthetic_id, "existing_potsi_id");
     }
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_cookie() {
+        let settings = Settings::new().unwrap();
         let req = create_test_request(vec![(
             &header::COOKIE.to_string(),
             "synthetic_id=existing_cookie_id",
         )]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
         assert_eq!(synthetic_id, "existing_cookie_id");
     }
 
     #[test]
     fn test_get_or_generate_synthetic_id_generate_new() {
+        let settings = Settings::new().unwrap();
         let req = create_test_request(vec![]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
         assert!(!synthetic_id.is_empty());
     }
 }

@@ -4,6 +4,7 @@ use serde_json::json;
 use url;
 
 use crate::constants::{SYNTH_HEADER_FRESH, SYNTH_HEADER_POTSI};
+use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
 /// Represents a request to the Prebid Server with all necessary parameters
@@ -28,13 +29,13 @@ impl PrebidRequest {
     ///
     /// # Returns
     /// * `Result<Self, Error>` - New PrebidRequest or error
-    pub fn new(req: &Request) -> Result<Self, Error> {
+    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
         // Get the POTSI ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
             .get_header(SYNTH_HEADER_POTSI)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| generate_synthetic_id(req));
+            .unwrap_or_else(|| generate_synthetic_id(settings, req));
 
         // Get the original client IP from Fastly headers
         let client_ip = req

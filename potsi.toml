@@ -8,4 +8,4 @@ server_url = "http://68.183.113.79:8000/openrtb2/auction"
 [synthetic]
 counter_store = "jevans_synth_id_counter"
 opid_store = "jevans_synth_id_opid"
-secret_key = "stackpop"
+secret_key = "potsi"
