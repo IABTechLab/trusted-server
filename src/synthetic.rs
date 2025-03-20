@@ -100,10 +100,26 @@ mod tests {
         req
     }
 
+    fn create_settings() -> Settings {
+        Settings {
+            ad_server: crate::settings::AdServer {
+                ad_partner_url: "https://example.com".to_string(),
+                sync_url: "https://example.com/synthetic_id={{synthetic_id}}".to_string(),
+            },
+            prebid: crate::settings::Prebid {
+                server_url: "https://example.com".to_string(),
+            },
+            synthetic: crate::settings::Synthetic {
+                counter_store: "https://example.com".to_string(),
+                opid_store: "https://example.com".to_string(),
+                secret_key: "secret_key".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn test_generate_synthetic_id() {
-        let settings = Settings::new().unwrap();
-
+        let settings: Settings = create_settings();
         let req = create_test_request(vec![
             (&header::USER_AGENT.to_string(), "Mozilla/5.0"),
             (&header::COOKIE.to_string(), "pub_userid=12345"),
@@ -115,13 +131,13 @@ mod tests {
         let synthetic_id = generate_synthetic_id(&settings, &req);
         assert_eq!(
             synthetic_id,
-            "5023f58a61668e5405a804d18662fc0b37518875cac551ed86e5e7223b541600"
+            "07cd73bb8c7db39753ab6b10198b10c3237a3f5a6d2232c6ce578f2c2a623e56"
         )
     }
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
-        let settings = Settings::new().unwrap();
+        let settings = create_settings();
         let req = create_test_request(vec![(SYNTH_HEADER_POTSI, "existing_potsi_id")]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
@@ -130,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_cookie() {
-        let settings = Settings::new().unwrap();
+        let settings = create_settings();
         let req = create_test_request(vec![(
             &header::COOKIE.to_string(),
             "synthetic_id=existing_cookie_id",
@@ -142,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_generate_new() {
-        let settings = Settings::new().unwrap();
+        let settings = create_settings();
         let req = create_test_request(vec![]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);

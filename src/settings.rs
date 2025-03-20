@@ -5,8 +5,8 @@ use std::str;
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
 pub struct AdServer {
-    pub backend: String,
-    pub server_url: String,
+    pub ad_partner_url: String,
+    pub sync_url: String,
 }
 
 #[derive(Debug, Deserialize)]

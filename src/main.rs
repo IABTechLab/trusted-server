@@ -43,8 +43,8 @@ fn main(req: Request) -> Result<Response, Error> {
 
 fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error> {
     println!(
-        "Testing constants - BACKEND2: {}, SYNTH_ID_COUNTER_STORE: {}",
-        settings.ad_server.backend, settings.synthetic.counter_store,
+        "Using ad_partner_url: {}, counter_store: {}",
+        settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
     );
 
     log_fastly::init_simple("mylogs", Info);
@@ -163,10 +163,7 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
     println!("Synthetic ID {} visit count: {}", synthetic_id, new_count);
 
     // Construct URL with synthetic ID
-    let ad_server_url = format!(
-        "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={}",
-        synthetic_id
-    );
+    let ad_server_url = settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id);
 
     println!("Sending request to backend: {}", ad_server_url);
 
@@ -177,7 +174,7 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
         println!("  {}: {:?}", name, value);
     }
 
-    match req.send(settings.ad_server.backend.as_str()) {
+    match req.send(settings.ad_server.ad_partner_url.as_str()) {
         Ok(mut res) => {
             println!(
                 "Received response from backend with status: {}",
