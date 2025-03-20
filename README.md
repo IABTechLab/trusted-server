@@ -48,14 +48,14 @@ fastly version
 
 #### Create profile and follow interactive prompt for pasting your API Token created earlier:
 ```sh	
-astly profile create
+fastly profile create
 ```
 
 ### Rust
 
 #### Install Rust with asdf
 ```sh
-sbrew install asdf
+brew install asdf
 asdf plugin add rust
 asdf install rust 1.83.0
 asdf reshim
