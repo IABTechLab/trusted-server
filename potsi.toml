@@ -1,3 +1,11 @@
+[ad_server]
+ad_partner_url = "equativ_ad_api_2"
+sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={{synthetic_id}}"
+
+[prebid]
+server_url = "http://68.183.113.79:8000/openrtb2/auction"
+
 [synthetic]
 counter_store = "jevans_synth_id_counter"
 opid_store = "jevans_synth_id_opid"
+secret_key = "potsi"

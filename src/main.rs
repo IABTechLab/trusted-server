@@ -7,7 +7,7 @@ use std::env;
 
 mod constants;
 mod cookies;
-use constants::*;
+use constants::{SYNTH_HEADER_FRESH, SYNTH_HEADER_POTSI};
 mod models;
 use models::AdResponse;
 mod prebid;
@@ -21,7 +21,9 @@ use templates::HTML_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    let _settings = Settings::new();
+    let settings = Settings::new().unwrap();
+    println!("Settings {settings:?}");
+
     futures::executor::block_on(async {
         println!(
             "FASTLY_SERVICE_VERSION: {}",
@@ -29,9 +31,9 @@ fn main(req: Request) -> Result<Response, Error> {
         );
 
         match (req.get_method(), req.get_path()) {
-            (&Method::GET, "/") => handle_main_page(req),
-            (&Method::GET, "/ad-creative") => handle_ad_request(req),
-            (&Method::GET, "/prebid-test") => handle_prebid_test(req).await,
+            (&Method::GET, "/") => handle_main_page(&settings, req),
+            (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
+            (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
             _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
                 .with_body("Not Found")
                 .with_header(header::CONTENT_TYPE, "text/plain")),
@@ -39,26 +41,26 @@ fn main(req: Request) -> Result<Response, Error> {
     })
 }
 
-fn handle_main_page(req: Request) -> Result<Response, Error> {
+fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error> {
     println!(
-        "Testing constants - BACKEND2: {}, SYNTH_ID_COUNTER_STORE: {}",
-        BACKEND2, SYNTH_ID_COUNTER_STORE
+        "Using ad_partner_url: {}, counter_store: {}",
+        settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
     );
 
     log_fastly::init_simple("mylogs", Info);
 
     // Calculate fresh ID first using the synthetic module
-    let fresh_id = synthetic::generate_synthetic_id(&req);
+    let fresh_id = synthetic::generate_synthetic_id(settings, &req);
 
     // Check for existing POTSI ID in this specific order:
     // 1. X-Synthetic-Potsi header
     // 2. Cookie
     // 3. Fall back to fresh ID
-    let synthetic_id = synthetic::get_or_generate_synthetic_id(&req);
+    let synthetic_id = synthetic::get_or_generate_synthetic_id(settings, &req);
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header("X-Synthetic-Potsi")
+        req.get_header(SYNTH_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
@@ -67,8 +69,8 @@ fn handle_main_page(req: Request) -> Result<Response, Error> {
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header("X-Synthetic-Fresh", &fresh_id) // Fresh ID always changes
-        .with_header("X-Synthetic-Potsi", &synthetic_id); // POTSI ID remains stable
+        .with_header(SYNTH_HEADER_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(SYNTH_HEADER_POTSI, &synthetic_id); // POTSI ID remains stable
 
     // Always set the cookie with the synthetic ID
     response.set_header(
@@ -94,7 +96,7 @@ fn handle_main_page(req: Request) -> Result<Response, Error> {
     Ok(response)
 }
 
-fn handle_ad_request(req: Request) -> Result<Response, Error> {
+fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Error> {
     // Log headers for debugging
     let client_ip = req
         .get_client_ip_addr()
@@ -108,11 +110,11 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
     println!("X-Forwarded-For: {}", x_forwarded_for.unwrap_or("None"));
 
     // Generate synthetic ID
-    let synthetic_id = generate_synthetic_id(&req);
+    let synthetic_id = generate_synthetic_id(settings, &req);
 
     // Increment visit counter in KV store
-    println!("Opening KV store: {}", SYNTH_ID_COUNTER_STORE);
-    let store = match KVStore::open(SYNTH_ID_COUNTER_STORE) {
+    println!("Opening KV store: {}", settings.synthetic.counter_store);
+    let store = match KVStore::open(settings.synthetic.counter_store.as_str()) {
         Ok(Some(store)) => store,
         Ok(None) => {
             println!("KV store not found");
@@ -161,10 +163,7 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
     println!("Synthetic ID {} visit count: {}", synthetic_id, new_count);
 
     // Construct URL with synthetic ID
-    let ad_server_url = format!(
-        "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={}",
-        synthetic_id
-    );
+    let ad_server_url = settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id);
 
     println!("Sending request to backend: {}", ad_server_url);
 
@@ -175,7 +174,7 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
         println!("  {}: {:?}", name, value);
     }
 
-    match req.send(BACKEND2) {
+    match req.send(settings.ad_server.ad_partner_url.as_str()) {
         Ok(mut res) => {
             println!(
                 "Received response from backend with status: {}",
@@ -236,8 +235,11 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
                             println!("Found opid: {}", opid);
 
                             // Store in opid KV store
-                            println!("Attempting to open KV store: {}", SYNTH_ID_OPID_STORE);
-                            match KVStore::open(SYNTH_ID_OPID_STORE) {
+                            println!(
+                                "Attempting to open KV store: {}",
+                                settings.synthetic.opid_store
+                            );
+                            match KVStore::open(settings.synthetic.opid_store.as_str()) {
                                 Ok(Some(store)) => {
                                     println!("Successfully opened KV store");
                                     match store.insert(&synthetic_id, opid.as_bytes()) {
@@ -251,12 +253,15 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
                                     }
                                 }
                                 Ok(None) => {
-                                    println!("KV store returned None: {}", SYNTH_ID_OPID_STORE);
+                                    println!(
+                                        "KV store returned None: {}",
+                                        settings.synthetic.opid_store
+                                    );
                                 }
                                 Err(e) => {
                                     println!(
                                         "Error opening KV store '{}': {:?}",
-                                        SYNTH_ID_OPID_STORE, e
+                                        settings.synthetic.opid_store, e
                                     );
                                 }
                             };
@@ -293,29 +298,29 @@ fn handle_ad_request(req: Request) -> Result<Response, Error> {
 }
 
 /// Handles the prebid test route with detailed error logging
-async fn handle_prebid_test(mut req: Request) -> Result<Response, Error> {
+async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     println!("Starting prebid test request handling");
 
     // Calculate fresh ID
-    let fresh_id = synthetic::generate_synthetic_id(&req);
+    let fresh_id = synthetic::generate_synthetic_id(settings, &req);
 
     // Check for existing POTSI ID in same order as handle_main_page
-    let synthetic_id = synthetic::get_or_generate_synthetic_id(&req);
+    let synthetic_id = synthetic::get_or_generate_synthetic_id(settings, &req);
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header("X-Synthetic-Potsi")
+        req.get_header(SYNTH_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
 
     // Set both IDs as headers
-    req.set_header("X-Synthetic-Fresh", &fresh_id);
-    req.set_header("X-Synthetic-Potsi", &synthetic_id);
+    req.set_header(SYNTH_HEADER_FRESH, &fresh_id);
+    req.set_header(SYNTH_HEADER_POTSI, &synthetic_id);
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
 
-    let prebid_req = match PrebidRequest::new(&req) {
+    let prebid_req = match PrebidRequest::new(settings, &req) {
         Ok(req) => {
             println!(
                 "Successfully created PrebidRequest with synthetic ID: {}",
