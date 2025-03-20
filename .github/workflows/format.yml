@@ -1,0 +1,35 @@
+name: "Run Format"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Check formatting with rustfmt
+jobs:
+  format:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          toolchain: 1.83
+
+      - name: Rustfmt Check
+        uses: actions-rust-lang/rustfmt@v1
