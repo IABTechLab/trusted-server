@@ -12,9 +12,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Generates a fresh synthetic_id based on request parameters
 pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
-    let user_agent = req
-        .get_header(header::USER_AGENT)
-        .map(|h| h.to_str().unwrap_or("Unknown"));
     let first_party_id = handle_request_cookies(req).and_then(|jar| {
         jar.get("pub_userid")
             .map(|cookie| cookie.value().to_string())
@@ -25,20 +22,12 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
     let publisher_domain = req
         .get_header(header::HOST)
         .map(|h| h.to_str().unwrap_or("unknown.com"));
-    let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
-    let accept_language = req
-        .get_header(header::ACCEPT_LANGUAGE)
-        .and_then(|h| h.to_str().ok())
-        .map(|lang| lang.split(',').next().unwrap_or("unknown"));
 
     let input_string = format!(
-        "{}:{}:{}:{}:{}:{}",
-        client_ip.unwrap_or("unknown".to_string()),
-        user_agent.unwrap_or("unknown"),
+        "{}:{}:{}",
         first_party_id.unwrap_or("anonymous".to_string()),
         auth_user_id.unwrap_or("anonymous"),
         publisher_domain.unwrap_or("unknown.com"),
-        accept_language.unwrap_or("unknown")
     );
 
     log::info!("Input string for fresh ID: {}", input_string);
@@ -119,19 +108,21 @@ mod tests {
 
     #[test]
     fn test_generate_synthetic_id() {
+        log::info!("Hello!");
         let settings: Settings = create_settings();
         let req = create_test_request(vec![
-            (&header::USER_AGENT.to_string(), "Mozilla/5.0"),
             (&header::COOKIE.to_string(), "pub_userid=12345"),
             ("X-Pub-User-ID", "67890"),
             (&header::HOST.to_string(), "example.com"),
-            (&header::ACCEPT_LANGUAGE.to_string(), "en-US,en;q=0.9"),
         ]);
 
         let synthetic_id = generate_synthetic_id(&settings, &req);
+
+        log::info!("Generated Synthetic ID: {}", synthetic_id);
+
         assert_eq!(
             synthetic_id,
-            "07cd73bb8c7db39753ab6b10198b10c3237a3f5a6d2232c6ce578f2c2a623e56"
+            "f109d9239172c7bd5af42fbb25b6018e95ee1e44660ec3b4ea7bd006e232b13e"
         )
     }
 
