@@ -108,7 +108,6 @@ mod tests {
 
     #[test]
     fn test_generate_synthetic_id() {
-        log::info!("Hello!");
         let settings: Settings = create_settings();
         let req = create_test_request(vec![
             (&header::COOKIE.to_string(), "pub_userid=12345"),
@@ -117,8 +116,6 @@ mod tests {
         ]);
 
         let synthetic_id = generate_synthetic_id(&settings, &req);
-
-        log::info!("Generated Synthetic ID: {}", synthetic_id);
 
         assert_eq!(
             synthetic_id,
