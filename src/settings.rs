@@ -21,6 +21,7 @@ pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
     pub secret_key: String,
+    pub template: String,
 }
 
 #[derive(Debug, Deserialize)]
