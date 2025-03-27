@@ -28,7 +28,7 @@ jobs:
       - name: Set up rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt
+          components: "clippy, rustfmt"
           toolchain: 1.83
 
       - name: Run cargo fmt
