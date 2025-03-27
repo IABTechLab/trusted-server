@@ -7,7 +7,6 @@ edition = "2021"
 # Otherwise, `publish = false` prevents an accidental `cargo publish` from revealing private source.
 publish = false
 license = "Apache-2.0"
-license-file = "LICENSE"
 
 [profile.release]
 debug = 1

@@ -129,22 +129,22 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
     println!("Fetching current count for synthetic ID: {}", synthetic_id);
     let current_count: i32 = store
         .lookup(&synthetic_id)
-        .and_then(|mut val| {
+        .map(|mut val| {
             // Convert LookupResponse to bytes first
             match String::from_utf8(val.take_body_bytes()) {
                 Ok(s) => {
                     println!("Value from KV store: {}", s);
-                    Ok(Some(s))
+                    Some(s)
                 }
                 Err(e) => {
                     println!("Error converting bytes to string: {}", e);
-                    Ok(None)
+                    None
                 }
             }
         })
-        .and_then(|opt_s| {
+        .map(|opt_s| {
             println!("Parsing string value: {:?}", opt_s);
-            Ok(opt_s.and_then(|s| s.parse().ok()))
+            opt_s.and_then(|s| s.parse().ok())
         })
         .unwrap_or_else(|_| {
             println!("No existing count found, starting at 0");
@@ -163,7 +163,10 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
     println!("Synthetic ID {} visit count: {}", synthetic_id, new_count);
 
     // Construct URL with synthetic ID
-    let ad_server_url = settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id);
+    let ad_server_url = settings
+        .ad_server
+        .sync_url
+        .replace("{{synthetic_id}}", &synthetic_id);
 
     println!("Sending request to backend: {}", ad_server_url);
 
