@@ -1,9 +1,8 @@
 use cookie::{Cookie, CookieJar};
 use fastly::http::header;
 use fastly::Request;
-use log;
 
-const COOKIE_MAX_AGE: i32 = 1 * 365 * 24 * 60 * 60; // 1 year
+const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
 // return empty cookie jar for unparsable cookies
 pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
@@ -80,8 +79,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies() {
-        let mut req = Request::get("http://example.com").with_header(header::COOKIE, "c1=v1;c2=v2");
-        let jar = handle_request_cookies(&mut req).unwrap();
+        let req = Request::get("http://example.com").with_header(header::COOKIE, "c1=v1;c2=v2");
+        let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 2);
         assert_eq!(jar.get("c1").unwrap().value(), "v1");
@@ -90,24 +89,24 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_with_empty_cookie() {
-        let mut req = Request::get("http://example.com").with_header(header::COOKIE, "");
-        let jar = handle_request_cookies(&mut req).unwrap();
+        let req = Request::get("http://example.com").with_header(header::COOKIE, "");
+        let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 0);
     }
 
     #[test]
     fn test_handle_request_cookies_no_cookie_header() {
-        let mut req: Request = Request::get("https://example.com");
-        let jar = handle_request_cookies(&mut req);
+        let req: Request = Request::get("https://example.com");
+        let jar = handle_request_cookies(&req);
 
         assert!(jar.is_none());
     }
 
     #[test]
     fn test_handle_request_cookies_invalid_cookie_header() {
-        let mut req = Request::get("http://example.com").with_header(header::COOKIE, "invalid");
-        let jar = handle_request_cookies(&mut req).unwrap();
+        let req = Request::get("http://example.com").with_header(header::COOKIE, "invalid");
+        let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 0);
     }

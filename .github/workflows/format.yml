@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Cache Cargo dependencies
+      - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
@@ -25,11 +25,15 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Set up Rust toolchain
+      - name: Set up rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
           toolchain: 1.83
 
-      - name: Rustfmt Check
+      - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
+
+      - name: Run cargo clipply
+        run: cargo clippy --all-targets --all-features
+
