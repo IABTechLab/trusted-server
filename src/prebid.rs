@@ -1,7 +1,6 @@
 use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
-use url;
 
 use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_POTSI};
 use crate::settings::Settings;

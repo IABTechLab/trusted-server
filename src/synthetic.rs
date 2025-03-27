@@ -1,7 +1,6 @@
 use fastly::http::header;
 use fastly::Request;
 use hmac::{Hmac, Mac};
-use log;
 use sha2::Sha256;
 use handlebars::Handlebars;
 use serde_json::json;
@@ -69,7 +68,7 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
         return potsi;
     }
 
-    let req_cookie_jar: Option<cookie::CookieJar> = handle_request_cookies(&req);
+    let req_cookie_jar: Option<cookie::CookieJar> = handle_request_cookies(req);
     match req_cookie_jar {
         Some(jar) => {
             let potsi_cookie = jar.get("synthetic_id");
@@ -126,11 +125,11 @@ mod tests {
     fn test_generate_synthetic_id() {
         let settings: Settings = create_settings();
         let req = create_test_request(vec![
-            (&header::USER_AGENT.to_string(), "Mozilla/5.0"),
-            (&header::COOKIE.to_string(), "pub_userid=12345"),
+            (header::USER_AGENT.as_ref(), "Mozilla/5.0"),
+            (header::COOKIE.as_ref(), "pub_userid=12345"),
             ("X-Pub-User-ID", "67890"),
-            (&header::HOST.to_string(), "example.com"),
-            (&header::ACCEPT_LANGUAGE.to_string(), "en-US,en;q=0.9"),
+            (header::HOST.as_ref(), "example.com"),
+            (header::ACCEPT_LANGUAGE.as_ref(), "en-US,en;q=0.9"),
         ]);
 
         let synthetic_id = generate_synthetic_id(&settings, &req);
@@ -154,7 +153,7 @@ mod tests {
     fn test_get_or_generate_synthetic_id_with_cookie() {
         let settings = create_settings();
         let req = create_test_request(vec![(
-            &header::COOKIE.to_string(),
+            header::COOKIE.as_ref(),
             "synthetic_id=existing_cookie_id",
         )]);
 
