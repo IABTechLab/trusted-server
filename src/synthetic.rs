@@ -1,9 +1,9 @@
 use fastly::http::header;
 use fastly::Request;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use handlebars::Handlebars;
+use hmac::{Hmac, Mac};
 use serde_json::json;
+use sha2::Sha256;
 
 use crate::constants::{SYNTHETIC_HEADER_POTSI, SYNTHETIC_HEADER_PUB_USER_ID};
 use crate::cookies::handle_request_cookies;
@@ -42,9 +42,10 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
         "accept_language": accept_language.unwrap_or("unknown")
     });
 
-    let input_string = handlebars.render_template(&settings.synthetic.template, data).unwrap();
+    let input_string = handlebars
+        .render_template(&settings.synthetic.template, data)
+        .unwrap();
     println!("Input string for fresh ID: {} {}", input_string, data);
-
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
         .expect("HMAC can take key of any size");

@@ -89,7 +89,11 @@ impl PrebidRequest {
     ///
     /// # Returns
     /// * `Result<Response, Error>` - Prebid Server response or error
-    pub async fn send_bid_request(&self, settings: &Settings, incoming_req: &Request) -> Result<Response, Error> {
+    pub async fn send_bid_request(
+        &self,
+        settings: &Settings,
+        incoming_req: &Request,
+    ) -> Result<Response, Error> {
         let mut req = Request::new(Method::POST, settings.prebid.server_url.to_owned());
 
         // Get and store the POTSI ID value from the incoming request
