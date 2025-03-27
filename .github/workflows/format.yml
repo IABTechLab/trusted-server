@@ -31,6 +31,9 @@ jobs:
           components: "clippy, rustfmt"
           toolchain: 1.83
 
+      - name: Add wasm32-wasi target
+        run: rustup target add wasm32-wasip1
+  
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
