@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::constants::{SYNTHETIC_HEADER_TRUSTED_SERVER, SYNTHETIC_HEADER_PUB_USER_ID};
+use crate::constants::{SYNTHETIC_HEADER_PUB_USER_ID, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
 use crate::settings::Settings;
 
@@ -86,7 +86,10 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
 
     // If no existing Synthetic ID found, generate a fresh one
     let fresh_id = generate_synthetic_id(settings, req);
-    log::info!("No existing Synthetic ID found, using fresh ID: {}", fresh_id);
+    log::info!(
+        "No existing Synthetic ID found, using fresh ID: {}",
+        fresh_id
+    );
     fresh_id
 }
 
@@ -144,7 +147,10 @@ mod tests {
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
         let settings = create_settings();
-        let req = create_test_request(vec![(SYNTHETIC_HEADER_TRUSTED_SERVER, "existing_synthetic_id")]);
+        let req = create_test_request(vec![(
+            SYNTHETIC_HEADER_TRUSTED_SERVER,
+            "existing_synthetic_id",
+        )]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
         assert_eq!(synthetic_id, "existing_synthetic_id");

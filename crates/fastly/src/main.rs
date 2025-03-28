@@ -67,10 +67,7 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
         .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id); // Trusted Server ID remains stable
 
     // Always set the cookie with the synthetic ID
-    response.set_header(
-        header::SET_COOKIE,
-        create_synthetic_cookie(&synthetic_id),
-    );
+    response.set_header(header::SET_COOKIE, create_synthetic_cookie(&synthetic_id));
 
     // Debug: Print all request headers
     println!("All Request Headers:");
