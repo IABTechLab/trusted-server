@@ -5,19 +5,13 @@ use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
 
-mod constants;
-mod cookies;
-use constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_POTSI};
-mod models;
-use models::AdResponse;
-mod prebid;
-use prebid::PrebidRequest;
-mod settings;
-use settings::Settings;
-mod synthetic;
-use synthetic::generate_synthetic_id;
-mod templates;
-use templates::HTML_TEMPLATE;
+use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use trusted_server_common::cookies::create_synthetic_cookie;
+use trusted_server_common::models::AdResponse;
+use trusted_server_common::prebid::PrebidRequest;
+use trusted_server_common::settings::Settings;
+use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
+use trusted_server_common::templates::HTML_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -50,32 +44,32 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
     log_fastly::init_simple("mylogs", Info);
 
     // Calculate fresh ID first using the synthetic module
-    let fresh_id = synthetic::generate_synthetic_id(settings, &req);
+    let fresh_id = generate_synthetic_id(settings, &req);
 
-    // Check for existing POTSI ID in this specific order:
-    // 1. X-Synthetic-Potsi header
+    // Check for existing Synthetic ID in this specific order:
+    // 1. Header
     // 2. Cookie
     // 3. Fall back to fresh ID
-    let synthetic_id = synthetic::get_or_generate_synthetic_id(settings, &req);
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req);
 
     println!(
-        "Existing POTSI header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_POTSI)
+        "Existing Synthetic header: {:?}",
+        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
-    println!("Using POTSI ID: {}", synthetic_id);
+    println!("Using Synthetic ID: {}", synthetic_id);
 
     // Create response with the main page HTML
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
         .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_POTSI, &synthetic_id); // POTSI ID remains stable
+        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id); // Trusted Server ID remains stable
 
     // Always set the cookie with the synthetic ID
     response.set_header(
         header::SET_COOKIE,
-        cookies::create_synthetic_cookie(&synthetic_id),
+        create_synthetic_cookie(&synthetic_id),
     );
 
     // Debug: Print all request headers
@@ -305,21 +299,21 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
     println!("Starting prebid test request handling");
 
     // Calculate fresh ID
-    let fresh_id = synthetic::generate_synthetic_id(settings, &req);
+    let fresh_id = generate_synthetic_id(settings, &req);
 
-    // Check for existing POTSI ID in same order as handle_main_page
-    let synthetic_id = synthetic::get_or_generate_synthetic_id(settings, &req);
+    // Check for existing Synthetic ID in same order as handle_main_page
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req);
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_POTSI)
+        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
 
     // Set both IDs as headers
     req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_POTSI, &synthetic_id);
+    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
 

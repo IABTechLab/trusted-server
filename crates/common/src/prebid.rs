@@ -2,7 +2,7 @@ use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
-use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_POTSI};
+use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -31,7 +31,7 @@ impl PrebidRequest {
     pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
         // Get the POTSI ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
-            .get_header(SYNTHETIC_HEADER_POTSI)
+            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_synthetic_id(settings, req));
@@ -98,12 +98,12 @@ impl PrebidRequest {
 
         // Get and store the POTSI ID value from the incoming request
         let potsi_id = incoming_req
-            .get_header(SYNTHETIC_HEADER_POTSI)
+            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
 
-        println!("Found POTSI ID from incoming request: {}", potsi_id);
+        println!("Found Truted Server ID from incoming request: {}", potsi_id);
 
         // Construct the OpenRTB2 bid request
         let prebid_body = json!({
@@ -170,7 +170,7 @@ impl PrebidRequest {
         req.set_header("X-Forwarded-For", &self.client_ip);
         req.set_header(header::ORIGIN, &self.origin);
         req.set_header(SYNTHETIC_HEADER_FRESH, &self.synthetic_id);
-        req.set_header(SYNTHETIC_HEADER_POTSI, &potsi_id);
+        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &potsi_id);
 
         println!(
             "Sending prebid request with Fresh ID: {} and POTSI ID: {}",
