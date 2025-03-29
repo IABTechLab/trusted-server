@@ -1,4 +1,4 @@
-#Project Governance for The Trusted Server
+# Project Governance for The Trusted Server
 
 The Trusted Server project will be governed as an open-source initiative, in accordance with the established guidelines of the IAB Tech Lab Open Source initiative. However, certain key distinctions apply:
 
