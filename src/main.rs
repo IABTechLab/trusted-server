@@ -1,6 +1,7 @@
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
+use fastly::geo::geo_lookup;
 use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
@@ -19,9 +20,11 @@ use synthetic::generate_synthetic_id;
 mod templates;
 use templates::HTML_TEMPLATE;
 mod gdpr;
-use gdpr::{get_consent_from_request, GdprConsent};
+use gdpr::get_consent_from_request;
 mod privacy;
 use privacy::PRIVACY_TEMPLATE;
+mod why;
+use why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -44,21 +47,75 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::DELETE, "/gdpr/data") => gdpr::handle_data_subject_request(&settings, req),
             (&Method::GET, "/privacy-policy") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(PRIVACY_TEMPLATE)
-                .with_header(header::CONTENT_TYPE, "text/html")),
+                .with_header(header::CONTENT_TYPE, "text/html")
+                .with_header("x-compress-hint", "on")),
+            (&Method::GET, "/why-trusted-server") => Ok(Response::from_status(StatusCode::OK)
+                .with_body(WHY_TEMPLATE)
+                .with_header(header::CONTENT_TYPE, "text/html")
+                .with_header("x-compress-hint", "on")),
             _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
                 .with_body("Not Found")
-                .with_header(header::CONTENT_TYPE, "text/plain")),
+                .with_header(header::CONTENT_TYPE, "text/plain")
+                .with_header("x-compress-hint", "on")),
         }
     })
 }
 
-fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error> {
+fn get_dma_code(req: &mut Request) -> Option<String> {
+    // Debug: Check if we're running in Fastly environment
+    println!("Fastly Environment Check:");
+    println!("  FASTLY_POP: {}", std::env::var("FASTLY_POP").unwrap_or_else(|_| "not in Fastly".to_string()));
+    println!("  FASTLY_REGION: {}", std::env::var("FASTLY_REGION").unwrap_or_else(|_| "not in Fastly".to_string()));
+    
+    // Get detailed geo information using geo_lookup
+    if let Some(geo) = req.get_client_ip_addr().and_then(geo_lookup) {
+        println!("Geo Information Found:");
+        
+        // Set all available geo information in headers
+        let city = geo.city();
+        req.set_header("X-Geo-City", city);
+        println!("  City: {}", city);
+        
+        let country = geo.country_code();
+        req.set_header("X-Geo-Country", country);
+        println!("  Country: {}", country);
+        
+        req.set_header("X-Geo-Continent", format!("{:?}", geo.continent()));
+        println!("  Continent: {:?}", geo.continent());
+        
+        req.set_header("X-Geo-Coordinates", format!("{},{}", geo.latitude(), geo.longitude()));
+        println!("  Location: ({}, {})", geo.latitude(), geo.longitude());
+        
+        // Get and set the metro code (DMA)
+        let metro_code = geo.metro_code();
+        req.set_header("X-Geo-Metro-Code", metro_code.to_string());
+        println!("Found DMA/Metro code: {}", metro_code);
+        return Some(metro_code.to_string());
+    } else {
+        println!("No geo information available for the request");
+        req.set_header("X-Geo-Info-Available", "false");
+    }
+
+    // If no metro code is found, log all request headers for debugging
+    println!("No DMA/Metro code found. All request headers:");
+    for (name, value) in req.get_headers() {
+        println!("  {}: {:?}", name, value);
+    }
+
+    None
+}
+
+fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     println!(
         "Using ad_partner_url: {}, counter_store: {}",
         settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
     );
 
     log_fastly::init_simple("mylogs", Info);
+
+    // Add DMA code check to main page as well
+    let dma_code = get_dma_code(&mut req);
+    println!("Main page - DMA Code: {:?}", dma_code);
 
     // Check GDPR consent before proceeding
     let consent = get_consent_from_request(&req).unwrap_or_default();
@@ -91,7 +148,20 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
         .with_header(SYNTH_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTH_HEADER_POTSI, &synthetic_id); // POTSI ID remains stable
+        .with_header(SYNTH_HEADER_POTSI, &synthetic_id) // POTSI ID remains stable
+        .with_header(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
+        )
+        .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .with_header("x-compress-hint", "on");
+
+    // Copy geo headers from request to response
+    for header_name in &["X-Geo-City", "X-Geo-Country", "X-Geo-Continent", "X-Geo-Coordinates", "X-Geo-Metro-Code", "X-Geo-Info-Available"] {
+        if let Some(value) = req.get_header(*header_name) {
+            response.set_header(*header_name, value);
+        }
+    }
 
     // Only set cookies if we have consent
     if consent.functional {
@@ -119,13 +189,18 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
     Ok(response)
 }
 
-fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Error> {
+fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
     let consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = req.get_header("X-Consent-Advertising")
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
+
+    // Add DMA code extraction
+    let dma_code = get_dma_code(&mut req);
+    
+    println!("Client location - DMA Code: {:?}", dma_code);
 
     // Log headers for debugging
     let client_ip = req
@@ -187,9 +262,13 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
         }
     }
 
-    // Construct URL with synthetic ID (or non-personalized flag)
+    // Modify the ad server URL construction to include DMA code if available
     let ad_server_url = if advertising_consent {
-        settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id)
+        let mut url = settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id);
+        if let Some(dma) = dma_code {
+            url = format!("{}&dma={}", url, dma);
+        }
+        url
     } else {
         // Use a different URL or parameter for non-personalized ads
         settings.ad_server.sync_url.replace("{{synthetic_id}}", "non-personalized")
@@ -304,11 +383,23 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
                 }
 
                 // Return the JSON response with CORS headers
-                let response = Response::from_status(StatusCode::OK)
+                let mut response = Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
                     .with_header(header::CACHE_CONTROL, "no-store, private")
                     .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .with_header(
+                        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                        "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
+                    )
+                    .with_header("x-compress-hint", "on")
                     .with_body(body);
+
+                // Copy geo headers from request to response
+                for header_name in &["X-Geo-City", "X-Geo-Country", "X-Geo-Continent", "X-Geo-Coordinates", "X-Geo-Metro-Code", "X-Geo-Info-Available"] {
+                    if let Some(value) = req.get_header(*header_name) {
+                        response.set_header(*header_name, value);
+                    }
+                }
 
                 // Attach PoP info to the response
                 //response.set_header("X-Debug-Fastly-PoP", &fastly_pop);
@@ -319,6 +410,7 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
                 println!("Backend returned non-success status");
                 Ok(Response::from_status(StatusCode::NO_CONTENT)
                     .with_header(header::CONTENT_TYPE, "application/json")
+                    .with_header("x-compress-hint", "on")
                     .with_body("{}"))
             }
         }
@@ -326,6 +418,7 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
             println!("Error making backend request: {:?}", e);
             Ok(Response::from_status(StatusCode::NO_CONTENT)
                 .with_header(header::CONTENT_TYPE, "application/json")
+                .with_header("x-compress-hint", "on")
                 .with_body("{}"))
         }
     }
@@ -405,6 +498,7 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                 .with_header("X-Prebid-Test", "true")
                 .with_header("X-Synthetic-ID", &prebid_req.synthetic_id)
                 .with_header("X-Consent-Advertising", if advertising_consent { "true" } else { "false" })
+                .with_header("x-compress-hint", "on")
                 .with_body(body))
         }
         Err(e) => {
