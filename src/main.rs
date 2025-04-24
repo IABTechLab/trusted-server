@@ -8,7 +8,7 @@ use std::env;
 
 mod constants;
 mod cookies;
-use constants::{SYNTH_HEADER_FRESH, SYNTH_HEADER_POTSI};
+use constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_POTSI};
 mod models;
 use models::AdResponse;
 mod prebid;
@@ -138,7 +138,7 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header(SYNTH_HEADER_POTSI)
+        req.get_header(SYNTHETIC_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
@@ -147,8 +147,8 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(SYNTH_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTH_HEADER_POTSI, &synthetic_id) // POTSI ID remains stable
+        .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(SYNTHETIC_HEADER_POTSI, &synthetic_id) // POTSI ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
@@ -446,15 +446,15 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header(SYNTH_HEADER_POTSI)
+        req.get_header(SYNTHETIC_HEADER_POTSI)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
     println!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
-    req.set_header(SYNTH_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTH_HEADER_POTSI, &synthetic_id);
+    req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
+    req.set_header(SYNTHETIC_HEADER_POTSI, &synthetic_id);
     req.set_header("X-Consent-Advertising", if advertising_consent { "true" } else { "false" });
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
@@ -480,7 +480,7 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     println!("Attempting to send bid request to Prebid Server at prebid_backend");
 
-    match prebid_req.send_bid_request(&req).await {
+    match prebid_req.send_bid_request(settings, &req).await {
         Ok(mut prebid_response) => {
             println!("Received response from Prebid Server");
             println!("Response status: {}", prebid_response.get_status());

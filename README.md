@@ -46,6 +46,8 @@ brew install fastly/tap/fastly
 fastly version
 ```
 
+:warning: fastly cli version should be at least v11.1.0
+
 #### Create profile and follow interactive prompt for pasting your API Token created earlier:
 ```sh	
 fastly profile create
@@ -91,7 +93,7 @@ git clone git@github.com:IABTechLab/trusted-server.git
 :information_source: Note that you’ll have to edit the following files for your setup:
 
 - fastly.toml (service ID, author, description) 
-- Potsi.toml (KV store ID names) 
+- potsi.toml (KV store ID names) 
 
 ### Build
 
