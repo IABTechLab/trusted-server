@@ -1,6 +1,7 @@
 use cookie::{Cookie, CookieJar};
 use fastly::http::header;
-use fastly::Request;
+
+use crate::http_wrapper::RequestWrapper;
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
@@ -17,7 +18,7 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
     jar
 }
 
-pub fn handle_request_cookies(req: &Request) -> Option<CookieJar> {
+pub fn handle_request_cookies<T: RequestWrapper>(req: &T) -> Option<CookieJar> {
     match req.get_header(header::COOKIE) {
         Some(header_value) => {
             let header_value_str: &str = header_value.to_str().unwrap_or("");

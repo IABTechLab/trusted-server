@@ -26,15 +26,15 @@ pub struct Synthetic {
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
-pub(crate) struct Settings {
+pub struct Settings {
     pub ad_server: AdServer,
     pub prebid: Prebid,
     pub synthetic: Synthetic,
 }
 
 impl Settings {
-    pub(crate) fn new() -> Result<Self, ConfigError> {
-        let toml_bytes = include_bytes!("../potsi.toml");
+    pub fn new() -> Result<Self, ConfigError> {
+        let toml_bytes = include_bytes!("../../../trusted-server.toml");
         let toml_str = str::from_utf8(toml_bytes).unwrap();
 
         let s = Config::builder()
