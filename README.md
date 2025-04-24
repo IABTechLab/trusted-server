@@ -46,6 +46,8 @@ brew install fastly/tap/fastly
 fastly version
 ```
 
+:warning: fastly cli version should be at least v11.1.0
+
 #### Create profile and follow interactive prompt for pasting your API Token created earlier:
 ```sh	
 fastly profile create
