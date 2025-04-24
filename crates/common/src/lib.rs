@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod cookies;
+pub mod http_wrapper;
 pub mod models;
 pub mod prebid;
 pub mod settings;

@@ -1,17 +1,22 @@
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
+use http::header::HeaderValue;
 use log::LevelFilter::Info;
 use serde_json::json;
+use trusted_server_common::http_wrapper::RequestWrapper;
 use std::env;
 
-use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use trusted_server_common::constants::{HEADER_X_FORWARDED_FOR, HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::models::AdResponse;
 use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use trusted_server_common::templates::HTML_TEMPLATE;
+
+pub mod http_wrapper;
+use crate::http_wrapper::FastlyRequestWrapper;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -35,7 +40,7 @@ fn main(req: Request) -> Result<Response, Error> {
     })
 }
 
-fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error> {
+fn handle_main_page<T: RequestWrapper>(settings: &Settings, req: T) -> Result<Response, Error> {
     println!(
         "Using ad_partner_url: {}, counter_store: {}",
         settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
@@ -54,7 +59,7 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
 
     println!(
         "Existing Synthetic header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using Synthetic ID: {}", synthetic_id);
@@ -63,8 +68,8 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id); // Trusted Server ID remains stable
+        .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id); // Trusted Server ID remains stable
 
     // Always set the cookie with the synthetic ID
     response.set_header(header::SET_COOKIE, create_synthetic_cookie(&synthetic_id));
@@ -87,14 +92,14 @@ fn handle_main_page(settings: &Settings, req: Request) -> Result<Response, Error
     Ok(response)
 }
 
-fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Error> {
+fn handle_ad_request<T: RequestWrapper>(settings: &Settings, req: T) -> Result<Response, Error> {
     // Log headers for debugging
     let client_ip = req
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     let x_forwarded_for = req
-        .get_header("x-forwarded-for")
+        .get_header(HEADER_X_FORWARDED_FOR)
         .map(|h| h.to_str().unwrap_or("Unknown"));
 
     println!("Client IP: {}", client_ip);
@@ -292,7 +297,7 @@ fn handle_ad_request(settings: &Settings, req: Request) -> Result<Response, Erro
 }
 
 /// Handles the prebid test route with detailed error logging
-async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+async fn handle_prebid_test<T: RequestWrapper>(settings: &Settings, mut req: T) -> Result<Response, Error> {
     println!("Starting prebid test request handling");
 
     // Calculate fresh ID
@@ -303,14 +308,14 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     println!(
         "Existing POTSI header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using POTSI ID: {}", synthetic_id);
 
     // Set both IDs as headers
-    req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
+    req.set_header(HEADER_SYNTHETIC_FRESH, HeaderValue::from_str(&fresh_id).unwrap());
+    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, HeaderValue::from_str(&synthetic_id).unwrap());
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
 

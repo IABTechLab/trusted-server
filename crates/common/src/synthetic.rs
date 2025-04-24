@@ -1,18 +1,18 @@
 use fastly::http::header;
-use fastly::Request;
 use handlebars::Handlebars;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::constants::{SYNTHETIC_HEADER_PUB_USER_ID, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
+use crate::http_wrapper::RequestWrapper;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Generates a fresh synthetic_id based on request parameters
-pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
+pub fn generate_synthetic_id<T: RequestWrapper>(settings: &Settings, req: &T) -> String {
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
@@ -21,7 +21,7 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
             .map(|cookie| cookie.value().to_string())
     });
     let auth_user_id = req
-        .get_header(SYNTHETIC_HEADER_PUB_USER_ID)
+        .get_header(HEADER_SYNTHETIC_PUB_USER_ID)
         .map(|h| h.to_str().unwrap_or("anonymous"));
     let publisher_domain = req
         .get_header(header::HOST)
@@ -58,10 +58,10 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
 }
 
 /// Gets or creates a synthetic_id from the request
-pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
+pub fn get_or_generate_synthetic_id<T: RequestWrapper>(settings: &Settings, req: &T) -> String {
     // First try to get existing POTSI ID from header
     if let Some(synthetic_id) = req
-        .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
     {
@@ -148,7 +148,7 @@ mod tests {
     fn test_get_or_generate_synthetic_id_with_header() {
         let settings = create_settings();
         let req = create_test_request(vec![(
-            SYNTHETIC_HEADER_TRUSTED_SERVER,
+            HEADER_SYNTHETIC_TRUSTED_SERVER,
             "existing_synthetic_id",
         )]);
 
