@@ -64,15 +64,15 @@ pub fn create_consent_cookie(consent: &GdprConsent) -> String {
 }
 
 pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
-    match req.get_method() {
-        &Method::GET => {
+    match *req.get_method() {
+        Method::GET => {
             // Return current consent status
             let consent = get_consent_from_request(&req).unwrap_or_default();
             Ok(Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(serde_json::to_string(&consent)?))
         }
-        &Method::POST => {
+        Method::POST => {
             // Update consent preferences
             let consent: GdprConsent = serde_json::from_slice(req.into_body_bytes().as_slice())?;
             let mut response = Response::from_status(StatusCode::OK)
@@ -90,8 +90,8 @@ pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Resp
 }
 
 pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
-    match req.get_method() {
-        &Method::GET => {
+    match *req.get_method() {
+        Method::GET => {
             // Handle data access request
             if let Some(synthetic_id) = req.get_header("X-Subject-ID") {
                 // Create a HashMap to store all user-related data
@@ -108,7 +108,7 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
                 Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("Missing subject ID"))
             }
         }
-        &Method::DELETE => {
+        Method::DELETE => {
             // Handle right to erasure (right to be forgotten)
             if let Some(_synthetic_id) = req.get_header("X-Subject-ID") {
                 // TODO: Implement data deletion from KV store
