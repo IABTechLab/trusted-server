@@ -11,7 +11,7 @@ service_id = "q9waEnTgJfqQV1a0cYOuo3"
 
 [scripts]
 build = """
-    cargo build --bin potsi --release --target wasm32-wasip1 --color always &&
+    cargo build --bin potsi --release --target wasm32-wasip1 --color always
 """
 
 [local_server]
