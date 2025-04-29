@@ -138,4 +138,4 @@ pub const PRIVACY_TEMPLATE: &str = r#"<!DOCTYPE html>
         <p class="last-updated">Last Updated: March 24, 2024</p>
     </div>
 </body>
-</html>"#; 
+</html>"#;

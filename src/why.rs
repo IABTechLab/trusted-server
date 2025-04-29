@@ -218,4 +218,4 @@ pub const WHY_TEMPLATE: &str = r#"<!DOCTYPE html>
         </div>
     </div>
 </body>
-</html>"#; 
+</html>"#;

@@ -1,7 +1,7 @@
+use fastly::geo::geo_lookup;
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
-use fastly::geo::geo_lookup;
 use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
@@ -64,28 +64,37 @@ fn main(req: Request) -> Result<Response, Error> {
 fn get_dma_code(req: &mut Request) -> Option<String> {
     // Debug: Check if we're running in Fastly environment
     println!("Fastly Environment Check:");
-    println!("  FASTLY_POP: {}", std::env::var("FASTLY_POP").unwrap_or_else(|_| "not in Fastly".to_string()));
-    println!("  FASTLY_REGION: {}", std::env::var("FASTLY_REGION").unwrap_or_else(|_| "not in Fastly".to_string()));
-    
+    println!(
+        "  FASTLY_POP: {}",
+        std::env::var("FASTLY_POP").unwrap_or_else(|_| "not in Fastly".to_string())
+    );
+    println!(
+        "  FASTLY_REGION: {}",
+        std::env::var("FASTLY_REGION").unwrap_or_else(|_| "not in Fastly".to_string())
+    );
+
     // Get detailed geo information using geo_lookup
     if let Some(geo) = req.get_client_ip_addr().and_then(geo_lookup) {
         println!("Geo Information Found:");
-        
+
         // Set all available geo information in headers
         let city = geo.city();
         req.set_header("X-Geo-City", city);
         println!("  City: {}", city);
-        
+
         let country = geo.country_code();
         req.set_header("X-Geo-Country", country);
         println!("  Country: {}", country);
-        
+
         req.set_header("X-Geo-Continent", format!("{:?}", geo.continent()));
         println!("  Continent: {:?}", geo.continent());
-        
-        req.set_header("X-Geo-Coordinates", format!("{},{}", geo.latitude(), geo.longitude()));
+
+        req.set_header(
+            "X-Geo-Coordinates",
+            format!("{},{}", geo.latitude(), geo.longitude()),
+        );
         println!("  Location: ({}, {})", geo.latitude(), geo.longitude());
-        
+
         // Get and set the metro code (DMA)
         let metro_code = geo.metro_code();
         req.set_header("X-Geo-Metro-Code", metro_code.to_string());
@@ -122,7 +131,9 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     if !consent.functional {
         // Return a version of the page without tracking
         return Ok(Response::from_status(StatusCode::OK)
-            .with_body(HTML_TEMPLATE.replace("fetch('/prebid-test')", "console.log('Tracking disabled')"))
+            .with_body(
+                HTML_TEMPLATE.replace("fetch('/prebid-test')", "console.log('Tracking disabled')"),
+            )
             .with_header(header::CONTENT_TYPE, "text/html")
             .with_header(header::CACHE_CONTROL, "no-store, private"));
     }
@@ -157,7 +168,14 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
         .with_header("x-compress-hint", "on");
 
     // Copy geo headers from request to response
-    for header_name in &["X-Geo-City", "X-Geo-Country", "X-Geo-Continent", "X-Geo-Coordinates", "X-Geo-Metro-Code", "X-Geo-Info-Available"] {
+    for header_name in &[
+        "X-Geo-City",
+        "X-Geo-Country",
+        "X-Geo-Continent",
+        "X-Geo-Coordinates",
+        "X-Geo-Metro-Code",
+        "X-Geo-Info-Available",
+    ] {
         if let Some(value) = req.get_header(*header_name) {
             response.set_header(*header_name, value);
         }
@@ -191,15 +209,16 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
 fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
-    let consent = get_consent_from_request(&req).unwrap_or_default();
-    let advertising_consent = req.get_header("X-Consent-Advertising")
+    let _consent = get_consent_from_request(&req).unwrap_or_default();
+    let advertising_consent = req
+        .get_header("X-Consent-Advertising")
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
 
     // Add DMA code extraction
     let dma_code = get_dma_code(&mut req);
-    
+
     println!("Client location - DMA Code: {:?}", dma_code);
 
     // Log headers for debugging
@@ -231,16 +250,14 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             println!("Fetching current count for synthetic ID: {}", synthetic_id);
             let current_count: i32 = store
                 .lookup(&synthetic_id)
-                .and_then(|mut val| {
-                    match String::from_utf8(val.take_body_bytes()) {
-                        Ok(s) => {
-                            println!("Value from KV store: {}", s);
-                            Ok(Some(s))
-                        }
-                        Err(e) => {
-                            println!("Error converting bytes to string: {}", e);
-                            Ok(None)
-                        }
+                .and_then(|mut val| match String::from_utf8(val.take_body_bytes()) {
+                    Ok(s) => {
+                        println!("Value from KV store: {}", s);
+                        Ok(Some(s))
+                    }
+                    Err(e) => {
+                        println!("Error converting bytes to string: {}", e);
+                        Ok(None)
                     }
                 })
                 .and_then(|opt_s| {
@@ -264,24 +281,33 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 
     // Modify the ad server URL construction to include DMA code if available
     let ad_server_url = if advertising_consent {
-        let mut url = settings.ad_server.sync_url.replace("{{synthetic_id}}", &synthetic_id);
+        let mut url = settings
+            .ad_server
+            .sync_url
+            .replace("{{synthetic_id}}", &synthetic_id);
         if let Some(dma) = dma_code {
             url = format!("{}&dma={}", url, dma);
         }
         url
     } else {
         // Use a different URL or parameter for non-personalized ads
-        settings.ad_server.sync_url.replace("{{synthetic_id}}", "non-personalized")
+        settings
+            .ad_server
+            .sync_url
+            .replace("{{synthetic_id}}", "non-personalized")
     };
 
     println!("Sending request to backend: {}", ad_server_url);
 
     // Add header logging here
     let mut ad_req = Request::get(ad_server_url);
-    
+
     // Add consent information to the ad request
-    ad_req.set_header("X-Consent-Advertising", if advertising_consent { "true" } else { "false" });
-    
+    ad_req.set_header(
+        "X-Consent-Advertising",
+        if advertising_consent { "true" } else { "false" },
+    );
+
     println!("Request headers to Equativ:");
     for (name, value) in ad_req.get_headers() {
         println!("  {}: {:?}", name, value);
@@ -395,7 +421,14 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                     .with_body(body);
 
                 // Copy geo headers from request to response
-                for header_name in &["X-Geo-City", "X-Geo-Country", "X-Geo-Continent", "X-Geo-Coordinates", "X-Geo-Metro-Code", "X-Geo-Info-Available"] {
+                for header_name in &[
+                    "X-Geo-City",
+                    "X-Geo-Country",
+                    "X-Geo-Continent",
+                    "X-Geo-Coordinates",
+                    "X-Geo-Metro-Code",
+                    "X-Geo-Info-Available",
+                ] {
                     if let Some(value) = req.get_header(*header_name) {
                         response.set_header(*header_name, value);
                     }
@@ -429,7 +462,8 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
     println!("Starting prebid test request handling");
 
     // Check consent status from headers
-    let advertising_consent = req.get_header("X-Consent-Advertising")
+    let advertising_consent = req
+        .get_header("X-Consent-Advertising")
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -441,7 +475,10 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
         (fresh, synth)
     } else {
         // Use non-personalized IDs when no consent
-        ("non-personalized".to_string(), "non-personalized".to_string())
+        (
+            "non-personalized".to_string(),
+            "non-personalized".to_string(),
+        )
     };
 
     println!(
@@ -455,7 +492,10 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
     // Set both IDs as headers
     req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
     req.set_header(SYNTHETIC_HEADER_POTSI, &synthetic_id);
-    req.set_header("X-Consent-Advertising", if advertising_consent { "true" } else { "false" });
+    req.set_header(
+        "X-Consent-Advertising",
+        if advertising_consent { "true" } else { "false" },
+    );
 
     println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
 
@@ -497,7 +537,10 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_header("X-Prebid-Test", "true")
                 .with_header("X-Synthetic-ID", &prebid_req.synthetic_id)
-                .with_header("X-Consent-Advertising", if advertising_consent { "true" } else { "false" })
+                .with_header(
+                    "X-Consent-Advertising",
+                    if advertising_consent { "true" } else { "false" },
+                )
                 .with_header("x-compress-hint", "on")
                 .with_body(body))
         }

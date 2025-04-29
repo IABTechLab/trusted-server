@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use fastly::{Error, Request, Response};
-use fastly::http::{header, Method, StatusCode};
 use crate::cookies;
 use crate::settings::Settings;
+use fastly::http::{header, Method, StatusCode};
+use fastly::{Error, Request, Response};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GdprConsent {
@@ -63,7 +63,7 @@ pub fn create_consent_cookie(consent: &GdprConsent) -> String {
     )
 }
 
-pub fn handle_consent_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
     match req.get_method() {
         &Method::GET => {
             // Return current consent status
@@ -78,47 +78,49 @@ pub fn handle_consent_request(settings: &Settings, mut req: Request) -> Result<R
             let mut response = Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(serde_json::to_string(&consent)?);
-            
+
             response.set_header(header::SET_COOKIE, create_consent_cookie(&consent));
             Ok(response)
         }
-        _ => Ok(Response::from_status(StatusCode::METHOD_NOT_ALLOWED)
-            .with_body("Method not allowed"))
+        _ => {
+            Ok(Response::from_status(StatusCode::METHOD_NOT_ALLOWED)
+                .with_body("Method not allowed"))
+        }
     }
 }
 
-pub fn handle_data_subject_request(settings: &Settings, req: Request) -> Result<Response, Error> {
+pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
     match req.get_method() {
         &Method::GET => {
             // Handle data access request
             if let Some(synthetic_id) = req.get_header("X-Subject-ID") {
                 // Create a HashMap to store all user-related data
                 let mut data: HashMap<String, UserData> = HashMap::new();
-                
+
                 // TODO: Implement actual data retrieval from KV store
                 // For now, return empty user data
                 data.insert(synthetic_id.to_str()?.to_string(), UserData::default());
-                
+
                 Ok(Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
                     .with_body(serde_json::to_string(&data)?))
             } else {
-                Ok(Response::from_status(StatusCode::BAD_REQUEST)
-                    .with_body("Missing subject ID"))
+                Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("Missing subject ID"))
             }
         }
         &Method::DELETE => {
             // Handle right to erasure (right to be forgotten)
-            if let Some(synthetic_id) = req.get_header("X-Subject-ID") {
+            if let Some(_synthetic_id) = req.get_header("X-Subject-ID") {
                 // TODO: Implement data deletion from KV store
                 Ok(Response::from_status(StatusCode::OK)
                     .with_body("Data deletion request processed"))
             } else {
-                Ok(Response::from_status(StatusCode::BAD_REQUEST)
-                    .with_body("Missing subject ID"))
+                Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("Missing subject ID"))
             }
         }
-        _ => Ok(Response::from_status(StatusCode::METHOD_NOT_ALLOWED)
-            .with_body("Method not allowed"))
+        _ => {
+            Ok(Response::from_status(StatusCode::METHOD_NOT_ALLOWED)
+                .with_body("Method not allowed"))
+        }
     }
-} 
+}
