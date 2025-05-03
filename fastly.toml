@@ -11,8 +11,7 @@ service_id = "q9waEnTgJfqQV1a0cYOuo3"
 
 [scripts]
 build = """
-    cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always &&
-    ln -fs wasm32-wasip1 target/wasm32-wasi
+    cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always
 """
 
 

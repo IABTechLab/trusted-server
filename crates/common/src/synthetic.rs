@@ -59,7 +59,7 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
 
 /// Gets or creates a synthetic_id from the request
 pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
-    // First try to get existing POTSI ID from header
+    // First try to get existing Trusted Server ID from header
     if let Some(synthetic_id) = req
         .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
         .and_then(|h| h.to_str().ok())
@@ -74,9 +74,9 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
         Some(jar) => {
             let ts_cookie = jar.get("synthetic_id");
             if let Some(cookie) = ts_cookie {
-                let potsi = cookie.value().to_string();
-                log::info!("Using existing POTSI ID from cookie: {}", potsi);
-                return potsi;
+                let id = cookie.value().to_string();
+                log::info!("Using existing Trusted Server ID from cookie: {}", id);
+                return id;
             }
         }
         None => {

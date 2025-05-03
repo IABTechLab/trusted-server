@@ -1,7 +1,10 @@
 pub mod constants;
 pub mod cookies;
+pub mod gdpr;
 pub mod models;
 pub mod prebid;
+pub mod privacy;
 pub mod settings;
 pub mod synthetic;
 pub mod templates;
+pub mod why;

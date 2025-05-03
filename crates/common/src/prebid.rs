@@ -29,7 +29,7 @@ impl PrebidRequest {
     /// # Returns
     /// * `Result<Self, Error>` - New PrebidRequest or error
     pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
-        // Get the POTSI ID from header (which we just set in handle_prebid_test)
+        // Get the Trusted Server ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
             .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
@@ -97,17 +97,17 @@ impl PrebidRequest {
         let mut req = Request::new(Method::POST, settings.prebid.server_url.to_owned());
 
         // Get and store the POTSI ID value from the incoming request
-        let potsi_id = incoming_req
+        let id: String = incoming_req
             .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
 
-        println!("Found Truted Server ID from incoming request: {}", potsi_id);
+        println!("Found Truted Server ID from incoming request: {}", id);
 
         // Construct the OpenRTB2 bid request
         let prebid_body = json!({
-            "id": potsi_id,
+            "id": id,
             "imp": [{
                 "id": "imp1",
                 "banner": {
@@ -150,10 +150,10 @@ impl PrebidRequest {
                         {
                             "source": &self.domain,
                             "uids": [{
-                                "id": &potsi_id,
+                                "id": &id,
                                 "atype": 1,
                                 "ext": {
-                                    "type": "potsi"
+                                    "type": "potsi" // TODO: remove reference to potsi
                                 }
                             }]
                         }
@@ -170,11 +170,11 @@ impl PrebidRequest {
         req.set_header("X-Forwarded-For", &self.client_ip);
         req.set_header(header::ORIGIN, &self.origin);
         req.set_header(SYNTHETIC_HEADER_FRESH, &self.synthetic_id);
-        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &potsi_id);
+        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &id);
 
         println!(
-            "Sending prebid request with Fresh ID: {} and POTSI ID: {}",
-            self.synthetic_id, potsi_id
+            "Sending prebid request with Fresh ID: {} and Trusted Server ID: {}",
+            self.synthetic_id, id
         );
 
         req.set_body_json(&prebid_body)?;
