@@ -6,25 +6,18 @@ use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
 
-mod constants;
-mod cookies;
-use constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_POTSI};
-mod models;
-use models::AdResponse;
-mod prebid;
-use prebid::PrebidRequest;
-mod settings;
-use settings::Settings;
-mod synthetic;
-use synthetic::generate_synthetic_id;
-mod templates;
-use templates::HTML_TEMPLATE;
-mod gdpr;
-use gdpr::get_consent_from_request;
-mod privacy;
-use privacy::PRIVACY_TEMPLATE;
-mod why;
-use why::WHY_TEMPLATE;
+use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use trusted_server_common::cookies::create_synthetic_cookie;
+use trusted_server_common::gdpr::{
+    get_consent_from_request, handle_consent_request, handle_data_subject_request,
+};
+use trusted_server_common::models::AdResponse;
+use trusted_server_common::prebid::PrebidRequest;
+use trusted_server_common::privacy::PRIVACY_TEMPLATE;
+use trusted_server_common::settings::Settings;
+use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
+use trusted_server_common::templates::HTML_TEMPLATE;
+use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -41,10 +34,10 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/") => handle_main_page(&settings, req),
             (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
             (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
-            (&Method::GET, "/gdpr/consent") => gdpr::handle_consent_request(&settings, req),
-            (&Method::POST, "/gdpr/consent") => gdpr::handle_consent_request(&settings, req),
-            (&Method::GET, "/gdpr/data") => gdpr::handle_data_subject_request(&settings, req),
-            (&Method::DELETE, "/gdpr/data") => gdpr::handle_data_subject_request(&settings, req),
+            (&Method::GET, "/gdpr/consent") => handle_consent_request(&settings, req),
+            (&Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
+            (&Method::GET, "/gdpr/data") => handle_data_subject_request(&settings, req),
+            (&Method::DELETE, "/gdpr/data") => handle_data_subject_request(&settings, req),
             (&Method::GET, "/privacy-policy") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(PRIVACY_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
@@ -139,27 +132,27 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     }
 
     // Calculate fresh ID first using the synthetic module
-    let fresh_id = synthetic::generate_synthetic_id(settings, &req);
+    let fresh_id = generate_synthetic_id(settings, &req);
 
-    // Check for existing POTSI ID in this specific order:
-    // 1. X-Synthetic-Potsi header
+    // Check for existing Trusted Server ID in this specific order:
+    // 1. X-Synthetic-Trusted-Server header
     // 2. Cookie
     // 3. Fall back to fresh ID
-    let synthetic_id = synthetic::get_or_generate_synthetic_id(settings, &req);
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req);
 
     println!(
-        "Existing POTSI header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_POTSI)
+        "Existing Truted Server header: {:?}",
+        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
-    println!("Using POTSI ID: {}", synthetic_id);
+    println!("Using Trusted Server ID: {}", synthetic_id);
 
     // Create response with the main page HTML
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
         .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_POTSI, &synthetic_id) // POTSI ID remains stable
+        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
@@ -183,10 +176,7 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     // Only set cookies if we have consent
     if consent.functional {
-        response.set_header(
-            header::SET_COOKIE,
-            cookies::create_synthetic_cookie(&synthetic_id),
-        );
+        response.set_header(header::SET_COOKIE, create_synthetic_cookie(&synthetic_id));
     }
 
     // Debug: Print all request headers
@@ -470,8 +460,8 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     // Calculate fresh ID and synthetic ID only if we have advertising consent
     let (fresh_id, synthetic_id) = if advertising_consent {
-        let fresh = synthetic::generate_synthetic_id(settings, &req);
-        let synth = synthetic::get_or_generate_synthetic_id(settings, &req);
+        let fresh = generate_synthetic_id(settings, &req);
+        let synth = get_or_generate_synthetic_id(settings, &req);
         (fresh, synth)
     } else {
         // Use non-personalized IDs when no consent
@@ -482,22 +472,25 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
     };
 
     println!(
-        "Existing POTSI header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_POTSI)
+        "Existing Trusted Server header: {:?}",
+        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
-    println!("Using POTSI ID: {}", synthetic_id);
+    println!("Using Trusted Server ID: {}", synthetic_id);
     println!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
     req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_POTSI, &synthetic_id);
+    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
     req.set_header(
         "X-Consent-Advertising",
         if advertising_consent { "true" } else { "false" },
     );
 
-    println!("Using POTSI ID: {}, Fresh ID: {}", synthetic_id, fresh_id);
+    println!(
+        "Using Trusted Server ID: {}, Fresh ID: {}",
+        synthetic_id, fresh_id
+    );
 
     let prebid_req = match PrebidRequest::new(settings, &req) {
         Ok(req) => {

@@ -93,7 +93,7 @@ git clone git@github.com:IABTechLab/trusted-server.git
 :information_source: Note that you’ll have to edit the following files for your setup:
 
 - fastly.toml (service ID, author, description) 
-- potsi.toml (KV store ID names) 
+- trusted-server.toml (KV store ID names) 
 
 ### Build
 
