@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - in case of vulnerabilities.
 
-## [1.0.4] - 2025-05-19
+## [1.0.5] - 2025-05-19
 
 ### Changed
 
@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Document FAQ for POC [FAQ_POC.md]
 
 ## [1.0.1] - 2025-03-27
+
+### Changed
+
+- Allow to templatize synthetic cookies
+
+## [1.0.0] - 2025-03-26
 
 ### Added
 
