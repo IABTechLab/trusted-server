@@ -7,13 +7,11 @@ description = "aslk"
 language = "rust"
 manifest_version = 3
 name = "trusted-server-fastly"
-service_id = "q9waEnTgJfqQV1a0cYOuo3"
 
 [scripts]
 build = """
     cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always
 """
-
 
 [local_server]
     [local_server.backends]
