@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::constants::{SYNTHETIC_HEADER_POTSI, SYNTHETIC_HEADER_PUB_USER_ID};
+use crate::constants::{SYNTHETIC_HEADER_PUB_USER_ID, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
 use crate::settings::Settings;
 
@@ -59,24 +59,24 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
 
 /// Gets or creates a synthetic_id from the request
 pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
-    // First try to get existing POTSI ID from header
-    if let Some(potsi) = req
-        .get_header(SYNTHETIC_HEADER_POTSI)
+    // First try to get existing Trusted Server ID from header
+    if let Some(synthetic_id) = req
+        .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
     {
-        log::info!("Using existing POTSI ID from header: {}", potsi);
-        return potsi;
+        log::info!("Using existing Synthetic ID from header: {}", synthetic_id);
+        return synthetic_id;
     }
 
     let req_cookie_jar: Option<cookie::CookieJar> = handle_request_cookies(req);
     match req_cookie_jar {
         Some(jar) => {
-            let potsi_cookie = jar.get("synthetic_id");
-            if let Some(cookie) = potsi_cookie {
-                let potsi = cookie.value().to_string();
-                log::info!("Using existing POTSI ID from cookie: {}", potsi);
-                return potsi;
+            let ts_cookie = jar.get("synthetic_id");
+            if let Some(cookie) = ts_cookie {
+                let id = cookie.value().to_string();
+                log::info!("Using existing Trusted Server ID from cookie: {}", id);
+                return id;
             }
         }
         None => {
@@ -84,9 +84,12 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
         }
     }
 
-    // If no existing POTSI ID found, generate a fresh one
+    // If no existing Synthetic ID found, generate a fresh one
     let fresh_id = generate_synthetic_id(settings, req);
-    log::info!("No existing POTSI ID found, using fresh ID: {}", fresh_id);
+    log::info!(
+        "No existing Synthetic ID found, using fresh ID: {}",
+        fresh_id
+    );
     fresh_id
 }
 
@@ -144,10 +147,13 @@ mod tests {
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
         let settings = create_settings();
-        let req = create_test_request(vec![(SYNTHETIC_HEADER_POTSI, "existing_potsi_id")]);
+        let req = create_test_request(vec![(
+            SYNTHETIC_HEADER_TRUSTED_SERVER,
+            "existing_synthetic_id",
+        )]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
-        assert_eq!(synthetic_id, "existing_potsi_id");
+        assert_eq!(synthetic_id, "existing_synthetic_id");
     }
 
     #[test]
