@@ -6,7 +6,7 @@ use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
 
-use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use trusted_server_common::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
@@ -142,7 +142,7 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     println!(
         "Existing Truted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using Trusted Server ID: {}", synthetic_id);
@@ -151,8 +151,8 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
+        .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
@@ -473,15 +473,15 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     println!(
         "Existing Trusted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using Trusted Server ID: {}", synthetic_id);
     println!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
-    req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
+    req.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
     req.set_header(
         "X-Consent-Advertising",
         if advertising_consent { "true" } else { "false" },
