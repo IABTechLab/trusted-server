@@ -13,6 +13,7 @@ pub trait RequestWrapper {
 
     fn get_path(&self) -> &str;
 
+    #[allow(clippy::wrong_self_convention)]
     fn into_body_bytes(&mut self) -> Vec<u8>;
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue);
