@@ -1,5 +1,6 @@
-use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
+use http::header;
+use http::method::Method;
 use serde_json::json;
 
 use crate::constants::{
@@ -24,10 +25,10 @@ pub struct PrebidRequest {
 }
 
 impl PrebidRequest {
-    /// Creates a new PrebidRequest from an incoming Fastly request
+    /// Creates a new PrebidRequest from an incoming request
     ///
     /// # Arguments
-    /// * `req` - The incoming Fastly request
+    /// * `req` - The incoming request
     ///
     /// # Returns
     /// * `Result<Self, Error>` - New PrebidRequest or error
@@ -39,7 +40,7 @@ impl PrebidRequest {
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_synthetic_id(settings, req));
 
-        // Get the original client IP from Fastly headers
+        // Get the original client IP from headers
         let client_ip = req
             .get_client_ip_addr()
             .map(|ip| ip.to_string())
@@ -92,10 +93,10 @@ impl PrebidRequest {
     ///
     /// # Returns
     /// * `Result<Response, Error>` - Prebid Server response or error
-    pub async fn send_bid_request(
+    pub async fn send_bid_request<T: RequestWrapper>(
         &self,
         settings: &Settings,
-        incoming_req: &Request,
+        incoming_req: &T,
     ) -> Result<Response, Error> {
         let mut req = Request::new(Method::POST, settings.prebid.server_url.to_owned());
 

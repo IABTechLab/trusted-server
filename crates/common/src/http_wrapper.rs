@@ -13,9 +13,13 @@ pub trait RequestWrapper {
 
     fn get_path(&self) -> &str;
 
-    fn into_body_bytes(&self) -> Vec<u8>;
+    fn into_body_bytes(&mut self) -> Vec<u8>;
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue);
+
+    fn set_header_str(&mut self, name: HeaderName, value: &str) {
+        self.set_header(name, HeaderValue::from_str(value).unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -61,7 +65,7 @@ pub(crate) mod tests {
             self.builder.uri_ref().unwrap().path()
         }
 
-        fn into_body_bytes(&self) -> Vec<u8> {
+        fn into_body_bytes(&mut self) -> Vec<u8> {
             // TODO: Implement the actual value extraction logic
             vec![]
         }

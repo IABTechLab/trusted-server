@@ -6,17 +6,17 @@ use std::net::IpAddr;
 use trusted_server_common::http_wrapper::RequestWrapper;
 
 #[derive(Debug)]
-pub struct FastlyRequestWrapper {
-    request: FastlyRequest,
+pub struct FastlyRequestWrapper<'a> {
+    request: &'a mut FastlyRequest,
 }
 
-impl FastlyRequestWrapper {
-    pub fn new(request: FastlyRequest) -> Self {
+impl<'a> FastlyRequestWrapper<'a> {
+    pub fn new(request: &'a mut FastlyRequest) -> Self {
         FastlyRequestWrapper { request }
     }
 }
 
-impl RequestWrapper for FastlyRequestWrapper {
+impl<'a> RequestWrapper for FastlyRequestWrapper<'a> {
     #[inline(always)]
     fn get_client_ip_addr(&self) -> Option<IpAddr> {
         self.request.get_client_ip_addr()
@@ -40,6 +40,11 @@ impl RequestWrapper for FastlyRequestWrapper {
     #[inline(always)]
     fn get_path(&self) -> &str {
         self.request.get_path()
+    }
+
+    #[inline(always)]
+    fn into_body_bytes(&mut self) -> Vec<u8> {
+        self.request.take_body_bytes()
     }
 
     #[inline(always)]

@@ -1549,6 +1549,7 @@ version = "0.1.0"
 dependencies = [
  "fastly 0.11.2",
  "futures",
+ "http",
  "log",
  "log-fastly",
  "serde",

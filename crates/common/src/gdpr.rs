@@ -73,7 +73,7 @@ pub fn create_consent_cookie(consent: &GdprConsent) -> String {
 
 pub fn handle_consent_request<T: RequestWrapper>(
     _settings: &Settings,
-    req: T,
+    mut req: T,
 ) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {

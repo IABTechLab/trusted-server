@@ -111,8 +111,8 @@ mod tests {
             builder = builder.header(key, value);
         }
 
-        let req = HttpRequestWrapper::new(builder);
-        req
+        
+        HttpRequestWrapper::new(builder)
     }
 
     fn create_settings() -> Settings {

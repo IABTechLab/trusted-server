@@ -1,16 +1,28 @@
-use fastly::geo::geo_lookup;
-use fastly::http::{header, Method, StatusCode};
-use fastly::KVStore;
-use fastly::{Error, Request, Response};
-use log::LevelFilter::Info;
-use serde_json::json;
 use std::env;
 
-use trusted_server_common::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
+use http::header;
+use http::Method;
+use http::status::StatusCode;
+
+use fastly::geo::geo_lookup;
+use fastly::KVStore;
+use fastly::{Error, Request as FastlyRequest, Response};
+use log::LevelFilter::Info;
+use serde_json::json;
+
+pub mod http_wrapper;
+use crate::http_wrapper::FastlyRequestWrapper;
+
+use trusted_server_common::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_CONSENT_ADVERTISING,
+    HEADER_X_FORWARDED_FOR, HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES,
+    HEADER_X_GEO_COUNTRY, HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
+};
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
 };
+use trusted_server_common::http_wrapper::RequestWrapper;
 use trusted_server_common::models::AdResponse;
 use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::privacy::PRIVACY_TEMPLATE;
@@ -20,7 +32,7 @@ use trusted_server_common::templates::HTML_TEMPLATE;
 use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
-fn main(req: Request) -> Result<Response, Error> {
+fn main(mut fastly_req: FastlyRequest) -> Result<Response, Error> {
     let settings = Settings::new().unwrap();
     println!("Settings {settings:?}");
 
@@ -29,6 +41,8 @@ fn main(req: Request) -> Result<Response, Error> {
             "FASTLY_SERVICE_VERSION: {}",
             std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
         );
+
+        let req = FastlyRequestWrapper::new(&mut fastly_req);
 
         match (req.get_method(), req.get_path()) {
             (&Method::GET, "/") => handle_main_page(&settings, req),
@@ -54,7 +68,7 @@ fn main(req: Request) -> Result<Response, Error> {
     })
 }
 
-fn get_dma_code(req: &mut Request) -> Option<String> {
+fn get_dma_code<T: RequestWrapper>(req: &mut T) -> Option<String> {
     // Debug: Check if we're running in Fastly environment
     println!("Fastly Environment Check:");
     println!(
@@ -72,30 +86,30 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
 
         // Set all available geo information in headers
         let city = geo.city();
-        req.set_header("X-Geo-City", city);
+        req.set_header_str(HEADER_X_GEO_CITY, city);
         println!("  City: {}", city);
 
         let country = geo.country_code();
-        req.set_header("X-Geo-Country", country);
+        req.set_header_str(HEADER_X_GEO_COUNTRY, country);
         println!("  Country: {}", country);
 
-        req.set_header("X-Geo-Continent", format!("{:?}", geo.continent()));
+        req.set_header_str(HEADER_X_GEO_CONTINENT, &format!("{:?}", geo.continent()));
         println!("  Continent: {:?}", geo.continent());
 
-        req.set_header(
-            "X-Geo-Coordinates",
-            format!("{},{}", geo.latitude(), geo.longitude()),
+        req.set_header_str(
+            HEADER_X_GEO_COORDINATES,
+            &format!("{},{}", geo.latitude(), geo.longitude()),
         );
         println!("  Location: ({}, {})", geo.latitude(), geo.longitude());
 
         // Get and set the metro code (DMA)
         let metro_code = geo.metro_code();
-        req.set_header("X-Geo-Metro-Code", metro_code.to_string());
+        req.set_header_str(HEADER_X_GEO_METRO_CODE, &metro_code.to_string());
         println!("Found DMA/Metro code: {}", metro_code);
         return Some(metro_code.to_string());
     } else {
         println!("No geo information available for the request");
-        req.set_header("X-Geo-Info-Available", "false");
+        req.set_header_str(HEADER_X_GEO_INFO_AVAILABLE, "false");
     }
 
     // If no metro code is found, log all request headers for debugging
@@ -107,7 +121,7 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
     None
 }
 
-fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+fn handle_main_page<T: RequestWrapper>(settings: &Settings, mut req: T) -> Result<Response, Error> {
     println!(
         "Using ad_partner_url: {}, counter_store: {}",
         settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
@@ -161,16 +175,16 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
         .with_header("x-compress-hint", "on");
 
     // Copy geo headers from request to response
-    for header_name in &[
-        "X-Geo-City",
-        "X-Geo-Country",
-        "X-Geo-Continent",
-        "X-Geo-Coordinates",
-        "X-Geo-Metro-Code",
-        "X-Geo-Info-Available",
+    for header_name in [
+        HEADER_X_GEO_CITY,
+        HEADER_X_GEO_COUNTRY,
+        HEADER_X_GEO_CONTINENT,
+        HEADER_X_GEO_COORDINATES,
+        HEADER_X_GEO_METRO_CODE,
+        HEADER_X_GEO_INFO_AVAILABLE,
     ] {
-        if let Some(value) = req.get_header(*header_name) {
-            response.set_header(*header_name, value);
+        if let Some(value) = req.get_header(header_name.clone()) {
+            response.set_header(header_name, value);
         }
     }
 
@@ -197,11 +211,14 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     Ok(response)
 }
 
-fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+fn handle_ad_request<T: RequestWrapper>(
+    settings: &Settings,
+    mut req: T,
+) -> Result<Response, Error> {
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
     let _consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -217,7 +234,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     let x_forwarded_for = req
-        .get_header("x-forwarded-for")
+        .get_header(HEADER_X_FORWARDED_FOR)
         .map(|h| h.to_str().unwrap_or("Unknown"));
 
     println!("Client IP: {}", client_ip);
@@ -290,7 +307,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
     println!("Sending request to backend: {}", ad_server_url);
 
     // Add header logging here
-    let mut ad_req = Request::get(ad_server_url);
+    let mut ad_req = FastlyRequest::get(ad_server_url);
 
     // Add consent information to the ad request
     ad_req.set_header(
@@ -412,15 +429,15 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 
                 // Copy geo headers from request to response
                 for header_name in &[
-                    "X-Geo-City",
-                    "X-Geo-Country",
-                    "X-Geo-Continent",
-                    "X-Geo-Coordinates",
-                    "X-Geo-Metro-Code",
-                    "X-Geo-Info-Available",
+                    HEADER_X_GEO_CITY,
+                    HEADER_X_GEO_COUNTRY,
+                    HEADER_X_GEO_CONTINENT,
+                    HEADER_X_GEO_COORDINATES,
+                    HEADER_X_GEO_METRO_CODE,
+                    HEADER_X_GEO_INFO_AVAILABLE,
                 ] {
-                    if let Some(value) = req.get_header(*header_name) {
-                        response.set_header(*header_name, value);
+                    if let Some(value) = req.get_header(header_name.clone()) {
+                        response.set_header(header_name, value);
                     }
                 }
 
@@ -448,12 +465,15 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 }
 
 /// Handles the prebid test route with detailed error logging
-async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+async fn handle_prebid_test<T: RequestWrapper>(
+    settings: &Settings,
+    mut req: T,
+) -> Result<Response, Error> {
     println!("Starting prebid test request handling");
 
     // Check consent status from headers
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -480,10 +500,10 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
     println!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
-    req.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
-    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
-    req.set_header(
-        "X-Consent-Advertising",
+    req.set_header_str(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    req.set_header_str(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
+    req.set_header_str(
+        HEADER_X_CONSENT_ADVERTISING,
         if advertising_consent { "true" } else { "false" },
     );
 
