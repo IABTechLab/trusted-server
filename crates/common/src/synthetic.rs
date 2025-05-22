@@ -111,7 +111,6 @@ mod tests {
             builder = builder.header(key, value);
         }
 
-        
         HttpRequestWrapper::new(builder)
     }
 

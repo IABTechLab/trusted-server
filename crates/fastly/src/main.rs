@@ -1,8 +1,8 @@
 use std::env;
 
 use http::header;
-use http::Method;
 use http::status::StatusCode;
+use http::Method;
 
 use fastly::geo::geo_lookup;
 use fastly::KVStore;
