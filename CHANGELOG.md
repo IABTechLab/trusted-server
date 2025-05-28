@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 -  Remove hard coded Fast ID in fastly.tom
+-  Updated README to better describe what Trusted Server does and high-level goal
+
 
 ## [1.0.5] - 2025-05-19
 
