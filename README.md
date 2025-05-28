@@ -1,6 +1,10 @@
 # Trusted Server 
 
-:information_source: At this time, Trusted Server is designed to work with Fastly. Follow these steps to configure Fastly Compute and deploy it.
+:information_source: Trusted Server is an open-source runtime and edge-orchestration layer for modern publishers - executing 3rd-party scripts and your entire ad-stack server-side, all under 1st-party control. Our goal is to move ad-related code execution and control from web browsers to publisher controlled, "trusted" edge-cloud infrastructure. 
+
+Trusted Server is the new execution layer for the open-web - returning control of 1st party data, security, and overall user-experience back to publishers.
+
+At this time, Trusted Server is designed to work with Fastly Compute. Follow these steps to configure Fastly Compute and deploy it.
 
 ## Fastly
 - Create account at Fastly if you don’t have one - manage.fastly.com
