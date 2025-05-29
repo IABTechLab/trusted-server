@@ -1,8 +1,12 @@
-use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
+use http::header;
+use http::method::Method;
 use serde_json::json;
 
-use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use crate::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
+};
+use crate::http_wrapper::RequestWrapper;
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -21,27 +25,27 @@ pub struct PrebidRequest {
 }
 
 impl PrebidRequest {
-    /// Creates a new PrebidRequest from an incoming Fastly request
+    /// Creates a new PrebidRequest from an incoming request
     ///
     /// # Arguments
-    /// * `req` - The incoming Fastly request
+    /// * `req` - The incoming request
     ///
     /// # Returns
     /// * `Result<Self, Error>` - New PrebidRequest or error
-    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
+    pub fn new<T: RequestWrapper>(settings: &Settings, req: &T) -> Result<Self, Error> {
         // Get the Trusted Server ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_synthetic_id(settings, req));
 
-        // Get the original client IP from Fastly headers
+        // Get the original client IP from headers
         let client_ip = req
             .get_client_ip_addr()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| {
-                req.get_header("X-Forwarded-For")
+                req.get_header(HEADER_X_FORWARDED_FOR)
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("")
                     .split(',') // X-Forwarded-For can be a comma-separated list
@@ -89,16 +93,16 @@ impl PrebidRequest {
     ///
     /// # Returns
     /// * `Result<Response, Error>` - Prebid Server response or error
-    pub async fn send_bid_request(
+    pub async fn send_bid_request<T: RequestWrapper>(
         &self,
         settings: &Settings,
-        incoming_req: &Request,
+        incoming_req: &T,
     ) -> Result<Response, Error> {
         let mut req = Request::new(Method::POST, settings.prebid.server_url.to_owned());
 
         // Get and store the POTSI ID value from the incoming request
         let id: String = incoming_req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
@@ -169,8 +173,8 @@ impl PrebidRequest {
         req.set_header(header::CONTENT_TYPE, "application/json");
         req.set_header("X-Forwarded-For", &self.client_ip);
         req.set_header(header::ORIGIN, &self.origin);
-        req.set_header(SYNTHETIC_HEADER_FRESH, &self.synthetic_id);
-        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &id);
+        req.set_header(HEADER_SYNTHETIC_FRESH, &self.synthetic_id);
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &id);
 
         println!(
             "Sending prebid request with Fresh ID: {} and Trusted Server ID: {}",

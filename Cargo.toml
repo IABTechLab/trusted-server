@@ -4,3 +4,6 @@ members = [
     "crates/common",
     "crates/fastly", 
 ]
+
+[profile.release]
+debug = 1

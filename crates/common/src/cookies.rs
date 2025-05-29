@@ -1,6 +1,7 @@
 use cookie::{Cookie, CookieJar};
-use fastly::http::header;
-use fastly::Request;
+use http::header;
+
+use crate::http_wrapper::RequestWrapper;
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
@@ -17,7 +18,7 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
     jar
 }
 
-pub fn handle_request_cookies(req: &Request) -> Option<CookieJar> {
+pub fn handle_request_cookies<T: RequestWrapper>(req: &T) -> Option<CookieJar> {
     match req.get_header(header::COOKIE) {
         Some(header_value) => {
             let header_value_str: &str = header_value.to_str().unwrap_or("");
@@ -41,6 +42,9 @@ pub fn create_synthetic_cookie(synthetic_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::http_wrapper::tests::HttpRequestWrapper;
+    use http::request;
 
     #[test]
     fn test_parse_cookies_to_jar() {
@@ -79,7 +83,11 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "c1=v1;c2=v2");
+        let builder = request::Builder::new()
+            .method("GET")
+            .uri("http://example.com")
+            .header(header::COOKIE, "c1=v1; c2=v2");
+        let req = HttpRequestWrapper::new(builder);
         let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 2);
@@ -89,7 +97,11 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_with_empty_cookie() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "");
+        let builder = request::Builder::new()
+            .method("GET")
+            .uri("http://example.com")
+            .header(header::COOKIE, "");
+        let req = HttpRequestWrapper::new(builder);
         let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 0);
@@ -97,7 +109,10 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_no_cookie_header() {
-        let req: Request = Request::get("https://example.com");
+        let builder = request::Builder::new()
+            .method("GET")
+            .uri("http://example.com");
+        let req = HttpRequestWrapper::new(builder);
         let jar = handle_request_cookies(&req);
 
         assert!(jar.is_none());
@@ -105,7 +120,11 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_invalid_cookie_header() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "invalid");
+        let builder = request::Builder::new()
+            .method("GET")
+            .uri("http://example.com")
+            .header(header::COOKIE, "invalid");
+        let req = HttpRequestWrapper::new(builder);
         let jar = handle_request_cookies(&req).unwrap();
 
         assert!(jar.iter().count() == 0);
