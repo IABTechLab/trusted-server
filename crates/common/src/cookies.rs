@@ -2,6 +2,7 @@ use cookie::{Cookie, CookieJar};
 use http::header;
 
 use crate::http_wrapper::RequestWrapper;
+use crate::settings::Settings;
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
@@ -32,10 +33,10 @@ pub fn handle_request_cookies<T: RequestWrapper>(req: &T) -> Option<CookieJar> {
     }
 }
 
-pub fn create_synthetic_cookie(synthetic_id: &str) -> String {
+pub fn create_synthetic_cookie(synthetic_id: &str, settings: &Settings) -> String {
     format!(
-        "synthetic_id={}; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        synthetic_id, COOKIE_MAX_AGE,
+        "synthetic_id={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        synthetic_id, settings.server.cookie_domain, COOKIE_MAX_AGE,
     )
 }
 
@@ -132,10 +133,40 @@ mod tests {
 
     #[test]
     fn test_create_synthetic_cookie() {
-        let result = create_synthetic_cookie("12345");
+        // Create a test settings
+        let settings_toml = r#"
+[server]
+domain = "example.com"
+cookie_domain = ".example.com"
+
+[ad_server]
+ad_partner_url = "test"
+sync_url = "test"
+
+[prebid]
+server_url = "test"
+
+[synthetic]
+counter_store = "test"
+opid_store = "test"
+secret_key = "test-key"
+template = "test"
+        "#;
+
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(
+                settings_toml,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+
+        let result = create_synthetic_cookie("12345", &settings);
         assert_eq!(
             result,
-            "synthetic_id=12345; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000"
+            "synthetic_id=12345; Domain=.example.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000"
         );
     }
 }

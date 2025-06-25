@@ -45,7 +45,7 @@ pub fn generate_synthetic_id<T: RequestWrapper>(settings: &Settings, req: &T) ->
     let input_string = handlebars
         .render_template(&settings.synthetic.template, data)
         .unwrap();
-    println!("Input string for fresh ID: {} {}", input_string, data);
+    log::debug!("Input string for fresh ID: {} {}", input_string, data);
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
         .expect("HMAC can take key of any size");
@@ -116,6 +116,10 @@ mod tests {
 
     fn create_settings() -> Settings {
         Settings {
+            server: crate::settings::Server {
+                domain: "example.com".to_string(),
+                cookie_domain: ".example.com".to_string(),
+            },
             ad_server: crate::settings::AdServer {
                 ad_partner_url: "https://example.com".to_string(),
                 sync_url: "https://example.com/synthetic_id={{synthetic_id}}".to_string(),

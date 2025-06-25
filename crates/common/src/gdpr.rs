@@ -64,15 +64,16 @@ pub fn get_consent_from_request<T: RequestWrapper>(req: &T) -> Option<GdprConsen
     None
 }
 
-pub fn create_consent_cookie(consent: &GdprConsent) -> String {
+pub fn create_consent_cookie(consent: &GdprConsent, settings: &Settings) -> String {
     format!(
-        "gdpr_consent={}; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
-        serde_json::to_string(consent).unwrap_or_default()
+        "gdpr_consent={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
+        serde_json::to_string(consent).unwrap_or_default(),
+        settings.server.cookie_domain
     )
 }
 
 pub fn handle_consent_request<T: RequestWrapper>(
-    _settings: &Settings,
+    settings: &Settings,
     mut req: T,
 ) -> Result<Response, Error> {
     match *req.get_method() {
@@ -90,7 +91,10 @@ pub fn handle_consent_request<T: RequestWrapper>(
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(serde_json::to_string(&consent)?);
 
-            response.set_header(header::SET_COOKIE, create_consent_cookie(&consent));
+            response.set_header(
+                header::SET_COOKIE,
+                create_consent_cookie(&consent, settings),
+            );
             Ok(response)
         }
         _ => {

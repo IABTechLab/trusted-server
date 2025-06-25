@@ -15,3 +15,4 @@ pub const HEADER_X_GEO_INFO_AVAILABLE: HeaderName = HeaderName::from_static("x-g
 pub const HEADER_X_GEO_METRO_CODE: HeaderName = HeaderName::from_static("x-geo-metro-code");
 pub const HEADER_X_GEO_REGION: HeaderName = HeaderName::from_static("x-geo-region");
 pub const HEADER_X_SUBJECT_ID: HeaderName = HeaderName::from_static("x-subject-id");
+pub const HEADER_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");

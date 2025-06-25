@@ -1,4 +1,4 @@
-use config::{Config, ConfigError, File, FileFormat};
+use config::{Config, ConfigError, Environment, File, FileFormat};
 use serde::Deserialize;
 use std::str;
 
@@ -26,7 +26,15 @@ pub struct Synthetic {
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
+pub struct Server {
+    pub domain: String,
+    pub cookie_domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct Settings {
+    pub server: Server,
     pub ad_server: AdServer,
     pub prebid: Prebid,
     pub synthetic: Synthetic,
@@ -35,13 +43,24 @@ pub struct Settings {
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         let toml_bytes = include_bytes!("../../../trusted-server.toml");
-        let toml_str = str::from_utf8(toml_bytes).unwrap();
+        let toml_str = str::from_utf8(toml_bytes)
+            .map_err(|e| ConfigError::Message(format!("Invalid UTF-8 in config: {}", e)))?;
 
-        let s = Config::builder()
+        let builder = Config::builder()
             .add_source(File::from_str(toml_str, FileFormat::Toml))
-            .build()?;
+            .add_source(Environment::with_prefix("TRUSTED_SERVER").separator("__"));
 
-        // You can deserialize (and thus freeze) the entire configuration as
-        s.try_deserialize()
+        let config = builder.build()?;
+
+        // Validate that secret key is not the default
+        if let Ok(secret_key) = config.get_string("synthetic.secret_key") {
+            if secret_key == "trusted-server" {
+                return Err(ConfigError::Message(
+                    "Secret key must be changed from default. Set TRUSTED_SERVER__SYNTHETIC__SECRET_KEY environment variable.".into()
+                ));
+            }
+        }
+
+        config.try_deserialize()
     }
 }
