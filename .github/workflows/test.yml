@@ -24,10 +24,15 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Set up Rust tool chain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.83
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
       - name: Add wasm32-wasi target
         run: rustup target add wasm32-wasip1

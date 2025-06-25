@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - in case of vulnerabilities
 
+## [1.0.6] - 2025-05-29
+
+### Changed
+- Remove hard coded Fast ID in fastly.tom
+- Updated README to better describe what Trusted Server does and high-level goal
+- Use Rust toolchain version from .tool-versions for GitHub actions 
+
 ## [1.0.5] - 2025-05-19
 
 ### Changed
