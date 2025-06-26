@@ -17,6 +17,21 @@ pub struct Prebid {
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
+pub struct GamAdUnit {
+    pub name: String,
+    pub size: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+pub struct Gam {
+    pub publisher_id: String,
+    pub server_url: String,
+    pub ad_units: Vec<GamAdUnit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
@@ -29,6 +44,7 @@ pub struct Synthetic {
 pub struct Settings {
     pub ad_server: AdServer,
     pub prebid: Prebid,
+    pub gam: Gam,
     pub synthetic: Synthetic,
 }
 

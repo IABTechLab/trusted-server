@@ -8,6 +8,7 @@ use std::env;
 
 use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use trusted_server_common::cookies::create_synthetic_cookie;
+use trusted_server_common::gam::{handle_gam_test, handle_gam_golden_url, handle_gam_custom_url};
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
 };
@@ -16,24 +17,41 @@ use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::privacy::PRIVACY_TEMPLATE;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use trusted_server_common::templates::HTML_TEMPLATE;
+use trusted_server_common::templates::{HTML_TEMPLATE, GAM_TEST_TEMPLATE};
 use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
     let settings = Settings::new().unwrap();
-    println!("Settings {settings:?}");
+    
+    // Print Fastly Service Version only once at the beginning
+    println!(
+        "FASTLY_SERVICE_VERSION: {}",
+        std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
+    );
+    
+    // Print User IP address immediately after Fastly Service Version
+    let client_ip = req
+        .get_client_ip_addr()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    println!("User IP: {}", client_ip);
+    
+    // Print Settings only once at the beginning
+    println!("Settings: {settings:?}");
 
     futures::executor::block_on(async {
-        println!(
-            "FASTLY_SERVICE_VERSION: {}",
-            std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
-        );
-
         match (req.get_method(), req.get_path()) {
             (&Method::GET, "/") => handle_main_page(&settings, req),
             (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
             (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
+            (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
+            (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
+            (&Method::POST, "/gam-test-custom-url") => handle_gam_custom_url(&settings, req).await,
+            (&Method::GET, "/gam-test-page") => Ok(Response::from_status(StatusCode::OK)
+                .with_body(GAM_TEST_TEMPLATE)
+                .with_header(header::CONTENT_TYPE, "text/html")
+                .with_header("x-compress-hint", "on")),
             (&Method::GET, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::GET, "/gdpr/data") => handle_data_subject_request(&settings, req),
@@ -108,11 +126,6 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
 }
 
 fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
-    println!(
-        "Using ad_partner_url: {}, counter_store: {}",
-        settings.ad_server.ad_partner_url, settings.synthetic.counter_store,
-    );
-
     log_fastly::init_simple("mylogs", Info);
 
     // Add DMA code check to main page as well
@@ -321,11 +334,10 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             let fastly_region = env::var("FASTLY_REGION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_service_id =
                 env::var("FASTLY_SERVICE_ID").unwrap_or_else(|_| "unknown".to_string());
-            // let fastly_service_version = env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            println!("Fastly Jason PoP: {}", fastly_pop);
+            println!("Fastly PoP: {}", fastly_pop);
             println!("Fastly Compute Variables:");
             println!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
             println!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
@@ -333,7 +345,6 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             println!("  - FASTLY_POP: {}", fastly_pop);
             println!("  - FASTLY_REGION: {}", fastly_region);
             println!("  - FASTLY_SERVICE_ID: {}", fastly_service_id);
-            //println!("  - FASTLY_SERVICE_VERSION: {}", fastly_service_version);
             println!("  - FASTLY_TRACE_ID: {}", fastly_trace_id);
 
             // Log all response headers
@@ -423,10 +434,6 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                         response.set_header(*header_name, value);
                     }
                 }
-
-                // Attach PoP info to the response
-                //response.set_header("X-Debug-Fastly-PoP", &fastly_pop);
-                //println!("Added X-Debug-Fastly-PoP: {}", fastly_pop);
 
                 Ok(response)
             } else {
