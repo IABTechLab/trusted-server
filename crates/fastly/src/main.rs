@@ -239,13 +239,13 @@ fn handle_main_page<T: RequestWrapper>(settings: &Settings, mut req: T) -> Resul
     // Debug: Print all request headers
     log::debug!("All Request Headers:");
     for (name, value) in req.get_headers() {
-        log::info!("{}: {:?}", name, value);
+        log::debug!("{}: {:?}", name, value);
     }
 
     // Debug: Print the response headers
     log::debug!("Response Headers:");
     for (name, value) in response.get_headers() {
-        log::info!("{}: {:?}", name, value);
+        log::debug!("{}: {:?}", name, value);
     }
 
     // Prevent caching
