@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::constants::{SYNTHETIC_HEADER_PUB_USER_ID, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
 use crate::settings::Settings;
 
@@ -21,7 +21,7 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
             .map(|cookie| cookie.value().to_string())
     });
     let auth_user_id = req
-        .get_header(SYNTHETIC_HEADER_PUB_USER_ID)
+        .get_header(HEADER_SYNTHETIC_PUB_USER_ID)
         .map(|h| h.to_str().unwrap_or("anonymous"));
     let publisher_domain = req
         .get_header(header::HOST)
@@ -61,7 +61,7 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
 pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
     // First try to get existing Trusted Server ID from header
     if let Some(synthetic_id) = req
-        .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
     {
@@ -96,9 +96,10 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastly::http::HeaderValue;
+    use crate::constants::HEADER_X_PUB_USER_ID;
+    use fastly::http::{HeaderName, HeaderValue};
 
-    fn create_test_request(headers: Vec<(&str, &str)>) -> Request {
+    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
         let mut req = Request::new("GET", "http://example.com");
         for (key, value) in headers {
             req.set_header(key, HeaderValue::from_str(value).unwrap());
@@ -129,11 +130,11 @@ mod tests {
     fn test_generate_synthetic_id() {
         let settings: Settings = create_settings();
         let req = create_test_request(vec![
-            (header::USER_AGENT.as_ref(), "Mozilla/5.0"),
-            (header::COOKIE.as_ref(), "pub_userid=12345"),
-            ("X-Pub-User-ID", "67890"),
-            (header::HOST.as_ref(), "example.com"),
-            (header::ACCEPT_LANGUAGE.as_ref(), "en-US,en;q=0.9"),
+            (header::USER_AGENT, "Mozilla/5.0"),
+            (header::COOKIE, "pub_userid=12345"),
+            (HEADER_X_PUB_USER_ID, "67890"),
+            (header::HOST, "example.com"),
+            (header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
         ]);
 
         let synthetic_id = generate_synthetic_id(&settings, &req);
@@ -148,7 +149,7 @@ mod tests {
     fn test_get_or_generate_synthetic_id_with_header() {
         let settings = create_settings();
         let req = create_test_request(vec![(
-            SYNTHETIC_HEADER_TRUSTED_SERVER,
+            HEADER_SYNTHETIC_TRUSTED_SERVER,
             "existing_synthetic_id",
         )]);
 
@@ -160,7 +161,7 @@ mod tests {
     fn test_get_or_generate_synthetic_id_with_cookie() {
         let settings = create_settings();
         let req = create_test_request(vec![(
-            header::COOKIE.as_ref(),
+            header::COOKIE,
             "synthetic_id=existing_cookie_id",
         )]);
 

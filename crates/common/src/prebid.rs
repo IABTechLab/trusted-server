@@ -2,7 +2,7 @@ use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
-use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR};
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -31,7 +31,7 @@ impl PrebidRequest {
     pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
         // Get the Trusted Server ID from header (which we just set in handle_prebid_test)
         let synthetic_id = req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_synthetic_id(settings, req));
@@ -41,7 +41,7 @@ impl PrebidRequest {
             .get_client_ip_addr()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| {
-                req.get_header("X-Forwarded-For")
+                req.get_header(HEADER_X_FORWARDED_FOR)
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("")
                     .split(',') // X-Forwarded-For can be a comma-separated list
@@ -98,7 +98,7 @@ impl PrebidRequest {
 
         // Get and store the POTSI ID value from the incoming request
         let id: String = incoming_req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
@@ -167,10 +167,10 @@ impl PrebidRequest {
         });
 
         req.set_header(header::CONTENT_TYPE, "application/json");
-        req.set_header("X-Forwarded-For", &self.client_ip);
+        req.set_header(HEADER_X_FORWARDED_FOR, &self.client_ip);
         req.set_header(header::ORIGIN, &self.origin);
-        req.set_header(SYNTHETIC_HEADER_FRESH, &self.synthetic_id);
-        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &id);
+        req.set_header(HEADER_SYNTHETIC_FRESH, &self.synthetic_id);
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &id);
 
         println!(
             "Sending prebid request with Fresh ID: {} and Trusted Server ID: {}",
@@ -211,10 +211,10 @@ mod tests {
     fn test_prebid_request_new_with_full_headers() {
         let settings = create_test_settings();
         let mut req = Request::get("https://example.com/test");
-        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, "existing-synthetic-id");
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, "existing-synthetic-id");
         req.set_header(header::REFERER, "https://test-domain.com/page");
         req.set_header(header::ORIGIN, "https://test-domain.com");
-        req.set_header("X-Forwarded-For", "192.168.1.1, 10.0.0.1");
+        req.set_header(HEADER_X_FORWARDED_FOR, "192.168.1.1, 10.0.0.1");
 
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
 
@@ -280,7 +280,7 @@ mod tests {
     fn test_prebid_request_x_forwarded_for_parsing() {
         let settings = create_test_settings();
         let mut req = Request::get("https://example.com/test");
-        req.set_header("X-Forwarded-For", "192.168.1.1, 10.0.0.1, 172.16.0.1");
+        req.set_header(HEADER_X_FORWARDED_FOR, "192.168.1.1, 10.0.0.1, 172.16.0.1");
 
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
 
@@ -330,7 +330,7 @@ mod tests {
 
         // Test with empty X-Forwarded-For
         let mut req = Request::get("https://example.com/test");
-        req.set_header("X-Forwarded-For", "");
+        req.set_header(HEADER_X_FORWARDED_FOR, "");
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
         assert!(!prebid_req.client_ip.is_empty() || prebid_req.client_ip.is_empty());
 
