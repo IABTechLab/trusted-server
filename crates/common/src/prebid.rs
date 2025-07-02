@@ -2,7 +2,9 @@ use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
-use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR};
+use crate::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
+};
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 

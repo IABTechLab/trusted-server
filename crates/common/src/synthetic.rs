@@ -160,10 +160,7 @@ mod tests {
     #[test]
     fn test_get_or_generate_synthetic_id_with_cookie() {
         let settings = create_settings();
-        let req = create_test_request(vec![(
-            header::COOKIE,
-            "synthetic_id=existing_cookie_id",
-        )]);
+        let req = create_test_request(vec![(header::COOKIE, "synthetic_id=existing_cookie_id")]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
         assert_eq!(synthetic_id, "existing_cookie_id");
