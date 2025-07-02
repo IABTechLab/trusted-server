@@ -237,9 +237,9 @@ mod tests {
         let consent = get_consent_from_request(&req);
         assert!(consent.is_some());
         let consent = consent.unwrap();
-        assert_eq!(consent.analytics, true);
-        assert_eq!(consent.advertising, false);
-        assert_eq!(consent.functional, true);
+        assert!(consent.analytics);
+        assert!(!consent.advertising);
+        assert!(consent.functional);
     }
 
     #[test]
@@ -300,9 +300,9 @@ mod tests {
         // Check response body
         let body = response.into_body_str();
         let returned_consent: GdprConsent = serde_json::from_str(&body).unwrap();
-        assert_eq!(returned_consent.analytics, true);
-        assert_eq!(returned_consent.advertising, true);
-        assert_eq!(returned_consent.functional, false);
+        assert!(returned_consent.analytics);
+        assert!(returned_consent.advertising);
+        assert!(!returned_consent.functional);
     }
 
     #[test]
