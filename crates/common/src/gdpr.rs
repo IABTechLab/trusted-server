@@ -1,9 +1,17 @@
-use crate::cookies;
-use crate::settings::Settings;
-use fastly::http::{header, Method, StatusCode};
-use fastly::{Error, Request, Response};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use http::header;
+use http::method::Method;
+use http::status::StatusCode;
+
+use fastly::{Error, Response};
+
+use serde::{Deserialize, Serialize};
+
+use crate::constants::HEADER_X_SUBJECT_ID;
+use crate::cookies;
+use crate::http_wrapper::RequestWrapper;
+use crate::settings::Settings;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GdprConsent {
@@ -45,7 +53,7 @@ impl Default for UserData {
     }
 }
 
-pub fn get_consent_from_request(req: &Request) -> Option<GdprConsent> {
+pub fn get_consent_from_request<T: RequestWrapper>(req: &T) -> Option<GdprConsent> {
     if let Some(jar) = cookies::handle_request_cookies(req) {
         if let Some(consent_cookie) = jar.get("gdpr_consent") {
             if let Ok(consent) = serde_json::from_str(consent_cookie.value()) {
@@ -56,14 +64,18 @@ pub fn get_consent_from_request(req: &Request) -> Option<GdprConsent> {
     None
 }
 
-pub fn create_consent_cookie(consent: &GdprConsent) -> String {
+pub fn create_consent_cookie(consent: &GdprConsent, settings: &Settings) -> String {
     format!(
-        "gdpr_consent={}; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
-        serde_json::to_string(consent).unwrap_or_default()
+        "gdpr_consent={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
+        serde_json::to_string(consent).unwrap_or_default(),
+        settings.server.cookie_domain
     )
 }
 
-pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
+pub fn handle_consent_request<T: RequestWrapper>(
+    settings: &Settings,
+    mut req: T,
+) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {
             // Return current consent status
@@ -79,7 +91,10 @@ pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Resp
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(serde_json::to_string(&consent)?);
 
-            response.set_header(header::SET_COOKIE, create_consent_cookie(&consent));
+            response.set_header(
+                header::SET_COOKIE,
+                create_consent_cookie(&consent, settings),
+            );
             Ok(response)
         }
         _ => {
@@ -89,11 +104,14 @@ pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Resp
     }
 }
 
-pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
+pub fn handle_data_subject_request<T: RequestWrapper>(
+    _settings: &Settings,
+    req: T,
+) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {
             // Handle data access request
-            if let Some(synthetic_id) = req.get_header("X-Subject-ID") {
+            if let Some(synthetic_id) = req.get_header(HEADER_X_SUBJECT_ID) {
                 // Create a HashMap to store all user-related data
                 let mut data: HashMap<String, UserData> = HashMap::new();
 
@@ -110,7 +128,7 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
         }
         Method::DELETE => {
             // Handle right to erasure (right to be forgotten)
-            if let Some(_synthetic_id) = req.get_header("X-Subject-ID") {
+            if let Some(_synthetic_id) = req.get_header(HEADER_X_SUBJECT_ID) {
                 // TODO: Implement data deletion from KV store
                 Ok(Response::from_status(StatusCode::OK)
                     .with_body("Data deletion request processed"))
