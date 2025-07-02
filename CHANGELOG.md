@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - in case of vulnerabilities
 
+## [Unreleased]
+
+### Changed
+- Upgrade to rust 1.87.0
+- Upgrade to fastly-cli 11.3.0
+
 ## [1.0.6] - 2025-05-29
 
 ### Changed
