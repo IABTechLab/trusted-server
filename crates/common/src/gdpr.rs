@@ -124,3 +124,274 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::{Body, Request};
+
+    fn create_test_settings() -> Settings {
+        Settings {
+            ad_server: crate::settings::AdServer {
+                ad_partner_url: "https://test.com".to_string(),
+                sync_url: "https://sync.test.com".to_string(),
+            },
+            prebid: crate::settings::Prebid {
+                server_url: "https://prebid.test.com".to_string(),
+            },
+            synthetic: crate::settings::Synthetic {
+                counter_store: "test-counter".to_string(),
+                opid_store: "test-opid".to_string(),
+                secret_key: "test-secret".to_string(),
+                template: "{{test}}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_gdpr_consent_default() {
+        let consent = GdprConsent::default();
+        assert!(!consent.analytics);
+        assert!(!consent.advertising);
+        assert!(!consent.functional);
+        assert_eq!(consent.version, "1.0");
+        assert!(consent.timestamp > 0);
+    }
+
+    #[test]
+    fn test_user_data_default() {
+        let data = UserData::default();
+        assert_eq!(data.visit_count, 0);
+        assert!(data.last_visit > 0);
+        assert!(data.ad_interactions.is_empty());
+        assert!(data.consent_history.is_empty());
+    }
+
+    #[test]
+    fn test_gdpr_consent_serialization() {
+        let consent = GdprConsent {
+            analytics: true,
+            advertising: false,
+            functional: true,
+            timestamp: 1234567890,
+            version: "2.0".to_string(),
+        };
+
+        let json = serde_json::to_string(&consent).unwrap();
+        assert!(json.contains("\"analytics\":true"));
+        assert!(json.contains("\"advertising\":false"));
+        assert!(json.contains("\"functional\":true"));
+        assert!(json.contains("\"timestamp\":1234567890"));
+        assert!(json.contains("\"version\":\"2.0\""));
+
+        let deserialized: GdprConsent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.analytics, consent.analytics);
+        assert_eq!(deserialized.advertising, consent.advertising);
+        assert_eq!(deserialized.functional, consent.functional);
+        assert_eq!(deserialized.timestamp, consent.timestamp);
+        assert_eq!(deserialized.version, consent.version);
+    }
+
+    #[test]
+    fn test_create_consent_cookie() {
+        let consent = GdprConsent {
+            analytics: true,
+            advertising: true,
+            functional: true,
+            timestamp: 1234567890,
+            version: "1.0".to_string(),
+        };
+
+        let cookie = create_consent_cookie(&consent);
+        assert!(cookie.starts_with("gdpr_consent="));
+        assert!(cookie.contains("Domain=.auburndao.com"));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=31536000"));
+    }
+
+    #[test]
+    fn test_get_consent_from_request_no_cookie() {
+        let req = Request::get("https://example.com");
+        let consent = get_consent_from_request(&req);
+        assert!(consent.is_none());
+    }
+
+    #[test]
+    fn test_get_consent_from_request_with_valid_cookie() {
+        let mut req = Request::get("https://example.com");
+        let consent_data = GdprConsent {
+            analytics: true,
+            advertising: false,
+            functional: true,
+            timestamp: 1234567890,
+            version: "1.0".to_string(),
+        };
+        let cookie_value = format!(
+            "gdpr_consent={}",
+            serde_json::to_string(&consent_data).unwrap()
+        );
+        req.set_header(header::COOKIE, cookie_value);
+
+        let consent = get_consent_from_request(&req);
+        assert!(consent.is_some());
+        let consent = consent.unwrap();
+        assert_eq!(consent.analytics, true);
+        assert_eq!(consent.advertising, false);
+        assert_eq!(consent.functional, true);
+    }
+
+    #[test]
+    fn test_get_consent_from_request_with_invalid_cookie() {
+        let mut req = Request::get("https://example.com");
+        req.set_header(header::COOKIE, "gdpr_consent=invalid-json");
+
+        let consent = get_consent_from_request(&req);
+        assert!(consent.is_none());
+    }
+
+    #[test]
+    fn test_handle_consent_request_get() {
+        let settings = create_test_settings();
+        let req = Request::get("https://example.com/gdpr/consent");
+
+        let response = handle_consent_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/json")
+        );
+
+        let body = response.into_body_str();
+        let consent: GdprConsent = serde_json::from_str(&body).unwrap();
+        assert!(!consent.analytics); // Default values
+        assert!(!consent.advertising);
+        assert!(!consent.functional);
+    }
+
+    #[test]
+    fn test_handle_consent_request_post() {
+        let settings = create_test_settings();
+        let consent_data = GdprConsent {
+            analytics: true,
+            advertising: true,
+            functional: false,
+            timestamp: 1234567890,
+            version: "1.0".to_string(),
+        };
+
+        let mut req = Request::post("https://example.com/gdpr/consent");
+        req.set_body(Body::from(serde_json::to_string(&consent_data).unwrap()));
+
+        let response = handle_consent_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/json")
+        );
+
+        // Check Set-Cookie header
+        let set_cookie = response.get_header_str(header::SET_COOKIE);
+        assert!(set_cookie.is_some());
+        assert!(set_cookie.unwrap().contains("gdpr_consent="));
+        assert!(set_cookie.unwrap().contains("Domain=.auburndao.com"));
+
+        // Check response body
+        let body = response.into_body_str();
+        let returned_consent: GdprConsent = serde_json::from_str(&body).unwrap();
+        assert_eq!(returned_consent.analytics, true);
+        assert_eq!(returned_consent.advertising, true);
+        assert_eq!(returned_consent.functional, false);
+    }
+
+    #[test]
+    fn test_handle_consent_request_invalid_method() {
+        let settings = create_test_settings();
+        let req = Request::put("https://example.com/gdpr/consent");
+
+        let response = handle_consent_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.into_body_str(), "Method not allowed");
+    }
+
+    #[test]
+    fn test_handle_data_subject_request_get_with_id() {
+        let settings = create_test_settings();
+        let mut req = Request::get("https://example.com/gdpr/data");
+        req.set_header("X-Subject-ID", "test-subject-123");
+
+        let response = handle_data_subject_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/json")
+        );
+
+        let body = response.into_body_str();
+        let data: HashMap<String, UserData> = serde_json::from_str(&body).unwrap();
+        assert!(data.contains_key("test-subject-123"));
+        assert_eq!(data["test-subject-123"].visit_count, 0); // Default value
+    }
+
+    #[test]
+    fn test_handle_data_subject_request_get_without_id() {
+        let settings = create_test_settings();
+        let req = Request::get("https://example.com/gdpr/data");
+
+        let response = handle_data_subject_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.into_body_str(), "Missing subject ID");
+    }
+
+    #[test]
+    fn test_handle_data_subject_request_delete_with_id() {
+        let settings = create_test_settings();
+        let mut req = Request::delete("https://example.com/gdpr/data");
+        req.set_header("X-Subject-ID", "test-subject-123");
+
+        let response = handle_data_subject_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.into_body_str(), "Data deletion request processed");
+    }
+
+    #[test]
+    fn test_handle_data_subject_request_delete_without_id() {
+        let settings = create_test_settings();
+        let req = Request::delete("https://example.com/gdpr/data");
+
+        let response = handle_data_subject_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.into_body_str(), "Missing subject ID");
+    }
+
+    #[test]
+    fn test_handle_data_subject_request_invalid_method() {
+        let settings = create_test_settings();
+        let req = Request::post("https://example.com/gdpr/data");
+
+        let response = handle_data_subject_request(&settings, req).unwrap();
+        assert_eq!(response.get_status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.into_body_str(), "Method not allowed");
+    }
+
+    #[test]
+    fn test_user_data_serialization() {
+        let user_data = UserData {
+            visit_count: 5,
+            last_visit: 1234567890,
+            ad_interactions: vec!["click1".to_string(), "view2".to_string()],
+            consent_history: vec![GdprConsent::default()],
+        };
+
+        let json = serde_json::to_string(&user_data).unwrap();
+        assert!(json.contains("\"visit_count\":5"));
+        assert!(json.contains("\"last_visit\":1234567890"));
+        assert!(json.contains("\"ad_interactions\":[\"click1\",\"view2\"]"));
+
+        let deserialized: UserData = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.visit_count, user_data.visit_count);
+        assert_eq!(deserialized.last_visit, user_data.last_visit);
+        assert_eq!(deserialized.ad_interactions.len(), 2);
+    }
+}
