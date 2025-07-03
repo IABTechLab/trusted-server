@@ -45,7 +45,7 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
     let input_string = handlebars
         .render_template(&settings.synthetic.template, data)
         .unwrap();
-    println!("Input string for fresh ID: {} {}", input_string, data);
+    log::info!("Input string for fresh ID: {} {}", input_string, data);
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
         .expect("HMAC can take key of any size");
@@ -138,7 +138,7 @@ mod tests {
         ]);
 
         let synthetic_id = generate_synthetic_id(&settings, &req);
-        print!("Generated synthetic ID: {}", synthetic_id);
+        log::info!("Generated synthetic ID: {}", synthetic_id);
         assert_eq!(
             synthetic_id,
             "07cd73bb8c7db39753ab6b10198b10c3237a3f5a6d2232c6ce578f2c2a623e56"

@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgrade to rust 1.87.0
 - Upgrade to fastly-cli 11.3.0
 - Changed to use constants for headers
+- Changed to use log statements
 
 ## [1.0.6] - 2025-05-29
 
@@ -86,7 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial implementation of Trusted Server
 
-[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.0.5...HEAD
+[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.0.6...HEAD
+[1.0.6]:https://github.com/IABTechLab/trusted-server/compare/v1.0.5...v1.0.6
 [1.0.5]:https://github.com/IABTechLab/trusted-server/compare/v1.0.4...v1.0.5
 [1.0.4]:https://github.com/IABTechLab/trusted-server/compare/v1.0.3...v1.0.4
 [1.0.3]:https://github.com/IABTechLab/trusted-server/compare/v1.0.2...v1.0.3
