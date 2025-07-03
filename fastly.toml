@@ -20,11 +20,9 @@ build = """
 
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]
-            key = "random_id"
-            file = "crates/fastly/tests/kv_store/counter_store.json"
-            format = "json"
+            key = "placeholder"
+            data = "placeholder"
 
         [[local_server.kv_stores.opid_store]]
-            key = "random_id"
-            file = "crates/fastly/tests/kv_store/opid_store.json"
-            format = "json"
+            key = "placeholder"
+            data = "placeholder"
