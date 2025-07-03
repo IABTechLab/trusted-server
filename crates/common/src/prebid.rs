@@ -66,7 +66,7 @@ impl PrebidRequest {
             })
             .unwrap_or_else(|| "auburndao.com".to_string());
 
-        println!("Detected domain: {}", domain);
+        log::info!("Detected domain: {}", domain);
 
         // Create origin with owned String
         let origin = req
@@ -105,7 +105,7 @@ impl PrebidRequest {
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
 
-        println!("Found Truted Server ID from incoming request: {}", id);
+        log::info!("Found Trusted Server ID from incoming request: {}", id);
 
         // Construct the OpenRTB2 bid request
         let prebid_body = json!({
@@ -174,9 +174,10 @@ impl PrebidRequest {
         req.set_header(HEADER_SYNTHETIC_FRESH, &self.synthetic_id);
         req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &id);
 
-        println!(
+        log::info!(
             "Sending prebid request with Fresh ID: {} and Trusted Server ID: {}",
-            self.synthetic_id, id
+            self.synthetic_id,
+            id
         );
 
         req.set_body_json(&prebid_body)?;
