@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgrade to fastly-cli 11.3.0
 - Changed to use constants for headers
 - Changed to use log statements
+- Updated fastly.toml for local development
 
 ## [1.0.6] - 2025-05-29
 
@@ -55,7 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Implemented GDPR consent for creating and passing synth headers
-
 
 ## [1.0.4] - 2025-04-29
 
