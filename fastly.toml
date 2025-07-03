@@ -3,7 +3,7 @@
 
 authors = ["jason@stackpop.com"]
 cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
-description = "aslk"
+description = "Trusted Server"
 language = "rust"
 manifest_version = 3
 name = "trusted-server-fastly"
@@ -15,14 +15,14 @@ build = """
 
 [local_server]
     [local_server.backends]
-        [local_server.backends.equativ_ad_api_2] # FIX ME: must match config
-            url = "http://127.0.0.1/"
+        [local_server.backends.ad_partner_url]
+            url = "http://127.0.0.1:10180/"
 
     [local_server.kv_stores]
-        [[local_server.kv_stores.jevans_synth_id_counter]] # FIX ME: must match config
+        [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.jevans_synth_id_opid]] # FIX ME: must match config
+        [[local_server.kv_stores.opid_store]]
             key = "placeholder"
             data = "placeholder"
