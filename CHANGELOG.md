@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Upgrade to rust 1.87.0
 - Upgrade to fastly-cli 11.3.0
+- Changed to use constants for headers
 
 ## [1.0.6] - 2025-05-29
 

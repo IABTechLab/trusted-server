@@ -6,7 +6,12 @@ use log::LevelFilter::Info;
 use serde_json::json;
 use std::env;
 
-use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use trusted_server_common::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
+    HEADER_X_CONSENT_ADVERTISING, HEADER_X_FORWARDED_FOR, HEADER_X_GEO_CITY,
+    HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
+};
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
@@ -41,15 +46,15 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/privacy-policy") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(PRIVACY_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
             (&Method::GET, "/why-trusted-server") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(WHY_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
             _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
                 .with_body("Not Found")
                 .with_header(header::CONTENT_TYPE, "text/plain")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
         }
     })
 }
@@ -72,30 +77,30 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
 
         // Set all available geo information in headers
         let city = geo.city();
-        req.set_header("X-Geo-City", city);
+        req.set_header(HEADER_X_GEO_CITY, city);
         println!("  City: {}", city);
 
         let country = geo.country_code();
-        req.set_header("X-Geo-Country", country);
+        req.set_header(HEADER_X_GEO_COUNTRY, country);
         println!("  Country: {}", country);
 
-        req.set_header("X-Geo-Continent", format!("{:?}", geo.continent()));
+        req.set_header(HEADER_X_GEO_CONTINENT, format!("{:?}", geo.continent()));
         println!("  Continent: {:?}", geo.continent());
 
         req.set_header(
-            "X-Geo-Coordinates",
+            HEADER_X_GEO_COORDINATES,
             format!("{},{}", geo.latitude(), geo.longitude()),
         );
         println!("  Location: ({}, {})", geo.latitude(), geo.longitude());
 
         // Get and set the metro code (DMA)
         let metro_code = geo.metro_code();
-        req.set_header("X-Geo-Metro-Code", metro_code.to_string());
+        req.set_header(HEADER_X_GEO_METRO_CODE, metro_code.to_string());
         println!("Found DMA/Metro code: {}", metro_code);
         return Some(metro_code.to_string());
     } else {
         println!("No geo information available for the request");
-        req.set_header("X-Geo-Info-Available", "false");
+        req.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
     }
 
     // If no metro code is found, log all request headers for debugging
@@ -142,7 +147,7 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     println!(
         "Existing Truted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using Trusted Server ID: {}", synthetic_id);
@@ -151,8 +156,8 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
+        .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
@@ -201,7 +206,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
     let _consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -217,7 +222,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     let x_forwarded_for = req
-        .get_header("x-forwarded-for")
+        .get_header(HEADER_X_FORWARDED_FOR)
         .map(|h| h.to_str().unwrap_or("Unknown"));
 
     println!("Client IP: {}", client_ip);
@@ -294,7 +299,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 
     // Add consent information to the ad request
     ad_req.set_header(
-        "X-Consent-Advertising",
+        HEADER_X_CONSENT_ADVERTISING,
         if advertising_consent { "true" } else { "false" },
     );
 
@@ -325,7 +330,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            println!("Fastly Jason PoP: {}", fastly_pop);
+            println!("Fastly PoP: {}", fastly_pop);
             println!("Fastly Compute Variables:");
             println!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
             println!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
@@ -407,20 +412,20 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                         header::ACCESS_CONTROL_EXPOSE_HEADERS,
                         "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
                     )
-                    .with_header("x-compress-hint", "on")
+                    .with_header(HEADER_X_COMPRESS_HINT, "on")
                     .with_body(body);
 
                 // Copy geo headers from request to response
                 for header_name in &[
-                    "X-Geo-City",
-                    "X-Geo-Country",
-                    "X-Geo-Continent",
-                    "X-Geo-Coordinates",
-                    "X-Geo-Metro-Code",
-                    "X-Geo-Info-Available",
+                    HEADER_X_GEO_CITY,
+                    HEADER_X_GEO_COUNTRY,
+                    HEADER_X_GEO_CONTINENT,
+                    HEADER_X_GEO_COORDINATES,
+                    HEADER_X_GEO_METRO_CODE,
+                    HEADER_X_GEO_INFO_AVAILABLE,
                 ] {
-                    if let Some(value) = req.get_header(*header_name) {
-                        response.set_header(*header_name, value);
+                    if let Some(value) = req.get_header(header_name) {
+                        response.set_header(header_name, value);
                     }
                 }
 
@@ -433,7 +438,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                 println!("Backend returned non-success status");
                 Ok(Response::from_status(StatusCode::NO_CONTENT)
                     .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header("x-compress-hint", "on")
+                    .with_header(HEADER_X_COMPRESS_HINT, "on")
                     .with_body("{}"))
             }
         }
@@ -441,7 +446,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             println!("Error making backend request: {:?}", e);
             Ok(Response::from_status(StatusCode::NO_CONTENT)
                 .with_header(header::CONTENT_TYPE, "application/json")
-                .with_header("x-compress-hint", "on")
+                .with_header(HEADER_X_COMPRESS_HINT, "on")
                 .with_body("{}"))
         }
     }
@@ -453,7 +458,7 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     // Check consent status from headers
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -473,17 +478,17 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     println!(
         "Existing Trusted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
     println!("Generated Fresh ID: {}", fresh_id);
     println!("Using Trusted Server ID: {}", synthetic_id);
     println!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
-    req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
+    req.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
     req.set_header(
-        "X-Consent-Advertising",
+        HEADER_X_CONSENT_ADVERTISING,
         if advertising_consent { "true" } else { "false" },
     );
 
@@ -534,7 +539,7 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                     "X-Consent-Advertising",
                     if advertising_consent { "true" } else { "false" },
                 )
-                .with_header("x-compress-hint", "on")
+                .with_header(HEADER_X_COMPRESS_HINT, "on")
                 .with_body(body))
         }
         Err(e) => {

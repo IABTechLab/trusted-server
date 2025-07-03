@@ -1,9 +1,11 @@
-use crate::cookies;
-use crate::settings::Settings;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::constants::HEADER_X_SUBJECT_ID;
+use crate::cookies;
+use crate::settings::Settings;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GdprConsent {
@@ -93,7 +95,7 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
     match *req.get_method() {
         Method::GET => {
             // Handle data access request
-            if let Some(synthetic_id) = req.get_header("X-Subject-ID") {
+            if let Some(synthetic_id) = req.get_header(HEADER_X_SUBJECT_ID) {
                 // Create a HashMap to store all user-related data
                 let mut data: HashMap<String, UserData> = HashMap::new();
 
@@ -110,7 +112,7 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
         }
         Method::DELETE => {
             // Handle right to erasure (right to be forgotten)
-            if let Some(_synthetic_id) = req.get_header("X-Subject-ID") {
+            if let Some(_synthetic_id) = req.get_header(HEADER_X_SUBJECT_ID) {
                 // TODO: Implement data deletion from KV store
                 Ok(Response::from_status(StatusCode::OK)
                     .with_body("Data deletion request processed"))
@@ -319,7 +321,7 @@ mod tests {
     fn test_handle_data_subject_request_get_with_id() {
         let settings = create_test_settings();
         let mut req = Request::get("https://example.com/gdpr/data");
-        req.set_header("X-Subject-ID", "test-subject-123");
+        req.set_header(HEADER_X_SUBJECT_ID, "test-subject-123");
 
         let response = handle_data_subject_request(&settings, req).unwrap();
         assert_eq!(response.get_status(), StatusCode::OK);
@@ -348,7 +350,7 @@ mod tests {
     fn test_handle_data_subject_request_delete_with_id() {
         let settings = create_test_settings();
         let mut req = Request::delete("https://example.com/gdpr/data");
-        req.set_header("X-Subject-ID", "test-subject-123");
+        req.set_header(HEADER_X_SUBJECT_ID, "test-subject-123");
 
         let response = handle_data_subject_request(&settings, req).unwrap();
         assert_eq!(response.get_status(), StatusCode::OK);
