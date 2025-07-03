@@ -2,6 +2,8 @@ use cookie::{Cookie, CookieJar};
 use fastly::http::header;
 use fastly::Request;
 
+use crate::settings::Settings;
+
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
 // return empty cookie jar for unparsable cookies
@@ -31,15 +33,17 @@ pub fn handle_request_cookies(req: &Request) -> Option<CookieJar> {
     }
 }
 
-pub fn create_synthetic_cookie(synthetic_id: &str) -> String {
+pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
     format!(
-        "synthetic_id={}; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        synthetic_id, COOKIE_MAX_AGE,
+        "synthetic_id={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::tests::create_test_settings;
+
     use super::*;
 
     #[test]
@@ -113,10 +117,14 @@ mod tests {
 
     #[test]
     fn test_create_synthetic_cookie() {
-        let result = create_synthetic_cookie("12345");
+        let settings = create_test_settings();
+        let result = create_synthetic_cookie(&settings, "12345");
         assert_eq!(
             result,
-            "synthetic_id=12345; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000"
+            format!(
+                "synthetic_id=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+            )
         );
     }
 }

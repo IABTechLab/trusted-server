@@ -7,4 +7,5 @@ pub mod privacy;
 pub mod settings;
 pub mod synthetic;
 pub mod templates;
+pub mod test_support;
 pub mod why;
