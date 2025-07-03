@@ -119,7 +119,13 @@ cargo install viceroy
 ```
 
 #### Run Fastly server locally
-Review configuration for [local_server](fastly.toml#L16)
+- Review configuration for [local_server](fastly.toml#L16)
+- Review env variables overrides in [.env.dev](.env.dev)
+
+```sh
+export $(grep -v '^#' .env.dev | xargs -0)
+```
+
 ```sh
 fastly -i compute serve
 ```
