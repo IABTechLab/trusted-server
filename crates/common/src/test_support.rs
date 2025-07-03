@@ -3,7 +3,7 @@ pub mod tests {
     use crate::settings::{AdServer, Prebid, Publisher, Settings, Synthetic};
 
     pub fn crate_test_settings_str() -> String {
-        return r#"
+        r#"
             [ad_server]
             ad_partner_url = "https://test-adpartner.com"
             sync_url = "https://test-adpartner.com/synthetic_id={{synthetic_id}}"
@@ -21,7 +21,7 @@ pub mod tests {
             opid_store = "test-opid-store"
             secret_key = "test-secret-key"
             template = "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}"
-            "#.to_string();
+            "#.to_string()
     }
 
     pub fn create_test_settings() -> Settings {
