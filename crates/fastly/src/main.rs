@@ -330,7 +330,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            println!("Fastly Jason PoP: {}", fastly_pop);
+            println!("Fastly PoP: {}", fastly_pop);
             println!("Fastly Compute Variables:");
             println!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
             println!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
