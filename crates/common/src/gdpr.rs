@@ -287,8 +287,6 @@ mod tests {
         assert!(set_cookie.is_some());
         assert!(set_cookie.unwrap().contains("gdpr_consent="));
 
-        println!("SFDSFD {:?}", set_cookie);
-
         assert!(set_cookie
             .unwrap()
             .contains(format!("Domain={}", settings.publisher.cookie_domain).as_str()));
