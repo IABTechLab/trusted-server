@@ -58,14 +58,15 @@ pub fn get_consent_from_request(req: &Request) -> Option<GdprConsent> {
     None
 }
 
-pub fn create_consent_cookie(consent: &GdprConsent) -> String {
+pub fn create_consent_cookie(settings: &Settings, consent: &GdprConsent) -> String {
     format!(
-        "gdpr_consent={}; Domain=.auburndao.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
-        serde_json::to_string(consent).unwrap_or_default()
+        "gdpr_consent={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
+        serde_json::to_string(consent).unwrap_or_default(),
+        settings.publisher.cookie_domain,
     )
 }
 
-pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
+pub fn handle_consent_request(settings: &Settings, req: Request) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {
             // Return current consent status
@@ -81,7 +82,10 @@ pub fn handle_consent_request(_settings: &Settings, req: Request) -> Result<Resp
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(serde_json::to_string(&consent)?);
 
-            response.set_header(header::SET_COOKIE, create_consent_cookie(&consent));
+            response.set_header(
+                header::SET_COOKIE,
+                create_consent_cookie(settings, &consent),
+            );
             Ok(response)
         }
         _ => {
@@ -132,23 +136,7 @@ mod tests {
     use super::*;
     use fastly::{Body, Request};
 
-    fn create_test_settings() -> Settings {
-        Settings {
-            ad_server: crate::settings::AdServer {
-                ad_partner_url: "https://test.com".to_string(),
-                sync_url: "https://sync.test.com".to_string(),
-            },
-            prebid: crate::settings::Prebid {
-                server_url: "https://prebid.test.com".to_string(),
-            },
-            synthetic: crate::settings::Synthetic {
-                counter_store: "test-counter".to_string(),
-                opid_store: "test-opid".to_string(),
-                secret_key: "test-secret".to_string(),
-                template: "{{test}}".to_string(),
-            },
-        }
-    }
+    use crate::test_support::tests::create_test_settings;
 
     #[test]
     fn test_gdpr_consent_default() {
@@ -196,6 +184,7 @@ mod tests {
 
     #[test]
     fn test_create_consent_cookie() {
+        let settings = create_test_settings();
         let consent = GdprConsent {
             analytics: true,
             advertising: true,
@@ -204,9 +193,9 @@ mod tests {
             version: "1.0".to_string(),
         };
 
-        let cookie = create_consent_cookie(&consent);
+        let cookie = create_consent_cookie(&settings, &consent);
         assert!(cookie.starts_with("gdpr_consent="));
-        assert!(cookie.contains("Domain=.auburndao.com"));
+        assert!(cookie.contains(format!("Domain={}", settings.publisher.cookie_domain).as_str()));
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Lax"));
@@ -297,7 +286,10 @@ mod tests {
         let set_cookie = response.get_header_str(header::SET_COOKIE);
         assert!(set_cookie.is_some());
         assert!(set_cookie.unwrap().contains("gdpr_consent="));
-        assert!(set_cookie.unwrap().contains("Domain=.auburndao.com"));
+
+        assert!(set_cookie
+            .unwrap()
+            .contains(format!("Domain={}", settings.publisher.cookie_domain).as_str()));
 
         // Check response body
         let body = response.into_body_str();

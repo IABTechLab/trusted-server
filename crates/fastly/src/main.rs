@@ -182,7 +182,10 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     // Only set cookies if we have consent
     if consent.functional {
-        response.set_header(header::SET_COOKIE, create_synthetic_cookie(&synthetic_id));
+        response.set_header(
+            header::SET_COOKIE,
+            create_synthetic_cookie(settings, &synthetic_id),
+        );
     }
 
     // Debug: Print all request headers

@@ -96,8 +96,10 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::HEADER_X_PUB_USER_ID;
     use fastly::http::{HeaderName, HeaderValue};
+
+    use crate::constants::HEADER_X_PUB_USER_ID;
+    use crate::test_support::tests::create_test_settings;
 
     fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
         let mut req = Request::new("GET", "http://example.com");
@@ -108,32 +110,14 @@ mod tests {
         req
     }
 
-    fn create_settings() -> Settings {
-        Settings {
-            ad_server: crate::settings::AdServer {
-                ad_partner_url: "https://example.com".to_string(),
-                sync_url: "https://example.com/synthetic_id={{synthetic_id}}".to_string(),
-            },
-            prebid: crate::settings::Prebid {
-                server_url: "https://example.com".to_string(),
-            },
-            synthetic: crate::settings::Synthetic {
-                counter_store: "https://example.com".to_string(),
-                opid_store: "https://example.com".to_string(),
-                secret_key: "secret_key".to_string(),
-                template: "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_id }}:{{ publisher_domain }}:{{ accept_language }}".to_string(),
-            },
-        }
-    }
-
     #[test]
     fn test_generate_synthetic_id() {
-        let settings: Settings = create_settings();
+        let settings: Settings = create_test_settings();
         let req = create_test_request(vec![
             (header::USER_AGENT, "Mozilla/5.0"),
             (header::COOKIE, "pub_userid=12345"),
             (HEADER_X_PUB_USER_ID, "67890"),
-            (header::HOST, "example.com"),
+            (header::HOST, settings.publisher.domain.as_str()),
             (header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
         ]);
 
@@ -141,13 +125,13 @@ mod tests {
         log::info!("Generated synthetic ID: {}", synthetic_id);
         assert_eq!(
             synthetic_id,
-            "07cd73bb8c7db39753ab6b10198b10c3237a3f5a6d2232c6ce578f2c2a623e56"
+            "a1748067b3908f2c9e0f6ea30a341328ba4b84de45448b13d1007030df14a98e"
         )
     }
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_header() {
-        let settings = create_settings();
+        let settings = create_test_settings();
         let req = create_test_request(vec![(
             HEADER_SYNTHETIC_TRUSTED_SERVER,
             "existing_synthetic_id",
@@ -159,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_with_cookie() {
-        let settings = create_settings();
+        let settings = create_test_settings();
         let req = create_test_request(vec![(header::COOKIE, "synthetic_id=existing_cookie_id")]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
@@ -168,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_get_or_generate_synthetic_id_generate_new() {
-        let settings = create_settings();
+        let settings = create_test_settings();
         let req = create_test_request(vec![]);
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req);

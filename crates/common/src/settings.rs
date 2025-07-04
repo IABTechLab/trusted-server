@@ -12,6 +12,14 @@ pub struct AdServer {
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
+pub struct Publisher {
+    pub domain: String,
+    pub cookie_domain: String,
+    pub origin_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct Prebid {
     pub server_url: String,
 }
@@ -29,6 +37,7 @@ pub struct Synthetic {
 #[allow(unused)]
 pub struct Settings {
     pub ad_server: AdServer,
+    pub publisher: Publisher,
     pub prebid: Prebid,
     pub synthetic: Synthetic,
 }
@@ -60,6 +69,9 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+
+    use crate::test_support::tests::crate_test_settings_str;
 
     #[test]
     fn test_settings_new() {
@@ -71,6 +83,9 @@ mod tests {
         // Verify basic structure is loaded
         assert!(!settings.ad_server.ad_partner_url.is_empty());
         assert!(!settings.ad_server.sync_url.is_empty());
+        assert!(!settings.publisher.domain.is_empty());
+        assert!(!settings.publisher.cookie_domain.is_empty());
+        assert!(!settings.publisher.origin_url.is_empty());
         assert!(!settings.prebid.server_url.is_empty());
         assert!(!settings.synthetic.counter_store.is_empty());
         assert!(!settings.synthetic.opid_store.is_empty());
@@ -80,58 +95,43 @@ mod tests {
 
     #[test]
     fn test_settings_from_valid_toml() {
-        let toml_str = r#"
-            [ad_server]
-            ad_partner_url = "https://example-ad.com/serve"
-            sync_url = "https://example-ad.com/sync"
+        let toml_str = crate_test_settings_str();
+        let settings: Result<Settings, ConfigError> = Settings::from_toml(&toml_str);
 
-            [prebid]
-            server_url = "https://prebid.example.com/openrtb2/auction"
-
-            [synthetic]
-            counter_store = "test-counter-store"
-            opid_store = "test-opid-store"
-            secret_key = "test-secret-key-1234567890"
-            template = "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}"
-            "#;
-
-        let settings = Settings::from_toml(toml_str);
         assert!(settings.is_ok());
 
         let settings = settings.unwrap();
         assert_eq!(
             settings.ad_server.ad_partner_url,
-            "https://example-ad.com/serve"
+            "https://test-adpartner.com"
         );
-        assert_eq!(settings.ad_server.sync_url, "https://example-ad.com/sync");
+        assert_eq!(
+            settings.ad_server.sync_url,
+            "https://test-adpartner.com/synthetic_id={{synthetic_id}}"
+        );
         assert_eq!(
             settings.prebid.server_url,
-            "https://prebid.example.com/openrtb2/auction"
+            "https://test-prebid.com/openrtb2/auction"
+        );
+        assert_eq!(settings.publisher.domain, "test-publisher.com");
+        assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
+        assert_eq!(
+            settings.publisher.origin_url,
+            "https://origin.test-publisher.com"
         );
         assert_eq!(settings.synthetic.counter_store, "test-counter-store");
         assert_eq!(settings.synthetic.opid_store, "test-opid-store");
-        assert_eq!(settings.synthetic.secret_key, "test-secret-key-1234567890");
+        assert_eq!(settings.synthetic.secret_key, "test-secret-key");
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
     }
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let toml_str = r#"
-            [ad_server]
-            ad_partner_url = "https://example-ad.com/serve"
-            # Missing sync_url
+        let re = Regex::new(r"ad_partner_url = .*").unwrap();
+        let toml_str = crate_test_settings_str();
+        let toml_str = re.replace(&toml_str, "");
 
-            [prebid]
-            server_url = "https://prebid.example.com/openrtb2/auction"
-
-            [synthetic]
-            counter_store = "test-counter-store"
-            opid_store = "test-opid-store"
-            secret_key = "test-secret-key"
-            template = "{{client_ip}}"
-            "#;
-
-        let settings = Settings::from_toml(toml_str);
+        let settings = Settings::from_toml(&toml_str);
         assert!(
             settings.is_err(),
             "Should fail when required fields are missing"
@@ -148,71 +148,43 @@ mod tests {
 
     #[test]
     fn test_settings_invalid_toml_syntax() {
-        let toml_str = r#"
-            [ad_server
-            ad_partner_url = "https://example-ad.com/serve"
-            "#;
+        let re = Regex::new(r"\]").unwrap();
+        let toml_str = crate_test_settings_str();
+        let toml_str = re.replace(&toml_str, "");
 
-        let settings = Settings::from_toml(toml_str);
+        let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail with invalid TOML syntax");
     }
 
     #[test]
     fn test_settings_partial_config() {
-        let toml_str = r#"
-            [ad_server]
-            ad_partner_url = "https://example-ad.com/serve"
-            sync_url = "https://example-ad.com/sync"
-            "#;
+        let re = Regex::new(r"\[ad_server\]").unwrap();
+        let toml_str = crate_test_settings_str();
+        let toml_str = re.replace(&toml_str, "");
 
-        let settings = Settings::from_toml(toml_str);
+        let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail when sections are missing");
     }
 
     #[test]
     fn test_settings_extra_fields() {
-        let toml_str = r#"
-        [ad_server]
-        ad_partner_url = "https://example-ad.com/serve"
-        sync_url = "https://example-ad.com/sync"
-        extra_field = "should be ignored"
+        let toml_str = crate_test_settings_str() + "\nhello = 1";
 
-        [prebid]
-        server_url = "https://prebid.example.com/openrtb2/auction"
-
-        [synthetic]
-        counter_store = "test-counter-store"
-        opid_store = "test-opid-store"
-        secret_key = "test-secret-key-1234567890"
-        template = "{{client_ip}}"
-        "#;
-
-        let settings = Settings::from_toml(toml_str);
+        let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_ok(), "Extra fields should be ignored");
     }
 
     #[test]
     fn test_set_env() {
-        let toml_str = r#"
-            [ad_server]
-            # ad_partner_url will be set by env variable
-            sync_url = "https://example-ad.com/sync"
-
-            [prebid]
-            server_url = "https://prebid.example.com/openrtb2/auction"
-
-            [synthetic] 
-            counter_store = "test-counter-stor  e"
-            opid_store = "test-opid-store"
-            secret_key = "test-secret-key-1234567890"
-            template = "{{client_ip}}"
-            "#;
+        let re = Regex::new(r"ad_partner_url = .*").unwrap();
+        let toml_str = crate_test_settings_str();
+        let toml_str = re.replace(&toml_str, "");
 
         temp_env::with_var(
             "TRUSTED_SERVER__AD_SERVER__AD_PARTNER_URL",
             Some("https://change-ad.com/serve"),
             || {
-                let settings = Settings::from_toml(toml_str);
+                let settings = Settings::from_toml(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
@@ -225,26 +197,13 @@ mod tests {
 
     #[test]
     fn test_override_env() {
-        let toml_str = r#"
-            [ad_server]
-            ad_partner_url = "https://example-ad.com/serve"
-            sync_url = "https://example-ad.com/sync"
-
-            [prebid]
-            server_url = "https://prebid.example.com/openrtb2/auction"
-
-            [synthetic] 
-            counter_store = "test-counter-stor  e"
-            opid_store = "test-opid-store"
-            secret_key = "test-secret-key-1234567890"
-            template = "{{client_ip}}"
-            "#;
+        let toml_str = crate_test_settings_str();
 
         temp_env::with_var(
             "TRUSTED_SERVER__AD_SERVER__AD_PARTNER_URL",
             Some("https://change-ad.com/serve"),
             || {
-                let settings = Settings::from_toml(toml_str);
+                let settings = Settings::from_toml(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
