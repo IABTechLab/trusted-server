@@ -13,13 +13,7 @@ fn main() {
     let settings_json = serde_json::to_value(&default_settings).unwrap();
 
     let mut env_vars = HashSet::new();
-    collect_env_vars(
-        &settings_json,
-        settings::ENVIRONMENT_VARIABLE_PREFIX,
-        settings::ENVIRONMENT_VARIABLE_SEPARATOR,
-        &mut env_vars,
-        vec![],
-    );
+    collect_env_vars(&settings_json, &mut env_vars, vec![]);
 
     // Print rerun-if-env-changed for each variable
     let mut sorted_vars: Vec<_> = env_vars.into_iter().collect();
@@ -30,13 +24,7 @@ fn main() {
     }
 }
 
-fn collect_env_vars(
-    value: &Value,
-    prefix: &str,
-    sep: &str,
-    env_vars: &mut HashSet<String>,
-    path: Vec<String>,
-) {
+fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: Vec<String>) {
     if let Value::Object(map) = value {
         for (key, val) in map {
             let mut new_path = path.clone();
@@ -45,12 +33,17 @@ fn collect_env_vars(
             match val {
                 Value::String(_) | Value::Number(_) | Value::Bool(_) => {
                     // Leaf node - create environment variable
-                    let env_var = format!("{}{}{}", prefix, sep, new_path.join(sep));
+                    let env_var = format!(
+                        "{}{}{}",
+                        settings::ENVIRONMENT_VARIABLE_PREFIX,
+                        settings::ENVIRONMENT_VARIABLE_SEPARATOR,
+                        new_path.join(settings::ENVIRONMENT_VARIABLE_SEPARATOR)
+                    );
                     env_vars.insert(env_var);
                 }
                 Value::Object(_) => {
                     // Recurse into nested objects
-                    collect_env_vars(val, prefix, sep, env_vars, new_path);
+                    collect_env_vars(val, env_vars, new_path);
                 }
                 _ => {}
             }
