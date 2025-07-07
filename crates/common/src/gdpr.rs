@@ -1,3 +1,8 @@
+//! GDPR consent management and compliance.
+//!
+//! This module provides functionality for managing GDPR consent, including
+//! consent tracking, data subject requests, and compliance with EU privacy regulations.
+
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -7,20 +12,36 @@ use crate::constants::HEADER_X_SUBJECT_ID;
 use crate::cookies;
 use crate::settings::Settings;
 
+/// GDPR consent information for a user.
+///
+/// Tracks consent status for different purposes as required by GDPR.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GdprConsent {
+    /// Consent for analytics and measurement.
     pub analytics: bool,
+    /// Consent for personalized advertising.
     pub advertising: bool,
+    /// Consent for functional cookies and features.
     pub functional: bool,
+    /// Unix timestamp when consent was given.
     pub timestamp: i64,
+    /// Version of the consent framework.
     pub version: String,
 }
 
+/// User data collected for GDPR compliance.
+///
+/// Contains all data collected about a user that must be made available
+/// for data subject access requests.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserData {
+    /// Number of visits by the user.
     pub visit_count: i32,
+    /// Unix timestamp of the last visit.
     pub last_visit: i64,
+    /// List of ad interaction events.
     pub ad_interactions: Vec<String>,
+    /// History of consent changes.
     pub consent_history: Vec<GdprConsent>,
 }
 
@@ -47,17 +68,34 @@ impl Default for UserData {
     }
 }
 
+/// Extracts GDPR consent information from a request.
+///
+/// Looks for consent information in the `gdpr_consent` cookie and parses
+/// it into a [`GdprConsent`] structure.
+///
+/// Returns [`None`] if no consent cookie is found or parsing fails.
 pub fn get_consent_from_request(req: &Request) -> Option<GdprConsent> {
-    if let Some(jar) = cookies::handle_request_cookies(req) {
-        if let Some(consent_cookie) = jar.get("gdpr_consent") {
-            if let Ok(consent) = serde_json::from_str(consent_cookie.value()) {
-                return Some(consent);
+    match cookies::handle_request_cookies(req) {
+        Ok(Some(jar)) => {
+            if let Some(consent_cookie) = jar.get("gdpr_consent") {
+                if let Ok(consent) = serde_json::from_str(consent_cookie.value()) {
+                    return Some(consent);
+                }
             }
+            None
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("Failed to parse cookies for consent: {:?}", e);
+            None
         }
     }
-    None
 }
 
+/// Creates a GDPR consent cookie string.
+///
+/// Generates a properly formatted cookie string with the consent data,
+/// including security attributes and domain settings.
 pub fn create_consent_cookie(settings: &Settings, consent: &GdprConsent) -> String {
     format!(
         "gdpr_consent={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=31536000",
@@ -66,6 +104,15 @@ pub fn create_consent_cookie(settings: &Settings, consent: &GdprConsent) -> Stri
     )
 }
 
+/// Handles GDPR consent management requests.
+///
+/// Processes GET and POST requests to the `/gdpr/consent` endpoint:
+/// - GET: Returns current consent status
+/// - POST: Updates consent preferences
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 pub fn handle_consent_request(settings: &Settings, req: Request) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {
@@ -95,6 +142,17 @@ pub fn handle_consent_request(settings: &Settings, req: Request) -> Result<Respo
     }
 }
 
+/// Handles GDPR data subject access requests.
+///
+/// Processes requests to view or delete user data as required by GDPR:
+/// - GET: Returns all collected user data
+/// - DELETE: Removes all user data
+///
+/// Requires the `X-Subject-ID` header for authentication.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
     match *req.get_method() {
         Method::GET => {

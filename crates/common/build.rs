@@ -1,3 +1,6 @@
+#[path = "src/error.rs"]
+mod error;
+
 #[path = "src/settings.rs"]
 mod settings;
 

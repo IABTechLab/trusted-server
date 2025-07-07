@@ -1,10 +1,14 @@
+use std::env;
+
 use fastly::geo::geo_lookup;
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
 use log::LevelFilter::Info;
 use serde_json::json;
-use std::env;
+
+mod error;
+use crate::error::to_error_response;
 
 use trusted_server_common::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
@@ -13,8 +17,9 @@ use trusted_server_common::constants::{
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
 };
 use trusted_server_common::cookies::create_synthetic_cookie;
+// Note: TrustedServerError is used internally by the common crate
 use trusted_server_common::gdpr::{
-    get_consent_from_request, handle_consent_request, handle_data_subject_request,
+    get_consent_from_request, handle_consent_request, handle_data_subject_request, GdprConsent,
 };
 use trusted_server_common::models::AdResponse;
 use trusted_server_common::prebid::PrebidRequest;
@@ -26,7 +31,13 @@ use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    let settings = Settings::new().unwrap();
+    let settings = match Settings::new() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to load settings: {:?}", e);
+            return Ok(to_error_response(e));
+        }
+    };
     log::info!("Settings {settings:?}");
 
     futures::executor::block_on(async {
@@ -112,6 +123,13 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
     None
 }
 
+/// Handles the main page request.
+///
+/// Serves the main page with synthetic ID generation and ad integration.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     log::info!(
         "Using ad_partner_url: {}, counter_store: {}",
@@ -126,7 +144,13 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     log::info!("Main page - DMA Code: {:?}", dma_code);
 
     // Check GDPR consent before proceeding
-    let consent = get_consent_from_request(&req).unwrap_or_default();
+    let consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found, using default");
+            GdprConsent::default()
+        }
+    };
     if !consent.functional {
         // Return a version of the page without tracking
         return Ok(Response::from_status(StatusCode::OK)
@@ -138,26 +162,32 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     }
 
     // Calculate fresh ID first using the synthetic module
-    let fresh_id = generate_synthetic_id(settings, &req);
+    let fresh_id = match generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
 
     // Check for existing Trusted Server ID in this specific order:
     // 1. X-Synthetic-Trusted-Server header
     // 2. Cookie
     // 3. Fall back to fresh ID
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req);
+    let synthetic_id = match get_or_generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
 
     log::info!(
         "Existing Trusted Server header: {:?}",
         req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
-    log::info!("Generated Fresh ID: {}", fresh_id);
+    log::info!("Generated Fresh ID: {}", &fresh_id);
     log::info!("Using Trusted Server ID: {}", synthetic_id);
 
     // Create response with the main page HTML
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id) // Fresh ID always changes
+        .with_header(HEADER_SYNTHETIC_FRESH, fresh_id.as_str()) // Fresh ID always changes
         .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -206,9 +236,22 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     Ok(response)
 }
 
+/// Handles ad creative requests.
+///
+/// Processes ad requests with synthetic ID and consent checking.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
-    let _consent = get_consent_from_request(&req).unwrap_or_default();
+    let _consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found in ad request, using default");
+            GdprConsent::default()
+        }
+    };
     let advertising_consent = req
         .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
@@ -235,7 +278,10 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 
     // Generate synthetic ID only if we have consent
     let synthetic_id = if advertising_consent {
-        generate_synthetic_id(settings, &req)
+        match generate_synthetic_id(settings, &req) {
+            Ok(id) => id,
+            Err(e) => return Ok(to_error_response(e)),
+        }
     } else {
         // Use a generic ID for non-personalized ads
         "non-personalized".to_string()
@@ -471,9 +517,21 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
 
     // Calculate fresh ID and synthetic ID only if we have advertising consent
     let (fresh_id, synthetic_id) = if advertising_consent {
-        let fresh = generate_synthetic_id(settings, &req);
-        let synth = get_or_generate_synthetic_id(settings, &req);
-        (fresh, synth)
+        match (
+            generate_synthetic_id(settings, &req),
+            get_or_generate_synthetic_id(settings, &req),
+        ) {
+            (Ok(fresh), Ok(synth)) => (fresh, synth),
+            (Err(e), _) | (_, Err(e)) => {
+                log::error!("Failed to generate IDs: {:?}", e);
+                return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_header(header::CONTENT_TYPE, "application/json")
+                    .with_body_json(&json!({
+                        "error": "Failed to generate IDs",
+                        "details": format!("{:?}", e)
+                    }))?);
+            }
+        }
     } else {
         // Use non-personalized IDs when no consent
         (
@@ -486,7 +544,7 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
         "Existing Trusted Server header: {:?}",
         req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
-    log::info!("Generated Fresh ID: {}", fresh_id);
+    log::info!("Generated Fresh ID: {}", &fresh_id);
     log::info!("Using Trusted Server ID: {}", synthetic_id);
     log::info!("Advertising consent: {}", advertising_consent);
 
