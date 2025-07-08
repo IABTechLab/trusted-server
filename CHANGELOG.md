@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added basic unit tests
+- Added publisher config
 
 ### Changed
 - Upgrade to rust 1.87.0
