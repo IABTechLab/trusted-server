@@ -3,7 +3,7 @@
 //! This module provides functionality for generating privacy-preserving synthetic IDs
 //! based on various request parameters and a secret key.
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 use handlebars::Handlebars;
@@ -62,20 +62,15 @@ pub fn generate_synthetic_id(
 
     let input_string = handlebars
         .render_template(&settings.synthetic.template, data)
-        .map_err(|e| {
-            Report::new(TrustedServerError::Template {
-                message: "Failed to render synthetic ID template".to_string(),
-            })
-            .attach_printable(e.to_string())
+        .change_context(TrustedServerError::Template {
+            message: "Failed to render synthetic ID template".to_string(),
         })?;
+
     log::info!("Input string for fresh ID: {} {}", input_string, data);
 
-    let mut mac =
-        HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes()).map_err(|e| {
-            Report::new(TrustedServerError::SyntheticId {
-                message: "Failed to create HMAC instance".to_string(),
-            })
-            .attach_printable(e.to_string())
+    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
+        .change_context(TrustedServerError::SyntheticId {
+            message: "Failed to create HMAC instance".to_string(),
         })?;
     mac.update(input_string.as_bytes());
     let fresh_id = hex::encode(mac.finalize().into_bytes());

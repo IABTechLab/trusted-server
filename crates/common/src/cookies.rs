@@ -4,7 +4,7 @@
 //! used in the trusted server system.
 
 use cookie::{Cookie, CookieJar};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 
@@ -42,12 +42,12 @@ pub fn handle_request_cookies(
 ) -> Result<Option<CookieJar>, Report<TrustedServerError>> {
     match req.get_header(header::COOKIE) {
         Some(header_value) => {
-            let header_value_str = header_value.to_str().map_err(|e| {
-                Report::new(TrustedServerError::InvalidHeaderValue {
-                    message: "Cookie header contains invalid UTF-8".to_string(),
-                })
-                .attach_printable(e.to_string())
-            })?;
+            let header_value_str =
+                header_value
+                    .to_str()
+                    .change_context(TrustedServerError::InvalidHeaderValue {
+                        message: "Cookie header contains invalid UTF-8".to_string(),
+                    })?;
             let jar = parse_cookies_to_jar(header_value_str);
             Ok(Some(jar))
         }
