@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added basic unit tests
 - Added publisher config
+- Add AI assist rules. Based on https://github.com/hashintel/hash
 
 ### Changed
 - Upgrade to rust 1.87.0
@@ -38,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed to use constants for headers
 - Changed to use log statements
 - Updated fastly.toml for local development
+- Changed to propagate server errors as HTTP errors
+
+### Fixed
+- Rebuild when `TRUSTED_SERVER__*` env variables change 
 
 ### Fixed
 - Rebuild when `TRUSTED_SERVER__*` env variables change 

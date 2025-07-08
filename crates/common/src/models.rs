@@ -1,26 +1,51 @@
+//! Data models for ad serving and callbacks.
+//!
+//! This module defines the structures used for communication with ad servers
+//! and tracking callbacks.
+
 use serde::Deserialize;
 
+/// Response from an ad server containing creative details.
+///
+/// Contains all the information needed to display an ad and track
+/// its performance through various callbacks.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AdResponse {
+    /// Network identifier for the ad network.
     pub network_id: String,
+    /// Site identifier where the ad will be displayed.
     pub site_id: String,
+    /// Page identifier within the site.
     pub page_id: String,
+    /// Format identifier for the ad format.
     pub format_id: String,
+    /// Advertiser identifier.
     pub advertiser_id: String,
+    /// Campaign identifier.
     pub campaign_id: String,
+    /// Insertion order identifier.
     pub insertion_id: String,
+    /// Creative identifier.
     pub creative_id: String,
+    /// URL of the creative asset to display.
     pub creative_url: String,
+    /// List of tracking callbacks for various events.
     pub callbacks: Vec<Callback>,
 }
 
+/// Tracking callback for ad events.
+///
+/// Represents a URL that should be called when specific ad events occur,
+/// such as impressions, clicks, or viewability milestones.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Callback {
+    /// Type of callback (e.g., "impression", "click", "viewable").
     #[serde(rename = "type")]
     pub callback_type: String,
+    /// URL to call when the event occurs.
     pub url: String,
 }
 

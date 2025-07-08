@@ -1,3 +1,9 @@
+//! Synthetic ID generation using HMAC.
+//!
+//! This module provides functionality for generating privacy-preserving synthetic IDs
+//! based on various request parameters and a secret key.
+
+use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 use handlebars::Handlebars;
@@ -7,16 +13,28 @@ use sha2::Sha256;
 
 use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Generates a fresh synthetic_id based on request parameters
-pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
+/// Generates a fresh synthetic ID based on request parameters.
+///
+/// Creates a deterministic ID using HMAC-SHA256 with the configured secret key
+/// and various request attributes including IP, user agent, cookies, and headers.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::Template`] if the template rendering fails
+/// - [`TrustedServerError::SyntheticId`] if HMAC generation fails
+pub fn generate_synthetic_id(
+    settings: &Settings,
+    req: &Request,
+) -> Result<String, Report<TrustedServerError>> {
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
-    let first_party_id = handle_request_cookies(req).and_then(|jar| {
+    let first_party_id = handle_request_cookies(req).ok().flatten().and_then(|jar| {
         jar.get("pub_userid")
             .map(|cookie| cookie.value().to_string())
     });
@@ -44,21 +62,40 @@ pub fn generate_synthetic_id(settings: &Settings, req: &Request) -> String {
 
     let input_string = handlebars
         .render_template(&settings.synthetic.template, data)
-        .unwrap();
+        .change_context(TrustedServerError::Template {
+            message: "Failed to render synthetic ID template".to_string(),
+        })?;
+
     log::info!("Input string for fresh ID: {} {}", input_string, data);
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
-        .expect("HMAC can take key of any size");
+        .change_context(TrustedServerError::SyntheticId {
+            message: "Failed to create HMAC instance".to_string(),
+        })?;
     mac.update(input_string.as_bytes());
     let fresh_id = hex::encode(mac.finalize().into_bytes());
 
     log::info!("Generated fresh ID: {}", fresh_id);
 
-    fresh_id
+    Ok(fresh_id)
 }
 
-/// Gets or creates a synthetic_id from the request
-pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> String {
+/// Gets or creates a synthetic ID from the request.
+///
+/// Attempts to retrieve an existing synthetic ID from:
+/// 1. The `X-Synthetic-Trusted-Server` header
+/// 2. The `synthetic_id` cookie
+///
+/// If neither exists, generates a new synthetic ID.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::Template`] if template rendering fails during generation
+/// - [`TrustedServerError::SyntheticId`] if ID generation fails
+pub fn get_or_generate_synthetic_id(
+    settings: &Settings,
+    req: &Request,
+) -> Result<String, Report<TrustedServerError>> {
     // First try to get existing Trusted Server ID from header
     if let Some(synthetic_id) = req
         .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
@@ -66,31 +103,30 @@ pub fn get_or_generate_synthetic_id(settings: &Settings, req: &Request) -> Strin
         .map(|s| s.to_string())
     {
         log::info!("Using existing Synthetic ID from header: {}", synthetic_id);
-        return synthetic_id;
+        return Ok(synthetic_id);
     }
 
-    let req_cookie_jar: Option<cookie::CookieJar> = handle_request_cookies(req);
-    match req_cookie_jar {
+    // Try to get synthetic ID from cookies
+    match handle_request_cookies(req)? {
         Some(jar) => {
-            let ts_cookie = jar.get("synthetic_id");
-            if let Some(cookie) = ts_cookie {
+            if let Some(cookie) = jar.get("synthetic_id") {
                 let id = cookie.value().to_string();
                 log::info!("Using existing Trusted Server ID from cookie: {}", id);
-                return id;
+                return Ok(id);
             }
         }
         None => {
-            log::warn!("No cookie header found in request");
+            log::debug!("No cookie header found in request");
         }
     }
 
     // If no existing Synthetic ID found, generate a fresh one
-    let fresh_id = generate_synthetic_id(settings, req);
+    let fresh_id = generate_synthetic_id(settings, req)?;
     log::info!(
         "No existing Synthetic ID found, using fresh ID: {}",
         fresh_id
     );
-    fresh_id
+    Ok(fresh_id)
 }
 
 #[cfg(test)]
@@ -104,7 +140,10 @@ mod tests {
     fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
         let mut req = Request::new("GET", "http://example.com");
         for (key, value) in headers {
-            req.set_header(key, HeaderValue::from_str(value).unwrap());
+            req.set_header(
+                key,
+                HeaderValue::from_str(value).expect("should create valid header value"),
+            );
         }
 
         req
@@ -121,7 +160,8 @@ mod tests {
             (header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
         ]);
 
-        let synthetic_id = generate_synthetic_id(&settings, &req);
+        let synthetic_id =
+            generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
         log::info!("Generated synthetic ID: {}", synthetic_id);
         assert_eq!(
             synthetic_id,
@@ -137,7 +177,8 @@ mod tests {
             "existing_synthetic_id",
         )]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should get or generate synthetic ID");
         assert_eq!(synthetic_id, "existing_synthetic_id");
     }
 
@@ -146,7 +187,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![(header::COOKIE, "synthetic_id=existing_cookie_id")]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should get or generate synthetic ID");
         assert_eq!(synthetic_id, "existing_cookie_id");
     }
 
@@ -155,7 +197,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req);
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should get or generate synthetic ID");
         assert!(!synthetic_id.is_empty());
     }
 }

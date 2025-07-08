@@ -1,7 +1,10 @@
-use std::str;
+use core::str;
 
-use config::{Config, ConfigError, Environment, File, FileFormat};
+use config::{Config, Environment, File, FileFormat};
+use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
+
+use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
@@ -42,14 +45,42 @@ pub struct Settings {
 
 #[allow(unused)]
 impl Settings {
-    pub fn new() -> Result<Self, ConfigError> {
+    /// Creates a new [`Settings`] instance from the embedded configuration file.
+    ///
+    /// Loads the configuration from the embedded `trusted-server.toml` file
+    /// and applies any environment variable overrides.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
+    /// - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
+    /// - [`TrustedServerError::InsecureSecretKey`] if the secret key is set to the default value
+    pub fn new() -> Result<Self, Report<TrustedServerError>> {
         let toml_bytes = include_bytes!("../../../trusted-server.toml");
-        let toml_str = str::from_utf8(toml_bytes).unwrap();
+        let toml_str =
+            str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {
+                message: "embedded trusted-server.toml file".to_string(),
+            })?;
 
-        Self::from_toml(toml_str)
+        let settings = Self::from_toml(toml_str)?;
+
+        // Validate that the secret key is not the default
+        if settings.synthetic.secret_key == "secret-key" {
+            return Err(Report::new(TrustedServerError::InsecureSecretKey));
+        }
+
+        Ok(settings)
     }
 
-    pub fn from_toml(toml_str: &str) -> Result<Self, ConfigError> {
+    /// Creates a new [`Settings`] instance from a TOML string.
+    ///
+    /// Parses the provided TOML configuration and applies any environment
+    /// variable overrides using the `TRUSTED_SERVER__` prefix.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
             .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
@@ -58,10 +89,16 @@ impl Settings {
         let config = Config::builder()
             .add_source(toml)
             .add_source(environment)
-            .build()?;
-
+            .build()
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to build configuration".to_string(),
+            })?;
         // You can deserialize (and thus freeze) the entire configuration as
-        config.try_deserialize()
+        config
+            .try_deserialize()
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to deserialize configuration".to_string(),
+            })
     }
 }
 
@@ -95,11 +132,11 @@ mod tests {
     #[test]
     fn test_settings_from_valid_toml() {
         let toml_str = crate_test_settings_str();
-        let settings: Result<Settings, ConfigError> = Settings::from_toml(&toml_str);
+        let settings = Settings::from_toml(&toml_str);
 
         assert!(settings.is_ok());
 
-        let settings = settings.unwrap();
+        let settings = settings.expect("should parse valid TOML");
         assert_eq!(
             settings.ad_server.ad_partner_url,
             "https://test-adpartner.com"

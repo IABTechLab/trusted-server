@@ -64,7 +64,7 @@ cargo check
 ### Configuration Files
 - `fastly.toml`: Fastly service configuration and build settings
 - `trusted-server.toml`: Application settings (ad servers, KV stores, ID templates)
-- `rust-toolchain.toml`: Pins Rust version to 1.83.0
+- `rust-toolchain.toml`: Pins Rust version to 1.87.0
 
 ### Key Functionality Areas
 1. **Synthetic ID Generation**: Privacy-preserving user identification using HMAC

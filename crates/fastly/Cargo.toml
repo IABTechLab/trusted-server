@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+error-stack = "0.5"
 fastly = "0.11.5"
 futures = "0.3"
 log = "0.4.20"

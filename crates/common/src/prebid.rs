@@ -1,3 +1,9 @@
+//! Prebid integration for real-time bidding.
+//!
+//! This module provides functionality for integrating with Prebid Server
+//! to enable header bidding and real-time ad auctions.
+
+use error_stack::Report;
 use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
@@ -5,6 +11,7 @@ use serde_json::json;
 use crate::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
 };
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -23,20 +30,24 @@ pub struct PrebidRequest {
 }
 
 impl PrebidRequest {
-    /// Creates a new PrebidRequest from an incoming Fastly request
+    /// Creates a new PrebidRequest from an incoming Fastly request.
     ///
-    /// # Arguments
-    /// * `req` - The incoming Fastly request
+    /// Extracts necessary information from the request including synthetic ID,
+    /// client IP, and origin for use in Prebid Server requests.
     ///
-    /// # Returns
-    /// * `Result<Self, Error>` - New PrebidRequest or error
-    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::SyntheticId`] if synthetic ID generation fails
+    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Report<TrustedServerError>> {
         // Get the Trusted Server ID from header (which we just set in handle_prebid_test)
-        let synthetic_id = req
+        let synthetic_id = match req
             .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| generate_synthetic_id(settings, req));
+        {
+            Some(id) => id,
+            None => generate_synthetic_id(settings, req)?,
+        };
 
         // Get the original client IP from Fastly headers
         let client_ip = req
