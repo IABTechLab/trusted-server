@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added basic unit tests
+- Added publisher config
 
 ### Changed
 - Upgrade to rust 1.87.0
@@ -37,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed to use constants for headers
 - Changed to use log statements
 - Updated fastly.toml for local development
+
+### Fixed
+- Rebuild when `TRUSTED_SERVER__*` env variables change 
 
 ## [1.0.6] - 2025-05-29
 
