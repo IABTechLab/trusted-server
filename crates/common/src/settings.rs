@@ -1,31 +1,30 @@
 use std::str;
 
 use config::{Config, ConfigError, Environment, File, FileFormat};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
-#[allow(unused)]
+pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
+pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AdServer {
     pub ad_partner_url: String,
     pub sync_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
     pub origin_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Prebid {
     pub server_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
@@ -33,8 +32,7 @@ pub struct Synthetic {
     pub template: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub ad_server: AdServer,
     pub publisher: Publisher,
@@ -42,6 +40,7 @@ pub struct Settings {
     pub synthetic: Synthetic,
 }
 
+#[allow(unused)]
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         let toml_bytes = include_bytes!("../../../trusted-server.toml");
@@ -52,8 +51,8 @@ impl Settings {
 
     pub fn from_toml(toml_str: &str) -> Result<Self, ConfigError> {
         let environment = Environment::default()
-            .prefix("TRUSTED_SERVER")
-            .separator("__");
+            .prefix(ENVIRONMENT_VARIABLE_PREFIX)
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -181,7 +180,12 @@ mod tests {
         let toml_str = re.replace(&toml_str, "");
 
         temp_env::with_var(
-            "TRUSTED_SERVER__AD_SERVER__AD_PARTNER_URL",
+            format!(
+                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR
+            ),
             Some("https://change-ad.com/serve"),
             || {
                 let settings = Settings::from_toml(&toml_str);
@@ -200,7 +204,12 @@ mod tests {
         let toml_str = crate_test_settings_str();
 
         temp_env::with_var(
-            "TRUSTED_SERVER__AD_SERVER__AD_PARTNER_URL",
+            format!(
+                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR
+            ),
             Some("https://change-ad.com/serve"),
             || {
                 let settings = Settings::from_toml(&toml_str);

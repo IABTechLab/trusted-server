@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed to use log statements
 - Updated fastly.toml for local development
 
+### Fixed
+- Rebuild when `TRUSTED_SERVER__*` env variables change 
+
 ## [1.0.6] - 2025-05-29
 
 ### Changed
