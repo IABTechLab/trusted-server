@@ -64,7 +64,7 @@ impl PrebidRequest {
                     .and_then(|o| url::Url::parse(o).ok())
                     .and_then(|u| u.host_str().map(|h| h.to_string()))
             })
-            .unwrap_or_else(|| "auburndao.com".to_string());
+            .unwrap_or_else(|| settings.publisher.domain.clone());
 
         log::info!("Detected domain: {}", domain);
 
@@ -192,23 +192,7 @@ mod tests {
     use super::*;
     use fastly::Request;
 
-    fn create_test_settings() -> Settings {
-        Settings {
-            ad_server: crate::settings::AdServer {
-                ad_partner_url: "https://test.com".to_string(),
-                sync_url: "https://sync.test.com".to_string(),
-            },
-            prebid: crate::settings::Prebid {
-                server_url: "https://prebid.test.com/openrtb2/auction".to_string(),
-            },
-            synthetic: crate::settings::Synthetic {
-                counter_store: "test-counter".to_string(),
-                opid_store: "test-opid".to_string(),
-                secret_key: "test-secret-key".to_string(),
-                template: "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}".to_string(),
-            },
-        }
-    }
+    use crate::test_support::tests::create_test_settings;
 
     #[test]
     fn test_prebid_request_new_with_full_headers() {
@@ -258,31 +242,34 @@ mod tests {
     #[test]
     fn test_prebid_request_domain_fallback() {
         let settings = create_test_settings();
-        let req = Request::get("https://example.com/test");
+        let url = format!("https://{}", settings.publisher.domain);
+        let req = Request::get(url.clone());
         // No referer or origin headers
 
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
 
-        assert_eq!(prebid_req.domain, "auburndao.com");
-        assert_eq!(prebid_req.origin, "https://auburndao.com");
+        assert_eq!(prebid_req.domain, settings.publisher.domain);
+        assert_eq!(prebid_req.origin, url);
     }
 
     #[test]
     fn test_prebid_request_invalid_url_in_referer() {
         let settings = create_test_settings();
-        let mut req = Request::get("https://example.com/test");
+        let url = format!("https://{}/test", settings.publisher.domain);
+        let mut req = Request::get(url);
         req.set_header(header::REFERER, "not-a-valid-url");
 
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
 
         // Should fallback to default domain
-        assert_eq!(prebid_req.domain, "auburndao.com");
+        assert_eq!(prebid_req.domain, settings.publisher.domain);
     }
 
     #[test]
     fn test_prebid_request_x_forwarded_for_parsing() {
         let settings = create_test_settings();
-        let mut req = Request::get("https://example.com/test");
+        let url = format!("https://{}/test", settings.publisher.domain);
+        let mut req = Request::get(url);
         req.set_header(HEADER_X_FORWARDED_FOR, "192.168.1.1, 10.0.0.1, 172.16.0.1");
 
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
@@ -330,18 +317,19 @@ mod tests {
     #[test]
     fn test_prebid_request_edge_cases() {
         let settings = create_test_settings();
+        let url = format!("https://{}/test", settings.publisher.domain);
 
         // Test with empty X-Forwarded-For
-        let mut req = Request::get("https://example.com/test");
+        let mut req = Request::get(url.clone());
         req.set_header(HEADER_X_FORWARDED_FOR, "");
         let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
         assert!(!prebid_req.client_ip.is_empty() || prebid_req.client_ip.is_empty());
 
         // Test with malformed origin
-        let mut req2 = Request::get("https://example.com/test");
+        let mut req2 = Request::get(url.clone());
         req2.set_header(header::ORIGIN, "://invalid");
         let prebid_req2 = PrebidRequest::new(&settings, &req2).unwrap();
-        assert_eq!(prebid_req2.domain, "auburndao.com");
+        assert_eq!(prebid_req2.domain, settings.publisher.domain);
     }
 
     // Note: Testing send_bid_request would require mocking the Fastly backend,
