@@ -3,13 +3,15 @@
 //! This module provides functionality for managing GDPR consent, including
 //! consent tracking, data subject requests, and compliance with EU privacy regulations.
 
+use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
-use fastly::{Error, Request, Response};
+use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::constants::HEADER_X_SUBJECT_ID;
 use crate::cookies;
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 /// GDPR consent information for a user.
@@ -112,22 +114,43 @@ pub fn create_consent_cookie(settings: &Settings, consent: &GdprConsent) -> Stri
 ///
 /// # Errors
 ///
-/// Returns a Fastly [`Error`] if response creation fails.
-pub fn handle_consent_request(settings: &Settings, req: Request) -> Result<Response, Error> {
+/// Returns a [`TrustedServerError`] if:
+/// - JSON serialization/deserialization fails
+/// - Response creation fails
+pub fn handle_consent_request(
+    settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
     match *req.get_method() {
         Method::GET => {
             // Return current consent status
             let consent = get_consent_from_request(&req).unwrap_or_default();
+            let json_body = serde_json::to_string(&consent).change_context(
+                TrustedServerError::GdprConsent {
+                    message: "Failed to serialize consent data".to_string(),
+                },
+            )?;
+
             Ok(Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
-                .with_body(serde_json::to_string(&consent)?))
+                .with_body(json_body))
         }
         Method::POST => {
             // Update consent preferences
-            let consent: GdprConsent = serde_json::from_slice(req.into_body_bytes().as_slice())?;
+            let consent: GdprConsent = serde_json::from_slice(req.into_body_bytes().as_slice())
+                .change_context(TrustedServerError::GdprConsent {
+                    message: "Failed to parse consent request body".to_string(),
+                })?;
+
+            let json_body = serde_json::to_string(&consent).change_context(
+                TrustedServerError::GdprConsent {
+                    message: "Failed to serialize consent response".to_string(),
+                },
+            )?;
+
             let mut response = Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
-                .with_body(serde_json::to_string(&consent)?);
+                .with_body(json_body);
 
             response.set_header(
                 header::SET_COOKIE,
@@ -152,8 +175,13 @@ pub fn handle_consent_request(settings: &Settings, req: Request) -> Result<Respo
 ///
 /// # Errors
 ///
-/// Returns a Fastly [`Error`] if response creation fails.
-pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result<Response, Error> {
+/// Returns a [`TrustedServerError`] if:
+/// - Header value extraction fails
+/// - JSON serialization fails
+pub fn handle_data_subject_request(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
     match *req.get_method() {
         Method::GET => {
             // Handle data access request
@@ -163,11 +191,22 @@ pub fn handle_data_subject_request(_settings: &Settings, req: Request) -> Result
 
                 // TODO: Implement actual data retrieval from KV store
                 // For now, return empty user data
-                data.insert(synthetic_id.to_str()?.to_string(), UserData::default());
+                let id_str = synthetic_id.to_str().change_context(
+                    TrustedServerError::InvalidHeaderValue {
+                        message: "Invalid subject ID header value".to_string(),
+                    },
+                )?;
+                data.insert(id_str.to_string(), UserData::default());
+
+                let json_body = serde_json::to_string(&data).change_context(
+                    TrustedServerError::GdprConsent {
+                        message: "Failed to serialize user data".to_string(),
+                    },
+                )?;
 
                 Ok(Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_body(serde_json::to_string(&data)?))
+                    .with_body(json_body))
             } else {
                 Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("Missing subject ID"))
             }

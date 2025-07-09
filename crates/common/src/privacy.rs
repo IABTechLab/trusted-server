@@ -1,3 +1,33 @@
+//! Privacy policy handling.
+//!
+//! This module provides the privacy policy template and handler function.
+
+use error_stack::Report;
+use fastly::http::{header, StatusCode};
+use fastly::{Request, Response};
+
+use crate::constants::HEADER_X_COMPRESS_HINT;
+use crate::error::TrustedServerError;
+use crate::settings::Settings;
+
+/// Handles privacy policy page requests.
+///
+/// Returns the privacy policy HTML page.
+///
+/// # Errors
+///
+/// This function currently doesn't return errors, but returns a `Result` for consistency
+/// and future extensibility.
+pub fn handle_privacy_policy(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_body(PRIVACY_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header(HEADER_X_COMPRESS_HINT, "on"))
+}
+
 pub const PRIVACY_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
