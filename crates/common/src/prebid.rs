@@ -297,7 +297,7 @@ pub async fn handle_prebid_test(
         Err(e) => {
             log::error!("Error sending bid request: {:?}", e);
             log::error!("Backend name used: prebid_backend");
-            
+
             // Convert Fastly Error to TrustedServerError
             Err(Report::new(TrustedServerError::Prebid {
                 message: format!("Failed to send bid request: {}", e),

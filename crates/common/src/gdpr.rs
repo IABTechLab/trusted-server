@@ -125,11 +125,12 @@ pub fn handle_consent_request(
         Method::GET => {
             // Return current consent status
             let consent = get_consent_from_request(&req).unwrap_or_default();
-            let json_body = serde_json::to_string(&consent)
-                .change_context(TrustedServerError::GdprConsent {
+            let json_body = serde_json::to_string(&consent).change_context(
+                TrustedServerError::GdprConsent {
                     message: "Failed to serialize consent data".to_string(),
-                })?;
-            
+                },
+            )?;
+
             Ok(Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(json_body))
@@ -140,12 +141,13 @@ pub fn handle_consent_request(
                 .change_context(TrustedServerError::GdprConsent {
                     message: "Failed to parse consent request body".to_string(),
                 })?;
-            
-            let json_body = serde_json::to_string(&consent)
-                .change_context(TrustedServerError::GdprConsent {
+
+            let json_body = serde_json::to_string(&consent).change_context(
+                TrustedServerError::GdprConsent {
                     message: "Failed to serialize consent response".to_string(),
-                })?;
-            
+                },
+            )?;
+
             let mut response = Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body(json_body);
@@ -189,17 +191,18 @@ pub fn handle_data_subject_request(
 
                 // TODO: Implement actual data retrieval from KV store
                 // For now, return empty user data
-                let id_str = synthetic_id
-                    .to_str()
-                    .change_context(TrustedServerError::InvalidHeaderValue {
+                let id_str = synthetic_id.to_str().change_context(
+                    TrustedServerError::InvalidHeaderValue {
                         message: "Invalid subject ID header value".to_string(),
-                    })?;
+                    },
+                )?;
                 data.insert(id_str.to_string(), UserData::default());
 
-                let json_body = serde_json::to_string(&data)
-                    .change_context(TrustedServerError::GdprConsent {
+                let json_body = serde_json::to_string(&data).change_context(
+                    TrustedServerError::GdprConsent {
                         message: "Failed to serialize user data".to_string(),
-                    })?;
+                    },
+                )?;
 
                 Ok(Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")

@@ -45,15 +45,17 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/") => handle_main_page(&settings, req),
         (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
         (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
-        
+
         // GDPR compliance routes
         (&Method::GET | &Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
-        (&Method::GET | &Method::DELETE, "/gdpr/data") => handle_data_subject_request(&settings, req),
-        
+        (&Method::GET | &Method::DELETE, "/gdpr/data") => {
+            handle_data_subject_request(&settings, req)
+        }
+
         // Static content pages
         (&Method::GET, "/privacy-policy") => handle_privacy_policy(&settings, req),
         (&Method::GET, "/why-trusted-server") => handle_why_trusted_server(&settings, req),
-        
+
         // Catch-all 404 handler
         _ => return Ok(not_found_response()),
     };
