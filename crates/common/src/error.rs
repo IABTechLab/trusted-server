@@ -19,37 +19,41 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// GDPR consent handling error.
+    #[display("GDPR consent error: {message}")]
+    GdprConsent { message: String },
+
+    /// Key-value store operation failed.
+    #[display("KV store error: {store_name} - {message}")]
+    KvStore { store_name: String, message: String },
+
     /// The synthetic secret key is using the insecure default value.
     #[display("Synthetic secret key is set to the default value - this is insecure")]
     InsecureSecretKey,
-
-    /// Invalid UTF-8 data encountered.
-    #[display("Invalid UTF-8 data: {message}")]
-    InvalidUtf8 { message: String },
 
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
 
-    /// Settings parsing or validation failed.
-    #[display("Settings error: {message}")]
-    Settings { message: String },
-
-    /// GDPR consent handling error.
-    #[display("GDPR consent error: {message}")]
-    GdprConsent { message: String },
-
-    /// Synthetic ID generation or validation failed.
-    #[display("Synthetic ID error: {message}")]
-    SyntheticId { message: String },
+    /// Invalid UTF-8 data encountered.
+    #[display("Invalid UTF-8 data: {message}")]
+    InvalidUtf8 { message: String },
 
     /// Prebid integration error.
     #[display("Prebid error: {message}")]
     Prebid { message: String },
 
-    /// Key-value store operation failed.
-    #[display("KV store error: {store_name} - {message}")]
-    KvStore { store_name: String, message: String },
+    /// Proxy error.
+    #[display("Template error: {message}")]
+    Proxy { message: String },
+
+    /// Settings parsing or validation failed.
+    #[display("Settings error: {message}")]
+    Settings { message: String },
+
+    /// Synthetic ID generation or validation failed.
+    #[display("Synthetic ID error: {message}")]
+    SyntheticId { message: String },
 
     /// Template rendering error.
     #[display("Template error: {message}")]
@@ -72,13 +76,14 @@ impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
-            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

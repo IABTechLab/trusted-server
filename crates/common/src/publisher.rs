@@ -1,4 +1,4 @@
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 
@@ -123,4 +123,34 @@ pub fn handle_main_page(
     response.set_header(header::CACHE_CONTROL, "no-store, private");
 
     Ok(response)
+}
+
+/// Proxies requests to the publisher's origin server.
+///
+/// This function forwards incoming requests to the configured origin URL,
+/// preserving headers and request body. It's used as a fallback for routes
+/// not explicitly handled by the trusted server.
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if:
+/// - The proxy request fails
+/// - The origin backend is unreachable
+pub fn handle_publisher_request(
+    settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    log::info!("Proxying request to publisher_origin");
+
+    // Extract host from the origin_url using the Publisher's origin_host method
+    let host = settings.publisher.origin_host();
+
+    log::info!("Setting host header to: {}", host);
+    req.set_header("host", host);
+
+    // Send the request to the origin backend
+    req.send(&settings.publisher.origin_backend)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to proxy request".to_string(),
+        })
 }

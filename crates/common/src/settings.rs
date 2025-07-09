@@ -3,6 +3,7 @@ use core::str;
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::TrustedServerError;
 
@@ -19,7 +20,35 @@ pub struct AdServer {
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
+    pub origin_backend: String,
     pub origin_url: String,
+}
+
+impl Publisher {
+    /// Extracts the host (including port if present) from the origin_url.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trusted_server_common::settings::Publisher;
+    /// let publisher = Publisher {
+    ///     domain: "example.com".to_string(),
+    ///     cookie_domain: ".example.com".to_string(),
+    ///     origin_url: "https://origin.example.com:8080".to_string(),
+    /// };
+    /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
+    /// ```
+    pub fn origin_host(&self) -> String {
+        Url::parse(&self.origin_url)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| match url.port() {
+                    Some(port) => format!("{}:{}", host, port),
+                    None => host.to_string(),
+                })
+            })
+            .unwrap_or_else(|| self.origin_url.clone())
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -211,5 +240,62 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_publisher_origin_host() {
+        // Test with full URL including port
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "https://origin.example.com:8080".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "origin.example.com:8080");
+
+        // Test with URL without port (default HTTPS port)
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "origin.example.com");
+
+        // Test with HTTP URL with explicit port
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://localhost:9090".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "localhost:9090");
+
+        // Test with URL without protocol (fallback to original)
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "localhost:9090".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "localhost:9090");
+
+        // Test with IPv4 address
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://192.168.1.1:8080".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
+
+        // Test with IPv6 address
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://[::1]:8080".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
 }

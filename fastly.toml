@@ -17,6 +17,9 @@ build = """
     [local_server.backends]
         [local_server.backends.ad_partner_url]
             url = "http://127.0.0.1:10180/"
+        
+        [local_server.backends.publisher_origin]
+            url = "http://localhost:9090"
 
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]
