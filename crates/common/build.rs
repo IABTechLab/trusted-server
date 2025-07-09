@@ -6,10 +6,20 @@ mod settings;
 
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+const TRUSTED_SERVER_INIT_CONFIG_PATH: &str = "../../trusted-server.toml";
+const TRUSTED_SERVER_OUTPUT_CONFIG_PATH: &str = "../../target/trusted-server-out.toml";
 
 fn main() {
-    // Watch the settings.rs file for changes
-    println!("cargo:rerun-if-changed=../../trusted-server.toml");
+    merge_toml();
+    rerun_if_changed();
+}
+
+fn rerun_if_changed() {
+    // Watch the root trusted-server.toml file for changes
+    println!("cargo:rerun-if-changed={}", TRUSTED_SERVER_INIT_CONFIG_PATH);
 
     // Create a default Settings instance and convert to JSON to discover all fields
     let default_settings = settings::Settings::default();
@@ -25,6 +35,26 @@ fn main() {
     for var in sorted_vars {
         println!("cargo:rerun-if-env-changed={}", var);
     }
+}
+
+fn merge_toml() {
+    // Get the OUT_DIR where we'll copy the config file
+    let dest_path = Path::new(TRUSTED_SERVER_OUTPUT_CONFIG_PATH);
+
+    // Read init config
+    let init_config_path = Path::new(TRUSTED_SERVER_INIT_CONFIG_PATH);
+    let toml_content = fs::read_to_string(init_config_path)
+        .unwrap_or_else(|_| panic!("Failed to read {:?}", init_config_path));
+
+    // For build time: use from_toml to parse with environment variables
+    let settings = settings::Settings::from_toml(&toml_content)
+        .expect("Failed to parse settings at build time");
+
+    // Write the merged settings to the output directory as TOML
+    let merged_toml =
+        toml::to_string_pretty(&settings).expect("Failed to serialize settings to TOML");
+
+    fs::write(dest_path, merged_toml).unwrap_or_else(|_| panic!("Failed to write {:?}", dest_path));
 }
 
 fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: Vec<String>) {

@@ -31,6 +31,7 @@ pub mod prebid;
 pub mod privacy;
 pub mod publisher;
 pub mod settings;
+pub mod settings_data;
 pub mod synthetic;
 pub mod templates;
 pub mod test_support;
