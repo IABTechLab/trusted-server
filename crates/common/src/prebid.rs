@@ -4,16 +4,17 @@
 //! to enable header bidding and real-time ad auctions.
 
 use error_stack::Report;
-use fastly::http::{header, Method};
+use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
 use crate::constants::{
-    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
+    HEADER_X_CONSENT_ADVERTISING, HEADER_X_FORWARDED_FOR,
 };
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
-use crate::synthetic::generate_synthetic_id;
+use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 /// Represents a request to the Prebid Server with all necessary parameters
 pub struct PrebidRequest {
@@ -195,6 +196,113 @@ impl PrebidRequest {
 
         let resp = req.send("prebid_backend")?;
         Ok(resp)
+    }
+}
+
+/// Handles the prebid test route with detailed error logging.
+///
+/// This endpoint is used to test Prebid Server integration by:
+/// 1. Checking consent status
+/// 2. Generating synthetic IDs (if consent is given)
+/// 3. Creating a PrebidRequest
+/// 4. Sending the bid request to Prebid Server
+/// 5. Returning the response with appropriate headers
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if:
+/// - Synthetic ID generation fails
+/// - PrebidRequest creation fails
+/// - Communication with Prebid Server fails
+pub async fn handle_prebid_test(
+    settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    log::info!("Starting prebid test request handling");
+
+    // Check consent status from headers
+    let advertising_consent = req
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Calculate fresh ID and synthetic ID only if we have advertising consent
+    let (fresh_id, synthetic_id) = if advertising_consent {
+        let fresh = generate_synthetic_id(settings, &req)?;
+        let synth = get_or_generate_synthetic_id(settings, &req)?;
+        (fresh, synth)
+    } else {
+        // Use non-personalized IDs when no consent
+        (
+            "non-personalized".to_string(),
+            "non-personalized".to_string(),
+        )
+    };
+
+    log::info!(
+        "Existing Trusted Server header: {:?}",
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
+    );
+    log::info!("Generated Fresh ID: {}", &fresh_id);
+    log::info!("Using Trusted Server ID: {}", synthetic_id);
+    log::info!("Advertising consent: {}", advertising_consent);
+
+    // Set both IDs as headers
+    req.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
+    req.set_header(
+        HEADER_X_CONSENT_ADVERTISING,
+        if advertising_consent { "true" } else { "false" },
+    );
+
+    log::info!(
+        "Using Trusted Server ID: {}, Fresh ID: {}",
+        synthetic_id,
+        fresh_id
+    );
+
+    let prebid_req = PrebidRequest::new(settings, &req)?;
+    log::info!(
+        "Successfully created PrebidRequest with synthetic ID: {}",
+        prebid_req.synthetic_id
+    );
+
+    log::info!("Attempting to send bid request to Prebid Server at prebid_backend");
+
+    match prebid_req.send_bid_request(settings, &req).await {
+        Ok(mut prebid_response) => {
+            log::info!("Received response from Prebid Server");
+            log::info!("Response status: {}", prebid_response.get_status());
+
+            log::info!("Response headers:");
+            for (name, value) in prebid_response.get_headers() {
+                log::info!("  {}: {:?}", name, value);
+            }
+
+            let body = prebid_response.take_body_str();
+            log::info!("Response body: {}", body);
+
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_header("X-Prebid-Test", "true")
+                .with_header("X-Synthetic-ID", &prebid_req.synthetic_id)
+                .with_header(
+                    "X-Consent-Advertising",
+                    if advertising_consent { "true" } else { "false" },
+                )
+                .with_header(HEADER_X_COMPRESS_HINT, "on")
+                .with_body(body))
+        }
+        Err(e) => {
+            log::error!("Error sending bid request: {:?}", e);
+            log::error!("Backend name used: prebid_backend");
+            
+            // Convert Fastly Error to TrustedServerError
+            Err(Report::new(TrustedServerError::Prebid {
+                message: format!("Failed to send bid request: {}", e),
+            }))
+        }
     }
 }
 

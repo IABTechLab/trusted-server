@@ -1,3 +1,34 @@
+//! Why Trusted Server page handling.
+//!
+//! This module provides the "Why Trusted Server" explanation page.
+
+use error_stack::Report;
+use fastly::http::{header, StatusCode};
+use fastly::{Request, Response};
+
+use crate::constants::HEADER_X_COMPRESS_HINT;
+use crate::error::TrustedServerError;
+use crate::settings::Settings;
+
+/// Handles "Why Trusted Server" page requests.
+///
+/// Returns the Why Trusted Server HTML page that explains the purpose and benefits
+/// of the trusted server approach.
+///
+/// # Errors
+///
+/// This function currently doesn't return errors, but returns a `Result` for consistency
+/// and future extensibility.
+pub fn handle_why_trusted_server(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_body(WHY_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header(HEADER_X_COMPRESS_HINT, "on"))
+}
+
 pub const WHY_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
