@@ -44,7 +44,7 @@ fn merge_toml() {
     // Read init config
     let init_config_path = Path::new(TRUSTED_SERVER_INIT_CONFIG_PATH);
     let toml_content = fs::read_to_string(init_config_path)
-        .expect(&format!("Failed to read {:?}", init_config_path));
+        .unwrap_or_else(|_| panic!("Failed to read {:?}", init_config_path));
 
     // For build time: use from_toml to parse with environment variables
     let settings = settings::Settings::from_toml(&toml_content)
@@ -54,7 +54,7 @@ fn merge_toml() {
     let merged_toml =
         toml::to_string_pretty(&settings).expect("Failed to serialize settings to TOML");
 
-    fs::write(&dest_path, merged_toml).expect(&format!("Failed to write {:?}", dest_path));
+    fs::write(dest_path, merged_toml).unwrap_or_else(|_| panic!("Failed to write {:?}", dest_path));
 }
 
 fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: Vec<String>) {
