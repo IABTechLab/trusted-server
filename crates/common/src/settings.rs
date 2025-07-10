@@ -38,6 +38,7 @@ impl Publisher {
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
+    #[allow(dead_code)]
     pub fn origin_host(&self) -> String {
         Url::parse(&self.origin_url)
             .ok()
