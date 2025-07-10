@@ -130,6 +130,52 @@ pub fn handle_main_page(
     Ok(response)
 }
 
+/// Generic streaming processor that reads from a source, processes through replacer, and writes to output
+fn stream_process<R: Read, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    replacer: &mut StreamingReplacer,
+    chunk_size: usize,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut buffer = vec![0u8; chunk_size];
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                // End of stream - process any remaining data
+                let final_chunk = replacer.process_chunk(&[], true);
+                if !final_chunk.is_empty() {
+                    writer
+                        .write_all(&final_chunk)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write final chunk".to_string(),
+                        })?;
+                }
+                break;
+            }
+            Ok(n) => {
+                // Process this chunk
+                let processed = replacer.process_chunk(&buffer[..n], false);
+                if !processed.is_empty() {
+                    writer
+                        .write_all(&processed)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write processed chunk".to_string(),
+                        })?;
+                }
+            }
+            Err(e) => {
+                log::error!("Error reading from stream: {}", e);
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("Failed to read from stream: {}", e),
+                }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Process response body in streaming fashion with compression preservation
 fn process_response_streaming(
     body: Body,
@@ -152,69 +198,42 @@ fn process_response_streaming(
     let is_compressed = matches!(content_encoding, "gzip" | "deflate");
 
     if is_compressed {
-        // For compressed content, we need to:
-        // 1. Decompress the entire content
-        // 2. Process it
-        // 3. Recompress it
-        // This is necessary because compression algorithms need to see the full content
+        // For compressed content, we stream through:
+        // 1. Decompress chunks
+        // 2. Process them
+        // 3. Recompress and write to output
 
         log::info!(
             "Processing compressed content with encoding: {}",
             content_encoding
         );
 
-        // First, decompress everything
-        let mut decompressed = Vec::new();
-        let mut decoder: Box<dyn Read> = match content_encoding {
-            "gzip" => Box::new(GzDecoder::new(body)),
-            "deflate" => Box::new(ZlibDecoder::new(body)),
-            _ => unreachable!(),
-        };
-
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: format!("Failed to decompress {} content", content_encoding),
-            })?;
-
-        log::info!("Decompressed {} bytes", decompressed.len());
-
-        // Process the decompressed content in chunks
-        let mut processed = Vec::new();
-        let chunks = decompressed.chunks(CHUNK_SIZE);
-        let total_chunks = chunks.len();
-
-        for (i, chunk) in chunks.enumerate() {
-            let is_last = i == total_chunks - 1;
-            let result = replacer.process_chunk(chunk, is_last);
-            processed.extend_from_slice(&result);
-        }
-
-        log::info!("Processed {} bytes", processed.len());
-
-        // Recompress with the same encoding
         match content_encoding {
             "gzip" => {
-                log::info!("Recompressing as gzip");
-                let mut encoder = GzEncoder::new(&mut output_body, Compression::default());
-                encoder
-                    .write_all(&processed)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to write gzip data".to_string(),
-                    })?;
-                encoder.finish().change_context(TrustedServerError::Proxy {
+                // Create gzip decompressor
+                let decoder = GzDecoder::new(body);
+                // Create gzip compressor
+                let mut encoder = GzEncoder::new(output_body, Compression::default());
+
+                // Stream through the pipeline
+                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE)?;
+
+                // Finish compression and get the output body
+                output_body = encoder.finish().change_context(TrustedServerError::Proxy {
                     message: "Failed to finish gzip compression".to_string(),
                 })?;
             }
             "deflate" => {
-                log::info!("Recompressing as deflate");
-                let mut encoder = ZlibEncoder::new(&mut output_body, Compression::default());
-                encoder
-                    .write_all(&processed)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to write deflate data".to_string(),
-                    })?;
-                encoder.finish().change_context(TrustedServerError::Proxy {
+                // Create deflate decompressor
+                let decoder = ZlibDecoder::new(body);
+                // Create deflate compressor
+                let mut encoder = ZlibEncoder::new(output_body, Compression::default());
+
+                // Stream through the pipeline
+                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE)?;
+
+                // Finish compression and get the output body
+                output_body = encoder.finish().change_context(TrustedServerError::Proxy {
                     message: "Failed to finish deflate compression".to_string(),
                 })?;
             }
@@ -224,42 +243,8 @@ fn process_response_streaming(
         // For uncompressed content, we can truly stream
         log::info!("Processing uncompressed content");
 
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-        let mut body_reader = body;
-
-        loop {
-            match body_reader.read(&mut buffer) {
-                Ok(0) => {
-                    // End of stream - process any remaining data
-                    let final_chunk = replacer.process_chunk(&[], true);
-                    if !final_chunk.is_empty() {
-                        output_body.write_all(&final_chunk).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write final chunk".to_string(),
-                            },
-                        )?;
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    // Process this chunk
-                    let processed = replacer.process_chunk(&buffer[..n], false);
-                    if !processed.is_empty() {
-                        output_body.write_all(&processed).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write processed chunk".to_string(),
-                            },
-                        )?;
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error reading body: {}", e);
-                    return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read body: {}", e),
-                    }));
-                }
-            }
-        }
+        // Stream directly from body to output
+        stream_process(body, &mut output_body, &mut replacer, CHUNK_SIZE)?;
     }
 
     log::info!("Streaming processing complete");
@@ -564,6 +549,63 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn test_streaming_compressed_content() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Create some HTML content with origin URLs
+        let original_content = r#"<html>
+            <link href="https://origin.example.com/style.css" rel="stylesheet">
+            <script src="https://origin.example.com/app.js"></script>
+            <a href="https://origin.example.com/page">Link</a>
+        </html>"#;
+
+        // Compress the content
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut compressed, Compression::default());
+            encoder.write_all(original_content.as_bytes()).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        // Create a Body from compressed data
+        let body = Body::from(compressed);
+
+        // Process the compressed body
+        let result = process_response_streaming(
+            body,
+            "gzip",
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(result.is_ok());
+        let processed_body = result.unwrap();
+
+        // The body should still be compressed
+        // In a real test, we'd decompress and verify the content
+        // For now, just check that we got a body back
+        let bytes = processed_body.into_bytes();
+        assert!(!bytes.is_empty());
+
+        // Decompress to verify content was transformed
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoder = GzDecoder::new(&bytes[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+
+        // Verify URLs were replaced
+        assert!(decompressed.contains("https://test.example.com/style.css"));
+        assert!(decompressed.contains("https://test.example.com/app.js"));
+        assert!(decompressed.contains("https://test.example.com/page"));
+        assert!(!decompressed.contains("origin.example.com"));
     }
 
     #[test]
