@@ -15,6 +15,7 @@
 //! - [`prebid`]: Prebid integration and real-time bidding support
 //! - [`privacy`]: Privacy utilities and helpers
 //! - [`settings`]: Configuration management and validation
+//! - [`streaming_replacer`]: Streaming URL replacement for large responses
 //! - [`synthetic`]: Synthetic ID generation using HMAC
 //! - [`templates`]: Handlebars template handling
 //! - [`test_support`]: Testing utilities and mocks
@@ -32,6 +33,7 @@ pub mod privacy;
 pub mod publisher;
 pub mod settings;
 pub mod settings_data;
+pub mod streaming_replacer;
 pub mod synthetic;
 pub mod templates;
 pub mod test_support;
