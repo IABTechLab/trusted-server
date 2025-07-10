@@ -1,17 +1,22 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
-use fastly::{Request, Response};
+use fastly::{Body, Request, Response};
 use flate2::read::{GzDecoder, ZlibDecoder};
-use std::io::Read;
+use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::Compression;
+use std::io::{Read, Write};
 
 use crate::constants::{
-    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR, HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY, HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
+    HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
 };
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::gdpr::{get_consent_from_request, GdprConsent};
 use crate::geo::get_dma_code;
 use crate::settings::Settings;
+use crate::streaming_replacer::StreamingReplacer;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::templates::HTML_TEMPLATE;
 
@@ -125,6 +130,142 @@ pub fn handle_main_page(
     Ok(response)
 }
 
+/// Process response body in streaming fashion with compression preservation
+fn process_response_streaming(
+    body: Body,
+    content_encoding: &str,
+    origin_host: &str,
+    origin_url: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> Result<Body, Report<TrustedServerError>> {
+    const CHUNK_SIZE: usize = 8192; // 8KB chunks
+
+    // Create the streaming replacer
+    let mut replacer =
+        StreamingReplacer::new(origin_host, origin_url, request_host, request_scheme);
+
+    // Create output body
+    let mut output_body = Body::new();
+
+    // Determine if content needs decompression/recompression
+    let is_compressed = matches!(content_encoding, "gzip" | "deflate");
+
+    if is_compressed {
+        // For compressed content, we need to:
+        // 1. Decompress the entire content
+        // 2. Process it
+        // 3. Recompress it
+        // This is necessary because compression algorithms need to see the full content
+
+        log::info!(
+            "Processing compressed content with encoding: {}",
+            content_encoding
+        );
+
+        // First, decompress everything
+        let mut decompressed = Vec::new();
+        let mut decoder: Box<dyn Read> = match content_encoding {
+            "gzip" => Box::new(GzDecoder::new(body)),
+            "deflate" => Box::new(ZlibDecoder::new(body)),
+            _ => unreachable!(),
+        };
+
+        decoder
+            .read_to_end(&mut decompressed)
+            .change_context(TrustedServerError::Proxy {
+                message: format!("Failed to decompress {} content", content_encoding),
+            })?;
+
+        log::info!("Decompressed {} bytes", decompressed.len());
+
+        // Process the decompressed content in chunks
+        let mut processed = Vec::new();
+        let chunks = decompressed.chunks(CHUNK_SIZE);
+        let total_chunks = chunks.len();
+
+        for (i, chunk) in chunks.enumerate() {
+            let is_last = i == total_chunks - 1;
+            let result = replacer.process_chunk(chunk, is_last);
+            processed.extend_from_slice(&result);
+        }
+
+        log::info!("Processed {} bytes", processed.len());
+
+        // Recompress with the same encoding
+        match content_encoding {
+            "gzip" => {
+                log::info!("Recompressing as gzip");
+                let mut encoder = GzEncoder::new(&mut output_body, Compression::default());
+                encoder
+                    .write_all(&processed)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to write gzip data".to_string(),
+                    })?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finish gzip compression".to_string(),
+                })?;
+            }
+            "deflate" => {
+                log::info!("Recompressing as deflate");
+                let mut encoder = ZlibEncoder::new(&mut output_body, Compression::default());
+                encoder
+                    .write_all(&processed)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to write deflate data".to_string(),
+                    })?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finish deflate compression".to_string(),
+                })?;
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        // For uncompressed content, we can truly stream
+        log::info!("Processing uncompressed content");
+
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut body_reader = body;
+
+        loop {
+            match body_reader.read(&mut buffer) {
+                Ok(0) => {
+                    // End of stream - process any remaining data
+                    let final_chunk = replacer.process_chunk(&[], true);
+                    if !final_chunk.is_empty() {
+                        output_body.write_all(&final_chunk).change_context(
+                            TrustedServerError::Proxy {
+                                message: "Failed to write final chunk".to_string(),
+                            },
+                        )?;
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    // Process this chunk
+                    let processed = replacer.process_chunk(&buffer[..n], false);
+                    if !processed.is_empty() {
+                        output_body.write_all(&processed).change_context(
+                            TrustedServerError::Proxy {
+                                message: "Failed to write processed chunk".to_string(),
+                            },
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error reading body: {}", e);
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to read body: {}", e),
+                    }));
+                }
+            }
+        }
+    }
+
+    log::info!("Streaming processing complete");
+    Ok(output_body)
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// This function forwards incoming requests to the configured origin URL,
@@ -203,78 +344,39 @@ pub fn handle_publisher_request(
             content_type, content_encoding, request_host, origin_host
         );
 
-        // Get the response body as bytes
-        let body_bytes = response.take_body_bytes();
+        // Take the response body for streaming processing
+        let body = response.take_body();
 
-        // Check if we got an empty body
-        if body_bytes.is_empty() {
-            log::warn!("Response body is empty, nothing to process");
-            return Ok(response);
-        }
-
-        log::info!("Response body size: {} bytes", body_bytes.len());
-
-        // Decompress the body if needed
-        let decompressed_body = match content_encoding.as_str() {
-            "gzip" => {
-                let mut decoder = GzDecoder::new(&body_bytes[..]);
-                let mut decompressed = Vec::new();
-                match decoder.read_to_end(&mut decompressed) {
-                    Ok(_) => {
-                        log::info!("Successfully decompressed gzip content");
-                        decompressed
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to decompress gzip content: {}. Content might already be decompressed by Fastly", e);
-                        // Try using the original bytes
-                        body_bytes
-                    }
-                }
-            }
-            "deflate" => {
-                let mut decoder = ZlibDecoder::new(&body_bytes[..]);
-                let mut decompressed = Vec::new();
-                match decoder.read_to_end(&mut decompressed) {
-                    Ok(_) => {
-                        log::info!("Successfully decompressed deflate content");
-                        decompressed
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to decompress deflate content: {}. Content might already be decompressed by Fastly", e);
-                        // Try using the original bytes
-                        body_bytes
-                    }
-                }
-            }
-            _ => {
-                log::warn!(
-                    "Unsupported content encoding: {}, passing through",
-                    content_encoding
-                );
-                body_bytes
-            }
-        };
-
-        // Try to convert to UTF-8 using lossy conversion to handle more cases
-        let body_str = String::from_utf8_lossy(&decompressed_body);
-
-        // Use the extracted function to perform URL replacement
-        let modified_body = replace_origin_urls(
-            &body_str,
+        // Process the body using streaming approach
+        match process_response_streaming(
+            body,
+            &content_encoding,
             &origin_host,
             &settings.publisher.origin_url,
             &request_host,
             &request_scheme,
-        );
+        ) {
+            Ok(processed_body) => {
+                // Set the processed body back
+                response.set_body(processed_body);
 
-        // Set the modified body back
-        response.set_body(modified_body);
+                // Remove Content-Length as the size has likely changed
+                response.remove_header(header::CONTENT_LENGTH);
 
-        // Remove headers that are no longer valid after modification
-        response.remove_header(header::CONTENT_LENGTH);
-        response.remove_header(header::CONTENT_ENCODING);
+                // Keep Content-Encoding header since we're returning compressed content
+                log::info!(
+                    "Preserved Content-Encoding: {} for compressed response",
+                    content_encoding
+                );
 
-        log::info!("Completed processing response body");
+                log::info!("Completed streaming processing of response body");
+            }
+            Err(e) => {
+                log::error!("Failed to process response body: {:?}", e);
+                // Return an error response
+                return Err(e);
+            }
+        }
     } else {
         log::info!(
             "Skipping response processing - should_process: {}, request_host: '{}'",
@@ -284,62 +386,6 @@ pub fn handle_publisher_request(
     }
 
     Ok(response)
-}
-
-/// Replaces origin URLs in content with request URLs.
-///
-/// This function performs the URL replacement logic used in `handle_publisher_request`.
-/// It replaces both the origin host and full origin URL with their request equivalents.
-///
-/// # Arguments
-///
-/// * `content` - The content to process
-/// * `origin_host` - The origin hostname (e.g., "origin.example.com")
-/// * `origin_url` - The full origin URL (e.g., "https://origin.example.com")
-/// * `request_host` - The request hostname (e.g., "test.example.com")
-/// * `request_scheme` - The request scheme ("http" or "https")
-///
-/// # Returns
-///
-/// The content with all origin references replaced
-pub fn replace_origin_urls(
-    content: &str,
-    origin_host: &str,
-    origin_url: &str,
-    request_host: &str,
-    request_scheme: &str,
-) -> String {
-    let request_url = format!("{}://{}", request_scheme, request_host);
-
-    log::info!("Replacing {} with {}", origin_url, request_url);
-
-    // Start with the content
-    let mut result = content.to_string();
-
-    // Replace full URLs first (more specific)
-    result = result.replace(origin_url, &request_url);
-
-    // Also try with http if origin was https (in case of mixed content)
-    if origin_url.starts_with("https://") {
-        let http_origin_url = origin_url.replace("https://", "http://");
-        result = result.replace(&http_origin_url, &request_url);
-    }
-
-    // Replace protocol-relative URLs (//example.com)
-    let protocol_relative_origin = format!("//{}", origin_host);
-    let protocol_relative_request = format!("//{}", request_host);
-    result = result.replace(&protocol_relative_origin, &protocol_relative_request);
-
-    // Replace host in various contexts
-    // This handles cases like: "host": "origin.example.com" in JSON
-    result = result.replace(origin_host, request_host);
-
-    // Log if replacements were made
-    if result != content {
-        log::debug!("URL replacements made in content");
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -369,121 +415,6 @@ mod tests {
                 server_url: "https://prebid.example.com".to_string(),
             },
         }
-    }
-
-    #[test]
-    fn test_replace_origin_urls() {
-        let test_cases = vec![
-            (
-                // Test HTML content
-                r#"<html>
-                <link rel="stylesheet" href="https://origin.example.com/style.css">
-                <script src="https://origin.example.com/script.js"></script>
-                <a href="https://origin.example.com/page">Link</a>
-                <img src="//origin.example.com/image.jpg">
-                </html>"#,
-                r#"<html>
-                <link rel="stylesheet" href="https://test.example.com/style.css">
-                <script src="https://test.example.com/script.js"></script>
-                <a href="https://test.example.com/page">Link</a>
-                <img src="//test.example.com/image.jpg">
-                </html>"#,
-                "https",
-            ),
-            (
-                // Test JavaScript content
-                r#"const API_URL = 'https://origin.example.com/api';
-                fetch('https://origin.example.com/data')
-                    .then(res => res.json());
-                window.location = 'https://origin.example.com/redirect';"#,
-                r#"const API_URL = 'https://test.example.com/api';
-                fetch('https://test.example.com/data')
-                    .then(res => res.json());
-                window.location = 'https://test.example.com/redirect';"#,
-                "https",
-            ),
-            (
-                // Test CSS content
-                r#".hero {
-                    background: url('https://origin.example.com/hero.jpg');
-                }
-                @import url('https://origin.example.com/fonts.css');"#,
-                r#".hero {
-                    background: url('https://test.example.com/hero.jpg');
-                }
-                @import url('https://test.example.com/fonts.css');"#,
-                "https",
-            ),
-            (
-                // Test JSON API response
-                r#"{
-                    "api_endpoint": "https://origin.example.com/v1",
-                    "assets_url": "https://origin.example.com/assets",
-                    "websocket": "wss://origin.example.com/ws"
-                }"#,
-                r#"{
-                    "api_endpoint": "https://test.example.com/v1",
-                    "assets_url": "https://test.example.com/assets",
-                    "websocket": "wss://test.example.com/ws"
-                }"#,
-                "https",
-            ),
-            (
-                // Test HTTP scheme
-                r#"<a href="http://origin.example.com/page">HTTP Link</a>"#,
-                r#"<a href="http://test.example.com/page">HTTP Link</a>"#,
-                "http",
-            ),
-        ];
-
-        for (input, expected, scheme) in test_cases {
-            let result = replace_origin_urls(
-                input,
-                "origin.example.com",
-                "https://origin.example.com",
-                "test.example.com",
-                scheme,
-            );
-            assert_eq!(result, expected);
-        }
-    }
-
-    #[test]
-    fn test_replace_origin_urls_with_port() {
-        let content = r#"<a href="https://origin.example.com:8080/page">Link</a>"#;
-        let result = replace_origin_urls(
-            content,
-            "origin.example.com:8080",
-            "https://origin.example.com:8080",
-            "test.example.com:9090",
-            "https",
-        );
-        assert_eq!(
-            result,
-            r#"<a href="https://test.example.com:9090/page">Link</a>"#
-        );
-    }
-
-    #[test]
-    fn test_replace_origin_urls_mixed_protocols() {
-        let content = r#"
-            <a href="https://origin.example.com/secure">HTTPS</a>
-            <a href="http://origin.example.com/insecure">HTTP</a>
-            <img src="//origin.example.com/protocol-relative.jpg">
-        "#;
-
-        // When replacing with HTTPS, both http and https URLs are replaced
-        let result = replace_origin_urls(
-            content,
-            "origin.example.com",
-            "https://origin.example.com",
-            "test.example.com",
-            "https",
-        );
-
-        assert!(result.contains("https://test.example.com/secure"));
-        assert!(result.contains("https://test.example.com/insecure")); // HTTP also replaced to HTTPS
-        assert!(result.contains("//test.example.com/protocol-relative.jpg"));
     }
 
     #[test]
@@ -655,73 +586,5 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
-    }
-
-    #[test]
-    fn test_compressed_content_handling() {
-        // Test the overall flow with compressed content
-        // In production, Fastly handles decompression/recompression automatically
-
-        let compressed_html = r#"<html>
-            <link href="https://origin.example.com/style.css" rel="stylesheet">
-            <script src="https://origin.example.com/app.js"></script>
-        </html>"#;
-
-        let expected_html = r#"<html>
-            <link href="https://test.example.com/style.css" rel="stylesheet">
-            <script src="https://test.example.com/app.js"></script>
-        </html>"#;
-
-        let result = replace_origin_urls(
-            compressed_html,
-            "origin.example.com",
-            "https://origin.example.com",
-            "test.example.com",
-            "https",
-        );
-
-        assert_eq!(result, expected_html);
-    }
-
-    #[test]
-    fn test_replace_origin_urls_comprehensive() {
-        // Test comprehensive URL replacement scenarios
-        let content = r#"
-            <!-- Full HTTPS URLs -->
-            <a href="https://origin.example.com/page">Link</a>
-            
-            <!-- HTTP URLs (should be upgraded to request scheme) -->
-            <img src="http://origin.example.com/image.jpg">
-            
-            <!-- Protocol-relative URLs -->
-            <script src="//origin.example.com/script.js"></script>
-            
-            <!-- JSON API responses -->
-            {"api": "https://origin.example.com/api", "host": "origin.example.com"}
-            
-            <!-- URLs in JavaScript -->
-            fetch('https://origin.example.com/data');
-            const host = 'origin.example.com';
-        "#;
-
-        let result = replace_origin_urls(
-            content,
-            "origin.example.com",
-            "https://origin.example.com",
-            "test.example.com",
-            "https",
-        );
-
-        // Verify all replacements
-        assert!(result.contains(r#"href="https://test.example.com/page""#));
-        assert!(result.contains(r#"src="https://test.example.com/image.jpg""#)); // HTTP upgraded
-        assert!(result.contains(r#"src="//test.example.com/script.js""#));
-        assert!(result.contains(r#""api": "https://test.example.com/api""#));
-        assert!(result.contains(r#""host": "test.example.com""#));
-        assert!(result.contains(r#"fetch('https://test.example.com/data')"#));
-        assert!(result.contains(r#"const host = 'test.example.com'"#));
-
-        // Ensure no origin references remain
-        assert!(!result.contains("origin.example.com"));
     }
 }
