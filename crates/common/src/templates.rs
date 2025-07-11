@@ -700,7 +700,7 @@ struct PageContext {
 
 enum DataProvider {
     Permutive(PermutiveConfig),
-    Lotame(LotameConfig), 
+    Lotame(LotameConfig),
     Neustar(NeustarConfig),
     Custom(CustomProviderConfig),
 }
@@ -734,4 +734,3 @@ struct DynamicGamBuilder {
 
 // let context = data_provider_manager.build_context(&user_id, &request_context);
 // let gam_req_with_context = gam_req.with_dynamic_context(context);
-

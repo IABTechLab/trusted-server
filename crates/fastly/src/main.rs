@@ -8,7 +8,9 @@ use std::env;
 
 use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use trusted_server_common::cookies::create_synthetic_cookie;
-use trusted_server_common::gam::{handle_gam_test, handle_gam_golden_url, handle_gam_custom_url, handle_gam_render};
+use trusted_server_common::gam::{
+    handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
+};
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
 };
@@ -17,26 +19,26 @@ use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::privacy::PRIVACY_TEMPLATE;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use trusted_server_common::templates::{HTML_TEMPLATE, GAM_TEST_TEMPLATE};
+use trusted_server_common::templates::{GAM_TEST_TEMPLATE, HTML_TEMPLATE};
 use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
     let settings = Settings::new().unwrap();
-    
+
     // Print Fastly Service Version only once at the beginning
     println!(
         "FASTLY_SERVICE_VERSION: {}",
         std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
     );
-    
+
     // Print User IP address immediately after Fastly Service Version
     let client_ip = req
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     println!("User IP: {}", client_ip);
-    
+
     // Print Settings only once at the beginning
     println!("Settings: {settings:?}");
 

@@ -1,5 +1,5 @@
-use crate::settings::Settings;
 use crate::gdpr::get_consent_from_request;
+use crate::settings::Settings;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use serde_json::json;
@@ -37,7 +37,12 @@ impl GamRequest {
 
         Ok(Self {
             publisher_id: settings.gam.publisher_id.clone(),
-            ad_units: settings.gam.ad_units.iter().map(|u| u.name.clone()).collect(),
+            ad_units: settings
+                .gam
+                .ad_units
+                .iter()
+                .map(|u| u.name.clone())
+                .collect(),
             page_url,
             correlator,
             prmtvctx: None, // Will be set later with captured value
@@ -57,34 +62,46 @@ impl GamRequest {
         // This will be replaced with the actual captured URL from autoblog.com
         // For now, using a template based on the captured Golden URL
         let mut params = HashMap::new();
-        
+
         // Core GAM parameters (based on captured URL)
         params.insert("pvsid".to_string(), "3290837576990024".to_string()); // Publisher Viewability ID
         params.insert("correlator".to_string(), self.correlator.clone());
-        params.insert("eid".to_string(), "31086815,31093089,95353385,31085777,83321072".to_string()); // Event IDs
+        params.insert(
+            "eid".to_string(),
+            "31086815,31093089,95353385,31085777,83321072".to_string(),
+        ); // Event IDs
         params.insert("output".to_string(), "ldjh".to_string()); // Important: not 'json'
         params.insert("gdfp_req".to_string(), "1".to_string());
         params.insert("vrg".to_string(), "202506170101".to_string()); // Version/Region
         params.insert("ptt".to_string(), "17".to_string()); // Page Type
         params.insert("impl".to_string(), "fifs".to_string()); // Implementation
-        
+
         // Ad unit parameters (simplified version of captured format)
-        params.insert("iu_parts".to_string(), format!("{},{},homepage", self.publisher_id, "trustedserver"));
-        params.insert("enc_prev_ius".to_string(), "/0/1/2,/0/1/2,/0/1/2".to_string());
+        params.insert(
+            "iu_parts".to_string(),
+            format!("{},{},homepage", self.publisher_id, "trustedserver"),
+        );
+        params.insert(
+            "enc_prev_ius".to_string(),
+            "/0/1/2,/0/1/2,/0/1/2".to_string(),
+        );
         params.insert("prev_iu_szs".to_string(), "320x50|300x250|728x90|970x90|970x250|1x2,320x50|300x250|728x90|970x90|970x250|1x2,320x50|300x250|728x90|970x90|970x250|1x2".to_string());
         params.insert("fluid".to_string(), "height,height,height".to_string());
-        
+
         // Browser context (simplified)
         params.insert("biw".to_string(), "1512".to_string());
         params.insert("bih".to_string(), "345".to_string());
         params.insert("u_tz".to_string(), "-300".to_string());
         params.insert("u_cd".to_string(), "30".to_string());
         params.insert("u_sd".to_string(), "2".to_string());
-        
+
         // Page context
         params.insert("url".to_string(), self.page_url.clone());
-        params.insert("dt".to_string(), chrono::Utc::now().timestamp_millis().to_string());
-        
+        params.insert(
+            "dt".to_string(),
+            chrono::Utc::now().timestamp_millis().to_string(),
+        );
+
         // Add Permutive context if available (in cust_params like the captured URL)
         if let Some(ref prmtvctx) = self.prmtvctx {
             let cust_params = format!("permutive={}&puid={}", prmtvctx, self.synthetic_id);
@@ -114,7 +131,7 @@ impl GamRequest {
 
         // Create the request
         let mut req = Request::new(Method::GET, &url);
-        
+
         // Set headers to mimic a browser request (using only Fastly-compatible headers)
         req.set_header(header::USER_AGENT, &self.user_agent);
         req.set_header(header::ACCEPT, "application/json, text/plain, */*");
@@ -127,11 +144,14 @@ impl GamRequest {
         // Send the request to the GAM backend
         let backend_name = "gam_backend";
         println!("Sending request to backend: {}", backend_name);
-        
+
         match req.send(backend_name) {
             Ok(mut response) => {
-                println!("Received GAM response with status: {}", response.get_status());
-                
+                println!(
+                    "Received GAM response with status: {}",
+                    response.get_status()
+                );
+
                 // Log response headers for debugging
                 println!("GAM Response headers:");
                 for (name, value) in response.get_headers() {
@@ -144,14 +164,20 @@ impl GamRequest {
                     Ok(body_str) => body_str.to_string(),
                     Err(e) => {
                         println!("Warning: Could not read response body as UTF-8: {:?}", e);
-                        
+
                         // Try to decompress if it's Brotli compressed
                         let mut decompressed = Vec::new();
-                        match brotli::BrotliDecompress(&mut std::io::Cursor::new(&body_bytes), &mut decompressed) {
+                        match brotli::BrotliDecompress(
+                            &mut std::io::Cursor::new(&body_bytes),
+                            &mut decompressed,
+                        ) {
                             Ok(_) => {
                                 match std::str::from_utf8(&decompressed) {
                                     Ok(decompressed_str) => {
-                                        println!("Successfully decompressed Brotli response: {} bytes", decompressed_str.len());
+                                        println!(
+                                            "Successfully decompressed Brotli response: {} bytes",
+                                            decompressed_str.len()
+                                        );
                                         decompressed_str.to_string()
                                     }
                                     Err(e2) => {
@@ -170,7 +196,7 @@ impl GamRequest {
                 };
 
                 println!("GAM Response body length: {} bytes", body.len());
-                
+
                 // For debugging, log first 500 chars of response
                 if body.len() > 500 {
                     println!("GAM Response preview: {}...", &body[..500]);
@@ -211,7 +237,10 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     let advertising_consent = consent.advertising;
 
     println!("GAM Test - Consent from cookie: {:?}", consent);
-    println!("GAM Test - Advertising consent from cookie: {}", advertising_consent);
+    println!(
+        "GAM Test - Advertising consent from cookie: {}",
+        advertising_consent
+    );
 
     // Also check header as fallback
     let header_consent = req
@@ -220,7 +249,10 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    println!("GAM Test - Advertising consent from header: {}", header_consent);
+    println!(
+        "GAM Test - Advertising consent from header: {}",
+        header_consent
+    );
 
     // Use cookie consent as primary, header as fallback
     let final_consent = advertising_consent || header_consent;
@@ -261,7 +293,10 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     // This will be replaced with the actual value from autoblog.com
     let gam_req_with_context = gam_req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string());
 
-    println!("Sending GAM request with correlator: {}", gam_req_with_context.correlator);
+    println!(
+        "Sending GAM request with correlator: {}",
+        gam_req_with_context.correlator
+    );
 
     match gam_req_with_context.send_request(settings).await {
         Ok(response) => {
@@ -283,7 +318,7 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
 /// Handle GAM golden URL replay (for testing captured requests)
 pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Result<Response, Error> {
     println!("Handling GAM golden URL replay");
-    
+
     // This endpoint will be used to test the exact captured URL from autoblog.com
     // For now, return a placeholder response
     Ok(Response::from_status(StatusCode::OK)
@@ -300,13 +335,16 @@ pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Resul
 }
 
 /// Handle GAM custom URL testing (for testing captured URLs directly)
-pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Result<Response, Error> {
+pub async fn handle_gam_custom_url(
+    _settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Error> {
     println!("Handling GAM custom URL test");
-    
+
     // Check consent status from cookie
     let consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = consent.advertising;
-    
+
     if !advertising_consent {
         return Ok(Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
@@ -315,39 +353,45 @@ pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Re
                 "message": "GAM requests require advertising consent"
             }))?);
     }
-    
+
     // Parse the request body to get the custom URL
     let body = req.take_body_str();
-    let url_data: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| {
-            println!("Error parsing request body: {:?}", e);
-            fastly::Error::msg("Invalid JSON in request body")
-        })?;
-    
-    let custom_url = url_data["url"].as_str()
+    let url_data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        println!("Error parsing request body: {:?}", e);
+        fastly::Error::msg("Invalid JSON in request body")
+    })?;
+
+    let custom_url = url_data["url"]
+        .as_str()
         .ok_or_else(|| fastly::Error::msg("Missing 'url' field in request body"))?;
-    
+
     println!("Testing custom GAM URL: {}", custom_url);
-    
+
     // Create a request to the custom URL
     let mut gam_req = Request::new(Method::GET, custom_url);
-    
+
     // Set headers to mimic a browser request
-    gam_req.set_header(header::USER_AGENT, "Mozilla/5.0 (compatible; TrustedServer/1.0)");
+    gam_req.set_header(
+        header::USER_AGENT,
+        "Mozilla/5.0 (compatible; TrustedServer/1.0)",
+    );
     gam_req.set_header(header::ACCEPT, "application/json, text/plain, */*");
     gam_req.set_header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
     gam_req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br");
     gam_req.set_header(header::REFERER, "https://www.autoblog.com/");
     gam_req.set_header(header::ORIGIN, "https://www.autoblog.com");
-    
+
     // Send the request to the GAM backend
     let backend_name = "gam_backend";
     println!("Sending custom URL request to backend: {}", backend_name);
-    
+
     match gam_req.send(backend_name) {
         Ok(mut response) => {
-            println!("Received GAM response with status: {}", response.get_status());
-            
+            println!(
+                "Received GAM response with status: {}",
+                response.get_status()
+            );
+
             // Log response headers for debugging
             println!("GAM Response headers:");
             for (name, value) in response.get_headers() {
@@ -360,22 +404,29 @@ pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Re
                 Ok(body_str) => body_str.to_string(),
                 Err(e) => {
                     println!("Warning: Could not read response body as UTF-8: {:?}", e);
-                    
+
                     // Try to decompress if it's Brotli compressed
                     let mut decompressed = Vec::new();
-                    match brotli::BrotliDecompress(&mut std::io::Cursor::new(&body_bytes), &mut decompressed) {
-                        Ok(_) => {
-                            match std::str::from_utf8(&decompressed) {
-                                Ok(decompressed_str) => {
-                                    println!("Successfully decompressed Brotli response: {} bytes", decompressed_str.len());
-                                    decompressed_str.to_string()
-                                }
-                                Err(e2) => {
-                                    println!("Warning: Could not read decompressed body as UTF-8: {:?}", e2);
-                                    format!("{{\"error\": \"decompression_failed\", \"message\": \"Could not decode decompressed response\", \"original_error\": \"{:?}\"}}", e2)
-                                }
+                    match brotli::BrotliDecompress(
+                        &mut std::io::Cursor::new(&body_bytes),
+                        &mut decompressed,
+                    ) {
+                        Ok(_) => match std::str::from_utf8(&decompressed) {
+                            Ok(decompressed_str) => {
+                                println!(
+                                    "Successfully decompressed Brotli response: {} bytes",
+                                    decompressed_str.len()
+                                );
+                                decompressed_str.to_string()
                             }
-                        }
+                            Err(e2) => {
+                                println!(
+                                    "Warning: Could not read decompressed body as UTF-8: {:?}",
+                                    e2
+                                );
+                                format!("{{\"error\": \"decompression_failed\", \"message\": \"Could not decode decompressed response\", \"original_error\": \"{:?}\"}}", e2)
+                            }
+                        },
                         Err(e2) => {
                             println!("Warning: Could not decompress Brotli response: {:?}", e2);
                             // Return a placeholder since we can't parse the binary response
@@ -386,7 +437,7 @@ pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Re
             };
 
             println!("GAM Response body length: {} bytes", body.len());
-            
+
             Ok(Response::from_status(response.get_status())
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_header(header::CACHE_CONTROL, "no-store, private")
@@ -413,16 +464,16 @@ pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Re
                 }))?)
         }
     }
-} 
+}
 
 /// Handle GAM response rendering in iframe
 pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Response, Error> {
     println!("Handling GAM response rendering");
-    
+
     // Check consent status from cookie
     let consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = consent.advertising;
-    
+
     if !advertising_consent {
         return Ok(Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
@@ -431,7 +482,7 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
                 "message": "GAM requests require advertising consent"
             }))?);
     }
-    
+
     // Create GAM request and get response
     let gam_req = match GamRequest::new(settings, &req) {
         Ok(req) => req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string()),
@@ -461,10 +512,10 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
     // Parse the GAM response to extract HTML
     let response_body = gam_response.into_body_str();
     println!("Parsing GAM response for HTML extraction");
-    
+
     // The GAM response format is: {"/ad_unit_path":["html",0,null,null,0,90,728,0,0,null,null,null,null,null,[...],null,null,null,null,null,null,null,0,null,null,null,null,null,null,"creative_id","line_item_id"],"<!doctype html>..."}
     // We need to extract the HTML part after the JSON array
-    
+
     let html_content = if response_body.contains("<!doctype html>") {
         // Find the start of HTML content
         if let Some(html_start) = response_body.find("<!doctype html>") {
@@ -477,8 +528,10 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
         }
     } else {
         // Fallback: return the raw response in a safe HTML wrapper
-        format!("<html><body><p>GAM Response (no HTML found):</p><pre>{}</pre></body></html>", 
-               response_body.chars().take(1000).collect::<String>())
+        format!(
+            "<html><body><p>GAM Response (no HTML found):</p><pre>{}</pre></body></html>",
+            response_body.chars().take(1000).collect::<String>()
+        )
     };
 
     // Create a safe HTML page that renders the ad content in an iframe
@@ -621,4 +674,4 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
         .with_header("X-Synthetic-ID", &gam_req.synthetic_id)
         .with_header("X-Correlator", &gam_req.correlator)
         .with_body(render_page))
-} 
+}
