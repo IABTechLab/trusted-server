@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -479,6 +481,21 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
         </div>
 
         <div class="phase">
+            <h3>Phase 3: Ad Rendering in iFrame</h3>
+            <p>Render the GAM response HTML content in a sandboxed iframe for visual testing.</p>
+            
+            <div class="test-section">
+                <h4>Ad Render Test</h4>
+                <p>Test rendering the GAM response as an actual ad in an iframe:</p>
+                <button onclick="testAdRender()">🎯 Render Ad in iFrame</button>
+                <button onclick="window.open('/gam-render', '_blank')">🔄 Open Render Page</button>
+                <div id="renderResult" class="status info" style="display: none;">
+                    Opening ad render page in new tab...
+                </div>
+            </div>
+        </div>
+
+        <div class="phase">
             <h3>Debug Information</h3>
             <div class="test-section">
                 <h4>Request Headers</h4>
@@ -592,11 +609,63 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
                     }
                 });
                 
-                const data = await response.json();
+                // Get the response as text first (since it contains both JSON and HTML)
+                const responseText = await response.text();
+                
+                // Try to parse as JSON first (in case it's a pure JSON response)
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch (jsonError) {
+                    // If JSON parsing fails, it's likely the mixed JSON+HTML format
+                    // Find the end of the JSON part (before the HTML starts)
+                    const htmlStart = responseText.indexOf('<!doctype html>');
+                    if (htmlStart !== -1) {
+                        // Extract just the JSON part
+                        const jsonPart = responseText.substring(0, htmlStart);
+                        try {
+                            data = JSON.parse(jsonPart);
+                            // Add info about the HTML part
+                            data.html_content_length = responseText.length - htmlStart;
+                            data.full_response_length = responseText.length;
+                        } catch (innerError) {
+                            // If we still can't parse JSON, show the raw response
+                            data = {
+                                error: 'Could not parse GAM response as JSON',
+                                raw_response_preview: responseText.substring(0, 500) + '...',
+                                response_length: responseText.length
+                            };
+                        }
+                    } else {
+                        // No HTML found, show the raw response
+                        data = {
+                            error: 'Unexpected response format',
+                            raw_response: responseText,
+                            response_length: responseText.length
+                        };
+                    }
+                }
+                
                 resultDiv.textContent = JSON.stringify(data, null, 2);
             } catch (error) {
                 resultDiv.textContent = 'Error: ' + error.message;
             }
+        }
+
+        // Test ad rendering in iframe
+        async function testAdRender() {
+            const resultDiv = document.getElementById('renderResult');
+            resultDiv.style.display = 'block';
+            resultDiv.textContent = 'Opening ad render page in new tab...';
+            
+            // Open the render page in a new tab
+            window.open('/gam-render', '_blank');
+            
+            // Update the result message
+            setTimeout(() => {
+                resultDiv.textContent = 'Ad render page opened in new tab. Check the new tab to see the rendered ad!';
+                resultDiv.className = 'status success';
+            }, 1000);
         }
 
         // Initialize page
@@ -608,3 +677,61 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
 </body>
 </html>
 "#;
+// GAM Configuration Template
+struct GamConfigTemplate {
+    publisher_id: String,
+    ad_units: Vec<AdUnitConfig>,
+    page_context: PageContext,
+    data_providers: Vec<DataProvider>,
+}
+
+struct AdUnitConfig {
+    name: String,
+    sizes: Vec<String>,
+    position: String,
+    targeting: HashMap<String, String>,
+}
+
+struct PageContext {
+    page_type: String,
+    section: String,
+    keywords: Vec<String>,
+}
+
+enum DataProvider {
+    Permutive(PermutiveConfig),
+    Lotame(LotameConfig), 
+    Neustar(NeustarConfig),
+    Custom(CustomProviderConfig),
+}
+
+struct PermutiveConfig {}
+struct LotameConfig {}
+struct NeustarConfig {}
+struct CustomProviderConfig {}
+
+trait DataProviderTrait {
+    fn get_user_segments(&self, user_id: &str) -> Vec<String>;
+}
+
+struct RequestContext {
+    user_id: String,
+    page_url: String,
+    consent_status: bool,
+}
+
+struct DynamicGamBuilder {
+    base_config: GamConfigTemplate,
+    context: RequestContext,
+    data_providers: Vec<Box<dyn DataProviderTrait>>,
+}
+
+// Instead of hardcoded strings, use templates:
+// "cust_params": "{{#each data_providers}}{{name}}={{segments}}&{{/each}}puid={{user_id}}"
+
+// This could generate:
+// "permutive=129627,137412...&lotame=segment1,segment2&puid=abc123"
+
+// let context = data_provider_manager.build_context(&user_id, &request_context);
+// let gam_req_with_context = gam_req.with_dynamic_context(context);
+

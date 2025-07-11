@@ -8,7 +8,7 @@ use std::env;
 
 use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
 use trusted_server_common::cookies::create_synthetic_cookie;
-use trusted_server_common::gam::{handle_gam_test, handle_gam_golden_url, handle_gam_custom_url};
+use trusted_server_common::gam::{handle_gam_test, handle_gam_golden_url, handle_gam_custom_url, handle_gam_render};
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request,
 };
@@ -48,6 +48,7 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
             (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
             (&Method::POST, "/gam-test-custom-url") => handle_gam_custom_url(&settings, req).await,
+            (&Method::GET, "/gam-render") => handle_gam_render(&settings, req).await,
             (&Method::GET, "/gam-test-page") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(GAM_TEST_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")

@@ -300,7 +300,7 @@ pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Resul
 }
 
 /// Handle GAM custom URL testing (for testing captured URLs directly)
-pub async fn handle_gam_custom_url(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+pub async fn handle_gam_custom_url(_settings: &Settings, mut req: Request) -> Result<Response, Error> {
     println!("Handling GAM custom URL test");
     
     // Check consent status from cookie
@@ -413,4 +413,212 @@ pub async fn handle_gam_custom_url(settings: &Settings, mut req: Request) -> Res
                 }))?)
         }
     }
+} 
+
+/// Handle GAM response rendering in iframe
+pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Response, Error> {
+    println!("Handling GAM response rendering");
+    
+    // Check consent status from cookie
+    let consent = get_consent_from_request(&req).unwrap_or_default();
+    let advertising_consent = consent.advertising;
+    
+    if !advertising_consent {
+        return Ok(Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_body_json(&json!({
+                "error": "No advertising consent",
+                "message": "GAM requests require advertising consent"
+            }))?);
+    }
+    
+    // Create GAM request and get response
+    let gam_req = match GamRequest::new(settings, &req) {
+        Ok(req) => req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string()),
+        Err(e) => {
+            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Failed to create GAM request",
+                    "details": format!("{:?}", e)
+                }))?);
+        }
+    };
+
+    // Get GAM response
+    let gam_response = match gam_req.send_request(settings).await {
+        Ok(response) => response,
+        Err(e) => {
+            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Failed to get GAM response",
+                    "details": format!("{:?}", e)
+                }))?);
+        }
+    };
+
+    // Parse the GAM response to extract HTML
+    let response_body = gam_response.into_body_str();
+    println!("Parsing GAM response for HTML extraction");
+    
+    // The GAM response format is: {"/ad_unit_path":["html",0,null,null,0,90,728,0,0,null,null,null,null,null,[...],null,null,null,null,null,null,null,0,null,null,null,null,null,null,"creative_id","line_item_id"],"<!doctype html>..."}
+    // We need to extract the HTML part after the JSON array
+    
+    let html_content = if response_body.contains("<!doctype html>") {
+        // Find the start of HTML content
+        if let Some(html_start) = response_body.find("<!doctype html>") {
+            let html = &response_body[html_start..];
+            println!("Extracted HTML content: {} bytes", html.len());
+            html.to_string()
+        } else {
+            format!("<html><body><p>Error: Could not find HTML content in GAM response</p><pre>{}</pre></body></html>", 
+                   response_body.chars().take(500).collect::<String>())
+        }
+    } else {
+        // Fallback: return the raw response in a safe HTML wrapper
+        format!("<html><body><p>GAM Response (no HTML found):</p><pre>{}</pre></body></html>", 
+               response_body.chars().take(1000).collect::<String>())
+    };
+
+    // Create a safe HTML page that renders the ad content in an iframe
+    let render_page = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GAM Ad Render Test</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #eee;
+        }}
+        .ad-frame {{
+            width: 100%;
+            min-height: 600px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            background: white;
+        }}
+        .controls {{
+            margin: 20px 0;
+            text-align: center;
+        }}
+        .btn {{
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 10px;
+        }}
+        .btn:hover {{
+            background: #0056b3;
+        }}
+        .info {{
+            background: #e9ecef;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }}
+        .debug {{
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 20px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 GAM Ad Render Test</h1>
+            <p>Rendering Google Ad Manager response in iframe</p>
+        </div>
+        
+        <div class="info">
+            <strong>Status:</strong> Ad content loaded successfully<br>
+            <strong>Response Size:</strong> {} bytes<br>
+            <strong>Timestamp:</strong> {}
+        </div>
+        
+        <div class="controls">
+            <button class="btn" onclick="refreshAd()">🔄 Refresh Ad</button>
+            <button class="btn" onclick="toggleDebug()">🐛 Toggle Debug</button>
+            <button class="btn" onclick="window.location.href='/gam-test-page'">← Back to Test Page</button>
+        </div>
+        
+        <iframe 
+            id="adFrame" 
+            class="ad-frame" 
+            srcdoc="{}"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
+            title="GAM Ad Content">
+        </iframe>
+        
+        <div id="debugInfo" class="debug" style="display: none;">
+            <strong>Debug Info:</strong><br>
+            <strong>HTML Content Length:</strong> {} characters<br>
+            <strong>HTML Preview:</strong><br>
+            <pre>{}</pre>
+        </div>
+    </div>
+    
+    <script>
+        function refreshAd() {{
+            // Reload the entire page to get a fresh GAM request
+            window.location.reload();
+        }}
+        
+        function toggleDebug() {{
+            const debug = document.getElementById('debugInfo');
+            if (debug.style.display === 'none' || debug.style.display === '') {{
+                debug.style.display = 'block';
+            }} else {{
+                debug.style.display = 'none';
+            }}
+        }}
+        
+        // Auto-refresh every 30 seconds for testing
+        setInterval(refreshAd, 30000);
+    </script>
+</body>
+</html>"#,
+        html_content.len(),
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        html_content.replace("\"", "&quot;").replace("'", "&#39;"),
+        html_content.len(),
+        html_content.chars().take(200).collect::<String>()
+    );
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .with_header("X-GAM-Render", "true")
+        .with_header("X-Synthetic-ID", &gam_req.synthetic_id)
+        .with_header("X-Correlator", &gam_req.correlator)
+        .with_body(render_page))
 } 
