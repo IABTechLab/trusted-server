@@ -48,7 +48,7 @@ fn main(req: Request) -> Result<Response, Error> {
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    println!("User IP: {}", client_ip);
+    log::info!("User IP: {}", client_ip);
 
     futures::executor::block_on(async {
         log::info!(

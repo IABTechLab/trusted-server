@@ -127,7 +127,7 @@ impl GamRequest {
     /// Send the GAM request and return the response
     pub async fn send_request(&self, _settings: &Settings) -> Result<Response, Error> {
         let url = self.build_golden_url();
-        println!("Sending GAM request to: {}", url);
+        log::info!("Sending GAM request to: {}", url);
 
         // Create the request
         let mut req = Request::new(Method::GET, &url);
@@ -143,19 +143,19 @@ impl GamRequest {
 
         // Send the request to the GAM backend
         let backend_name = "gam_backend";
-        println!("Sending request to backend: {}", backend_name);
+        log::info!("Sending request to backend: {}", backend_name);
 
         match req.send(backend_name) {
             Ok(mut response) => {
-                println!(
+                log::info!(
                     "Received GAM response with status: {}",
                     response.get_status()
                 );
 
                 // Log response headers for debugging
-                println!("GAM Response headers:");
+                log::debug!("GAM Response headers:");
                 for (name, value) in response.get_headers() {
-                    println!("  {}: {:?}", name, value);
+                    log::debug!("  {}: {:?}", name, value);
                 }
 
                 // Handle response body safely
@@ -163,7 +163,7 @@ impl GamRequest {
                 let body = match std::str::from_utf8(&body_bytes) {
                     Ok(body_str) => body_str.to_string(),
                     Err(e) => {
-                        println!("Warning: Could not read response body as UTF-8: {:?}", e);
+                        log::warn!("Could not read response body as UTF-8: {:?}", e);
 
                         // Try to decompress if it's Brotli compressed
                         let mut decompressed = Vec::new();
@@ -171,23 +171,24 @@ impl GamRequest {
                             &mut std::io::Cursor::new(&body_bytes),
                             &mut decompressed,
                         ) {
-                            Ok(_) => {
-                                match std::str::from_utf8(&decompressed) {
-                                    Ok(decompressed_str) => {
-                                        println!(
-                                            "Successfully decompressed Brotli response: {} bytes",
-                                            decompressed_str.len()
-                                        );
-                                        decompressed_str.to_string()
-                                    }
-                                    Err(e2) => {
-                                        println!("Warning: Could not read decompressed body as UTF-8: {:?}", e2);
-                                        format!("{{\"error\": \"decompression_failed\", \"message\": \"Could not decode decompressed response\", \"original_error\": \"{:?}\"}}", e2)
-                                    }
+                            Ok(_) => match std::str::from_utf8(&decompressed) {
+                                Ok(decompressed_str) => {
+                                    log::debug!(
+                                        "Successfully decompressed Brotli response: {} bytes",
+                                        decompressed_str.len()
+                                    );
+                                    decompressed_str.to_string()
                                 }
-                            }
+                                Err(e2) => {
+                                    log::warn!(
+                                        "Could not read decompressed body as UTF-8: {:?}",
+                                        e2
+                                    );
+                                    format!("{{\"error\": \"decompression_failed\", \"message\": \"Could not decode decompressed response\", \"original_error\": \"{:?}\"}}", e2)
+                                }
+                            },
                             Err(e2) => {
-                                println!("Warning: Could not decompress Brotli response: {:?}", e2);
+                                log::warn!("Could not decompress Brotli response: {:?}", e2);
                                 // Return a placeholder since we can't parse the binary response
                                 format!("{{\"error\": \"compression_failed\", \"message\": \"Could not decompress response\", \"original_error\": \"{:?}\"}}", e2)
                             }
@@ -195,13 +196,13 @@ impl GamRequest {
                     }
                 };
 
-                println!("GAM Response body length: {} bytes", body.len());
+                log::debug!("GAM Response body length: {} bytes", body.len());
 
                 // For debugging, log first 500 chars of response
                 if body.len() > 500 {
-                    println!("GAM Response preview: {}...", &body[..500]);
+                    log::debug!("GAM Response preview: {}...", &body[..500]);
                 } else {
-                    println!("GAM Response: {}", body);
+                    log::debug!("GAM Response: {}", body);
                 }
 
                 Ok(Response::from_status(response.get_status())
@@ -215,7 +216,7 @@ impl GamRequest {
                     .with_body(body))
             }
             Err(e) => {
-                println!("Error sending GAM request: {:?}", e);
+                log::error!("Error sending GAM request: {:?}", e);
                 Err(e.into())
             }
         }
@@ -224,20 +225,20 @@ impl GamRequest {
 
 /// Handle GAM test requests (Phase 1: Capture & Replay)
 pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Response, Error> {
-    println!("Starting GAM test request handling");
+    log::info!("Starting GAM test request handling");
 
     // Debug: Log all request headers
-    println!("GAM Test - All request headers:");
+    log::debug!("GAM Test - All request headers:");
     for (name, value) in req.get_headers() {
-        println!("  {}: {:?}", name, value);
+        log::debug!("  {}: {:?}", name, value);
     }
 
     // Check consent status from cookie (more reliable than header)
     let consent = get_consent_from_request(&req).unwrap_or_default();
     let advertising_consent = consent.advertising;
 
-    println!("GAM Test - Consent from cookie: {:?}", consent);
-    println!(
+    log::debug!("GAM Test - Consent from cookie: {:?}", consent);
+    log::debug!(
         "GAM Test - Advertising consent from cookie: {}",
         advertising_consent
     );
@@ -249,14 +250,14 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    println!(
+    log::debug!(
         "GAM Test - Advertising consent from header: {}",
         header_consent
     );
 
     // Use cookie consent as primary, header as fallback
     let final_consent = advertising_consent || header_consent;
-    println!("GAM Test - Final advertising consent: {}", final_consent);
+    log::info!("GAM Test - Final advertising consent: {}", final_consent);
 
     if !final_consent {
         return Ok(Response::from_status(StatusCode::OK)
@@ -275,11 +276,11 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     // Create GAM request
     let gam_req = match GamRequest::new(settings, &req) {
         Ok(req) => {
-            println!("Successfully created GAM request");
+            log::info!("Successfully created GAM request");
             req
         }
         Err(e) => {
-            println!("Error creating GAM request: {:?}", e);
+            log::error!("Error creating GAM request: {:?}", e);
             return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
@@ -293,18 +294,18 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     // This will be replaced with the actual value from autoblog.com
     let gam_req_with_context = gam_req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string());
 
-    println!(
+    log::info!(
         "Sending GAM request with correlator: {}",
         gam_req_with_context.correlator
     );
 
     match gam_req_with_context.send_request(settings).await {
         Ok(response) => {
-            println!("GAM request successful");
+            log::info!("GAM request successful");
             Ok(response)
         }
         Err(e) => {
-            println!("GAM request failed: {:?}", e);
+            log::error!("GAM request failed: {:?}", e);
             Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
@@ -317,7 +318,7 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
 
 /// Handle GAM golden URL replay (for testing captured requests)
 pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Result<Response, Error> {
-    println!("Handling GAM golden URL replay");
+    log::info!("Handling GAM golden URL replay");
 
     // This endpoint will be used to test the exact captured URL from autoblog.com
     // For now, return a placeholder response
@@ -339,7 +340,7 @@ pub async fn handle_gam_custom_url(
     _settings: &Settings,
     mut req: Request,
 ) -> Result<Response, Error> {
-    println!("Handling GAM custom URL test");
+    log::info!("Handling GAM custom URL test");
 
     // Check consent status from cookie
     let consent = get_consent_from_request(&req).unwrap_or_default();
@@ -357,7 +358,7 @@ pub async fn handle_gam_custom_url(
     // Parse the request body to get the custom URL
     let body = req.take_body_str();
     let url_data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-        println!("Error parsing request body: {:?}", e);
+        log::error!("Error parsing request body: {:?}", e);
         fastly::Error::msg("Invalid JSON in request body")
     })?;
 
@@ -365,7 +366,7 @@ pub async fn handle_gam_custom_url(
         .as_str()
         .ok_or_else(|| fastly::Error::msg("Missing 'url' field in request body"))?;
 
-    println!("Testing custom GAM URL: {}", custom_url);
+    log::info!("Testing custom GAM URL: {}", custom_url);
 
     // Create a request to the custom URL
     let mut gam_req = Request::new(Method::GET, custom_url);
@@ -383,19 +384,19 @@ pub async fn handle_gam_custom_url(
 
     // Send the request to the GAM backend
     let backend_name = "gam_backend";
-    println!("Sending custom URL request to backend: {}", backend_name);
+    log::info!("Sending custom URL request to backend: {}", backend_name);
 
     match gam_req.send(backend_name) {
         Ok(mut response) => {
-            println!(
+            log::info!(
                 "Received GAM response with status: {}",
                 response.get_status()
             );
 
             // Log response headers for debugging
-            println!("GAM Response headers:");
+            log::debug!("GAM Response headers:");
             for (name, value) in response.get_headers() {
-                println!("  {}: {:?}", name, value);
+                log::debug!("  {}: {:?}", name, value);
             }
 
             // Handle response body safely
@@ -403,7 +404,7 @@ pub async fn handle_gam_custom_url(
             let body = match std::str::from_utf8(&body_bytes) {
                 Ok(body_str) => body_str.to_string(),
                 Err(e) => {
-                    println!("Warning: Could not read response body as UTF-8: {:?}", e);
+                    log::warn!("Could not read response body as UTF-8: {:?}", e);
 
                     // Try to decompress if it's Brotli compressed
                     let mut decompressed = Vec::new();
@@ -413,22 +414,19 @@ pub async fn handle_gam_custom_url(
                     ) {
                         Ok(_) => match std::str::from_utf8(&decompressed) {
                             Ok(decompressed_str) => {
-                                println!(
+                                log::debug!(
                                     "Successfully decompressed Brotli response: {} bytes",
                                     decompressed_str.len()
                                 );
                                 decompressed_str.to_string()
                             }
                             Err(e2) => {
-                                println!(
-                                    "Warning: Could not read decompressed body as UTF-8: {:?}",
-                                    e2
-                                );
+                                log::warn!("Could not read decompressed body as UTF-8: {:?}", e2);
                                 format!("{{\"error\": \"decompression_failed\", \"message\": \"Could not decode decompressed response\", \"original_error\": \"{:?}\"}}", e2)
                             }
                         },
                         Err(e2) => {
-                            println!("Warning: Could not decompress Brotli response: {:?}", e2);
+                            log::warn!("Could not decompress Brotli response: {:?}", e2);
                             // Return a placeholder since we can't parse the binary response
                             format!("{{\"error\": \"compression_failed\", \"message\": \"Could not decompress response\", \"original_error\": \"{:?}\"}}", e2)
                         }
@@ -436,7 +434,7 @@ pub async fn handle_gam_custom_url(
                 }
             };
 
-            println!("GAM Response body length: {} bytes", body.len());
+            log::debug!("GAM Response body length: {} bytes", body.len());
 
             Ok(Response::from_status(response.get_status())
                 .with_header(header::CONTENT_TYPE, "application/json")
@@ -454,7 +452,7 @@ pub async fn handle_gam_custom_url(
                 }))?)
         }
         Err(e) => {
-            println!("Error sending custom GAM request: {:?}", e);
+            log::error!("Error sending custom GAM request: {:?}", e);
             Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
@@ -468,7 +466,7 @@ pub async fn handle_gam_custom_url(
 
 /// Handle GAM response rendering in iframe
 pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Response, Error> {
-    println!("Handling GAM response rendering");
+    log::info!("Handling GAM response rendering");
 
     // Check consent status from cookie
     let consent = get_consent_from_request(&req).unwrap_or_default();
@@ -511,7 +509,7 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
 
     // Parse the GAM response to extract HTML
     let response_body = gam_response.into_body_str();
-    println!("Parsing GAM response for HTML extraction");
+    log::info!("Parsing GAM response for HTML extraction");
 
     // The GAM response format is: {"/ad_unit_path":["html",0,null,null,0,90,728,0,0,null,null,null,null,null,[...],null,null,null,null,null,null,null,0,null,null,null,null,null,null,"creative_id","line_item_id"],"<!doctype html>..."}
     // We need to extract the HTML part after the JSON array
@@ -520,7 +518,7 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
         // Find the start of HTML content
         if let Some(html_start) = response_body.find("<!doctype html>") {
             let html = &response_body[html_start..];
-            println!("Extracted HTML content: {} bytes", html.len());
+            log::debug!("Extracted HTML content: {} bytes", html.len());
             html.to_string()
         } else {
             format!("<html><body><p>Error: Could not find HTML content in GAM response</p><pre>{}</pre></body></html>", 
