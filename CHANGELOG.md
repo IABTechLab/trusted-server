@@ -26,6 +26,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - in case of vulnerabilities
 
+## [Unreleased]
+
+### Added
+- Added basic unit tests
+- Added publisher config
+- Add AI assist rules. Based on https://github.com/hashintel/hash
+
+### Changed
+- Upgrade to rust 1.87.0
+- Upgrade to fastly-cli 11.3.0
+- Changed to use constants for headers
+- Changed to use log statements
+- Updated fastly.toml for local development
+- Changed to propagate server errors as HTTP errors
+
+### Fixed
+- Rebuild when `TRUSTED_SERVER__*` env variables change 
+
+### Fixed
+- Rebuild when `TRUSTED_SERVER__*` env variables change 
+
 ## [1.0.6] - 2025-05-29
 
 ### Changed
@@ -44,7 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Implemented GDPR consent for creating and passing synth headers
-
 
 ## [1.0.4] - 2025-04-29
 
@@ -76,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial implementation of Trusted Server
 
-[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.0.5...HEAD
+[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.0.6...HEAD
+[1.0.6]:https://github.com/IABTechLab/trusted-server/compare/v1.0.5...v1.0.6
 [1.0.5]:https://github.com/IABTechLab/trusted-server/compare/v1.0.4...v1.0.5
 [1.0.4]:https://github.com/IABTechLab/trusted-server/compare/v1.0.3...v1.0.4
 [1.0.3]:https://github.com/IABTechLab/trusted-server/compare/v1.0.2...v1.0.3

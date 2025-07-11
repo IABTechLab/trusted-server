@@ -1,18 +1,28 @@
+use std::env;
+
 use fastly::geo::geo_lookup;
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
 use log::LevelFilter::Info;
 use serde_json::json;
-use std::env;
 
-use trusted_server_common::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+mod error;
+use crate::error::to_error_response;
+
+use trusted_server_common::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
+    HEADER_X_CONSENT_ADVERTISING, HEADER_X_FORWARDED_FOR, HEADER_X_GEO_CITY,
+    HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
+};
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::gam::{
     handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
 };
+// Note: TrustedServerError is used internally by the common crate
 use trusted_server_common::gdpr::{
-    get_consent_from_request, handle_consent_request, handle_data_subject_request,
+    get_consent_from_request, handle_consent_request, handle_data_subject_request, GdprConsent,
 };
 use trusted_server_common::models::AdResponse;
 use trusted_server_common::prebid::PrebidRequest;
@@ -24,25 +34,29 @@ use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    let settings = Settings::new().unwrap();
 
-    // Print Fastly Service Version only once at the beginning
-    println!(
-        "FASTLY_SERVICE_VERSION: {}",
-        std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
-    );
-
-    // Print User IP address immediately after Fastly Service Version
+    // Print Settings only once at the beginning
+    let settings = match Settings::new() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to load settings: {:?}", e);
+            return Ok(to_error_response(e));
+        }
+    };
+    log::info!("Settings {settings:?}");
+  // Print User IP address immediately after Fastly Service Version 
     let client_ip = req
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     println!("User IP: {}", client_ip);
-
-    // Print Settings only once at the beginning
-    println!("Settings: {settings:?}");
-
+  
     futures::executor::block_on(async {
+        log::info!(
+            "FASTLY_SERVICE_VERSION: {}",
+            std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
+        );
+
         match (req.get_method(), req.get_path()) {
             (&Method::GET, "/") => handle_main_page(&settings, req),
             (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
@@ -62,81 +76,101 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/privacy-policy") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(PRIVACY_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
             (&Method::GET, "/why-trusted-server") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(WHY_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
             _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
                 .with_body("Not Found")
                 .with_header(header::CONTENT_TYPE, "text/plain")
-                .with_header("x-compress-hint", "on")),
+                .with_header(HEADER_X_COMPRESS_HINT, "on")),
         }
     })
 }
 
 fn get_dma_code(req: &mut Request) -> Option<String> {
     // Debug: Check if we're running in Fastly environment
-    println!("Fastly Environment Check:");
-    println!(
+    log::info!("Fastly Environment Check:");
+    log::info!(
         "  FASTLY_POP: {}",
         std::env::var("FASTLY_POP").unwrap_or_else(|_| "not in Fastly".to_string())
     );
-    println!(
+    log::info!(
         "  FASTLY_REGION: {}",
         std::env::var("FASTLY_REGION").unwrap_or_else(|_| "not in Fastly".to_string())
     );
 
     // Get detailed geo information using geo_lookup
     if let Some(geo) = req.get_client_ip_addr().and_then(geo_lookup) {
-        println!("Geo Information Found:");
+        log::info!("Geo Information Found:");
 
         // Set all available geo information in headers
         let city = geo.city();
-        req.set_header("X-Geo-City", city);
-        println!("  City: {}", city);
+        req.set_header(HEADER_X_GEO_CITY, city);
+        log::info!("  City: {}", city);
 
         let country = geo.country_code();
-        req.set_header("X-Geo-Country", country);
-        println!("  Country: {}", country);
+        req.set_header(HEADER_X_GEO_COUNTRY, country);
+        log::info!("  Country: {}", country);
 
-        req.set_header("X-Geo-Continent", format!("{:?}", geo.continent()));
-        println!("  Continent: {:?}", geo.continent());
+        req.set_header(HEADER_X_GEO_CONTINENT, format!("{:?}", geo.continent()));
+        log::info!("  Continent: {:?}", geo.continent());
 
         req.set_header(
-            "X-Geo-Coordinates",
+            HEADER_X_GEO_COORDINATES,
             format!("{},{}", geo.latitude(), geo.longitude()),
         );
-        println!("  Location: ({}, {})", geo.latitude(), geo.longitude());
+        log::info!("  Location: ({}, {})", geo.latitude(), geo.longitude());
 
         // Get and set the metro code (DMA)
         let metro_code = geo.metro_code();
-        req.set_header("X-Geo-Metro-Code", metro_code.to_string());
-        println!("Found DMA/Metro code: {}", metro_code);
+        req.set_header(HEADER_X_GEO_METRO_CODE, metro_code.to_string());
+        log::info!("Found DMA/Metro code: {}", metro_code);
         return Some(metro_code.to_string());
     } else {
-        println!("No geo information available for the request");
-        req.set_header("X-Geo-Info-Available", "false");
+        log::info!("No geo information available for the request");
+        req.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
     }
 
     // If no metro code is found, log all request headers for debugging
-    println!("No DMA/Metro code found. All request headers:");
+    log::info!("No DMA/Metro code found. All request headers:");
     for (name, value) in req.get_headers() {
-        println!("  {}: {:?}", name, value);
+        log::info!("  {}: {:?}", name, value);
     }
 
     None
 }
 
+/// Handles the main page request.
+///
+/// Serves the main page with synthetic ID generation and ad integration.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+
+    log::info!(
+        "Using ad_partner_url: {}, counter_store: {}",
+        settings.ad_server.ad_partner_url,
+        settings.synthetic.counter_store,
+    );
+
     log_fastly::init_simple("mylogs", Info);
 
     // Add DMA code check to main page as well
     let dma_code = get_dma_code(&mut req);
-    println!("Main page - DMA Code: {:?}", dma_code);
+    log::info!("Main page - DMA Code: {:?}", dma_code);
 
     // Check GDPR consent before proceeding
-    let consent = get_consent_from_request(&req).unwrap_or_default();
+    let consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found, using default");
+            GdprConsent::default()
+        }
+    };
     if !consent.functional {
         // Return a version of the page without tracking
         return Ok(Response::from_status(StatusCode::OK)
@@ -148,27 +182,33 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     }
 
     // Calculate fresh ID first using the synthetic module
-    let fresh_id = generate_synthetic_id(settings, &req);
+    let fresh_id = match generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
 
     // Check for existing Trusted Server ID in this specific order:
     // 1. X-Synthetic-Trusted-Server header
     // 2. Cookie
     // 3. Fall back to fresh ID
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req);
+    let synthetic_id = match get_or_generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
 
-    println!(
-        "Existing Truted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+    log::info!(
+        "Existing Trusted Server header: {:?}",
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
-    println!("Generated Fresh ID: {}", fresh_id);
-    println!("Using Trusted Server ID: {}", synthetic_id);
+    log::info!("Generated Fresh ID: {}", &fresh_id);
+    log::info!("Using Trusted Server ID: {}", synthetic_id);
 
     // Create response with the main page HTML
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(HTML_TEMPLATE)
         .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(SYNTHETIC_HEADER_FRESH, &fresh_id) // Fresh ID always changes
-        .with_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
+        .with_header(HEADER_SYNTHETIC_FRESH, fresh_id.as_str()) // Fresh ID always changes
+        .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id) // Trusted Server ID remains stable
         .with_header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
@@ -192,17 +232,20 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
 
     // Only set cookies if we have consent
     if consent.functional {
-        response.set_header(header::SET_COOKIE, create_synthetic_cookie(&synthetic_id));
+        response.set_header(
+            header::SET_COOKIE,
+            create_synthetic_cookie(settings, &synthetic_id),
+        );
     }
 
     // Debug: Print all request headers
-    println!("All Request Headers:");
+    log::info!("All Request Headers:");
     for (name, value) in req.get_headers() {
         log::info!("{}: {:?}", name, value);
     }
 
     // Debug: Print the response headers
-    println!("Response Headers:");
+    log::info!("Response Headers:");
     for (name, value) in response.get_headers() {
         log::info!("{}: {:?}", name, value);
     }
@@ -213,11 +256,24 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
     Ok(response)
 }
 
+/// Handles ad creative requests.
+///
+/// Processes ad requests with synthetic ID and consent checking.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
 fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, Error> {
     // Check GDPR consent to determine if we should serve personalized or non-personalized ads
-    let _consent = get_consent_from_request(&req).unwrap_or_default();
+    let _consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found in ad request, using default");
+            GdprConsent::default()
+        }
+    };
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -225,7 +281,7 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
     // Add DMA code extraction
     let dma_code = get_dma_code(&mut req);
 
-    println!("Client location - DMA Code: {:?}", dma_code);
+    log::info!("Client location - DMA Code: {:?}", dma_code);
 
     // Log headers for debugging
     let client_ip = req
@@ -233,16 +289,19 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     let x_forwarded_for = req
-        .get_header("x-forwarded-for")
+        .get_header(HEADER_X_FORWARDED_FOR)
         .map(|h| h.to_str().unwrap_or("Unknown"));
 
-    println!("Client IP: {}", client_ip);
-    println!("X-Forwarded-For: {}", x_forwarded_for.unwrap_or("None"));
-    println!("Advertising consent: {}", advertising_consent);
+    log::info!("Client IP: {}", client_ip);
+    log::info!("X-Forwarded-For: {}", x_forwarded_for.unwrap_or("None"));
+    log::info!("Advertising consent: {}", advertising_consent);
 
     // Generate synthetic ID only if we have consent
     let synthetic_id = if advertising_consent {
-        generate_synthetic_id(settings, &req)
+        match generate_synthetic_id(settings, &req) {
+            Ok(id) => id,
+            Err(e) => return Ok(to_error_response(e)),
+        }
     } else {
         // Use a generic ID for non-personalized ads
         "non-personalized".to_string()
@@ -251,36 +310,36 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
     // Only track visits if we have consent
     if advertising_consent {
         // Increment visit counter in KV store
-        println!("Opening KV store: {}", settings.synthetic.counter_store);
+        log::info!("Opening KV store: {}", settings.synthetic.counter_store);
         if let Ok(Some(store)) = KVStore::open(settings.synthetic.counter_store.as_str()) {
-            println!("Fetching current count for synthetic ID: {}", synthetic_id);
+            log::info!("Fetching current count for synthetic ID: {}", synthetic_id);
             let current_count: i32 = store
                 .lookup(&synthetic_id)
                 .map(|mut val| match String::from_utf8(val.take_body_bytes()) {
                     Ok(s) => {
-                        println!("Value from KV store: {}", s);
+                        log::info!("Value from KV store: {}", s);
                         Some(s)
                     }
                     Err(e) => {
-                        println!("Error converting bytes to string: {}", e);
+                        log::error!("Error converting bytes to string: {}", e);
                         None
                     }
                 })
                 .map(|opt_s| {
-                    println!("Parsing string value: {:?}", opt_s);
+                    log::info!("Parsing string value: {:?}", opt_s);
                     opt_s.and_then(|s| s.parse().ok())
                 })
                 .unwrap_or_else(|_| {
-                    println!("No existing count found, starting at 0");
+                    log::info!("No existing count found, starting at 0");
                     None
                 })
                 .unwrap_or(0);
 
             let new_count = current_count + 1;
-            println!("Incrementing count from {} to {}", current_count, new_count);
+            log::info!("Incrementing count from {} to {}", current_count, new_count);
 
             if let Err(e) = store.insert(&synthetic_id, new_count.to_string().as_bytes()) {
-                println!("Error updating KV store: {:?}", e);
+                log::error!("Error updating KV store: {:?}", e);
             }
         }
     }
@@ -303,25 +362,25 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             .replace("{{synthetic_id}}", "non-personalized")
     };
 
-    println!("Sending request to backend: {}", ad_server_url);
+    log::info!("Sending request to backend: {}", ad_server_url);
 
     // Add header logging here
     let mut ad_req = Request::get(ad_server_url);
 
     // Add consent information to the ad request
     ad_req.set_header(
-        "X-Consent-Advertising",
+        HEADER_X_CONSENT_ADVERTISING,
         if advertising_consent { "true" } else { "false" },
     );
 
-    println!("Request headers to Equativ:");
+    log::info!("Request headers to Equativ:");
     for (name, value) in ad_req.get_headers() {
-        println!("  {}: {:?}", name, value);
+        log::info!("  {}: {:?}", name, value);
     }
 
     match ad_req.send(settings.ad_server.ad_partner_url.as_str()) {
         Ok(mut res) => {
-            println!(
+            log::info!(
                 "Received response from backend with status: {}",
                 res.get_status()
             );
@@ -340,25 +399,26 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            println!("Fastly PoP: {}", fastly_pop);
-            println!("Fastly Compute Variables:");
-            println!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
-            println!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
-            println!("  - FASTLY_HOSTNAME: {}", fastly_hostname);
-            println!("  - FASTLY_POP: {}", fastly_pop);
-            println!("  - FASTLY_REGION: {}", fastly_region);
-            println!("  - FASTLY_SERVICE_ID: {}", fastly_service_id);
-            println!("  - FASTLY_TRACE_ID: {}", fastly_trace_id);
+            log::info!("Fastly POP: {}", fastly_pop);
+            log::info!("Fastly Compute Variables:");
+            log::info!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
+            log::info!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
+            log::info!("  - FASTLY_HOSTNAME: {}", fastly_hostname);
+            log::info!("  - FASTLY_POP: {}", fastly_pop);
+            log::info!("  - FASTLY_REGION: {}", fastly_region);
+            log::info!("  - FASTLY_SERVICE_ID: {}", fastly_service_id);
+            //log::info!("  - FASTLY_SERVICE_VERSION: {}", fastly_service_version);
+            log::info!("  - FASTLY_TRACE_ID: {}", fastly_trace_id);
 
             // Log all response headers
-            println!("Response headers from Equativ:");
+            log::info!("Response headers from Equativ:");
             for (name, value) in res.get_headers() {
-                println!("  {}: {:?}", name, value);
+                log::info!("  {}: {:?}", name, value);
             }
 
             if res.get_status().is_success() {
                 let body = res.take_body_str();
-                println!("Backend response body: {}", body);
+                log::info!("Backend response body: {}", body);
 
                 // Parse the JSON response and extract opid
                 if let Ok(ad_response) = serde_json::from_str::<AdResponse>(&body) {
@@ -375,36 +435,38 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                             .find(|&param| param.starts_with("opid="))
                             .and_then(|param| param.split('=').nth(1))
                         {
-                            println!("Found opid: {}", opid);
+                            log::info!("Found opid: {}", opid);
 
                             // Store in opid KV store
-                            println!(
+                            log::info!(
                                 "Attempting to open KV store: {}",
                                 settings.synthetic.opid_store
                             );
                             match KVStore::open(settings.synthetic.opid_store.as_str()) {
                                 Ok(Some(store)) => {
-                                    println!("Successfully opened KV store");
+                                    log::info!("Successfully opened KV store");
                                     match store.insert(&synthetic_id, opid.as_bytes()) {
-                                        Ok(_) => println!(
+                                        Ok(_) => log::info!(
                                             "Successfully stored opid {} for synthetic ID: {}",
-                                            opid, synthetic_id
+                                            opid,
+                                            synthetic_id
                                         ),
                                         Err(e) => {
-                                            println!("Error storing opid in KV store: {:?}", e)
+                                            log::error!("Error storing opid in KV store: {:?}", e)
                                         }
                                     }
                                 }
                                 Ok(None) => {
-                                    println!(
+                                    log::warn!(
                                         "KV store returned None: {}",
                                         settings.synthetic.opid_store
                                     );
                                 }
                                 Err(e) => {
-                                    println!(
+                                    log::error!(
                                         "Error opening KV store '{}': {:?}",
-                                        settings.synthetic.opid_store, e
+                                        settings.synthetic.opid_store,
+                                        e
                                     );
                                 }
                             };
@@ -421,37 +483,37 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                         header::ACCESS_CONTROL_EXPOSE_HEADERS,
                         "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
                     )
-                    .with_header("x-compress-hint", "on")
+                    .with_header(HEADER_X_COMPRESS_HINT, "on")
                     .with_body(body);
 
                 // Copy geo headers from request to response
                 for header_name in &[
-                    "X-Geo-City",
-                    "X-Geo-Country",
-                    "X-Geo-Continent",
-                    "X-Geo-Coordinates",
-                    "X-Geo-Metro-Code",
-                    "X-Geo-Info-Available",
+                    HEADER_X_GEO_CITY,
+                    HEADER_X_GEO_COUNTRY,
+                    HEADER_X_GEO_CONTINENT,
+                    HEADER_X_GEO_COORDINATES,
+                    HEADER_X_GEO_METRO_CODE,
+                    HEADER_X_GEO_INFO_AVAILABLE,
                 ] {
-                    if let Some(value) = req.get_header(*header_name) {
-                        response.set_header(*header_name, value);
+                    if let Some(value) = req.get_header(header_name) {
+                        response.set_header(header_name, value);
                     }
                 }
 
                 Ok(response)
             } else {
-                println!("Backend returned non-success status");
+                log::warn!("Backend returned non-success status");
                 Ok(Response::from_status(StatusCode::NO_CONTENT)
                     .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header("x-compress-hint", "on")
+                    .with_header(HEADER_X_COMPRESS_HINT, "on")
                     .with_body("{}"))
             }
         }
         Err(e) => {
-            println!("Error making backend request: {:?}", e);
+            log::error!("Error making backend request: {:?}", e);
             Ok(Response::from_status(StatusCode::NO_CONTENT)
                 .with_header(header::CONTENT_TYPE, "application/json")
-                .with_header("x-compress-hint", "on")
+                .with_header(HEADER_X_COMPRESS_HINT, "on")
                 .with_body("{}"))
         }
     }
@@ -459,20 +521,32 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
 
 /// Handles the prebid test route with detailed error logging
 async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Response, Error> {
-    println!("Starting prebid test request handling");
+    log::info!("Starting prebid test request handling");
 
     // Check consent status from headers
     let advertising_consent = req
-        .get_header("X-Consent-Advertising")
+        .get_header(HEADER_X_CONSENT_ADVERTISING)
         .and_then(|h| h.to_str().ok())
         .map(|v| v == "true")
         .unwrap_or(false);
 
     // Calculate fresh ID and synthetic ID only if we have advertising consent
     let (fresh_id, synthetic_id) = if advertising_consent {
-        let fresh = generate_synthetic_id(settings, &req);
-        let synth = get_or_generate_synthetic_id(settings, &req);
-        (fresh, synth)
+        match (
+            generate_synthetic_id(settings, &req),
+            get_or_generate_synthetic_id(settings, &req),
+        ) {
+            (Ok(fresh), Ok(synth)) => (fresh, synth),
+            (Err(e), _) | (_, Err(e)) => {
+                log::error!("Failed to generate IDs: {:?}", e);
+                return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_header(header::CONTENT_TYPE, "application/json")
+                    .with_body_json(&json!({
+                        "error": "Failed to generate IDs",
+                        "details": format!("{:?}", e)
+                    }))?);
+            }
+        }
     } else {
         // Use non-personalized IDs when no consent
         (
@@ -481,37 +555,38 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
         )
     };
 
-    println!(
+    log::info!(
         "Existing Trusted Server header: {:?}",
-        req.get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        req.get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
     );
-    println!("Generated Fresh ID: {}", fresh_id);
-    println!("Using Trusted Server ID: {}", synthetic_id);
-    println!("Advertising consent: {}", advertising_consent);
+    log::info!("Generated Fresh ID: {}", &fresh_id);
+    log::info!("Using Trusted Server ID: {}", synthetic_id);
+    log::info!("Advertising consent: {}", advertising_consent);
 
     // Set both IDs as headers
-    req.set_header(SYNTHETIC_HEADER_FRESH, &fresh_id);
-    req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &synthetic_id);
+    req.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
     req.set_header(
-        "X-Consent-Advertising",
+        HEADER_X_CONSENT_ADVERTISING,
         if advertising_consent { "true" } else { "false" },
     );
 
-    println!(
+    log::info!(
         "Using Trusted Server ID: {}, Fresh ID: {}",
-        synthetic_id, fresh_id
+        synthetic_id,
+        fresh_id
     );
 
     let prebid_req = match PrebidRequest::new(settings, &req) {
         Ok(req) => {
-            println!(
+            log::info!(
                 "Successfully created PrebidRequest with synthetic ID: {}",
                 req.synthetic_id
             );
             req
         }
         Err(e) => {
-            println!("Error creating PrebidRequest: {:?}", e);
+            log::error!("Error creating PrebidRequest: {:?}", e);
             return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
@@ -521,20 +596,20 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
         }
     };
 
-    println!("Attempting to send bid request to Prebid Server at prebid_backend");
+    log::info!("Attempting to send bid request to Prebid Server at prebid_backend");
 
     match prebid_req.send_bid_request(settings, &req).await {
         Ok(mut prebid_response) => {
-            println!("Received response from Prebid Server");
-            println!("Response status: {}", prebid_response.get_status());
+            log::info!("Received response from Prebid Server");
+            log::info!("Response status: {}", prebid_response.get_status());
 
-            println!("Response headers:");
+            log::info!("Response headers:");
             for (name, value) in prebid_response.get_headers() {
-                println!("  {}: {:?}", name, value);
+                log::info!("  {}: {:?}", name, value);
             }
 
             let body = prebid_response.take_body_str();
-            println!("Response body: {}", body);
+            log::info!("Response body: {}", body);
 
             Ok(Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/json")
@@ -544,12 +619,12 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                     "X-Consent-Advertising",
                     if advertising_consent { "true" } else { "false" },
                 )
-                .with_header("x-compress-hint", "on")
+                .with_header(HEADER_X_COMPRESS_HINT, "on")
                 .with_body(body))
         }
         Err(e) => {
-            println!("Error sending bid request: {:?}", e);
-            println!("Backend name used: prebid_backend");
+            log::error!("Error sending bid request: {:?}", e);
+            log::error!("Backend name used: prebid_backend");
             Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({

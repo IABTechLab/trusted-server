@@ -3,7 +3,7 @@
 
 authors = ["jason@stackpop.com"]
 cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
-description = "aslk"
+description = "Trusted Server"
 language = "rust"
 manifest_version = 3
 name = "trusted-server-fastly"
@@ -15,6 +15,7 @@ build = """
 
 [local_server]
     [local_server.backends]
+
         [local_server.backends.equativ_ad_api_2]
             url = "https://adapi-srv-eu.smartadserver.com"
         [local_server.backends.prebid_backend]
@@ -24,11 +25,12 @@ build = """
         [local_server.backends.wordpress_backend]
             url = "http://localhost:8080"  # Adjust this to your local WordPress URL
 
+
     [local_server.kv_stores]
-        [[local_server.kv_stores.jevans_synth_id_counter]] # FIX ME: must match config
+        [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.jevans_synth_id_opid]] # FIX ME: must match config
+        [[local_server.kv_stores.opid_store]]
             key = "placeholder"
             data = "placeholder"

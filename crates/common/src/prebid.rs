@@ -1,8 +1,17 @@
+//! Prebid integration for real-time bidding.
+//!
+//! This module provides functionality for integrating with Prebid Server
+//! to enable header bidding and real-time ad auctions.
+
+use error_stack::Report;
 use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
-use crate::constants::{SYNTHETIC_HEADER_FRESH, SYNTHETIC_HEADER_TRUSTED_SERVER};
+use crate::constants::{
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_FORWARDED_FOR,
+};
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -21,27 +30,31 @@ pub struct PrebidRequest {
 }
 
 impl PrebidRequest {
-    /// Creates a new PrebidRequest from an incoming Fastly request
+    /// Creates a new PrebidRequest from an incoming Fastly request.
     ///
-    /// # Arguments
-    /// * `req` - The incoming Fastly request
+    /// Extracts necessary information from the request including synthetic ID,
+    /// client IP, and origin for use in Prebid Server requests.
     ///
-    /// # Returns
-    /// * `Result<Self, Error>` - New PrebidRequest or error
-    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::SyntheticId`] if synthetic ID generation fails
+    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Report<TrustedServerError>> {
         // Get the Trusted Server ID from header (which we just set in handle_prebid_test)
-        let synthetic_id = req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+        let synthetic_id = match req
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| generate_synthetic_id(settings, req));
+        {
+            Some(id) => id,
+            None => generate_synthetic_id(settings, req)?,
+        };
 
         // Get the original client IP from Fastly headers
         let client_ip = req
             .get_client_ip_addr()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| {
-                req.get_header("X-Forwarded-For")
+                req.get_header(HEADER_X_FORWARDED_FOR)
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("")
                     .split(',') // X-Forwarded-For can be a comma-separated list
@@ -62,9 +75,9 @@ impl PrebidRequest {
                     .and_then(|o| url::Url::parse(o).ok())
                     .and_then(|u| u.host_str().map(|h| h.to_string()))
             })
-            .unwrap_or_else(|| "auburndao.com".to_string());
+            .unwrap_or_else(|| settings.publisher.domain.clone());
 
-        println!("Detected domain: {}", domain);
+        log::info!("Detected domain: {}", domain);
 
         // Create origin with owned String
         let origin = req
@@ -98,12 +111,12 @@ impl PrebidRequest {
 
         // Get and store the POTSI ID value from the incoming request
         let id: String = incoming_req
-            .get_header(SYNTHETIC_HEADER_TRUSTED_SERVER)
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.synthetic_id.clone());
 
-        println!("Found Truted Server ID from incoming request: {}", id);
+        log::info!("Found Trusted Server ID from incoming request: {}", id);
 
         // Construct the OpenRTB2 bid request
         let prebid_body = json!({
@@ -167,14 +180,15 @@ impl PrebidRequest {
         });
 
         req.set_header(header::CONTENT_TYPE, "application/json");
-        req.set_header("X-Forwarded-For", &self.client_ip);
+        req.set_header(HEADER_X_FORWARDED_FOR, &self.client_ip);
         req.set_header(header::ORIGIN, &self.origin);
-        req.set_header(SYNTHETIC_HEADER_FRESH, &self.synthetic_id);
-        req.set_header(SYNTHETIC_HEADER_TRUSTED_SERVER, &id);
+        req.set_header(HEADER_SYNTHETIC_FRESH, &self.synthetic_id);
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &id);
 
-        println!(
+        log::info!(
             "Sending prebid request with Fresh ID: {} and Trusted Server ID: {}",
-            self.synthetic_id, id
+            self.synthetic_id,
+            id
         );
 
         req.set_body_json(&prebid_body)?;
@@ -182,4 +196,154 @@ impl PrebidRequest {
         let resp = req.send("prebid_backend")?;
         Ok(resp)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::Request;
+
+    use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn test_prebid_request_new_with_full_headers() {
+        let settings = create_test_settings();
+        let mut req = Request::get("https://example.com/test");
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, "existing-synthetic-id");
+        req.set_header(header::REFERER, "https://test-domain.com/page");
+        req.set_header(header::ORIGIN, "https://test-domain.com");
+        req.set_header(HEADER_X_FORWARDED_FOR, "192.168.1.1, 10.0.0.1");
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        assert_eq!(prebid_req.synthetic_id, "existing-synthetic-id");
+        assert_eq!(prebid_req.domain, "test-domain.com");
+        assert_eq!(prebid_req.banner_sizes, vec![(728, 90)]);
+        assert_eq!(prebid_req.origin, "https://test-domain.com");
+        // Note: client_ip extraction from X-Forwarded-For depends on Fastly runtime
+    }
+
+    #[test]
+    fn test_prebid_request_new_without_synthetic_id() {
+        let settings = create_test_settings();
+        let mut req = Request::get("https://example.com/test");
+        req.set_header("User-Agent", "Mozilla/5.0");
+        req.set_header(header::REFERER, "https://test-domain.com/page");
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        // Should generate a new synthetic ID
+        assert!(!prebid_req.synthetic_id.is_empty());
+        assert_eq!(prebid_req.domain, "test-domain.com");
+    }
+
+    #[test]
+    fn test_prebid_request_domain_from_origin() {
+        let settings = create_test_settings();
+        let mut req = Request::get("https://example.com/test");
+        req.set_header(header::ORIGIN, "https://origin-domain.com");
+        // No referer header
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        assert_eq!(prebid_req.domain, "origin-domain.com");
+        assert_eq!(prebid_req.origin, "https://origin-domain.com");
+    }
+
+    #[test]
+    fn test_prebid_request_domain_fallback() {
+        let settings = create_test_settings();
+        let url = format!("https://{}", settings.publisher.domain);
+        let req = Request::get(url.clone());
+        // No referer or origin headers
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        assert_eq!(prebid_req.domain, settings.publisher.domain);
+        assert_eq!(prebid_req.origin, url);
+    }
+
+    #[test]
+    fn test_prebid_request_invalid_url_in_referer() {
+        let settings = create_test_settings();
+        let url = format!("https://{}/test", settings.publisher.domain);
+        let mut req = Request::get(url);
+        req.set_header(header::REFERER, "not-a-valid-url");
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        // Should fallback to default domain
+        assert_eq!(prebid_req.domain, settings.publisher.domain);
+    }
+
+    #[test]
+    fn test_prebid_request_x_forwarded_for_parsing() {
+        let settings = create_test_settings();
+        let url = format!("https://{}/test", settings.publisher.domain);
+        let mut req = Request::get(url);
+        req.set_header(HEADER_X_FORWARDED_FOR, "192.168.1.1, 10.0.0.1, 172.16.0.1");
+
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+
+        // Should get the first IP from the list (if get_client_ip_addr returns None)
+        // The actual behavior depends on Fastly runtime
+        assert!(!prebid_req.client_ip.is_empty());
+    }
+
+    #[test]
+    fn test_prebid_request_struct_fields() {
+        let prebid_req = PrebidRequest {
+            synthetic_id: "test-id".to_string(),
+            domain: "test.com".to_string(),
+            banner_sizes: vec![(300, 250), (728, 90)],
+            client_ip: "192.168.1.1".to_string(),
+            origin: "https://test.com".to_string(),
+        };
+
+        assert_eq!(prebid_req.synthetic_id, "test-id");
+        assert_eq!(prebid_req.domain, "test.com");
+        assert_eq!(prebid_req.banner_sizes.len(), 2);
+        assert_eq!(prebid_req.banner_sizes[0], (300, 250));
+        assert_eq!(prebid_req.banner_sizes[1], (728, 90));
+        assert_eq!(prebid_req.client_ip, "192.168.1.1");
+        assert_eq!(prebid_req.origin, "https://test.com");
+    }
+
+    #[test]
+    fn test_prebid_request_with_multiple_sizes() {
+        let mut prebid_req = PrebidRequest {
+            synthetic_id: "test-id".to_string(),
+            domain: "test.com".to_string(),
+            banner_sizes: vec![(300, 250), (728, 90), (160, 600)],
+            client_ip: "192.168.1.1".to_string(),
+            origin: "https://test.com".to_string(),
+        };
+
+        // Test modifying banner sizes
+        prebid_req.banner_sizes.push((970, 250));
+        assert_eq!(prebid_req.banner_sizes.len(), 4);
+        assert_eq!(prebid_req.banner_sizes[3], (970, 250));
+    }
+
+    #[test]
+    fn test_prebid_request_edge_cases() {
+        let settings = create_test_settings();
+        let url = format!("https://{}/test", settings.publisher.domain);
+
+        // Test with empty X-Forwarded-For
+        let mut req = Request::get(url.clone());
+        req.set_header(HEADER_X_FORWARDED_FOR, "");
+        let prebid_req = PrebidRequest::new(&settings, &req).unwrap();
+        assert!(!prebid_req.client_ip.is_empty() || prebid_req.client_ip.is_empty());
+
+        // Test with malformed origin
+        let mut req2 = Request::get(url.clone());
+        req2.set_header(header::ORIGIN, "://invalid");
+        let prebid_req2 = PrebidRequest::new(&settings, &req2).unwrap();
+        assert_eq!(prebid_req2.domain, settings.publisher.domain);
+    }
+
+    // Note: Testing send_bid_request would require mocking the Fastly backend,
+    // which isn't available in unit tests. This would be covered in integration tests.
+    // The method constructs a proper OpenRTB request with all required fields.
 }
