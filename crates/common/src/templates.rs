@@ -678,48 +678,54 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
 </html>
 "#;
 // GAM Configuration Template
+#[allow(dead_code)]
 struct GamConfigTemplate {
     publisher_id: String,
     ad_units: Vec<AdUnitConfig>,
     page_context: PageContext,
     data_providers: Vec<DataProvider>,
 }
-
+#[allow(dead_code)]
 struct AdUnitConfig {
     name: String,
     sizes: Vec<String>,
     position: String,
     targeting: HashMap<String, String>,
 }
-
+#[allow(dead_code)]
 struct PageContext {
     page_type: String,
     section: String,
     keywords: Vec<String>,
 }
-
+#[allow(dead_code)]
 enum DataProvider {
     Permutive(PermutiveConfig),
     Lotame(LotameConfig),
     Neustar(NeustarConfig),
     Custom(CustomProviderConfig),
 }
-
+#[allow(dead_code)]
 struct PermutiveConfig {}
+#[allow(dead_code)]
 struct LotameConfig {}
+#[allow(dead_code)]
 struct NeustarConfig {}
+#[allow(dead_code)]
 struct CustomProviderConfig {}
-
+#[allow(dead_code)]
 trait DataProviderTrait {
     fn get_user_segments(&self, user_id: &str) -> Vec<String>;
 }
 
+#[allow(dead_code)]
 struct RequestContext {
     user_id: String,
     page_url: String,
     consent_status: bool,
 }
 
+#[allow(dead_code)]
 struct DynamicGamBuilder {
     base_config: GamConfigTemplate,
     context: RequestContext,

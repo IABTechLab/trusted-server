@@ -34,7 +34,6 @@ use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-
     // Print Settings only once at the beginning
     let settings = match Settings::new() {
         Ok(s) => s,
@@ -44,13 +43,13 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
-  // Print User IP address immediately after Fastly Service Version 
+    // Print User IP address immediately after Fastly Service Version
     let client_ip = req
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
     println!("User IP: {}", client_ip);
-  
+
     futures::executor::block_on(async {
         log::info!(
             "FASTLY_SERVICE_VERSION: {}",
@@ -150,7 +149,6 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
 ///
 /// Returns a Fastly [`Error`] if response creation fails.
 fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
-
     log::info!(
         "Using ad_partner_url: {}, counter_store: {}",
         settings.ad_server.ad_partner_url,
