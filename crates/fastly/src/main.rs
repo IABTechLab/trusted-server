@@ -17,6 +17,9 @@ use trusted_server_common::constants::{
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
 };
 use trusted_server_common::cookies::create_synthetic_cookie;
+use trusted_server_common::gam::{
+    handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
+};
 // Note: TrustedServerError is used internally by the common crate
 use trusted_server_common::gdpr::{
     get_consent_from_request, handle_consent_request, handle_data_subject_request, GdprConsent,
@@ -26,11 +29,12 @@ use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::privacy::PRIVACY_TEMPLATE;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use trusted_server_common::templates::HTML_TEMPLATE;
+use trusted_server_common::templates::{GAM_TEST_TEMPLATE, HTML_TEMPLATE};
 use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
+    // Print Settings only once at the beginning
     let settings = match Settings::new() {
         Ok(s) => s,
         Err(e) => {
@@ -39,6 +43,12 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
+    // Print User IP address immediately after Fastly Service Version
+    let client_ip = req
+        .get_client_ip_addr()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    log::info!("User IP: {}", client_ip);
 
     futures::executor::block_on(async {
         log::info!(
@@ -50,6 +60,14 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/") => handle_main_page(&settings, req),
             (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
             (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
+            (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
+            (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
+            (&Method::POST, "/gam-test-custom-url") => handle_gam_custom_url(&settings, req).await,
+            (&Method::GET, "/gam-render") => handle_gam_render(&settings, req).await,
+            (&Method::GET, "/gam-test-page") => Ok(Response::from_status(StatusCode::OK)
+                .with_body(GAM_TEST_TEMPLATE)
+                .with_header(header::CONTENT_TYPE, "text/html")
+                .with_header("x-compress-hint", "on")),
             (&Method::GET, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::GET, "/gdpr/data") => handle_data_subject_request(&settings, req),
@@ -376,11 +394,10 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
             let fastly_region = env::var("FASTLY_REGION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_service_id =
                 env::var("FASTLY_SERVICE_ID").unwrap_or_else(|_| "unknown".to_string());
-            // let fastly_service_version = env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            log::info!("Fastly Jason PoP: {}", fastly_pop);
+            log::info!("Fastly POP: {}", fastly_pop);
             log::info!("Fastly Compute Variables:");
             log::info!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
             log::info!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
@@ -480,10 +497,6 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                         response.set_header(header_name, value);
                     }
                 }
-
-                // Attach PoP info to the response
-                //response.set_header("X-Debug-Fastly-PoP", &fastly_pop);
-                //log::info!("Added X-Debug-Fastly-PoP: {}", fastly_pop);
 
                 Ok(response)
             } else {
