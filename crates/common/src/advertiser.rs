@@ -11,8 +11,9 @@ use fastly::http::{header, StatusCode};
 use fastly::{KVStore, Request, Response};
 
 use crate::constants::{
-    HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT, HEADER_X_CONSENT_ADVERTISING,
-    HEADER_X_FORWARDED_FOR,
+    HEADER_X_COMPRESS_HINT, HEADER_X_CONSENT_ADVERTISING, HEADER_X_FORWARDED_FOR,
+    HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
 };
 use crate::error::TrustedServerError;
 use crate::gdpr::{get_consent_from_request, GdprConsent};
@@ -146,7 +147,7 @@ pub fn handle_ad_request(
         log::info!("  {}: {:?}", name, value);
     }
 
-    match ad_req.send(settings.ad_server.ad_partner_url.as_str()) {
+    match ad_req.send(settings.ad_server.ad_partner_backend.as_str()) {
         Ok(mut res) => {
             log::info!(
                 "Received response from backend with status: {}",
@@ -164,11 +165,10 @@ pub fn handle_ad_request(
             let fastly_region = env::var("FASTLY_REGION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_service_id =
                 env::var("FASTLY_SERVICE_ID").unwrap_or_else(|_| "unknown".to_string());
-            // let fastly_service_version = env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| "unknown".to_string());
             let fastly_trace_id =
                 env::var("FASTLY_TRACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-            log::info!("Fastly Jason PoP: {}", fastly_pop);
+            log::info!("Fastly POP: {}", fastly_pop);
             log::info!("Fastly Compute Variables:");
             log::info!("  - FASTLY_CACHE_GENERATION: {}", fastly_cache_generation);
             log::info!("  - FASTLY_CUSTOMER_ID: {}", fastly_customer_id);
@@ -233,44 +233,46 @@ pub fn handle_ad_request(
                                 }
                                 Err(e) => {
                                     log::error!(
-                                        "Error opening KV store {}: {:?}",
+                                        "Error opening KV store '{}': {:?}",
                                         settings.synthetic.opid_store,
                                         e
                                     );
                                 }
-                            }
-                        } else {
-                            log::warn!("Could not extract opid from impression callback URL");
+                            };
                         }
-                    } else {
-                        log::warn!("No impression callback found in ad response");
                     }
-                } else {
-                    log::warn!("Could not parse JSON response to extract opid");
                 }
 
-                let synthetic_header = req
-                    .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
-                    .map(|h| h.to_str().unwrap_or(""));
-                log::info!(
-                    "Returning response with Synthetic header: {:?}",
-                    synthetic_header
-                );
-                log::info!("Advertising consent: {}", advertising_consent);
-
-                // Return the response to the client
-                Ok(Response::from_body(body)
-                    .with_status(res.get_status())
+                // Return the JSON response with CORS headers
+                let mut response = Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header("X-Synthetic-ID", &synthetic_id)
+                    .with_header(header::CACHE_CONTROL, "no-store, private")
+                    .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .with_header(
-                        "X-Consent-Advertising",
-                        if advertising_consent { "true" } else { "false" },
+                        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                        "X-Geo-City, X-Geo-Country, X-Geo-Continent, X-Geo-Coordinates, X-Geo-Metro-Code, X-Geo-Info-Available"
                     )
-                    .with_header("X-Fastly-PoP", &fastly_pop)
-                    .with_header(HEADER_X_COMPRESS_HINT, "on"))
+                    .with_header(HEADER_X_COMPRESS_HINT, "on")
+                    .with_body(body);
+
+                // Copy geo headers from request to response
+                for header_name in &[
+                    HEADER_X_GEO_CITY,
+                    HEADER_X_GEO_COUNTRY,
+                    HEADER_X_GEO_CONTINENT,
+                    HEADER_X_GEO_COORDINATES,
+                    HEADER_X_GEO_METRO_CODE,
+                    HEADER_X_GEO_INFO_AVAILABLE,
+                ] {
+                    if let Some(value) = req.get_header(header_name) {
+                        response.set_header(header_name, value);
+                    }
+                }
+
+                Ok(response)
             } else {
-                Ok(Response::from_status(res.get_status())
+                log::warn!("Backend returned non-success status");
+                Ok(Response::from_status(StatusCode::NO_CONTENT)
                     .with_header(header::CONTENT_TYPE, "application/json")
                     .with_header(HEADER_X_COMPRESS_HINT, "on")
                     .with_body("{}"))
