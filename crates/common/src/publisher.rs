@@ -29,8 +29,8 @@ pub fn handle_main_page(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!(
-        "Using ad_partner_url: {}, counter_store: {}",
-        settings.ad_server.ad_partner_url,
+        "Using ad_partner_backend: {}, counter_store: {}",
+        settings.ad_server.ad_partner_backend,
         settings.synthetic.counter_store,
     );
 

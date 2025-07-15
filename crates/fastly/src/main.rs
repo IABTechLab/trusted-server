@@ -7,11 +7,15 @@ use crate::error::to_error_response;
 
 use trusted_server_common::advertiser::handle_ad_request;
 use trusted_server_common::constants::HEADER_X_COMPRESS_HINT;
+use trusted_server_common::gam::{
+    handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
+};
 use trusted_server_common::gdpr::{handle_consent_request, handle_data_subject_request};
 use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::handle_main_page;
 use trusted_server_common::settings::Settings;
+use trusted_server_common::templates::GAM_TEST_TEMPLATE;
 use trusted_server_common::why::handle_why_trusted_server;
 
 #[fastly::main]
@@ -45,6 +49,14 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/") => handle_main_page(&settings, req),
         (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
         (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
+        (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
+        (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
+        (&Method::POST, "/gam-test-custom-url") => handle_gam_custom_url(&settings, req).await,
+        (&Method::GET, "/gam-render") => handle_gam_render(&settings, req).await,
+        (&Method::GET, "/gam-test-page") => Ok(Response::from_status(StatusCode::OK)
+            .with_body(GAM_TEST_TEMPLATE)
+            .with_header(header::CONTENT_TYPE, "text/html")
+            .with_header("x-compress-hint", "on")),
 
         // GDPR compliance routes
         (&Method::GET | &Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
