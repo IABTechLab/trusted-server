@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added basic unit tests
 - Added publisher config
 - Add AI assist rules. Based on https://github.com/hashintel/hash
+- Added ability to construct GAM requests from static permutive segments with test pages
 
 ### Changed
 - Upgrade to rust 1.87.0

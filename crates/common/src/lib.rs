@@ -25,6 +25,7 @@ pub mod advertiser;
 pub mod constants;
 pub mod cookies;
 pub mod error;
+pub mod gam;
 pub mod gdpr;
 pub mod geo;
 pub mod models;

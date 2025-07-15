@@ -21,7 +21,7 @@ use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::templates::HTML_TEMPLATE;
 
 /// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
-/// 
+///
 /// Tries multiple methods in order of reliability:
 /// 1. Fastly SDK TLS detection methods (most reliable)
 /// 2. Forwarded header (RFC 7239)
@@ -36,13 +36,13 @@ fn detect_request_scheme(req: &Request) -> String {
         log::debug!("TLS protocol detected: {}", tls_protocol);
         return "https".to_string();
     }
-    
+
     // Also check TLS cipher - if present, connection is HTTPS
     if req.get_tls_cipher_openssl_name().is_some() {
         log::debug!("TLS cipher detected, using HTTPS");
         return "https".to_string();
     }
-    
+
     // 2. Try the Forwarded header (RFC 7239)
     if let Some(forwarded) = req.get_header("forwarded") {
         if let Ok(forwarded_str) = forwarded.to_str() {
@@ -55,7 +55,7 @@ fn detect_request_scheme(req: &Request) -> String {
             }
         }
     }
-    
+
     // 3. Try X-Forwarded-Proto header
     if let Some(proto) = req.get_header("x-forwarded-proto") {
         if let Ok(proto_str) = proto.to_str() {
@@ -65,7 +65,7 @@ fn detect_request_scheme(req: &Request) -> String {
             }
         }
     }
-    
+
     // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
     if let Some(ssl) = req.get_header("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
@@ -74,7 +74,7 @@ fn detect_request_scheme(req: &Request) -> String {
             }
         }
     }
-    
+
     // Default to HTTP (changed from HTTPS based on your settings file)
     "http".to_string()
 }
@@ -93,8 +93,8 @@ pub fn handle_main_page(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!(
-        "Using ad_partner_url: {}, counter_store: {}",
-        settings.ad_server.ad_partner_url,
+        "Using ad_partner_backend: {}, counter_store: {}",
+        settings.ad_server.ad_partner_backend,
         settings.synthetic.counter_store,
     );
 
@@ -336,7 +336,7 @@ pub fn handle_publisher_request(
 
     // Detect the request scheme using multiple methods
     let request_scheme = detect_request_scheme(&req);
-    
+
     // Log detection details for debugging
     log::info!(
         "Scheme detection - TLS Protocol: {:?}, TLS Cipher: {:?}, Forwarded: {:?}, X-Forwarded-Proto: {:?}, Fastly-SSL: {:?}, Result: {}",
@@ -442,65 +442,42 @@ pub fn handle_publisher_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
-
-    fn create_test_settings() -> Settings {
-        Settings {
-            publisher: crate::settings::Publisher {
-                domain: "example.com".to_string(),
-                cookie_domain: ".example.com".to_string(),
-                origin_backend: "test_origin".to_string(),
-                origin_url: "https://origin.example.com".to_string(),
-            },
-            ad_server: crate::settings::AdServer {
-                ad_partner_url: "https://ad.example.com".to_string(),
-                sync_url: "https://sync.example.com".to_string(),
-            },
-            synthetic: crate::settings::Synthetic {
-                counter_store: "test_counter".to_string(),
-                opid_store: "test_opid_store".to_string(),
-                secret_key: "test_secret_key".to_string(),
-                template: "{{user_agent}}+{{ip}}".to_string(),
-            },
-            prebid: crate::settings::Prebid {
-                server_url: "https://prebid.example.com".to_string(),
-            },
-        }
-    }
 
     #[test]
     fn test_detect_request_scheme() {
         // Note: In tests, we can't mock the TLS methods on Request, so we test header fallbacks
-        
+
         // Test Forwarded header with HTTPS
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
         req.set_header("forwarded", "for=192.0.2.60;proto=https;by=203.0.113.43");
         assert_eq!(detect_request_scheme(&req), "https");
-        
+
         // Test Forwarded header with HTTP
         let mut req = Request::new(Method::GET, "http://test.example.com/page");
         req.set_header("forwarded", "for=192.0.2.60;proto=http;by=203.0.113.43");
         assert_eq!(detect_request_scheme(&req), "http");
-        
+
         // Test X-Forwarded-Proto with HTTPS
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
         req.set_header("x-forwarded-proto", "https");
         assert_eq!(detect_request_scheme(&req), "https");
-        
+
         // Test X-Forwarded-Proto with HTTP
         let mut req = Request::new(Method::GET, "http://test.example.com/page");
         req.set_header("x-forwarded-proto", "http");
         assert_eq!(detect_request_scheme(&req), "http");
-        
+
         // Test Fastly-SSL header
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
         req.set_header("fastly-ssl", "1");
         assert_eq!(detect_request_scheme(&req), "https");
-        
+
         // Test default to HTTP when no headers present
         let req = Request::new(Method::GET, "https://test.example.com/page");
         assert_eq!(detect_request_scheme(&req), "http");
-        
+
         // Test priority: Forwarded takes precedence over X-Forwarded-Proto
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
         req.set_header("forwarded", "proto=https");
@@ -610,14 +587,14 @@ mod tests {
     fn test_publisher_origin_host_extraction() {
         let settings = create_test_settings();
         let origin_host = settings.publisher.origin_host();
-        assert_eq!(origin_host, "origin.example.com");
+        assert_eq!(origin_host, "origin.test-publisher.com");
 
         // Test with port
         let mut settings_with_port = create_test_settings();
-        settings_with_port.publisher.origin_url = "https://origin.example.com:8080".to_string();
+        settings_with_port.publisher.origin_url = "origin.test-publisher.com:8080".to_string();
         assert_eq!(
             settings_with_port.publisher.origin_host(),
-            "origin.example.com:8080"
+            "origin.test-publisher.com:8080"
         );
     }
 

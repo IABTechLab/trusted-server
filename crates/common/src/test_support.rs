@@ -5,7 +5,7 @@ pub mod tests {
     pub fn crate_test_settings_str() -> String {
         r#"
             [ad_server]
-            ad_partner_url = "https://test-adpartner.com"
+            ad_partner_backend = "https://test-adpartner.com"
             sync_url = "https://test-adpartner.com/synthetic_id={{synthetic_id}}"
 
             [publisher]
@@ -16,6 +16,16 @@ pub mod tests {
 
             [prebid]
             server_url = "https://test-prebid.com/openrtb2/auction"
+
+            [gam]
+            publisher_id = "3790"
+            server_url = "https://securepubads.g.doubleclick.net/gampad/ads"
+            ad_units = [
+                { name = "Flex8:1", size = "flexible" },
+                { name = "Fixed728x90", size = "728x90" },
+                { name = "Static8:1", size = "flexible" },
+                { name = "Static728x90", size = "728x90" }
+            ]
 
             [synthetic] 
             counter_store = "test-counter-store"

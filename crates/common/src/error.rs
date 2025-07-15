@@ -19,32 +19,36 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// GAM (Google Ad Manager) integration error.
+    #[display("GAM error: {message}")]
+    Gam { message: String },
     /// GDPR consent handling error.
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
-    /// Key-value store operation failed.
-    #[display("KV store error: {store_name} - {message}")]
-    KvStore { store_name: String, message: String },
-
     /// The synthetic secret key is using the insecure default value.
+
     #[display("Synthetic secret key is set to the default value - this is insecure")]
     InsecureSecretKey,
+
+    /// Invalid UTF-8 data encountered.
+    #[display("Invalid UTF-8 data: {message}")]
+    InvalidUtf8 { message: String },
 
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
 
-    /// Invalid UTF-8 data encountered.
-    #[display("Invalid UTF-8 data: {message}")]
-    InvalidUtf8 { message: String },
+    /// Key-value store operation failed.
+    #[display("KV store error: {store_name} - {message}")]
+    KvStore { store_name: String, message: String },
 
     /// Prebid integration error.
     #[display("Prebid error: {message}")]
     Prebid { message: String },
 
     /// Proxy error.
-    #[display("Template error: {message}")]
+    #[display("Proxy error: {message}")]
     Proxy { message: String },
 
     /// Settings parsing or validation failed.
@@ -76,6 +80,7 @@ impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
