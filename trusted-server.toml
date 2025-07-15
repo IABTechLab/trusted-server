@@ -4,11 +4,21 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 
 [ad_server]
-ad_partner_url = "equativ_ad_api_2"
+ad_partner_backend = "ad_partner_backend"
 sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={{synthetic_id}}"
 
 [prebid]
 server_url = "http://68.183.113.79:8000/openrtb2/auction"
+
+[gam]
+publisher_id = "3790"
+server_url = "https://securepubads.g.doubleclick.net/gampad/ads"
+ad_units = [
+    { name = "Flex8:1", size = "flexible" },
+    { name = "Fixed728x90", size = "728x90" },
+    { name = "Static8:1", size = "flexible" },
+    { name = "Static728x90", size = "728x90" }
+]
 
 [synthetic]
 counter_store = "jevans_synth_id_counter"
