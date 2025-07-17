@@ -5,6 +5,7 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
 use log::LevelFilter::Info;
+use log_fastly::Logger;
 use serde_json::json;
 
 mod error;
@@ -34,6 +35,8 @@ use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
+    init_logger();
+
     // Print Settings only once at the beginning
     let settings = match Settings::new() {
         Ok(s) => s,
@@ -154,8 +157,6 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
         settings.ad_server.ad_partner_url,
         settings.synthetic.counter_store,
     );
-
-    log_fastly::init_simple("mylogs", Info);
 
     // Add DMA code check to main page as well
     let dma_code = get_dma_code(&mut req);
@@ -632,4 +633,26 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                 }))?)
         }
     }
+}
+
+fn init_logger() {
+    let logger = Logger::builder()
+        .default_endpoint("tslog")
+        .echo_stdout(true)
+        .max_level(log::LevelFilter::Debug)
+        .build()
+        .expect("Failed to build Logger");
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}  {} {}",
+                chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                record.level(),
+                message
+            ))
+        })
+        .chain(Box::new(logger) as Box<dyn log::Log>)
+        .apply()
+        .expect("Failed to initialize logger");
 }
