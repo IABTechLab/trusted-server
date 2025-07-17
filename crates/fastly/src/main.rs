@@ -88,7 +88,7 @@ fn not_found_response() -> Response {
 fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
-        // .echo_stdout(true)
+        .echo_stdout(true)
         .max_level(log::LevelFilter::Debug)
         .build()
         .expect("Failed to build Logger");
