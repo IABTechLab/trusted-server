@@ -1,7 +1,7 @@
 [publisher]
-domain = "test-publisher.com"
-cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
+domain = "auburndao.com"
+cookie_domain = ".auburndao.com"
+origin_url = "https://origin.auburndao.com"
 
 [ad_server]
 ad_partner_url = "equativ_ad_api_2"

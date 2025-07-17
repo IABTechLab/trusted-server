@@ -536,6 +536,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fern"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4316185f709b23713e41e3195f90edef7fb00c3ed4adc79769cf09cc762a3b29"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,8 +1670,10 @@ dependencies = [
 name = "trusted-server-fastly"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "error-stack",
  "fastly",
+ "fern",
  "futures",
  "log",
  "log-fastly",

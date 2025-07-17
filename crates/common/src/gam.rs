@@ -206,7 +206,7 @@ impl GamRequest {
                 }
 
                 Ok(Response::from_status(response.get_status())
-                    .with_header(header::CONTENT_TYPE, "application/json")
+                    .with_header(header::CONTENT_TYPE, "text/plain")
                     .with_header(header::CACHE_CONTROL, "no-store, private")
                     .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .with_header("X-GAM-Test", "true")

@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4.41"
 error-stack = "0.5"
 fastly = "0.11.5"
+fern = "0.7.1"
 futures = "0.3"
 log = "0.4.20"
 log-fastly = "0.11.5"
