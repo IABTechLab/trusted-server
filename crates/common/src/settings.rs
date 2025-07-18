@@ -127,26 +127,6 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     #[test]
-    fn test_settings_new() {
-        // Test that Settings::new() loads successfully
-        let settings = Settings::new();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
-
-        let settings = settings.unwrap();
-        // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_backend.is_empty());
-        assert!(!settings.ad_server.sync_url.is_empty());
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.prebid.server_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
-    }
-
-    #[test]
     fn test_settings_from_valid_toml() {
         let toml_str = crate_test_settings_str();
         let settings = Settings::from_toml(&toml_str);

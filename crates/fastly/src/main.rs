@@ -15,6 +15,7 @@ use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::handle_main_page;
 use trusted_server_common::settings::Settings;
+use trusted_server_common::settings_data::get_settings;
 use trusted_server_common::templates::GAM_TEST_TEMPLATE;
 use trusted_server_common::why::handle_why_trusted_server;
 
@@ -22,7 +23,7 @@ use trusted_server_common::why::handle_why_trusted_server;
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
 
-    let settings = match Settings::new() {
+    let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
