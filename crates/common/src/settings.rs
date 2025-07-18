@@ -11,7 +11,7 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AdServer {
-    pub ad_partner_url: String,
+    pub ad_partner_backend: String,
     pub sync_url: String,
 }
 
@@ -134,7 +134,7 @@ mod tests {
 
         let settings = settings.unwrap();
         // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_url.is_empty());
+        assert!(!settings.ad_server.ad_partner_backend.is_empty());
         assert!(!settings.ad_server.sync_url.is_empty());
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
@@ -155,7 +155,7 @@ mod tests {
 
         let settings = settings.expect("should parse valid TOML");
         assert_eq!(
-            settings.ad_server.ad_partner_url,
+            settings.ad_server.ad_partner_backend,
             "https://test-adpartner.com"
         );
         assert_eq!(
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new(r"ad_partner_url = .*").unwrap();
+        let re = Regex::new(r"ad_partner_backend = .*").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -229,13 +229,13 @@ mod tests {
 
     #[test]
     fn test_set_env() {
-        let re = Regex::new(r"ad_partner_url = .*").unwrap();
+        let re = Regex::new(r"ad_partner_backend = .*").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                "{}{}AD_SERVER{}AD_PARTNER_BACKEND",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
@@ -246,7 +246,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_url,
+                    settings.unwrap().ad_server.ad_partner_backend,
                     "https://change-ad.com/serve"
                 );
             },
@@ -259,7 +259,7 @@ mod tests {
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                "{}{}AD_SERVER{}AD_PARTNER_BACKEND",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
@@ -270,7 +270,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_url,
+                    settings.unwrap().ad_server.ad_partner_backend,
                     "https://change-ad.com/serve"
                 );
             },

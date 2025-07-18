@@ -1,7 +1,9 @@
+use crate::error::TrustedServerError;
 use crate::gdpr::get_consent_from_request;
 use crate::settings::Settings;
+use error_stack::Report;
 use fastly::http::{header, Method, StatusCode};
-use fastly::{Error, Request, Response};
+use fastly::{Request, Response};
 use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -19,7 +21,7 @@ pub struct GamRequest {
 
 impl GamRequest {
     /// Create a new GAM request with default parameters
-    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Error> {
+    pub fn new(settings: &Settings, req: &Request) -> Result<Self, Report<TrustedServerError>> {
         let correlator = Uuid::new_v4().to_string();
         let page_url = req.get_url().to_string();
         let user_agent = req
@@ -125,7 +127,10 @@ impl GamRequest {
     }
 
     /// Send the GAM request and return the response
-    pub async fn send_request(&self, _settings: &Settings) -> Result<Response, Error> {
+    pub async fn send_request(
+        &self,
+        _settings: &Settings,
+    ) -> Result<Response, Report<TrustedServerError>> {
         let url = self.build_golden_url();
         log::info!("Sending GAM request to: {}", url);
 
@@ -217,14 +222,19 @@ impl GamRequest {
             }
             Err(e) => {
                 log::error!("Error sending GAM request: {:?}", e);
-                Err(e.into())
+                Err(Report::new(TrustedServerError::Gam {
+                    message: format!("Failed to send GAM request: {}", e),
+                }))
             }
         }
     }
 }
 
 /// Handle GAM test requests (Phase 1: Capture & Replay)
-pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Response, Error> {
+pub async fn handle_gam_test(
+    settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Starting GAM test request handling");
 
     // Debug: Log all request headers
@@ -260,7 +270,7 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     log::info!("GAM Test - Final advertising consent: {}", final_consent);
 
     if !final_consent {
-        return Ok(Response::from_status(StatusCode::OK)
+        return Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body_json(&json!({
                 "error": "No advertising consent",
@@ -270,7 +280,12 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
                     "header_consent": header_consent,
                     "final_consent": final_consent
                 }
-            }))?);
+            }))
+            .map_err(|e| {
+                Report::new(TrustedServerError::Gam {
+                    message: format!("Failed to serialize consent response: {}", e),
+                })
+            });
     }
 
     // Create GAM request
@@ -281,12 +296,17 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
         }
         Err(e) => {
             log::error!("Error creating GAM request: {:?}", e);
-            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+            return Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
                     "error": "Failed to create GAM request",
                     "details": format!("{:?}", e)
-                }))?);
+                }))
+                .map_err(|e| {
+                    Report::new(TrustedServerError::Gam {
+                        message: format!("Failed to serialize error response: {}", e),
+                    })
+                });
         }
     };
 
@@ -306,23 +326,31 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
         }
         Err(e) => {
             log::error!("GAM request failed: {:?}", e);
-            Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+            Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
                     "error": "Failed to send GAM request",
                     "details": format!("{:?}", e)
-                }))?)
+                }))
+                .map_err(|e| {
+                    Report::new(TrustedServerError::Gam {
+                        message: format!("Failed to serialize error response: {}", e),
+                    })
+                })
         }
     }
 }
 
 /// Handle GAM golden URL replay (for testing captured requests)
-pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Result<Response, Error> {
+pub async fn handle_gam_golden_url(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Handling GAM golden URL replay");
 
     // This endpoint will be used to test the exact captured URL from autoblog.com
     // For now, return a placeholder response
-    Ok(Response::from_status(StatusCode::OK)
+    Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_body_json(&json!({
             "status": "golden_url_replay",
@@ -332,14 +360,19 @@ pub async fn handle_gam_golden_url(_settings: &Settings, _req: Request) -> Resul
                 "2. Replace placeholder URL in GamRequest::build_golden_url()",
                 "3. Test with exact captured parameters"
             ]
-        }))?)
+        }))
+        .map_err(|e| {
+            Report::new(TrustedServerError::Gam {
+                message: format!("Failed to serialize response: {}", e),
+            })
+        })
 }
 
 /// Handle GAM custom URL testing (for testing captured URLs directly)
 pub async fn handle_gam_custom_url(
     _settings: &Settings,
     mut req: Request,
-) -> Result<Response, Error> {
+) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Handling GAM custom URL test");
 
     // Check consent status from cookie
@@ -347,24 +380,33 @@ pub async fn handle_gam_custom_url(
     let advertising_consent = consent.advertising;
 
     if !advertising_consent {
-        return Ok(Response::from_status(StatusCode::OK)
+        return Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body_json(&json!({
                 "error": "No advertising consent",
                 "message": "GAM requests require advertising consent"
-            }))?);
+            }))
+            .map_err(|e| {
+                Report::new(TrustedServerError::Gam {
+                    message: format!("Failed to serialize response: {}", e),
+                })
+            });
     }
 
     // Parse the request body to get the custom URL
     let body = req.take_body_str();
     let url_data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
         log::error!("Error parsing request body: {:?}", e);
-        fastly::Error::msg("Invalid JSON in request body")
+        Report::new(TrustedServerError::Gam {
+            message: format!("Invalid JSON in request body: {}", e),
+        })
     })?;
 
-    let custom_url = url_data["url"]
-        .as_str()
-        .ok_or_else(|| fastly::Error::msg("Missing 'url' field in request body"))?;
+    let custom_url = url_data["url"].as_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Gam {
+            message: "Missing 'url' field in request body".to_string(),
+        })
+    })?;
 
     log::info!("Testing custom GAM URL: {}", custom_url);
 
@@ -449,23 +491,36 @@ pub async fn handle_gam_custom_url(
                     "response_status": response.get_status().as_u16(),
                     "response_body": body,
                     "message": "Custom URL test completed"
-                }))?)
+                }))
+                .map_err(|e| {
+                    Report::new(TrustedServerError::Gam {
+                        message: format!("Failed to serialize response: {}", e),
+                    })
+                })?)
         }
         Err(e) => {
             log::error!("Error sending custom GAM request: {:?}", e);
-            Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+            Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
                     "error": "Failed to send custom GAM request",
                     "details": format!("{:?}", e),
                     "original_url": custom_url
-                }))?)
+                }))
+                .map_err(|e| {
+                    Report::new(TrustedServerError::Gam {
+                        message: format!("Failed to serialize error response: {}", e),
+                    })
+                })
         }
     }
 }
 
 /// Handle GAM response rendering in iframe
-pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Response, Error> {
+pub async fn handle_gam_render(
+    settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Handling GAM response rendering");
 
     // Check consent status from cookie
@@ -473,24 +528,32 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
     let advertising_consent = consent.advertising;
 
     if !advertising_consent {
-        return Ok(Response::from_status(StatusCode::OK)
+        return Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body_json(&json!({
                 "error": "No advertising consent",
                 "message": "GAM requests require advertising consent"
-            }))?);
+            }))
+            .map_err(|e| {
+                Report::new(TrustedServerError::Gam {
+                    message: format!("Failed to serialize response: {}", e),
+                })
+            });
     }
 
     // Create GAM request and get response
     let gam_req = match GamRequest::new(settings, &req) {
         Ok(req) => req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string()),
         Err(e) => {
-            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+            return Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
                     "error": "Failed to create GAM request",
                     "details": format!("{:?}", e)
-                }))?);
+                }))
+                .map_err(|e| Report::new(TrustedServerError::Gam {
+                    message: format!("Failed to serialize error response: {}", e),
+                }));
         }
     };
 
@@ -498,12 +561,17 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
     let gam_response = match gam_req.send_request(settings).await {
         Ok(response) => response,
         Err(e) => {
-            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+            return Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_header(header::CONTENT_TYPE, "application/json")
                 .with_body_json(&json!({
                     "error": "Failed to get GAM response",
                     "details": format!("{:?}", e)
-                }))?);
+                }))
+                .map_err(|e| {
+                    Report::new(TrustedServerError::Gam {
+                        message: format!("Failed to serialize error response: {}", e),
+                    })
+                });
         }
     };
 
