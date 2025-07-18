@@ -1,6 +1,6 @@
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
-use log::LevelFilter::Info;
+use log_fastly::Logger;
 
 mod error;
 use crate::error::to_error_response;
@@ -20,7 +20,7 @@ use trusted_server_common::why::handle_why_trusted_server;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    log_fastly::init_simple("mylogs", Info);
+    init_logger();
 
     let settings = match Settings::new() {
         Ok(s) => s,
@@ -82,4 +82,26 @@ fn not_found_response() -> Response {
         .with_body("Not Found")
         .with_header(header::CONTENT_TYPE, "text/plain")
         .with_header(HEADER_X_COMPRESS_HINT, "on")
+}
+
+fn init_logger() {
+    let logger = Logger::builder()
+        .default_endpoint("tslog")
+        .echo_stdout(true)
+        .max_level(log::LevelFilter::Debug)
+        .build()
+        .expect("Failed to build Logger");
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}  {} {}",
+                chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                record.level(),
+                message
+            ))
+        })
+        .chain(Box::new(logger) as Box<dyn log::Log>)
+        .apply()
+        .expect("Failed to initialize logger");
 }
