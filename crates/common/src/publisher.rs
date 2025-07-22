@@ -1,10 +1,11 @@
+use brotli::enc::{writer::CompressorWriter, BrotliEncoderParams};
+use brotli::Decompressor;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
-use std::io::{Read, Write};
 
 use crate::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_GEO_CITY,
@@ -16,7 +17,7 @@ use crate::error::TrustedServerError;
 use crate::gdpr::{get_consent_from_request, GdprConsent};
 use crate::geo::get_dma_code;
 use crate::settings::Settings;
-use crate::streaming_replacer::StreamingReplacer;
+use crate::streaming_replacer::{create_url_replacer, stream_process};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::templates::HTML_TEMPLATE;
 
@@ -189,52 +190,6 @@ pub fn handle_main_page(
     Ok(response)
 }
 
-/// Generic streaming processor that reads from a source, processes through replacer, and writes to output
-fn stream_process<R: Read, W: Write>(
-    mut reader: R,
-    writer: &mut W,
-    replacer: &mut StreamingReplacer,
-    chunk_size: usize,
-) -> Result<(), Report<TrustedServerError>> {
-    let mut buffer = vec![0u8; chunk_size];
-
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                // End of stream - process any remaining data
-                let final_chunk = replacer.process_chunk(&[], true);
-                if !final_chunk.is_empty() {
-                    writer
-                        .write_all(&final_chunk)
-                        .change_context(TrustedServerError::Proxy {
-                            message: "Failed to write final chunk".to_string(),
-                        })?;
-                }
-                break;
-            }
-            Ok(n) => {
-                // Process this chunk
-                let processed = replacer.process_chunk(&buffer[..n], false);
-                if !processed.is_empty() {
-                    writer
-                        .write_all(&processed)
-                        .change_context(TrustedServerError::Proxy {
-                            message: "Failed to write processed chunk".to_string(),
-                        })?;
-                }
-            }
-            Err(e) => {
-                log::error!("Error reading from stream: {}", e);
-                return Err(Report::new(TrustedServerError::Proxy {
-                    message: format!("Failed to read from stream: {}", e),
-                }));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Process response body in streaming fashion with compression preservation
 fn process_response_streaming(
     body: Body,
@@ -246,15 +201,14 @@ fn process_response_streaming(
 ) -> Result<Body, Report<TrustedServerError>> {
     const CHUNK_SIZE: usize = 8192; // 8KB chunks
 
-    // Create the streaming replacer
-    let mut replacer =
-        StreamingReplacer::new(origin_host, origin_url, request_host, request_scheme);
+    // Create the streaming replacer for URL replacements
+    let mut replacer = create_url_replacer(origin_host, origin_url, request_host, request_scheme);
 
     // Create output body
     let mut output_body = Body::new();
 
     // Determine if content needs decompression/recompression
-    let is_compressed = matches!(content_encoding, "gzip" | "deflate");
+    let is_compressed = matches!(content_encoding, "gzip" | "deflate" | "br");
 
     if is_compressed {
         // For compressed content, we stream through:
@@ -275,7 +229,11 @@ fn process_response_streaming(
                 let mut encoder = GzEncoder::new(output_body, Compression::default());
 
                 // Stream through the pipeline
-                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE)?;
+                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE).map_err(|e| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to process stream: {}", e),
+                    })
+                })?;
 
                 // Finish compression and get the output body
                 output_body = encoder.finish().change_context(TrustedServerError::Proxy {
@@ -289,12 +247,42 @@ fn process_response_streaming(
                 let mut encoder = ZlibEncoder::new(output_body, Compression::default());
 
                 // Stream through the pipeline
-                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE)?;
+                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE).map_err(|e| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to process stream: {}", e),
+                    })
+                })?;
 
                 // Finish compression and get the output body
                 output_body = encoder.finish().change_context(TrustedServerError::Proxy {
                     message: "Failed to finish deflate compression".to_string(),
                 })?;
+            }
+            "br" => {
+                // Create Brotli decompressor
+                let decoder = Decompressor::new(body, 4096); // 4KB buffer
+
+                // Create Brotli compressor with reasonable parameters
+                // Quality 4 gives good balance of speed and compression
+                let params = BrotliEncoderParams {
+                    quality: 4,
+                    lgwin: 22, // 4MB window
+                    ..Default::default()
+                };
+
+                // Create Brotli compressor writer
+                let mut encoder = CompressorWriter::with_params(output_body, 4096, &params);
+
+                // Stream through the pipeline
+                stream_process(decoder, &mut encoder, &mut replacer, CHUNK_SIZE).map_err(|e| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to process Brotli stream: {}", e),
+                    })
+                })?;
+
+                // Finish compression and get the output body
+                // Note: into_inner() returns the inner writer (Body), not a Result
+                output_body = encoder.into_inner();
             }
             _ => unreachable!(),
         }
@@ -303,7 +291,11 @@ fn process_response_streaming(
         log::info!("Processing uncompressed content");
 
         // Stream directly from body to output
-        stream_process(body, &mut output_body, &mut replacer, CHUNK_SIZE)?;
+        stream_process(body, &mut output_body, &mut replacer, CHUNK_SIZE).map_err(|e| {
+            Report::new(TrustedServerError::Proxy {
+                message: format!("Failed to process stream: {}", e),
+            })
+        })?;
     }
 
     log::info!("Streaming processing complete");
@@ -375,9 +367,7 @@ pub fn handle_publisher_request(
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default();
 
-    let should_process = content_type.contains("text/html")
-        || content_type.contains("text/css")
-        || content_type.contains("text/javascript")
+    let should_process = content_type.contains("text/")
         || content_type.contains("application/javascript")
         || content_type.contains("application/json");
 
@@ -681,6 +671,68 @@ mod tests {
         use flate2::read::GzDecoder;
         use std::io::Read;
         let mut decoder = GzDecoder::new(&bytes[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+
+        // Verify URLs were replaced
+        assert!(decompressed.contains("https://test.example.com/style.css"));
+        assert!(decompressed.contains("https://test.example.com/app.js"));
+        assert!(decompressed.contains("https://test.example.com/page"));
+        assert!(!decompressed.contains("origin.example.com"));
+    }
+
+    #[test]
+    fn test_streaming_brotli_content() {
+        use brotli::enc::writer::CompressorWriter;
+        use brotli::enc::BrotliEncoderParams;
+        use std::io::Write;
+
+        // Create some HTML content with origin URLs
+        let original_content = r#"<html>
+            <link href="https://origin.example.com/style.css" rel="stylesheet">
+            <script src="https://origin.example.com/app.js"></script>
+            <a href="https://origin.example.com/page">Link</a>
+        </html>"#;
+
+        // Compress the content with Brotli
+        let mut compressed = Vec::new();
+        {
+            let params = BrotliEncoderParams {
+                quality: 4,
+                lgwin: 22,
+                ..Default::default()
+            };
+            let mut encoder = CompressorWriter::with_params(&mut compressed, 4096, &params);
+            encoder.write_all(original_content.as_bytes()).unwrap();
+            // encoder is dropped here, which finishes the compression
+        }
+
+        // Create a Body from compressed data
+        let body = Body::from(compressed);
+
+        // Process the compressed body
+        let result = process_response_streaming(
+            body,
+            "br",
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(result.is_ok());
+        let processed_body = result.unwrap();
+
+        // The body should still be compressed
+        // In a real test, we'd decompress and verify the content
+        // For now, just check that we got a body back
+        let bytes = processed_body.into_bytes();
+        assert!(!bytes.is_empty());
+
+        // Decompress to verify content was transformed
+        use brotli::Decompressor;
+        use std::io::Read;
+        let mut decoder = Decompressor::new(&bytes[..], 4096);
         let mut decompressed = String::new();
         decoder.read_to_string(&mut decompressed).unwrap();
 
