@@ -1,10 +1,11 @@
 use std::env;
+use std::io::Read;
 
 use fastly::geo::geo_lookup;
 use fastly::http::{header, Method, StatusCode};
 use fastly::KVStore;
 use fastly::{Error, Request, Response};
-use log::LevelFilter::Info;
+use log_fastly::Logger;
 use serde_json::json;
 
 mod error;
@@ -29,11 +30,19 @@ use trusted_server_common::prebid::PrebidRequest;
 use trusted_server_common::privacy::PRIVACY_TEMPLATE;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use trusted_server_common::templates::{GAM_TEST_TEMPLATE, HTML_TEMPLATE};
+use trusted_server_common::templates::{EDGEPUBS_TEMPLATE, GAM_TEST_TEMPLATE, HTML_TEMPLATE};
 use trusted_server_common::why::WHY_TEMPLATE;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
+    init_logger();
+
+    // Log service version first
+    log::info!(
+        "FASTLY_SERVICE_VERSION: {}",
+        std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
+    );
+
     // Print Settings only once at the beginning
     let settings = match Settings::new() {
         Ok(s) => s,
@@ -51,14 +60,18 @@ fn main(req: Request) -> Result<Response, Error> {
     log::info!("User IP: {}", client_ip);
 
     futures::executor::block_on(async {
-        log::info!(
-            "FASTLY_SERVICE_VERSION: {}",
-            std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
-        );
-
         match (req.get_method(), req.get_path()) {
-            (&Method::GET, "/") => handle_main_page(&settings, req),
+            (&Method::GET, "/") => handle_edgepubs_page(&settings, req),
+            (&Method::GET, "/auburndao") => handle_main_page(&settings, req),
             (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
+            // Direct asset serving for partner domains (like auburndao.com approach)
+            (&Method::GET, path) if is_partner_asset_path(path) => {
+                handle_partner_asset(&settings, req).await
+            }
+            // GAM asset serving (separate from Equativ, checked after Equativ)
+            (&Method::GET, path) if is_gam_asset_path(path) => {
+                handle_gam_asset(&settings, req).await
+            }
             (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
             (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
             (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
@@ -141,6 +154,582 @@ fn get_dma_code(req: &mut Request) -> Option<String> {
     None
 }
 
+/// Handles the EdgePubs page request.
+///
+/// Serves the EdgePubs landing page with integrated ad slots.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if response creation fails.
+fn handle_edgepubs_page(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+    log::info!("Serving EdgePubs landing page");
+
+    // log_fastly::init_simple("mylogs", Info);
+
+    // Add DMA code check
+    let dma_code = get_dma_code(&mut req);
+    log::info!("EdgePubs page - DMA Code: {:?}", dma_code);
+
+    // Check GDPR consent
+    let _consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found for EdgePubs page, using default");
+            GdprConsent::default()
+        }
+    };
+
+    // Generate synthetic ID for EdgePubs page
+    let fresh_id = match generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
+
+    // Get or generate Trusted Server ID
+    let trusted_server_id = match get_or_generate_synthetic_id(settings, &req) {
+        Ok(id) => id,
+        Err(e) => return Ok(to_error_response(e)),
+    };
+
+    // Create response with EdgePubs template
+    let mut response = Response::from_status(StatusCode::OK)
+        .with_body(EDGEPUBS_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(HEADER_X_COMPRESS_HINT, "on");
+
+    // Add synthetic ID headers
+    response.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &trusted_server_id);
+
+    // Add DMA code header if available
+    if let Some(dma) = dma_code {
+        response.set_header(HEADER_X_GEO_METRO_CODE, dma);
+    }
+
+    // Set synthetic ID cookie
+    let cookie = create_synthetic_cookie(settings, &trusted_server_id);
+    response.set_header(header::SET_COOKIE, cookie);
+
+    Ok(response)
+}
+
+/// Check if the path is for an Equativ asset that should be served directly (like auburndao.com)
+fn is_partner_asset_path(path: &str) -> bool {
+    // Only handle Equativ/Smart AdServer assets for now
+    path.contains("/diff/") ||          // Equativ assets
+    path.ends_with(".png") ||           // Images
+    path.ends_with(".jpg") ||           // Images
+    path.ends_with(".gif") // Images
+}
+
+/// Handles direct asset serving for partner domains (like auburndao.com).
+///
+/// Fetches assets from original partner domains and serves them as first-party content.
+/// This bypasses ad blockers and Safari ITP by making all assets appear to come from edgepubs.com.
+///
+/// # Errors
+///
+/// Returns a Fastly [`Error`] if asset fetching fails.
+async fn handle_partner_asset(_settings: &Settings, req: Request) -> Result<Response, Error> {
+    let path = req.get_path();
+    println!("=== HANDLING PARTNER ASSET: {} ===", path);
+    log::info!("Handling partner asset request: {}", path);
+
+    // Only handle Equativ/Smart AdServer assets (matching auburndao.com approach)
+    let (backend_name, original_host) = ("equativ_sascdn_backend", "creatives.sascdn.com");
+
+    log::info!(
+        "Serving asset from backend: {} (original host: {})",
+        backend_name,
+        original_host
+    );
+
+    // Construct full URL using the original host and path
+    let full_url = format!("https://{}{}", original_host, path);
+    log::info!("Fetching asset URL: {}", full_url);
+
+    let mut asset_req = Request::new(req.get_method().clone(), &full_url);
+
+    // Copy all headers from original request
+    for (name, value) in req.get_headers() {
+        asset_req.set_header(name, value);
+    }
+
+    // Set the Host header to the original domain for proper routing
+    asset_req.set_header(header::HOST, original_host);
+
+    // Send to appropriate backend
+    match asset_req.send(backend_name) {
+        Ok(mut response) => {
+            // Match auburndao.com cache control exactly
+            let cache_control = "max-age=31536000";
+
+            // No content rewriting needed for Equativ assets (they're mostly images)
+            // This matches the auburndao.com approach of serving assets directly
+
+            // Match auburndao.com headers exactly - no modifications
+            response.set_header(header::CACHE_CONTROL, cache_control);
+
+            // Don't modify any other headers - keep them exactly as auburndao.com gets them
+
+            println!("=== ASSET RESPONSE HEADERS FOR {} ===", path);
+            for (name, value) in response.get_headers() {
+                println!("  {}: {:?}", name, value);
+            }
+
+            // No special CORB handling needed for Equativ image assets
+
+            log::info!(
+                "Partner asset served successfully, cache-control: {}",
+                cache_control
+            );
+            Ok(response)
+        }
+        Err(e) => {
+            log::error!(
+                "Error fetching partner asset from {} (original host: {}): {:?}",
+                backend_name,
+                original_host,
+                e
+            );
+            Ok(Response::from_status(StatusCode::NOT_FOUND)
+                .with_header(header::CONTENT_TYPE, "text/plain")
+                .with_header("X-Original-Host", original_host)
+                .with_header("X-Backend-Used", backend_name)
+                .with_body(format!("Asset not found: Unable to fetch from {} (original: {})\\nPath: {}\\nError: {:?}", backend_name, original_host, path, e)))
+        }
+    }
+}
+
+/// Check if the path is for a GAM asset (separate from Equativ)
+fn is_gam_asset_path(path: &str) -> bool {
+    // Instead of trying to match specific path patterns, we check if this looks like 
+    // a request that was originally intended for a GAM domain but got rewritten to edgepubs.com
+    
+    // Common GAM paths that we know about
+    path.contains("/tag/js/") ||        // Google Tag Manager/GAM scripts (including our renamed test.js)
+    path.contains("/pagead/") ||        // GAM ad serving and interactions
+    path.contains("/gtag/js") ||        // Google Analytics/GAM gtag scripts
+    path.contains("/gampad/") ||        // GAM ad requests (gampad/ads)
+    path.contains("/bg/") ||            // GAM background scripts
+    path.contains("/sodar") ||          // GAM traffic quality checks
+    path.contains("/getconfig/") ||     // GAM configuration requests
+    path.contains("/generate_204") ||   // GAM tracking pixels
+    path.contains("/recaptcha/") ||     // reCAPTCHA requests
+    path.contains("/static/topics/") || // GAM topics framework
+    path.contains("safeframe")          // GAM safe frame containers
+}
+
+/// Handles GAM asset serving (completely separate from Equativ)
+/// Rewrite hardcoded URLs in GAM JavaScript to use first-party proxy
+fn rewrite_gam_urls(content: &str) -> String {
+    log::info!("Starting GAM URL rewriting...");
+
+    // Define the URL mappings based on the user's configuration
+    let url_mappings = [
+        // Primary GAM domains
+        ("securepubads.g.doubleclick.net", "edgepubs.com"),
+        ("googletagservices.com", "edgepubs.com"),
+        ("googlesyndication.com", "edgepubs.com"),
+        ("pagead2.googlesyndication.com", "edgepubs.com"),
+        ("tpc.googlesyndication.com", "edgepubs.com"),
+        
+        // GAM-specific subdomains that might appear
+        ("www.googletagservices.com", "edgepubs.com"),
+        ("www.googlesyndication.com", "edgepubs.com"),
+        ("static.googleadsserving.cn", "edgepubs.com"),
+        
+        // Ad serving domains
+        ("doubleclick.net", "edgepubs.com"),
+        ("www.google.com/adsense", "edgepubs.com/adsense"),
+        
+        // Google ad quality and traffic domains (these were missing!)
+        ("adtrafficquality.google", "edgepubs.com"),
+        ("ep1.adtrafficquality.google", "edgepubs.com"),
+        ("ep2.adtrafficquality.google", "edgepubs.com"),
+        ("ep3.adtrafficquality.google", "edgepubs.com"),
+        
+        // Other Google ad-related domains
+        ("6ab9b2c571ea5e8cf287325e9ebeaa41.safeframe.googlesyndication.com", "edgepubs.com"),
+        ("www.google.com/recaptcha", "edgepubs.com/recaptcha"),
+    ];
+
+    let mut rewritten_content = content.to_string();
+    let mut total_replacements = 0;
+
+    for (original_domain, proxy_domain) in &url_mappings {
+        // Count replacements for this domain
+        let before_count = rewritten_content.matches(original_domain).count();
+
+        if before_count > 0 {
+            log::info!(
+                "Found {} occurrences of '{}' to rewrite",
+                before_count,
+                original_domain
+            );
+
+            // Replace both HTTP and HTTPS versions
+            rewritten_content = rewritten_content.replace(
+                &format!("https://{}", original_domain),
+                &format!("https://{}", proxy_domain),
+            );
+            rewritten_content = rewritten_content.replace(
+                &format!("http://{}", original_domain),
+                &format!("https://{}", proxy_domain),
+            );
+
+            // Also replace protocol-relative URLs (//domain.com)
+            rewritten_content = rewritten_content.replace(
+                &format!("//{}", original_domain),
+                &format!("//{}", proxy_domain),
+            );
+
+            // Replace domain-only references (for cases where protocol is added separately)
+            rewritten_content = rewritten_content.replace(
+                &format!("\"{}\"", original_domain),
+                &format!("\"{}\"", proxy_domain),
+            );
+            rewritten_content = rewritten_content.replace(
+                &format!("'{}'", original_domain),
+                &format!("'{}'", proxy_domain),
+            );
+
+            let after_count = rewritten_content.matches(original_domain).count();
+            let replacements = before_count - after_count;
+            total_replacements += replacements;
+
+            if replacements > 0 {
+                log::info!(
+                    "Replaced {} occurrences of '{}' with '{}'",
+                    replacements,
+                    original_domain,
+                    proxy_domain
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "GAM URL rewriting complete. Total replacements: {}",
+        total_replacements
+    );
+
+    // Log a sample of the rewritten content for debugging (first 500 chars)
+    if total_replacements > 0 {
+        let sample_length = std::cmp::min(500, rewritten_content.len());
+        log::debug!(
+            "Rewritten content sample: {}",
+            &rewritten_content[..sample_length]
+        );
+    }
+
+    rewritten_content
+}
+
+async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response, Error> {
+    let path = req.get_path();
+    println!("=== HANDLING GAM ASSET: {} ===", path);
+    log::info!("Handling GAM asset request: {}", path);
+
+    // Enhanced logging for GAM requests
+    log::info!("GAM Asset Request Details:");
+    log::info!("  - Path: {}", path);
+    log::info!("  - Method: {}", req.get_method());
+    log::info!("  - Full URL: {}", req.get_url());
+
+    // Log all request headers for debugging
+    log::info!("GAM Asset Request Headers:");
+    for (name, value) in req.get_headers() {
+        log::info!("  {}: {:?}", name, value);
+    }
+
+    // Log query parameters if any
+    if let Some(query) = req.get_url().query() {
+        log::info!("GAM Asset Query Parameters: {}", query);
+    }
+
+    // For domain-level proxying, we assume all GAM requests go to the main GAM backend
+    // unless we detect specific patterns that need different backends
+    let (backend_name, original_host, target_path) = if path.contains("/tag/js/test.js") {
+        // Special case: our renamed test.js should map to the original gpt.js
+        ("gam_backend", "securepubads.g.doubleclick.net", "/tag/js/gpt.js".to_string())
+    } else if path.contains("/pagead/") && path.contains("googlesyndication") {
+        (
+            "pagead2_googlesyndication_backend",
+            "pagead2.googlesyndication.com",
+            path.to_string()
+        )
+    } else {
+        // Default: all other GAM requests go to main GAM backend with original path
+        ("gam_backend", "securepubads.g.doubleclick.net", path.to_string())
+    };
+
+    log::info!(
+        "Serving GAM asset from backend: {} (original host: {})",
+        backend_name,
+        original_host
+    );
+
+    // Construct full URL using the original host and target path (may be different from request path)
+    let mut full_url = format!("https://{}{}", original_host, target_path);
+    
+    // Add query string if present
+    if let Some(query) = req.get_url().query() {
+        full_url.push('?');
+        full_url.push_str(query);
+    }
+    
+    // Special handling for /gampad/ads requests - rewrite URL parameter to use autoblog.com
+    if target_path.contains("/gampad/ads") {
+        log::info!("Applying URL parameter rewriting for GAM ad request");
+        // Change url=https%3A%2F%2Fedgepubs.com%2F to url=https%3A%2F%2Fwww.autoblog.com%2F
+        full_url = full_url.replace(
+            "url=https%3A%2F%2Fedgepubs.com%2F",
+            "url=https%3A%2F%2Fwww.autoblog.com%2F"
+        );
+        log::info!("Rewrote URL parameter from edgepubs.com to www.autoblog.com");
+    }
+    
+    log::info!("Fetching GAM asset URL: {} (original request: {})", full_url, path);
+
+    let mut asset_req = Request::new(req.get_method().clone(), &full_url);
+
+    // Copy all headers from original request
+    for (name, value) in req.get_headers() {
+        asset_req.set_header(name, value);
+    }
+
+    // Set the Host header to the original domain for proper routing
+    asset_req.set_header(header::HOST, original_host);
+
+    // Send to appropriate GAM backend
+    log::info!(
+        "Sending GAM asset request to backend '{}' for URL: {}",
+        backend_name,
+        full_url
+    );
+    match asset_req.send(backend_name) {
+        Ok(mut response) => {
+            log::info!(
+                "Received GAM asset response: status={}, content-length={:?}",
+                response.get_status(),
+                response.get_header(header::CONTENT_LENGTH)
+            );
+            // Check if this is a JavaScript response that needs content rewriting
+            let content_type = response
+                .get_header(header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+
+            // Enable rewriting for JavaScript content
+            let needs_rewriting = content_type.contains("javascript") || path.contains(".js");
+            log::info!("Content rewriting enabled for JavaScript: {}", needs_rewriting);
+
+            log::info!(
+                "GAM asset content-type: {}, needs_rewriting: {}",
+                content_type,
+                needs_rewriting
+            );
+
+            if needs_rewriting {
+                // Step 1: Capture original content-disposition header before processing
+                let original_content_disposition = response.get_header("content-disposition")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
+                
+                log::info!("Captured original content-disposition: {:?}", original_content_disposition);
+                
+                // Step 2: Remove content-disposition header so we can process the response properly
+                response.remove_header("content-disposition");
+                log::info!("Step 2: Temporarily removed content-disposition header for processing");
+                
+                // Get the response body as bytes first
+                let body_bytes = response.take_body_bytes();
+                let original_length = body_bytes.len();
+
+                log::info!(
+                    "Original GAM JavaScript body length: {} bytes",
+                    original_length
+                );
+
+                // Check if we need to decompress Brotli data
+                let decompressed_body = if response.get_header("content-encoding")
+                    .and_then(|h| h.to_str().ok()) == Some("br") {
+                    
+                    log::info!("Detected Brotli compression, decompressing...");
+                    let mut decompressed = Vec::new();
+                    match brotli::Decompressor::new(&body_bytes[..], 4096)
+                        .read_to_end(&mut decompressed) {
+                        Ok(bytes_read) => {
+                            log::info!("Successfully decompressed {} bytes to {} bytes", original_length, bytes_read);
+                            decompressed
+                        }
+                        Err(e) => {
+                            log::error!("Failed to decompress Brotli data: {:?}", e);
+                            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .with_body(format!("Failed to decompress GAM asset: {:?}", e)));
+                        }
+                    }
+                } else {
+                    log::info!("No compression detected, using raw bytes");
+                    body_bytes
+                };
+
+                // Now safely convert decompressed data to string
+                let body = match std::str::from_utf8(&decompressed_body) {
+                    Ok(body_str) => {
+                        log::info!("Successfully decoded decompressed response as UTF-8");
+                        body_str.to_string()
+                    }
+                    Err(e) => {
+                        log::error!("Decompressed response contains non-UTF-8 data: {:?}", e);
+                        return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_body(format!("Invalid UTF-8 in decompressed GAM asset: {:?}", e)));
+                    }
+                };
+
+                // Log a sample of the original content for debugging (safely)
+                let sample = if body.len() > 200 {
+                    // Find a safe character boundary near 200 bytes
+                    match body.char_indices().nth(100) { // Get first ~100 characters instead of 200 bytes
+                        Some((byte_idx, _)) => &body[..byte_idx],
+                        None => &body[..std::cmp::min(50, body.len())] // Fallback to very short sample
+                    }
+                } else {
+                    &body
+                };
+                log::info!("Original content sample: {}", sample);
+
+                // Rewrite hardcoded URLs to use first-party proxy
+                let rewritten_body = rewrite_gam_urls(&body);
+                let rewritten_length = rewritten_body.len();
+
+                log::info!(
+                    "Rewritten GAM JavaScript body length: {} bytes (diff: {})",
+                    rewritten_length,
+                    rewritten_length as i32 - original_length as i32
+                );
+
+                // Log a sample of the rewritten content for comparison (safely)
+                if rewritten_length != original_length {
+                    let rewritten_sample = if rewritten_body.len() > 200 {
+                        // Find a safe character boundary near 200 bytes
+                        match rewritten_body.char_indices().nth(100) {
+                            Some((byte_idx, _)) => &rewritten_body[..byte_idx],
+                            None => &rewritten_body[..std::cmp::min(50, rewritten_body.len())]
+                        }
+                    } else {
+                        &rewritten_body
+                    };
+                    log::info!("Rewritten content sample: {}", rewritten_sample);
+                } else {
+                    log::warn!("No content changes detected - rewriting may not have found target URLs");
+                }
+
+                // Create new response with rewritten content
+                let mut new_response = Response::from_status(response.get_status());
+
+                // Copy headers from original response, but filter out problematic ones
+                for (name, value) in response.get_headers() {
+                    let header_name = name.as_str().to_lowercase();
+                    // Skip headers that would cause problems with rewritten content
+                    if header_name == "content-disposition" {
+                        log::info!("Skipping problematic header: {}: {:?}", name, value);
+                        continue;
+                    }
+                    // Skip compression headers since our rewritten content is uncompressed
+                    if header_name == "content-encoding" || header_name == "content-length" {
+                        log::info!("Skipping compression header for rewritten content: {}: {:?}", name, value);
+                        continue;
+                    }
+                    new_response.set_header(name, value);
+                }
+
+                // Set rewritten content (uncompressed to avoid timeout issues)
+                // Note: compression headers are already filtered out above
+                new_response.set_body(rewritten_body);
+                log::info!("Sending rewritten content uncompressed to avoid Fastly timeout limits");
+
+                // Disable caching during development/debugging
+                let cache_control = "no-cache, no-store, must-revalidate";
+                new_response.set_header(header::CACHE_CONTROL, cache_control);
+                new_response.set_header("Pragma", "no-cache");
+                new_response.set_header("Expires", "0");
+
+                // Step 3: Restore original content-disposition header if it existed
+                if let Some(original_disposition) = original_content_disposition {
+                    new_response.set_header("content-disposition", &original_disposition);
+                    log::info!("Step 3: Restored original content-disposition header: {}", original_disposition);
+                }
+                
+                // Add debug headers
+                new_response.set_header("X-Content-Rewritten", "true");
+                new_response.set_header("X-Original-Length", &original_length.to_string());
+                new_response.set_header("X-Rewritten-Length", &rewritten_length.to_string());
+
+                println!(
+                    "=== GAM ASSET RESPONSE HEADERS FOR {} (REWRITTEN) ===",
+                    path
+                );
+                log::info!("GAM Asset Response Headers (Rewritten):");
+                for (name, value) in new_response.get_headers() {
+                    println!("  {}: {:?}", name, value);
+                    log::info!("  {}: {:?}", name, value);
+                }
+
+                log::info!("GAM JavaScript asset rewritten and served successfully");
+                Ok(new_response)
+            } else {
+                // No rewriting needed, serve as-is but disable caching for debugging
+                let cache_control = "no-cache, no-store, must-revalidate";
+                response.set_header(header::CACHE_CONTROL, cache_control);
+                response.set_header("Pragma", "no-cache");
+                response.set_header("Expires", "0");
+
+                println!("=== GAM ASSET RESPONSE HEADERS FOR {} ===", path);
+                log::info!("GAM Asset Response Headers (No Rewriting):");
+                for (name, value) in response.get_headers() {
+                    println!("  {}: {:?}", name, value);
+                    log::info!("  {}: {:?}", name, value);
+                }
+
+                log::info!(
+                    "GAM asset served successfully, cache-control: {}",
+                    cache_control
+                );
+                Ok(response)
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Error fetching GAM asset from {} (original host: {}): {:?}",
+                backend_name,
+                original_host,
+                e
+            );
+            log::error!("GAM Asset Error Details:");
+            log::error!("  - Backend: {}", backend_name);
+            log::error!("  - Original Host: {}", original_host);
+            log::error!("  - Full URL: {}", full_url);
+            log::error!("  - Path: {}", path);
+            log::error!("  - Error: {:?}", e);
+
+            println!("=== GAM ASSET ERROR DETAILS ===");
+            println!("Backend: {}", backend_name);
+            println!("Original Host: {}", original_host);
+            println!("Full URL: {}", full_url);
+            println!("Error: {:?}", e);
+            Ok(Response::from_status(StatusCode::NOT_FOUND)
+                .with_header(header::CONTENT_TYPE, "text/plain")
+                .with_header("X-Original-Host", original_host)
+                .with_header("X-Backend-Used", backend_name)
+                .with_header("X-Full-URL", &full_url)
+                .with_body(format!("GAM Asset not found: Unable to fetch from {} (original: {})\\nPath: {}\\nFull URL: {}\\nError: {:?}", backend_name, original_host, path, full_url, e)))
+        }
+    }
+}
+
 /// Handles the main page request.
 ///
 /// Serves the main page with synthetic ID generation and ad integration.
@@ -155,7 +744,7 @@ fn handle_main_page(settings: &Settings, mut req: Request) -> Result<Response, E
         settings.synthetic.counter_store,
     );
 
-    log_fastly::init_simple("mylogs", Info);
+    // log_fastly::init_simple("mylogs", Info);
 
     // Add DMA code check to main page as well
     let dma_code = get_dma_code(&mut req);
@@ -632,4 +1221,25 @@ async fn handle_prebid_test(settings: &Settings, mut req: Request) -> Result<Res
                 }))?)
         }
     }
+}
+fn init_logger() {
+    let logger = Logger::builder()
+        .default_endpoint("tslog")
+        .echo_stdout(true)
+        .max_level(log::LevelFilter::Debug)
+        .build()
+        .expect("Failed to build Logger");
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}  {} {}",
+                chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                record.level(),
+                message
+            ))
+        })
+        .chain(Box::new(logger) as Box<dyn log::Log>)
+        .apply()
+        .expect("Failed to initialize logger");
 }

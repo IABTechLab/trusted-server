@@ -206,7 +206,7 @@ impl GamRequest {
                 }
 
                 Ok(Response::from_status(response.get_status())
-                    .with_header(header::CONTENT_TYPE, "application/json")
+                    .with_header(header::CONTENT_TYPE, "text/plain")
                     .with_header(header::CACHE_CONTROL, "no-store, private")
                     .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .with_header("X-GAM-Test", "true")
@@ -342,16 +342,29 @@ pub async fn handle_gam_custom_url(
 ) -> Result<Response, Error> {
     log::info!("Handling GAM custom URL test");
 
-    // Check consent status from cookie
+    // Check consent status from cookie or header for testing
     let consent = get_consent_from_request(&req).unwrap_or_default();
-    let advertising_consent = consent.advertising;
+    let cookie_consent = consent.advertising;
+
+    // Also check header as fallback for testing
+    let header_consent = req
+        .get_header("X-Consent-Advertising")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let advertising_consent = cookie_consent || header_consent;
 
     if !advertising_consent {
         return Ok(Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body_json(&json!({
                 "error": "No advertising consent",
-                "message": "GAM requests require advertising consent"
+                "message": "GAM requests require advertising consent",
+                "debug": {
+                    "cookie_consent": cookie_consent,
+                    "header_consent": header_consent
+                }
             }))?);
     }
 

@@ -24,6 +24,7 @@ pub mod error;
 pub mod gam;
 pub mod gdpr;
 pub mod models;
+pub mod partners;
 pub mod prebid;
 pub mod privacy;
 pub mod settings;

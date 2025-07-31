@@ -52,12 +52,29 @@ pub struct Synthetic {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PartnerConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub domains_to_proxy: Vec<String>,
+    pub proxy_domain: String,
+    pub backend_name: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Partners {
+    pub gam: Option<PartnerConfig>,
+    pub equativ: Option<PartnerConfig>,
+    pub prebid: Option<PartnerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub ad_server: AdServer,
     pub publisher: Publisher,
     pub prebid: Prebid,
     pub gam: Gam,
     pub synthetic: Synthetic,
+    pub partners: Option<Partners>,
 }
 
 #[allow(unused)]
