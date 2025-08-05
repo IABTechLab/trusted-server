@@ -133,6 +133,8 @@ impl PrebidRequest {
                 "bidfloorcur": "USD",
                 "ext": {
                     "prebid": {
+                        "debug": true,
+                        "trace": "verbose",
                         "bidder": {
                             "smartadserver": {
                                 "siteId": 686105,
@@ -174,8 +176,8 @@ impl PrebidRequest {
                     ]
                 }
             },
-            "test": 1,
-            "debug": 1,
+            "test": true,
+            "debug": true,
             "tmax": 1000,
             "at": 1
         });
