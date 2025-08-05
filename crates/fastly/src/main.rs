@@ -18,6 +18,8 @@ use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 use trusted_server_common::templates::GAM_TEST_TEMPLATE;
 use trusted_server_common::why::handle_why_trusted_server;
+use trusted_server_common::didomi::DidomiProxy;
+
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -68,6 +70,11 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         // Static content pages
         (&Method::GET, "/privacy-policy") => handle_privacy_policy(&settings, req),
         (&Method::GET, "/why-trusted-server") => handle_why_trusted_server(&settings, req),
+
+        // Didomi CMP routes
+        (_, path) if path.starts_with("/consent/") => {
+            DidomiProxy::handle_consent_request(&settings, req).await
+        }
 
         // Catch-all 404 handler
         _ => return Ok(not_found_response()),

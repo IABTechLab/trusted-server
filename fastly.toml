@@ -24,6 +24,10 @@ build = """
             url = "https://securepubads.g.doubleclick.net"
         [local_server.backends.wordpress_backend]
             url = "http://localhost:8080"  # Adjust this to your local WordPress URL
+        [local_server.backends.didomi_sdk]
+            url = "https://sdk.privacy-center.org"
+        [local_server.backends.didomi_api]
+            url = "https://api.privacy-center.org"
 
 
     [local_server.kv_stores]
