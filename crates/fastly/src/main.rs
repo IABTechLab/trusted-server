@@ -8,6 +8,9 @@ use trusted_server_common::gam::{
 };
 use trusted_server_common::gdpr::{handle_consent_request, handle_data_subject_request};
 use trusted_server_common::prebid::handle_prebid_test;
+use trusted_server_common::prebid_proxy::{
+    handle_ad_proxy, handle_prebid_auction, handle_prebid_cookie_sync,
+};
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::handle_publisher_request;
 use trusted_server_common::settings::Settings;
@@ -46,14 +49,23 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     );
 
     // Get path and method for routing
-    let path = req.get_path();
-    let method = req.get_method();
+    let path = req.get_path().to_string();
+    let method = req.get_method().clone();
 
     // Match known routes and handle them
-    let result = match (method, path) {
+    let result = match (&method, path.as_str()) {
         // Main application routes
         (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
         (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
+
+        // Prebid Server proxy endpoints (first-party)
+        (&Method::POST, "/openrtb2/auction") => handle_prebid_auction(&settings, req).await,
+        (&Method::POST, "/cookie_sync") => handle_prebid_cookie_sync(&settings, req).await,
+
+        // Ad creative and tracking proxy
+        (&Method::GET | &Method::POST, path) if path.starts_with("/ad-proxy/") => {
+            handle_ad_proxy(&settings, req, path).await
+        }
 
         // GAM (Google Ad Manager) routes
         (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
