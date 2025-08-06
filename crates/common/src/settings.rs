@@ -153,14 +153,21 @@ mod tests {
         // Verify basic structure is loaded
         assert!(!settings.ad_server.ad_partner_url.is_empty());
         assert!(!settings.ad_server.sync_url.is_empty());
+
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());
+
         assert!(!settings.prebid.server_url.is_empty());
+        
         assert!(!settings.synthetic.counter_store.is_empty());
         assert!(!settings.synthetic.opid_store.is_empty());
         assert!(!settings.synthetic.secret_key.is_empty());
         assert!(!settings.synthetic.template.is_empty());
+
+        assert!(!settings.gam.publisher_id.is_empty());
+        assert!(!settings.gam.server_url.is_empty());
+        assert!(settings.gam.ad_units.len() > 0);
     }
 
     #[test]
@@ -193,6 +200,12 @@ mod tests {
         assert_eq!(settings.synthetic.opid_store, "test-opid-store");
         assert_eq!(settings.synthetic.secret_key, "test-secret-key");
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
+
+        assert_eq!(settings.gam.publisher_id, "21796327522");
+        assert_eq!(settings.gam.server_url, "https://securepubads.g.doubleclick.net/gampad/ads");
+        assert_eq!(settings.gam.ad_units.len(), 2);
+        assert_eq!(settings.gam.ad_units[0].name, "test_unit_1");
+        assert_eq!(settings.gam.ad_units[0].size, "320x50");
     }
 
     #[test]

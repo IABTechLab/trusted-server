@@ -102,36 +102,7 @@ mod tests {
     use super::*;
     use crate::settings::{PartnerConfig, Partners, Settings};
 
-    fn create_test_settings() -> Settings {
-        let mut settings = Settings::default();
-
-        let gam_config = PartnerConfig {
-            enabled: true,
-            name: "Google Ad Manager".to_string(),
-            domains_to_proxy: vec![
-                "securepubads.g.doubleclick.net".to_string(),
-                "tpc.googlesyndication.com".to_string(),
-            ],
-            proxy_domain: "creatives.auburndao.com".to_string(),
-            backend_name: "gam_proxy_backend".to_string(),
-        };
-
-        let equativ_config = PartnerConfig {
-            enabled: true,
-            name: "Equativ".to_string(),
-            domains_to_proxy: vec!["creatives.sascdn.com".to_string()],
-            proxy_domain: "creatives.auburndao.com".to_string(),
-            backend_name: "equativ_proxy_backend".to_string(),
-        };
-
-        settings.partners = Some(Partners {
-            gam: Some(gam_config),
-            equativ: Some(equativ_config),
-            prebid: None,
-        });
-
-        settings
-    }
+    use crate::test_support::tests::create_test_settings;
 
     #[test]
     fn test_url_rewriting() {
@@ -195,5 +166,196 @@ mod tests {
         assert!(!rewritten.contains("tpc.googlesyndication.com"));
         assert!(!rewritten.contains("securepubads.g.doubleclick.net"));
         assert!(!rewritten.contains("creatives.sascdn.com"));
+    }
+
+    #[test]
+    fn test_should_proxy_domain() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        assert!(manager.should_proxy_domain("tpc.googlesyndication.com"));
+        assert!(manager.should_proxy_domain("securepubads.g.doubleclick.net"));
+        assert!(manager.should_proxy_domain("creatives.sascdn.com"));
+        assert!(!manager.should_proxy_domain("example.com"));
+        assert!(!manager.should_proxy_domain("unknown.domain.com"));
+    }
+
+    #[test]
+    fn test_get_proxied_domains() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        let domains = manager.get_proxied_domains();
+        assert_eq!(domains.len(), 3);
+        assert!(domains.iter().any(|d| *d == "tpc.googlesyndication.com"));
+        assert!(domains
+            .iter()
+            .any(|d| *d == "securepubads.g.doubleclick.net"));
+        assert!(domains.iter().any(|d| *d == "creatives.sascdn.com"));
+    }
+
+    #[test]
+    fn test_disabled_partner_config() {
+        let mut settings = Settings::default();
+
+        // Create disabled GAM config
+        let gam_config = PartnerConfig {
+            enabled: false,
+            name: "Google Ad Manager".to_string(),
+            domains_to_proxy: vec!["securepubads.g.doubleclick.net".to_string()],
+            proxy_domain: "creatives.auburndao.com".to_string(),
+            backend_name: "gam_proxy_backend".to_string(),
+        };
+
+        settings.partners = Some(Partners {
+            gam: Some(gam_config),
+            equativ: None,
+            prebid: None,
+        });
+
+        let manager = PartnerManager::from_settings(&settings);
+
+        // Disabled partner should not have any domain mappings
+        assert!(!manager.should_proxy_domain("securepubads.g.doubleclick.net"));
+        assert_eq!(
+            manager.get_backend_for_domain("securepubads.g.doubleclick.net"),
+            None
+        );
+
+        let url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js";
+        assert_eq!(manager.rewrite_url(url), url);
+    }
+
+    #[test]
+    fn test_empty_partner_config() {
+        let settings = Settings::default();
+        let manager = PartnerManager::from_settings(&settings);
+
+        // No partners configured
+        assert_eq!(manager.get_proxied_domains().len(), 0);
+        assert!(!manager.should_proxy_domain("any.domain.com"));
+
+        let url = "https://example.com/test";
+        assert_eq!(manager.rewrite_url(url), url);
+    }
+
+    #[test]
+    fn test_multiple_replacements_in_single_url() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        // URL containing multiple domains (edge case - should only replace first match)
+        let url = "https://tpc.googlesyndication.com/path?redirect=https://securepubads.g.doubleclick.net/other";
+        let rewritten = manager.rewrite_url(url);
+
+        // Only the first domain should be replaced due to the break statement
+        assert!(rewritten.contains("creatives.auburndao.com"));
+        assert!(rewritten.contains("/path?redirect="));
+    }
+
+    #[test]
+    fn test_content_rewriting_with_protocol_variations() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        let content = r#"
+            http://tpc.googlesyndication.com/image.jpg
+            https://tpc.googlesyndication.com/image2.jpg
+            //tpc.googlesyndication.com/image3.jpg
+            src="tpc.googlesyndication.com/image4.jpg"
+        "#;
+
+        let rewritten = manager.rewrite_content(content);
+
+        assert!(rewritten.contains("http://creatives.auburndao.com/image.jpg"));
+        assert!(rewritten.contains("https://creatives.auburndao.com/image2.jpg"));
+        assert!(rewritten.contains("//creatives.auburndao.com/image3.jpg"));
+        assert!(rewritten.contains("src=\"creatives.auburndao.com/image4.jpg\""));
+    }
+
+    #[test]
+    fn test_case_sensitive_domain_matching() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        // Domain matching should be case-sensitive
+        let url = "https://TPC.GOOGLESYNDICATION.COM/test";
+        let rewritten = manager.rewrite_url(url);
+        assert_eq!(rewritten, url); // Should not be rewritten due to case mismatch
+
+        let url_lower = "https://tpc.googlesyndication.com/test";
+        let rewritten_lower = manager.rewrite_url(url_lower);
+        assert!(rewritten_lower.contains("creatives.auburndao.com"));
+    }
+
+    #[test]
+    fn test_partial_domain_matching() {
+        let settings = create_test_settings();
+        let manager = PartnerManager::from_settings(&settings);
+
+        // The current implementation does substring replacement, which can match partial domains
+        let content = r#"
+            https://notsecurepubads.g.doubleclick.net/test
+            https://securepubads.g.doubleclick.net.evil.com/test
+            https://fake-tpc.googlesyndication.com/test
+        "#;
+
+        let rewritten = manager.rewrite_content(content);
+
+        // Due to substring replacement, partial matches will occur
+        // "securepubads.g.doubleclick.net" within "notsecurepubads.g.doubleclick.net" gets replaced
+        assert!(rewritten.contains("notcreatives.auburndao.com/test"));
+        // "securepubads.g.doubleclick.net" within the URL gets replaced, leaving ".evil.com"
+        assert!(rewritten.contains("creatives.auburndao.com.evil.com/test"));
+        // "tpc.googlesyndication.com" within "fake-tpc.googlesyndication.com" gets replaced
+        assert!(rewritten.contains("fake-creatives.auburndao.com/test"));
+    }
+
+    #[test]
+    fn test_overlapping_domain_configurations() {
+        let mut settings = Settings::default();
+
+        // Create configs with overlapping proxy domains
+        let gam_config = PartnerConfig {
+            enabled: true,
+            name: "GAM".to_string(),
+            domains_to_proxy: vec!["gam.example.com".to_string()],
+            proxy_domain: "proxy.domain.com".to_string(),
+            backend_name: "gam_backend".to_string(),
+        };
+
+        let equativ_config = PartnerConfig {
+            enabled: true,
+            name: "Equativ".to_string(),
+            domains_to_proxy: vec!["equativ.example.com".to_string()],
+            proxy_domain: "proxy.domain.com".to_string(), // Same proxy domain
+            backend_name: "equativ_backend".to_string(),
+        };
+
+        settings.partners = Some(Partners {
+            gam: Some(gam_config),
+            equativ: Some(equativ_config),
+            prebid: None,
+        });
+
+        let manager = PartnerManager::from_settings(&settings);
+
+        // Both domains should map to the same proxy domain but different backends
+        assert_eq!(
+            manager.rewrite_url("https://gam.example.com/path"),
+            "https://proxy.domain.com/path"
+        );
+        assert_eq!(
+            manager.rewrite_url("https://equativ.example.com/path"),
+            "https://proxy.domain.com/path"
+        );
+        assert_eq!(
+            manager.get_backend_for_domain("gam.example.com"),
+            Some("gam_backend")
+        );
+        assert_eq!(
+            manager.get_backend_for_domain("equativ.example.com"),
+            Some("equativ_backend")
+        );
     }
 }
