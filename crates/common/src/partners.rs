@@ -115,8 +115,7 @@ pub async fn handle_partner_asset(
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let path = req.get_path();
-    println!("=== HANDLING PARTNER ASSET: {} ===", path);
-    log::info!("Handling partner asset request: {}", path);
+    log::info!("=== HANDLING PARTNER ASSET: {} ===", path);
 
     // Only handle Equativ/Smart AdServer assets (matching auburndao.com approach)
     let (backend_name, original_host) = ("equativ_sascdn_backend", "creatives.sascdn.com");
@@ -155,9 +154,9 @@ pub async fn handle_partner_asset(
 
             // Don't modify any other headers - keep them exactly as auburndao.com gets them
 
-            println!("=== ASSET RESPONSE HEADERS FOR {} ===", path);
+            log::debug!("=== ASSET RESPONSE HEADERS FOR {} ===", path);
             for (name, value) in response.get_headers() {
-                println!("  {}: {:?}", name, value);
+                log::debug!("  {}: {:?}", name, value);
             }
 
             // No special CORB handling needed for Equativ image assets
