@@ -35,6 +35,10 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
+    /// GAM (Google Ad Manager) integration error.
+    #[display("GAM error: {message}")]
+    Gam { message: String },
+
     /// GDPR consent handling error.
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
@@ -75,6 +79,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+            Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,

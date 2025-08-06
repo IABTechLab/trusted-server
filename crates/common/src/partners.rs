@@ -1,5 +1,10 @@
 use std::collections::HashMap;
 
+use error_stack::Report;
+use fastly::http::header;
+use fastly::{Request, Response};
+
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 /// Manages partner-specific URL rewriting and proxy configurations
@@ -94,6 +99,89 @@ impl PartnerManager {
         }
 
         rewritten_content
+    }
+}
+
+/// Handles direct asset serving for partner domains (like auburndao.com).
+///
+/// Fetches assets from original partner domains and serves them as first-party content.
+/// This bypasses ad blockers and Safari ITP by making all assets appear to come from edgepubs.com.
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if asset fetching fails.
+pub async fn handle_partner_asset(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let path = req.get_path();
+    println!("=== HANDLING PARTNER ASSET: {} ===", path);
+    log::info!("Handling partner asset request: {}", path);
+
+    // Only handle Equativ/Smart AdServer assets (matching auburndao.com approach)
+    let (backend_name, original_host) = ("equativ_sascdn_backend", "creatives.sascdn.com");
+
+    log::info!(
+        "Serving asset from backend: {} (original host: {})",
+        backend_name,
+        original_host
+    );
+
+    // Construct full URL using the original host and path
+    let full_url = format!("https://{}{}", original_host, path);
+    log::info!("Fetching asset URL: {}", full_url);
+
+    let mut asset_req = Request::new(req.get_method().clone(), &full_url);
+
+    // Copy all headers from original request
+    for (name, value) in req.get_headers() {
+        asset_req.set_header(name, value);
+    }
+
+    // Set the Host header to the original domain for proper routing
+    asset_req.set_header(header::HOST, original_host);
+
+    // Send to appropriate backend
+    match asset_req.send(backend_name) {
+        Ok(mut response) => {
+            // Match auburndao.com cache control exactly
+            let cache_control = "max-age=31536000";
+
+            // No content rewriting needed for Equativ assets (they're mostly images)
+            // This matches the auburndao.com approach of serving assets directly
+
+            // Match auburndao.com headers exactly - no modifications
+            response.set_header(header::CACHE_CONTROL, cache_control);
+
+            // Don't modify any other headers - keep them exactly as auburndao.com gets them
+
+            println!("=== ASSET RESPONSE HEADERS FOR {} ===", path);
+            for (name, value) in response.get_headers() {
+                println!("  {}: {:?}", name, value);
+            }
+
+            // No special CORB handling needed for Equativ image assets
+
+            log::info!(
+                "Partner asset served successfully, cache-control: {}",
+                cache_control
+            );
+            Ok(response)
+        }
+        Err(e) => {
+            log::error!(
+                "Error fetching partner asset from {} (original host: {}): {:?}",
+                backend_name,
+                original_host,
+                e
+            );
+            Err(Report::new(TrustedServerError::Gam {
+                message: format!(
+                    "Failed to fetch partner asset from {} ({}): path={}, error={:?}",
+                    backend_name, original_host, path, e
+                ),
+            }))
+        }
     }
 }
 

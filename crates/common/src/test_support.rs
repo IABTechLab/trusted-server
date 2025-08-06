@@ -20,9 +20,9 @@ pub mod tests {
             publisher_id = "21796327522"
             server_url = "https://securepubads.g.doubleclick.net/gampad/ads"
             ad_units = [
-                    { name = "test_unit_1", size = "320x50" },
-                    { name = "test_unit_2", size = "728x90" },
-                ]       
+                { name = "test_unit_1", size = "320x50" },
+                { name = "test_unit_2", size = "728x90" },
+            ]       
 
             [synthetic] 
             counter_store = "test-counter-store"
