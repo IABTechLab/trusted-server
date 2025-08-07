@@ -29,6 +29,7 @@ pub mod gam;
 pub mod gdpr;
 pub mod geo;
 pub mod models;
+pub mod partners;
 pub mod prebid;
 pub mod privacy;
 pub mod publisher;

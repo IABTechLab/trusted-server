@@ -3,13 +3,18 @@ use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
 use trusted_server_common::advertiser::handle_ad_request;
+use trusted_server_common::constants::HEADER_X_COMPRESS_HINT;
 use trusted_server_common::gam::{
-    handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
+    handle_gam_asset, handle_gam_custom_url, handle_gam_golden_url, handle_gam_render,
+    handle_gam_test, is_gam_asset_path,
 };
 use trusted_server_common::gdpr::{handle_consent_request, handle_data_subject_request};
+use trusted_server_common::partners::handle_partner_asset;
 use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::privacy::handle_privacy_policy;
-use trusted_server_common::publisher::handle_publisher_request;
+use trusted_server_common::publisher::{
+    handle_edgepubs_page, handle_main_page, handle_publisher_request,
+};
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 use trusted_server_common::templates::GAM_TEST_TEMPLATE;
@@ -52,7 +57,15 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     // Match known routes and handle them
     let result = match (method, path) {
         // Main application routes
+        (&Method::GET, "/") => handle_edgepubs_page(&settings, req),
+        (&Method::GET, "/auburndao") => handle_main_page(&settings, req),
         (&Method::GET, "/ad-creative") => handle_ad_request(&settings, req),
+        // Direct asset serving for partner domains (like auburndao.com approach)
+        (&Method::GET, path) if is_partner_asset_path(path) => {
+            handle_partner_asset(&settings, req).await
+        }
+        // GAM asset serving (separate from Equativ, checked after Equativ)
+        (&Method::GET, path) if is_gam_asset_path(path) => handle_gam_asset(&settings, req).await,
         (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
 
         // GAM (Google Ad Manager) routes
@@ -96,6 +109,13 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     result.map_or_else(|e| Ok(to_error_response(e)), Ok)
 }
 
+fn is_partner_asset_path(path: &str) -> bool {
+    // Only handle Equativ/Smart AdServer assets for now
+    path.contains("/diff/") ||          // Equativ assets
+    path.ends_with(".png") ||           // Images
+    path.ends_with(".jpg") ||           // Images
+    path.ends_with(".gif") // Images
+}
 fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
