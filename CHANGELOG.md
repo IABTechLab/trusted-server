@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added publisher config
 - Add AI assist rules. Based on https://github.com/hashintel/hash
 - Added ability to construct GAM requests from static permutive segments with test pages
+- Add more complete e2e GAM (Google Ad Manager) integration with request construction and ad serving capabilities
+- Add new partners.rs module for partner-specific configurations
+- Created comprehensive publisher IDs audit document identifying hardcoded values
 
 ### Changed
 - Upgrade to rust 1.87.0
