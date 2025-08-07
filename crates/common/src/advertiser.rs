@@ -147,7 +147,7 @@ pub fn handle_ad_request(
         log::info!("  {}: {:?}", name, value);
     }
 
-    match ad_req.send(settings.ad_server.ad_partner_backend.as_str()) {
+    match ad_req.send(settings.ad_server.ad_partner_url.as_str()) {
         Ok(mut res) => {
             log::info!(
                 "Received response from backend with status: {}",
