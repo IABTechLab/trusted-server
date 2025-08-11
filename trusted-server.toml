@@ -65,3 +65,7 @@ name = "Prebid Server"
 domains_to_proxy = ["68.183.113.79"]
 proxy_domain = "www.edgepubs.com"
 backend_name = "prebid_proxy_backend"
+
+# Experimental features
+[experimental]
+enable_edge_pub = false

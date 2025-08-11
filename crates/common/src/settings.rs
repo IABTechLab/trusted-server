@@ -98,6 +98,11 @@ pub struct Partners {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Experimental {
+    pub enable_edge_pub: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub ad_server: AdServer,
     pub publisher: Publisher,
@@ -105,6 +110,7 @@ pub struct Settings {
     pub gam: Gam,
     pub synthetic: Synthetic,
     pub partners: Option<Partners>,
+    pub experimental: Option<Experimental>,
 }
 
 #[allow(unused)]
