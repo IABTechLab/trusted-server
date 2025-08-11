@@ -3,6 +3,7 @@ use error_stack::{Report, ResultExt};
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use validator::Validate;
 
 const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.toml");
 
@@ -24,10 +25,10 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
 
     let settings = Settings::from_toml(toml_str)?;
 
-    // Validate that the secret key is not the default
-    if settings.synthetic.secret_key == "secret-key" {
-        return Err(Report::new(TrustedServerError::InsecureSecretKey));
-    }
+    // Validate the settings
+    settings.validate().change_context(TrustedServerError::Configuration {
+        message: "Failed to validate configuration".to_string(),
+    })?;
 
     Ok(settings)
 }
