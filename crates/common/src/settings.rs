@@ -4,19 +4,20 @@ use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
 use url::Url;
+use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct AdServer {
     pub ad_partner_url: String,
     pub sync_url: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
@@ -52,33 +53,43 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Prebid {
     pub server_url: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct GamAdUnit {
     pub name: String,
     pub size: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[allow(unused)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Gam {
     pub publisher_id: String,
     pub server_url: String,
     pub ad_units: Vec<GamAdUnit>,
 }
 
+
 #[allow(unused)]
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
+    #[validate(length(min = 1), custom(function = Synthetic::validate_secret_key))]
     pub secret_key: String,
+    #[validate(length(min = 1))]
     pub template: String,
+}
+
+impl Synthetic {
+    pub fn validate_secret_key(secret_key: &String) -> Result<(), ValidationError> {
+        match (secret_key).as_str() {
+            "secret_key" => Err(ValidationError::new("Secret key is not valid")),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -90,58 +101,38 @@ pub struct PartnerConfig {
     pub backend_name: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Partners {
     pub gam: Option<PartnerConfig>,
     pub equativ: Option<PartnerConfig>,
     pub prebid: Option<PartnerConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Experimental {
     pub enable_edge_pub: bool,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
+    #[validate(nested)]
     pub ad_server: AdServer,
+    #[validate(nested)]
     pub publisher: Publisher,
+    #[validate(nested)]
     pub prebid: Prebid,
+    #[validate(nested)]
     pub gam: Gam,
+    #[validate(nested)]
     pub synthetic: Synthetic,
+    #[validate(nested)]
     pub partners: Option<Partners>,
+    #[validate(nested)]
     pub experimental: Option<Experimental>,
 }
 
 #[allow(unused)]
 impl Settings {
-    /// Creates a new [`Settings`] instance from the embedded configuration file.
-    ///
-    /// Loads the configuration from the embedded `trusted-server.toml` file
-    /// and applies any environment variable overrides.
-    ///
-    /// # Errors
-    ///
-    /// - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
-    /// - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
-    /// - [`TrustedServerError::InsecureSecretKey`] if the secret key is set to the default value
-    pub fn new() -> Result<Self, Report<TrustedServerError>> {
-        let toml_bytes = include_bytes!("../../../trusted-server.toml");
-        let toml_str =
-            str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {
-                message: "embedded trusted-server.toml file".to_string(),
-            })?;
-
-        let settings = Self::from_toml(toml_str)?;
-
-        // Validate that the secret key is not the default
-        if settings.synthetic.secret_key == "secret-key" {
-            return Err(Report::new(TrustedServerError::InsecureSecretKey));
-        }
-
-        Ok(settings)
-    }
-
     /// Creates a new [`Settings`] instance from a TOML string.
     ///
     /// Parses the provided TOML configuration and applies any environment
@@ -178,33 +169,6 @@ mod tests {
     use regex::Regex;
 
     use crate::test_support::tests::crate_test_settings_str;
-
-    #[test]
-    fn test_settings_new() {
-        // Test that Settings::new() loads successfully
-        let settings = Settings::new();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
-
-        let settings = settings.unwrap();
-        // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_url.is_empty());
-        assert!(!settings.ad_server.sync_url.is_empty());
-
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-
-        assert!(!settings.prebid.server_url.is_empty());
-
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
-
-        assert!(!settings.gam.publisher_id.is_empty());
-        assert!(!settings.gam.server_url.is_empty());
-        assert!(!settings.gam.ad_units.is_empty());
-    }
 
     #[test]
     fn test_settings_from_valid_toml() {
