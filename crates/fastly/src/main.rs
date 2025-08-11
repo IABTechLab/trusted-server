@@ -3,7 +3,6 @@ use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
 use trusted_server_common::advertiser::handle_ad_request;
-use trusted_server_common::constants::HEADER_X_COMPRESS_HINT;
 use trusted_server_common::gam::{
     handle_gam_asset, handle_gam_custom_url, handle_gam_golden_url, handle_gam_render,
     handle_gam_test, is_gam_asset_path,
