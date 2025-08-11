@@ -234,7 +234,9 @@ pub const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
                     const adLink = document.createElement('a');
                     adLink.href = 'https://iabtechlab.com/?potsi-test%3F';
                     const adImage = document.createElement('img');
-                    adImage.src = data.creativeUrl.replace('creatives.sascdn.com', 'creatives.auburndao.com');
+                    // Direct first-party URL rewriting for Equativ only (like auburndao.com)
+                    adImage.src = data.creativeUrl
+                        .replace('creatives.sascdn.com', '//www.edgepubs.com');
                     adImage.alt = 'Ad Creative';
                     adLink.appendChild(adImage);
                     adContainer.appendChild(adLink);
@@ -328,6 +330,686 @@ pub const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 
 </body>
 </html>"#;
+
+pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EdgePubs - The Edge Is Yours</title>
+    <style>
+        @import url('https://db.onlinewebfonts.com/c/453969d3ddeb5e5cf1db0d91198f2f71?family=Geomanist-Regular');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Geomanist', sans-serif;
+            line-height: 1.5;
+            color: #666666;
+            background-color: #FFFFFF;
+        }
+        
+        h1, h2, h3 {
+            color: #333333;
+            font-weight: 700;
+        }
+        
+        h1 {
+            font-size: 48px;
+            line-height: 1.2;
+        }
+        
+        h2 {
+            font-size: 36px;
+            line-height: 1.2;
+        }
+        
+        h3 {
+            font-size: 28px;
+            line-height: 1.2;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        .btn-primary {
+            background-color: #FF6F00;
+            color: #FFFFFF;
+        }
+        
+        .btn-primary:hover {
+            background-color: #E65100;
+        }
+        
+        .btn-secondary {
+            background-color: #6A1B9A;
+            color: #FFFFFF;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #4A148C;
+        }
+        
+        /* Hero Section */
+        .hero {
+            background: linear-gradient(135deg, #FF6F00 0%, #6A1B9A 100%);
+            color: #FFFFFF;
+            padding: 80px 0;
+            text-align: center;
+        }
+        
+        .hero h1 {
+            color: #FFFFFF;
+            margin-bottom: 20px;
+        }
+        
+        .hero p {
+            font-size: 20px;
+            margin-bottom: 30px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+            color: #FFFFFF;
+        }
+        
+        /* Header Ad Slot */
+        .header-ad {
+            background: #F5F5F5;
+            padding: 20px 0;
+            text-align: center;
+        }
+        
+        .ad-container {
+            display: inline-block;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            background: #FFFFFF;
+            margin: 10px 0;
+            position: relative;
+        }
+        
+        .ad-label {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 5px;
+        }
+        
+        .ad-slot {
+            background: #f8f8f8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-size: 14px;
+            border: 1px dashed #ccc;
+        }
+        
+        .ad-slot-728x90 {
+            width: 728px;
+            height: 90px;
+            max-width: 100%;
+        }
+        
+        .ad-slot-300x250 {
+            width: 300px;
+            height: 250px;
+        }
+        
+        .ad-slot-970x250 {
+            width: 970px;
+            height: 250px;
+            max-width: 100%;
+        }
+        
+        /* Features Section */
+        .features {
+            padding: 80px 0;
+            background: #F5F5F5;
+        }
+        
+        .features h2 {
+            text-align: center;
+            margin-bottom: 60px;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 40px;
+        }
+        
+        .feature {
+            background: #FFFFFF;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .feature h3 {
+            margin-bottom: 15px;
+            color: #FF6F00;
+        }
+        
+        /* How It Works */
+        .how-it-works {
+            padding: 80px 0;
+            background: #FFFFFF;
+        }
+        
+        .how-it-works h2 {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        .how-it-works-content {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .how-it-works ul {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .how-it-works li {
+            margin-bottom: 15px;
+            padding-left: 20px;
+            position: relative;
+        }
+        
+        .how-it-works li:before {
+            content: "→";
+            position: absolute;
+            left: 0;
+            color: #FF6F00;
+            font-weight: bold;
+        }
+        
+        .diagram {
+            background: #F5F5F5;
+            padding: 40px;
+            border-radius: 8px;
+            text-align: center;
+            margin: 40px 0;
+            font-size: 18px;
+            color: #333333;
+        }
+        
+        /* Sidebar Ad */
+        .content-with-sidebar {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 40px;
+            align-items: start;
+        }
+        
+        .sidebar-ad {
+            position: sticky;
+            top: 20px;
+        }
+        
+        /* Tabs Section */
+        .tabs-section {
+            padding: 80px 0;
+            background: #F5F5F5;
+        }
+        
+        .tabs {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        .tab-button {
+            background: none;
+            border: 2px solid #FF6F00;
+            color: #FF6F00;
+            padding: 10px 20px;
+            margin: 0 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        
+        .tab-button.active {
+            background: #FF6F00;
+            color: #FFFFFF;
+        }
+        
+        .tab-content {
+            display: none;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .tab-content ul {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .tab-content li {
+            margin-bottom: 15px;
+            padding-left: 20px;
+            position: relative;
+        }
+        
+        .tab-content li:before {
+            content: "•";
+            position: absolute;
+            left: 0;
+            color: #6A1B9A;
+            font-weight: bold;
+        }
+        
+        /* Between Content Ad */
+        .between-content-ad {
+            padding: 40px 0;
+            text-align: center;
+            background: #FFFFFF;
+        }
+        
+        /* Footer CTA */
+        .footer-cta {
+            background: linear-gradient(135deg, #6A1B9A 0%, #FF6F00 100%);
+            color: #FFFFFF;
+            padding: 80px 0;
+            text-align: center;
+        }
+        
+        .footer-cta h2 {
+            color: #FFFFFF;
+            margin-bottom: 20px;
+        }
+        
+        .footer-cta p {
+            font-size: 18px;
+            margin-bottom: 30px;
+            color: #FFFFFF;
+        }
+        
+        /* GDPR Consent Banner */
+        #gdpr-banner {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            padding: 20px;
+            z-index: 1000;
+            display: none;
+        }
+        #gdpr-banner.visible {
+            display: block;
+        }
+        .gdpr-buttons {
+            margin-top: 10px;
+        }
+        .gdpr-buttons button {
+            margin: 5px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .gdpr-accept {
+            background: #4CAF50;
+            color: white;
+        }
+        .gdpr-customize {
+            background: #2196F3;
+            color: white;
+        }
+        .gdpr-reject {
+            background: #f44336;
+            color: white;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .content-with-sidebar {
+                grid-template-columns: 1fr;
+            }
+            
+            .sidebar-ad {
+                position: static;
+                text-align: center;
+            }
+            
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            h1 {
+                font-size: 36px;
+            }
+            
+            h2 {
+                font-size: 28px;
+            }
+            
+            .hero {
+                padding: 60px 0;
+            }
+        }
+    </style>
+    <script>
+        // Tab functionality
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        // GDPR functionality (reused from existing template)
+        function showGdprBanner() {
+            const consent = getCookie('gdpr_consent');
+            if (!consent) {
+                document.getElementById('gdpr-banner').classList.add('visible');
+            }
+        }
+
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+        }
+
+        function handleConsent(type) {
+            const consent = {
+                analytics: type === 'accept',
+                advertising: type === 'accept',
+                functional: type === 'accept',
+                timestamp: Date.now(),
+                version: "1.0"
+            };
+
+            saveConsent(consent);
+        }
+
+        function saveConsent(consent) {
+            document.cookie = `gdpr_consent=${JSON.stringify(consent)}; path=/; max-age=31536000`;
+            
+            fetch('/gdpr/consent', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(consent)
+            }).then(() => {
+                document.getElementById('gdpr-banner').classList.remove('visible');
+                loadAds(consent);
+            }).catch(error => {
+                console.error('Error saving consent:', error);
+            });
+        }
+        
+        // Removed old loadAds function - now using auburndao pattern directly in window.load
+
+        // Initialize page - MATCH AUBURNDAO PATTERN EXACTLY
+        window.addEventListener('load', function() {
+            const consent = getCookie('gdpr_consent');
+            if (!consent) {
+                showGdprBanner();
+            }
+            
+            // Get consent status (same as auburndao)
+            const consentData = consent ? JSON.parse(consent) : { advertising: false, functional: false };
+
+            // ALWAYS fetch ad creative (same as auburndao), but pass consent in headers
+            fetch('/ad-creative', {
+                headers: {
+                    'X-Consent-Advertising': consentData.advertising ? 'true' : 'false',
+                    'X-Consent-Functional': consentData.functional ? 'true' : 'false'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Ad response:', data);
+                if (data && data.creativeUrl) {
+                    const adContainer = document.getElementById('ad-container');
+                    // Use same DOM creation pattern as auburndao.com
+                    const adLink = document.createElement('a');
+                    adLink.href = 'https://iabtechlab.com/?potsi-test%3F';
+                    const adImage = document.createElement('img');
+                    // Use root domain since we don't have creatives.edgepubs.com TLS cert yet
+                    adImage.src = data.creativeUrl.replace('creatives.sascdn.com', 'edgepubs.com');
+                    adImage.alt = 'Ad Creative';
+                    adImage.style.maxWidth = '100%';
+                    adImage.style.height = 'auto';
+                    adLink.appendChild(adImage);
+                    adContainer.appendChild(adLink);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                // Hide the ad container on error (same as auburndao)
+                document.getElementById('ad-container').style.display = 'none';
+            });
+            
+            // GAM loading (separate from Equativ, runs in parallel)
+            if (consentData.advertising) {
+                console.log('Loading GAM ads with consent');
+                loadGAMScript();
+            } else {
+                console.log('Skipping GAM ads - no advertising consent');
+            }
+            
+            // Show publishers tab by default
+            document.getElementById('publishers').classList.add('active');
+            document.querySelector('.tab-button').classList.add('active');
+        });
+        
+        // GAM functions (completely separate from Equativ)
+        function loadGAMScript() {
+            console.log('Loading GAM script from edgepubs.com domain');
+            const script = document.createElement('script');
+            script.src = '/tag/js/test.js';
+            script.async = true;
+            script.onload = function() {
+                console.log('GAM script loaded, initializing ads');
+                initializeGAMAds();
+            };
+            script.onerror = function() {
+                console.error('Failed to load GAM script');
+            };
+            document.head.appendChild(script);
+        }
+        
+        function initializeGAMAds() {
+            // Initialize googletag if not already done
+            window.googletag = window.googletag || {cmd: []};
+            
+            googletag.cmd.push(function() {
+                console.log('Defining GAM ad slots');
+                
+                // Define sidebar ad slot (300x250)
+                googletag.defineSlot('/88059007/homepage/in_content', [300, 250], 'gam-sidebar-slot')
+                    .addService(googletag.pubads());
+                    
+                // Define leaderboard ad slot (970x250)  
+                googletag.defineSlot('/88059007/homepage/in_content', [970, 250], 'gam-leaderboard-slot')
+                    .addService(googletag.pubads());
+                
+                // Enable services
+                googletag.pubads().enableSingleRequest();
+                googletag.pubads().collapseEmptyDivs();
+                googletag.enableServices();
+                
+                console.log('GAM services enabled, displaying ads');
+                
+                // Display the ads
+                googletag.display('gam-sidebar-slot');
+                googletag.display('gam-leaderboard-slot');
+            });
+        }
+    </script>
+</head>
+<body>
+    <!-- GDPR Consent Banner -->
+    <div id="gdpr-banner">
+        <h3>Cookie Consent</h3>
+        <p>We use cookies to enhance your browsing experience and serve personalized ads. By clicking "Accept All", you consent to our use of cookies.</p>
+        <div class="gdpr-buttons">
+            <button class="gdpr-accept" onclick="handleConsent('accept')">Accept All</button>
+            <button class="gdpr-reject" onclick="handleConsent('reject')">Reject All</button>
+        </div>
+    </div>
+
+    <!-- Remove header ad - will add simple version after main content -->
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <h1>The Edge Is Yours</h1>
+            <p>Run your site, ads, and data stack server-side — under your domain, on your terms.</p>
+            <a href="#contact" class="btn btn-primary">Get Started →</a>
+        </div>
+    </section>
+
+    <!-- Content spacing -->
+    <div class="container">
+        <div id="ad-container" class="ad-container">
+            <!-- Content will be loaded here -->
+        </div>
+    </div>
+
+    <!-- Features Section -->
+    <section class="features">
+        <div class="container">
+            <h2>Why EdgePubs?</h2>
+            
+            <div class="content-with-sidebar">
+                <div class="features-grid">
+                    <div class="feature">
+                        <h3>Publisher-Controlled Execution</h3>
+                        <p>Replace slow browser scripts with fast, server-side orchestration. Run your entire site and ad stack at the edge.</p>
+                    </div>
+                    <div class="feature">
+                        <h3>1st-Party Data & Identity</h3>
+                        <p>Protect and activate your first-party data. Build synthetic IDs and pass privacy-compliant signals to your partners.</p>
+                    </div>
+                    <div class="feature">
+                        <h3>Server-Side Tagging</h3>
+                        <p>No more fragile on-page tags. Execute all third-party tags server-side, giving you speed, control, and compliance.</p>
+                    </div>
+                    <div class="feature">
+                        <h3>Ad Stack Orchestration</h3>
+                        <p>Integrate Prebid Server, GAM, and SSPs directly. Manage auctions and measurement server-side for faster performance.</p>
+                    </div>
+                    <div class="feature">
+                        <h3>Faster Sites, Better UX</h3>
+                        <p>Cut page load times in half. Delight users with blazing fast experiences and fewer third-party browser calls.</p>
+                    </div>
+                </div>
+                
+                <!-- Sidebar Ad (GAM 300x250) -->
+                <div class="sidebar-ad">
+                    <div class="ad-container">
+                        <div id="gam-sidebar-slot" class="ad-slot ad-slot-300x250">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How It Works Section -->
+    <section class="how-it-works">
+        <div class="container">
+            <h2>How It Works</h2>
+            <div class="how-it-works-content">
+                <ul>
+                    <li>Trusted Server acts as a secure reverse proxy in front of your CMS (WordPress, Drupal, etc.)</li>
+                    <li>Prebid auctions, ad-serving, and consent tools run server-side, not in the browser.</li>
+                    <li>Contextual signals and creative assets are stitched directly into the page at the edge.</li>
+                    <li>Result: More revenue. More control. Better user experience.</li>
+                </ul>
+                
+                <div class="diagram">
+                    Publisher → Trusted Server → Ad Tech Partners → User
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Between Content Ad (Equativ PBS 970x250) -->
+    <section class="between-content-ad">
+        <div class="container">
+            <div class="ad-container">
+                <div id="gam-leaderboard-slot" class="ad-slot ad-slot-970x250">
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Tabs Section -->
+    <section class="tabs-section">
+        <div class="container">
+            <div class="tabs">
+                <button class="tab-button" onclick="showTab('publishers')">For Publishers</button>
+                <button class="tab-button" onclick="showTab('advertisers')">For Advertisers</button>
+            </div>
+            
+            <div id="publishers" class="tab-content">
+                <ul>
+                    <li>Full control of your execution environment</li>
+                    <li>Server-side identity, consent, and measurement</li>
+                    <li>No more slow, fragile browser tags</li>
+                </ul>
+            </div>
+            
+            <div id="advertisers" class="tab-content">
+                <ul>
+                    <li>Cleaner supply paths (no intermediaries siphoning value)</li>
+                    <li>Higher-quality inventory with verified user signals</li>
+                    <li>Cookieless targeting ready out-of-the-box</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer CTA -->
+    <section class="footer-cta" id="contact">
+        <div class="container">
+            <h2>Ready to Take Control?</h2>
+            <p>EdgePubs is your publisher-owned execution layer. Let's talk.</p>
+            <a href="mailto:hello@edgepubs.com" class="btn btn-secondary">Request a Demo →</a>
+        </div>
+    </section>
+
+
+</body>
+</html>"##;
 
 pub const GAM_TEST_TEMPLATE: &str = r#"
 <!DOCTYPE html>
@@ -609,42 +1291,16 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
                     }
                 });
                 
-                // Get the response as text first (since it contains both JSON and HTML)
+                // Get the response as text (raw GAM response content)
                 const responseText = await response.text();
                 
-                // Try to parse as JSON first (in case it's a pure JSON response)
-                let data;
-                try {
-                    data = JSON.parse(responseText);
-                } catch (jsonError) {
-                    // If JSON parsing fails, it's likely the mixed JSON+HTML format
-                    // Find the end of the JSON part (before the HTML starts)
-                    const htmlStart = responseText.indexOf('<!doctype html>');
-                    if (htmlStart !== -1) {
-                        // Extract just the JSON part
-                        const jsonPart = responseText.substring(0, htmlStart);
-                        try {
-                            data = JSON.parse(jsonPart);
-                            // Add info about the HTML part
-                            data.html_content_length = responseText.length - htmlStart;
-                            data.full_response_length = responseText.length;
-                        } catch (innerError) {
-                            // If we still can't parse JSON, show the raw response
-                            data = {
-                                error: 'Could not parse GAM response as JSON',
-                                raw_response_preview: responseText.substring(0, 500) + '...',
-                                response_length: responseText.length
-                            };
-                        }
-                    } else {
-                        // No HTML found, show the raw response
-                        data = {
-                            error: 'Unexpected response format',
-                            raw_response: responseText,
-                            response_length: responseText.length
-                        };
-                    }
-                }
+                // For the test page, create a simple data structure for display
+                const data = {
+                    status: "gam_test_success",
+                    response_length: responseText.length,
+                    response_preview: responseText.substring(0, 500) + (responseText.length > 500 ? '...' : ''),
+                    full_response: responseText
+                };
                 
                 resultDiv.textContent = JSON.stringify(data, null, 2);
             } catch (error) {

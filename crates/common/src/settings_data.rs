@@ -44,7 +44,7 @@ mod tests {
 
         let settings = settings.unwrap();
         // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_backend.is_empty());
+        assert!(!settings.ad_server.ad_partner_url.is_empty());
         assert!(!settings.ad_server.sync_url.is_empty());
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());

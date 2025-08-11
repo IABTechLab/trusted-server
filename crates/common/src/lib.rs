@@ -32,6 +32,7 @@ pub mod gdpr;
 pub mod geo;
 pub mod html_processor;
 pub mod models;
+pub mod partners;
 pub mod prebid;
 pub mod prebid_injector;
 pub mod prebid_proxy;

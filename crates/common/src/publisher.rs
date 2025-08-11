@@ -3,8 +3,8 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::constants::{
-    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_GEO_CITY,
-    HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
+    HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
 };
 use crate::cookies::create_synthetic_cookie;
@@ -15,7 +15,7 @@ use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use crate::templates::HTML_TEMPLATE;
+use crate::templates::{EDGEPUBS_TEMPLATE, HTML_TEMPLATE};
 
 /// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
 ///
@@ -90,8 +90,8 @@ pub fn handle_main_page(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!(
-        "Using ad_partner_backend: {}, counter_store: {}",
-        settings.ad_server.ad_partner_backend,
+        "Using ad_partner_url: {}, counter_store: {}",
+        settings.ad_server.ad_partner_url,
         settings.synthetic.counter_store,
     );
 
@@ -400,6 +400,63 @@ pub fn handle_publisher_request(
             request_host
         );
     }
+
+    Ok(response)
+}
+
+/// Handles the EdgePubs page request.
+///
+/// Serves the EdgePubs landing page with integrated ad slots.
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if response creation fails.
+pub fn handle_edgepubs_page(
+    settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    log::info!("Serving EdgePubs landing page");
+
+    // log_fastly::init_simple("mylogs", Info);
+
+    // Add DMA code check
+    let dma_code = get_dma_code(&mut req);
+    log::info!("EdgePubs page - DMA Code: {:?}", dma_code);
+
+    // Check GDPR consent
+    let _consent = match get_consent_from_request(&req) {
+        Some(c) => c,
+        None => {
+            log::debug!("No GDPR consent found for EdgePubs page, using default");
+            GdprConsent::default()
+        }
+    };
+
+    // Generate synthetic ID for EdgePubs page
+    let fresh_id = generate_synthetic_id(settings, &req)?;
+
+    // Get or generate Trusted Server ID
+    let trusted_server_id = get_or_generate_synthetic_id(settings, &req)?;
+
+    // Create response with EdgePubs template
+    let mut response = Response::from_status(StatusCode::OK)
+        .with_body(EDGEPUBS_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(HEADER_X_COMPRESS_HINT, "on");
+
+    // Add synthetic ID headers
+    response.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+    response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &trusted_server_id);
+
+    // Add DMA code header if available
+    if let Some(dma) = dma_code {
+        response.set_header(HEADER_X_GEO_METRO_CODE, dma);
+    }
+
+    // Set synthetic ID cookie
+    let cookie = create_synthetic_cookie(settings, &trusted_server_id);
+    response.set_header(header::SET_COOKIE, cookie);
 
     Ok(response)
 }

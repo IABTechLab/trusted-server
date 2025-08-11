@@ -12,7 +12,7 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AdServer {
-    pub ad_partner_backend: String,
+    pub ad_partner_url: String,
     pub sync_url: String,
 }
 
@@ -113,12 +113,35 @@ pub struct Synthetic {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PartnerConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub domains_to_proxy: Vec<String>,
+    pub proxy_domain: String,
+    pub backend_name: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Partners {
+    pub gam: Option<PartnerConfig>,
+    pub equativ: Option<PartnerConfig>,
+    pub prebid: Option<PartnerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Experimental {
+    pub enable_edge_pub: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub ad_server: AdServer,
     pub publisher: Publisher,
     pub prebid: Prebid,
     pub gam: Gam,
     pub synthetic: Synthetic,
+    pub partners: Option<Partners>,
+    pub experimental: Option<Experimental>,
 }
 
 #[allow(unused)]
@@ -188,6 +211,33 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     #[test]
+    fn test_settings_new() {
+        // Test that Settings::new() loads successfully
+        let settings = Settings::new();
+        assert!(settings.is_ok(), "Settings should load from embedded TOML");
+
+        let settings = settings.unwrap();
+        // Verify basic structure is loaded
+        assert!(!settings.ad_server.ad_partner_url.is_empty());
+        assert!(!settings.ad_server.sync_url.is_empty());
+
+        assert!(!settings.publisher.domain.is_empty());
+        assert!(!settings.publisher.cookie_domain.is_empty());
+        assert!(!settings.publisher.origin_url.is_empty());
+
+        assert!(!settings.prebid.server_url.is_empty());
+
+        assert!(!settings.synthetic.counter_store.is_empty());
+        assert!(!settings.synthetic.opid_store.is_empty());
+        assert!(!settings.synthetic.secret_key.is_empty());
+        assert!(!settings.synthetic.template.is_empty());
+
+        assert!(!settings.gam.publisher_id.is_empty());
+        assert!(!settings.gam.server_url.is_empty());
+        assert!(!settings.gam.ad_units.is_empty());
+    }
+
+    #[test]
     fn test_settings_from_valid_toml() {
         let toml_str = crate_test_settings_str();
         let settings = Settings::from_toml(&toml_str);
@@ -196,7 +246,7 @@ mod tests {
 
         let settings = settings.expect("should parse valid TOML");
         assert_eq!(
-            settings.ad_server.ad_partner_backend,
+            settings.ad_server.ad_partner_url,
             "https://test-adpartner.com"
         );
         assert_eq!(
@@ -217,11 +267,20 @@ mod tests {
         assert_eq!(settings.synthetic.opid_store, "test-opid-store");
         assert_eq!(settings.synthetic.secret_key, "test-secret-key");
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
+
+        assert_eq!(settings.gam.publisher_id, "21796327522");
+        assert_eq!(
+            settings.gam.server_url,
+            "https://securepubads.g.doubleclick.net/gampad/ads"
+        );
+        assert_eq!(settings.gam.ad_units.len(), 2);
+        assert_eq!(settings.gam.ad_units[0].name, "test_unit_1");
+        assert_eq!(settings.gam.ad_units[0].size, "320x50");
     }
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new(r"ad_partner_backend = .*").unwrap();
+        let re = Regex::new(r"ad_partner_url = .*").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -270,13 +329,13 @@ mod tests {
 
     #[test]
     fn test_set_env() {
-        let re = Regex::new(r"ad_partner_backend = .*").unwrap();
+        let re = Regex::new(r"ad_partner_url = .*").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_BACKEND",
+                "{}{}AD_SERVER{}AD_PARTNER_URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
@@ -287,7 +346,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_backend,
+                    settings.unwrap().ad_server.ad_partner_url,
                     "https://change-ad.com/serve"
                 );
             },
@@ -300,7 +359,7 @@ mod tests {
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_BACKEND",
+                "{}{}AD_SERVER{}AD_PARTNER_URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
@@ -311,7 +370,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_backend,
+                    settings.unwrap().ad_server.ad_partner_url,
                     "https://change-ad.com/serve"
                 );
             },
