@@ -1,6 +1,3 @@
-use crate::error::TrustedServerError;
-use crate::gdpr::get_consent_from_request;
-use crate::settings::Settings;
 use error_stack::Report;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
@@ -8,6 +5,11 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::Read;
 use uuid::Uuid;
+
+use crate::error::TrustedServerError;
+use crate::gdpr::get_consent_from_request;
+use crate::settings::Settings;
+use crate::templates::GAM_TEST_TEMPLATE;
 
 /// GAM request builder for server-side ad requests
 pub struct GamRequest {
@@ -1058,6 +1060,16 @@ pub async fn handle_gam_asset(
             }))
         }
     }
+}
+
+pub fn handle_gam_test_page(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_body(GAM_TEST_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header("x-compress-hint", "on"))
 }
 
 #[cfg(test)]

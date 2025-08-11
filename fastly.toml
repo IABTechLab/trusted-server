@@ -67,6 +67,9 @@ build = """
         [local_server.backends.googleads_doubleclick_backend]
             url = "https://securepubads.g.doubleclick.net"
 
+        [local_server.backends.publisher_origin]
+            url = "http://localhost:9090"
+            override_host = "localhost:9090"
 
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]
