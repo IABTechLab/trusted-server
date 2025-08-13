@@ -158,11 +158,6 @@ pub fn create_url_replacer(
 ) -> StreamingReplacer {
     let request_url = format!("{}://{}", request_scheme, request_host);
 
-    log::info!(
-        "Creating URL replacer: origin_host='{}', origin_url='{}', request_host='{}', request_scheme='{}', request_url='{}'",
-        origin_host, origin_url, request_host, request_scheme, request_url
-    );
-
     let mut replacements = vec![
         // Replace full URLs first (more specific)
         Replacement {
@@ -191,16 +186,6 @@ pub fn create_url_replacer(
         find: origin_host.to_string(),
         replace_with: request_host.to_string(),
     });
-
-    log::info!("URL replacements configured:");
-    for (i, replacement) in replacements.iter().enumerate() {
-        log::info!(
-            "  {}. Find: '{}' -> Replace with: '{}'",
-            i + 1,
-            replacement.find,
-            replacement.replace_with
-        );
-    }
 
     StreamingReplacer::new(replacements)
 }

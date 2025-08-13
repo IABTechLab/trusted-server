@@ -50,21 +50,34 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    // Build replacement patterns
-    let href_find = format!("https://{}", config.origin_host);
-    let href_replace = format!("{}://{}", config.request_scheme, config.request_host);
-    let href_find2 = format!("http://{}", config.origin_host);
+    // Create a shared structure for URL replacement patterns
+    #[derive(Clone)]
+    struct UrlPatterns {
+        https_origin: String,
+        http_origin: String,
+        protocol_relative_origin: String,
+        origin_host: String,
+        replacement_url: String,
+        protocol_relative_replacement: String,
+        request_host: String,
+    }
 
-    // Clone for closures
-    let href_find_1 = href_find.clone();
-    let href_find_2 = href_find.clone();
-    let href_find_3 = href_find.clone();
-    let href_replace_1 = href_replace.clone();
-    let href_replace_2 = href_replace.clone();
-    let href_replace_3 = href_replace.clone();
-    let href_find2_1 = href_find2.clone();
-    let href_find2_2 = href_find2.clone();
-    let href_find2_3 = href_find2.clone();
+    let patterns = Rc::new(UrlPatterns {
+        https_origin: format!("https://{}", config.origin_host),
+        http_origin: format!("http://{}", config.origin_host),
+        protocol_relative_origin: format!("//{}", config.origin_host),
+        origin_host: config.origin_host.clone(),
+        replacement_url: format!("{}://{}", config.request_scheme, config.request_host),
+        protocol_relative_replacement: format!("//{}", config.request_host),
+        request_host: config.request_host.clone(),
+    });
+
+    // Clone Rc pointers for each closure (cheap - just increments reference count)
+    let patterns_href = patterns.clone();
+    let patterns_src = patterns.clone();
+    let patterns_action = patterns.clone();
+    let patterns_srcset = patterns.clone();
+    let patterns_imagesrcset = patterns.clone();
 
     // Create URL replacer
     let replacer = create_url_replacer(
@@ -103,8 +116,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("[href]", move |el| {
                 if let Some(href) = el.get_attribute("href") {
                     let new_href = href
-                        .replace(&href_find_1, &href_replace_1)
-                        .replace(&href_find2_1, &href_replace_1);
+                        .replace(&patterns_href.https_origin, &patterns_href.replacement_url)
+                        .replace(&patterns_href.http_origin, &patterns_href.replacement_url);
                     if new_href != href {
                         el.set_attribute("href", &new_href)?;
                     }
@@ -115,8 +128,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("[src]", move |el| {
                 if let Some(src) = el.get_attribute("src") {
                     let new_src = src
-                        .replace(&href_find_2, &href_replace_2)
-                        .replace(&href_find2_2, &href_replace_2);
+                        .replace(&patterns_src.https_origin, &patterns_src.replacement_url)
+                        .replace(&patterns_src.http_origin, &patterns_src.replacement_url);
                     if new_src != src {
                         el.set_attribute("src", &new_src)?;
                     }
@@ -127,10 +140,38 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("[action]", move |el| {
                 if let Some(action) = el.get_attribute("action") {
                     let new_action = action
-                        .replace(&href_find_3, &href_replace_3)
-                        .replace(&href_find2_3, &href_replace_3);
+                        .replace(&patterns_action.https_origin, &patterns_action.replacement_url)
+                        .replace(&patterns_action.http_origin, &patterns_action.replacement_url);
                     if new_action != action {
                         el.set_attribute("action", &new_action)?;
+                    }
+                }
+                Ok(())
+            }),
+            // Replace URLs in srcset attributes (for responsive images)
+            element!("[srcset]", move |el| {
+                if let Some(srcset) = el.get_attribute("srcset") {
+                    let new_srcset = srcset
+                        .replace(&patterns_srcset.https_origin, &patterns_srcset.replacement_url)
+                        .replace(&patterns_srcset.http_origin, &patterns_srcset.replacement_url)
+                        .replace(&patterns_srcset.protocol_relative_origin, &patterns_srcset.protocol_relative_replacement)
+                        .replace(&patterns_srcset.origin_host, &patterns_srcset.request_host);
+                    
+                    if new_srcset != srcset {
+                        el.set_attribute("srcset", &new_srcset)?;
+                    }
+                }
+                Ok(())
+            }),
+            // Replace URLs in imagesrcset attributes (for link preload)
+            element!("[imagesrcset]", move |el| {
+                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
+                    let new_imagesrcset = imagesrcset
+                        .replace(&patterns_imagesrcset.https_origin, &patterns_imagesrcset.replacement_url)
+                        .replace(&patterns_imagesrcset.http_origin, &patterns_imagesrcset.replacement_url)
+                        .replace(&patterns_imagesrcset.protocol_relative_origin, &patterns_imagesrcset.protocol_relative_replacement);
+                    if new_imagesrcset != imagesrcset {
+                        el.set_attribute("imagesrcset", &new_imagesrcset)?;
                     }
                 }
                 Ok(())

@@ -357,13 +357,6 @@ pub fn handle_publisher_request(
             "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
             content_type, content_encoding, request_host, origin_host
         );
-        log::info!(
-            "URL Replacement: will replace '{}' and '{}' with '{}://{}'",
-            origin_host,
-            settings.publisher.origin_url,
-            request_scheme,
-            request_host
-        );
 
         // Take the response body for streaming processing
         let body = response.take_body();
