@@ -13,7 +13,6 @@
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
 //! - [`prebid`]: Prebid integration and real-time bidding support
-//! - [`prebid_injector`]: Automatic Prebid.js configuration injection
 //! - [`prebid_proxy`]: Prebid Server proxy for first-party ad serving
 //! - [`privacy`]: Privacy utilities and helpers
 //! - [`settings`]: Configuration management and validation
@@ -34,7 +33,6 @@ pub mod html_processor;
 pub mod models;
 pub mod partners;
 pub mod prebid;
-pub mod prebid_injector;
 pub mod prebid_proxy;
 pub mod privacy;
 pub mod publisher;
