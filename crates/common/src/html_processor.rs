@@ -89,8 +89,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     // Generate Prebid config script if enabled
     let prebid_script = if config.enable_prebid {
+        log::info!("[Prebid] Auto-configuration enabled for origin: {}", config.origin_host);
         Some(generate_prebid_script(&config))
     } else {
+        log::debug!("[Prebid] Auto-configuration disabled");
         None
     };
 
@@ -183,9 +185,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         if (src.contains("prebid") || src.contains("pbjs"))
                             && !*config_injected_1.borrow()
                         {
+                            log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
                             el.after(script, lol_html::html_content::ContentType::Html);
                             *config_injected_1.borrow_mut() = true;
                             *prebid_detected_1.borrow_mut() = true;
+                            log::info!("[Prebid] Injected configuration after Prebid.js script tag");
                         }
                     }
                 }
@@ -195,8 +199,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("head", move |el| {
                 if let Some(ref script) = prebid_script_2 {
                     if *prebid_detected_2.borrow() && !*config_injected_2.borrow() {
+                        log::info!("[Prebid] Injecting configuration in <head> element (fallback)");
                         el.append(script, lol_html::html_content::ContentType::Html);
                         *config_injected_2.borrow_mut() = true;
+                    } else if config.enable_prebid && !*prebid_detected_2.borrow() {
+                        log::debug!("[Prebid] No Prebid.js detected in <head>, skipping injection");
                     }
                 }
                 Ok(())
@@ -213,6 +220,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 && (content.contains("pbjs") || content.contains("prebid"))
             {
                 *prebid_detected_3.borrow_mut() = true;
+                log::info!("[Prebid] Detected Prebid.js reference in text content");
             }
 
             // Apply URL replacements
