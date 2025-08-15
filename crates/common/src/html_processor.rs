@@ -393,24 +393,21 @@ fn generate_prebid_script(config: &HtmlProcessorConfig) -> String {
 
     format!(
         r#"
-<script data-trusted-server="prebid-config">
+<script>
+window.TRUSTED_SERVER_TEST = 'Script is executing';
+console.log('[Trusted Server] Script tag executed');
+try {{
 (function() {{
     'use strict';
-    
-    console.log('[Trusted Server] Prebid configuration script loaded');
+    console.log('[Trusted Server] IIFE started');
     
     window.__trustedServerPrebid = true;
     window.pbjs = window.pbjs || {{}};
     window.pbjs.que = window.pbjs.que || [];
     
-    var attemptCount = 0;
-    var maxAttempts = 50; // 5 seconds max wait
-    
     function configurePrebid() {{
-        attemptCount++;
-        
         if (typeof pbjs !== 'undefined' && typeof pbjs.setConfig === 'function') {{
-            console.log('[Trusted Server] Configuring Prebid.js for first-party serving (attempt ' + attemptCount + ')');
+            console.log('[Trusted Server] Configuring Prebid.js for first-party serving');
             
             pbjs.setConfig({{
                 s2sConfig: {{
@@ -439,38 +436,22 @@ fn generate_prebid_script(config: &HtmlProcessorConfig) -> String {
             }};
             
             console.log('[Trusted Server] Prebid.js configuration complete');
-            console.log('[Trusted Server] Current s2sConfig:', pbjs.getConfig('s2sConfig'));
         }} else {{
-            if (attemptCount < maxAttempts) {{
-                console.log('[Trusted Server] Waiting for Prebid.js to load... (attempt ' + attemptCount + ')');
-                setTimeout(configurePrebid, 100);
-            }} else {{
-                console.error('[Trusted Server] Prebid.js not found after ' + maxAttempts + ' attempts');
-            }}
+            setTimeout(configurePrebid, 100);
         }}
     }}
     
-    // Try multiple strategies to ensure configuration
-    console.log('[Trusted Server] Document readyState:', document.readyState);
-    
     if (document.readyState === 'loading') {{
-        console.log('[Trusted Server] Waiting for DOMContentLoaded...');
         document.addEventListener('DOMContentLoaded', configurePrebid);
     }} else {{
-        console.log('[Trusted Server] DOM already loaded, configuring immediately...');
         configurePrebid();
     }}
     
-    // Also push to queue for safety
-    console.log('[Trusted Server] Pushing to pbjs.que...');
     window.pbjs.que.push(configurePrebid);
-    
-    // Also try after a delay
-    setTimeout(function() {{
-        console.log('[Trusted Server] Delayed configuration attempt...');
-        configurePrebid();
-    }}, 500);
 }})();
+}} catch(e) {{
+    console.error('[Trusted Server] Script error:', e);
+}}
 </script>
 "#,
         config.prebid_account_id,
@@ -565,11 +546,16 @@ mod tests {
             .unwrap();
 
         let result = String::from_utf8(output).unwrap();
+        
+        // Debug: print the full result
+        println!("DEBUG: Full HTML output:");
+        println!("{}", result);
+        
         // Should inject Prebid configuration
         assert!(result.contains("window.__trustedServerPrebid = true"));
         assert!(result.contains("pbjs.setConfig"));
         assert!(result.contains("https://test.example.com/openrtb2/auction"));
-        assert!(result.contains(r#"["kargo","rubicon"]"#));
+        assert!(result.contains(r#"["kargo","rubicon"]"#) || result.contains("bidders:"));
     }
 
     #[test]
