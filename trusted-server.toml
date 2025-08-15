@@ -13,7 +13,7 @@ server_url = "http://68.183.113.79:8000"
 account_id = "1001"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = true
+auto_configure = false
 debug = false
 
 [gam]

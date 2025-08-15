@@ -345,12 +345,27 @@ impl StreamProcessor for HtmlRewriterAdapter {
                     },
                 );
 
-                rewriter
-                    .write(&self.accumulated_input)
-                    .map_err(|e| {
-                        log::error!("[HtmlRewriter] Write failed: {}", e);
-                        io::Error::other(format!("HTML rewriter write failed: {}", e))
-                    })?;
+                // Write in chunks to avoid potential issues with large content
+                let chunk_size = 65536; // 64KB chunks
+                for chunk in self.accumulated_input.chunks(chunk_size) {
+                    rewriter
+                        .write(chunk)
+                        .map_err(|e| {
+                            log::error!("[HtmlRewriter] Write failed at chunk: {}", e);
+                            
+                            // Log the problematic chunk for debugging
+                            if let Ok(text) = std::str::from_utf8(chunk) {
+                                let preview = if text.len() > 200 {
+                                    &text[..200]
+                                } else {
+                                    text
+                                };
+                                log::error!("[HtmlRewriter] Failed chunk preview: {}", preview);
+                            }
+                            
+                            io::Error::other(format!("HTML rewriter write failed: {}", e))
+                        })?;
+                }
 
                 rewriter
                     .end()

@@ -680,7 +680,7 @@ mod tests {
         
         // Should inject configuration at body fallback since pbjs was detected
         assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("data-trusted-server=\"prebid-config\""));
+        assert!(result.contains("window.TRUSTED_SERVER_TEST = 'YES'"));
     }
 
     #[test]
@@ -715,6 +715,218 @@ mod tests {
         // Should inject configuration somewhere (head or body fallback)
         assert!(result.contains("window.__trustedServerPrebid = true"));
         assert!(result.contains("pbjs.setConfig"));
+    }
+
+
+
+
+    #[test]
+    fn test_real_autoblog_html() {
+        // Test with real Autoblog HTML from test_rewrite.html
+        let html = include_str!("htm_processor.test.html");
+        
+        // Exact measurements - no approximations
+        const INPUT_SIZE: usize = 545235;
+        const OUTPUT_SIZE: usize = 554624;
+        const ORIGINAL_AUTOBLOG_URLS: usize = 859;
+        const REPLACED_URLS: usize = 851;
+        const UNREPLACED_URLS: usize = 8;
+        const SIZE_INCREASE: usize = 9389;
+        
+        // Verify input
+        assert_eq!(html.len(), INPUT_SIZE);
+        assert_eq!(html.matches("www.autoblog.com").count(), ORIGINAL_AUTOBLOG_URLS);
+        assert_eq!(html.matches("https://www.autoblog.com").count(), 853);
+        assert_eq!(html.matches("//www.autoblog.com").count(), 853);
+        
+        // Process
+        let mut config = create_test_config();
+        config.origin_host = "www.autoblog.com".to_string();
+        config.origin_url = "https://www.autoblog.com".to_string();
+        config.request_host = "autoblog-ts.edgecompute.app".to_string();
+        config.enable_prebid = false;
+        
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline.process(Cursor::new(html.as_bytes()), &mut output).unwrap();
+        let result = String::from_utf8(output).unwrap();
+        
+        // Exact assertions - no approximations
+        assert_eq!(result.len(), OUTPUT_SIZE);
+        assert_eq!(result.len() - html.len(), SIZE_INCREASE);
+        assert_eq!(result.matches("www.autoblog.com").count(), UNREPLACED_URLS);
+        assert_eq!(result.matches("autoblog-ts.edgecompute.app").count(), REPLACED_URLS);
+        
+        // Verify HTML structure
+        assert_eq!(&result[0..15], "<!DOCTYPE html>");
+        assert_eq!(&result[result.len()-7..], "</html>");
+        
+        // Verify specific content preservation (exact counts from source file)
+        assert_eq!(result.matches("Mercedes CEO").count(), 26); // All occurrences in article
+        assert_eq!(result.matches("sebastian-cenizo.jpg").count(), 56); // All image references
+        assert_eq!(result.matches("window.TRUSTED_SERVER_TEST").count(), 0); // Prebid disabled in this test
+    }
+
+    #[test]
+    fn test_real_autoblog_html_with_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::read::GzDecoder;
+        use flate2::Compression as GzCompression;
+        use std::io::{Write, Read};
+        
+        let html = include_str!("htm_processor.test.html");
+        
+        // Exact constants
+        const INPUT_SIZE: usize = 545235;
+        const OUTPUT_SIZE: usize = 554624;
+        const COMPRESSED_INPUT_SIZE: usize = 80834;
+        const COMPRESSED_OUTPUT_SIZE: usize = 81128;
+        const REPLACED_URLS: usize = 851;
+        const UNREPLACED_URLS: usize = 8;
+        
+        assert_eq!(html.len(), INPUT_SIZE);
+        
+        // Compress
+        let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
+        encoder.write_all(html.as_bytes()).unwrap();
+        let compressed_input = encoder.finish().unwrap();
+        
+        assert_eq!(compressed_input.len(), COMPRESSED_INPUT_SIZE);
+        
+        // Process with compression
+        let mut config = create_test_config();
+        config.origin_host = "www.autoblog.com".to_string();
+        config.origin_url = "https://www.autoblog.com".to_string();
+        config.request_host = "autoblog-ts.edgecompute.app".to_string();
+        config.enable_prebid = false;
+        
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        
+        let mut compressed_output = Vec::new();
+        pipeline.process(Cursor::new(&compressed_input), &mut compressed_output).unwrap();
+        
+        assert_eq!(compressed_output.len(), COMPRESSED_OUTPUT_SIZE);
+        
+        // Decompress and verify
+        let mut decoder = GzDecoder::new(&compressed_output[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        
+        // Exact assertions
+        assert_eq!(decompressed.len(), OUTPUT_SIZE);
+        assert_eq!(decompressed.matches("www.autoblog.com").count(), UNREPLACED_URLS);
+        assert_eq!(decompressed.matches("autoblog-ts.edgecompute.app").count(), REPLACED_URLS);
+        
+        // Verify structure
+        assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
+        assert_eq!(&decompressed[decompressed.len()-7..], "</html>");
+        
+        // Verify content (exact counts from source file)
+        assert_eq!(decompressed.matches("Mercedes CEO").count(), 26);
+        assert_eq!(decompressed.matches("sebastian-cenizo.jpg").count(), 56);
+        assert_eq!(decompressed.matches("window.TRUSTED_SERVER_TEST").count(), 0); // Prebid disabled in this test
+    }
+
+
+    #[test]
+    fn test_already_truncated_html_passthrough() {
+        // Test that we don't make truncated HTML worse
+        // This simulates receiving already-truncated HTML from origin
+        
+        let truncated_html = r#"<html><head><title>Test</title></head><body><p>This is a test that gets cut o"#;
+        
+        println!("Testing already-truncated HTML");
+        println!("Input: '{}'", truncated_html);
+        
+        let config = create_test_config();
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(truncated_html.as_bytes()), &mut output);
+        
+        assert!(result.is_ok(), "Should process truncated HTML without error");
+        
+        let processed = String::from_utf8_lossy(&output);
+        println!("Output: '{}'", processed);
+        
+        // The processor should pass through the truncated HTML
+        // It might add some closing tags, but shouldn't truncate further
+        assert!(processed.len() >= truncated_html.len(), 
+            "Output should not be shorter than truncated input");
+    }
+    
+    #[test]
+    fn test_truncated_html_validation() {
+        // This is the actual truncated HTML from production
+        let truncated_html = r#"<html class="site--autoblog disable-scroll-animations" lang="en" style="--newsletter-button-height: 0px; --scroll-padding: 145px; --scroll-bar: 0px; --footer-ad-height: 90px;"><head><script type="text/javascript" src="https://standout-cdn.kargo.com/js/scpb8.js" async=""></script><link rel="stylesheet" href="//qmod.quotemedia.com/static/v1.44.2/css/main.7a6dc03776dda294370525a54e13ed37.css" nonce="QMOD_NOONCE" id="qmod-style-main"><link rel="stylesheet" href="//qmod.quotemedia.com/static/v1.44.2/css/miniquotes.9de6940fc80522687b2e6b794d4aaec9.css" nonce="QMOD_NOONCE" id="qmod-style-miniquotes"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="preload" as="image" href="https://www.autoblog.com/.image/NzowMDAwMDAwMDAwODc4Nzc3/autoblog-logo-878777.svg" fetchpriority="high"><link rel="preload" as="image" imagesrcset="https://www.autoblog.com/.image/w_16,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 16w, https://www.autoblog.com/.image/w_32,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 32w, https://www.autoblog.com/.image/w_48,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 48w, https://www.autoblog.com/.image/w_64,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 64w, https://www.autoblog.com/.image/w_96,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 96w, https://www.autoblog.com/.image/w_128,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 128w, https://www.autoblog.com/.image/w_256,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 256w, https://www.autoblog.com/.image/w_384,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 384w, https://www.autoblog.com/.image/w_640,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/sebastian-cenizo.jpg 640w, https://www.autoblog.com/.image/w_750,q_auto:good,c_fill,ar_1:1/NzowMDAwMDAwMDAwOTAyMDc2/se"#;
+
+        // This HTML is clearly truncated - it ends in the middle of an attribute value
+        println!("Testing truncated HTML (ends with '/se' in middle of URL)");
+        println!("Input length: {} bytes", truncated_html.len());
+        
+        // Check that the input is indeed truncated
+        assert!(!truncated_html.contains("</html>"), "Input should be truncated (no closing html tag)");
+        assert!(!truncated_html.contains("</head>"), "Input should be truncated (no closing head tag)"); 
+        assert!(truncated_html.ends_with("/se"), "Input should end with '/se' showing truncation");
+        
+        // Process it through our pipeline
+        let mut config = create_test_config();
+        config.origin_host = "www.autoblog.com".to_string();
+        config.origin_url = "https://www.autoblog.com".to_string();
+        config.request_host = "autoblog-ts.edgecompute.app".to_string();
+        config.enable_prebid = true;
+        
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        
+        // The processor should handle truncated HTML gracefully
+        let result = pipeline.process(Cursor::new(truncated_html.as_bytes()), &mut output);
+        
+        // Even with truncated input, processing should complete
+        assert!(result.is_ok(), "Processing should complete even with truncated HTML");
+        
+        let processed = String::from_utf8_lossy(&output);
+        println!("Output length: {} bytes", processed.len());
+        
+        // The processor will try to fix the HTML structure
+        // lol_html should handle the truncated input and still produce output
+        
+        // Check what we got back
+        if processed.contains("</html>") {
+            println!("Note: lol_html added closing tags to fix truncated HTML");
+        }
+        
+        // The key issue is that truncated HTML should not cause a panic or error
+        // The output might still be malformed, but it should process
+        
+        println!("Last 100 chars of output: {}", 
+            processed.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
     }
 
     #[test]
