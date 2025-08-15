@@ -293,8 +293,17 @@ impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         // Accumulate input
         self.accumulated_input.extend_from_slice(chunk);
+        
+        // Log accumulation progress
+        if chunk.len() > 0 {
+            log::debug!("[HtmlRewriter] Accumulated {} bytes, total: {} bytes", 
+                chunk.len(), self.accumulated_input.len());
+        }
 
         if is_last {
+            log::info!("[HtmlRewriter] Processing final chunk, total size: {} bytes", 
+                self.accumulated_input.len());
+            
             // Process all accumulated input
             let mut output = Vec::new();
 
@@ -308,13 +317,20 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
                 rewriter
                     .write(&self.accumulated_input)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                    .map_err(|e| {
+                        log::error!("[HtmlRewriter] Write failed: {}", e);
+                        io::Error::other(format!("HTML rewriter write failed: {}", e))
+                    })?;
 
                 rewriter
                     .end()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                    .map_err(|e| {
+                        log::error!("[HtmlRewriter] End failed: {}", e);
+                        io::Error::other(format!("HTML rewriter end failed: {}", e))
+                    })?;
             }
 
+            log::info!("[HtmlRewriter] Processed output size: {} bytes", output.len());
             self.accumulated_input.clear();
             Ok(output)
         } else {

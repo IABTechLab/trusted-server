@@ -249,7 +249,7 @@ fn process_response_streaming(
         pipeline.process(body, &mut output)?;
     }
 
-    log::info!("Streaming processing complete");
+    log::info!("Streaming processing complete - output size: {} bytes", output.len());
     Ok(Body::from(output))
 }
 
