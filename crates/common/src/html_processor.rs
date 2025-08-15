@@ -1,6 +1,8 @@
 //! Simplified HTML processor that combines URL replacement and Prebid injection
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use lol_html::{element, Settings as RewriterSettings};
 
@@ -45,13 +47,142 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// State machine for tracking Prebid.js detection and injection
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Fields are kept for debugging/logging purposes
+enum PrebidState {
+    /// No Prebid.js detected yet
+    NotDetected,
+    /// Prebid.js detected but config not yet injected
+    Detected { location: String },
+    /// Configuration has been injected
+    Injected { location: String, context: String },
+}
+
+/// Manages Prebid.js detection and configuration injection
+#[derive(Clone)]
+struct PrebidInjector {
+    script: Option<String>,
+    state: Rc<RefCell<PrebidState>>,
+}
+
+// TODO: IMPROVEMENT #3 - PrebidInjector Methods Could Be Simpler
+// The try_inject_after and try_inject_append have similar logic.
+// Consider:
+// - Combine with enum: `try_inject(el, InjectionPosition::After, context)`
+// - Make condition checking more declarative with a `should_inject()` method
+// - Could reduce code duplication and make injection logic clearer
+
+impl PrebidInjector {
+    fn new(config: &HtmlProcessorConfig) -> Self {
+        let script = if config.enable_prebid {
+            log::info!("[Prebid] Auto-configuration enabled for origin: {}", config.origin_host);
+            Some(generate_prebid_script(config))
+        } else {
+            log::debug!("[Prebid] Auto-configuration disabled");
+            None
+        };
+
+        Self {
+            script,
+            state: Rc::new(RefCell::new(PrebidState::NotDetected)),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.script.is_some()
+    }
+
+    fn mark_detected(&self, location: &str) {
+        let mut state = self.state.borrow_mut();
+        if matches!(*state, PrebidState::NotDetected) {
+            log::info!("[Prebid] Detected Prebid.js reference at: {}", location);
+            *state = PrebidState::Detected {
+                location: location.to_string(),
+            };
+        }
+    }
+
+    fn try_inject_after(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
+        if let Some(ref script) = self.script {
+            let mut state = self.state.borrow_mut();
+            match &*state {
+                PrebidState::NotDetected | PrebidState::Detected { .. } => {
+                    log::debug!("[Prebid] Injecting configuration {}", context);
+                    el.after(script, lol_html::html_content::ContentType::Html);
+                    
+                    let location = match &*state {
+                        PrebidState::Detected { location } => location.clone(),
+                        _ => "inline".to_string(),
+                    };
+                    
+                    *state = PrebidState::Injected {
+                        location,
+                        context: context.to_string(),
+                    };
+                    return true;
+                }
+                PrebidState::Injected { .. } => {
+                    // Already injected, do nothing
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    fn try_inject_append(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
+        if let Some(ref script) = self.script {
+            let mut state = self.state.borrow_mut();
+            match &*state {
+                PrebidState::Detected { location } => {
+                    log::debug!("[Prebid] Injecting configuration {}", context);
+                    el.append(script, lol_html::html_content::ContentType::Html);
+                    *state = PrebidState::Injected {
+                        location: location.clone(),
+                        context: context.to_string(),
+                    };
+                    return true;
+                }
+                _ => {
+                    // Not in the right state for append injection
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    fn detect_in_text(&self, text: &str) -> bool {
+        if self.is_enabled() {
+            let state = self.state.borrow();
+            if matches!(*state, PrebidState::NotDetected) {
+                if text.contains("pbjs") || text.contains("prebid") || text.contains("Prebid") {
+                    drop(state); // Release borrow before calling mark_detected
+                    self.mark_detected("text content");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn detect_in_src(&self, src: &str) -> bool {
+        src.contains("prebid") || src.contains("pbjs")
+    }
+}
+
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
+    // TODO: IMPROVEMENT #4 - URL Patterns Structure
+    // The UrlPatterns struct has redundant data (origins in multiple formats).
+    // Consider:
+    // - Generate variants on-demand with methods like `https_origin(&self)`
+    // - Or use a builder that constructs patterns as needed
+    // - Could reduce from 7 fields to 3-4 core fields
+    
     // Create a shared structure for URL replacement patterns
-    #[derive(Clone)]
     struct UrlPatterns {
         https_origin: String,
         http_origin: String,
@@ -72,13 +203,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_host: config.request_host.clone(),
     });
 
-    // Clone Rc pointers for each closure (cheap - just increments reference count)
-    let patterns_href = patterns.clone();
-    let patterns_src = patterns.clone();
-    let patterns_action = patterns.clone();
-    let patterns_srcset = patterns.clone();
-    let patterns_imagesrcset = patterns.clone();
-
     // Create URL replacer
     let replacer = create_url_replacer(
         &config.origin_host,
@@ -87,155 +211,173 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         &config.request_scheme,
     );
 
-    // Generate Prebid config script if enabled
-    let prebid_script = if config.enable_prebid {
-        log::info!("[Prebid] Auto-configuration enabled for origin: {}", config.origin_host);
-        Some(generate_prebid_script(&config))
-    } else {
-        log::debug!("[Prebid] Auto-configuration disabled");
-        None
-    };
+    // Create Prebid injector wrapped in Rc for sharing
+    let prebid = Rc::new(PrebidInjector::new(&config));
 
-    let prebid_script_1 = prebid_script.clone();
-    let prebid_script_2 = prebid_script.clone();
-
-    // Tracking state for injection (using RefCell for interior mutability)
-    let prebid_detected = Rc::new(RefCell::new(false));
-    let config_injected = Rc::new(RefCell::new(false));
-
-    let prebid_detected_1 = prebid_detected.clone();
-    let prebid_detected_2 = prebid_detected.clone();
-    let prebid_detected_3 = prebid_detected.clone();
-    let config_injected_1 = config_injected.clone();
-    let config_injected_2 = config_injected.clone();
-    let _config_injected_3 = config_injected.clone();
-
-    let enable_prebid = config.enable_prebid;
-
+    // TODO: IMPROVEMENT #5 - Element Handler Registration
+    // The long vector of element handlers could be built more dynamically:
+    // - Use a builder pattern: `HandlerBuilder::new().url_handlers().prebid_handlers().build()`
+    // - Or register handlers based on configuration flags
+    // - Could make it easier to conditionally include/exclude handlers
+    
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
+            // TODO: IMPROVEMENT #1 - Repetitive URL Replacement Logic
+            // Each URL handler below has similar replacement logic.
+            // Consider:
+            // - Create a helper: `create_url_handler("href", &patterns)`
+            // - Or add method to UrlPatterns: `patterns.create_replacement_handler("href")`
+            // - This would reduce ~50 lines to ~5 lines per handler
+            
             // Replace URLs in href attributes
-            element!("[href]", move |el| {
-                if let Some(href) = el.get_attribute("href") {
-                    let new_href = href
-                        .replace(&patterns_href.https_origin, &patterns_href.replacement_url)
-                        .replace(&patterns_href.http_origin, &patterns_href.replacement_url);
-                    if new_href != href {
-                        el.set_attribute("href", &new_href)?;
-                    }
-                }
-                Ok(())
-            }),
-            // Replace URLs in src attributes
-            element!("[src]", move |el| {
-                if let Some(src) = el.get_attribute("src") {
-                    let new_src = src
-                        .replace(&patterns_src.https_origin, &patterns_src.replacement_url)
-                        .replace(&patterns_src.http_origin, &patterns_src.replacement_url);
-                    if new_src != src {
-                        el.set_attribute("src", &new_src)?;
-                    }
-                }
-                Ok(())
-            }),
-            // Replace URLs in action attributes
-            element!("[action]", move |el| {
-                if let Some(action) = el.get_attribute("action") {
-                    let new_action = action
-                        .replace(&patterns_action.https_origin, &patterns_action.replacement_url)
-                        .replace(&patterns_action.http_origin, &patterns_action.replacement_url);
-                    if new_action != action {
-                        el.set_attribute("action", &new_action)?;
-                    }
-                }
-                Ok(())
-            }),
-            // Replace URLs in srcset attributes (for responsive images)
-            element!("[srcset]", move |el| {
-                if let Some(srcset) = el.get_attribute("srcset") {
-                    let new_srcset = srcset
-                        .replace(&patterns_srcset.https_origin, &patterns_srcset.replacement_url)
-                        .replace(&patterns_srcset.http_origin, &patterns_srcset.replacement_url)
-                        .replace(&patterns_srcset.protocol_relative_origin, &patterns_srcset.protocol_relative_replacement)
-                        .replace(&patterns_srcset.origin_host, &patterns_srcset.request_host);
-                    
-                    if new_srcset != srcset {
-                        el.set_attribute("srcset", &new_srcset)?;
-                    }
-                }
-                Ok(())
-            }),
-            // Replace URLs in imagesrcset attributes (for link preload)
-            element!("[imagesrcset]", move |el| {
-                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
-                    let new_imagesrcset = imagesrcset
-                        .replace(&patterns_imagesrcset.https_origin, &patterns_imagesrcset.replacement_url)
-                        .replace(&patterns_imagesrcset.http_origin, &patterns_imagesrcset.replacement_url)
-                        .replace(&patterns_imagesrcset.protocol_relative_origin, &patterns_imagesrcset.protocol_relative_replacement);
-                    if new_imagesrcset != imagesrcset {
-                        el.set_attribute("imagesrcset", &new_imagesrcset)?;
-                    }
-                }
-                Ok(())
-            }),
-            // Detect and inject Prebid config
-            element!("script", move |el| {
-                if let Some(ref script) = prebid_script_1 {
-                    if let Some(src) = el.get_attribute("src") {
-                        if (src.contains("prebid") || src.contains("pbjs"))
-                            && !*config_injected_1.borrow()
-                        {
-                            log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
-                            el.after(script, lol_html::html_content::ContentType::Html);
-                            *config_injected_1.borrow_mut() = true;
-                            *prebid_detected_1.borrow_mut() = true;
-                            log::info!("[Prebid] Injected configuration after Prebid.js script tag");
+            element!("[href]", {
+                let patterns = patterns.clone();
+                move |el| {
+                    if let Some(href) = el.get_attribute("href") {
+                        let new_href = href
+                            .replace(&patterns.https_origin, &patterns.replacement_url)
+                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                        if new_href != href {
+                            el.set_attribute("href", &new_href)?;
                         }
                     }
+                    Ok(())
                 }
-                Ok(())
             }),
-            // Fallback injection in head
-            element!("head", move |el| {
-                if let Some(ref script) = prebid_script_2 {
-                    if *prebid_detected_2.borrow() && !*config_injected_2.borrow() {
-                        log::info!("[Prebid] Injecting configuration in <head> element (fallback)");
-                        el.append(script, lol_html::html_content::ContentType::Html);
-                        *config_injected_2.borrow_mut() = true;
-                    } else if config.enable_prebid && !*prebid_detected_2.borrow() {
-                        log::debug!("[Prebid] No Prebid.js detected in <head>, skipping injection");
+            // Replace URLs in src attributes
+            element!("[src]", {
+                let patterns = patterns.clone();
+                move |el| {
+                    if let Some(src) = el.get_attribute("src") {
+                        let new_src = src
+                            .replace(&patterns.https_origin, &patterns.replacement_url)
+                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                        if new_src != src {
+                            el.set_attribute("src", &new_src)?;
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
+            }),
+            // Replace URLs in action attributes
+            element!("[action]", {
+                let patterns = patterns.clone();
+                move |el| {
+                    if let Some(action) = el.get_attribute("action") {
+                        let new_action = action
+                            .replace(&patterns.https_origin, &patterns.replacement_url)
+                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                        if new_action != action {
+                            el.set_attribute("action", &new_action)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+            // Replace URLs in srcset attributes (for responsive images)
+            element!("[srcset]", {
+                let patterns = patterns.clone();
+                move |el| {
+                    if let Some(srcset) = el.get_attribute("srcset") {
+                        let new_srcset = srcset
+                            .replace(&patterns.https_origin, &patterns.replacement_url)
+                            .replace(&patterns.http_origin, &patterns.replacement_url)
+                            .replace(&patterns.protocol_relative_origin, &patterns.protocol_relative_replacement)
+                            .replace(&patterns.origin_host, &patterns.request_host);
+                        
+                        if new_srcset != srcset {
+                            el.set_attribute("srcset", &new_srcset)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+            // Replace URLs in imagesrcset attributes (for link preload)
+            element!("[imagesrcset]", {
+                let patterns = patterns.clone();
+                move |el| {
+                    if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
+                        let new_imagesrcset = imagesrcset
+                            .replace(&patterns.https_origin, &patterns.replacement_url)
+                            .replace(&patterns.http_origin, &patterns.replacement_url)
+                            .replace(&patterns.protocol_relative_origin, &patterns.protocol_relative_replacement);
+                        if new_imagesrcset != imagesrcset {
+                            el.set_attribute("imagesrcset", &new_imagesrcset)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+            
+            // TODO: IMPROVEMENT #2 - Closure Scoping Pattern
+            // The pattern `element!("sel", { let x = x.clone(); move |el| {...} })`
+            // is repeated for every handler. Consider:
+            // - A macro: `clone_element!("script[src]", prebid, |el, prebid| { ... })`
+            // - Or restructure to use a shared context object that doesn't need cloning
+            
+            // Detect and inject Prebid config for external scripts
+            element!("script[src]", {
+                let prebid = prebid.clone();
+                move |el| {
+                    if let Some(src) = el.get_attribute("src") {
+                        if prebid.detect_in_src(&src) {
+                            log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
+                            prebid.mark_detected(&format!("script[src={}]", src));
+                            prebid.try_inject_after(el, "after Prebid.js script tag");
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+            // Check inline script tags and inject after if Prebid was detected
+            element!("script:not([src])", {
+                let prebid = prebid.clone();
+                move |el| {
+                    prebid.try_inject_append(el, "after inline script (Prebid detected earlier)");
+                    Ok(())
+                }
+            }),
+            // Fallback injection at end of head
+            element!("head", {
+                let prebid = prebid.clone();
+                move |el| {
+                    prebid.try_inject_append(el, "at end of <head> element (fallback)");
+                    Ok(())
+                }
+            }),
+            // Final fallback - inject at end of body if Prebid detected but not injected
+            element!("body", {
+                let prebid = prebid.clone();
+                move |el| {
+                    prebid.try_inject_append(el, "at end of <body> element (final fallback)");
+                    Ok(())
+                }
             }),
         ],
 
         // Replace URLs in text content
-        document_content_handlers: vec![lol_html::doc_text!(move |text| {
-            let content = text.as_str();
+        document_content_handlers: vec![lol_html::doc_text!({
+            let prebid = prebid.clone();
+            move |text| {
+                let content = text.as_str();
 
-            // Detect Prebid.js
-            if enable_prebid
-                && !*prebid_detected_3.borrow()
-                && (content.contains("pbjs") || content.contains("prebid"))
-            {
-                *prebid_detected_3.borrow_mut() = true;
-                log::info!("[Prebid] Detected Prebid.js reference in text content");
-            }
+                // Detect Prebid.js in text content
+                prebid.detect_in_text(content);
 
-            // Apply URL replacements
-            let mut new_content = content.to_string();
-            for replacement in replacer.replacements.iter() {
-                if new_content.contains(&replacement.find) {
-                    new_content = new_content.replace(&replacement.find, &replacement.replace_with);
+                // Apply URL replacements
+                let mut new_content = content.to_string();
+                for replacement in replacer.replacements.iter() {
+                    if new_content.contains(&replacement.find) {
+                        new_content = new_content.replace(&replacement.find, &replacement.replace_with);
+                    }
                 }
-            }
 
-            if new_content != content {
-                text.replace(&new_content, lol_html::html_content::ContentType::Text);
-            }
+                if new_content != content {
+                    text.replace(&new_content, lol_html::html_content::ContentType::Text);
+                }
 
-            Ok(())
+                Ok(())
+            }
         })],
 
         ..RewriterSettings::default()
@@ -451,5 +593,149 @@ mod tests {
         assert!(config.enable_prebid); // Uses default true
         assert_eq!(config.prebid_account_id, "1001"); // Uses default
         assert_eq!(config.prebid_bidders.len(), 4); // Uses default bidders
+    }
+
+    #[test]
+    fn test_prebid_injection_with_inline_script() {
+        let mut config = create_test_config();
+        config.enable_prebid = true;
+        let processor = create_html_processor(config);
+
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html = r#"<html>
+            <head>
+                <script>
+                    var pbjs = pbjs || {};
+                    pbjs.que = pbjs.que || [];
+                    pbjs.que.push(function() {
+                        pbjs.addAdUnits(adUnits);
+                    });
+                </script>
+            </head>
+            <body>Content</body>
+        </html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        // Should detect Prebid in inline script and inject configuration
+        assert!(result.contains("window.__trustedServerPrebid = true"));
+        assert!(result.contains("pbjs.setConfig"));
+        assert!(result.contains("https://test.example.com/openrtb2/auction"));
+    }
+
+    #[test]
+    fn test_prebid_injection_after_inline_script() {
+        let mut config = create_test_config();
+        config.enable_prebid = true;
+        let processor = create_html_processor(config);
+
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        // Put pbjs reference earlier so it's detected before we hit the script element
+        let html = r#"<html>
+            <head>
+                <title>Test with pbjs</title>
+            </head>
+            <body>
+                <script>
+                    // Initialize Prebid.js
+                    window.pbjs = window.pbjs || {};
+                </script>
+                <div>Content after script</div>
+            </body>
+        </html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        
+        // Should inject configuration at body fallback since pbjs was detected
+        assert!(result.contains("window.__trustedServerPrebid = true"));
+        assert!(result.contains("data-trusted-server=\"prebid-config\""));
+    }
+
+    #[test]
+    fn test_prebid_injection_body_fallback() {
+        let mut config = create_test_config();
+        config.enable_prebid = true;
+        let processor = create_html_processor(config);
+
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        // HTML with Prebid reference detected early (in title) but injected at body
+        let html = r#"<html>
+            <head>
+                <title>Page with pbjs</title>
+            </head>
+            <body>
+                <div>Content here</div>
+            </body>
+        </html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        // Should inject configuration somewhere (head or body fallback)
+        assert!(result.contains("window.__trustedServerPrebid = true"));
+        assert!(result.contains("pbjs.setConfig"));
+    }
+
+    #[test]
+    fn test_prebid_not_injected_when_disabled() {
+        let mut config = create_test_config();
+        config.enable_prebid = false; // Explicitly disable
+        let processor = create_html_processor(config);
+
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html = r#"<html>
+            <head>
+                <script src="/prebid.js"></script>
+                <script>
+                    var pbjs = pbjs || {};
+                </script>
+            </head>
+        </html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        // Should NOT inject when disabled
+        assert!(!result.contains("window.__trustedServerPrebid"));
+        assert!(!result.contains("pbjs.setConfig"));
     }
 }
