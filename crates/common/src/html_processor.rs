@@ -323,7 +323,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         if prebid.detect_in_src(&src) {
                             log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
                             prebid.mark_detected(&format!("script[src={}]", src));
-                            prebid.try_inject_after(el, "after Prebid.js script tag");
+                            let injected = prebid.try_inject_after(el, "after Prebid.js script tag");
+                            log::info!("[Prebid] Injection result: {}", if injected { "SUCCESS" } else { "FAILED" });
                         }
                     }
                     Ok(())
@@ -391,15 +392,15 @@ fn generate_prebid_script(config: &HtmlProcessorConfig) -> String {
     let bidders_json =
         serde_json::to_string(&config.prebid_bidders).unwrap_or_else(|_| "[]".to_string());
 
+    // Try a simpler injection first - just a comment and a simple script
     format!(
-        r#"
-<script>
-window.TRUSTED_SERVER_TEST = 'Script is executing';
-console.log('[Trusted Server] Script tag executed');
-try {{
+        r#"<!-- Trusted Server Prebid Config Start -->
+<script type="text/javascript">
+// Trusted Server Prebid Configuration
+window.TRUSTED_SERVER_TEST = 'YES';
+console.log('[TS] Script executing');
 (function() {{
-    'use strict';
-    console.log('[Trusted Server] IIFE started');
+    console.log('[TS] IIFE started');
     
     window.__trustedServerPrebid = true;
     window.pbjs = window.pbjs || {{}};
@@ -449,10 +450,8 @@ try {{
     
     window.pbjs.que.push(configurePrebid);
 }})();
-}} catch(e) {{
-    console.error('[Trusted Server] Script error:', e);
-}}
 </script>
+<!-- Trusted Server Prebid Config End -->
 "#,
         config.prebid_account_id,
         bidders_json,
