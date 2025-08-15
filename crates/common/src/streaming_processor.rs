@@ -171,10 +171,36 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
 
-        let decoder = GzDecoder::new(input);
-        let encoder = GzEncoder::new(output, Compression::default());
-
-        self.process_through_compression(decoder, encoder)
+        // Decompress input
+        let mut decoder = GzDecoder::new(input);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to decompress gzip".to_string(),
+            })?;
+        
+        log::info!("[Gzip] Decompressed size: {} bytes", decompressed.len());
+        
+        // Process the decompressed content
+        let processed = self.processor.process_chunk(&decompressed, true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process content".to_string(),
+            })?;
+        
+        log::info!("[Gzip] Processed size: {} bytes", processed.len());
+        
+        // Recompress the output
+        let mut encoder = GzEncoder::new(output, Compression::default());
+        encoder.write_all(&processed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to write to gzip encoder".to_string(),
+            })?;
+        encoder.finish()
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to finish gzip encoder".to_string(),
+            })?;
+        
+        Ok(())
     }
 
     /// Process deflate compressed stream
@@ -267,6 +293,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         encoder.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush encoder".to_string(),
         })?;
+        
+        // For GzEncoder and similar, we need to finish() to properly close the stream
+        // The flush above might not be enough
+        drop(encoder);
 
         Ok(())
     }
