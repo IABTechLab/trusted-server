@@ -66,12 +66,6 @@ struct PrebidInjector {
     state: Rc<RefCell<PrebidState>>,
 }
 
-// TODO: IMPROVEMENT #3 - PrebidInjector Methods Could Be Simpler
-// The try_inject_after and try_inject_append have similar logic.
-// Consider:
-// - Combine with enum: `try_inject(el, InjectionPosition::After, context)`
-// - Make condition checking more declarative with a `should_inject()` method
-// - Could reduce code duplication and make injection logic clearer
 
 impl PrebidInjector {
     fn new(config: &HtmlProcessorConfig) -> Self {
@@ -103,33 +97,6 @@ impl PrebidInjector {
         }
     }
 
-    fn try_inject_after(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
-        if let Some(ref script) = self.script {
-            let mut state = self.state.borrow_mut();
-            match &*state {
-                PrebidState::NotDetected | PrebidState::Detected { .. } => {
-                    log::info!("[Prebid] Injecting configuration {}", context);
-                    el.after(script, lol_html::html_content::ContentType::Html);
-                    
-                    let location = match &*state {
-                        PrebidState::Detected { location } => location.clone(),
-                        _ => "inline".to_string(),
-                    };
-                    
-                    *state = PrebidState::Injected {
-                        location,
-                        context: context.to_string(),
-                    };
-                    return true;
-                }
-                PrebidState::Injected { .. } => {
-                    // Already injected, do nothing
-                    return false;
-                }
-            }
-        }
-        false
-    }
 
     fn try_inject_append(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
         if let Some(ref script) = self.script {
@@ -313,7 +280,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // - A macro: `clone_element!("script[src]", prebid, |el, prebid| { ... })`
             // - Or restructure to use a shared context object that doesn't need cloning
             
-            // Detect and inject Prebid config for external scripts
+            // Detect Prebid in external scripts (but don't inject here)
             element!("script[src]", {
                 let prebid = prebid.clone();
                 move |el| {
@@ -321,34 +288,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         if prebid.detect_in_src(&src) {
                             log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
                             prebid.mark_detected(&format!("script[src={}]", src));
-                            let injected = prebid.try_inject_after(el, "after Prebid.js script tag");
-                            log::info!("[Prebid] Injection result: {}", if injected { "SUCCESS" } else { "FAILED" });
+                            // Don't inject here - wait for end of body
                         }
                     }
                     Ok(())
                 }
             }),
-            // Check inline script tags and inject after if Prebid was detected
-            element!("script:not([src])", {
-                let prebid = prebid.clone();
-                move |el| {
-                    prebid.try_inject_append(el, "after inline script (Prebid detected earlier)");
-                    Ok(())
-                }
-            }),
-            // Fallback injection at end of head
-            element!("head", {
-                let prebid = prebid.clone();
-                move |el| {
-                    prebid.try_inject_append(el, "at end of <head> element (fallback)");
-                    Ok(())
-                }
-            }),
-            // Final fallback - inject at end of body if Prebid detected but not injected
+            // Always inject at end of body if Prebid was detected
             element!("body", {
                 let prebid = prebid.clone();
                 move |el| {
-                    prebid.try_inject_append(el, "at end of <body> element (final fallback)");
+                    prebid.try_inject_append(el, "at end of <body> element");
                     Ok(())
                 }
             }),
@@ -877,6 +827,54 @@ mod tests {
             "Output should not be shorter than truncated input");
     }
     
+    #[test]
+    fn test_prebid_injection_at_end_of_body() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test</title>
+    <script src="/js/prebid.min.js"></script>
+</head>
+<body>
+    <h1>Test Page</h1>
+    <p>Some content here</p>
+    <div>More content</div>
+</body>
+</html>"#;
+
+        let mut config = create_test_config();
+        config.enable_prebid = true;
+        
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        
+        let mut output = Vec::new();
+        pipeline.process(Cursor::new(html.as_bytes()), &mut output).unwrap();
+        let result = String::from_utf8(output).unwrap();
+        
+        // Find positions
+        let prebid_pos = result.find("window.__trustedServerPrebid").expect("Prebid config should be injected");
+        let body_close_pos = result.find("</body>").expect("Should have closing body tag");
+        let last_div_pos = result.rfind("</div>").expect("Should have closing div tag");
+        
+        // Prebid should be after the last content but before </body>
+        assert!(prebid_pos > last_div_pos, "Prebid should be after the last content div");
+        assert!(prebid_pos < body_close_pos, "Prebid should be before the closing body tag");
+        
+        // Verify the injection location in the HTML structure
+        let _before_prebid = &result[prebid_pos.saturating_sub(50)..prebid_pos];
+        let after_prebid_end = result[prebid_pos..].find("</script>").unwrap() + prebid_pos + 9; // Find end of Prebid script
+        let after_prebid = &result[after_prebid_end..(after_prebid_end + 50).min(result.len())];
+        
+        // Should be right before </body>
+        assert!(after_prebid.contains("</body>"), "Prebid script should be immediately before </body>");
+    }
+
     #[test]
     fn test_truncated_html_validation() {
         // Simulated truncated HTML - ends mid-attribute
