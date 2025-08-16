@@ -47,23 +47,11 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// State machine for tracking Prebid.js detection and injection
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Fields are kept for debugging/logging purposes
-enum PrebidState {
-    /// No Prebid.js detected yet
-    NotDetected,
-    /// Prebid.js detected but config not yet injected
-    Detected { location: String },
-    /// Configuration has been injected
-    Injected { location: String, context: String },
-}
-
-/// Manages Prebid.js detection and configuration injection
+/// Manages Prebid.js configuration injection
 #[derive(Clone)]
 struct PrebidInjector {
     script: Option<String>,
-    state: Rc<RefCell<PrebidState>>,
+    injected: Rc<RefCell<bool>>,
 }
 
 
@@ -79,68 +67,24 @@ impl PrebidInjector {
 
         Self {
             script,
-            state: Rc::new(RefCell::new(PrebidState::NotDetected)),
+            injected: Rc::new(RefCell::new(false)),
         }
     }
-
-    fn is_enabled(&self) -> bool {
-        self.script.is_some()
-    }
-
-    fn mark_detected(&self, location: &str) {
-        let mut state = self.state.borrow_mut();
-        if matches!(*state, PrebidState::NotDetected) {
-            log::info!("[Prebid] Detected Prebid.js reference at: {}", location);
-            *state = PrebidState::Detected {
-                location: location.to_string(),
-            };
-        }
-    }
-
 
     fn try_inject_prepend(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
         if let Some(ref script) = self.script {
-            let mut state = self.state.borrow_mut();
-            match &*state {
-                PrebidState::NotDetected | PrebidState::Detected { .. } => {
-                    log::info!("[Prebid] Injecting configuration {}", context);
-                    el.prepend(script, lol_html::html_content::ContentType::Html);
-                    
-                    let location = match &*state {
-                        PrebidState::Detected { location } => location.clone(),
-                        _ => "auto-inject".to_string(),
-                    };
-                    
-                    *state = PrebidState::Injected {
-                        location,
-                        context: context.to_string(),
-                    };
-                    return true;
-                }
-                PrebidState::Injected { .. } => {
-                    // Already injected, do nothing
-                    return false;
-                }
-            }
-        }
-        false
-    }
-
-    fn detect_in_text(&self, text: &str) -> bool {
-        if self.is_enabled() {
-            let state = self.state.borrow();
-            if matches!(*state, PrebidState::NotDetected) && (text.contains("pbjs") || text.contains("prebid") || text.contains("Prebid")) {
-                drop(state); // Release borrow before calling mark_detected
-                self.mark_detected("text content");
+            let mut injected = self.injected.borrow_mut();
+            if !*injected {
+                // Inject if not already done
+                log::info!("[Prebid] Injecting configuration {}", context);
+                el.prepend(script, lol_html::html_content::ContentType::Html);
+                *injected = true;
                 return true;
             }
         }
         false
     }
 
-    fn detect_in_src(&self, src: &str) -> bool {
-        src.contains("prebid") || src.contains("pbjs")
-    }
 }
 
 /// Create an HTML processor with URL replacement and optional Prebid injection
@@ -293,20 +237,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // - A macro: `clone_element!("script[src]", prebid, |el, prebid| { ... })`
             // - Or restructure to use a shared context object that doesn't need cloning
             
-            // Detect Prebid in external scripts (but don't inject here)
-            element!("script[src]", {
-                let prebid_injector = prebid_injector.clone();
-                move |el| {
-                    if let Some(src) = el.get_attribute("src") {
-                        if prebid_injector.detect_in_src(&src) {
-                            log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
-                            prebid_injector.mark_detected(&format!("script[src={}]", src));
-                            // Don't inject here - wait for head tag
-                        }
-                    }
-                    Ok(())
-                }
-            }),
             // Inject at beginning of head if Prebid was detected
             element!("head", {
                 let prebid_injector = prebid_injector.clone();
@@ -319,12 +249,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
         // Replace URLs in text content
         document_content_handlers: vec![lol_html::doc_text!({
-            let prebid_injector = prebid_injector.clone();
             move |text| {
                 let content = text.as_str();
-
-                // Detect Prebid.js in text content
-                prebid_injector.detect_in_text(content);
 
                 // Apply URL replacements
                 let mut new_content = content.to_string();
@@ -366,6 +292,12 @@ window.pbjs.que = window.pbjs.que || [];
 window.pbjs.que.push(function() {{
     console.log('[Trusted Server] Configuring Prebid.js for first-party serving');
     
+    // Ensure we have the required objects
+    if (typeof pbjs === 'undefined' || !pbjs.setConfig) {{
+        console.error('[Trusted Server] Prebid.js not fully loaded yet');
+        return;
+    }}
+    
     pbjs.setConfig({{
         s2sConfig: {{
             accountId: '{}',
@@ -378,19 +310,36 @@ window.pbjs.que.push(function() {{
             adapter: 'prebidServer',
             allowUnknownBidderCodes: true
         }},
-        debug: {}
+        debug: {},
+        userSync: {{
+            syncEnabled: true,
+            userIds: [],
+            syncsPerBidder: 5,
+            syncDelay: 3000,
+            auctionDelay: 0
+        }}
     }});
     
     // Override setConfig to preserve our endpoints
     var originalSetConfig = pbjs.setConfig;
     pbjs.setConfig = function(config) {{
         if (config.s2sConfig && !config.__trustedServerOverride) {{
+            console.log('[Trusted Server] Preserving first-party s2sConfig endpoints');
             config.s2sConfig.endpoint = '{}://{}/openrtb2/auction';
             config.s2sConfig.syncEndpoint = '{}://{}/cookie_sync';
             config.s2sConfig.enabled = true;
         }}
         return originalSetConfig.call(this, config);
     }};
+    
+    console.log('[Trusted Server] Configuration complete. Current config:', pbjs.getConfig('s2sConfig'));
+    
+    // Check if ad units are defined
+    if (pbjs.adUnits && pbjs.adUnits.length > 0) {{
+        console.log('[Trusted Server] Found ' + pbjs.adUnits.length + ' ad units');
+    }} else {{
+        console.log('[Trusted Server] No ad units defined yet. Prebid will request bids when ad units are added.');
+    }}
 }});
 </script>
 <!-- Trusted Server Prebid Config End -->
