@@ -353,64 +353,45 @@ fn generate_prebid_script(config: &HtmlProcessorConfig) -> String {
     let bidders_json =
         serde_json::to_string(&config.prebid_bidders).unwrap_or_else(|_| "[]".to_string());
 
-    // Try a simpler injection first - just a comment and a simple script
+    // Simplified Prebid configuration using queue mechanism
     format!(
         r#"<!-- Trusted Server Prebid Config Start -->
 <script type="text/javascript">
-// Trusted Server Prebid Configuration
-window.TRUSTED_SERVER_TEST = 'YES';
-console.log('[TS] Script executing');
-(function() {{
-    console.log('[TS] IIFE started');
+// Initialize Prebid queue
+window.__trustedServerPrebid = true;
+window.pbjs = window.pbjs || {{}};
+window.pbjs.que = window.pbjs.que || [];
+
+// Queue the configuration
+window.pbjs.que.push(function() {{
+    console.log('[Trusted Server] Configuring Prebid.js for first-party serving');
     
-    window.__trustedServerPrebid = true;
-    window.pbjs = window.pbjs || {{}};
-    window.pbjs.que = window.pbjs.que || [];
+    pbjs.setConfig({{
+        s2sConfig: {{
+            accountId: '{}',
+            enabled: true,
+            defaultVendor: 'custom',
+            bidders: {},
+            endpoint: '{}://{}/openrtb2/auction',
+            syncEndpoint: '{}://{}/cookie_sync',
+            timeout: {},
+            adapter: 'prebidServer',
+            allowUnknownBidderCodes: true
+        }},
+        debug: {}
+    }});
     
-    function configurePrebid() {{
-        if (typeof pbjs !== 'undefined' && typeof pbjs.setConfig === 'function') {{
-            console.log('[Trusted Server] Configuring Prebid.js for first-party serving');
-            
-            pbjs.setConfig({{
-                s2sConfig: {{
-                    accountId: '{}',
-                    enabled: true,
-                    defaultVendor: 'custom',
-                    bidders: {},
-                    endpoint: '{}://{}/openrtb2/auction',
-                    syncEndpoint: '{}://{}/cookie_sync',
-                    timeout: {},
-                    adapter: 'prebidServer',
-                    allowUnknownBidderCodes: true
-                }},
-                debug: {}
-            }});
-            
-            var originalSetConfig = pbjs.setConfig;
-            pbjs.setConfig = function(config) {{
-                if (config.s2sConfig && !config.__trustedServerOverride) {{
-                    console.log('[Trusted Server] Preserving first-party s2sConfig endpoints');
-                    config.s2sConfig.endpoint = '{}://{}/openrtb2/auction';
-                    config.s2sConfig.syncEndpoint = '{}://{}/cookie_sync';
-                    config.s2sConfig.enabled = true;
-                }}
-                return originalSetConfig.call(this, config);
-            }};
-            
-            console.log('[Trusted Server] Prebid.js configuration complete');
-        }} else {{
-            setTimeout(configurePrebid, 100);
+    // Override setConfig to preserve our endpoints
+    var originalSetConfig = pbjs.setConfig;
+    pbjs.setConfig = function(config) {{
+        if (config.s2sConfig && !config.__trustedServerOverride) {{
+            config.s2sConfig.endpoint = '{}://{}/openrtb2/auction';
+            config.s2sConfig.syncEndpoint = '{}://{}/cookie_sync';
+            config.s2sConfig.enabled = true;
         }}
-    }}
-    
-    if (document.readyState === 'loading') {{
-        document.addEventListener('DOMContentLoaded', configurePrebid);
-    }} else {{
-        configurePrebid();
-    }}
-    
-    window.pbjs.que.push(configurePrebid);
-}})();
+        return originalSetConfig.call(this, config);
+    }};
+}});
 </script>
 <!-- Trusted Server Prebid Config End -->
 "#,
@@ -639,9 +620,8 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         
-        // Should inject configuration at body fallback since pbjs was detected
+        // Should inject configuration at head since we now inject there
         assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("window.TRUSTED_SERVER_TEST = 'YES'"));
     }
 
     #[test]
