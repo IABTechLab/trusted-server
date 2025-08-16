@@ -325,7 +325,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
         self.accumulated_input.extend_from_slice(chunk);
         
         // Log accumulation progress
-        if chunk.len() > 0 {
+        if !chunk.is_empty() {
             log::debug!("[HtmlRewriter] Accumulated {} bytes, total: {} bytes", 
                 chunk.len(), self.accumulated_input.len());
         }
