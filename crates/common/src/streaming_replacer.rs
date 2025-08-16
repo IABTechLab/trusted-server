@@ -3,7 +3,8 @@
 //! This module provides functionality for replacing patterns in content
 //! in streaming fashion, handling content that may be split across multiple chunks.
 
-use std::io::{self, Read, Write};
+// Note: std::io::{Read, Write} were previously used by stream_process function
+// which has been removed in favor of StreamingPipeline
 
 /// A replacement pattern configuration
 #[derive(Debug, Clone)]
@@ -17,7 +18,7 @@ pub struct Replacement {
 /// A generic streaming replacer that processes content in chunks
 pub struct StreamingReplacer {
     /// List of replacements to apply
-    replacements: Vec<Replacement>,
+    pub replacements: Vec<Replacement>,
     // Buffer to handle partial matches at chunk boundaries
     overlap_buffer: Vec<u8>,
     // Maximum pattern length to determine overlap size
@@ -144,52 +145,9 @@ impl StreamingReplacer {
     }
 }
 
-/// Process a stream through a StreamingReplacer
-///
-/// This function reads from a source, processes chunks through the replacer,
-/// and writes the results to the output.
-///
-/// # Arguments
-///
-/// * `reader` - The input stream to read from
-/// * `writer` - The output stream to write to
-/// * `replacer` - The streaming replacer to use for processing
-/// * `chunk_size` - The size of chunks to read at a time
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success, or an `io::Error` if reading/writing fails.
-pub fn stream_process<R: Read, W: Write>(
-    mut reader: R,
-    writer: &mut W,
-    replacer: &mut StreamingReplacer,
-    chunk_size: usize,
-) -> io::Result<()> {
-    let mut buffer = vec![0u8; chunk_size];
-
-    loop {
-        match reader.read(&mut buffer)? {
-            0 => {
-                // End of stream - process any remaining data
-                let final_chunk = replacer.process_chunk(&[], true);
-                if !final_chunk.is_empty() {
-                    writer.write_all(&final_chunk)?;
-                }
-                break;
-            }
-            n => {
-                // Process this chunk
-                let processed = replacer.process_chunk(&buffer[..n], false);
-                if !processed.is_empty() {
-                    writer.write_all(&processed)?;
-                }
-            }
-        }
-    }
-
-    writer.flush()?;
-    Ok(())
-}
+// Note: The stream_process function has been removed in favor of using
+// StreamingPipeline from the streaming_processor module, which provides
+// a more comprehensive solution with compression support.
 
 /// Helper function to create a StreamingReplacer for URL replacements
 pub fn create_url_replacer(
@@ -248,27 +206,8 @@ mod tests {
         assert_eq!(result, "Visit https://test.example.com for more info");
     }
 
-    #[test]
-    fn test_multiple_replacements() {
-        let replacements = vec![
-            Replacement {
-                find: "foo".to_string(),
-                replace_with: "bar".to_string(),
-            },
-            Replacement {
-                find: "hello".to_string(),
-                replace_with: "hi".to_string(),
-            },
-        ];
-
-        let mut replacer = StreamingReplacer::new(replacements);
-
-        let input = b"hello world, foo is foo";
-        let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
-
-        assert_eq!(result, "hi world, bar is bar");
-    }
+    // Note: test_multiple_replacements removed as it's redundant with test_stream_process
+    // which tests the same functionality through StreamingPipeline
 
     #[test]
     fn test_streaming_replacer_chunks() {
@@ -650,6 +589,7 @@ mod tests {
 
     #[test]
     fn test_stream_process() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
 
         let replacements = vec![
@@ -663,17 +603,20 @@ mod tests {
             },
         ];
 
-        let mut replacer = StreamingReplacer::new(replacements);
+        let replacer = StreamingReplacer::new(replacements);
         let input = "hello world, foo is foo";
         let mut output = Vec::new();
 
-        stream_process(
-            Cursor::new(input.as_bytes()),
-            &mut output,
-            &mut replacer,
-            50, // Use larger chunk size to ensure patterns aren't split
-        )
-        .unwrap();
+        let config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 50, // Use larger chunk size to ensure patterns aren't split
+        };
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+
+        pipeline
+            .process(Cursor::new(input.as_bytes()), &mut output)
+            .unwrap();
 
         let result = String::from_utf8(output).unwrap();
         assert_eq!(result, "hi world, bar is bar");
@@ -681,9 +624,10 @@ mod tests {
 
     #[test]
     fn test_stream_process_large_content() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
 
-        let mut replacer = StreamingReplacer::new_single("OLD", "NEW");
+        let replacer = StreamingReplacer::new_single("OLD", "NEW");
 
         // Create large content with repeated patterns
         let input = "OLD content ".repeat(1000);
@@ -691,13 +635,16 @@ mod tests {
 
         let mut output = Vec::new();
 
-        stream_process(
-            Cursor::new(input.as_bytes()),
-            &mut output,
-            &mut replacer,
-            1024, // 1KB chunks
-        )
-        .unwrap();
+        let config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 1024, // 1KB chunks
+        };
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+
+        pipeline
+            .process(Cursor::new(input.as_bytes()), &mut output)
+            .unwrap();
 
         let result = String::from_utf8(output).unwrap();
         assert_eq!(result, expected);
@@ -705,28 +652,46 @@ mod tests {
 
     #[test]
     fn test_stream_process_empty_input() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
 
-        let mut replacer = StreamingReplacer::new_single("foo", "bar");
+        let replacer = StreamingReplacer::new_single("foo", "bar");
         let mut output = Vec::new();
 
-        stream_process(Cursor::new(b""), &mut output, &mut replacer, 8192).unwrap();
+        let config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+
+        pipeline.process(Cursor::new(b""), &mut output).unwrap();
 
         assert!(output.is_empty());
     }
 
     #[test]
     fn test_stream_process_pattern_split_across_chunks() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
 
-        let mut replacer = StreamingReplacer::new_single("hello", "hi");
+        let replacer = StreamingReplacer::new_single("hello", "hi");
 
         let input = "hello world";
         let mut output = Vec::new();
 
         // Use a chunk size that will split "hello" across chunks
         // With chunk size 3, we get: "hel", "lo ", "wor", "ld"
-        stream_process(Cursor::new(input.as_bytes()), &mut output, &mut replacer, 3).unwrap();
+        let config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 3,
+        };
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+
+        pipeline
+            .process(Cursor::new(input.as_bytes()), &mut output)
+            .unwrap();
 
         let result = String::from_utf8(output).unwrap();
         assert_eq!(result, "hi world");

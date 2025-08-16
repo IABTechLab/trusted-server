@@ -55,6 +55,37 @@ impl Publisher {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Prebid {
     pub server_url: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u32,
+    #[serde(default = "default_bidders")]
+    pub bidders: Vec<String>,
+    #[serde(default = "default_auto_configure")]
+    pub auto_configure: bool,
+    #[serde(default)]
+    pub debug: bool,
+}
+
+fn default_account_id() -> String {
+    "1001".to_string()
+}
+
+fn default_timeout_ms() -> u32 {
+    1000
+}
+
+fn default_bidders() -> Vec<String> {
+    vec![
+        "kargo".to_string(),
+        "rubicon".to_string(),
+        "appnexus".to_string(),
+        "openx".to_string(),
+    ]
+}
+
+fn default_auto_configure() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
