@@ -98,21 +98,27 @@ impl PrebidInjector {
     }
 
 
-    fn try_inject_append(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
+    fn try_inject_prepend(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
         if let Some(ref script) = self.script {
             let mut state = self.state.borrow_mut();
             match &*state {
-                PrebidState::Detected { location } => {
+                PrebidState::NotDetected | PrebidState::Detected { .. } => {
                     log::info!("[Prebid] Injecting configuration {}", context);
-                    el.append(script, lol_html::html_content::ContentType::Html);
+                    el.prepend(script, lol_html::html_content::ContentType::Html);
+                    
+                    let location = match &*state {
+                        PrebidState::Detected { location } => location.clone(),
+                        _ => "auto-inject".to_string(),
+                    };
+                    
                     *state = PrebidState::Injected {
-                        location: location.clone(),
+                        location,
                         context: context.to_string(),
                     };
                     return true;
                 }
-                _ => {
-                    // Not in the right state for append injection
+                PrebidState::Injected { .. } => {
+                    // Already injected, do nothing
                     return false;
                 }
             }
@@ -140,32 +146,39 @@ impl PrebidInjector {
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
 
-    // TODO: IMPROVEMENT #4 - URL Patterns Structure
-    // The UrlPatterns struct has redundant data (origins in multiple formats).
-    // Consider:
-    // - Generate variants on-demand with methods like `https_origin(&self)`
-    // - Or use a builder that constructs patterns as needed
-    // - Could reduce from 7 fields to 3-4 core fields
-    
-    // Create a shared structure for URL replacement patterns
+    // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
-        https_origin: String,
-        http_origin: String,
-        protocol_relative_origin: String,
         origin_host: String,
-        replacement_url: String,
-        protocol_relative_replacement: String,
         request_host: String,
+        request_scheme: String,
+    }
+
+    impl UrlPatterns {
+        fn https_origin(&self) -> String {
+            format!("https://{}", self.origin_host)
+        }
+        
+        fn http_origin(&self) -> String {
+            format!("http://{}", self.origin_host)
+        }
+        
+        fn protocol_relative_origin(&self) -> String {
+            format!("//{}", self.origin_host)
+        }
+        
+        fn replacement_url(&self) -> String {
+            format!("{}://{}", self.request_scheme, self.request_host)
+        }
+        
+        fn protocol_relative_replacement(&self) -> String {
+            format!("//{}", self.request_host)
+        }
     }
 
     let patterns = Rc::new(UrlPatterns {
-        https_origin: format!("https://{}", config.origin_host),
-        http_origin: format!("http://{}", config.origin_host),
-        protocol_relative_origin: format!("//{}", config.origin_host),
         origin_host: config.origin_host.clone(),
-        replacement_url: format!("{}://{}", config.request_scheme, config.request_host),
-        protocol_relative_replacement: format!("//{}", config.request_host),
         request_host: config.request_host.clone(),
+        request_scheme: config.request_scheme.clone(),
     });
 
     // Create URL replacer
@@ -177,7 +190,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     );
 
     // Create Prebid injector wrapped in Rc for sharing
-    let prebid = Rc::new(PrebidInjector::new(&config));
+    let prebid_injector = Rc::new(PrebidInjector::new(&config));
 
     // TODO: IMPROVEMENT #5 - Element Handler Registration
     // The long vector of element handlers could be built more dynamically:
@@ -200,8 +213,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(href) = el.get_attribute("href") {
                         let new_href = href
-                            .replace(&patterns.https_origin, &patterns.replacement_url)
-                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_href != href {
                             el.set_attribute("href", &new_href)?;
                         }
@@ -215,8 +228,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
                         let new_src = src
-                            .replace(&patterns.https_origin, &patterns.replacement_url)
-                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_src != src {
                             el.set_attribute("src", &new_src)?;
                         }
@@ -230,8 +243,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(action) = el.get_attribute("action") {
                         let new_action = action
-                            .replace(&patterns.https_origin, &patterns.replacement_url)
-                            .replace(&patterns.http_origin, &patterns.replacement_url);
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_action != action {
                             el.set_attribute("action", &new_action)?;
                         }
@@ -245,9 +258,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(srcset) = el.get_attribute("srcset") {
                         let new_srcset = srcset
-                            .replace(&patterns.https_origin, &patterns.replacement_url)
-                            .replace(&patterns.http_origin, &patterns.replacement_url)
-                            .replace(&patterns.protocol_relative_origin, &patterns.protocol_relative_replacement)
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url())
+                            .replace(&patterns.protocol_relative_origin(), &patterns.protocol_relative_replacement())
                             .replace(&patterns.origin_host, &patterns.request_host);
                         
                         if new_srcset != srcset {
@@ -263,9 +276,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
                         let new_imagesrcset = imagesrcset
-                            .replace(&patterns.https_origin, &patterns.replacement_url)
-                            .replace(&patterns.http_origin, &patterns.replacement_url)
-                            .replace(&patterns.protocol_relative_origin, &patterns.protocol_relative_replacement);
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url())
+                            .replace(&patterns.protocol_relative_origin(), &patterns.protocol_relative_replacement());
                         if new_imagesrcset != imagesrcset {
                             el.set_attribute("imagesrcset", &new_imagesrcset)?;
                         }
@@ -282,23 +295,23 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             
             // Detect Prebid in external scripts (but don't inject here)
             element!("script[src]", {
-                let prebid = prebid.clone();
+                let prebid_injector = prebid_injector.clone();
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
-                        if prebid.detect_in_src(&src) {
+                        if prebid_injector.detect_in_src(&src) {
                             log::info!("[Prebid] Detected Prebid.js script tag: src={}", src);
-                            prebid.mark_detected(&format!("script[src={}]", src));
-                            // Don't inject here - wait for end of body
+                            prebid_injector.mark_detected(&format!("script[src={}]", src));
+                            // Don't inject here - wait for head tag
                         }
                     }
                     Ok(())
                 }
             }),
-            // Always inject at end of body if Prebid was detected
-            element!("body", {
-                let prebid = prebid.clone();
+            // Inject at beginning of head if Prebid was detected
+            element!("head", {
+                let prebid_injector = prebid_injector.clone();
                 move |el| {
-                    prebid.try_inject_append(el, "at end of <body> element");
+                    prebid_injector.try_inject_prepend(el, "at beginning of <head> element");
                     Ok(())
                 }
             }),
@@ -306,12 +319,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
         // Replace URLs in text content
         document_content_handlers: vec![lol_html::doc_text!({
-            let prebid = prebid.clone();
+            let prebid_injector = prebid_injector.clone();
             move |text| {
                 let content = text.as_str();
 
                 // Detect Prebid.js in text content
-                prebid.detect_in_text(content);
+                prebid_injector.detect_in_text(content);
 
                 // Apply URL replacements
                 let mut new_content = content.to_string();
@@ -710,10 +723,10 @@ mod tests {
         println!("  Remaining original URLs: {}", remaining_urls);
         println!("  Edge domain URLs: {}", replaced_urls);
         
-        // Most URLs should be replaced, except those in script/JSON-LD contexts
-        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced (in script/JSON-LD): found {}", remaining_urls);
-        // Should have replacements + 4 from Prebid config (852 replaced + 4 = 856)
-        assert_eq!(replaced_urls, 856, "Should have exactly 856 edge domain URLs (852 replaced + 4 from Prebid)");
+        // Most URLs should be replaced
+        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced: found {}", remaining_urls);
+        // Should have replacements + 4 from Prebid config (855 replaced + 4 = 859)
+        assert_eq!(replaced_urls, 859, "Should have exactly 859 edge domain URLs (855 replaced + 4 from Prebid)");
         
         // Verify HTML structure
         assert_eq!(&result[0..15], "<!DOCTYPE html>");
@@ -778,8 +791,8 @@ mod tests {
         let remaining_urls = decompressed.matches("www.test-publisher.com").count();
         let replaced_urls = decompressed.matches("test-publisher-ts.edgecompute.app").count();
         
-        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced (in script/JSON-LD)");
-        assert_eq!(replaced_urls, 856, "Should have exactly 856 edge domain URLs (852 replaced + 4 from Prebid)");
+        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced");
+        assert_eq!(replaced_urls, 859, "Should have exactly 859 edge domain URLs (855 replaced + 4 from Prebid)");
         
         // Verify structure
         assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
@@ -828,7 +841,7 @@ mod tests {
     }
     
     #[test]
-    fn test_prebid_injection_at_end_of_body() {
+    fn test_prebid_injection_at_beginning_of_head() {
         let html = r#"<!DOCTYPE html>
 <html>
 <head>
@@ -858,21 +871,20 @@ mod tests {
         let result = String::from_utf8(output).unwrap();
         
         // Find positions
+        let head_open_pos = result.find("<head>").expect("Should have opening head tag") + 6;
         let prebid_pos = result.find("window.__trustedServerPrebid").expect("Prebid config should be injected");
-        let body_close_pos = result.find("</body>").expect("Should have closing body tag");
-        let last_div_pos = result.rfind("</div>").expect("Should have closing div tag");
+        let title_pos = result.find("<title>").expect("Should have title tag");
+        let prebid_js_pos = result.find("src=\"/js/prebid.min.js\"").expect("Should have prebid.min.js script");
         
-        // Prebid should be after the last content but before </body>
-        assert!(prebid_pos > last_div_pos, "Prebid should be after the last content div");
-        assert!(prebid_pos < body_close_pos, "Prebid should be before the closing body tag");
+        // Prebid config should be after <head> opens but before other head content
+        assert!(prebid_pos > head_open_pos, "Prebid should be after head opening tag");
+        assert!(prebid_pos < title_pos, "Prebid should be before the title tag");
+        assert!(prebid_pos < prebid_js_pos, "Prebid config should be before prebid.min.js loads");
         
-        // Verify the injection location in the HTML structure
-        let _before_prebid = &result[prebid_pos.saturating_sub(50)..prebid_pos];
-        let after_prebid_end = result[prebid_pos..].find("</script>").unwrap() + prebid_pos + 9; // Find end of Prebid script
-        let after_prebid = &result[after_prebid_end..(after_prebid_end + 50).min(result.len())];
-        
-        // Should be right before </body>
-        assert!(after_prebid.contains("</body>"), "Prebid script should be immediately before </body>");
+        // Verify it's at the beginning of head
+        let head_content_start = &result[head_open_pos..head_open_pos + 100];
+        assert!(head_content_start.contains("<!-- Trusted Server Prebid Config Start -->"), 
+            "Prebid config should be at the beginning of head");
     }
 
     #[test]
