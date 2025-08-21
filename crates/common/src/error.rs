@@ -61,7 +61,7 @@ pub enum TrustedServerError {
 
     /// Fastly platform error.
     #[display("Fastly error: {message}")]
-    FastlyError { message: String },    
+    FastlyError { message: String },
 }
 
 impl Error for TrustedServerError {}

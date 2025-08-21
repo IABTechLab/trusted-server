@@ -7,6 +7,7 @@ use crate::error::to_error_response;
 
 use trusted_server_common::advertiser::handle_ad_request;
 use trusted_server_common::constants::HEADER_X_COMPRESS_HINT;
+use trusted_server_common::didomi::DidomiProxy;
 use trusted_server_common::gam::{
     handle_gam_asset, handle_gam_custom_url, handle_gam_golden_url, handle_gam_render,
     handle_gam_test, is_gam_asset_path,
@@ -20,8 +21,6 @@ use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 use trusted_server_common::templates::GAM_TEST_TEMPLATE;
 use trusted_server_common::why::handle_why_trusted_server;
-use trusted_server_common::didomi::DidomiProxy;
-
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
