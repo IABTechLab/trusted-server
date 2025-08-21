@@ -3,20 +3,46 @@
 
 authors = ["jason@stackpop.com"]
 cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
-description = "Trusted Server"
+description = "EdgePubs - Trusted Server"
 language = "rust"
 manifest_version = 3
 name = "trusted-server-fastly"
+service_id = "dysUw6h73VzeomD61eal85"
 
 [scripts]
 build = """
     cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always
 """
 
+# Production Backends for Partner Asset Serving (like auburndao.com)
+[backends]
+    
+    [backends.tpc_googlesyndication_backend]
+        url = "https://tpc.googlesyndication.com"
+        
+    [backends.GAM_javascript_backend]
+        url = "https://pagead2.googlesyndication.com"
+        
+    [backends.GTS_services_backend]
+        url = "https://googletagservices.com"
+        
+    [backends.pagead2_googlesyndication_backend]
+        url = "https://googlesyndication.com"
+        
+    [backends.equativ_sascdn_backend]
+        url = "https://creatives.sascdn.com"
+        
+    [backends.googleads_doubleclick_backend]
+        url = "https://securepubads.g.doubleclick.net"
+
 [local_server]
+    address = "127.0.0.1:7676"
+    tls_cert_path = "./localhost+2.pem"
+    tls_key_path = "./localhost+2-key.pem"
+    
     [local_server.backends]
 
-        [local_server.backends.ad_partner_backend]
+        [local_server.backends.equativ_ad_api_2]
             url = "https://adapi-srv-eu.smartadserver.com"
         [local_server.backends.prebid_backend]
             url = "http://68.183.113.79:8000"
@@ -24,10 +50,29 @@ build = """
             url = "https://securepubads.g.doubleclick.net"
         [local_server.backends.wordpress_backend]
             url = "http://localhost:8080"  # Adjust this to your local WordPress URL
+
+        [local_server.backends.edgepubs_main_be]
+            url = "https://api.edgepubs.com"  # EdgePubs API backend (update when you provide the real backend URL)
+        
+        # Partner Asset Backends (matching auburndao.com approach)
+        [local_server.backends.tpc_googlesyndication_backend]
+            url = "https://tpc.googlesyndication.com"
+        [local_server.backends.GAM_javascript_backend]
+            url = "https://pagead2.googlesyndication.com"
+        [local_server.backends.GTS_services_backend]
+            url = "https://googletagservices.com"
+        [local_server.backends.pagead2_googlesyndication_backend]
+            url = "https://googlesyndication.com"
+        [local_server.backends.equativ_sascdn_backend]
+            url = "https://creatives.sascdn.com"
+        [local_server.backends.googleads_doubleclick_backend]
+            url = "https://securepubads.g.doubleclick.net"
+
+        # Didomi CMP BAckends
         [local_server.backends.didomi_sdk]
             url = "https://sdk.privacy-center.org"
         [local_server.backends.didomi_api]
-            url = "https://api.privacy-center.org"
+            url = "https://api.privacy-center.org"            
 
 
     [local_server.kv_stores]

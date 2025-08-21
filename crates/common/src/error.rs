@@ -38,6 +38,7 @@ pub enum TrustedServerError {
     /// GAM (Google Ad Manager) integration error.
     #[display("GAM error: {message}")]
     Gam { message: String },
+
     /// GDPR consent handling error.
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
