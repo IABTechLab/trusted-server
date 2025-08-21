@@ -50,6 +50,7 @@ build = """
             url = "https://securepubads.g.doubleclick.net"
         [local_server.backends.wordpress_backend]
             url = "http://localhost:8080"  # Adjust this to your local WordPress URL
+
         [local_server.backends.edgepubs_main_be]
             url = "https://api.edgepubs.com"  # EdgePubs API backend (update when you provide the real backend URL)
         
@@ -66,6 +67,12 @@ build = """
             url = "https://creatives.sascdn.com"
         [local_server.backends.googleads_doubleclick_backend]
             url = "https://securepubads.g.doubleclick.net"
+
+        # Didomi CMP BAckends
+        [local_server.backends.didomi_sdk]
+            url = "https://sdk.privacy-center.org"
+        [local_server.backends.didomi_api]
+            url = "https://api.privacy-center.org"            
 
 
     [local_server.kv_stores]

@@ -7,6 +7,7 @@ use crate::error::to_error_response;
 
 use trusted_server_common::advertiser::handle_ad_request;
 use trusted_server_common::constants::HEADER_X_COMPRESS_HINT;
+use trusted_server_common::didomi::DidomiProxy;
 use trusted_server_common::gam::{
     handle_gam_asset, handle_gam_custom_url, handle_gam_golden_url, handle_gam_render,
     handle_gam_test, is_gam_asset_path,
@@ -73,6 +74,11 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         }
         (&Method::GET, "/privacy-policy") => handle_privacy_policy(&settings, req),
         (&Method::GET, "/why-trusted-server") => handle_why_trusted_server(&settings, req),
+
+        // Didomi CMP routes
+        (_, path) if path.starts_with("/consent/") => {
+            DidomiProxy::handle_consent_request(&settings, req).await
+        }
 
         // Catch-all 404 handler
         _ => return Ok(not_found_response()),

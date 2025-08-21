@@ -23,6 +23,7 @@
 pub mod advertiser;
 pub mod constants;
 pub mod cookies;
+pub mod didomi;
 pub mod error;
 pub mod gam;
 pub mod gdpr;
