@@ -1,4 +1,5 @@
 use crate::gdpr::get_consent_from_request;
+use crate::partners::PartnerManager;
 use crate::settings::Settings;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
@@ -57,61 +58,46 @@ impl GamRequest {
         self
     }
 
-    /// Build the GAM request URL for the "Golden URL" replay phase
+    /// Build the GAM request URL - simplified traditional format
     pub fn build_golden_url(&self) -> String {
-        // This will be replaced with the actual captured URL from autoblog.com
-        // For now, using a template based on the captured Golden URL
+        // Using simplified traditional GAM ad request format (not SRA)
         let mut params = HashMap::new();
 
-        // Core GAM parameters (based on captured URL)
-        params.insert("pvsid".to_string(), "3290837576990024".to_string()); // Publisher Viewability ID
-        params.insert("correlator".to_string(), self.correlator.clone());
-        params.insert(
-            "eid".to_string(),
-            "31086815,31093089,95353385,31085777,83321072".to_string(),
-        ); // Event IDs
-        params.insert("output".to_string(), "ldjh".to_string()); // Important: not 'json'
-        params.insert("gdfp_req".to_string(), "1".to_string());
-        params.insert("vrg".to_string(), "202506170101".to_string()); // Version/Region
-        params.insert("ptt".to_string(), "17".to_string()); // Page Type
-        params.insert("impl".to_string(), "fifs".to_string()); // Implementation
-
-        // Ad unit parameters (simplified version of captured format)
-        params.insert(
-            "iu_parts".to_string(),
-            format!("{},{},homepage", self.publisher_id, "trustedserver"),
-        );
-        params.insert(
-            "enc_prev_ius".to_string(),
-            "/0/1/2,/0/1/2,/0/1/2".to_string(),
-        );
-        params.insert("prev_iu_szs".to_string(), "320x50|300x250|728x90|970x90|970x250|1x2,320x50|300x250|728x90|970x90|970x250|1x2,320x50|300x250|728x90|970x90|970x250|1x2".to_string());
-        params.insert("fluid".to_string(), "height,height,height".to_string());
-
-        // Browser context (simplified)
-        params.insert("biw".to_string(), "1512".to_string());
-        params.insert("bih".to_string(), "345".to_string());
-        params.insert("u_tz".to_string(), "-300".to_string());
-        params.insert("u_cd".to_string(), "30".to_string());
-        params.insert("u_sd".to_string(), "2".to_string());
-
+        // Basic GAM ad request parameters
+        params.insert("iu".to_string(), format!("/{}/autoblog/reviews", self.publisher_id));
+        params.insert("sz".to_string(), "728x90|300x250".to_string()); // Multiple sizes
+        params.insert("c".to_string(), self.correlator.clone());
+        
+        // Output format
+        params.insert("output".to_string(), "html".to_string()); // Standard HTML output
+        params.insert("impl".to_string(), "s".to_string()); // Standard implementation
+        
         // Page context
-        params.insert("url".to_string(), self.page_url.clone());
-        params.insert(
-            "dt".to_string(),
-            chrono::Utc::now().timestamp_millis().to_string(),
-        );
+        params.insert("url".to_string(), urlencoding::encode("https://www.autoblog.com/reviews/test").to_string());
+        params.insert("ref".to_string(), urlencoding::encode("https://www.autoblog.com/").to_string());
+        
+        // Basic targeting - URL encoded
+        let cust_params = if let Some(ref prmtvctx) = self.prmtvctx {
+            format!("channel=web&cv=lifestyle&lang=en&pagetype=photo-gallery-article&permutive={}", prmtvctx)
+        } else {
+            "channel=web&cv=lifestyle&lang=en&pagetype=photo-gallery-article".to_string()
+        };
+        params.insert("cust_params".to_string(), urlencoding::encode(&cust_params).to_string());
 
-        // Add Permutive context if available (in cust_params like the captured URL)
-        if let Some(ref prmtvctx) = self.prmtvctx {
-            let cust_params = format!("permutive={}&puid={}", prmtvctx, self.synthetic_id);
-            params.insert("cust_params".to_string(), cust_params);
-        }
+        // Publisher Provided ID
+        params.insert("ppid".to_string(), format!("arenaGroup-{}", self.synthetic_id));
+        
+        // Timestamps
+        params.insert("dt".to_string(), chrono::Utc::now().timestamp_millis().to_string());
+        
+        // Browser hints (minimal)
+        params.insert("biw".to_string(), "1024".to_string());
+        params.insert("bih".to_string(), "768".to_string());
 
         // Build query string
         let query_string = params
             .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
             .join("&");
 
@@ -300,9 +286,30 @@ pub async fn handle_gam_test(settings: &Settings, req: Request) -> Result<Respon
     );
 
     match gam_req_with_context.send_request(settings).await {
-        Ok(response) => {
+        Ok(mut response) => {
             log::info!("GAM request successful");
-            Ok(response)
+            
+            // Apply domain rewriting to the response body
+            let partner_manager = PartnerManager::from_settings(settings);
+            let original_body = response.take_body_str();
+            let rewritten_body = partner_manager.rewrite_content(&original_body);
+            
+            if original_body != rewritten_body {
+                log::info!("Applied domain rewriting to GAM response (changed {} to {} chars)", 
+                          original_body.len(), rewritten_body.len());
+            } else {
+                log::debug!("No domain rewriting needed for GAM response");
+            }
+            
+            Ok(Response::from_status(response.get_status())
+                .with_header(header::CONTENT_TYPE, response.get_header(header::CONTENT_TYPE).unwrap_or(&header::HeaderValue::from_static("text/plain")))
+                .with_header(header::CACHE_CONTROL, "no-store, private")
+                .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .with_header("X-GAM-Test", "true")
+                .with_header("X-Synthetic-ID", &gam_req_with_context.synthetic_id)
+                .with_header("X-Correlator", &gam_req_with_context.correlator)
+                .with_header("x-compress-hint", "on")
+                .with_body(rewritten_body))
         }
         Err(e) => {
             log::error!("GAM request failed: {:?}", e);

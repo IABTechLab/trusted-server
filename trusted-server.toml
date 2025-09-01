@@ -43,7 +43,17 @@ domains_to_proxy = [
     "securepubads.g.doubleclick.net",
     "tpc.googlesyndication.com",
     "googletagservices.com",
-    "googlesyndication.com"
+    "googlesyndication.com",
+    "googleads.g.doubleclick.net",
+    "stats.g.doubleclick.net",
+    "cm.g.doubleclick.net",
+    "ad.doubleclick.net",
+    "pagead2.googlesyndication.com",
+    "safeframe.googlesyndication.com",
+    "ep1.adtrafficquality.google",
+    "ep2.adtrafficquality.google", 
+    "ep3.adtrafficquality.google",
+    "adtrafficquality.google"
 ]
 proxy_domain = "www.edgepubs.com"
 backend_name = "gam_proxy_backend"
