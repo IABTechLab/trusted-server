@@ -34,6 +34,18 @@ build = """
         
     [backends.googleads_doubleclick_backend]
         url = "https://securepubads.g.doubleclick.net"
+        
+    [backends.adtraffic_backend]
+        url = "https://ep1.adtrafficquality.google"
+        
+    [backends.safeframe_backend]
+        url = "https://safeframe.googlesyndication.com"
+        
+    [backends.adtraffic_ep2_backend]
+        url = "https://ep2.adtrafficquality.google"
+        
+    [backends.adtraffic_ep3_backend]
+        url = "https://ep3.adtrafficquality.google"
 
 [local_server]
     address = "127.0.0.1:7676"
@@ -66,6 +78,18 @@ build = """
             url = "https://creatives.sascdn.com"
         [local_server.backends.googleads_doubleclick_backend]
             url = "https://securepubads.g.doubleclick.net"
+            
+        [local_server.backends.adtraffic_backend]
+            url = "https://ep1.adtrafficquality.google"
+            
+        [local_server.backends.safeframe_backend]
+            url = "https://safeframe.googlesyndication.com"
+            
+        [local_server.backends.adtraffic_ep2_backend]
+            url = "https://ep2.adtrafficquality.google"
+            
+        [local_server.backends.adtraffic_ep3_backend]
+            url = "https://ep3.adtrafficquality.google"
 
 
     [local_server.kv_stores]

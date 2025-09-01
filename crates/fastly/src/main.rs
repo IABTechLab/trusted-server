@@ -68,10 +68,7 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, path) if is_partner_asset_path(path) => {
                 handle_partner_asset(&settings, req).await
             }
-            // GAM asset serving (separate from Equativ, checked after Equativ)
-            (&Method::GET, path) if is_gam_asset_path(path) => {
-                handle_gam_asset(&settings, req).await
-            }
+            // Specific routes MUST come before catch-all patterns
             (&Method::GET, "/prebid-test") => handle_prebid_test(&settings, req).await,
             (&Method::GET, "/gam-test") => handle_gam_test(&settings, req).await,
             (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
@@ -81,6 +78,14 @@ fn main(req: Request) -> Result<Response, Error> {
                 .with_body(GAM_TEST_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
                 .with_header("x-compress-hint", "on")),
+            // Encoded path routing for domain proxying
+            (&Method::GET, path) if is_encoded_path(path) => {
+                handle_encoded_path(&settings, req).await
+            }
+            // GAM asset serving (separate from Equativ, checked after encoded paths)
+            (&Method::GET, path) if is_text_response_path(path) => {
+                handle_gam_asset(&settings, req).await
+            },
             (&Method::GET, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::POST, "/gdpr/consent") => handle_consent_request(&settings, req),
             (&Method::GET, "/gdpr/data") => handle_data_subject_request(&settings, req),
@@ -302,13 +307,30 @@ async fn handle_partner_asset(_settings: &Settings, req: Request) -> Result<Resp
     }
 }
 
+/// Check if the path uses encoded domain routing
+fn is_encoded_path(path: &str) -> bool {
+    // Match our encoded path patterns (10-char hex codes)
+    if let Some(first_segment) = path.strip_prefix('/').and_then(|p| p.split('/').next()) {
+        first_segment.len() == 10 && first_segment.chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        false
+    }
+}
+
 /// Check if the path is for a GAM asset (separate from Equativ)
-fn is_gam_asset_path(path: &str) -> bool {
-    // Instead of trying to match specific path patterns, we check if this looks like 
-    // a request that was originally intended for a GAM domain but got rewritten to edgepubs.com
-    
-    // Common GAM paths that we know about
-    path.contains("/tag/js/") ||        // Google Tag Manager/GAM scripts (including our renamed test.js)
+fn is_text_response_path(path: &str) -> bool {
+    // Broaden matching to catch all text content that might contain domain references
+
+    // JavaScript and web assets
+    path.ends_with(".js") ||
+    path.ends_with(".css") ||
+    path.ends_with(".html") ||
+    path.ends_with(".htm") ||
+    path.ends_with(".json") ||
+    path.ends_with(".xml") ||
+
+    // Google/GAM specific paths
+    path.contains("/tag/js/") ||        // Google Tag Manager/GAM scripts
     path.contains("/pagead/") ||        // GAM ad serving and interactions
     path.contains("/gtag/js") ||        // Google Analytics/GAM gtag scripts
     path.contains("/gampad/") ||        // GAM ad requests (gampad/ads)
@@ -318,113 +340,235 @@ fn is_gam_asset_path(path: &str) -> bool {
     path.contains("/generate_204") ||   // GAM tracking pixels
     path.contains("/recaptcha/") ||     // reCAPTCHA requests
     path.contains("/static/topics/") || // GAM topics framework
-    path.contains("safeframe")          // GAM safe frame containers
+
+    // Broader Google domain patterns
+    path.contains("google") ||          // Any Google service
+    path.contains("doubleclick") ||     // All DoubleClick variations
+    path.contains("syndication") ||     // Google ad syndication
+
+    // API and configuration endpoints
+    path.contains("/api/") ||           // API responses may contain URLs
+    path.contains("/config/") ||        // Configuration files
+    path.contains("/ads/") ||           // Ad-related content
+
+    // Default: apply rewriting to most text content to be comprehensive
+    !path.ends_with(".png") && 
+    !path.ends_with(".jpg") && 
+    !path.ends_with(".jpeg") && 
+    !path.ends_with(".gif") && 
+    !path.ends_with(".ico") && 
+    !path.ends_with(".woff") && 
+    !path.ends_with(".woff2") && 
+    !path.ends_with(".ttf") && 
+    !path.ends_with(".eot") && 
+    !path.ends_with(".svg") &&
+    !path.ends_with(".mp4") &&
+    !path.ends_with(".webm") &&
+    !path.ends_with(".pdf")
 }
 
 /// Handles GAM asset serving (completely separate from Equativ)
-/// Rewrite hardcoded URLs in GAM JavaScript to use first-party proxy
+/// Rewrite hardcoded URLs in content to use first-party proxy domains
 fn rewrite_gam_urls(content: &str) -> String {
-    log::info!("Starting GAM URL rewriting...");
-
-    // Define the URL mappings based on the user's configuration
-    let url_mappings = [
-        // Primary GAM domains
-        ("securepubads.g.doubleclick.net", "edgepubs.com"),
-        ("googletagservices.com", "edgepubs.com"),
-        ("googlesyndication.com", "edgepubs.com"),
-        ("pagead2.googlesyndication.com", "edgepubs.com"),
-        ("tpc.googlesyndication.com", "edgepubs.com"),
-        
-        // GAM-specific subdomains that might appear
-        ("www.googletagservices.com", "edgepubs.com"),
-        ("www.googlesyndication.com", "edgepubs.com"),
-        ("static.googleadsserving.cn", "edgepubs.com"),
-        
-        // Ad serving domains
-        ("doubleclick.net", "edgepubs.com"),
-        ("www.google.com/adsense", "edgepubs.com/adsense"),
-        
-        // Google ad quality and traffic domains (these were missing!)
-        ("adtrafficquality.google", "edgepubs.com"),
-        ("ep1.adtrafficquality.google", "edgepubs.com"),
-        ("ep2.adtrafficquality.google", "edgepubs.com"),
-        ("ep3.adtrafficquality.google", "edgepubs.com"),
-        
-        // Other Google ad-related domains
-        ("6ab9b2c571ea5e8cf287325e9ebeaa41.safeframe.googlesyndication.com", "edgepubs.com"),
-        ("www.google.com/recaptcha", "edgepubs.com/recaptcha"),
-    ];
+    log::info!("Starting precise domain rewriting with encoded paths...");
 
     let mut rewritten_content = content.to_string();
     let mut total_replacements = 0;
 
-    for (original_domain, proxy_domain) in &url_mappings {
-        // Count replacements for this domain
-        let before_count = rewritten_content.matches(original_domain).count();
+    // Define precise domain-to-encoded-path mappings (order matters - longest first to avoid conflicts)
+    let domain_mappings = [
+        // Specific subdomains FIRST (to avoid conflicts with broader matches)
+        ("securepubads.g.doubleclick.net", "edgepubs.com/d4f8a2b1c3"),
+        ("googleads.g.doubleclick.net", "edgepubs.com/f9a2d3e7c1"), 
+        ("stats.g.doubleclick.net", "edgepubs.com/c7e1f4a9d2"),
+        ("cm.g.doubleclick.net", "edgepubs.com/e3d8f2a5c9"),
+        ("pagead2.googlesyndication.com", "edgepubs.com/a8f3d9e2c4"),
+        ("tpc.googlesyndication.com", "edgepubs.com/b8d4e1f5a2"),
+        ("safeframe.googlesyndication.com", "edgepubs.com/g2h7f9a4e1"),
+        ("ep1.adtrafficquality.google", "edgepubs.com/a7e3f9d2c8"),
+        ("ep2.adtrafficquality.google", "edgepubs.com/b4f7a8e1d5"),
+        ("ep3.adtrafficquality.google", "edgepubs.com/c9a4f2e7b3"),
+        
+        // Main domains LAST (after all subdomains processed)
+        ("googlesyndication.com", "edgepubs.com/e7f2a9c4d1"),
+        ("googletagservices.com", "edgepubs.com/f3a8d9e2c7"),
+        ("adtrafficquality.google", "edgepubs.com/d6c9f4a2e8"),
+    ];
 
-        if before_count > 0 {
-            log::info!(
-                "Found {} occurrences of '{}' to rewrite",
-                before_count,
-                original_domain
-            );
-
-            // Replace both HTTP and HTTPS versions
-            rewritten_content = rewritten_content.replace(
-                &format!("https://{}", original_domain),
-                &format!("https://{}", proxy_domain),
-            );
-            rewritten_content = rewritten_content.replace(
-                &format!("http://{}", original_domain),
-                &format!("https://{}", proxy_domain),
-            );
-
-            // Also replace protocol-relative URLs (//domain.com)
-            rewritten_content = rewritten_content.replace(
-                &format!("//{}", original_domain),
-                &format!("//{}", proxy_domain),
-            );
-
-            // Replace domain-only references (for cases where protocol is added separately)
-            rewritten_content = rewritten_content.replace(
-                &format!("\"{}\"", original_domain),
-                &format!("\"{}\"", proxy_domain),
-            );
-            rewritten_content = rewritten_content.replace(
-                &format!("'{}'", original_domain),
-                &format!("'{}'", proxy_domain),
-            );
-
-            let after_count = rewritten_content.matches(original_domain).count();
-            let replacements = before_count - after_count;
-            total_replacements += replacements;
-
-            if replacements > 0 {
-                log::info!(
-                    "Replaced {} occurrences of '{}' with '{}'",
-                    replacements,
-                    original_domain,
-                    proxy_domain
-                );
+    // Process domains in order (specific subdomains first, then general domains)
+    for (original_domain, encoded_path) in &domain_mappings {
+        if rewritten_content.contains(original_domain) {
+            let before_len = rewritten_content.len();
+            
+            // Replace with multiple URL patterns for thoroughness
+            rewritten_content = rewritten_content
+                .replace(&format!("https://{}", original_domain), &format!("https://{}", encoded_path))
+                .replace(&format!("http://{}", original_domain), &format!("https://{}", encoded_path))
+                .replace(&format!("//{}", original_domain), &format!("//{}", encoded_path))
+                .replace(&format!("\"{}\"", original_domain), &format!("\"{}\"", encoded_path))
+                .replace(&format!("'{}'", original_domain), &format!("'{}'", encoded_path));
+            
+            let after_len = rewritten_content.len();
+            if before_len != after_len {
+                total_replacements += 1;
+                log::info!("Rewrote domain: {} -> {}", original_domain, encoded_path);
             }
         }
     }
 
     log::info!(
-        "GAM URL rewriting complete. Total replacements: {}",
+        "Precise domain rewriting complete. {} domains processed",
         total_replacements
     );
 
-    // Log a sample of the rewritten content for debugging (first 500 chars)
-    if total_replacements > 0 {
-        let sample_length = std::cmp::min(500, rewritten_content.len());
-        log::debug!(
-            "Rewritten content sample: {}",
-            &rewritten_content[..sample_length]
-        );
-    }
-
     rewritten_content
+}
+
+/// Handle requests to encoded domain paths
+async fn handle_encoded_path(_settings: &Settings, req: Request) -> Result<Response, Error> {
+    let path = req.get_path();
+    log::info!("Handling encoded path request: {}", path);
+    
+    // Extract encoded domain and remaining path
+    let (encoded_domain, backend_path) = if let Some(stripped) = path.strip_prefix('/') {
+        if let Some((first, rest)) = stripped.split_once('/') {
+            (first, format!("/{}", rest))
+        } else {
+            (stripped, "/".to_string())
+        }
+    } else {
+        return Ok(Response::from_status(StatusCode::BAD_REQUEST)
+            .with_body("Invalid encoded path"));
+    };
+    
+    // Map encoded domains to backends (now including version 48 backends)
+    let (backend_name, original_domain) = match encoded_domain {
+        // Existing backends (version 47)
+        "d4f8a2b1c3" => ("gam_backend", "securepubads.g.doubleclick.net"),
+        "a8f3d9e2c4" => ("GAM_javascript_backend", "pagead2.googlesyndication.com"),
+        "b8d4e1f5a2" => ("tpc_googlesyndication_backend", "tpc.googlesyndication.com"),
+        "e7f2a9c4d1" => ("pagead2_googlesyndication_backend", "googlesyndication.com"),
+        "f3a8d9e2c7" => ("GTS_services_backend", "googletagservices.com"),
+        
+        // New backends (version 48)
+        "a7e3f9d2c8" => ("adtraffic_backend", "ep1.adtrafficquality.google"),
+        "b4f7a8e1d5" => ("adtraffic_ep2_backend", "ep2.adtrafficquality.google"),
+        "c9a4f2e7b3" => ("adtraffic_ep3_backend", "ep3.adtrafficquality.google"),
+        "g2h7f9a4e1" => ("safeframe_backend", "safeframe.googlesyndication.com"),
+        
+        // Additional domains that might route to existing backends
+        "f9a2d3e7c1" => ("gam_backend", "googleads.g.doubleclick.net"), // Route to gam_backend
+        "c7e1f4a9d2" => ("gam_backend", "stats.g.doubleclick.net"), // Route to gam_backend  
+        "e3d8f2a5c9" => ("gam_backend", "cm.g.doubleclick.net"), // Route to gam_backend
+        "d6c9f4a2e8" => ("adtraffic_backend", "adtrafficquality.google"), // Route to adtraffic_backend
+        
+        // Fallback to default GAM backend for unknown codes
+        _ => {
+            log::warn!("Unknown encoded domain '{}', routing to default GAM backend", encoded_domain);
+            ("gam_backend", "securepubads.g.doubleclick.net")
+        }
+    };
+    
+    log::info!(
+        "Routing encoded path '{}' to backend '{}' ({}{})",
+        encoded_domain, backend_name, original_domain, backend_path
+    );
+    
+    // Construct the full target URL
+    let mut target_url = format!("https://{}{}", original_domain, backend_path);
+    if let Some(query) = req.get_url().query() {
+        target_url = format!("{}?{}", target_url, query);
+    }
+    
+    log::info!("Full target URL: {}", target_url);
+    
+    // Create backend request
+    let mut backend_req = Request::new(req.get_method().clone(), &target_url);
+    
+    // Copy headers from original request
+    for (name, value) in req.get_headers() {
+        backend_req.set_header(name, value);
+    }
+    backend_req.set_header("host", original_domain);
+    
+    // Send request to backend
+    match backend_req.send(backend_name) {
+        Ok(mut response) => {
+            log::info!(
+                "Encoded path response: status={}, content-type={:?}",
+                response.get_status(),
+                response.get_header("content-type")
+            );
+            
+            // Apply domain rewriting to response body if it's text content
+            let content_type = response.get_header("content-type")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+                
+            if content_type.contains("javascript") || content_type.contains("text") || backend_path.ends_with(".js") {
+                // Handle compressed content properly (like original GAM asset handler)
+                let body_bytes = response.take_body_bytes();
+                
+                // Check if content is compressed
+                let decompressed_body = if response.get_header("content-encoding")
+                    .and_then(|h| h.to_str().ok()) == Some("br") {
+                    
+                    log::info!("Detected Brotli compression in encoded path response, decompressing...");
+                    let mut decompressed = Vec::new();
+                    match brotli::Decompressor::new(&body_bytes[..], 4096)
+                        .read_to_end(&mut decompressed) {
+                        Ok(_) => decompressed,
+                        Err(e) => {
+                            log::error!("Failed to decompress encoded path response: {:?}", e);
+                            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .with_body("Failed to decompress response"));
+                        }
+                    }
+                } else {
+                    body_bytes
+                };
+                
+                // Convert to string safely
+                match std::str::from_utf8(&decompressed_body) {
+                    Ok(body_str) => {
+                        // Debug GAM response content
+                        log::info!("GAM encoded path response analysis:");
+                        log::info!("  - Body length: {} chars", body_str.len());
+                        log::info!("  - Contains 'creative': {}", body_str.contains("creative"));
+                        log::info!("  - Contains 'img': {}", body_str.contains("img"));
+                        log::info!("  - Contains 'src=': {}", body_str.contains("src="));
+                        log::info!("  - Contains 'http': {}", body_str.contains("http"));
+                        if body_str.len() > 400 {
+                            log::info!("  - First 200 chars: {}", &body_str[0..200]);
+                            log::info!("  - Last 200 chars: {}", &body_str[body_str.len()-200..]);
+                        } else {
+                            log::info!("  - Full content (short): {}", body_str);
+                        }
+                        
+                        let rewritten_body = rewrite_gam_urls(body_str);
+                        response.set_body(rewritten_body);
+                        // Remove compression headers since we're serving uncompressed
+                        response.remove_header("content-encoding");
+                        response.remove_header("content-length");
+                        log::info!("Applied domain rewriting to encoded path response");
+                    }
+                    Err(e) => {
+                        log::error!("Encoded path response contains non-UTF-8 data: {:?}", e);
+                        // Return original binary content without rewriting
+                        response.set_body(decompressed_body);
+                        log::warn!("Served encoded path response without domain rewriting (binary content)");
+                    }
+                }
+            }
+            
+            Ok(response)
+        }
+        Err(e) => {
+            log::error!("Error fetching encoded path from {}: {:?}", backend_name, e);
+            Ok(Response::from_status(StatusCode::BAD_GATEWAY)
+                .with_body(format!("Failed to fetch from encoded path: {}", encoded_domain)))
+        }
+    }
 }
 
 async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response, Error> {
@@ -453,16 +597,24 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
     // unless we detect specific patterns that need different backends
     let (backend_name, original_host, target_path) = if path.contains("/tag/js/test.js") {
         // Special case: our renamed test.js should map to the original gpt.js
-        ("gam_backend", "securepubads.g.doubleclick.net", "/tag/js/gpt.js".to_string())
+        (
+            "gam_backend",
+            "securepubads.g.doubleclick.net",
+            "/tag/js/gpt.js".to_string(),
+        )
     } else if path.contains("/pagead/") && path.contains("googlesyndication") {
         (
             "pagead2_googlesyndication_backend",
             "pagead2.googlesyndication.com",
-            path.to_string()
+            path.to_string(),
         )
     } else {
         // Default: all other GAM requests go to main GAM backend with original path
-        ("gam_backend", "securepubads.g.doubleclick.net", path.to_string())
+        (
+            "gam_backend",
+            "securepubads.g.doubleclick.net",
+            path.to_string(),
+        )
     };
 
     log::info!(
@@ -473,25 +625,29 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
 
     // Construct full URL using the original host and target path (may be different from request path)
     let mut full_url = format!("https://{}{}", original_host, target_path);
-    
+
     // Add query string if present
     if let Some(query) = req.get_url().query() {
         full_url.push('?');
         full_url.push_str(query);
     }
-    
+
     // Special handling for /gampad/ads requests - rewrite URL parameter to use autoblog.com
     if target_path.contains("/gampad/ads") {
         log::info!("Applying URL parameter rewriting for GAM ad request");
         // Change url=https%3A%2F%2Fedgepubs.com%2F to url=https%3A%2F%2Fwww.autoblog.com%2F
         full_url = full_url.replace(
             "url=https%3A%2F%2Fedgepubs.com%2F",
-            "url=https%3A%2F%2Fwww.autoblog.com%2F"
+            "url=https%3A%2F%2Fwww.autoblog.com%2F",
         );
         log::info!("Rewrote URL parameter from edgepubs.com to www.autoblog.com");
     }
-    
-    log::info!("Fetching GAM asset URL: {} (original request: {})", full_url, path);
+
+    log::info!(
+        "Fetching GAM asset URL: {} (original request: {})",
+        full_url,
+        path
+    );
 
     let mut asset_req = Request::new(req.get_method().clone(), &full_url);
 
@@ -524,7 +680,10 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
 
             // Enable rewriting for JavaScript content
             let needs_rewriting = content_type.contains("javascript") || path.contains(".js");
-            log::info!("Content rewriting enabled for JavaScript: {}", needs_rewriting);
+            log::info!(
+                "Content rewriting enabled for JavaScript: {}",
+                needs_rewriting
+            );
 
             log::info!(
                 "GAM asset content-type: {}, needs_rewriting: {}",
@@ -534,16 +693,20 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
 
             if needs_rewriting {
                 // Step 1: Capture original content-disposition header before processing
-                let original_content_disposition = response.get_header("content-disposition")
+                let original_content_disposition = response
+                    .get_header("content-disposition")
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string());
-                
-                log::info!("Captured original content-disposition: {:?}", original_content_disposition);
-                
+
+                log::info!(
+                    "Captured original content-disposition: {:?}",
+                    original_content_disposition
+                );
+
                 // Step 2: Remove content-disposition header so we can process the response properly
                 response.remove_header("content-disposition");
                 log::info!("Step 2: Temporarily removed content-disposition header for processing");
-                
+
                 // Get the response body as bytes first
                 let body_bytes = response.take_body_bytes();
                 let original_length = body_bytes.len();
@@ -554,15 +717,22 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
                 );
 
                 // Check if we need to decompress Brotli data
-                let decompressed_body = if response.get_header("content-encoding")
-                    .and_then(|h| h.to_str().ok()) == Some("br") {
-                    
+                let decompressed_body = if response
+                    .get_header("content-encoding")
+                    .and_then(|h| h.to_str().ok())
+                    == Some("br")
+                {
                     log::info!("Detected Brotli compression, decompressing...");
                     let mut decompressed = Vec::new();
                     match brotli::Decompressor::new(&body_bytes[..], 4096)
-                        .read_to_end(&mut decompressed) {
+                        .read_to_end(&mut decompressed)
+                    {
                         Ok(bytes_read) => {
-                            log::info!("Successfully decompressed {} bytes to {} bytes", original_length, bytes_read);
+                            log::info!(
+                                "Successfully decompressed {} bytes to {} bytes",
+                                original_length,
+                                bytes_read
+                            );
                             decompressed
                         }
                         Err(e) => {
@@ -585,23 +755,27 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
                     Err(e) => {
                         log::error!("Decompressed response contains non-UTF-8 data: {:?}", e);
                         return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .with_body(format!("Invalid UTF-8 in decompressed GAM asset: {:?}", e)));
+                            .with_body(format!(
+                                "Invalid UTF-8 in decompressed GAM asset: {:?}",
+                                e
+                            )));
                     }
                 };
 
                 // Log a sample of the original content for debugging (safely)
                 let sample = if body.len() > 200 {
                     // Find a safe character boundary near 200 bytes
-                    match body.char_indices().nth(100) { // Get first ~100 characters instead of 200 bytes
+                    match body.char_indices().nth(100) {
+                        // Get first ~100 characters instead of 200 bytes
                         Some((byte_idx, _)) => &body[..byte_idx],
-                        None => &body[..std::cmp::min(50, body.len())] // Fallback to very short sample
+                        None => &body[..std::cmp::min(50, body.len())], // Fallback to very short sample
                     }
                 } else {
                     &body
                 };
                 log::info!("Original content sample: {}", sample);
 
-                // Rewrite hardcoded URLs to use first-party proxy
+                // Rewrite hardcoded URLs to use first-party proxy (now applied to all text content)
                 let rewritten_body = rewrite_gam_urls(&body);
                 let rewritten_length = rewritten_body.len();
 
@@ -617,14 +791,16 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
                         // Find a safe character boundary near 200 bytes
                         match rewritten_body.char_indices().nth(100) {
                             Some((byte_idx, _)) => &rewritten_body[..byte_idx],
-                            None => &rewritten_body[..std::cmp::min(50, rewritten_body.len())]
+                            None => &rewritten_body[..std::cmp::min(50, rewritten_body.len())],
                         }
                     } else {
                         &rewritten_body
                     };
                     log::info!("Rewritten content sample: {}", rewritten_sample);
                 } else {
-                    log::warn!("No content changes detected - rewriting may not have found target URLs");
+                    log::warn!(
+                        "No content changes detected - rewriting may not have found target URLs"
+                    );
                 }
 
                 // Create new response with rewritten content
@@ -640,7 +816,11 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
                     }
                     // Skip compression headers since our rewritten content is uncompressed
                     if header_name == "content-encoding" || header_name == "content-length" {
-                        log::info!("Skipping compression header for rewritten content: {}: {:?}", name, value);
+                        log::info!(
+                            "Skipping compression header for rewritten content: {}: {:?}",
+                            name,
+                            value
+                        );
                         continue;
                     }
                     new_response.set_header(name, value);
@@ -660,9 +840,12 @@ async fn handle_gam_asset(_settings: &Settings, req: Request) -> Result<Response
                 // Step 3: Restore original content-disposition header if it existed
                 if let Some(original_disposition) = original_content_disposition {
                     new_response.set_header("content-disposition", &original_disposition);
-                    log::info!("Step 3: Restored original content-disposition header: {}", original_disposition);
+                    log::info!(
+                        "Step 3: Restored original content-disposition header: {}",
+                        original_disposition
+                    );
                 }
-                
+
                 // Add debug headers
                 new_response.set_header("X-Content-Rewritten", "true");
                 new_response.set_header("X-Original-Length", &original_length.to_string());

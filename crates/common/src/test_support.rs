@@ -59,6 +59,7 @@ pub mod tests {
                 secret_key: "test-secret-key".to_string(),
                 template: "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}".to_string(),
             },
+            partners: None,
         }
     }
 }
