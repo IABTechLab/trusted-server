@@ -1,9 +1,10 @@
 use crate::gdpr::get_consent_from_request;
 use crate::partners::PartnerManager;
+use crate::prebid::PrebidRequest;
 use crate::settings::Settings;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -68,9 +69,49 @@ impl GamRequest {
         params.insert("sz".to_string(), "728x90|300x250".to_string()); // Multiple sizes
         params.insert("c".to_string(), self.correlator.clone());
         
-        // Output format
-        params.insert("output".to_string(), "html".to_string()); // Standard HTML output
-        params.insert("impl".to_string(), "s".to_string()); // Standard implementation
+        // Output format - match production autoblog
+        params.insert("output".to_string(), "ldjh".to_string()); // LDJH format like autoblog
+        params.insert("impl".to_string(), "fifs".to_string()); // FIFS implementation like autoblog
+        
+        // Required GAM parameters from production
+        params.insert("gdfp_req".to_string(), "1".to_string()); // Required GAM identifier
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        params.insert("pvsid".to_string(), timestamp.to_string()); // Page view session ID
+        params.insert("vrg".to_string(), "202508280101".to_string()); // Version/release group
+        params.insert("frm".to_string(), "20".to_string()); // Frame parameter
+        
+        // Add correlator as separate parameter (different from 'c')
+        params.insert("correlator".to_string(), timestamp.to_string());
+        
+        // Experiment IDs from production autoblog
+        params.insert("eid".to_string(), "31086815%2C31093080%2C83321073".to_string());
+        
+        // Page and session parameters
+        params.insert("ptt".to_string(), "17".to_string()); // Page type
+        params.insert("ifi".to_string(), "5".to_string()); // Iframe index
+        params.insert("sc".to_string(), "1".to_string()); // Screen
+        params.insert("eri".to_string(), "1".to_string()); // Error info
+        params.insert("sfv".to_string(), "1-0-45".to_string()); // SafeFrame version
+        params.insert("abxe".to_string(), "1".to_string()); // Ad blocker
+        params.insert("lmt".to_string(), timestamp.to_string()); // Load time
+        
+        // Browser/device parameters from production
+        params.insert("u_his".to_string(), "3".to_string()); // History length
+        params.insert("u_h".to_string(), "982".to_string()); // Screen height
+        params.insert("u_w".to_string(), "1512".to_string()); // Screen width  
+        params.insert("u_ah".to_string(), "889".to_string()); // Available height
+        params.insert("u_aw".to_string(), "1512".to_string()); // Available width
+        params.insert("u_cd".to_string(), "30".to_string()); // Color depth
+        params.insert("u_sd".to_string(), "2".to_string()); // Screen density
+        params.insert("u_tz".to_string(), "-300".to_string()); // Timezone offset
+        params.insert("dmc".to_string(), "8".to_string()); // Device memory
+        params.insert("bc".to_string(), "31".to_string()); // Browser capabilities
+        params.insert("nvt".to_string(), "1".to_string()); // Navigation type
+        params.insert("vis".to_string(), "1".to_string()); // Visibility
+        
+        // Cookie parameters from production  
+        params.insert("cookie".to_string(), "ID%3Dcd6d5b4a2d1c1371%3AT%3D1749585594%3ART%3D1756844784%3AS%3DALNI_MZxgfKMLtdNI6bEtVhMeqqg2IEL-g".to_string());
+        params.insert("gpic".to_string(), "UID%3D000010d34192ecc4%3AT%3D1749585594%3ART%3D1756844784%3AS%3DALNI_MYAoYlnKkmIbJV5p7kgvAFcTQjiUQ".to_string());
         
         // Page context
         params.insert("url".to_string(), urlencoding::encode("https://www.autoblog.com/reviews/test").to_string());
@@ -84,8 +125,8 @@ impl GamRequest {
         };
         params.insert("cust_params".to_string(), urlencoding::encode(&cust_params).to_string());
 
-        // Publisher Provided ID
-        params.insert("ppid".to_string(), format!("arenaGroup-{}", self.synthetic_id));
+        // Publisher Provided ID - use proper UUID format like autoblog
+        params.insert("ppid".to_string(), format!("arenaGroup-{}", uuid::Uuid::new_v4()));
         
         // Timestamps
         params.insert("dt".to_string(), chrono::Utc::now().timestamp_millis().to_string());
@@ -118,13 +159,22 @@ impl GamRequest {
         // Create the request
         let mut req = Request::new(Method::GET, &url);
 
-        // Set headers to mimic a browser request (using only Fastly-compatible headers)
+        // Set headers to mimic browser request exactly (critical for GAM authentication)
         req.set_header(header::USER_AGENT, &self.user_agent);
-        req.set_header(header::ACCEPT, "application/json, text/plain, */*");
+        req.set_header(header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
         req.set_header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
         req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br");
         req.set_header(header::REFERER, &self.page_url);
-        req.set_header(header::ORIGIN, &self.page_url);
+        
+        // Critical browser security headers that GAM validates
+        req.set_header("Sec-Fetch-Site", "cross-site");
+        req.set_header("Sec-Fetch-Mode", "no-cors");
+        req.set_header("Sec-Fetch-Dest", "script");
+        req.set_header(header::CACHE_CONTROL, "no-cache");
+        req.set_header("Pragma", "no-cache");
+        req.set_header("Connection", "keep-alive");
+        
+        // Don't send Origin header as GAM scripts typically don't include it
         req.set_header("X-Synthetic-ID", &self.synthetic_id);
 
         // Send the request to the GAM backend
@@ -686,10 +736,340 @@ pub async fn handle_gam_render(settings: &Settings, req: Request) -> Result<Resp
 
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, private")
+        .with_header("Pragma", "no-cache")
+        .with_header("Expires", "0")
         .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .with_header("X-GAM-Render", "true")
         .with_header("X-Synthetic-ID", &gam_req.synthetic_id)
         .with_header("X-Correlator", &gam_req.correlator)
         .with_body(render_page))
+}
+
+/// Handle GAM passthrough from Prebid (receives winning bid data and forwards to GAM)
+pub async fn handle_gam_passthrough(settings: &Settings, mut req: Request) -> Result<Response, Error> {
+    log::info!("Starting GAM passthrough from Prebid");
+
+    // Check consent status from cookie
+    let consent = get_consent_from_request(&req).unwrap_or_default();
+    let advertising_consent = consent.advertising;
+
+    if !advertising_consent {
+        return Ok(Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_body_json(&json!({
+                "error": "No advertising consent",
+                "message": "GAM passthrough requires advertising consent"
+            }))?);
+    }
+
+    // Parse Prebid auction response data
+    let body = req.take_body_str();
+    let prebid_data: Value = match serde_json::from_str(&body) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("Error parsing Prebid auction data: {:?}", e);
+            return Ok(Response::from_status(StatusCode::BAD_REQUEST)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Invalid Prebid auction data",
+                    "details": format!("{:?}", e)
+                }))?);
+        }
+    };
+
+    log::info!("Received Prebid auction data: {}", 
+               serde_json::to_string_pretty(&prebid_data).unwrap_or_else(|_| "invalid".to_string()));
+
+    // Extract winning bid information
+    let winning_bidder = prebid_data["seatbid"][0]["seat"]
+        .as_str()
+        .unwrap_or("unknown");
+    let winning_price = prebid_data["seatbid"][0]["bid"][0]["price"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let auction_id = prebid_data["id"]
+        .as_str()
+        .unwrap_or_else(|| "unknown");
+
+    log::info!("Winning bid: bidder={}, price=${:.3}, auction_id={}", 
+               winning_bidder, winning_price, auction_id);
+
+    // Get synthetic ID from original request context
+    let synthetic_id = req.get_header("X-Synthetic-ID")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(auction_id);
+
+    // Create GAM request with winning bid context
+    let mut gam_req = GamRequest {
+        publisher_id: settings.gam.publisher_id.clone(),
+        ad_units: settings.gam.ad_units.iter().map(|u| u.name.clone()).collect(),
+        page_url: req.get_url().to_string(),
+        correlator: Uuid::new_v4().to_string(),
+        prmtvctx: None,
+        user_agent: req.get_header(header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("Mozilla/5.0 (compatible; TrustedServer/1.0)")
+            .to_string(),
+        synthetic_id: synthetic_id.to_string(),
+    };
+
+    // Add Prebid winning bid data using standard targeting parameters
+    let prebid_context = if winning_price > 0.0 {
+        format!(
+            "hb_bidder={}&hb_pb={:.2}&hb_adid={}&hb_size=728x90&hb_source=server",
+            winning_bidder, winning_price, auction_id
+        )
+    } else {
+        "hb_source=server".to_string() // No winning bid, just indicate server-side
+    };
+    gam_req.prmtvctx = Some(prebid_context);
+
+    log::info!("Forwarding winning bid to GAM with context: {}", 
+               gam_req.prmtvctx.as_ref().unwrap());
+
+    // Send request to GAM with winning bid information
+    match gam_req.send_request(settings).await {
+        Ok(mut response) => {
+            log::info!("GAM passthrough successful");
+            
+            // Apply domain rewriting to GAM response
+            let partner_manager = PartnerManager::from_settings(settings);
+            let original_body = response.take_body_str();
+            let rewritten_body = partner_manager.rewrite_content(&original_body);
+            
+            if original_body != rewritten_body {
+                log::info!("Applied domain rewriting to GAM passthrough response");
+            }
+
+            Ok(Response::from_status(response.get_status())
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_header(header::CACHE_CONTROL, "no-store, private") 
+                .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .with_header("X-GAM-Passthrough", "true")
+                .with_header("X-Winning-Bidder", winning_bidder)
+                .with_header("X-Winning-Price", &winning_price.to_string())
+                .with_header("X-Auction-ID", auction_id)
+                .with_body_json(&json!({
+                    "status": "gam_passthrough_success",
+                    "prebid_auction": {
+                        "winning_bidder": winning_bidder,
+                        "winning_price": winning_price,
+                        "auction_id": auction_id
+                    },
+                    "gam_response": rewritten_body,
+                    "domain_rewriting_applied": original_body != rewritten_body
+                }))?)
+        }
+        Err(e) => {
+            log::error!("GAM passthrough failed: {:?}", e);
+            Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "GAM passthrough failed",
+                    "details": format!("{:?}", e),
+                    "prebid_auction": {
+                        "winning_bidder": winning_bidder,
+                        "winning_price": winning_price,
+                        "auction_id": auction_id
+                    }
+                }))?)
+        }
+    }
+}
+
+/// Handle server-side ad orchestration: Prebid → GAM flow
+pub async fn handle_server_side_ad(settings: &Settings, req: Request) -> Result<Response, Error> {
+    log::info!("Starting server-side ad orchestration: Prebid → GAM");
+
+    // Check consent status from cookie and header fallback
+    let consent = get_consent_from_request(&req).unwrap_or_default();
+    let cookie_consent = consent.advertising;
+    
+    // Also check header as fallback
+    let header_consent = req
+        .get_header("X-Consent-Advertising")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    
+    let advertising_consent = cookie_consent || header_consent;
+    
+    log::info!("Server-side ad consent check: cookie={}, header={}, final={}", 
+               cookie_consent, header_consent, advertising_consent);
+
+    if !advertising_consent {
+        return Ok(Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_body_json(&json!({
+                "error": "No advertising consent",
+                "message": "Server-side ad orchestration requires advertising consent",
+                "ad_slot_html": "<span style='color: #999;'>Ads disabled - no advertising consent</span>"
+            }))?);
+    }
+
+    // Step 1: Create and send Prebid request
+    let prebid_req = match PrebidRequest::new(settings, &req) {
+        Ok(req) => req,
+        Err(e) => {
+            log::error!("Error creating Prebid request: {:?}", e);
+            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Failed to create Prebid request",
+                    "details": format!("{:?}", e),
+                    "ad_slot_html": "<span style='color: #999;'>Ad temporarily unavailable</span>"
+                }))?);
+        }
+    };
+
+    log::info!("Sending Prebid request for server-side ad orchestration");
+    
+    let prebid_response = match prebid_req.send_bid_request(settings, &req).await {
+        Ok(mut response) => {
+            let prebid_body = response.take_body_str();
+            log::info!("Prebid response received: {} chars", prebid_body.len());
+            
+            // Parse Prebid response
+            match serde_json::from_str::<Value>(&prebid_body) {
+                Ok(data) => data,
+                Err(e) => {
+                    log::error!("Error parsing Prebid response: {:?}", e);
+                    return Ok(Response::from_status(StatusCode::OK)
+                        .with_header(header::CONTENT_TYPE, "application/json")
+                        .with_body_json(&json!({
+                            "error": "Invalid Prebid response",
+                            "details": format!("{:?}", e),
+                            "ad_slot_html": "<span style='color: #999;'>Ad service error</span>"
+                        }))?);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Prebid request failed: {:?}", e);
+            return Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Prebid request failed",
+                    "details": format!("{:?}", e),
+                    "ad_slot_html": "<span style='color: #999;'>No bids available</span>"
+                }))?);
+        }
+    };
+
+    // Step 2: Extract winning bid information (corrected structure)
+    let winning_bidder = prebid_response["seatbid"][0]["seat"]
+        .as_str()
+        .unwrap_or("unknown");
+    let winning_price = prebid_response["seatbid"][0]["bid"][0]["price"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let creative_content = prebid_response["seatbid"][0]["bid"][0]["adm"]
+        .as_str()
+        .unwrap_or("");
+    let auction_id = prebid_response["id"]
+        .as_str()
+        .unwrap_or("unknown");
+
+    log::info!("Prebid auction complete: bidder={}, price=${:.3}, auction_id={}, creative_length={}", 
+               winning_bidder, winning_price, auction_id, creative_content.len());
+
+    // Step 3: Create GAM request with winning bid context
+    let synthetic_id = req.get_header("X-Synthetic-Trusted-Server")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(auction_id);
+
+    let mut gam_req = GamRequest {
+        publisher_id: settings.gam.publisher_id.clone(),
+        ad_units: vec!["728x90_header".to_string()], // Specific slot
+        page_url: req.get_url().to_string(),
+        correlator: uuid::Uuid::new_v4().to_string(),
+        prmtvctx: None,
+        user_agent: req.get_header(header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("Mozilla/5.0 (compatible; TrustedServer/1.0)")
+            .to_string(),
+        synthetic_id: synthetic_id.to_string(),
+    };
+
+    // Add Prebid winning bid data using standard targeting parameters + working prmtvctx
+    let prebid_context = if winning_price > 0.0 {
+        format!(
+            "hb_bidder={}&hb_pb={:.2}&hb_adid={}&hb_size=728x90&hb_source=server&{}",
+            winning_bidder, winning_price, auction_id,
+            "129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts"
+        )
+    } else {
+        format!(
+            "hb_source=server&{}",
+            "129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts"
+        )
+    };
+    gam_req.prmtvctx = Some(prebid_context.clone());
+
+    log::info!("Sending GAM request with Prebid context: {}", prebid_context);
+
+    // Step 4: Send GAM request with winning bid information
+    match gam_req.send_request(settings).await {
+        Ok(mut response) => {
+            log::info!("Server-side ad orchestration successful");
+            
+            // Apply domain rewriting to GAM response
+            let partner_manager = PartnerManager::from_settings(settings);
+            let original_body = response.take_body_str();
+            let rewritten_body = partner_manager.rewrite_content(&original_body);
+            
+            if original_body != rewritten_body {
+                log::info!("Applied domain rewriting to server-side ad response");
+            }
+
+            // Extract creative HTML for injection
+            let creative_html = if rewritten_body.contains("<!DOCTYPE html>") {
+                if let Some(html_start) = rewritten_body.find("<!DOCTYPE html>") {
+                    rewritten_body[html_start..].to_string()
+                } else {
+                    "<span style='color: #999;'>Creative format error</span>".to_string()
+                }
+            } else {
+                rewritten_body.clone()
+            };
+
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                .with_header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, private")
+                .with_header("Pragma", "no-cache")
+                .with_header("Expires", "0") 
+                .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .with_header("X-Server-Side-Ad", "true")
+                .with_header("X-Winning-Bidder", winning_bidder)
+                .with_header("X-Winning-Price", &winning_price.to_string())
+                .with_header("X-Auction-ID", auction_id)
+                .with_body_json(&json!({
+                    "status": "server_side_ad_success",
+                    "prebid_auction": {
+                        "winning_bidder": winning_bidder,
+                        "winning_price": winning_price,
+                        "auction_id": auction_id
+                    },
+                    "gam_response": rewritten_body,
+                    "ad_slot_html": creative_html,
+                    "domain_rewriting_applied": original_body != rewritten_body
+                }))?)
+        }
+        Err(e) => {
+            log::error!("Server-side ad orchestration failed: {:?}", e);
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body_json(&json!({
+                    "error": "Server-side ad orchestration failed",
+                    "details": format!("{:?}", e),
+                    "prebid_auction": {
+                        "winning_bidder": winning_bidder,
+                        "winning_price": winning_price,
+                        "auction_id": auction_id
+                    },
+                    "ad_slot_html": "<span style='color: #999;'>Ad temporarily unavailable</span>"
+                }))?)
+        }
+    }
 }

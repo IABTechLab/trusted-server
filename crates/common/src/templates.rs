@@ -337,7 +337,10 @@ pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EdgePubs - The Edge Is Yours</title>
+    <!-- External CSS for cacheable assets -->
+    <link rel="stylesheet" href="/static/styles.css">
     <style>
+        /* Critical inline CSS only */
         @import url('https://db.onlinewebfonts.com/c/453969d3ddeb5e5cf1db0d91198f2f71?family=Geomanist-Regular');
         
         * {
@@ -785,6 +788,13 @@ pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
             // Get consent status (same as auburndao)
             const consentData = consent ? JSON.parse(consent) : { advertising: false, functional: false };
 
+            // NEW: Server-side ad orchestration - fetch from Prebid → GAM
+            if (consentData.advertising) {
+                loadServerSideAd();
+            } else {
+                document.getElementById('server-side-ad-slot').innerHTML = '<span style="color: #999;">Ads disabled - no advertising consent</span>';
+            }
+
             // ALWAYS fetch ad creative (same as auburndao), but pass consent in headers
             fetch('/ad-creative', {
                 headers: {
@@ -828,6 +838,69 @@ pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
             document.getElementById('publishers').classList.add('active');
             document.querySelector('.tab-button').classList.add('active');
         });
+        
+        // Server-side ad orchestration function
+        async function loadServerSideAd() {
+            const adSlot = document.getElementById('server-side-ad-slot');
+            adSlot.innerHTML = '<span>Loading server-side ad (Prebid → GAM)...</span>';
+            
+            try {
+                // Single endpoint that handles Prebid → GAM orchestration server-side
+                const response = await fetch('/server-side-ad', {
+                    method: 'GET',
+                    headers: {
+                        'X-Consent-Advertising': 'true',
+                        'X-Ad-Slot': 'header-728x90'
+                    }
+                });
+                
+                const data = await response.json();
+                console.log('Server-side ad response:', data);
+                
+                // Inject the final creative into the ad slot
+                if (data.status === 'server_side_ad_success' && data.ad_slot_html) {
+                    adSlot.innerHTML = data.ad_slot_html;
+                    console.log('Server-side ad loaded successfully:', {
+                        bidder: data.prebid_auction.winning_bidder,
+                        price: data.prebid_auction.winning_price,
+                        auction_id: data.prebid_auction.auction_id
+                    });
+                } else {
+                    adSlot.innerHTML = data.ad_slot_html || '<span style="color: #999;">No ad available</span>';
+                    console.log('Server-side ad failed:', data.error || 'Unknown error');
+                }
+                
+            } catch (error) {
+                console.error('Server-side ad loading error:', error);
+                adSlot.innerHTML = '<span style="color: #999;">Ad unavailable</span>';
+            }
+        }
+        
+        // Helper function to extract creative from GAM response
+        function extractCreativeFromGAM(gamResponse) {
+            try {
+                // Handle LDJH format: {"slot_id": ["html", ...], "<!DOCTYPE html>..."}
+                if (typeof gamResponse === 'string' && gamResponse.includes('<!DOCTYPE html>')) {
+                    const htmlStart = gamResponse.indexOf('<!DOCTYPE html>');
+                    return gamResponse.substring(htmlStart);
+                }
+                
+                // Handle JSON format with embedded HTML
+                if (typeof gamResponse === 'object' && gamResponse.html) {
+                    return gamResponse.html;
+                }
+                
+                // Fallback: treat as HTML string
+                if (typeof gamResponse === 'string' && gamResponse.includes('<')) {
+                    return gamResponse;
+                }
+                
+                return null;
+            } catch (e) {
+                console.error('Error extracting creative:', e);
+                return null;
+            }
+        }
         
         // GAM functions (completely separate from Equativ)
         function loadGAMScript() {
@@ -893,6 +966,18 @@ pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
             <h1>The Edge Is Yours</h1>
             <p>Run your site, ads, and data stack server-side — under your domain, on your terms.</p>
             <a href="#contact" class="btn btn-primary">Get Started →</a>
+        </div>
+    </section>
+
+    <!-- Header Ad Slot (728x90) - Server-side loaded -->
+    <section class="header-ad">
+        <div class="container">
+            <div class="ad-container">
+                <div class="ad-label">Advertisement</div>
+                <div id="server-side-ad-slot" class="ad-slot ad-slot-728x90" data-slot-id="header-728x90">
+                    <span>Loading ad...</span>
+                </div>
+            </div>
         </div>
     </section>
 
@@ -1007,7 +1092,8 @@ pub const EDGEPUBS_TEMPLATE: &str = r##"<!DOCTYPE html>
         </div>
     </section>
 
-
+    <!-- Load JavaScript asynchronously for better performance -->
+    <script src="/static/app.js" async defer></script>
 </body>
 </html>"##;
 

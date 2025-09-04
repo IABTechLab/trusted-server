@@ -1,0 +1,143 @@
+/* EdgePubs Static CSS - Cacheable */
+@import url('https://db.onlinewebfonts.com/c/453969d3ddeb5e5cf1db0d91198f2f71?family=Geomanist-Regular');
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Geomanist', sans-serif;
+    line-height: 1.5;
+    color: #666666;
+    background-color: #FFFFFF;
+}
+
+h1, h2, h3 {
+    color: #333333;
+    font-weight: 700;
+}
+
+h1 {
+    font-size: 48px;
+    line-height: 1.2;
+}
+
+h2 {
+    font-size: 36px;
+    line-height: 1.2;
+}
+
+h3 {
+    font-size: 28px;
+    line-height: 1.2;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 20px;
+}
+
+.btn {
+    display: inline-block;
+    padding: 12px 24px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 500;
+    transition: all 0.3s ease;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.btn-primary {
+    background-color: #FF6F00;
+    color: #FFFFFF;
+}
+
+.btn-primary:hover {
+    background-color: #E65100;
+}
+
+.btn-secondary {
+    background-color: #6A1B9A;
+    color: #FFFFFF;
+}
+
+.btn-secondary:hover {
+    background-color: #4A148C;
+}
+
+/* Hero Section */
+.hero {
+    background: linear-gradient(135deg, #FF6F00 0%, #6A1B9A 100%);
+    color: #FFFFFF;
+    padding: 80px 0;
+    text-align: center;
+}
+
+.hero h1 {
+    color: #FFFFFF;
+    margin-bottom: 20px;
+}
+
+.hero p {
+    font-size: 20px;
+    margin-bottom: 30px;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+    color: #FFFFFF;
+}
+
+/* Ad Slots */
+.header-ad {
+    background: #F5F5F5;
+    padding: 20px 0;
+    text-align: center;
+}
+
+.ad-container {
+    display: inline-block;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 10px;
+    background: #FFFFFF;
+    margin: 10px 0;
+    position: relative;
+}
+
+.ad-label {
+    font-size: 12px;
+    color: #999;
+    margin-bottom: 5px;
+}
+
+.ad-slot {
+    background: #f8f8f8;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #999;
+    font-size: 14px;
+    border: 1px dashed #ccc;
+}
+
+.ad-slot-728x90 {
+    width: 728px;
+    height: 90px;
+    max-width: 100%;
+}
+
+.ad-slot-300x250 {
+    width: 300px;
+    height: 250px;
+}
+
+.ad-slot-970x250 {
+    width: 970px;
+    height: 250px;
+    max-width: 100%;
+}

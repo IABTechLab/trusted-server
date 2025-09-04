@@ -19,7 +19,7 @@ use trusted_server_common::constants::{
 };
 use trusted_server_common::cookies::create_synthetic_cookie;
 use trusted_server_common::gam::{
-    handle_gam_custom_url, handle_gam_golden_url, handle_gam_render, handle_gam_test,
+    handle_gam_custom_url, handle_gam_golden_url, handle_gam_passthrough, handle_gam_render, handle_gam_test, handle_server_side_ad,
 };
 // Note: TrustedServerError is used internally by the common crate
 use trusted_server_common::gdpr::{
@@ -74,6 +74,13 @@ fn main(req: Request) -> Result<Response, Error> {
             (&Method::GET, "/gam-golden-url") => handle_gam_golden_url(&settings, req).await,
             (&Method::POST, "/gam-test-custom-url") => handle_gam_custom_url(&settings, req).await,
             (&Method::GET, "/gam-render") => handle_gam_render(&settings, req).await,
+            (&Method::POST, "/gam-passthrough") => handle_gam_passthrough(&settings, req).await,
+            (&Method::GET, "/server-side-ad") => handle_server_side_ad(&settings, req).await,
+            
+            // Static asset endpoints with long cache
+            (&Method::GET, "/static/styles.css") => handle_static_css(),
+            (&Method::GET, "/static/app.js") => handle_static_js(),
+            
             (&Method::GET, "/gam-test-page") => Ok(Response::from_status(StatusCode::OK)
                 .with_body(GAM_TEST_TEMPLATE)
                 .with_header(header::CONTENT_TYPE, "text/html")
@@ -196,11 +203,12 @@ fn handle_edgepubs_page(settings: &Settings, mut req: Request) -> Result<Respons
         Err(e) => return Ok(to_error_response(e)),
     };
 
-    // Create response with EdgePubs template
+    // Create response with EdgePubs template - cache base HTML for 10 minutes
     let mut response = Response::from_status(StatusCode::OK)
         .with_body(EDGEPUBS_TEMPLATE)
-        .with_header(header::CONTENT_TYPE, "text/html")
-        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "public, max-age=600, s-maxage=600") // 10 min cache
+        .with_header("ETag", &format!("\"edgepubs-v68-{}\"", fresh_id[..8].to_string())) // Version-based ETag
         .with_header(HEADER_X_COMPRESS_HINT, "on");
 
     // Add synthetic ID headers
@@ -1244,10 +1252,12 @@ fn handle_ad_request(settings: &Settings, mut req: Request) -> Result<Response, 
                     }
                 }
 
-                // Return the JSON response with CORS headers
+                // Return the JSON response with CORS headers - NO CACHE for ad content
                 let mut response = Response::from_status(StatusCode::OK)
-                    .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header(header::CACHE_CONTROL, "no-store, private")
+                    .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .with_header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, private")
+                    .with_header("Pragma", "no-cache") // HTTP/1.0 compatibility
+                    .with_header("Expires", "0") // Prevent any proxy caching
                     .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .with_header(
                         header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -1425,4 +1435,24 @@ fn init_logger() {
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
         .expect("Failed to initialize logger");
+}
+
+/// Handle static CSS with long cache
+fn handle_static_css() -> Result<Response, Error> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/css; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "public, max-age=86400, s-maxage=86400") // 24 hour cache
+        .with_header("ETag", "\"css-v68\"")
+        .with_header(HEADER_X_COMPRESS_HINT, "on")
+        .with_body(include_str!("../../../static/styles.css")))
+}
+
+/// Handle static JS with long cache  
+fn handle_static_js() -> Result<Response, Error> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "public, max-age=86400, s-maxage=86400") // 24 hour cache
+        .with_header("ETag", "\"js-v68\"")
+        .with_header(HEADER_X_COMPRESS_HINT, "on")
+        .with_body(include_str!("../../../static/app.js")))
 }
