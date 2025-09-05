@@ -76,6 +76,18 @@ fn detect_request_scheme(req: &Request) -> String {
     "http".to_string()
 }
 
+/// Returns true if the request path appears to reference a Prebid.js asset.
+/// Matches common filenames regardless of directory:
+/// - prebid.js, prebid.min.js
+/// - prebidjs.js, prebidjs.min.js (e.g., WordPress plugin paths)
+fn is_prebid_js_path(path: &str) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        filename.as_str(),
+        "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
+    )
+}
+
 /// Handles the main page request.
 ///
 /// Serves the main page with synthetic ID generation and ad integration.
@@ -349,8 +361,11 @@ pub fn handle_publisher_request(
     // Path match ignores query string (Fastly's get_path() returns only the path)
     if settings.prebid.auto_configure {
         let path = req.get_path();
-        if path == "/js/prebid.min.js" {
-            log::info!("Serving custom Prebid.js from static assets (auto_configure enabled)");
+        if is_prebid_js_path(path) {
+            log::info!(
+                "Serving custom Prebid.js for path '{}' (auto_configure enabled)",
+                path
+            );
             return handle_static_prebid_js(settings, req);
         }
     }
@@ -787,6 +802,25 @@ mod tests {
 
         // With auto_configure enabled (default), route should serve static prebid asset
         let mut req = Request::new(Method::GET, "https://edge.example.com/js/prebid.min.js");
+        req.set_header(header::HOST, "edge.example.com");
+        req.set_header("x-forwarded-proto", "https");
+
+        let mut resp = handle_publisher_request(&settings, req).expect("should serve prebid asset");
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        let body = resp.take_body_str();
+        assert!(body.contains("pbjs.setConfig"));
+        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
+    }
+
+    #[test]
+    fn test_handle_publisher_request_routes_prebid_asset_plugin_path() {
+        let settings = create_test_settings();
+
+        // WordPress plugin path with version query
+        let mut req = Request::new(
+            Method::GET,
+            "https://edge.example.com/wp-content/plugins/prebidjs/js/prebidjs.min.js?ver=1.0.0",
+        );
         req.set_header(header::HOST, "edge.example.com");
         req.set_header("x-forwarded-proto", "https");
 
