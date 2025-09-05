@@ -174,32 +174,35 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         // Decompress input
         let mut decoder = GzDecoder::new(input);
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)
+        decoder
+            .read_to_end(&mut decompressed)
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to decompress gzip".to_string(),
             })?;
-        
+
         log::info!("[Gzip] Decompressed size: {} bytes", decompressed.len());
-        
+
         // Process the decompressed content
-        let processed = self.processor.process_chunk(&decompressed, true)
+        let processed = self
+            .processor
+            .process_chunk(&decompressed, true)
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to process content".to_string(),
             })?;
-        
+
         log::info!("[Gzip] Processed size: {} bytes", processed.len());
-        
+
         // Recompress the output
         let mut encoder = GzEncoder::new(output, Compression::default());
-        encoder.write_all(&processed)
+        encoder
+            .write_all(&processed)
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to write to gzip encoder".to_string(),
             })?;
-        encoder.finish()
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to finish gzip encoder".to_string(),
-            })?;
-        
+        encoder.finish().change_context(TrustedServerError::Proxy {
+            message: "Failed to finish gzip encoder".to_string(),
+        })?;
+
         Ok(())
     }
 
@@ -293,7 +296,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         encoder.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush encoder".to_string(),
         })?;
-        
+
         // For GzEncoder and similar, we need to finish() to properly close the stream
         // The flush above might not be enough
         drop(encoder);
@@ -325,17 +328,22 @@ impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         // Accumulate input chunks
         self.accumulated_input.extend_from_slice(chunk);
-        
+
         if !chunk.is_empty() {
-            log::debug!("[HtmlRewriter] Buffering chunk: {} bytes, total buffered: {} bytes", 
-                chunk.len(), self.accumulated_input.len());
+            log::debug!(
+                "[HtmlRewriter] Buffering chunk: {} bytes, total buffered: {} bytes",
+                chunk.len(),
+                self.accumulated_input.len()
+            );
         }
 
         // Only process when we have all the input
         if is_last {
-            log::info!("[HtmlRewriter] Processing complete document: {} bytes", 
-                self.accumulated_input.len());
-            
+            log::info!(
+                "[HtmlRewriter] Processing complete document: {} bytes",
+                self.accumulated_input.len()
+            );
+
             // Process all accumulated input at once
             let mut output = Vec::new();
 
@@ -348,20 +356,16 @@ impl StreamProcessor for HtmlRewriterAdapter {
             );
 
             // Process the entire document
-            rewriter
-                .write(&self.accumulated_input)
-                .map_err(|e| {
-                    log::error!("[HtmlRewriter] Failed to process HTML: {}", e);
-                    io::Error::other(format!("HTML processing failed: {}", e))
-                })?;
+            rewriter.write(&self.accumulated_input).map_err(|e| {
+                log::error!("[HtmlRewriter] Failed to process HTML: {}", e);
+                io::Error::other(format!("HTML processing failed: {}", e))
+            })?;
 
             // Finalize the rewriter
-            rewriter
-                .end()
-                .map_err(|e| {
-                    log::error!("[HtmlRewriter] Failed to finalize: {}", e);
-                    io::Error::other(format!("HTML finalization failed: {}", e))
-                })?;
+            rewriter.end().map_err(|e| {
+                log::error!("[HtmlRewriter] Failed to finalize: {}", e);
+                io::Error::other(format!("HTML finalization failed: {}", e))
+            })?;
 
             log::debug!("[HtmlRewriter] Output size: {} bytes", output.len());
             self.accumulated_input.clear();
@@ -438,34 +442,35 @@ mod tests {
     #[test]
     fn test_html_rewriter_adapter_accumulates_until_last() {
         use lol_html::{element, Settings};
-        
+
         // Create a simple HTML rewriter that replaces text
         let settings = Settings {
-            element_content_handlers: vec![
-                element!("p", |el| {
-                    el.set_inner_content("replaced", lol_html::html_content::ContentType::Text);
-                    Ok(())
-                }),
-            ],
+            element_content_handlers: vec![element!("p", |el| {
+                el.set_inner_content("replaced", lol_html::html_content::ContentType::Text);
+                Ok(())
+            })],
             ..Settings::default()
         };
-        
+
         let mut adapter = HtmlRewriterAdapter::new(settings);
-        
+
         // Test that intermediate chunks return empty
         let chunk1 = b"<html><body>";
         let result1 = adapter.process_chunk(chunk1, false).unwrap();
         assert_eq!(result1.len(), 0, "Should return empty for non-last chunk");
-        
+
         let chunk2 = b"<p>original</p>";
         let result2 = adapter.process_chunk(chunk2, false).unwrap();
         assert_eq!(result2.len(), 0, "Should return empty for non-last chunk");
-        
+
         // Test that last chunk processes everything
         let chunk3 = b"</body></html>";
         let result3 = adapter.process_chunk(chunk3, true).unwrap();
-        assert!(result3.len() > 0, "Should return processed content for last chunk");
-        
+        assert!(
+            result3.len() > 0,
+            "Should return processed content for last chunk"
+        );
+
         let output = String::from_utf8(result3).unwrap();
         assert!(output.contains("replaced"), "Should have replaced content");
         assert!(output.contains("<html>"), "Should have complete HTML");
@@ -474,86 +479,96 @@ mod tests {
     #[test]
     fn test_html_rewriter_adapter_handles_large_input() {
         use lol_html::Settings;
-        
+
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
-        
+
         // Create a large HTML document
         let mut large_html = String::from("<html><body>");
         for i in 0..1000 {
             large_html.push_str(&format!("<p>Paragraph {}</p>", i));
         }
         large_html.push_str("</body></html>");
-        
+
         // Process in chunks
         let chunk_size = 1024;
         let bytes = large_html.as_bytes();
         let mut chunks = bytes.chunks(chunk_size);
         let mut last_chunk = chunks.next().unwrap_or(&[]);
-        
+
         for chunk in chunks {
             let result = adapter.process_chunk(last_chunk, false).unwrap();
             assert_eq!(result.len(), 0, "Intermediate chunks should return empty");
             last_chunk = chunk;
         }
-        
+
         // Process last chunk
         let result = adapter.process_chunk(last_chunk, true).unwrap();
         assert!(result.len() > 0, "Last chunk should return content");
-        
+
         let output = String::from_utf8(result).unwrap();
-        assert!(output.contains("Paragraph 999"), "Should contain all content");
+        assert!(
+            output.contains("Paragraph 999"),
+            "Should contain all content"
+        );
     }
 
     #[test]
     fn test_html_rewriter_adapter_reset() {
         use lol_html::Settings;
-        
+
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
-        
+
         // Process some content
         adapter.process_chunk(b"<html>", false).unwrap();
         adapter.process_chunk(b"<body>test</body>", false).unwrap();
-        
+
         // Reset should clear accumulated input
         adapter.reset();
-        
+
         // After reset, adapter should be ready for new input
         let result = adapter.process_chunk(b"<p>new</p>", true).unwrap();
         let output = String::from_utf8(result).unwrap();
-        assert_eq!(output, "<p>new</p>", "Should only contain new input after reset");
+        assert_eq!(
+            output, "<p>new</p>",
+            "Should only contain new input after reset"
+        );
     }
 
     #[test]
     fn test_streaming_pipeline_with_html_rewriter() {
         use lol_html::{element, Settings};
-        
+
         let settings = Settings {
-            element_content_handlers: vec![
-                element!("a[href]", |el| {
-                    if let Some(href) = el.get_attribute("href") {
-                        if href.contains("example.com") {
-                            el.set_attribute("href", &href.replace("example.com", "test.com"))?;
-                        }
+            element_content_handlers: vec![element!("a[href]", |el| {
+                if let Some(href) = el.get_attribute("href") {
+                    if href.contains("example.com") {
+                        el.set_attribute("href", &href.replace("example.com", "test.com"))?;
                     }
-                    Ok(())
-                }),
-            ],
+                }
+                Ok(())
+            })],
             ..Settings::default()
         };
-        
+
         let adapter = HtmlRewriterAdapter::new(settings);
         let config = PipelineConfig::default();
         let mut pipeline = StreamingPipeline::new(config, adapter);
-        
+
         let input = b"<html><body><a href=\"https://example.com\">Link</a></body></html>";
         let mut output = Vec::new();
-        
+
         pipeline.process(&input[..], &mut output).unwrap();
-        
+
         let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("https://test.com"), "Should have replaced URL");
-        assert!(!result.contains("example.com"), "Should not contain original URL");
+        assert!(
+            result.contains("https://test.com"),
+            "Should have replaced URL"
+        );
+        assert!(
+            !result.contains("example.com"),
+            "Should not contain original URL"
+        );
     }
 }

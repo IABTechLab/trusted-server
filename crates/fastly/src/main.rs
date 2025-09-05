@@ -10,6 +10,7 @@ use trusted_server_common::gam::{
 use trusted_server_common::gdpr::{handle_consent_request, handle_data_subject_request};
 use trusted_server_common::partners::handle_partner_asset;
 use trusted_server_common::prebid::handle_prebid_test;
+use trusted_server_common::prebid_proxy::{handle_prebid_auction, handle_prebid_cookie_sync};
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::{
     handle_edgepubs_page, handle_main_page, handle_publisher_request,
@@ -77,6 +78,11 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
             handle_gam_asset(&settings, req).await
         }
         (&Method::GET, "/prebid-test", _) => handle_prebid_test(&settings, req).await,
+
+        // Prebid Server first-party auction endpoint
+        (&Method::POST, "/openrtb2/auction", _) => handle_prebid_auction(&settings, req).await,
+        // Prebid Server first-party cookie sync
+        (&Method::POST, "/cookie_sync", _) => handle_prebid_cookie_sync(&settings, req).await,
 
         // GAM (Google Ad Manager) routes
         (&Method::GET, "/gam-test", true) => handle_gam_test(&settings, req).await,

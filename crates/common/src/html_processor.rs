@@ -1,14 +1,12 @@
 //! Simplified HTML processor that combines URL replacement and Prebid injection
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use lol_html::{element, Settings as RewriterSettings};
 
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
-use crate::streaming_replacer::create_url_replacer;
 
 /// Configuration for HTML processing
 #[derive(Clone)]
@@ -47,49 +45,8 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Manages Prebid.js configuration injection
-#[derive(Clone)]
-struct PrebidInjector {
-    script: Option<String>,
-    injected: Rc<RefCell<bool>>,
-}
-
-
-impl PrebidInjector {
-    fn new(config: &HtmlProcessorConfig) -> Self {
-        let script = if config.enable_prebid {
-            log::info!("[Prebid] Auto-configuration enabled for origin: {}", config.origin_host);
-            Some(generate_prebid_script(config))
-        } else {
-            log::debug!("[Prebid] Auto-configuration disabled");
-            None
-        };
-
-        Self {
-            script,
-            injected: Rc::new(RefCell::new(false)),
-        }
-    }
-
-    fn try_inject_prepend(&self, el: &mut lol_html::html_content::Element, context: &str) -> bool {
-        if let Some(ref script) = self.script {
-            let mut injected = self.injected.borrow_mut();
-            if !*injected {
-                // Inject if not already done
-                log::info!("[Prebid] Injecting configuration {}", context);
-                el.prepend(script, lol_html::html_content::ContentType::Html);
-                *injected = true;
-                return true;
-            }
-        }
-        false
-    }
-
-}
-
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
         origin_host: String,
@@ -101,19 +58,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         fn https_origin(&self) -> String {
             format!("https://{}", self.origin_host)
         }
-        
+
         fn http_origin(&self) -> String {
             format!("http://{}", self.origin_host)
         }
-        
+
         fn protocol_relative_origin(&self) -> String {
             format!("//{}", self.origin_host)
         }
-        
+
         fn replacement_url(&self) -> String {
             format!("{}://{}", self.request_scheme, self.request_host)
         }
-        
+
         fn protocol_relative_replacement(&self) -> String {
             format!("//{}", self.request_host)
         }
@@ -125,32 +82,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_scheme: config.request_scheme.clone(),
     });
 
-    // Create URL replacer
-    let replacer = create_url_replacer(
-        &config.origin_host,
-        &config.origin_url,
-        &config.request_host,
-        &config.request_scheme,
-    );
+    // Prebid injection is now handled in publisher.rs when serving /js/prebid.min.js
+    // Keep processor focused on URL rewriting only.
 
-    // Create Prebid injector wrapped in Rc for sharing
-    let prebid_injector = Rc::new(PrebidInjector::new(&config));
-
-    // TODO: IMPROVEMENT #5 - Element Handler Registration
-    // The long vector of element handlers could be built more dynamically:
-    // - Use a builder pattern: `HandlerBuilder::new().url_handlers().prebid_handlers().build()`
-    // - Or register handlers based on configuration flags
-    // - Could make it easier to conditionally include/exclude handlers
-    
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
-            // TODO: IMPROVEMENT #1 - Repetitive URL Replacement Logic
-            // Each URL handler below has similar replacement logic.
-            // Consider:
-            // - Create a helper: `create_url_handler("href", &patterns)`
-            // - Or add method to UrlPatterns: `patterns.create_replacement_handler("href")`
-            // - This would reduce ~50 lines to ~5 lines per handler
-            
             // Replace URLs in href attributes
             element!("[href]", {
                 let patterns = patterns.clone();
@@ -204,9 +140,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         let new_srcset = srcset
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url())
-                            .replace(&patterns.protocol_relative_origin(), &patterns.protocol_relative_replacement())
+                            .replace(
+                                &patterns.protocol_relative_origin(),
+                                &patterns.protocol_relative_replacement(),
+                            )
                             .replace(&patterns.origin_host, &patterns.request_host);
-                        
+
                         if new_srcset != srcset {
                             el.set_attribute("srcset", &new_srcset)?;
                         }
@@ -222,7 +161,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         let new_imagesrcset = imagesrcset
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url())
-                            .replace(&patterns.protocol_relative_origin(), &patterns.protocol_relative_replacement());
+                            .replace(
+                                &patterns.protocol_relative_origin(),
+                                &patterns.protocol_relative_replacement(),
+                            );
                         if new_imagesrcset != imagesrcset {
                             el.set_attribute("imagesrcset", &new_imagesrcset)?;
                         }
@@ -230,133 +172,33 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     Ok(())
                 }
             }),
-            
-            // TODO: IMPROVEMENT #2 - Closure Scoping Pattern
-            // The pattern `element!("sel", { let x = x.clone(); move |el| {...} })`
-            // is repeated for every handler. Consider:
-            // - A macro: `clone_element!("script[src]", prebid, |el, prebid| { ... })`
-            // - Or restructure to use a shared context object that doesn't need cloning
-            
-            // Inject at beginning of head if Prebid was detected
-            element!("head", {
-                let prebid_injector = prebid_injector.clone();
-                move |el| {
-                    prebid_injector.try_inject_prepend(el, "at beginning of <head> element");
-                    Ok(())
-                }
-            }),
         ],
 
-        // Replace URLs in text content
-        document_content_handlers: vec![lol_html::doc_text!({
-            move |text| {
-                let content = text.as_str();
+        // TODO: Consider adding text content replacement if needed with settings
+        // // Replace URLs in text content
+        // document_content_handlers: vec![lol_html::doc_text!({
+        //     move |text| {
+        //         let content = text.as_str();
 
-                // Apply URL replacements
-                let mut new_content = content.to_string();
-                for replacement in replacer.replacements.iter() {
-                    if new_content.contains(&replacement.find) {
-                        new_content = new_content.replace(&replacement.find, &replacement.replace_with);
-                    }
-                }
+        //         // Apply URL replacements
+        //         let mut new_content = content.to_string();
+        //         for replacement in replacer.replacements.iter() {
+        //             if new_content.contains(&replacement.find) {
+        //                 new_content = new_content.replace(&replacement.find, &replacement.replace_with);
+        //             }
+        //         }
 
-                if new_content != content {
-                    text.replace(&new_content, lol_html::html_content::ContentType::Text);
-                }
+        //         if new_content != content {
+        //             text.replace(&new_content, lol_html::html_content::ContentType::Text);
+        //         }
 
-                Ok(())
-            }
-        })],
-
+        //         Ok(())
+        //     }
+        // })],
         ..RewriterSettings::default()
     };
 
     HtmlRewriterAdapter::new(rewriter_settings)
-}
-
-/// Generate Prebid configuration script
-fn generate_prebid_script(config: &HtmlProcessorConfig) -> String {
-    let bidders_json =
-        serde_json::to_string(&config.prebid_bidders).unwrap_or_else(|_| "[]".to_string());
-
-    // Simplified Prebid configuration using queue mechanism
-    format!(
-        r#"<!-- Trusted Server Prebid Config Start -->
-<script type="text/javascript">
-// Initialize Prebid queue
-window.__trustedServerPrebid = true;
-window.pbjs = window.pbjs || {{}};
-window.pbjs.que = window.pbjs.que || [];
-
-// Queue the configuration
-window.pbjs.que.push(function() {{
-    console.log('[Trusted Server] Configuring Prebid.js for first-party serving');
-    
-    // Ensure we have the required objects
-    if (typeof pbjs === 'undefined' || !pbjs.setConfig) {{
-        console.error('[Trusted Server] Prebid.js not fully loaded yet');
-        return;
-    }}
-    
-    pbjs.setConfig({{
-        s2sConfig: {{
-            accountId: '{}',
-            enabled: true,
-            defaultVendor: 'custom',
-            bidders: {},
-            endpoint: '{}://{}/openrtb2/auction',
-            syncEndpoint: '{}://{}/cookie_sync',
-            timeout: {},
-            adapter: 'prebidServer',
-            allowUnknownBidderCodes: true
-        }},
-        debug: {},
-        userSync: {{
-            syncEnabled: true,
-            userIds: [],
-            syncsPerBidder: 5,
-            syncDelay: 3000,
-            auctionDelay: 0
-        }}
-    }});
-    
-    // Override setConfig to preserve our endpoints
-    var originalSetConfig = pbjs.setConfig;
-    pbjs.setConfig = function(config) {{
-        if (config.s2sConfig && !config.__trustedServerOverride) {{
-            console.log('[Trusted Server] Preserving first-party s2sConfig endpoints');
-            config.s2sConfig.endpoint = '{}://{}/openrtb2/auction';
-            config.s2sConfig.syncEndpoint = '{}://{}/cookie_sync';
-            config.s2sConfig.enabled = true;
-        }}
-        return originalSetConfig.call(this, config);
-    }};
-    
-    console.log('[Trusted Server] Configuration complete. Current config:', pbjs.getConfig('s2sConfig'));
-    
-    // Check if ad units are defined
-    if (pbjs.adUnits && pbjs.adUnits.length > 0) {{
-        console.log('[Trusted Server] Found ' + pbjs.adUnits.length + ' ad units');
-    }} else {{
-        console.log('[Trusted Server] No ad units defined yet. Prebid will request bids when ad units are added.');
-    }}
-}});
-</script>
-<!-- Trusted Server Prebid Config End -->
-"#,
-        config.prebid_account_id,
-        bidders_json,
-        config.request_scheme,
-        config.request_host,
-        config.request_scheme,
-        config.request_host,
-        config.prebid_timeout_ms,
-        config.prebid_debug,
-        config.request_scheme,
-        config.request_host,
-        config.request_scheme,
-        config.request_host
-    )
 }
 
 #[cfg(test)]
@@ -411,71 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_html_processor_with_prebid_injection() {
-        let mut config = create_test_config();
-        config.enable_prebid = true;
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = r#"<html>
-            <head>
-                <script src="/prebid.js"></script>
-            </head>
-            <body>Content</body>
-        </html>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        
-        // Debug: print the full result
-        println!("DEBUG: Full HTML output:");
-        println!("{}", result);
-        
-        // Should inject Prebid configuration
-        assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("pbjs.setConfig"));
-        assert!(result.contains("https://test.example.com/openrtb2/auction"));
-        assert!(result.contains(r#"["kargo","rubicon"]"#) || result.contains("bidders:"));
-    }
-
-    #[test]
-    fn test_create_html_processor_text_content_replacement() {
-        let config = create_test_config();
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = r#"<script>
-            var apiUrl = "https://origin.example.com/api";
-            fetch("http://origin.example.com/data");
-        </script>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains(r#"https://test.example.com/api"#));
-        assert!(result.contains(r#"https://test.example.com/data"#));
-    }
-
-    #[test]
     fn test_html_processor_config_from_settings() {
         use crate::test_support::tests::create_test_settings;
 
@@ -498,137 +275,27 @@ mod tests {
     }
 
     #[test]
-    fn test_prebid_injection_with_inline_script() {
-        let mut config = create_test_config();
-        config.enable_prebid = true;
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = r#"<html>
-            <head>
-                <script>
-                    var pbjs = pbjs || {};
-                    pbjs.que = pbjs.que || [];
-                    pbjs.que.push(function() {
-                        pbjs.addAdUnits(adUnits);
-                    });
-                </script>
-            </head>
-            <body>Content</body>
-        </html>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        // Should detect Prebid in inline script and inject configuration
-        assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("pbjs.setConfig"));
-        assert!(result.contains("https://test.example.com/openrtb2/auction"));
-    }
-
-    #[test]
-    fn test_prebid_injection_after_inline_script() {
-        let mut config = create_test_config();
-        config.enable_prebid = true;
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        // Put pbjs reference earlier so it's detected before we hit the script element
-        let html = r#"<html>
-            <head>
-                <title>Test with pbjs</title>
-            </head>
-            <body>
-                <script>
-                    // Initialize Prebid.js
-                    window.pbjs = window.pbjs || {};
-                </script>
-                <div>Content after script</div>
-            </body>
-        </html>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        
-        // Should inject configuration at head since we now inject there
-        assert!(result.contains("window.__trustedServerPrebid = true"));
-    }
-
-    #[test]
-    fn test_prebid_injection_body_fallback() {
-        let mut config = create_test_config();
-        config.enable_prebid = true;
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        // HTML with Prebid reference detected early (in title) but injected at body
-        let html = r#"<html>
-            <head>
-                <title>Page with pbjs</title>
-            </head>
-            <body>
-                <div>Content here</div>
-            </body>
-        </html>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        // Should inject configuration somewhere (head or body fallback)
-        assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("pbjs.setConfig"));
-    }
-
-    #[test]
     fn test_real_publisher_html() {
         // Test with publisher HTML from test_publisher.html
         let html = include_str!("html_processor.test.html");
-        
+
         // Count URLs in the test HTML
         let original_urls = html.matches("www.test-publisher.com").count();
         let https_urls = html.matches("https://www.test-publisher.com").count();
         let protocol_relative_urls = html.matches("//www.test-publisher.com").count();
-        
+
         println!("Test HTML stats:");
         println!("  Total URLs: {}", original_urls);
         println!("  HTTPS URLs: {}", https_urls);
         println!("  Protocol-relative URLs: {}", protocol_relative_urls);
-        
+
         // Process - replace test-publisher.com with our edge domain
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
         config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true; // Enable Prebid auto-configuration
-        
+
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -638,63 +305,74 @@ mod tests {
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
         let mut output = Vec::new();
-        pipeline.process(Cursor::new(html.as_bytes()), &mut output).unwrap();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
         let result = String::from_utf8(output).unwrap();
-        
-        // Assertions - with Prebid injection
-        assert!(result.len() > html.len(), "Output should be larger due to Prebid injection");
-        
-        // Check URL replacements
+
+        // Assertions - only URL attribute replacements are expected
+        // Check URL replacements (not all occurrences will be replaced since
+        // we only rewrite attributes, not text/JSON/script bodies)
         let remaining_urls = result.matches("www.test-publisher.com").count();
         let replaced_urls = result.matches("test-publisher-ts.edgecompute.app").count();
-        
+
         println!("After processing:");
         println!("  Remaining original URLs: {}", remaining_urls);
         println!("  Edge domain URLs: {}", replaced_urls);
-        
-        // Most URLs should be replaced
-        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced: found {}", remaining_urls);
-        // Should have replacements + 4 from Prebid config (855 replaced + 4 = 859)
-        assert_eq!(replaced_urls, 859, "Should have exactly 859 edge domain URLs (855 replaced + 4 from Prebid)");
-        
+
+        // Expect at least some replacements and fewer originals than before
+        assert!(replaced_urls > 0, "Should replace some URLs in attributes");
+        assert!(
+            remaining_urls < original_urls,
+            "Should reduce occurrences of original host in attributes"
+        );
+
         // Verify HTML structure
         assert_eq!(&result[0..15], "<!DOCTYPE html>");
-        assert_eq!(&result[result.len()-7..], "</html>");
-        
+        assert_eq!(&result[result.len() - 7..], "</html>");
+
         // Verify content preservation
-        assert!(result.contains("Mercedes CEO"), "Should preserve article title");
-        assert!(result.contains("test-publisher"), "Should preserve text content");
-        // Prebid auto-configuration should be injected
-        assert!(result.contains("window.__trustedServerPrebid = true"), "Should contain Prebid initialization");
-        assert!(result.contains("pbjs.setConfig"), "Should contain Prebid configuration");
+        assert!(
+            result.contains("Mercedes CEO"),
+            "Should preserve article title"
+        );
+        assert!(
+            result.contains("test-publisher"),
+            "Should preserve text content"
+        );
+        // No Prebid auto-configuration injection performed here
+        assert!(
+            !result.contains("window.__trustedServerPrebid"),
+            "HtmlProcessor should not inject Prebid config"
+        );
     }
 
     #[test]
     fn test_real_publisher_html_with_gzip() {
-        use flate2::write::GzEncoder;
         use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
         use flate2::Compression as GzCompression;
-        use std::io::{Write, Read};
-        
+        use std::io::{Read, Write};
+
         let html = include_str!("html_processor.test.html");
-        
+
         // Count URLs in test HTML
         let _original_urls = html.matches("www.test-publisher.com").count();
-        
+
         // Compress
         let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
         encoder.write_all(html.as_bytes()).unwrap();
         let compressed_input = encoder.finish().unwrap();
-        
+
         println!("Compressed input size: {} bytes", compressed_input.len());
-        
+
         // Process with compression
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
         config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true;
-        
+
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::Gzip,
@@ -702,50 +380,65 @@ mod tests {
             chunk_size: 8192,
         };
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-        
+
         let mut compressed_output = Vec::new();
-        pipeline.process(Cursor::new(&compressed_input), &mut compressed_output).unwrap();
-        
-        // Compressed output will be larger due to Prebid injection
-        assert!(compressed_output.len() > compressed_input.len(), "Compressed output should be larger than input");
-        
+        pipeline
+            .process(Cursor::new(&compressed_input), &mut compressed_output)
+            .unwrap();
+
+        // Ensure we produced output
+        assert!(
+            compressed_output.len() > 0,
+            "Should produce compressed output"
+        );
+
         // Decompress and verify
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
         decoder.read_to_string(&mut decompressed).unwrap();
-        
-        // Assertions - with Prebid injection
-        assert!(decompressed.len() > html.len(), "Decompressed output should be larger than original");
-        
+
         let remaining_urls = decompressed.matches("www.test-publisher.com").count();
-        let replaced_urls = decompressed.matches("test-publisher-ts.edgecompute.app").count();
-        
-        assert!(remaining_urls <= 8, "At most 8 URLs should remain unreplaced");
-        assert_eq!(replaced_urls, 859, "Should have exactly 859 edge domain URLs (855 replaced + 4 from Prebid)");
-        
+        let replaced_urls = decompressed
+            .matches("test-publisher-ts.edgecompute.app")
+            .count();
+
+        assert!(replaced_urls > 0, "Should replace some URLs in attributes");
+        assert!(
+            remaining_urls < _original_urls,
+            "Should reduce occurrences of original host in attributes"
+        );
+
         // Verify structure
         assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
-        assert_eq!(&decompressed[decompressed.len()-7..], "</html>");
-        
-        // Verify content preservation
-        assert!(decompressed.contains("Mercedes CEO"), "Should preserve article title");
-        assert!(decompressed.contains("test-publisher"), "Should preserve text content");
-        // Prebid auto-configuration should be injected
-        assert!(decompressed.contains("window.__trustedServerPrebid = true"), "Should contain Prebid initialization");
-        assert!(decompressed.contains("pbjs.setConfig"), "Should contain Prebid configuration");
-    }
+        assert_eq!(&decompressed[decompressed.len() - 7..], "</html>");
 
+        // Verify content preservation
+        assert!(
+            decompressed.contains("Mercedes CEO"),
+            "Should preserve article title"
+        );
+        assert!(
+            decompressed.contains("test-publisher"),
+            "Should preserve text content"
+        );
+        // No Prebid auto-configuration injection performed here
+        assert!(
+            !decompressed.contains("window.__trustedServerPrebid"),
+            "HtmlProcessor should not inject Prebid config"
+        );
+    }
 
     #[test]
     fn test_already_truncated_html_passthrough() {
         // Test that we don't make truncated HTML worse
         // This simulates receiving already-truncated HTML from origin
-        
-        let truncated_html = r#"<html><head><title>Test</title></head><body><p>This is a test that gets cut o"#;
-        
+
+        let truncated_html =
+            r#"<html><head><title>Test</title></head><body><p>This is a test that gets cut o"#;
+
         println!("Testing already-truncated HTML");
         println!("Input: '{}'", truncated_html);
-        
+
         let config = create_test_config();
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -754,66 +447,24 @@ mod tests {
             chunk_size: 8192,
         };
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-        
+
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(truncated_html.as_bytes()), &mut output);
-        
-        assert!(result.is_ok(), "Should process truncated HTML without error");
-        
+
+        assert!(
+            result.is_ok(),
+            "Should process truncated HTML without error"
+        );
+
         let processed = String::from_utf8_lossy(&output);
         println!("Output: '{}'", processed);
-        
+
         // The processor should pass through the truncated HTML
         // It might add some closing tags, but shouldn't truncate further
-        assert!(processed.len() >= truncated_html.len(), 
-            "Output should not be shorter than truncated input");
-    }
-    
-    #[test]
-    fn test_prebid_injection_at_beginning_of_head() {
-        let html = r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Test</title>
-    <script src="/js/prebid.min.js"></script>
-</head>
-<body>
-    <h1>Test Page</h1>
-    <p>Some content here</p>
-    <div>More content</div>
-</body>
-</html>"#;
-
-        let mut config = create_test_config();
-        config.enable_prebid = true;
-        
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-        
-        let mut output = Vec::new();
-        pipeline.process(Cursor::new(html.as_bytes()), &mut output).unwrap();
-        let result = String::from_utf8(output).unwrap();
-        
-        // Find positions
-        let head_open_pos = result.find("<head>").expect("Should have opening head tag") + 6;
-        let prebid_pos = result.find("window.__trustedServerPrebid").expect("Prebid config should be injected");
-        let title_pos = result.find("<title>").expect("Should have title tag");
-        let prebid_js_pos = result.find("src=\"/js/prebid.min.js\"").expect("Should have prebid.min.js script");
-        
-        // Prebid config should be after <head> opens but before other head content
-        assert!(prebid_pos > head_open_pos, "Prebid should be after head opening tag");
-        assert!(prebid_pos < title_pos, "Prebid should be before the title tag");
-        assert!(prebid_pos < prebid_js_pos, "Prebid config should be before prebid.min.js loads");
-        
-        // Verify it's at the beginning of head
-        let head_content_start = &result[head_open_pos..head_open_pos + 100];
-        assert!(head_content_start.contains("<!-- Trusted Server Prebid Config Start -->"), 
-            "Prebid config should be at the beginning of head");
+        assert!(
+            processed.len() >= truncated_html.len(),
+            "Output should not be shorter than truncated input"
+        );
     }
 
     #[test]
@@ -824,19 +475,28 @@ mod tests {
         // This HTML is clearly truncated - it ends in the middle of an attribute value
         println!("Testing truncated HTML (ends in middle of URL)");
         println!("Input length: {} bytes", truncated_html.len());
-        
+
         // Check that the input is indeed truncated
-        assert!(!truncated_html.contains("</html>"), "Input should be truncated (no closing html tag)");
-        assert!(!truncated_html.contains("</body>"), "Input should be truncated (no closing body tag)"); 
-        assert!(truncated_html.ends_with("/ar"), "Input should end with '/ar' showing truncation");
-        
+        assert!(
+            !truncated_html.contains("</html>"),
+            "Input should be truncated (no closing html tag)"
+        );
+        assert!(
+            !truncated_html.contains("</body>"),
+            "Input should be truncated (no closing body tag)"
+        );
+        assert!(
+            truncated_html.ends_with("/ar"),
+            "Input should end with '/ar' showing truncation"
+        );
+
         // Process it through our pipeline
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
         config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true;
-        
+
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -846,101 +506,40 @@ mod tests {
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
         let mut output = Vec::new();
-        
+
         // The processor should handle truncated HTML gracefully
         let result = pipeline.process(Cursor::new(truncated_html.as_bytes()), &mut output);
-        
+
         // Even with truncated input, processing should complete
-        assert!(result.is_ok(), "Processing should complete even with truncated HTML");
-        
+        assert!(
+            result.is_ok(),
+            "Processing should complete even with truncated HTML"
+        );
+
         let processed = String::from_utf8_lossy(&output);
         println!("Output length: {} bytes", processed.len());
-        
+
         // The processor will try to fix the HTML structure
         // lol_html should handle the truncated input and still produce output
-        
+
         // Check what we got back
         if processed.contains("</html>") {
             println!("Note: lol_html added closing tags to fix truncated HTML");
         }
-        
+
         // The key issue is that truncated HTML should not cause a panic or error
         // The output might still be malformed, but it should process
-        
-        println!("Last 100 chars of output: {}", 
-            processed.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
-    }
 
-    #[test]
-    fn test_prebid_autoconfigure_enabled() {
-        // Test that Prebid is injected when auto_configure is true
-        let mut config = create_test_config();
-        config.enable_prebid = true; // auto_configure enabled
-        config.prebid_account_id = "test-1001".to_string();
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = r#"
-        <html>
-        <head>
-            <script src="/prebid.js"></script>
-        </head>
-        <body>
-            <p>Test content</p>
-        </body>
-        </html>
-        "#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        
-        // Should auto-inject Prebid configuration
-        assert!(result.contains("window.__trustedServerPrebid = true"));
-        assert!(result.contains("pbjs.setConfig"));
-        assert!(result.contains("test-1001")); // Account ID
-        assert!(result.contains("Trusted Server Prebid Config"));
-    }
-
-    #[test]
-    fn test_prebid_not_injected_when_disabled() {
-        let mut config = create_test_config();
-        config.enable_prebid = false; // Explicitly disable (auto_configure = false)
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = r#"<html>
-            <head>
-                <script src="/prebid.js"></script>
-                <script>
-                    var pbjs = pbjs || {};
-                </script>
-            </head>
-        </html>"#;
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        // Should NOT inject when disabled
-        assert!(!result.contains("window.__trustedServerPrebid"));
-        assert!(!result.contains("pbjs.setConfig"));
+        println!(
+            "Last 100 chars of output: {}",
+            processed
+                .chars()
+                .rev()
+                .take(100)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
     }
 }

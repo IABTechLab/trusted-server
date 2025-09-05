@@ -186,6 +186,57 @@ pub fn handle_main_page(
     Ok(response)
 }
 
+/// Serves the custom Prebid.js build from `static/prebid/` when requested as `/js/prebid.min.js`.
+///
+/// This ignores any version query parameter (e.g., `?v=...`) since routing uses only the path.
+pub fn handle_static_prebid_js(
+    _settings: &Settings,
+    mut _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    use serde_json::json;
+
+    // Base Prebid library
+    let prebid_lib = include_str!("../../../static/prebid/prebijs.min.js");
+
+    // Runtime shim that configures S2S and ensures SAS is present on request
+    let shim_tpl = include_str!("../../../static/prebid/prebidjs-shim.js");
+
+    // Build replacements from settings and request
+    let scheme = detect_request_scheme(&_req);
+    let host = _req
+        .get_header(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let bidders_json = json!(&_settings.prebid.bidders).to_string();
+    let shim_filled = shim_tpl
+        .replace("__ACCOUNT_ID__", &_settings.prebid.account_id)
+        .replace("__BIDDERS__", &bidders_json)
+        .replace("__SCHEME__", &scheme)
+        .replace("__HOST__", &host)
+        .replace("__TIMEOUT__", &_settings.prebid.timeout_ms.to_string())
+        .replace(
+            "__DEBUG__",
+            if _settings.prebid.debug {
+                "true"
+            } else {
+                "false"
+            },
+        );
+
+    let combined = format!("{}\n;\n{}\n", prebid_lib, shim_filled);
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
+        // Long cache; asset is versioned by query param at the caller
+        .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .with_body(combined))
+}
+
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
@@ -249,7 +300,10 @@ fn process_response_streaming(
         pipeline.process(body, &mut output)?;
     }
 
-    log::info!("Streaming processing complete - output size: {} bytes", output.len());
+    log::info!(
+        "Streaming processing complete - output size: {} bytes",
+        output.len()
+    );
     Ok(Body::from(output))
 }
 
@@ -290,6 +344,16 @@ pub fn handle_publisher_request(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Proxying request to publisher_origin");
+
+    // Serve our custom Prebid.js only when auto_configure is enabled
+    // Path match ignores query string (Fastly's get_path() returns only the path)
+    if settings.prebid.auto_configure {
+        let path = req.get_path();
+        if path == "/js/prebid.min.js" {
+            log::info!("Serving custom Prebid.js from static assets (auto_configure enabled)");
+            return handle_static_prebid_js(settings, req);
+        }
+    }
 
     // Extract the request host from the incoming request
     let request_host = req
@@ -655,5 +719,81 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn test_handle_static_prebid_js_injects_config_https() {
+        let settings = create_test_settings();
+
+        let mut req = Request::new(Method::GET, "https://edge.example.com/js/prebid.min.js");
+        req.set_header(header::HOST, "edge.example.com");
+        req.set_header("x-forwarded-proto", "https");
+
+        let mut resp = handle_static_prebid_js(&settings, req).expect("should build prebid asset");
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header(header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default(),
+            "application/javascript; charset=utf-8"
+        );
+
+        let body = resp.take_body_str();
+
+        // Contains shim config and replaced placeholders
+        assert!(body.contains("pbjs.setConfig"));
+        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
+        assert!(body.contains("https://edge.example.com/cookie_sync"));
+        assert!(body.contains("'1001'")); // default account id from settings
+        assert!(body.contains("kargo") && body.contains("rubicon"));
+
+        // Ensure no unreplaced placeholders remain
+        for placeholder in [
+            "__ACCOUNT_ID__",
+            "__BIDDERS__",
+            "__SCHEME__",
+            "__HOST__",
+            "__TIMEOUT__",
+            "__DEBUG__",
+        ] {
+            assert!(
+                !body.contains(placeholder),
+                "Placeholder '{}' should be replaced",
+                placeholder
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_static_prebid_js_injects_config_http() {
+        let mut settings = create_test_settings();
+        settings.prebid.debug = true; // also verify __DEBUG__ replacement
+
+        let mut req = Request::new(Method::GET, "http://edge.example.com/js/prebid.min.js");
+        req.set_header(header::HOST, "edge.example.com");
+        req.set_header("x-forwarded-proto", "http");
+
+        let mut resp = handle_static_prebid_js(&settings, req).expect("should build prebid asset");
+        let body = resp.take_body_str();
+
+        assert!(body.contains("http://edge.example.com/openrtb2/auction"));
+        assert!(body.contains("http://edge.example.com/cookie_sync"));
+        assert!(body.contains("debug: true"));
+    }
+
+    #[test]
+    fn test_handle_publisher_request_routes_prebid_asset() {
+        let settings = create_test_settings();
+
+        // With auto_configure enabled (default), route should serve static prebid asset
+        let mut req = Request::new(Method::GET, "https://edge.example.com/js/prebid.min.js");
+        req.set_header(header::HOST, "edge.example.com");
+        req.set_header("x-forwarded-proto", "https");
+
+        let mut resp = handle_publisher_request(&settings, req).expect("should serve prebid asset");
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        let body = resp.take_body_str();
+        assert!(body.contains("pbjs.setConfig"));
+        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
     }
 }
