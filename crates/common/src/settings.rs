@@ -222,9 +222,9 @@ where
         JsonValue::Object(map) => {
             let mut items: Vec<(usize, T)> = Vec::with_capacity(map.len());
             for (k, val) in map.into_iter() {
-                let idx = k
-                    .parse::<usize>()
-                    .map_err(|_| serde::de::Error::custom(format!("Invalid index '{}' in map for Vec field", k)))?;
+                let idx = k.parse::<usize>().map_err(|_| {
+                    serde::de::Error::custom(format!("Invalid index '{}' in map for Vec field", k))
+                })?;
                 let parsed: T = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
                 items.push((idx, parsed));
             }
@@ -237,14 +237,18 @@ where
                 serde_json::from_str::<Vec<T>>(txt).map_err(serde::de::Error::custom)
             } else {
                 let parts = if txt.contains(',') {
-                    txt.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect::<Vec<_>>()
+                    txt.split(',')
+                        .map(|p| p.trim())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
                 } else {
                     vec![txt]
                 };
                 let mut out: Vec<T> = Vec::with_capacity(parts.len());
                 for p in parts {
                     let json = format!("\"{}\"", p.replace('"', "\\\""));
-                    let parsed: T = serde_json::from_str(&json).map_err(serde::de::Error::custom)?;
+                    let parsed: T =
+                        serde_json::from_str(&json).map_err(serde::de::Error::custom)?;
                     out.push(parsed);
                 }
                 Ok(out)
@@ -395,11 +399,11 @@ mod tests {
             Some("https://origin.test-publisher.com"),
             || {
                 temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                let res = Settings::from_toml(&toml_str);
-                if res.is_err() {
-                    eprintln!("JSON override error: {:?}", res.as_ref().err());
-                }
-                let settings = res.expect("Settings should parse with JSON env override");
+                    let res = Settings::from_toml(&toml_str);
+                    if res.is_err() {
+                        eprintln!("JSON override error: {:?}", res.as_ref().err());
+                    }
+                    let settings = res.expect("Settings should parse with JSON env override");
                     assert_eq!(
                         settings.prebid.bidders,
                         vec!["smartadserver".to_string(), "rubicon".to_string()]
@@ -443,10 +447,7 @@ mod tests {
                     temp_env::with_var(env_key1, Some("openx"), || {
                         let res = Settings::from_toml(&toml_str);
                         if res.is_err() {
-                            eprintln!(
-                                "Indexed override error: {:?}",
-                                res.as_ref().err()
-                            );
+                            eprintln!("Indexed override error: {:?}", res.as_ref().err());
                         }
                         let settings =
                             res.expect("Settings should parse with indexed env override");
