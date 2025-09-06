@@ -21,11 +21,17 @@ async function loadServerSideAd() {
         
         const data = await response.json();
         console.log('Server-side ad response:', data);
+        console.log('Response status:', data.status);
+        console.log('Ad HTML length:', data.ad_slot_html ? data.ad_slot_html.length : 0);
         
         if (data.status === 'server_side_ad_success' && data.ad_slot_html) {
+            console.log('Setting innerHTML for ad slot with content length:', data.ad_slot_html.length);
+            console.log('First 200 chars of creative:', data.ad_slot_html.substring(0, 200));
             adSlot.innerHTML = data.ad_slot_html;
             console.log('Server-side ad loaded successfully');
+            console.log('Ad slot innerHTML after setting:', adSlot.innerHTML.substring(0, 200));
         } else {
+            console.log('No successful bid, showing fallback');
             adSlot.innerHTML = data.ad_slot_html || '<span style="color: #999;">No ad available</span>';
         }
     } catch (error) {

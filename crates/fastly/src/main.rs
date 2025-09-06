@@ -1456,3 +1456,4 @@ fn handle_static_js() -> Result<Response, Error> {
         .with_header(HEADER_X_COMPRESS_HINT, "on")
         .with_body(include_str!("../../../static/app.js")))
 }
+

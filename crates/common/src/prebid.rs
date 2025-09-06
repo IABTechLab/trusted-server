@@ -107,7 +107,7 @@ impl PrebidRequest {
         settings: &Settings,
         incoming_req: &Request,
     ) -> Result<Response, Error> {
-        let mut req = Request::new(Method::POST, settings.prebid.server_url.to_owned());
+        let mut req = Request::new(Method::POST, "http://68.183.113.79:8000/openrtb2/auction");
 
         // Get and store the POTSI ID value from the incoming request
         let id: String = incoming_req
@@ -137,21 +137,25 @@ impl PrebidRequest {
                                 "siteId": 686105,
                                 "networkId": 5280,
                                 "pageId": 2040327,
-                                "formatId": 137675,
+                                "formatId": 141225,
                                 "target": "testing=prebid",
-                                "domain": &self.domain
+                                "domain": "auburndao.com"
                             }
                         }
                     }
                 }
             }],
-            "site": { "page": format!("https://{}", self.domain) },
+            "site": { "page": "https://auburndao.com" },
+            "device": {
+                "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
+                "ip": &self.client_ip
+            },
             "user": {
                 "id": "5280",
                 "ext": {
                     "eids": [
                         {
-                            "source": &self.domain,
+                            "source": "auburndao.com",
                             "uids": [{
                                 "id": self.synthetic_id,
                                 "atype": 1,
@@ -161,7 +165,7 @@ impl PrebidRequest {
                             }],
                         },
                         {
-                            "source": &self.domain,
+                            "source": "auburndao.com",
                             "uids": [{
                                 "id": &id,
                                 "atype": 1,
