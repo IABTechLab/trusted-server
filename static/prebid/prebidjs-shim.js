@@ -9,21 +9,21 @@
       // Build S2S bidder list from config placeholders or runtime override
       var s2sBidders = (window.__TS_S2S_BIDDERS && Array.isArray(window.__TS_S2S_BIDDERS))
         ? window.__TS_S2S_BIDDERS.slice()
-        : __BIDDERS__;
+        : {{{bidders}}};
       if (!Array.isArray(s2sBidders)) s2sBidders = [];
 
       // Configure S2S with first-party endpoints
       pbjs.setConfig({
         s2sConfig: {
-          accountId: '__ACCOUNT_ID__',
+          accountId: '{{account_id}}',
           enabled: true,
           bidders: s2sBidders,
-          endpoint: '__SCHEME__://__HOST__/openrtb2/auction',
-          syncEndpoint: '__SCHEME__://__HOST__/cookie_sync',
-          timeout: __TIMEOUT__,
+          endpoint: '{{scheme}}://{{host}}/openrtb2/auction',
+          syncEndpoint: '{{scheme}}://{{host}}/cookie_sync',
+          timeout: {{timeout}},
         },
         enabledBidders: s2sBidders,
-        debug: __DEBUG__
+        debug: {{debug}}
       });
 
       console.log('[Trusted Server] Runtime shim active. s2s bidders:', s2sBidders);

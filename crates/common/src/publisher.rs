@@ -1,6 +1,8 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
+use handlebars::Handlebars;
+use sha2::{Digest, Sha256};
 
 use crate::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
@@ -210,7 +212,7 @@ pub fn handle_static_prebid_js(
     // Base Prebid library
     let prebid_lib = include_str!("../../../static/prebid/prebijs.min.js");
 
-    // Runtime shim that configures S2S and ensures SAS is present on request
+    // Runtime shim template (rendered via Handlebars)
     let shim_tpl = include_str!("../../../static/prebid/prebidjs-shim.js");
 
     // Build replacements from settings and request
@@ -221,31 +223,64 @@ pub fn handle_static_prebid_js(
         .unwrap_or("")
         .to_string();
 
-    let bidders_json = json!(&_settings.prebid.bidders).to_string();
-    let shim_filled = shim_tpl
-        .replace("__ACCOUNT_ID__", &_settings.prebid.account_id)
-        .replace("__BIDDERS__", &bidders_json)
-        .replace("__SCHEME__", &scheme)
-        .replace("__HOST__", &host)
-        .replace("__TIMEOUT__", &_settings.prebid.timeout_ms.to_string())
-        .replace(
-            "__DEBUG__",
-            if _settings.prebid.debug {
-                "true"
-            } else {
-                "false"
-            },
-        );
+    // Prepare Handlebars context and render
+    let mut hbs = Handlebars::new();
+    // Disable HTML escaping since we're producing JavaScript
+    hbs.register_escape_fn(handlebars::no_escape);
+
+    let ctx = json!({
+        "account_id": _settings.prebid.account_id,
+        "bidders": _settings.prebid.bidders,
+        "scheme": scheme,
+        "host": host,
+        "timeout": _settings.prebid.timeout_ms,
+        "debug": _settings.prebid.debug,
+    });
+
+    let shim_filled =
+        hbs.render_template(shim_tpl, &ctx)
+            .change_context(TrustedServerError::Template {
+                message: "Failed to render Prebid shim template".to_string(),
+            })?;
 
     let combined = format!("{}\n;\n{}\n", prebid_lib, shim_filled);
+
+    // Compute ETag for conditional caching
+    let hash = Sha256::digest(combined.as_bytes());
+    let etag = format!("\"sha256-{}\"", hex::encode(hash));
+
+    // If-None-Match handling for 304 responses
+    if let Some(if_none_match) = _req
+        .get_header(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+    {
+        if if_none_match == etag {
+            return Ok(
+                Response::from_status(StatusCode::NOT_MODIFIED)
+                    .with_header(header::ETAG, etag)
+                    .with_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
+                    )
+                    .with_header("surrogate-control", "max-age=300")
+                    .with_header(header::VARY, "Accept-Encoding"),
+            );
+        }
+    }
 
     Ok(Response::from_status(StatusCode::OK)
         .with_header(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )
-        // Long cache; asset is versioned by query param at the caller
-        .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .with_header(
+            header::CACHE_CONTROL,
+            "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
+        )
+        .with_header("surrogate-control", "max-age=300")
+        .with_header(header::ETAG, etag)
+        .with_header(header::VARY, "Accept-Encoding")
+        .with_header(HEADER_X_COMPRESS_HINT, "on")
         .with_body(combined))
 }
 
