@@ -2,6 +2,7 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
+use trusted_server_common::ad::handle_server_ad;
 use trusted_server_common::advertiser::handle_ad_request;
 use trusted_server_common::gam::{
     handle_gam_asset, handle_gam_custom_url, handle_gam_golden_url, handle_gam_render,
@@ -13,7 +14,7 @@ use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::prebid_proxy::{handle_prebid_auction, handle_prebid_cookie_sync};
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::{
-    handle_edgepubs_page, handle_main_page, handle_publisher_request,
+    handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_js,
 };
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
@@ -103,6 +104,12 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         // Static content pages
         (&Method::GET, "/privacy-policy", _) => handle_privacy_policy(&settings, req),
         (&Method::GET, "/why-trusted-server", _) => handle_why_trusted_server(&settings, req),
+
+        // Serve the tsjs library
+        (&Method::GET, "/static/tsjs.min.js", _) => handle_tsjs_js(&settings, req),
+
+        // tsjs simplified prebid proxy endpoint
+        (&Method::POST, "/serve-ad", _) => handle_server_ad(&settings, req).await,
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {

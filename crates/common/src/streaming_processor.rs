@@ -467,7 +467,7 @@ mod tests {
         let chunk3 = b"</body></html>";
         let result3 = adapter.process_chunk(chunk3, true).unwrap();
         assert!(
-            result3.len() > 0,
+            !result3.is_empty(),
             "Should return processed content for last chunk"
         );
 
@@ -504,7 +504,7 @@ mod tests {
 
         // Process last chunk
         let result = adapter.process_chunk(last_chunk, true).unwrap();
-        assert!(result.len() > 0, "Last chunk should return content");
+        assert!(!result.is_empty(), "Last chunk should return content");
 
         let output = String::from_utf8(result).unwrap();
         assert!(

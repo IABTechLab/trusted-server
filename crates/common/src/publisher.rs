@@ -1,7 +1,6 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
-use handlebars::Handlebars;
 use sha2::{Digest, Sha256};
 
 use crate::constants::{
@@ -200,64 +199,34 @@ pub fn handle_main_page(
     Ok(response)
 }
 
-/// Serves the custom Prebid.js build from `static/prebid/` when requested as `/js/prebid.min.js`.
+/// Serves the Trusted Server TypeScript bundle in place of Prebid.js.
 ///
-/// This ignores any version query parameter (e.g., `?v=...`) since routing uses only the path.
-pub fn handle_static_prebid_js(
+/// Any requests for common Prebid filenames (e.g., `prebid.min.js`) are routed here
+/// when auto_configure is enabled. We return the embedded tsjs bundle content.
+/// Serves the Trusted Server TypeScript bundle as a first-party JS asset.
+///
+/// Exposed separately so service frontends can route directly to this handler
+/// (e.g., `/static/tsjs.min.js`).
+pub fn handle_tsjs_js(
     _settings: &Settings,
-    mut _req: Request,
+    req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    use serde_json::json;
-
-    // Base Prebid library
-    let prebid_lib = include_str!("../../../static/prebid/prebijs.min.js");
-
-    // Runtime shim template (rendered via Handlebars)
-    let shim_tpl = include_str!("../../../static/prebid/prebidjs-shim.js");
-
-    // Build replacements from settings and request
-    let scheme = detect_request_scheme(&_req);
-    let host = _req
-        .get_header(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // Prepare Handlebars context and render
-    let mut hbs = Handlebars::new();
-    // Disable HTML escaping since we're producing JavaScript
-    hbs.register_escape_fn(handlebars::no_escape);
-
-    let ctx = json!({
-        "account_id": _settings.prebid.account_id,
-        "bidders": _settings.prebid.bidders,
-        "scheme": scheme,
-        "host": host,
-        "timeout": _settings.prebid.timeout_ms,
-        "debug": _settings.prebid.debug,
-    });
-
-    let shim_filled =
-        hbs.render_template(shim_tpl, &ctx)
-            .change_context(TrustedServerError::Template {
-                message: "Failed to render Prebid shim template".to_string(),
-            })?;
-
-    let combined = format!("{}\n;\n{}\n", prebid_lib, shim_filled);
+    let bundle: &str = trusted_server_js::TSJS_BUNDLE;
 
     // Compute ETag for conditional caching
-    let hash = Sha256::digest(combined.as_bytes());
+    let hash = Sha256::digest(bundle.as_bytes());
     let etag = format!("\"sha256-{}\"", hex::encode(hash));
 
     // If-None-Match handling for 304 responses
-    if let Some(if_none_match) = _req
+    if let Some(if_none_match) = req
         .get_header(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
     {
         if if_none_match == etag {
+            log::debug!("tsjs: 304 Not Modified (etag match)");
             return Ok(
                 Response::from_status(StatusCode::NOT_MODIFIED)
-                    .with_header(header::ETAG, etag)
+                    .with_header(header::ETAG, &etag)
                     .with_header(
                         header::CACHE_CONTROL,
                         "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
@@ -267,6 +236,8 @@ pub fn handle_static_prebid_js(
             );
         }
     }
+
+    log::info!("Serving tsjs bundle: bytes={}, etag={}", bundle.len(), etag);
 
     Ok(Response::from_status(StatusCode::OK)
         .with_header(
@@ -278,10 +249,10 @@ pub fn handle_static_prebid_js(
             "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
         )
         .with_header("surrogate-control", "max-age=300")
-        .with_header(header::ETAG, etag)
+        .with_header(header::ETAG, &etag)
         .with_header(header::VARY, "Accept-Encoding")
         .with_header(HEADER_X_COMPRESS_HINT, "on")
-        .with_body(combined))
+        .with_body(bundle))
 }
 
 /// Parameters for processing response streaming
@@ -375,6 +346,41 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
+/// Serve an empty shim for PrebidJS that preserves `pbjs.que` but does nothing.
+fn handle_prebid_shim_js(req: Request) -> Result<Response, Report<TrustedServerError>> {
+    // Load shim template from static assets
+    let shim = include_str!("../../../static/prebid/prebidjs-shim.js");
+
+    // Compute ETag for conditional caching
+    let hash = Sha256::digest(shim.as_bytes());
+    let etag = format!("\"sha256-{}\"", hex::encode(hash));
+
+    if let Some(if_none_match) = req
+        .get_header(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+    {
+        if if_none_match == etag {
+            return Ok(Response::from_status(StatusCode::NOT_MODIFIED)
+                .with_header(header::ETAG, &etag)
+                .with_header(header::CACHE_CONTROL, "public, max-age=300, s-maxage=300")
+                .with_header("surrogate-control", "max-age=300")
+                .with_header(header::VARY, "Accept-Encoding"));
+        }
+    }
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
+        .with_header(header::CACHE_CONTROL, "public, max-age=300, s-maxage=300")
+        .with_header("surrogate-control", "max-age=300")
+        .with_header(header::ETAG, &etag)
+        .with_header(header::VARY, "Accept-Encoding")
+        .with_header(HEADER_X_COMPRESS_HINT, "on")
+        .with_body(shim))
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// This function forwards incoming requests to the configured origin URL,
@@ -392,18 +398,15 @@ pub fn handle_publisher_request(
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Proxying request to publisher_origin");
 
-    // Serve our custom Prebid.js only when auto_configure is enabled
-    // Path match ignores query string (Fastly's get_path() returns only the path)
-    if settings.prebid.auto_configure {
-        let path = req.get_path();
-        if is_prebid_js_path(path) {
-            log::info!(
-                "Serving custom Prebid.js for path '{}' (auto_configure enabled)",
-                path
-            );
-            return handle_static_prebid_js(settings, req);
-        }
+    // Intercept common PrebidJS asset paths and serve a safe shim instead
+    let path = req.get_path();
+    if is_prebid_js_path(path) {
+        log::info!("Serving PrebidJS shim for path: {}", path);
+        return handle_prebid_shim_js(req);
     }
+
+    // Prebid.js requests are not intercepted here. The HTML processor rewrites
+    // any Prebid script references to `/static/tsjs.min.js`, which is served by the service.
 
     // Extract the request host from the incoming request
     let request_host = req
@@ -580,6 +583,7 @@ mod tests {
     use super::*;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn test_detect_request_scheme() {
@@ -619,6 +623,48 @@ mod tests {
         req.set_header("forwarded", "proto=https");
         req.set_header("x-forwarded-proto", "http");
         assert_eq!(detect_request_scheme(&req), "https");
+    }
+
+    #[test]
+    fn test_handle_tsjs_js_serves_with_headers() {
+        let settings = create_test_settings();
+        let req = Request::new(Method::GET, "https://edge.example.com/static/tsjs.min.js");
+
+        let mut resp = handle_tsjs_js(&settings, req).expect("should serve tsjs asset");
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        let ct = resp
+            .get_header(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("application/javascript"));
+
+        // Body should contain recognizable marker
+        let body = resp.take_body_str();
+        assert!(body.contains("Trusted Server"));
+    }
+
+    #[test]
+    fn test_handle_tsjs_js_etag_304() {
+        let settings = create_test_settings();
+        // First call to compute ETag
+        let bundle = trusted_server_js::TSJS_BUNDLE;
+        let etag = format!(
+            "\"sha256-{}\"",
+            hex::encode(Sha256::digest(bundle.as_bytes()))
+        );
+
+        let mut req = Request::new(Method::GET, "https://edge.example.com/static/tsjs.min.js");
+        req.set_header(header::IF_NONE_MATCH, &etag);
+
+        let resp = handle_tsjs_js(&settings, req).expect("should serve tsjs 304");
+        assert_eq!(resp.get_status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            resp.get_header(header::ETAG)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default(),
+            etag
+        );
     }
 
     #[test]
@@ -771,98 +817,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_handle_static_prebid_js_injects_config_https() {
-        let settings = create_test_settings();
-
-        let mut req = Request::new(Method::GET, "https://edge.example.com/js/prebid.min.js");
-        req.set_header(header::HOST, "edge.example.com");
-        req.set_header("x-forwarded-proto", "https");
-
-        let mut resp = handle_static_prebid_js(&settings, req).expect("should build prebid asset");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        assert_eq!(
-            resp.get_header(header::CONTENT_TYPE)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or_default(),
-            "application/javascript; charset=utf-8"
-        );
-
-        let body = resp.take_body_str();
-
-        // Contains shim config and replaced placeholders
-        assert!(body.contains("pbjs.setConfig"));
-        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
-        assert!(body.contains("https://edge.example.com/cookie_sync"));
-        assert!(body.contains("'1001'")); // default account id from settings
-        assert!(body.contains("kargo") && body.contains("rubicon"));
-
-        // Ensure no unreplaced placeholders remain
-        for placeholder in [
-            "__ACCOUNT_ID__",
-            "__BIDDERS__",
-            "__SCHEME__",
-            "__HOST__",
-            "__TIMEOUT__",
-            "__DEBUG__",
-        ] {
-            assert!(
-                !body.contains(placeholder),
-                "Placeholder '{}' should be replaced",
-                placeholder
-            );
-        }
-    }
-
-    #[test]
-    fn test_handle_static_prebid_js_injects_config_http() {
-        let mut settings = create_test_settings();
-        settings.prebid.debug = true; // also verify __DEBUG__ replacement
-
-        let mut req = Request::new(Method::GET, "http://edge.example.com/js/prebid.min.js");
-        req.set_header(header::HOST, "edge.example.com");
-        req.set_header("x-forwarded-proto", "http");
-
-        let mut resp = handle_static_prebid_js(&settings, req).expect("should build prebid asset");
-        let body = resp.take_body_str();
-
-        assert!(body.contains("http://edge.example.com/openrtb2/auction"));
-        assert!(body.contains("http://edge.example.com/cookie_sync"));
-        assert!(body.contains("debug: true"));
-    }
-
-    #[test]
-    fn test_handle_publisher_request_routes_prebid_asset() {
-        let settings = create_test_settings();
-
-        // With auto_configure enabled (default), route should serve static prebid asset
-        let mut req = Request::new(Method::GET, "https://edge.example.com/js/prebid.min.js");
-        req.set_header(header::HOST, "edge.example.com");
-        req.set_header("x-forwarded-proto", "https");
-
-        let mut resp = handle_publisher_request(&settings, req).expect("should serve prebid asset");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let body = resp.take_body_str();
-        assert!(body.contains("pbjs.setConfig"));
-        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
-    }
-
-    #[test]
-    fn test_handle_publisher_request_routes_prebid_asset_plugin_path() {
-        let settings = create_test_settings();
-
-        // WordPress plugin path with version query
-        let mut req = Request::new(
-            Method::GET,
-            "https://edge.example.com/wp-content/plugins/prebidjs/js/prebidjs.min.js?ver=1.0.0",
-        );
-        req.set_header(header::HOST, "edge.example.com");
-        req.set_header("x-forwarded-proto", "https");
-
-        let mut resp = handle_publisher_request(&settings, req).expect("should serve prebid asset");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let body = resp.take_body_str();
-        assert!(body.contains("pbjs.setConfig"));
-        assert!(body.contains("https://edge.example.com/openrtb2/auction"));
-    }
+    // Tests related to serving Prebid.js directly or intercepting its paths were removed.
 }

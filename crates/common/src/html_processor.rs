@@ -1,9 +1,10 @@
 //! Simplified HTML processor that combines URL replacement and Prebid injection
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
+use std::cell::Cell;
 use std::rc::Rc;
 
-use lol_html::{element, Settings as RewriterSettings};
+use lol_html::{element, html_content::ContentType, Settings as RewriterSettings};
 
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -82,11 +83,22 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_scheme: config.request_scheme.clone(),
     });
 
-    // Prebid injection is now handled in publisher.rs when serving /js/prebid.min.js
-    // Keep processor focused on URL rewriting only.
+    let injected_tsjs = Rc::new(Cell::new(false));
+    let tsjs_loader: &'static str = include_str!("../../../static/tsjs/tsjs.html");
 
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
+            // Inject tsjs once at the start of <head>
+            element!("head", {
+                let injected_tsjs = injected_tsjs.clone();
+                move |el| {
+                    if !injected_tsjs.get() {
+                        el.prepend(tsjs_loader, ContentType::Html);
+                        injected_tsjs.set(true);
+                    }
+                    Ok(())
+                }
+            }),
             // Replace URLs in href attributes
             element!("[href]", {
                 let patterns = patterns.clone();
@@ -219,6 +231,81 @@ mod tests {
             prebid_timeout_ms: 1000,
             prebid_debug: false,
         }
+    }
+
+    #[test]
+    fn test_injects_tsjs_script_and_keeps_prebid_refs() {
+        let html = r#"<html><head>
+            <script src="/js/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+        let config = create_test_config();
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/static/tsjs.min.js"));
+        // We no longer rewrite Prebid references; they will be shimmed server-side
+        assert!(processed.contains("prebid.min.js"));
+        assert!(processed.contains("cdn.prebid.org/prebid.js"));
+    }
+
+    #[test]
+    fn test_injects_tsjs_script_when_prebid_has_query_string() {
+        let html = r#"<html><head>
+            <script src="/wp-content/plugins/prebidjs/js/prebidjs.min.js?v=1.2.3"></script>
+        </head><body></body></html>"#;
+
+        let config = create_test_config();
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/static/tsjs.min.js"));
+        assert!(processed.contains("prebidjs.min.js"));
+    }
+
+    #[test]
+    fn test_always_injects_tsjs_script() {
+        let html = r#"<html><head>
+            <script src="/js/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.enable_prebid = false; // No longer affects tsjs injection
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/js/prebid.min.js"));
+        assert!(processed.contains("cdn.prebid.org/prebid.js"));
+        assert!(processed.contains("/static/tsjs.min.js"));
     }
 
     #[test]
@@ -388,7 +475,7 @@ mod tests {
 
         // Ensure we produced output
         assert!(
-            compressed_output.len() > 0,
+            !compressed_output.is_empty(),
             "Should produce compressed output"
         );
 

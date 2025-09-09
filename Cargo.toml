@@ -3,6 +3,13 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/fastly", 
+    "crates/js",
+]
+
+# Build defaults exclude the web-only tsjs crate, which is compiled via wasm-pack.
+default-members = [
+    "crates/common",
+    "crates/fastly",
 ]
 
 [profile.release]

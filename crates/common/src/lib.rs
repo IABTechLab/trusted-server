@@ -22,6 +22,7 @@
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`why`]: Debugging and introspection utilities
 
+pub mod ad;
 pub mod advertiser;
 pub mod constants;
 pub mod cookies;
@@ -31,6 +32,7 @@ pub mod gdpr;
 pub mod geo;
 pub mod html_processor;
 pub mod models;
+pub mod openrtb;
 pub mod partners;
 pub mod prebid;
 pub mod prebid_proxy;
