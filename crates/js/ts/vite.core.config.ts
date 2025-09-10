@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vite';
 
 // Build in library mode to a sibling dist/ folder so the Rust crate can embed it.
 export default defineConfig({
@@ -15,4 +15,4 @@ export default defineConfig({
     emptyOutDir: false,
     assetsDir: '.',
   },
-})
+});

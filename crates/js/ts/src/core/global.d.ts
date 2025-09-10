@@ -1,11 +1,10 @@
-import type { TsjsApi } from './types'
+import type { TsjsApi } from './types';
 
 declare global {
   interface Window {
-    tsjs?: TsjsApi
-    pbjs?: TsjsApi
+    tsjs?: TsjsApi;
+    pbjs?: TsjsApi;
   }
 }
 
-export {}
-
+export {};

@@ -1,9 +1,9 @@
 // ESLint v9 flat config
-import js from '@eslint/js'
-import tseslint from 'typescript-eslint'
-import importPlugin from 'eslint-plugin-import'
-import jsdoc from 'eslint-plugin-jsdoc'
-import unicorn from 'eslint-plugin-unicorn'
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import importPlugin from 'eslint-plugin-import';
+import jsdoc from 'eslint-plugin-jsdoc';
+import unicorn from 'eslint-plugin-unicorn';
 
 export default [
   // Files/folders to ignore
@@ -36,4 +36,4 @@ export default [
       'import/order': ['error', { 'newlines-between': 'always' }],
     },
   },
-]
+];

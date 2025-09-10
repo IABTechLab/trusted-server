@@ -1,52 +1,57 @@
-Trusted Server JS (tsjs)
+# Trusted Server JS (tsjs)
 
-Best-practice TypeScript project that builds a browser JS library and embeds the bundle in this Rust crate.
+tsjs is the browser-side library for Trusted Server. It ships as two small IIFE bundles: a core (`tsjs-core.js`) that is always loaded, and an optional Prebid.js extension (`tsjs-ext.js`). This Rust crate builds those bundles (via Vite) and embeds them so other crates can serve them as first‑party assets.
 
-What it provides
+## What It Provides
 
-- Global `tsjs.que` and `pbjs.que` queues (both flushed on init)
-- `tsjs` and `pbjs` refer to the same global object
+- Core `tsjs` API and queue (`window.tsjs.que`) always available
+- Optional Prebid extension that aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`
 - `addAdUnits(units)` to register ad units
 - `renderAllAdUnits()` to render all registered ad units
 - `renderAdUnit(code)` to render a single unit by `code`
-- `setConfig(cfg)` and `getConfig()` to accept Prebid-like configs
-- `requestBids({ bidsBackHandler })` calls the callback immediately and renders placeholders
+- `setConfig(cfg)` and `getConfig()` to control logging, etc.
+- `requestBids({ bidsBackHandler })` calls the callback synchronously, renders placeholders, and posts to `/serve-ad`
+- `getHighestCpmBids(adUnitCodes?)` returns synthetic placeholders
 - `version`
 
-Logging
+## Logging
 
-- Prebid-style logging via `tsjs.log` (also aliased on `pbjs.log`):
+- Prebid-style logging via `tsjs.log` (aliased on `pbjs.log` when the extension is loaded):
   - Levels: `silent`, `error`, `warn`, `info`, `debug` (default `warn`)
   - Methods: `log.info()`, `log.warn()`, `log.error()`, `log.debug()`, `log.setLevel()`, `log.getLevel()`
   - `setConfig({ debug: true })` sets level to `debug`, or set explicit `logLevel` in config
   - Key lifecycle logs: init, queue flushes, `addAdUnits`, `renderAdUnit`, `renderAllAdUnits`, `requestBids`
+  - In browsers, logs show a colored `[tsjs]` prefix
 
-Project layout
+## Project Layout
 
 - `ts/` — TypeScript source, tooling (Vite, Vitest, ESLint, Prettier)
-- `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode). Build script copies this into `OUT_DIR/tsjs-core.js` and the Rust crate embeds that.
-- `dist/tsjs-ext.js` — Prebid.js shim extension (IIFE). Build script also copies this into `OUT_DIR/tsjs-ext.js` for optional serving.
-- `src/lib.rs` — exposes `TSJS_BUNDLE` and `TSJS_FILENAME`
+- `ts/src/core/` — core library (bootstrap, config, log, registry, render, request, types, queue)
+- `ts/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `ext.entry.ts`)
+- `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode)
+- `dist/tsjs-ext.js` — PrebidJS shim extension (IIFE)
+- Rust crate exposes `TSJS_CORE_BUNDLE` and `TSJS_EXT_BUNDLE` (core and extension contents)
 - `build.rs` — runs `npm run build` inside `ts/` if Node is available
 
-Build the JS bundle
+## Build the JS Bundle
 
 - Requires Node >=18
 - From repo root: `cd crates/js/ts && npm ci && npm run build`
 - Or simply `cargo build` — the build script will run `npm install` and `npm run build`, and then copy the outputs to `OUT_DIR/tsjs-core.js` and `OUT_DIR/tsjs-ext.js` (failing if core cannot be found).
 
-Run tests (TypeScript)
+## Run Tests (TypeScript)
 
 - `cd crates/js/ts && npm test` (vitest + jsdom)
 
-Serve from Rust
+## Serving From Rust
 
 ```rust
-use trusted_server_js::TSJS_CORE_BUNDLE;
-// Return TSJS_CORE_BUNDLE in a response with Content-Type: application/javascript
+use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
+// Serve TSJS_CORE_BUNDLE at /static/tsjs-core.min.js
+// Serve TSJS_EXT_BUNDLE at /static/tsjs-ext.min.js
 ```
 
-HTML usage
+## HTML Usage
 
 ```html
 <script>
@@ -75,8 +80,10 @@ HTML usage
 </script>
 ```
 
+## Auto‑Rewrite (Server)
 
-Notes
+- When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
+## Notes
 
 - By default, the build fails if `tsjs-core.js` cannot be produced. To change behavior:
   - `TSJS_SKIP_BUILD=1`: skip running npm; requires `dist/tsjs-core.js` to exist so it can be copied to `OUT_DIR`.

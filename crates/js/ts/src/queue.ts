@@ -1,1 +1,1 @@
-export * from './core/queue'
+export * from './core/queue';

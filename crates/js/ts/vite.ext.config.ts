@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vite';
 
 // Build the Prebid.js shim extension as a separate IIFE bundle.
 export default defineConfig({
@@ -15,4 +15,4 @@ export default defineConfig({
     emptyOutDir: false,
     assetsDir: '.',
   },
-})
+});

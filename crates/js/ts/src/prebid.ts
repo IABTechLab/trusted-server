@@ -1,1 +1,1 @@
-export * from './core/bids'
+export * from './core/request';

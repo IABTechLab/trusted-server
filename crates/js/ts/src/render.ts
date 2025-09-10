@@ -1,1 +1,1 @@
-export * from './core/render'
+export * from './core/render';
