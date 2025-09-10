@@ -21,9 +21,9 @@ export interface TsjsApi {
   renderAllAdUnits(): void;
   setConfig?(cfg: Config): void;
   getConfig?(): Config;
-  // Accept Prebid-like signatures: requestBids(opts) or requestBids(callback, opts)
-  requestBids?(opts?: RequestBidsOptions): void;
-  requestBids?(callback: RequestBidsCallback, opts?: RequestBidsOptions): void;
+  // Core API: requestAds; accepts same signatures as Prebid's requestBids
+  requestAds?(opts?: RequestAdsOptions): void;
+  requestAds?(callback: RequestAdsCallback, opts?: RequestAdsOptions): void;
   getHighestCpmBids?(adUnitCodes?: string | string[]): ReadonlyArray<HighestCpmBid>;
   log?: {
     setLevel(l: 'silent' | 'error' | 'warn' | 'info' | 'debug'): void;
@@ -35,24 +35,29 @@ export interface TsjsApi {
   };
 }
 
+export enum RequestMode {
+  FirstParty = 'firstParty',
+  ThirdParty = 'thirdParty',
+}
+
 export interface Config {
   debug?: boolean;
   logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
-  /**
-   * When true, renderCreativeIntoSlot will create a container div if the
-   * target slot id is not found. Defaults to false to avoid injecting ads
-   * into unexpected places if the page structure differs.
-   */
-  autoCreateSlots?: boolean;
+  /** Select ad serving mode. Default is RequestMode.FirstParty. */
+  mode?: RequestMode;
   // Extendable for future fields
   [key: string]: unknown;
 }
 
-export type RequestBidsCallback = () => void;
-export interface RequestBidsOptions {
-  bidsBackHandler?: RequestBidsCallback;
+// Core-neutral request types
+export type RequestAdsCallback = () => void;
+export interface RequestAdsOptions {
+  bidsBackHandler?: RequestAdsCallback;
   timeout?: number;
 }
+
+// Back-compat aliases for Prebid-style naming (used by the extension shim)
+export type RequestBidsCallback = RequestAdsCallback;
 
 export interface HighestCpmBid {
   adUnitCode: string;
@@ -66,14 +71,4 @@ export interface HighestCpmBid {
 }
 
 // Minimal OpenRTB response typing
-export interface OpenRtbBid {
-  impid?: string;
-  adm?: string;
-  [key: string]: unknown;
-}
-export interface OpenRtbSeatBid {
-  bid?: OpenRtbBid[] | null;
-}
-export interface OpenRtbBidResponse {
-  seatbid?: OpenRtbSeatBid[] | null;
-}
+// OpenRTB response typing is specific to the Prebid extension and lives in src/ext/types.ts

@@ -111,8 +111,11 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/static/tsjs-prebidjs.js", _) => handle_tsjs_ext_js(&settings, req),
         (&Method::GET, "/static/tsjs-ext.min.js", _) => handle_tsjs_ext_js(&settings, req),
 
-        // tsjs simplified prebid proxy endpoint
+        // tsjs endpoints
         (&Method::POST, "/serve-ad", _) => handle_server_ad(&settings, req).await,
+        (&Method::GET, "/serve-ad", _) => {
+            trusted_server_common::ad::handle_server_ad_get(&settings, req).await
+        }
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {

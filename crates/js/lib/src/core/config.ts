@@ -1,7 +1,8 @@
 import { log, LogLevel } from './log';
 import type { Config } from './types';
+import { RequestMode } from './types';
 
-let CONFIG: Config = {};
+let CONFIG: Config = { mode: RequestMode.FirstParty };
 
 export function setConfig(cfg: Config): void {
   CONFIG = { ...CONFIG, ...cfg };

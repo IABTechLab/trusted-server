@@ -5,8 +5,8 @@ use std::process::Command;
 
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under ts/
-    println!("cargo:rerun-if-changed=ts");
-    watch_dir_recursively(Path::new("ts"));
+    println!("cargo:rerun-if-changed=lib");
+    watch_dir_recursively(Path::new("lib"));
 
     // Allow opt-out or force via env
     let skip = env::var("TSJS_SKIP_BUILD")
@@ -15,7 +15,7 @@ fn main() {
 
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let ts_dir = crate_dir.join("ts");
+    let ts_dir = crate_dir.join("lib");
     let dist_dir = crate_dir.join("dist");
     let core_outfile = dist_dir.join("tsjs-core.js");
     let ext_outfile = dist_dir.join("tsjs-ext.js");
@@ -23,7 +23,7 @@ fn main() {
     // Ensure dist exists
     let _ = fs::create_dir_all(&dist_dir);
 
-    // Only try to build if we have a ts project
+    // Only try to build if we have a library project
     if !ts_dir.join("package.json").exists() {
         // No TS project; rely on prebuilt dist if present
         return;

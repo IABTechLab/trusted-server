@@ -1,7 +1,6 @@
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
-import { getConfig } from './config';
 
 function normalizeId(raw: string): string {
   const s = String(raw ?? '').trim();
@@ -79,16 +78,10 @@ export function renderAllAdUnits(): void {
 }
 
 export function renderCreativeIntoSlot(slotId: string, html: string): void {
-  const existing = findSlot(slotId);
-  const cfg = getConfig?.() || {};
-  const createIfMissing = (cfg as any).autoCreateSlots === true;
-  if (!existing && !createIfMissing) {
+  const el = findSlot(slotId);
+  if (!el) {
     log.warn('renderCreativeIntoSlot: slot not found; skipping render', { slotId });
     return;
-  }
-  const el = existing ?? ensureSlot(slotId);
-  if (!existing && createIfMissing) {
-    log.warn('renderCreativeIntoSlot: slot not found; created container', { slotId });
   }
   try {
     // Clear previous content
@@ -115,7 +108,10 @@ const NORMALIZE_CSS =
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-function createAdIframe(container: HTMLElement, opts: IframeOptions = {}): HTMLIFrameElement {
+export function createAdIframe(
+  container: HTMLElement,
+  opts: IframeOptions = {}
+): HTMLIFrameElement {
   const iframe = document.createElement('iframe');
   // Attributes
   iframe.scrolling = 'no';
@@ -133,7 +129,7 @@ function createAdIframe(container: HTMLElement, opts: IframeOptions = {}): HTMLI
       'allow-popups-to-escape-sandbox',
       'allow-same-origin',
       'allow-scripts',
-      'allow-top-navigation-by-user-activation',
+      'allow-top-navigation-by-user-activation'
     );
   } catch {}
   // Sizing + style

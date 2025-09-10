@@ -8,6 +8,8 @@ use crate::error::TrustedServerError;
 use crate::openrtb;
 use crate::prebid_proxy::handle_prebid_auction;
 use crate::settings::Settings;
+use fastly::http::{header, StatusCode};
+use serde_json::Value as Json;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,4 +146,94 @@ pub async fn handle_server_ad(
         })?;
 
     handle_prebid_auction(settings, req).await
+}
+
+/// GET variant for first-party slot rendering: /serve-ad?slot=code[&w=300&h=250]
+pub async fn handle_server_ad_get(
+    settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    // Parse query
+    let url = req.get_url_str();
+    let parsed = url::Url::parse(&url).change_context(TrustedServerError::Prebid {
+        message: "Invalid serve-ad URL".to_string(),
+    })?;
+    let qp = parsed
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let slot = qp.get("slot").cloned().unwrap_or_default();
+    let w = qp
+        .get("w")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(300);
+    let h = qp
+        .get("h")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(250);
+    if slot.is_empty() {
+        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("missing slot"));
+    }
+
+    // Build a synthetic AdRequest with a single unit for this slot
+    let ad_req = AdRequest {
+        ad_units: vec![AdUnit {
+            code: slot.clone(),
+            media_types: Some(MediaTypes {
+                banner: Some(BannerUnit {
+                    sizes: vec![vec![w, h]],
+                }),
+            }),
+            bids: None,
+        }],
+        config: None,
+    };
+
+    // Convert to OpenRTB and delegate to PBS
+    let ortb = build_openrtb_from_ts(&ad_req, settings);
+    req.set_body_json(&ortb)
+        .change_context(TrustedServerError::Prebid {
+            message: "Failed to set OpenRTB body".to_string(),
+        })?;
+    let mut pbs_resp = handle_prebid_auction(settings, req).await?;
+
+    // Try to extract HTML creative for this slot
+    let body_bytes = pbs_resp.take_body_bytes();
+    let html = match serde_json::from_slice::<Json>(&body_bytes) {
+        Ok(json) => {
+            extract_adm_for_slot(&json, &slot).unwrap_or_else(|| "<!-- no creative -->".to_string())
+        }
+        Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
+    };
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_body(html))
+}
+
+fn extract_adm_for_slot(json: &Json, slot: &str) -> Option<String> {
+    let seatbids = json.get("seatbid")?.as_array()?;
+    for sb in seatbids {
+        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
+            for b in bids {
+                let impid = b.get("impid").and_then(|v| v.as_str()).unwrap_or("");
+                if impid == slot {
+                    if let Some(adm) = b.get("adm").and_then(|v| v.as_str()) {
+                        return Some(adm.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Fallback to first available adm
+    for sb in seatbids {
+        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
+            for b in bids {
+                if let Some(adm) = b.get("adm").and_then(|v| v.as_str()) {
+                    return Some(adm.to_string());
+                }
+            }
+        }
+    }
+    None
 }

@@ -10,8 +10,10 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 - `renderAllAdUnits()` to render all registered ad units
 - `renderAdUnit(code)` to render a single unit by `code`
 - `setConfig(cfg)` and `getConfig()` to control logging, etc.
-- `requestBids({ bidsBackHandler })` calls the callback synchronously, renders placeholders, and posts to `/serve-ad`
-- `getHighestCpmBids(adUnitCodes?)` returns synthetic placeholders
+- `requestAds({ bidsBackHandler })` calls the callback synchronously.
+  - In `firstParty` mode (default): inserts a sandboxed iframe per ad unit that loads `/serve-ad?slot=<code>&w=<w>&h=<h>`
+  - In `thirdParty` mode: posts to `/serve-ad` and renders returned creatives
+  - The Prebid extension also adds `pbjs.getHighestCpmBids(adUnitCodes?)`
 - `version`
 
 ## Logging
@@ -26,8 +28,8 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 ## Project Layout
 
 - `ts/` — TypeScript source, tooling (Vite, Vitest, ESLint, Prettier)
-- `ts/src/core/` — core library (bootstrap, config, log, registry, render, request, types, queue)
-- `ts/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `ext.entry.ts`)
+- `lib/src/core/` — core library (bootstrap, config, log, registry, render, request, types, queue)
+- `lib/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `ext.entry.ts`)
 - `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode)
 - `dist/tsjs-ext.js` — PrebidJS shim extension (IIFE)
 - Rust crate exposes `TSJS_CORE_BUNDLE` and `TSJS_EXT_BUNDLE` (core and extension contents)
@@ -36,12 +38,12 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 ## Build the JS Bundle
 
 - Requires Node >=18
-- From repo root: `cd crates/js/ts && npm ci && npm run build`
+- From repo root: `cd crates/js/lib && npm ci && npm run build`
 - Or simply `cargo build` — the build script will run `npm install` and `npm run build`, and then copy the outputs to `OUT_DIR/tsjs-core.js` and `OUT_DIR/tsjs-ext.js` (failing if core cannot be found).
 
 ## Run Tests (TypeScript)
 
-- `cd crates/js/ts && npm test` (vitest + jsdom)
+- `cd crates/js/lib && npm test` (vitest + jsdom)
 
 ## Serving From Rust
 
@@ -65,7 +67,8 @@ use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
 
   tsjs.que.push(function() {
     tsjs.addAdUnits(adUnits);
-    tsjs.renderAllAdUnits();
+    tsjs.setConfig({ mode: 'firstParty' }); // or 'thirdParty'
+    tsjs.requestAds({ bidsBackHandler: function() {} });
   });
   // later: load core
   // <script src="/static/tsjs-core.min.js"></script>  <!-- serves tsjs-core.js -->
@@ -83,6 +86,7 @@ use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
 ## Auto‑Rewrite (Server)
 
 - When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
+
 ## Notes
 
 - By default, the build fails if `tsjs-core.js` cannot be produced. To change behavior:

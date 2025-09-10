@@ -44,7 +44,7 @@ describe('tsjs', () => {
     cleanupDom();
     (window as any).pbjs = { que: [] };
     (window as any).pbjs.que.push(function () {
-      window.pbjs.setConfig({ debug: true });
+      window.pbjs.setConfig({ debug: true, mode: 'thirdParty' });
       window.pbjs.addAdUnits({ code: 'pbslot', mediaTypes: { banner: { sizes: [[300, 250]] } } });
       window.pbjs.requestBids({ bidsBackHandler: () => {} });
     });
@@ -63,6 +63,7 @@ describe('tsjs', () => {
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
     import('../src/ext/ext.entry');
     let called = false;
+    window.tsjs.setConfig({ mode: 'thirdParty' } as any);
     window.tsjs.addAdUnits({ code: 'rb', mediaTypes: { banner: { sizes: [[320, 50]] } } });
     window.pbjs.requestBids({
       bidsBackHandler: () => {
