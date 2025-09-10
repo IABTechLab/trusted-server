@@ -1,7 +1,8 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
-use sha2::{Digest, Sha256};
+
+use crate::http_util::serve_static_with_etag;
 
 use crate::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
@@ -77,17 +78,7 @@ fn detect_request_scheme(req: &Request) -> String {
     "http".to_string()
 }
 
-/// Returns true if the request path appears to reference a Prebid.js asset.
-/// Matches common filenames regardless of directory:
-/// - prebid.js, prebid.min.js
-/// - prebidjs.js, prebidjs.min.js (e.g., WordPress plugin paths)
-fn is_prebid_js_path(path: &str) -> bool {
-    let filename = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-    matches!(
-        filename.as_str(),
-        "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
-    )
-}
+// Prebid URL interception logic removed; HTML rewriting handles Prebid script references
 
 /// Handles the main page request.
 ///
@@ -206,53 +197,26 @@ pub fn handle_main_page(
 /// Serves the Trusted Server TypeScript bundle as a first-party JS asset.
 ///
 /// Exposed separately so service frontends can route directly to this handler
-/// (e.g., `/static/tsjs.min.js`).
-pub fn handle_tsjs_js(
+/// (e.g., `/static/tsjs-core.min.js`).
+pub fn handle_tsjs_js_core(
     _settings: &Settings,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let bundle: &str = trusted_server_js::TSJS_BUNDLE;
+    let bundle: &str = trusted_server_js::TSJS_CORE_BUNDLE;
+    let mut resp = serve_static_with_etag(bundle, &req, "application/javascript; charset=utf-8");
+    // Preserve previous behavior: hint the edge to compress
+    resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+    Ok(resp)
+}
 
-    // Compute ETag for conditional caching
-    let hash = Sha256::digest(bundle.as_bytes());
-    let etag = format!("\"sha256-{}\"", hex::encode(hash));
-
-    // If-None-Match handling for 304 responses
-    if let Some(if_none_match) = req
-        .get_header(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-    {
-        if if_none_match == etag {
-            log::debug!("tsjs: 304 Not Modified (etag match)");
-            return Ok(
-                Response::from_status(StatusCode::NOT_MODIFIED)
-                    .with_header(header::ETAG, &etag)
-                    .with_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
-                    )
-                    .with_header("surrogate-control", "max-age=300")
-                    .with_header(header::VARY, "Accept-Encoding"),
-            );
-        }
-    }
-
-    log::info!("Serving tsjs bundle: bytes={}, etag={}", bundle.len(), etag);
-
-    Ok(Response::from_status(StatusCode::OK)
-        .with_header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )
-        .with_header(
-            header::CACHE_CONTROL,
-            "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
-        )
-        .with_header("surrogate-control", "max-age=300")
-        .with_header(header::ETAG, &etag)
-        .with_header(header::VARY, "Accept-Encoding")
-        .with_header(HEADER_X_COMPRESS_HINT, "on")
-        .with_body(bundle))
+/// Serves the optional Prebid.js shim extension bundle.
+pub fn handle_tsjs_ext_js(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let bundle: &str = trusted_server_js::TSJS_EXT_BUNDLE;
+    let resp = serve_static_with_etag(bundle, &req, "application/javascript; charset=utf-8");
+    Ok(resp)
 }
 
 /// Parameters for processing response streaming
@@ -347,39 +311,7 @@ fn create_html_stream_processor(
 }
 
 /// Serve an empty shim for PrebidJS that preserves `pbjs.que` but does nothing.
-fn handle_prebid_shim_js(req: Request) -> Result<Response, Report<TrustedServerError>> {
-    // Load shim template from static assets
-    let shim = include_str!("../../../static/prebid/prebidjs-shim.js");
-
-    // Compute ETag for conditional caching
-    let hash = Sha256::digest(shim.as_bytes());
-    let etag = format!("\"sha256-{}\"", hex::encode(hash));
-
-    if let Some(if_none_match) = req
-        .get_header(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-    {
-        if if_none_match == etag {
-            return Ok(Response::from_status(StatusCode::NOT_MODIFIED)
-                .with_header(header::ETAG, &etag)
-                .with_header(header::CACHE_CONTROL, "public, max-age=300, s-maxage=300")
-                .with_header("surrogate-control", "max-age=300")
-                .with_header(header::VARY, "Accept-Encoding"));
-        }
-    }
-
-    Ok(Response::from_status(StatusCode::OK)
-        .with_header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )
-        .with_header(header::CACHE_CONTROL, "public, max-age=300, s-maxage=300")
-        .with_header("surrogate-control", "max-age=300")
-        .with_header(header::ETAG, &etag)
-        .with_header(header::VARY, "Accept-Encoding")
-        .with_header(HEADER_X_COMPRESS_HINT, "on")
-        .with_body(shim))
-}
+// Legacy Prebid shim serving removed; clients receive rewritten URLs instead.
 
 /// Proxies requests to the publisher's origin server.
 ///
@@ -398,15 +330,8 @@ pub fn handle_publisher_request(
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Proxying request to publisher_origin");
 
-    // Intercept common PrebidJS asset paths and serve a safe shim instead
-    let path = req.get_path();
-    if is_prebid_js_path(path) {
-        log::info!("Serving PrebidJS shim for path: {}", path);
-        return handle_prebid_shim_js(req);
-    }
-
-    // Prebid.js requests are not intercepted here. The HTML processor rewrites
-    // any Prebid script references to `/static/tsjs.min.js`, which is served by the service.
+    // Prebid.js requests are not intercepted here anymore. The HTML processor rewrites
+    // any Prebid script references to `/static/tsjs-ext.min.js` when auto-configure is enabled.
 
     // Extract the request host from the incoming request
     let request_host = req
@@ -628,9 +553,12 @@ mod tests {
     #[test]
     fn test_handle_tsjs_js_serves_with_headers() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://edge.example.com/static/tsjs.min.js");
+        let req = Request::new(
+            Method::GET,
+            "https://edge.example.com/static/tsjs-core.min.js",
+        );
 
-        let mut resp = handle_tsjs_js(&settings, req).expect("should serve tsjs asset");
+        let mut resp = handle_tsjs_js_core(&settings, req).expect("should serve tsjs asset");
         assert_eq!(resp.get_status(), StatusCode::OK);
         let ct = resp
             .get_header(header::CONTENT_TYPE)
@@ -648,16 +576,19 @@ mod tests {
     fn test_handle_tsjs_js_etag_304() {
         let settings = create_test_settings();
         // First call to compute ETag
-        let bundle = trusted_server_js::TSJS_BUNDLE;
+        let bundle = trusted_server_js::TSJS_CORE_BUNDLE;
         let etag = format!(
             "\"sha256-{}\"",
             hex::encode(Sha256::digest(bundle.as_bytes()))
         );
 
-        let mut req = Request::new(Method::GET, "https://edge.example.com/static/tsjs.min.js");
+        let mut req = Request::new(
+            Method::GET,
+            "https://edge.example.com/static/tsjs-core.min.js",
+        );
         req.set_header(header::IF_NONE_MATCH, &etag);
 
-        let resp = handle_tsjs_js(&settings, req).expect("should serve tsjs 304");
+        let resp = handle_tsjs_js_core(&settings, req).expect("should serve tsjs 304");
         assert_eq!(resp.get_status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
             resp.get_header(header::ETAG)

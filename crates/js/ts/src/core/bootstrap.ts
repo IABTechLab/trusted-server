@@ -3,7 +3,7 @@ import { addAdUnits } from './registry'
 import { renderAdUnit, renderAllAdUnits } from './render'
 import { log } from './log'
 import { setConfig, getConfig } from './config'
-import { requestBids, getHighestCpmBids } from './prebid'
+import { requestBids, getHighestCpmBids } from './bids'
 import { installQueue } from './queue'
 
 const VERSION = '0.1.0'
@@ -14,10 +14,8 @@ const w: (Window & { tsjs?: TsjsApi; pbjs?: TsjsApi }) =
     pbjs?: TsjsApi
   }) || ({} as Window & { tsjs?: TsjsApi; pbjs?: TsjsApi })
 
-// Collect existing queued fns before we overwrite
-const existingTsjsQue: Array<() => void> = Array.isArray(w.tsjs?.que) ? [...w.tsjs.que] : []
-const existingPbjsQue: Array<() => void> = Array.isArray(w.pbjs?.que) ? [...w.pbjs.que] : []
-const pending = [...existingTsjsQue, ...existingPbjsQue]
+// Collect existing tsjs queued fns before we overwrite
+const pending: Array<() => void> = Array.isArray(w.tsjs?.que) ? [...w.tsjs.que] : []
 
 // Create API and attach methods
 const api: TsjsApi = (w.tsjs ??= {} as TsjsApi)
@@ -28,12 +26,11 @@ api.renderAllAdUnits = () => renderAllAdUnits()
 api.log = log
 api.setConfig = setConfig
 api.getConfig = getConfig
+// Provide prebid-like APIs in core so ext can alias pbjs to tsjs
 api.requestBids = requestBids
 api.getHighestCpmBids = getHighestCpmBids
-
-// Point both globals to the same object
+// Point global tsjs
 w.tsjs = api
-w.pbjs = api
 
 // Single shared queue
 installQueue(api, w)

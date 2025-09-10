@@ -17,7 +17,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ts_dir = crate_dir.join("ts");
     let dist_dir = crate_dir.join("dist");
-    let outfile = dist_dir.join("tsjs.js");
+    let core_outfile = dist_dir.join("tsjs-core.js");
+    let ext_outfile = dist_dir.join("tsjs-ext.js");
 
     // Ensure dist exists
     let _ = fs::create_dir_all(&dist_dir);
@@ -73,34 +74,47 @@ fn main() {
     }
 
     // Copy the result into OUT_DIR for include_str!
-    let target_js = out_dir.join("tsjs.js");
-    if outfile.exists() {
-        if let Err(e) = fs::copy(&outfile, &target_js) {
+    // Copy core bundle (required)
+    let target_core = out_dir.join("tsjs-core.js");
+    if core_outfile.exists() {
+        if let Err(e) = fs::copy(&core_outfile, &target_core) {
             panic!(
                 "tsjs: failed to copy {:?} to {:?}: {}",
-                outfile, target_js, e
+                core_outfile, target_core, e
             );
         }
-        return;
-    }
-
-    // Fallback: use checked-in dist/tsjs.js if present (default behavior)
-    let fallback = crate_dir.join("dist/tsjs.js");
-    if fallback.exists() {
-        if let Err(e) = fs::copy(&fallback, &target_js) {
+    } else {
+        // Fallback: use checked-in dist/tsjs-core.js if present
+        let fallback_core = crate_dir.join("dist/tsjs-core.js");
+        if fallback_core.exists() {
+            if let Err(e) = fs::copy(&fallback_core, &target_core) {
+                panic!(
+                    "tsjs: failed to copy fallback {:?} to {:?}: {}",
+                    fallback_core, target_core, e
+                );
+            }
+        } else {
             panic!(
-                "tsjs: failed to copy fallback {:?} to {:?}: {}",
-                fallback, target_js, e
+                "tsjs: core build output not found: {:?} and fallback {:?} missing. Ensure Node is installed and `npm run build` succeeds, or commit dist/tsjs-core.js.",
+                core_outfile, fallback_core
             );
         }
-        return;
     }
 
-    // Final hard error to ensure tsjs.js exists somewhere
-    panic!(
-        "tsjs: build output not found: {:?} and fallback {:?} missing. Ensure Node is installed and `npm run build` succeeds, or commit dist/tsjs.js.",
-        outfile, fallback
-    );
+    // Copy extension bundle (optional, but expected when building ts project)
+    let target_ext = out_dir.join("tsjs-ext.js");
+    if ext_outfile.exists() {
+        let _ = fs::copy(&ext_outfile, &target_ext);
+    } else {
+        let fallback_ext = crate_dir.join("dist/tsjs-ext.js");
+        if fallback_ext.exists() {
+            let _ = fs::copy(&fallback_ext, &target_ext);
+        } else {
+            // If missing, write an empty placeholder to satisfy include_str!
+            let _ = fs::write(&target_ext, "");
+        }
+    }
+    return;
 }
 
 fn watch_dir_recursively(root: &Path) {

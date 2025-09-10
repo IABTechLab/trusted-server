@@ -7,8 +7,8 @@ describe('config', () => {
   })
 
   it('sets and gets config, controls log level', async () => {
-    const { setConfig, getConfig } = await import('../src/config')
-    const { log } = await import('../src/log')
+    const { setConfig, getConfig } = await import('../../src/core/config')
+    const { log } = await import('../../src/core/log')
 
     setConfig({ a: 1 })
     expect(getConfig()).toMatchObject({ a: 1 })

@@ -7,7 +7,7 @@ describe('render', () => {
   })
 
   it('injects creative into existing slot', async () => {
-    const { renderCreativeIntoSlot } = await import('../src/render')
+    const { renderCreativeIntoSlot } = await import('../../src/core/render')
     const div = document.createElement('div')
     div.id = 'slotA'
     document.body.appendChild(div)

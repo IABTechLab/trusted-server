@@ -50,6 +50,7 @@ describe('tsjs', () => {
     })
     vi.resetModules()
     await import('../src/index')
+    await import('../src/ext/ext.entry')
 
     expect(window.tsjs).toBe(window.pbjs)
     const el = document.getElementById('pbslot')
@@ -58,6 +59,9 @@ describe('tsjs', () => {
   })
 
   it('requestBids invokes callback and renders', () => {
+    // Ensure prebid extension is installed
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    import('../src/ext/ext.entry')
     let called = false
     window.tsjs.addAdUnits({ code: 'rb', mediaTypes: { banner: { sizes: [[320, 50]] } } })
     window.pbjs.requestBids({

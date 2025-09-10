@@ -1,2 +1,2 @@
-export type { AdUnit, TsjsApi } from './types'
-import './bootstrap'
+export type { AdUnit, TsjsApi } from './core/types'
+import './core/bootstrap'

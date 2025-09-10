@@ -24,7 +24,8 @@ Logging
 Project layout
 
 - `ts/` — TypeScript source, tooling (Vite, Vitest, ESLint, Prettier)
-- `dist/tsjs.js` — built bundle (IIFE, via Vite library mode). Build script copies this into `OUT_DIR/tsjs.js` and the Rust crate embeds that.
+- `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode). Build script copies this into `OUT_DIR/tsjs-core.js` and the Rust crate embeds that.
+- `dist/tsjs-ext.js` — Prebid.js shim extension (IIFE). Build script also copies this into `OUT_DIR/tsjs-ext.js` for optional serving.
 - `src/lib.rs` — exposes `TSJS_BUNDLE` and `TSJS_FILENAME`
 - `build.rs` — runs `npm run build` inside `ts/` if Node is available
 
@@ -32,7 +33,7 @@ Build the JS bundle
 
 - Requires Node >=18
 - From repo root: `cd crates/js/ts && npm ci && npm run build`
-- Or simply `cargo build` — the build script will run `npm install` and `npm run build`, and then copy the output to `OUT_DIR/tsjs.js` (failing the build if it can’t find the output).
+- Or simply `cargo build` — the build script will run `npm install` and `npm run build`, and then copy the outputs to `OUT_DIR/tsjs-core.js` and `OUT_DIR/tsjs-ext.js` (failing if core cannot be found).
 
 Run tests (TypeScript)
 
@@ -41,8 +42,8 @@ Run tests (TypeScript)
 Serve from Rust
 
 ```rust
-use trusted_server_js::TSJS_BUNDLE;
-// Return TSJS_BUNDLE in a response with Content-Type: application/javascript
+use trusted_server_js::TSJS_CORE_BUNDLE;
+// Return TSJS_CORE_BUNDLE in a response with Content-Type: application/javascript
 ```
 
 HTML usage
@@ -61,14 +62,23 @@ HTML usage
     tsjs.addAdUnits(adUnits);
     tsjs.renderAllAdUnits();
   });
-  // later: <script src="/static/tsjs.min.js"></script>
+  // later: load core
+  // <script src="/static/tsjs-core.min.js"></script>  <!-- serves tsjs-core.js -->
+  // optionally load Prebid shim when pbjs is present
+  // <script>
+  //   if (window.pbjs) {
+  //     var s=document.createElement('script');
+  //     s.src='/static/tsjs-ext.min.js';
+  //     document.head.appendChild(s);
+  //   }
+  // </script>
 </script>
 ```
 
 
 Notes
 
-- By default, the build fails if `tsjs.js` cannot be produced. To change behavior:
-  - `TSJS_SKIP_BUILD=1`: skip running npm; requires `dist/tsjs.js` to exist so it can be copied to `OUT_DIR`.
-  - `TSJS_ALLOW_FALLBACK=1`: allow using a checked‑in `dist/tsjs.js` if the npm build didn’t produce an output.
+- By default, the build fails if `tsjs-core.js` cannot be produced. To change behavior:
+  - `TSJS_SKIP_BUILD=1`: skip running npm; requires `dist/tsjs-core.js` to exist so it can be copied to `OUT_DIR`.
+  - `TSJS_ALLOW_FALLBACK=1`: allow using a checked‑in `dist/tsjs-core.js` if the npm build didn’t produce an output.
   - `TSJS_TEST=1`: run `npm test` during the build.

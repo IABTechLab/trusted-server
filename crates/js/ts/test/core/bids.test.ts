@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // Ensure mocks referenced inside vi.mock factory are hoisted
 const { renderMock } = vi.hoisted(() => ({ renderMock: vi.fn() }))
 
-describe('prebid.requestBids', () => {
+describe('bids.requestBids', () => {
   beforeEach(async () => {
     await vi.resetModules()
     document.body.innerHTML = ''
@@ -11,8 +11,8 @@ describe('prebid.requestBids', () => {
 
   it('sends fetch and renders creatives from response', async () => {
     // mock render module to capture calls
-    vi.mock('../src/render', async () => {
-      const actual = await vi.importActual<any>('../src/render')
+    vi.mock('../../src/core/render', async () => {
+      const actual = await vi.importActual<any>('../../src/core/render')
       return {
         ...actual,
         renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
@@ -27,8 +27,8 @@ describe('prebid.requestBids', () => {
       json: async () => ({ seatbid: [{ bid: [{ impid: 'slot1', adm: '<div>ad</div>' }] }] }),
     })
 
-    const { addAdUnits } = await import('../src/registry')
-    const { requestBids } = await import('../src/prebid')
+    const { addAdUnits } = await import('../../src/core/registry')
+    const { requestBids } = await import('../../src/core/bids')
 
     document.body.innerHTML = '<div id="slot1"></div>'
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any)

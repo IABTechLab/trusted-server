@@ -84,7 +84,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     });
 
     let injected_tsjs = Rc::new(Cell::new(false));
-    let tsjs_loader: &'static str = include_str!("../../../static/tsjs/tsjs.html");
+    let tsjs_loader: &'static str = include_str!("../../../static/tsjs/tsjs-core.html");
+
+    fn is_prebid_script_url(url: &str) -> bool {
+        let lower = url.to_ascii_lowercase();
+        let without_query = lower.split('?').next().unwrap_or("");
+        let filename = without_query.rsplit('/').next().unwrap_or("");
+        matches!(
+            filename,
+            "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
+        )
+    }
+
+    let rewrite_prebid = config.enable_prebid;
 
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
@@ -102,13 +114,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // Replace URLs in href attributes
             element!("[href]", {
                 let patterns = patterns.clone();
+                let rewrite_prebid = rewrite_prebid;
                 move |el| {
                     if let Some(href) = el.get_attribute("href") {
-                        let new_href = href
-                            .replace(&patterns.https_origin(), &patterns.replacement_url())
-                            .replace(&patterns.http_origin(), &patterns.replacement_url());
-                        if new_href != href {
-                            el.set_attribute("href", &new_href)?;
+                        // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
+                        if rewrite_prebid && is_prebid_script_url(&href) {
+                            el.set_attribute("href", "/static/tsjs-ext.min.js")?;
+                        } else {
+                            let new_href = href
+                                .replace(&patterns.https_origin(), &patterns.replacement_url())
+                                .replace(&patterns.http_origin(), &patterns.replacement_url());
+                            if new_href != href {
+                                el.set_attribute("href", &new_href)?;
+                            }
                         }
                     }
                     Ok(())
@@ -117,13 +135,18 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // Replace URLs in src attributes
             element!("[src]", {
                 let patterns = patterns.clone();
+                let rewrite_prebid = rewrite_prebid;
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
-                        let new_src = src
-                            .replace(&patterns.https_origin(), &patterns.replacement_url())
-                            .replace(&patterns.http_origin(), &patterns.replacement_url());
-                        if new_src != src {
-                            el.set_attribute("src", &new_src)?;
+                        if rewrite_prebid && is_prebid_script_url(&src) {
+                            el.set_attribute("src", "/static/tsjs-ext.min.js")?;
+                        } else {
+                            let new_src = src
+                                .replace(&patterns.https_origin(), &patterns.replacement_url())
+                                .replace(&patterns.http_origin(), &patterns.replacement_url());
+                            if new_src != src {
+                                el.set_attribute("src", &new_src)?;
+                            }
                         }
                     }
                     Ok(())
@@ -234,13 +257,14 @@ mod tests {
     }
 
     #[test]
-    fn test_injects_tsjs_script_and_keeps_prebid_refs() {
+    fn test_injects_tsjs_script_and_rewrites_prebid_refs() {
         let html = r#"<html><head>
             <script src="/js/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
         </head><body></body></html>"#;
 
-        let config = create_test_config();
+        let mut config = create_test_config();
+        config.enable_prebid = true; // enable rewriting of Prebid URLs
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -253,19 +277,19 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs.min.js"));
-        // We no longer rewrite Prebid references; they will be shimmed server-side
-        assert!(processed.contains("prebid.min.js"));
-        assert!(processed.contains("cdn.prebid.org/prebid.js"));
+        assert!(processed.contains("/static/tsjs-core.min.js"));
+        // Prebid references are rewritten to our extension when auto-configure is on
+        assert!(processed.contains("/static/tsjs-ext.min.js"));
     }
 
     #[test]
-    fn test_injects_tsjs_script_when_prebid_has_query_string() {
+    fn test_injects_tsjs_script_and_rewrites_prebid_with_query_string() {
         let html = r#"<html><head>
             <script src="/wp-content/plugins/prebidjs/js/prebidjs.min.js?v=1.2.3"></script>
         </head><body></body></html>"#;
 
-        let config = create_test_config();
+        let mut config = create_test_config();
+        config.enable_prebid = true; // enable rewriting of Prebid URLs
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -278,8 +302,8 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs.min.js"));
-        assert!(processed.contains("prebidjs.min.js"));
+        assert!(processed.contains("/static/tsjs-core.min.js"));
+        assert!(processed.contains("/static/tsjs-ext.min.js"));
     }
 
     #[test]
@@ -303,9 +327,10 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
+        // When auto-configure is disabled, do not rewrite Prebid references
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("/static/tsjs.min.js"));
+        assert!(processed.contains("/static/tsjs-core.min.js"));
     }
 
     #[test]

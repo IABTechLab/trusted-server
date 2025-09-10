@@ -14,7 +14,8 @@ use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::prebid_proxy::{handle_prebid_auction, handle_prebid_cookie_sync};
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::publisher::{
-    handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_js,
+    handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_ext_js,
+    handle_tsjs_js_core,
 };
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
@@ -106,7 +107,9 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/why-trusted-server", _) => handle_why_trusted_server(&settings, req),
 
         // Serve the tsjs library
-        (&Method::GET, "/static/tsjs.min.js", _) => handle_tsjs_js(&settings, req),
+        (&Method::GET, "/static/tsjs-core.min.js", _) => handle_tsjs_js_core(&settings, req),
+        (&Method::GET, "/static/tsjs-prebidjs.js", _) => handle_tsjs_ext_js(&settings, req),
+        (&Method::GET, "/static/tsjs-ext.min.js", _) => handle_tsjs_ext_js(&settings, req),
 
         // tsjs simplified prebid proxy endpoint
         (&Method::POST, "/serve-ad", _) => handle_server_ad(&settings, req).await,

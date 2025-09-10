@@ -1,13 +1,13 @@
 import { defineConfig } from 'vite'
 
-// Build in library mode to a sibling dist/ folder so the Rust crate can embed it.
+// Build the Prebid.js shim extension as a separate IIFE bundle.
 export default defineConfig({
   build: {
     lib: {
-      entry: 'src/index.ts',
+      entry: 'src/ext/ext.entry.ts',
       name: 'tsjs',
       formats: ['iife'],
-      fileName: () => 'tsjs.js',
+      fileName: () => 'tsjs-ext.js',
     },
     minify: 'esbuild',
     sourcemap: false,

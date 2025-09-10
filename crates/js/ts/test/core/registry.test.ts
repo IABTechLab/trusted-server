@@ -6,7 +6,7 @@ describe('registry', () => {
   })
 
   it('adds ad units and returns size', async () => {
-    const { addAdUnits, firstSize, getAllUnits } = await import('../src/registry')
+    const { addAdUnits, firstSize, getAllUnits } = await import('../../src/core/registry')
     const unit = {
       code: 'u1',
       mediaTypes: {
