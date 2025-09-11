@@ -30,7 +30,7 @@
     "activationBkgColor": "#d1fae5",
     "sequenceNumberColor": "#0f172a"
   },
-  "themeCSS": ".sequenceNumber{font-size:28px!important;font-weight:900!important;fill:#ffffff!important;paint-order:stroke fill;stroke:transparent;stroke-width:0px;} .sequenceNumber circle{r:35px!important;stroke-width:2px!important;stroke:#1e293b!important;fill:#1e40af!important;} .mermaid svg{background:#ffffff!important;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.06);} .actor{font-weight:600!important;} .messageText{font-weight:600!important;font-size:16px!important;} .activation0{stroke-width:3px!important;} .messageLine0,.messageLine1{stroke-width:3px!important;} .messageText tspan{font-size:16px!important;} path.messageLine0,path.messageLine1{stroke-width:3px!important;} marker#arrowhead path,marker#crosshead path{stroke-width:2px!important;}"
+  "themeCSS": ".sequenceNumber{font-size:26px!important;font-weight:900!important;fill:#ffffff!important;paint-order:stroke fill;stroke:#1e293b;stroke-width:1px;} .sequenceNumber circle{r:32px!important;stroke-width:3px!important;stroke:#1e293b!important;fill:#2563eb!important;} .mermaid svg{background:#ffffff!important;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.06);} .actor{font-weight:600!important;} .messageText{font-weight:600!important;font-size:16px!important;} .activation0{stroke-width:3px!important;} .messageLine0,.messageLine1{stroke-width:3px!important;} .messageText tspan{font-size:16px!important;} path.messageLine0,path.messageLine1{stroke-width:3px!important;} marker#arrowhead path,marker#crosshead path{stroke-width:2px!important;}"
 }}%%
 sequenceDiagram
   autonumber
@@ -117,7 +117,7 @@ sequenceDiagram
       TS-->>U: 200 image/* (proxied)
     end
 
-    opt 🖼️ JS/CSS/etc
+    opt 📚 Text Resource (eg JS/CSS/etc)
       TS->>TS: ✅ Verify content-type
       TS-->>U: 200 (proxied)
     end
