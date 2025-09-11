@@ -19,3 +19,10 @@ pub const HEADER_X_SUBJECT_ID: HeaderName = HeaderName::from_static("x-subject-i
 pub const HEADER_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub const HEADER_X_COMPRESS_HINT: HeaderName = HeaderName::from_static("x-compress-hint");
 pub const HEADER_X_DEBUG_FASTLY_POP: HeaderName = HeaderName::from_static("x-debug-fastly-pop");
+
+// Common standard header names used across modules
+pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");
+pub const HEADER_ACCEPT: HeaderName = HeaderName::from_static("accept");
+pub const HEADER_ACCEPT_LANGUAGE: HeaderName = HeaderName::from_static("accept-language");
+pub const HEADER_ACCEPT_ENCODING: HeaderName = HeaderName::from_static("accept-encoding");
+pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");

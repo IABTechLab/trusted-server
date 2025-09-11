@@ -1,0 +1,101 @@
+use std::time::Duration;
+
+use error_stack::Report;
+use fastly::backend::Backend;
+
+use crate::error::TrustedServerError;
+
+/// Ensure a dynamic backend exists for the given origin and return its name.
+///
+/// The backend name is derived from the scheme and host[:port] to avoid collisions across
+/// http/https or different ports. If a backend with the derived name already exists,
+/// this function logs and reuses it.
+pub fn ensure_origin_backend(
+    scheme: &str,
+    host: &str,
+    port: Option<u16>,
+) -> Result<String, Report<TrustedServerError>> {
+    if host.is_empty() {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        }));
+    }
+
+    let host_with_port = match port {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.to_string(),
+    };
+
+    // Name: iframe_<scheme>_<host[_port]> (sanitize '.' and ':')
+    let mut name_base = format!("{}_{}", scheme, host_with_port);
+    name_base = name_base.replace(['.', ':'], "_");
+    let backend_name = format!("backend_{}", name_base);
+
+    // Target base is host[:port]; SSL is enabled only for https scheme
+    let mut builder = Backend::builder(&backend_name, &host_with_port)
+        .override_host(host)
+        .connect_timeout(Duration::from_secs(1))
+        .first_byte_timeout(Duration::from_secs(15))
+        .between_bytes_timeout(Duration::from_secs(10));
+    if scheme.eq_ignore_ascii_case("https") {
+        builder = builder.enable_ssl();
+    }
+
+    match builder.finish() {
+        Ok(_) => {
+            log::info!(
+                "created dynamic backend: {} -> {}",
+                backend_name,
+                host_with_port
+            );
+            Ok(backend_name)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("NameInUse") || msg.contains("already in use") {
+                log::info!("reusing existing dynamic backend: {}", backend_name);
+                Ok(backend_name)
+            } else {
+                Err(Report::new(TrustedServerError::Proxy {
+                    message: format!(
+                        "dynamic backend creation failed ({} -> {}): {}",
+                        backend_name, host_with_port, msg
+                    ),
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_origin_backend;
+
+    #[test]
+    fn returns_name_for_https_no_port() {
+        let name = ensure_origin_backend("https", "origin.example.com", None).unwrap();
+        assert_eq!(name, "backend_https_origin_example_com");
+    }
+
+    #[test]
+    fn returns_name_for_http_with_port_and_sanitizes() {
+        let name = ensure_origin_backend("http", "api.test-site.org", Some(8080)).unwrap();
+        assert_eq!(name, "backend_http_api_test-site_org_8080");
+        // Explicitly check that ':' was replaced with '_'
+        assert!(name.ends_with("_8080"));
+    }
+
+    #[test]
+    fn error_on_missing_host() {
+        let err = ensure_origin_backend("https", "", None).err().unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("missing host"));
+    }
+
+    #[test]
+    fn second_call_reuses_existing_backend() {
+        let first = ensure_origin_backend("https", "reuse.example.com", None).unwrap();
+        let second = ensure_origin_backend("https", "reuse.example.com", None).unwrap();
+        assert_eq!(first, second);
+    }
+}

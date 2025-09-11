@@ -7,6 +7,7 @@ domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_backend = "publisher_origin"
 origin_url = "https://origin.test-publisher.com"
+proxy_secret = "change-me-proxy-secret"
 
 [prebid]
 server_url = "http://68.183.113.79:8000"

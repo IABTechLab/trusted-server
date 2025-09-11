@@ -13,14 +13,9 @@ use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 #[derive(Clone)]
 pub struct HtmlProcessorConfig {
     pub origin_host: String,
-    pub origin_url: String,
     pub request_host: String,
     pub request_scheme: String,
     pub enable_prebid: bool,
-    pub prebid_account_id: String,
-    pub prebid_bidders: Vec<String>,
-    pub prebid_timeout_ms: u32,
-    pub prebid_debug: bool,
 }
 
 impl HtmlProcessorConfig {
@@ -28,20 +23,14 @@ impl HtmlProcessorConfig {
     pub fn from_settings(
         settings: &Settings,
         origin_host: &str,
-        origin_url: &str,
         request_host: &str,
         request_scheme: &str,
     ) -> Self {
         Self {
             origin_host: origin_host.to_string(),
-            origin_url: origin_url.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             enable_prebid: settings.prebid.auto_configure,
-            prebid_account_id: settings.prebid.account_id.clone(),
-            prebid_bidders: settings.prebid.bidders.clone(),
-            prebid_timeout_ms: settings.prebid.timeout_ms,
-            prebid_debug: settings.prebid.debug,
         }
     }
 }
@@ -96,8 +85,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         )
     }
 
-    let rewrite_prebid = config.enable_prebid;
-
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
             // Inject tsjs once at the start of <head>
@@ -114,7 +101,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // Replace URLs in href attributes
             element!("[href]", {
                 let patterns = patterns.clone();
-                let rewrite_prebid = rewrite_prebid;
+                let rewrite_prebid = config.enable_prebid;
                 move |el| {
                     if let Some(href) = el.get_attribute("href") {
                         // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
@@ -135,7 +122,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             // Replace URLs in src attributes
             element!("[src]", {
                 let patterns = patterns.clone();
-                let rewrite_prebid = rewrite_prebid;
+                let rewrite_prebid = config.enable_prebid;
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
                         if rewrite_prebid && is_prebid_script_url(&src) {
@@ -245,14 +232,9 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             enable_prebid: false,
-            prebid_account_id: "test-account".to_string(),
-            prebid_bidders: vec!["kargo".to_string(), "rubicon".to_string()],
-            prebid_timeout_ms: 1000,
-            prebid_debug: false,
         }
     }
 
@@ -372,18 +354,14 @@ mod tests {
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             "origin.test-publisher.com",
-            "https://origin.test-publisher.com",
             "proxy.example.com",
             "https",
         );
 
         assert_eq!(config.origin_host, "origin.test-publisher.com");
-        assert_eq!(config.origin_url, "https://origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
         assert!(config.enable_prebid); // Uses default true
-        assert_eq!(config.prebid_account_id, "1001"); // Uses default
-        assert_eq!(config.prebid_bidders.len(), 4); // Uses default bidders
     }
 
     #[test]
@@ -404,7 +382,6 @@ mod tests {
         // Process - replace test-publisher.com with our edge domain
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true; // Enable Prebid auto-configuration
 
@@ -481,7 +458,6 @@ mod tests {
         // Process with compression
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true;
 
@@ -605,7 +581,6 @@ mod tests {
         // Process it through our pipeline
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.origin_url = "https://www.test-publisher.com".to_string();
         config.request_host = "test-publisher-ts.edgecompute.app".to_string();
         config.enable_prebid = true;
 

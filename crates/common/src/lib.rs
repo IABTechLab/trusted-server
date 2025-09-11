@@ -24,8 +24,10 @@
 
 pub mod ad;
 pub mod advertiser;
+pub mod backend;
 pub mod constants;
 pub mod cookies;
+pub mod creative;
 pub mod error;
 pub mod gam;
 pub mod gdpr;
@@ -38,6 +40,7 @@ pub mod partners;
 pub mod prebid;
 pub mod prebid_proxy;
 pub mod privacy;
+pub mod proxy;
 pub mod publisher;
 pub mod settings;
 pub mod settings_data;

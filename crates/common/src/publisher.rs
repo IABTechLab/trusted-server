@@ -249,7 +249,6 @@ fn process_response_streaming(
         // Use HTML rewriter for HTML content
         let processor = create_html_stream_processor(
             params.origin_host,
-            params.origin_url,
             params.request_host,
             params.request_scheme,
             params.settings,
@@ -292,26 +291,17 @@ fn process_response_streaming(
 /// Create a unified HTML stream processor
 fn create_html_stream_processor(
     origin_host: &str,
-    origin_url: &str,
     request_host: &str,
     request_scheme: &str,
     settings: &Settings,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
-    let config = HtmlProcessorConfig::from_settings(
-        settings,
-        origin_host,
-        origin_url,
-        request_host,
-        request_scheme,
-    );
+    let config =
+        HtmlProcessorConfig::from_settings(settings, origin_host, request_host, request_scheme);
 
     Ok(create_html_processor(config))
 }
-
-/// Serve an empty shim for PrebidJS that preserves `pbjs.que` but does nothing.
-// Legacy Prebid shim serving removed; clients receive rewritten URLs instead.
 
 /// Proxies requests to the publisher's origin server.
 ///

@@ -64,7 +64,7 @@ describe('request.requestAds', () => {
     // Verify iframe was inserted with expected src
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
     expect(iframe).toBeTruthy();
-    expect(iframe!.getAttribute('src')).toContain('/serve-ad?');
+    expect(iframe!.getAttribute('src')).toContain('/first-party/ad?');
     expect(iframe!.getAttribute('src')).toContain('slot=slot1');
     expect(iframe!.getAttribute('src')).toContain('w=300');
     expect(iframe!.getAttribute('src')).toContain('h=250');

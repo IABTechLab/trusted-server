@@ -56,7 +56,7 @@ function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
           width: size[0],
           height: size[1],
         });
-        iframe.src = `/serve-ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
+        iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
         return;
       }
       if (attempts <= 0) {
@@ -84,8 +84,10 @@ function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) 
     log.warn('requestAds: fetch not available; nothing to render');
     return;
   }
-  log.info('requestAds: sending request to /serve-ad', { units: (payload.adUnits || []).length });
-  void fetch('/serve-ad', {
+  log.info('requestAds: sending request to /third-party/ad', {
+    units: (payload.adUnits || []).length,
+  });
+  void fetch('/third-party/ad', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',

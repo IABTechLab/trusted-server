@@ -6,10 +6,10 @@ use std::collections::HashMap;
 
 use crate::error::TrustedServerError;
 use crate::openrtb;
-use crate::prebid_proxy::handle_prebid_auction;
 use crate::settings::Settings;
 use fastly::http::{header, StatusCode};
 use serde_json::Value as Json;
+// pixel HTML rewrite lives in crate::pixel
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,7 +31,7 @@ struct AdUnit {
     #[allow(dead_code)]
     media_types: Option<MediaTypes>,
     #[serde(default)]
-    bids: Option<Vec<TsBid>>, // Prebid-style bids in adUnit
+    bids: Option<Vec<Bid>>, // Prebid-style bids in adUnit
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,7 +43,7 @@ struct AdRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct TsBid {
+struct Bid {
     bidder: String,
     #[serde(default)]
     params: JsonValue,
@@ -104,6 +104,32 @@ fn build_openrtb_from_ts(req: &AdRequest, settings: &Settings) -> openrtb::OpenR
     }
 }
 
+// Wrapper that allows tests to intercept the PBS call used by the GET handler.
+async fn pbs_auction_for_get(
+    settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    #[cfg(test)]
+    {
+        if let Some(body) = MOCK_PBS_JSON.with(|c| c.borrow_mut().take()) {
+            return Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body(body));
+        }
+    }
+    crate::prebid_proxy::handle_prebid_auction(settings, req).await
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOCK_PBS_JSON: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_mock_pbs_response(body: Vec<u8>) {
+    MOCK_PBS_JSON.with(|c| *c.borrow_mut() = Some(body));
+}
+
 /// Handle tsjs ad requests and proxy to Prebid Server using the existing proxy pipeline.
 pub async fn handle_server_ad(
     settings: &Settings,
@@ -116,7 +142,7 @@ pub async fn handle_server_ad(
         },
     )?;
 
-    log::info!("/serve-ad: received {} adUnits", body.ad_units.len());
+    log::info!("/third-party/ad: received {} adUnits", body.ad_units.len());
     for u in &body.ad_units {
         if let Some(mt) = &u.media_types {
             if let Some(b) = &mt.banner {
@@ -145,18 +171,18 @@ pub async fn handle_server_ad(
             message: "Failed to set OpenRTB body".to_string(),
         })?;
 
-    handle_prebid_auction(settings, req).await
+    crate::prebid_proxy::handle_prebid_auction(settings, req).await
 }
 
-/// GET variant for first-party slot rendering: /serve-ad?slot=code[&w=300&h=250]
+/// GET variant for first-party slot rendering: /first-party/ad?slot=code[&w=300&h=250]
 pub async fn handle_server_ad_get(
     settings: &Settings,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse query
     let url = req.get_url_str();
-    let parsed = url::Url::parse(&url).change_context(TrustedServerError::Prebid {
-        message: "Invalid serve-ad URL".to_string(),
+    let parsed = url::Url::parse(url).change_context(TrustedServerError::Prebid {
+        message: "Invalid first-party serve-ad URL".to_string(),
     })?;
     let qp = parsed
         .query_pairs()
@@ -195,7 +221,7 @@ pub async fn handle_server_ad_get(
         .change_context(TrustedServerError::Prebid {
             message: "Failed to set OpenRTB body".to_string(),
         })?;
-    let mut pbs_resp = handle_prebid_auction(settings, req).await?;
+    let mut pbs_resp = pbs_auction_for_get(settings, req).await?;
 
     // Try to extract HTML creative for this slot
     let body_bytes = pbs_resp.take_body_bytes();
@@ -206,9 +232,11 @@ pub async fn handle_server_ad_get(
         Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
     };
 
+    let rewritten = crate::creative::rewrite_creative_html(&html, settings);
+
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .with_body(html))
+        .with_body(rewritten))
 }
 
 fn extract_adm_for_slot(json: &Json, slot: &str) -> Option<String> {
@@ -236,4 +264,167 @@ fn extract_adm_for_slot(json: &Json, slot: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::tests::create_test_settings;
+    use fastly::http::{Method, StatusCode};
+    use fastly::Request;
+    use serde_json::json;
+
+    #[test]
+    fn build_openrtb_defaults_when_missing_sizes_and_bids() {
+        let settings = create_test_settings();
+        let req = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "slot1".to_string(),
+                media_types: None,
+                bids: None,
+            }],
+            config: None,
+        };
+        let ortb = build_openrtb_from_ts(&req, &settings);
+        assert_eq!(ortb.imp.len(), 1);
+        let imp = &ortb.imp[0];
+        assert_eq!(imp.id, "slot1");
+        let banner = imp.banner.as_ref().expect("banner present");
+        assert_eq!(banner.format.len(), 1);
+        assert_eq!(banner.format[0].w, 300);
+        assert_eq!(banner.format[0].h, 250);
+        let bidders = &imp.ext.as_ref().unwrap().prebid.bidder;
+        for b in &settings.prebid.bidders {
+            assert!(bidders.contains_key(b), "missing bidder {}", b);
+        }
+        assert_eq!(bidders.len(), settings.prebid.bidders.len());
+        let site = ortb.site.as_ref().expect("site present");
+        assert_eq!(
+            site.domain.as_deref(),
+            Some(settings.publisher.domain.as_str())
+        );
+        assert_eq!(
+            site.page.as_deref(),
+            Some(format!("https://{}", settings.publisher.domain).as_str())
+        );
+    }
+
+    #[test]
+    fn build_openrtb_uses_provided_sizes_and_bids() {
+        let settings = create_test_settings();
+        let req = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "slot2".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![728, 90], vec![300, 250]],
+                    }),
+                }),
+                bids: Some(vec![
+                    Bid {
+                        bidder: "openx".to_string(),
+                        params: json!({"unit":"123"}),
+                    },
+                    Bid {
+                        bidder: "rubicon".to_string(),
+                        params: json!({}),
+                    },
+                ]),
+            }],
+            config: None,
+        };
+        let ortb = build_openrtb_from_ts(&req, &settings);
+        let imp = &ortb.imp[0];
+        let banner = imp.banner.as_ref().unwrap();
+        assert_eq!(banner.format.len(), 2);
+        assert!(banner.format.iter().any(|f| f.w == 728 && f.h == 90));
+        assert!(banner.format.iter().any(|f| f.w == 300 && f.h == 250));
+        let bidders = &imp.ext.as_ref().unwrap().prebid.bidder;
+        assert!(bidders.contains_key("openx"));
+        assert!(bidders.contains_key("rubicon"));
+        // When bids provided, do not add defaults
+        assert_eq!(bidders.len(), 2);
+    }
+
+    #[test]
+    fn extract_adm_picks_matching_slot_then_fallback() {
+        let json = json!({
+            "seatbid": [
+                { "bid": [
+                    { "impid": "slot2", "adm": "<div>two</div>" },
+                    { "impid": "slot1", "adm": "<div>one</div>" }
+                ]}
+            ]
+        });
+        let adm = extract_adm_for_slot(&json, "slot1").expect("adm present");
+        assert!(adm.contains("one"));
+
+        let json2 = json!({
+            "seatbid": [
+                { "bid": [ { "impid": "other", "adm": "<div>x</div>" } ] }
+            ]
+        });
+        let adm2 = extract_adm_for_slot(&json2, "slot-missing").expect("fallback adm");
+        assert!(adm2.contains("x"));
+    }
+
+    #[tokio::test]
+    async fn handle_server_ad_get_missing_slot_returns_400() {
+        let settings = create_test_settings();
+        let req = Request::new(
+            Method::GET,
+            "https://example.com/first-party/ad?w=300&h=250",
+        );
+        let res = handle_server_ad_get(&settings, req).await.unwrap();
+        assert_eq!(res.get_status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_server_ad_get_returns_html_ct_when_adm_present() {
+        let settings = create_test_settings();
+        // Mock PBS JSON with matching impid and simple HTML adm
+        let mock = serde_json::json!({
+            "seatbid": [{
+                "bid": [{ "impid": "slotA", "adm": "<div>creative</div>" }]
+            }]
+        });
+        super::set_mock_pbs_response(serde_json::to_vec(&mock).unwrap());
+
+        let req = Request::new(
+            Method::GET,
+            "https://example.com/first-party/ad?slot=slotA&w=300&h=250",
+        );
+        let mut res = handle_server_ad_get(&settings, req).await.unwrap();
+        assert_eq!(res.get_status(), StatusCode::OK);
+        let ct = res
+            .get_header(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.contains("text/html"));
+        let body = String::from_utf8(res.take_body_bytes()).unwrap();
+        assert!(body.contains("creative"));
+    }
+
+    #[tokio::test]
+    async fn handle_server_ad_get_rewrites_1x1_pixels() {
+        let settings = create_test_settings();
+        // Mock PBS JSON with a 1x1 img pixel in adm
+        let mock = serde_json::json!({
+            "seatbid": [{
+                "bid": [{ "impid": "slotP", "adm": "<html><body><img width=\"1\" height=\"1\" src=\"https://tracker.example/p.gif\"></body></html>" }]
+            }]
+        });
+        super::set_mock_pbs_response(serde_json::to_vec(&mock).unwrap());
+
+        let req = Request::new(
+            Method::GET,
+            "https://example.com/first-party/ad?slot=slotP&w=300&h=250",
+        );
+        let mut res = handle_server_ad_get(&settings, req).await.unwrap();
+        assert_eq!(res.get_status(), StatusCode::OK);
+        let body = String::from_utf8(res.take_body_bytes()).unwrap();
+        // Should rewrite to unified first-party proxy endpoint with base64-encoded URL
+        assert!(body.contains("/first-party/proxy?u="));
+    }
 }

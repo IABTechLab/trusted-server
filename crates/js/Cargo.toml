@@ -15,5 +15,5 @@ repository = "https://example.invalid/trusted-server"
 readme = "README.md"
 
 [build-dependencies]
-which = "6"
+which = "8"
 

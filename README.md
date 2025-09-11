@@ -142,3 +142,19 @@ cargo test
 - `cargo clippy`: Ensure idiomatic code
 - `cargo check`: Ensure compilation succeeds on Linux, MacOS, Windows and WebAssembly
 - `cargo bench`: Run all benchmarks
+
+## First-Party Endpoints
+
+ - `/first-party/ad` (GET): returns HTML for a single slot (`slot`, `w`, `h` query params). The server inspects returned creative HTML and rewrites:
+  - All absolute images and iframes to `/first-party/proxy?u=<token>` (1×1 pixels are detected server‑side heuristically for logging). The `<token>` is an encrypted+authenticated value derived from the publisher's proxy secret.
+ - `/third-party/ad` (POST): accepts tsjs ad units and proxies to Prebid Server.
+- `/first-party/proxy` (GET): unified proxy for resources referenced by creatives.
+  - Query params:
+    - `u`: Encrypted+authenticated token (Base64 URL‑safe, no padding) representing the original URL (required)
+  - Behavior:
+    - HTML responses: proxied and rewritten (images/iframes/pixels) via creative rewriter
+    - Image responses: proxied; if content‑type is missing, sets `image/*`; logs likely 1×1 pixels via size/URL heuristics
+
+Notes
+- Rewriting uses `lol_html`. Only absolute and protocol‑relative URLs are rewritten; relative URLs are left unchanged.
+- For the proxy endpoint, the `u` value is a Base64 URL‑safe (no padding) token that includes encryption and integrity protection using the configured `publisher.proxy_secret`.

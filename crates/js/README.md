@@ -11,8 +11,8 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 - `renderAdUnit(code)` to render a single unit by `code`
 - `setConfig(cfg)` and `getConfig()` to control logging, etc.
 - `requestAds({ bidsBackHandler })` calls the callback synchronously.
-  - In `firstParty` mode (default): inserts a sandboxed iframe per ad unit that loads `/serve-ad?slot=<code>&w=<w>&h=<h>`
-  - In `thirdParty` mode: posts to `/serve-ad` and renders returned creatives
+  - In `firstParty` mode (default): inserts a sandboxed iframe per ad unit that loads `/first-party/ad?slot=<code>&w=<w>&h=<h>`
+  - In `thirdParty` mode: posts to `/third-party/ad` and renders returned creatives
   - The Prebid extension also adds `pbjs.getHighestCpmBids(adUnitCodes?)`
 - `version`
 

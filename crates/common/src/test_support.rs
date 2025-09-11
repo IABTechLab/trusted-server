@@ -13,6 +13,7 @@ pub mod tests {
             cookie_domain = ".test-publisher.com"
             origin_backend = "publisher_origin"
             origin_url= "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
 
             [prebid]
             server_url = "https://test-prebid.com/openrtb2/auction"
