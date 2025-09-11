@@ -76,15 +76,6 @@ sequenceDiagram
       TS-->>U: 200 image/*
     end
   end
-
-  %% Cookie sync (do we need to show this?)
-  rect rgb(235,235,255)
-    JS->>TS: POST /cookie_sync
-    TS->>PBS: POST /cookie_sync
-    PBS-->>TS: 200 JSON syncs
-    TS->>TS: Rewrite sync URLs to first party proxy
-    TS-->>JS: 200 JSON sync URLs
-  end
 ```
 
 ## Notes
