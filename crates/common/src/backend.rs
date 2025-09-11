@@ -7,7 +7,7 @@ use crate::error::TrustedServerError;
 
 /// Ensure a dynamic backend exists for the given origin and return its name.
 ///
-/// The backend name is derived from the scheme and host[:port] to avoid collisions across
+/// The backend name is derived from the scheme and `host[:port]` to avoid collisions across
 /// http/https or different ports. If a backend with the derived name already exists,
 /// this function logs and reuses it.
 pub fn ensure_origin_backend(

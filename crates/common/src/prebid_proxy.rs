@@ -240,9 +240,9 @@ pub async fn handle_ad_proxy(
     // Extract proxy type and encoded URL
     let parts: Vec<&str> = path.trim_start_matches("/ad-proxy/").split('/').collect();
     if parts.len() < 2 {
-        return Ok(
-            Response::from_status(StatusCode::BAD_REQUEST).with_body("Invalid proxy request")
-        );
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "Invalid proxy request".to_string(),
+        }));
     }
 
     let proxy_type = parts[0];

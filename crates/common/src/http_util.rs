@@ -1,8 +1,8 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use sha2::{Digest, Sha256};
-use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 
 use crate::settings::Settings;
 
@@ -85,7 +85,10 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
 
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
     let cipher = XChaCha20Poly1305::new((&key_bytes).into());
-    cipher.decrypt(nonce, ciphertext).ok().and_then(|pt| String::from_utf8(pt).ok())
+    cipher
+        .decrypt(nonce, ciphertext)
+        .ok()
+        .and_then(|pt| String::from_utf8(pt).ok())
 }
 
 #[cfg(test)]

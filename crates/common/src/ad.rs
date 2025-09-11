@@ -198,7 +198,9 @@ pub async fn handle_server_ad_get(
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(250);
     if slot.is_empty() {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("missing slot"));
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "missing slot".to_string(),
+        }));
     }
 
     // Build a synthetic AdRequest with a single unit for this slot
@@ -375,8 +377,12 @@ mod tests {
             Method::GET,
             "https://example.com/first-party/ad?w=300&h=250",
         );
-        let res = handle_server_ad_get(&settings, req).await.unwrap();
-        assert_eq!(res.get_status(), StatusCode::BAD_REQUEST);
+        let err = handle_server_ad_get(&settings, req)
+            .await
+            .err()
+            .expect("expected error");
+        // ensure this is a BadRequest surfacing a 400 mapping
+        assert!(err.to_string().contains("missing slot"));
     }
 
     #[tokio::test]

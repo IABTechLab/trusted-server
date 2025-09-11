@@ -15,6 +15,9 @@ use http::StatusCode;
 #[allow(dead_code)]
 #[derive(Debug, Display)]
 pub enum TrustedServerError {
+    /// Client-side input/validation error resulting in a 400 Bad Request.
+    #[display("Bad request: {message}")]
+    BadRequest { message: String },
     /// Configuration errors that prevent the server from starting.
     #[display("Configuration error: {message}")]
     Configuration { message: String },
@@ -79,6 +82,7 @@ pub trait IntoHttpResponse {
 impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
+            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,

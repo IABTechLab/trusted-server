@@ -1,6 +1,6 @@
 use crate::http_util::decode_url;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, StatusCode};
+use fastly::http::header;
 use fastly::{Request, Response};
 
 use crate::constants::{
@@ -37,16 +37,18 @@ pub async fn handle_first_party_proxy(
 
     // Extract required param
     let Some(u_param) = params.get("u").cloned() else {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("missing u parameter"));
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "missing u parameter".to_string(),
+        }));
     };
 
     // Decrypt token
     let decoded = match decode_url(settings, &u_param) {
         Some(s) => s,
         None => {
-            return Ok(
-                Response::from_status(StatusCode::BAD_REQUEST).with_body("invalid token in u")
-            );
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "invalid token in u".to_string(),
+            }));
         }
     };
 
@@ -58,15 +60,21 @@ pub async fn handle_first_party_proxy(
 
     // Validate URL
     let Ok(u) = url::Url::parse(&target_url) else {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("invalid url"));
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "invalid url".to_string(),
+        }));
     };
     let scheme = u.scheme().to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("unsupported scheme"));
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported scheme".to_string(),
+        }));
     }
     let host = u.host_str().unwrap_or("");
     if host.is_empty() {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST).with_body("missing host"));
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        }));
     }
 
     // Ensure a backend exists
@@ -107,6 +115,16 @@ pub async fn handle_first_party_proxy(
         let rewritten = crate::creative::rewrite_creative_html(&body, settings);
         return Ok(Response::from_status(status)
             .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_body(rewritten));
+    }
+
+    if ct.contains("text/css") {
+        // CSS: rewrite url(...) references in stylesheets
+        let status = beresp.get_status();
+        let body = beresp.take_body_str();
+        let rewritten = crate::creative::rewrite_css_body(&body, settings);
+        return Ok(Response::from_status(status)
+            .with_header(header::CONTENT_TYPE, "text/css; charset=utf-8")
             .with_body(rewritten));
     }
 
@@ -162,7 +180,9 @@ pub async fn handle_first_party_proxy(
 #[cfg(test)]
 mod tests {
     use super::handle_first_party_proxy;
+    use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
+    use error_stack::Report;
     use fastly::http::{Method, StatusCode};
     use fastly::Request;
 
@@ -170,8 +190,11 @@ mod tests {
     async fn proxy_missing_param_returns_400() {
         let settings = create_test_settings();
         let req = Request::new(Method::GET, "https://example.com/first-party/proxy");
-        let resp = handle_first_party_proxy(&settings, req).await.unwrap();
-        assert_eq!(resp.get_status(), StatusCode::BAD_REQUEST);
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .err()
+            .expect("expected error");
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -182,7 +205,10 @@ mod tests {
             Method::GET,
             "https://example.com/first-party/proxy?u=@@notb64@@",
         );
-        let resp = handle_first_party_proxy(&settings, req).await.unwrap();
-        assert_eq!(resp.get_status(), StatusCode::BAD_REQUEST);
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .err()
+            .expect("expected error");
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 }
