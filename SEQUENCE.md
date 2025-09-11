@@ -1,80 +1,129 @@
-# Trusted Server — First-Party Proxying Flow
+# 🛡️ Trusted Server — First-Party Proxying Flow
 
-This sequence diagram shows how the Trusted Server proxies a publisher page, injects TSJS, rewrites publisher HTML, runs the auction path(s), and rewrites ad creative resources to the unified first‑party proxy.
-
-Tip: In VS Code, open this file and use the Markdown preview. If Mermaid isn’t rendering, install a Mermaid preview extension (e.g., “Markdown Preview Mermaid Support”) or use the built‑in preview if available.
+## 🔄 System Flow Diagram
 
 ```mermaid
 %%{init: {
   "theme": "base",
   "themeVariables": {
-    "actorBkg": "#eef5ff",
+    "background": "#ffffff",
+    "primaryColor": "#dbeafe",
+    "primaryTextColor": "#1e3a8a",
+    "primaryBorderColor": "#2563eb",
+    "lineColor": "#334155",
+    "secondaryColor": "#fef3c7",
+    "tertiaryColor": "#d1fae5",
+    "actorBkg": "#eff6ff",
     "actorBorderColor": "#3b82f6",
-    "actorTextColor": "#0b3d91",
-    "signalColor": "#334155",
-    "signalTextColor": "#334155",
-    "sequenceNumberColor": "#64748b"
-  }
+    "actorTextColor": "#1e40af",
+    "actorLineColor": "#64748b",
+    "signalColor": "#1e293b",
+    "signalTextColor": "#0f172a",
+    "labelBoxBkgColor": "#f1f5f9",
+    "labelBoxBorderColor": "#cbd5e1",
+    "labelTextColor": "#1e293b",
+    "loopTextColor": "#1e293b",
+    "noteBkgColor": "#fef3c7",
+    "noteBorderColor": "#d97706",
+    "noteTextColor": "#78350f",
+    "activationBorderColor": "#059669",
+    "activationBkgColor": "#d1fae5",
+    "sequenceNumberColor": "#0f172a"
+  },
+  "themeCSS": ".sequenceNumber{font-size:26px!important;font-weight:900!important;fill:#ffffff!important;paint-order:stroke fill;stroke:#1e293b;stroke-width:1px;} .sequenceNumber circle{r:32px!important;stroke-width:3px!important;stroke:#1e293b!important;fill:#2563eb!important;} .mermaid svg{background:#ffffff!important;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.06);} .actor{font-weight:600!important;} .messageText{font-weight:600!important;font-size:16px!important;} .activation0{stroke-width:3px!important;} .messageLine0,.messageLine1{stroke-width:3px!important;} .messageText tspan{font-size:16px!important;} path.messageLine0,path.messageLine1{stroke-width:3px!important;} marker#arrowhead path,marker#crosshead path{stroke-width:2px!important;}"
 }}%%
 sequenceDiagram
   autonumber
 
-  box rgb(235,245,255) Browser
-    actor U as User Browser
-  end
-  participant JS as TSJS
-  box rgb(255,240,235) Edge
-    participant TS as Trusted Server
-  end
-  box rgb(240,255,240) Origin
-    participant OR as Publisher Origin
-  end
-  participant PBS as Prebid Server
-  participant DSP as DSP
-  participant CS as Creative Server
+  participant U as 🌐 User Browser
+  participant JS as 📦 TSJS
+  participant TS as 🛡️ Trusted Server
+  participant OR as 🏢 Publisher Origin
+  participant PBS as 🎯 Prebid Server
+  participant DSP as 💰 DSP
+  participant CS as 🎨 Creative Server
 
-  %% Publisher page load
-  rect rgb(250,250,205)
-    U->>TS: GET https://publisher/path
-    TS->>OR: GET http://origin/path
-    OR-->>TS: 200 HTML
-    TS->>TS: Inject TSJS and rewrite prebid if enabled and replace origin URLs
-    TS-->>U: 200 HTML rewritten
+  %% === Page Load ===
+  rect rgb(243,244,246)
+    Note over U,CS: 📄 Page Load
+    activate U
+    activate TS
+    activate OR
+    U->>TS: GET https://publisher.com/page
+    TS->>OR: GET http://origin/page
+    OR-->>TS: 200 HTML (original)
+    TS->>TS: 🔧 Inject TSJS loader<br/>🔄 Rewrite origin URLs<br/>⚙️ Transform prebid config
+    TS-->>U: 200 HTML (transformed)
+    deactivate OR
+    deactivate TS
+    deactivate U
   end
 
-  %% TSJS bootstrap
-  rect rgb(220,255,235)
+  %% === TSJS Bootstrap ===
+  rect rgb(239,246,255)
+    Note over U,CS: 🚀 TSJS Bootstrap
+    activate U
+    activate TS
+    activate JS
     U->>TS: GET /static/tsjs-core.min.js
-    TS-->>U: 200 JS
-    JS->>JS: Discover ad units and render placeholders
+    TS-->>U: 200 JavaScript bundle
+    JS->>JS: 🔍 Discover ad units<br/>📊 Collect signals<br/>🖼️ Render placeholders
+    deactivate JS
+    deactivate TS
+    deactivate U
   end
 
-  %% Ad request
-  rect rgb(235,245,255)
-    JS->>TS: GET /first-party/ad
-    TS->>PBS: POST /openrtb2/auction
+  %% === Ad Auction ===
+  rect rgb(243,232,255)
+    Note over U,CS: 💱 Real-Time Auction
+    activate JS
+    activate TS
+    activate PBS
+    activate DSP
+    JS->>TS: GET /first-party/ad<br/>(with signals)
+    TS->>PBS: POST /openrtb2/auction<br/>(OpenRTB 2.x)
     PBS->>DSP: POST bid request
     DSP-->>PBS: 200 bid response
-    PBS-->>TS: 200 JSON bids
-    TS->>TS: Extract creative HTML from Prebid Server
-    TS->>TS: Rewrite resource in first party domain
-    TS-->>JS: 200 HTML creative
-    JS->>U: Inject creative in iframe
+    PBS-->>TS: 200 JSON (winning bids)
+    TS->>TS: 📝 Extract creative HTML<br/>🔐 Generate encrypted target urls<br/>🔄 Rewrite resource URLs
+    TS-->>JS: 200 HTML (secured creative)
+    deactivate PBS
+    deactivate DSP
+    activate U
+    JS->>U: 💉 Inject into iframe
+    deactivate U
+    deactivate TS
+    deactivate JS
   end
 
-  %% Creative subresources via first-party proxy
-  rect rgb(255,245,230)
-    U->>TS: GET first party proxy with token
-    TS->>CS: GET target url
-    CS-->>TS: 200 image or html
-    opt HTML response
-      TS->>TS: Rewrite creative HTML again in first party domain
-      TS-->>U: 200 text/html
+  %% === Creative Resources ===
+  rect rgb(236,253,245)
+    Note over U,CS: 🖼️ Proxied Resources
+    activate U
+    activate TS
+    activate CS
+    U->>TS: GET /first-party/proxy?u=encrypted_target_url
+    TS->>TS: 🔓 Decrypt target url<br/>✅ Validate signature
+    TS->>CS: GET original_url
+    CS-->>TS: 200 (image/HTML)
+    
+    opt 📄 HTML Response
+      TS->>TS: 🔐 Generate encrypted target urls<br/>🔄 Rewrite resource URLs
+      TS-->>U: 200 text/html (secured)
     end
-    opt Image response
-      TS->>TS: Ensure content type and log small pixel heuristics
-      TS-->>U: 200 image/*
+    
+    opt 🖼️ Image Response
+      TS->>TS: ✅ Verify content-type<br/>📊 Log pixel tracking
+      TS-->>U: 200 image/* (proxied)
     end
+
+    opt 🖼️ JS/CSS/etc
+      TS->>TS: ✅ Verify content-type<br/>
+      TS-->>U: 200 (proxied)
+    end
+    deactivate CS
+    deactivate TS
+    deactivate U
   end
 ```
 

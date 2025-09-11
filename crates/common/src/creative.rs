@@ -556,7 +556,8 @@ mod tests {
     fn rewrites_srcset_relative_no_space_middle() {
         let settings = crate::test_support::tests::create_test_settings();
         // Relative candidate (no leading slash) in the middle, no space after commas
-        let html = r#"<img srcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x">"#;
+        let html =
+            r#"<img srcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x">"#;
         let out = rewrite_creative_html(html, &settings);
         // Two absolute/protocol-relative rewritten
         assert!(out.matches("/first-party/proxy?u=").count() >= 2, "{}", out);
