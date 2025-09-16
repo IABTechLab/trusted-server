@@ -55,6 +55,7 @@ jobs:
 
       - name: Retrieve Node.js version
         id: node-version
+        working-directory: .
         run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
         
