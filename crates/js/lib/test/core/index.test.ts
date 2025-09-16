@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import '../src/core/index';
+import '../../src/core/index';
 
 declare global {
   interface Window {
@@ -63,8 +63,8 @@ describe('tsjs', () => {
       window.pbjs.requestBids({ bidsBackHandler: () => {} });
     });
     vi.resetModules();
-    await import('../src/core/index');
-    await import('../src/ext/index');
+    await import('../../src/core/index');
+    await import('../../src/ext/index');
 
     expect(window.tsjs).toBe(window.pbjs);
     const el = document.getElementById('pbslot');
@@ -75,7 +75,7 @@ describe('tsjs', () => {
   it('requestBids invokes callback and renders', () => {
     // Ensure prebid extension is installed
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    import('../src/ext/index');
+    import('../../src/ext/index');
     let called = false;
     window.tsjs.setConfig({ mode: 'thirdParty' } as any);
     window.tsjs.addAdUnits({ code: 'rb', mediaTypes: { banner: { sizes: [[320, 50]] } } });
@@ -96,7 +96,7 @@ describe('tsjs', () => {
       window.tsjs.renderAllAdUnits();
     });
     vi.resetModules();
-    await import('../src/core/index');
+    await import('../../src/core/index');
     const el = document.getElementById('qslot');
     expect(el).toBeTruthy();
     expect(el!.textContent).toContain('300x250');

@@ -10,7 +10,7 @@ const PROXY_RESPONSE =
 
 async function importCreativeModule() {
   delete (globalThis as any).__ts_creative_installed;
-  await import('../src/creative/index');
+  await import('../../src/creative/index');
 }
 
 describe('tsjs creative guard', () => {
