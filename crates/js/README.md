@@ -4,7 +4,7 @@ tsjs is the browser-side library for Trusted Server. It ships as small IIFE bund
 
 - Core (`tsjs-core.js`) — always loaded
 - Prebid.js extension (`tsjs-ext.js`) — optional shim
-- Creative helper (`tsjs-creative.js`) — injected into proxied creatives to guard click URLs
+- Creative helper (`tsjs-creative.js`) — injected into proxied creatives to guard and repair click URLs
 
 This Rust crate builds those bundles (via Vite) and embeds them so other crates can serve them as first‑party assets.
 
@@ -17,8 +17,8 @@ This Rust crate builds those bundles (via Vite) and embeds them so other crates 
 - `renderAdUnit(code)` to render a single unit by `code`
 - `setConfig(cfg)` and `getConfig()` to control logging, etc.
 - `requestAds({ bidsBackHandler })` calls the callback synchronously.
-  - In `firstParty` mode (default): inserts a sandboxed iframe per ad unit that loads `/first-party/ad?slot=<code>&w=<w>&h=<h>`
-  - In `thirdParty` mode: posts to `/third-party/ad` and renders returned creatives
+  - In `firstParty` mode (default): schedules insertion of a sandboxed iframe per ad unit that loads `/first-party/ad?slot=<code>&w=<w>&h=<h>` (retries until the slot exists)
+  - In `thirdParty` mode: posts to `/third-party/ad`, renders simple placeholders immediately, and swaps in returned creatives when the JSON response arrives
   - The Prebid extension also adds `pbjs.getHighestCpmBids(adUnitCodes?)`
 - `version`
 
@@ -34,8 +34,10 @@ This Rust crate builds those bundles (via Vite) and embeds them so other crates 
 ## Project Layout
 
 - `ts/` — TypeScript source, tooling (Vite, Vitest, ESLint, Prettier)
-- `lib/src/core/` — core library (bootstrap, config, log, registry, render, request, types, queue)
+- `lib/src/core/` — core library (bootstrap, config, log, registry, render, request, queue, types)
 - `lib/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `index.ts`)
+- `lib/src/creative/` — creative click guard bundle
+- `lib/src/shared/` — shared helpers (async scheduling, global detection, mutation batching)
 - `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode)
 - `dist/tsjs-ext.js` — PrebidJS shim extension (IIFE)
 - `dist/tsjs-creative.js` — creative click‑guard bundle (IIFE)
@@ -50,7 +52,8 @@ This Rust crate builds those bundles (via Vite) and embeds them so other crates 
 
 ## Run Tests (TypeScript)
 
-- `cd crates/js/lib && npm test` (vitest + jsdom)
+- `cd crates/js/lib && npm test` (vitest + jsdom). In sandboxed environments, use `npm run test -- --run` to execute once without watch mode.
+- `npm run lint` for ESLint checks.
 
 ## Serving From Rust
 
@@ -98,7 +101,7 @@ use trusted_server_js::{
 ## Auto‑Rewrite (Server)
 
 - When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs=tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
-- Proxied creative HTML injects the creative helper once at the top of `<body>`: `/static/tsjs=tsjs-creative.min.js`.
+- Proxied creative HTML injects the creative helper once at the top of `<body>`: `/static/tsjs=tsjs-creative.min.js`. The helper monitors anchors for script-driven rewrites and rebuilds first-party click URLs whenever creatives mutate them.
 
 ## Notes
 

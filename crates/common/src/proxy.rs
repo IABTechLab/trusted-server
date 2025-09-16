@@ -1,6 +1,6 @@
 use crate::http_util::compute_encrypted_sha256_token;
 use error_stack::{Report, ResultExt};
-use fastly::http::header;
+use fastly::http::{header, HeaderValue};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,24 @@ fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
 
 // Transform the backend response into the final response sent to the client.
 // Handles HTML and CSS rewrites and image content-type normalization.
+fn rebuild_text_response(beresp: Response, content_type: &'static str, body: String) -> Response {
+    let status = beresp.get_status();
+    let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
+        .get_headers()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut resp = Response::from_status(status);
+    for (name, value) in headers {
+        if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
+            continue;
+        }
+        resp.set_header(name, value);
+    }
+    resp.set_header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.set_body(body);
+    resp
+}
+
 fn finalize_proxied_response(
     settings: &Settings,
     req: &Request,
@@ -65,22 +83,16 @@ fn finalize_proxied_response(
 
     if ct.contains("text/html") {
         // HTML: rewrite and serve as HTML (safe to read as string)
-        let status = beresp.get_status();
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_creative_html(&body, settings);
-        return Response::from_status(status)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(rewritten);
+        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
     }
 
     if ct.contains("text/css") {
         // CSS: rewrite url(...) references in stylesheets (safe to read as string)
-        let status = beresp.get_status();
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_css_body(&body, settings);
-        return Response::from_status(status)
-            .with_header(header::CONTENT_TYPE, "text/css; charset=utf-8")
-            .with_body(rewritten);
+        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics
@@ -758,6 +770,8 @@ mod tests {
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
         let beresp = Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_header(header::CACHE_CONTROL, "public, max-age=60")
+            .with_header(header::SET_COOKIE, "a=1; Path=/; Secure")
             .with_body(html);
         // Sanity: header present and creative rewrite works directly
         let ct_pre = beresp
@@ -776,6 +790,16 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(ct, "text/html; charset=utf-8");
+        let cc = out
+            .get_header(header::CACHE_CONTROL)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(cc, "public, max-age=60");
+        let cookie = out
+            .get_header(header::SET_COOKIE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert!(cookie.contains("a=1"));
     }
 
     #[test]
