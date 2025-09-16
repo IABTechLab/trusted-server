@@ -6,9 +6,8 @@ on:
   pull_request:
     branches: [main]
 
-# Check formatting with rustfmt
 jobs:
-  format:
+  format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
@@ -45,3 +44,32 @@ jobs:
       - name: Run cargo clipply
         run: cargo clippy --all-targets --all-features
 
+  format-typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/js/lib
+        
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+        
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: crates/js/lib/package.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+      
+      - name: Run Prettier (check)
+        run: npm run format
