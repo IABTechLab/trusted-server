@@ -7,6 +7,7 @@ describe('request.requestAds', () => {
   beforeEach(async () => {
     await vi.resetModules();
     document.body.innerHTML = '';
+    renderMock.mockReset();
   });
 
   it('sends fetch and renders creatives from response', async () => {
@@ -42,6 +43,63 @@ describe('request.requestAds', () => {
 
     expect((globalThis as any).fetch).toHaveBeenCalled();
     expect(renderMock).toHaveBeenCalledWith('slot1', '<div>ad</div>');
+  });
+
+  it('handles unexpected third-party response without rendering', async () => {
+    vi.mock('../../src/core/render', async () => {
+      const actual = await vi.importActual<any>('../../src/core/render');
+      return {
+        ...actual,
+        renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
+      };
+    });
+
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/plain' },
+      json: async () => ({}),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { setConfig } = await import('../../src/core/config');
+    const { requestAds } = await import('../../src/core/request');
+
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+    setConfig({ mode: 'thirdParty' } as any);
+
+    requestAds();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect((globalThis as any).fetch).toHaveBeenCalled();
+    expect(renderMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores fetch rejection gracefully', async () => {
+    vi.mock('../../src/core/render', async () => {
+      const actual = await vi.importActual<any>('../../src/core/render');
+      return {
+        ...actual,
+        renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
+      };
+    });
+
+    (globalThis as any).fetch = vi.fn().mockRejectedValue(new Error('network-error'));
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { setConfig } = await import('../../src/core/config');
+    const { requestAds } = await import('../../src/core/request');
+
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+    setConfig({ mode: 'thirdParty' } as any);
+
+    requestAds();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect((globalThis as any).fetch).toHaveBeenCalled();
+    expect(renderMock).not.toHaveBeenCalled();
   });
 
   it('inserts an iframe per ad unit with correct src (firstParty)', async () => {

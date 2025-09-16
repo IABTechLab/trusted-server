@@ -146,15 +146,26 @@ cargo test
 ## First-Party Endpoints
 
  - `/first-party/ad` (GET): returns HTML for a single slot (`slot`, `w`, `h` query params). The server inspects returned creative HTML and rewrites:
-  - All absolute images and iframes to `/first-party/proxy?u=<token>` (1×1 pixels are detected server‑side heuristically for logging). The `<token>` is an encrypted+authenticated value derived from the publisher's proxy secret.
+  - All absolute images and iframes to `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` (1×1 pixels are detected server‑side heuristically for logging). The `tstoken` is derived from encrypting the full target URL and hashing it.
  - `/third-party/ad` (POST): accepts tsjs ad units and proxies to Prebid Server.
 - `/first-party/proxy` (GET): unified proxy for resources referenced by creatives.
   - Query params:
-    - `u`: Encrypted+authenticated token (Base64 URL‑safe, no padding) representing the original URL (required)
+    - `tsurl`: Target URL without query (base URL) — required
+    - Any original target query parameters are included at top level as-is (order preserved)
+    - `tstoken`: Base64 URL‑safe (no padding) SHA‑256 digest of the encrypted full target URL — required
   - Behavior:
+    - Reconstructs the full target URL from `tsurl` + provided parameters in order, computes `tstoken` by encrypting with XChaCha20‑Poly1305 (deterministic nonce) and hashing the bytes with SHA‑256, and validates it.
     - HTML responses: proxied and rewritten (images/iframes/pixels) via creative rewriter
     - Image responses: proxied; if content‑type is missing, sets `image/*`; logs likely 1×1 pixels via size/URL heuristics
+    - When forwarding to the target URL, no `tstoken` is included (it is not part of the target URL).
 
-Notes
-- Rewriting uses `lol_html`. Only absolute and protocol‑relative URLs are rewritten; relative URLs are left unchanged.
-- For the proxy endpoint, the `u` value is a Base64 URL‑safe (no padding) token that includes encryption and integrity protection using the configured `publisher.proxy_secret`.
+- `/first-party/click` (GET): first‑party click redirect handler for anchors and clickable areas.
+  - Query params: same as `/first-party/proxy` (uses `tsurl`, original params, `tstoken`).
+  - Behavior:
+    - Validates `tstoken` against the reconstructed full URL (same enc+SHA256 scheme).
+    - Emits a `302 Found` with `Location: <reconstructed_target_url>` — content is not parsed or proxied.
+    - Logs click metadata (tsurl, whether params are present, target URL, referer, user agent, and Trusted Server ID header) for observability.
+
+ Notes
+ - Rewriting uses `lol_html`. Only absolute and protocol‑relative URLs are rewritten; relative URLs are left unchanged.
+ - For the proxy endpoint, the base URL is carried in `tsurl`, the original query parameters are preserved individually, and `tstoken` authenticates the reconstructed full URL.

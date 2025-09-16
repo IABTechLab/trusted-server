@@ -106,7 +106,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if let Some(href) = el.get_attribute("href") {
                         // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
                         if rewrite_prebid && is_prebid_script_url(&href) {
-                            el.set_attribute("href", "/static/tsjs-ext.min.js")?;
+                            el.set_attribute("href", "/static/tsjs=tsjs-ext.min.js")?;
                         } else {
                             let new_href = href
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -126,7 +126,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
                         if rewrite_prebid && is_prebid_script_url(&src) {
-                            el.set_attribute("src", "/static/tsjs-ext.min.js")?;
+                            el.set_attribute("src", "/static/tsjs=tsjs-ext.min.js")?;
                         } else {
                             let new_src = src
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -259,9 +259,9 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs-core.min.js"));
+        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
         // Prebid references are rewritten to our extension when auto-configure is on
-        assert!(processed.contains("/static/tsjs-ext.min.js"));
+        assert!(processed.contains("/static/tsjs=tsjs-ext.min.js"));
     }
 
     #[test]
@@ -284,8 +284,8 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs-core.min.js"));
-        assert!(processed.contains("/static/tsjs-ext.min.js"));
+        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+        assert!(processed.contains("/static/tsjs=tsjs-ext.min.js"));
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         // When auto-configure is disabled, do not rewrite Prebid references
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("/static/tsjs-core.min.js"));
+        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
     }
 
     #[test]

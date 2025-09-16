@@ -47,7 +47,7 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
 pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     // Derive a 32-byte key via SHA-256(secret)
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
-    let cipher = XChaCha20Poly1305::new((&key_bytes).into());
+    let cipher = XChaCha20Poly1305::new(&key_bytes);
 
     // Deterministic 24-byte nonce derived from secret and plaintext (stable tokens)
     let mut hasher = Sha256::new();
@@ -84,11 +84,47 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
     let ciphertext = &data[2 + 24..];
 
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
-    let cipher = XChaCha20Poly1305::new((&key_bytes).into());
+    let cipher = XChaCha20Poly1305::new(&key_bytes);
     cipher
         .decrypt(nonce, ciphertext)
         .ok()
         .and_then(|pt| String::from_utf8(pt).ok())
+}
+
+/// Compute a deterministic signature token (tstoken) for a clear-text URL using the
+/// publisher's proxy_secret. This enables proxy URLs to retain the original URL in
+/// clear text while still providing integrity/authenticity via a keyed digest.
+///
+/// Token format: Base64 URL-safe (no padding) of SHA-256("ts-proxy-v2" || secret || url)
+/// - Not intended as a general HMAC; sufficient for validating unmodified URLs under a secret.
+pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ts-proxy-v2");
+    hasher.update(settings.publisher.proxy_secret.as_bytes());
+    hasher.update(clear_url.as_bytes());
+    let digest = hasher.finalize();
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Verify a `tstoken` for the given clear-text URL.
+pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
+    sign_clear_url(settings, clear_url) == token
+}
+
+/// Compute tstoken for the new proxy scheme: SHA-256 of the encrypted full URL (including query).
+///
+/// Steps:
+/// 1) Encrypt the full URL via `encode_url` (XChaCha20-Poly1305 with deterministic nonce)
+/// 2) Base64-decode the `x1||nonce||ciphertext+tag` bytes
+/// 3) Compute SHA-256 over those bytes
+/// 4) Return Base64 URL-safe (no padding) digest as `tstoken`
+pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> String {
+    // Encrypt deterministically using existing helper
+    let enc = encode_url(settings, full_url);
+    // Decode to raw bytes (x1 + nonce + ciphertext+tag)
+    let raw = URL_SAFE_NO_PAD.decode(enc.as_bytes()).unwrap_or_default();
+    let digest = Sha256::digest(&raw);
+    URL_SAFE_NO_PAD.encode(digest)
 }
 
 #[cfg(test)]
@@ -114,5 +150,20 @@ mod tests {
     fn decode_invalid() {
         let settings = crate::test_support::tests::create_test_settings();
         assert!(decode_url(&settings, "@@invalid@@").is_none());
+    }
+
+    #[test]
+    fn sign_and_verify_clear_url() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let url = "https://cdn.example/a.png?x=1";
+        let t1 = sign_clear_url(&settings, url);
+        assert!(!t1.is_empty());
+        assert!(verify_clear_url_signature(&settings, url, &t1));
+        // Different URL should not verify
+        assert!(!verify_clear_url_signature(
+            &settings,
+            "https://cdn.example/a.png?x=2",
+            &t1
+        ));
     }
 }

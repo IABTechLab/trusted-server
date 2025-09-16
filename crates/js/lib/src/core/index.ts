@@ -1,3 +1,4 @@
+export type { AdUnit, TsjsApi } from './types';
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';

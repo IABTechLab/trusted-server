@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import '../src/index';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import '../src/core/index';
 
 declare global {
   interface Window {
@@ -11,9 +11,23 @@ function cleanupDom() {
   document.body.innerHTML = '';
 }
 
+const ORIGINAL_FETCH = global.fetch;
+
 describe('tsjs', () => {
   beforeEach(() => {
     cleanupDom();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (key: string) => (key.toLowerCase() === 'content-type' ? 'application/json' : null),
+      },
+      json: async () => ({ ads: [] }),
+    }) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = ORIGINAL_FETCH;
   });
 
   it('exposes version and queue', () => {
@@ -49,8 +63,8 @@ describe('tsjs', () => {
       window.pbjs.requestBids({ bidsBackHandler: () => {} });
     });
     vi.resetModules();
-    await import('../src/index');
-    await import('../src/ext/ext.entry');
+    await import('../src/core/index');
+    await import('../src/ext/index');
 
     expect(window.tsjs).toBe(window.pbjs);
     const el = document.getElementById('pbslot');
@@ -61,7 +75,7 @@ describe('tsjs', () => {
   it('requestBids invokes callback and renders', () => {
     // Ensure prebid extension is installed
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    import('../src/ext/ext.entry');
+    import('../src/ext/index');
     let called = false;
     window.tsjs.setConfig({ mode: 'thirdParty' } as any);
     window.tsjs.addAdUnits({ code: 'rb', mediaTypes: { banner: { sizes: [[320, 50]] } } });
@@ -82,7 +96,7 @@ describe('tsjs', () => {
       window.tsjs.renderAllAdUnits();
     });
     vi.resetModules();
-    await import('../src/index');
+    await import('../src/core/index');
     const el = document.getElementById('qslot');
     expect(el).toBeTruthy();
     expect(el!.textContent).toContain('300x250');

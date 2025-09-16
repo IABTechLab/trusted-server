@@ -379,8 +379,7 @@ mod tests {
         );
         let err = handle_server_ad_get(&settings, req)
             .await
-            .err()
-            .expect("expected error");
+            .expect_err("expected error");
         // ensure this is a BadRequest surfacing a 400 mapping
         assert!(err.to_string().contains("missing slot"));
     }
@@ -430,7 +429,7 @@ mod tests {
         let mut res = handle_server_ad_get(&settings, req).await.unwrap();
         assert_eq!(res.get_status(), StatusCode::OK);
         let body = String::from_utf8(res.take_body_bytes()).unwrap();
-        // Should rewrite to unified first-party proxy endpoint with base64-encoded URL
-        assert!(body.contains("/first-party/proxy?u="));
+        // Should rewrite to unified first-party proxy endpoint with clear tsurl + tstoken
+        assert!(body.contains("/first-party/proxy?tsurl="));
     }
 }

@@ -8,7 +8,7 @@ The `creative` module rewrites external asset URLs in creative markup to a unifi
 
 Key rules:
 
-- Proxy absolute/protocol‑relative URLs (http/https or `//`) to `/first-party/proxy?u=<encoded>`
+- Proxy absolute/protocol‑relative URLs (http/https or `//`) to `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>`
 - Leave relative URLs unchanged (e.g., `/path`, `../path`, `local/file`)
 - Ignore non‑network schemes: `data:`, `javascript:`, `mailto:`, `tel:`, `blob:`, `about:`
 
@@ -24,6 +24,13 @@ Rewritten locations:
 - `<link rel~="stylesheet|preload|prefetch" href>` and `imagesrcset`
 - Inline styles (`[style]`) and `<style>` blocks: `url(...)` values are rewritten
 
+Additional behavior:
+
+- Injects a lightweight client helper into creative HTML once per document to preserve first‑party click URLs even if runtime scripts mutate anchors:
+  - Injected at the top of `<body>`: `<script src="/static/tsjs=tsjs-creative.min.js" async></script>`
+  - The bundle guards anchor clicks by restoring the originally rewritten first‑party link at click time.
+  - Served through the unified endpoint described below.
+
 Helpers:
 
 - `rewrite_creative_html(markup, settings) -> String` — rewrite an HTML fragment
@@ -31,5 +38,11 @@ Helpers:
 - `rewrite_srcset(srcset, settings) -> String` — proxy absolute candidates; preserve descriptors (`1x`, `1.5x`, `100w`)
 - `split_srcset_candidates(srcset) -> Vec<&str>` — robust splitting for commas with/without spaces; avoids splitting the first `data:` mediatype comma
 
-Behavior is covered by an extensive test suite in `crates/common/src/creative.rs`.
+Static bundles (served by publisher module):
 
+- Unified dynamic endpoint: `/static/tsjs=<filename>`
+  - `tsjs-core(.min).js` — core library
+  - `tsjs-ext(.min).js` — Prebid.js shim/extension
+  - `tsjs-creative(.min).js` — creative click‑guard injected into proxied creatives
+
+Behavior is covered by an extensive test suite in `crates/common/src/creative.rs`.

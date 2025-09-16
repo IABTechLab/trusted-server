@@ -85,7 +85,7 @@ sequenceDiagram
     PBS->>DSP: POST bid request
     DSP-->>PBS: 200 bid response
     PBS-->>TS: 200 JSON (winning bids)
-    TS->>TS: 📝 Extract creative HTML<br/>🔐 Generate encrypted target urls<br/>🔄 Rewrite resource URLs
+    TS->>TS: 📝 Extract creative HTML<br/>🔏 Generate signed target URLs<br/>🔄 Rewrite resource URLs
     TS-->>JS: 200 HTML (secured creative)
     deactivate PBS
     deactivate DSP
@@ -102,13 +102,13 @@ sequenceDiagram
     activate U
     activate TS
     activate CS
-    U->>TS: GET /first-party/proxy?u=encrypted_target_url
-    TS->>TS: 🔓 Decrypt target url<br/>✅ Validate signature
+    U->>TS: GET /first-party/proxy?tsurl=base_url&<orig_params>&tstoken=sig
+    TS->>TS: ✅ Reconstruct full URL<br/>✅ Validate tstoken (enc+SHA256)
     TS->>CS: GET original_url
     CS-->>TS: 200 (image/HTML)
     
     opt 📄 HTML Response
-      TS->>TS: 🔐 Generate encrypted target urls<br/>🔄 Rewrite resource URLs
+      TS->>TS: 🔏 Generate signed target URLs<br/>🔄 Rewrite resource URLs
       TS-->>U: 200 text/html (secured)
     end
     
@@ -134,9 +134,9 @@ sequenceDiagram
 - Publisher HTML Rewriting
   - Injects TSJS loader and rewrites absolute URLs from origin domain to first-party domain during streaming.
 - Creative HTML Rewriting
-  - Rewrites `<img>`, `srcset`, and `<iframe>` URLs to `/first-party/proxy?u=<token>`.
-  - `<token>` is an encrypted+authenticated value using XChaCha20-Poly1305 with `publisher.proxy_secret`.
+  - Rewrites `<img>`, `srcset`, and `<iframe>` URLs to `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>`.
+  - `tstoken` is derived by encrypting the full target URL and hashing (enc+SHA256) under `publisher.proxy_secret`.
 - Unified Proxy
-  - `/first-party/proxy?u=<token>` decrypts to the target URL, proxies it, rewrites HTML responses again, and ensures image content-type if missing (also logs likely 1×1 pixels by heuristics).
+  - `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` reconstructs and validates the target URL, proxies it, rewrites HTML responses again, ensures image content-type if missing (also logs likely 1×1 pixels by heuristics).
 - Prebid Server
   - OpenRTB requests are posted to `prebid.server_url`; responses are transformed to ensure first-party serving (HTML `adm` or JSON fields like `nurl/burl`).

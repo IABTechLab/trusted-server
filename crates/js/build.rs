@@ -3,6 +3,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+struct BundleSpec {
+    filename: &'static str,
+    required: bool,
+}
+
+const BUNDLES: &[BundleSpec] = &[
+    BundleSpec {
+        filename: "tsjs-core.js",
+        required: true,
+    },
+    BundleSpec {
+        filename: "tsjs-ext.js",
+        required: false,
+    },
+    BundleSpec {
+        filename: "tsjs-creative.js",
+        required: false,
+    },
+];
+
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under ts/
     println!("cargo:rerun-if-changed=lib");
@@ -17,8 +37,6 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ts_dir = crate_dir.join("lib");
     let dist_dir = crate_dir.join("dist");
-    let core_outfile = dist_dir.join("tsjs-core.js");
-    let ext_outfile = dist_dir.join("tsjs-ext.js");
 
     // Ensure dist exists
     let _ = fs::create_dir_all(&dist_dir);
@@ -43,7 +61,7 @@ fn main() {
                     .arg("install")
                     .current_dir(&ts_dir)
                     .status();
-                if status.as_ref().map(|s| s.success()).unwrap_or(false) == false {
+                if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
                     println!(
                         "cargo:warning=tsjs: npm install failed; using existing dist if available"
                     );
@@ -67,54 +85,42 @@ fn main() {
                 .args(["run", "build"])
                 .current_dir(&ts_dir)
                 .status();
-            if status.as_ref().map(|s| s.success()).unwrap_or(false) == false {
+            if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
                 println!("cargo:warning=tsjs: npm run build failed; will try fallback if allowed");
             }
         }
     }
 
     // Copy the result into OUT_DIR for include_str!
-    // Copy core bundle (required)
-    let target_core = out_dir.join("tsjs-core.js");
-    if core_outfile.exists() {
-        if let Err(e) = fs::copy(&core_outfile, &target_core) {
-            panic!(
-                "tsjs: failed to copy {:?} to {:?}: {}",
-                core_outfile, target_core, e
-            );
-        }
-    } else {
-        // Fallback: use checked-in dist/tsjs-core.js if present
-        let fallback_core = crate_dir.join("dist/tsjs-core.js");
-        if fallback_core.exists() {
-            if let Err(e) = fs::copy(&fallback_core, &target_core) {
-                panic!(
-                    "tsjs: failed to copy fallback {:?} to {:?}: {}",
-                    fallback_core, target_core, e
-                );
+    for bundle in BUNDLES {
+        copy_bundle(bundle, &crate_dir, &dist_dir, &out_dir);
+    }
+}
+
+fn copy_bundle(spec: &BundleSpec, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
+    let primary = dist_dir.join(spec.filename);
+    let fallback = crate_dir.join("dist").join(spec.filename);
+    let target = out_dir.join(spec.filename);
+
+    for source in [&primary, &fallback] {
+        if source.exists() {
+            if let Err(e) = fs::copy(source, &target) {
+                if spec.required {
+                    panic!("tsjs: failed to copy {:?} to {:?}: {}", source, target, e);
+                }
             }
-        } else {
-            panic!(
-                "tsjs: core build output not found: {:?} and fallback {:?} missing. Ensure Node is installed and `npm run build` succeeds, or commit dist/tsjs-core.js.",
-                core_outfile, fallback_core
-            );
+            return;
         }
     }
 
-    // Copy extension bundle (optional, but expected when building ts project)
-    let target_ext = out_dir.join("tsjs-ext.js");
-    if ext_outfile.exists() {
-        let _ = fs::copy(&ext_outfile, &target_ext);
-    } else {
-        let fallback_ext = crate_dir.join("dist/tsjs-ext.js");
-        if fallback_ext.exists() {
-            let _ = fs::copy(&fallback_ext, &target_ext);
-        } else {
-            // If missing, write an empty placeholder to satisfy include_str!
-            let _ = fs::write(&target_ext, "");
-        }
+    if spec.required {
+        panic!(
+            "tsjs: bundle {} not found: {:?} (and fallback {:?}). Ensure Node is installed and `npm run build` succeeds, or commit dist/{}.",
+            spec.filename, primary, fallback, spec.filename
+        );
     }
-    return;
+
+    let _ = fs::write(&target, "");
 }
 
 fn watch_dir_recursively(root: &Path) {

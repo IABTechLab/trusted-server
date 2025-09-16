@@ -1,6 +1,12 @@
 # Trusted Server JS (tsjs)
 
-tsjs is the browser-side library for Trusted Server. It ships as two small IIFE bundles: a core (`tsjs-core.js`) that is always loaded, and an optional Prebid.js extension (`tsjs-ext.js`). This Rust crate builds those bundles (via Vite) and embeds them so other crates can serve them as first‑party assets.
+tsjs is the browser-side library for Trusted Server. It ships as small IIFE bundles:
+
+- Core (`tsjs-core.js`) — always loaded
+- Prebid.js extension (`tsjs-ext.js`) — optional shim
+- Creative helper (`tsjs-creative.js`) — injected into proxied creatives to guard click URLs
+
+This Rust crate builds those bundles (via Vite) and embeds them so other crates can serve them as first‑party assets.
 
 ## What It Provides
 
@@ -29,10 +35,11 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 
 - `ts/` — TypeScript source, tooling (Vite, Vitest, ESLint, Prettier)
 - `lib/src/core/` — core library (bootstrap, config, log, registry, render, request, types, queue)
-- `lib/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `ext.entry.ts`)
+- `lib/src/ext/` — optional extensions (PrebidJS shim: `prebidjs.ts`, entry: `index.ts`)
 - `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode)
 - `dist/tsjs-ext.js` — PrebidJS shim extension (IIFE)
-- Rust crate exposes `TSJS_CORE_BUNDLE` and `TSJS_EXT_BUNDLE` (core and extension contents)
+- `dist/tsjs-creative.js` — creative click‑guard bundle (IIFE)
+- Rust crate exposes `TSJS_CORE_BUNDLE`, `TSJS_EXT_BUNDLE`, and `TSJS_CREATIVE_BUNDLE`
 - `build.rs` — runs `npm run build` inside `ts/` if Node is available
 
 ## Build the JS Bundle
@@ -48,9 +55,14 @@ tsjs is the browser-side library for Trusted Server. It ships as two small IIFE 
 ## Serving From Rust
 
 ```rust
-use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
-// Serve TSJS_CORE_BUNDLE at /static/tsjs-core.min.js
-// Serve TSJS_EXT_BUNDLE at /static/tsjs-ext.min.js
+use trusted_server_js::{
+    TSJS_CORE_BUNDLE, TSJS_CORE_FILENAME,
+    TSJS_EXT_BUNDLE, TSJS_EXT_FILENAME,
+    TSJS_CREATIVE_BUNDLE, TSJS_CREATIVE_FILENAME,
+};
+// Recommend serving via a unified endpoint your router handles:
+//   /static/tsjs=<filename>
+// where <filename> is one of TSJS_CORE_FILENAME, TSJS_EXT_FILENAME, TSJS_CREATIVE_FILENAME.
 ```
 
 ## HTML Usage
@@ -70,13 +82,13 @@ use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
     tsjs.setConfig({ mode: 'firstParty' }); // or 'thirdParty'
     tsjs.requestAds({ bidsBackHandler: function() {} });
   });
-  // later: load core
-  // <script src="/static/tsjs-core.min.js"></script>  <!-- serves tsjs-core.js -->
+  // later: load core (served via unified endpoint)
+  // <script src="/static/tsjs=tsjs-core.min.js"></script>
   // optionally load Prebid shim when pbjs is present
   // <script>
   //   if (window.pbjs) {
   //     var s=document.createElement('script');
-  //     s.src='/static/tsjs-ext.min.js';
+  //     s.src='/static/tsjs=tsjs-ext.min.js';
   //     document.head.appendChild(s);
   //   }
   // </script>
@@ -85,7 +97,8 @@ use trusted_server_js::{TSJS_CORE_BUNDLE, TSJS_EXT_BUNDLE};
 
 ## Auto‑Rewrite (Server)
 
-- When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
+- When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs=tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
+- Proxied creative HTML injects the creative helper once at the top of `<body>`: `/static/tsjs=tsjs-creative.min.js`.
 
 ## Notes
 

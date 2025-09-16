@@ -1,8 +1,12 @@
-import type { TsjsApi } from '../core/types';
+import type { TsjsApi, HighestCpmBid, RequestAdsCallback, RequestAdsOptions } from '../core/types';
 import { log } from '../core/log';
 import { installQueue } from '../core/queue';
 import { getAllCodes, getAllUnits, firstSize } from '../core/registry';
-import type { HighestCpmBid } from '../core/types';
+import { resolvePrebidWindow, PrebidWindow } from '../shared/globals';
+type RequestBidsFunction = (
+  callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
+  opts?: RequestAdsOptions
+) => void;
 
 /**
  * Shim implementation for pbjs.getHighestCpmBids that returns synthetic
@@ -33,22 +37,42 @@ function getHighestCpmBidsShim(adUnitCodes?: string | string[]): ReadonlyArray<H
 /**
  * Shim implementation for pbjs.requestBids that forwards to core requestAds.
  */
-function requestBidsShim(api: TsjsApi) {
-  return (...args: any[]) => (api as any).requestAds?.(...args);
+function requestBidsShim(api: TsjsApi): RequestBidsFunction {
+  return (callbackOrOpts?: RequestAdsCallback | RequestAdsOptions, opts?: RequestAdsOptions) => {
+    const requestAds = api.requestAds as
+      | ((options?: RequestAdsOptions) => void)
+      | ((callback: RequestAdsCallback, options?: RequestAdsOptions) => void)
+      | undefined;
+    if (!requestAds) return;
+    if (typeof callbackOrOpts === 'function') {
+      requestAds(callbackOrOpts, opts);
+    } else {
+      requestAds(callbackOrOpts);
+    }
+  };
+}
+
+function ensureTsjsApi(win: PrebidWindow): TsjsApi {
+  if (win.tsjs) return win.tsjs;
+  const stub: TsjsApi = {
+    version: '0.0.0',
+    que: [],
+    addAdUnits: () => undefined,
+    renderAdUnit: () => undefined,
+    renderAllAdUnits: () => undefined,
+  };
+  win.tsjs = stub;
+  return stub;
 }
 
 export function installPrebidJsShim(): boolean {
-  const w: Window & { tsjs?: TsjsApi; pbjs?: TsjsApi } =
-    ((globalThis as unknown as { window?: Window }).window as Window & {
-      tsjs?: TsjsApi;
-      pbjs?: TsjsApi;
-    }) || ({} as Window & { tsjs?: TsjsApi; pbjs?: TsjsApi });
+  const w = resolvePrebidWindow();
 
   // Ensure core exists
-  const api: TsjsApi = (w.tsjs ??= { version: '0.0.0', que: [] } as TsjsApi);
+  const api = ensureTsjsApi(w);
 
   // Capture any queued pbjs callbacks before aliasing
-  const pending: Array<() => void> = Array.isArray(w.pbjs?.que) ? [...(w.pbjs as TsjsApi).que] : [];
+  const pending: Array<() => void> = Array.isArray(w.pbjs?.que) ? [...(w.pbjs?.que ?? [])] : [];
 
   // Core provides requestAds/getHighestCpmBids; extension aliases pbjs and shims requestBids → requestAds
 
@@ -57,15 +81,14 @@ export function installPrebidJsShim(): boolean {
   if (!Array.isArray(api.que)) {
     installQueue(api, w);
   }
+  const pbjsApi = w.pbjs as TsjsApi & { requestBids?: RequestBidsFunction };
   // Make sure both globals share the same queue
   if (Array.isArray(api.que)) {
-    (w.pbjs as TsjsApi).que = api.que;
+    pbjsApi.que = api.que;
   }
   // Shim Prebid-style API surface
-  try {
-    (w.pbjs as any).requestBids = requestBidsShim(api);
-    (w.pbjs as any).getHighestCpmBids = getHighestCpmBidsShim;
-  } catch {}
+  pbjsApi.requestBids = requestBidsShim(api);
+  pbjsApi.getHighestCpmBids = getHighestCpmBidsShim;
 
   // Flush previously queued pbjs callbacks
   for (const fn of pending) {
@@ -74,14 +97,14 @@ export function installPrebidJsShim(): boolean {
         fn.call(api);
         log.debug('prebidjs extension: flushed callback');
       }
-    } catch {
-      /* ignore queued callback error */
+    } catch (err) {
+      log.debug('prebidjs extension: queued callback failed', err);
     }
   }
 
   log.info('prebidjs extension installed', {
-    hasRequestBids: typeof (w.pbjs as any).requestBids === 'function',
-    hasGetHighestCpmBids: typeof (w.pbjs as any).getHighestCpmBids === 'function',
+    hasRequestBids: typeof pbjsApi.requestBids === 'function',
+    hasGetHighestCpmBids: typeof pbjsApi.getHighestCpmBids === 'function',
   });
 
   return true;

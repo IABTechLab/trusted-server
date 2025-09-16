@@ -17,7 +17,9 @@ export function findSlot(id: string): HTMLElement | null {
     const selector = `[id="${nid.replace(/"/g, '\\"')}"]`;
     const byAttr = document.querySelector(selector) as HTMLElement | null;
     if (byAttr) return byAttr;
-  } catch {}
+  } catch {
+    // Ignore selector errors (e.g., invalid characters)
+  }
   return null;
 }
 
@@ -27,19 +29,17 @@ function ensureSlot(id: string): HTMLElement {
   if (el) return el;
   el = document.createElement('div');
   el.id = nid;
-  const body: HTMLElement | null = (document as any).body || null;
+  const body: HTMLElement | null = typeof document !== 'undefined' ? document.body : null;
   if (body && typeof body.appendChild === 'function') {
     body.appendChild(el);
   } else {
     // DOM not ready — attach once available
-    document.addEventListener(
-      'DOMContentLoaded',
-      () => {
-        const b = (document as any).body as HTMLElement | undefined;
-        if (b && !document.getElementById(nid)) b.appendChild(el!);
-      },
-      { once: true }
-    );
+    const element = el;
+    const onReady = () => {
+      const readyBody = document.body;
+      if (readyBody && !document.getElementById(nid) && element) readyBody.appendChild(element);
+    };
+    document.addEventListener('DOMContentLoaded', onReady, { once: true });
   }
   return el;
 }
@@ -61,8 +61,7 @@ export function renderAdUnit(codeOrUnit: string | AdUnit): void {
 export function renderAllAdUnits(): void {
   try {
     const parentReady =
-      typeof document !== 'undefined' &&
-      ((document as any).body || (document as any).documentElement);
+      typeof document !== 'undefined' && (document.body || document.documentElement);
     if (!parentReady) {
       log.warn('renderAllAdUnits: DOM not ready; skipping');
       return;
@@ -116,8 +115,8 @@ export function createAdIframe(
   // Attributes
   iframe.scrolling = 'no';
   iframe.frameBorder = '0';
-  (iframe as any).marginWidth = '0';
-  (iframe as any).marginHeight = '0';
+  iframe.setAttribute('marginwidth', '0');
+  iframe.setAttribute('marginheight', '0');
   if (opts.name) iframe.name = String(opts.name);
   iframe.title = opts.title || 'Ad content';
   iframe.setAttribute('aria-label', 'Advertisement');
@@ -131,7 +130,9 @@ export function createAdIframe(
       'allow-scripts',
       'allow-top-navigation-by-user-activation'
     );
-  } catch {}
+  } catch (err) {
+    log.debug('createAdIframe: sandbox add failed', err);
+  }
   // Sizing + style
   const w = Math.max(0, Number(opts.width ?? 0) | 0);
   const h = Math.max(0, Number(opts.height ?? 0) | 0);

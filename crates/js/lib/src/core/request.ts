@@ -1,3 +1,5 @@
+import { delay } from '../shared/async';
+
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { renderCreativeIntoSlot, renderAllAdUnits, createAdIframe, findSlot } from './render';
@@ -27,7 +29,7 @@ export function requestAds(
     const adUnits = getAllUnits();
     const payload = { adUnits, config: {} };
     log.debug('requestAds: payload', { units: adUnits.length });
-    if (mode === RequestMode.FirstParty) requestAdsFirstParty(adUnits);
+    if (mode === RequestMode.FirstParty) void requestAdsFirstParty(adUnits);
     else requestAdsThirdParty(payload);
     // Synchronously invoke callback to match test expectations
     try {
@@ -41,13 +43,12 @@ export function requestAds(
   }
 }
 
-function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
-  for (const u of adUnits) {
-    const size = (firstSize(u) ?? [300, 250]) as readonly [number, number];
-    const slotId = u.code;
+async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
+  for (const unit of adUnits) {
+    const size = (firstSize(unit) ?? [300, 250]) as readonly [number, number];
+    const slotId = unit.code;
 
-    // Retry helper to better accommodate different browser timings (e.g., Firefox)
-    const tryInsert = (attempts: number) => {
+    const attemptInsert = async (attemptsRemaining: number): Promise<void> => {
       const container = findSlot(slotId) as HTMLElement | null;
       if (container) {
         const iframe = createAdIframe(container, {
@@ -59,21 +60,28 @@ function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
         iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
         return;
       }
-      if (attempts <= 0) {
+
+      if (attemptsRemaining <= 0) {
         log.warn('requestAds(firstParty): slot not found; skipping iframe', { slotId });
         return;
       }
-      // If DOM is still loading, wait for DOMContentLoaded once; otherwise retry shortly
+
       if (typeof document !== 'undefined' && document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => tryInsert(attempts - 1), {
-          once: true,
-        });
-      } else {
-        setTimeout(() => tryInsert(attempts - 1), 50);
+        document.addEventListener(
+          'DOMContentLoaded',
+          () => {
+            void attemptInsert(attemptsRemaining - 1);
+          },
+          { once: true }
+        );
+        return;
       }
+
+      await delay(50);
+      await attemptInsert(attemptsRemaining - 1);
     };
 
-    tryInsert(10); // up to 10 attempts
+    void attemptInsert(10);
   }
 }
 
@@ -100,8 +108,8 @@ function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) 
         const ct = res.headers.get('content-type') || '';
         if (res.ok && ct.includes('application/json')) {
           const data: unknown = await res.json();
-          for (const b of parseSeatBids(data)) {
-            if (b.impid && b.adm) renderCreativeIntoSlot(String(b.impid), b.adm);
+          for (const bid of parseSeatBids(data)) {
+            if (bid.impid && bid.adm) renderCreativeIntoSlot(String(bid.impid), bid.adm);
           }
           log.info('requestAds: rendered creatives from response');
           return;

@@ -190,32 +190,33 @@ pub fn handle_main_page(
     Ok(response)
 }
 
-/// Serves the Trusted Server TypeScript bundle in place of Prebid.js.
-///
-/// Any requests for common Prebid filenames (e.g., `prebid.min.js`) are routed here
-/// when auto_configure is enabled. We return the embedded tsjs bundle content.
-/// Serves the Trusted Server TypeScript bundle as a first-party JS asset.
-///
-/// Exposed separately so service frontends can route directly to this handler
-/// (e.g., `/static/tsjs-core.min.js`).
-pub fn handle_tsjs_js_core(
+/// Unified tsjs static serving: `/static/tsjs=<filename>`
+/// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
+pub fn handle_tsjs_dynamic(
     _settings: &Settings,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let bundle: &str = trusted_server_js::TSJS_CORE_BUNDLE;
-    let mut resp = serve_static_with_etag(bundle, &req, "application/javascript; charset=utf-8");
-    // Preserve previous behavior: hint the edge to compress
-    resp.set_header(HEADER_X_COMPRESS_HINT, "on");
-    Ok(resp)
-}
+    const PREFIX: &str = "/static/tsjs=";
+    let path = req.get_path();
+    if !path.starts_with(PREFIX) {
+        return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+    }
+    let filename = &path[PREFIX.len()..];
+    // Normalize .min.js to .js for matching
+    let normalized = filename.replace(".min.js", ".js");
 
-/// Serves the optional Prebid.js shim extension bundle.
-pub fn handle_tsjs_ext_js(
-    _settings: &Settings,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let bundle: &str = trusted_server_js::TSJS_EXT_BUNDLE;
-    let resp = serve_static_with_etag(bundle, &req, "application/javascript; charset=utf-8");
+    let body: &str = if normalized == trusted_server_js::TSJS_CORE_FILENAME {
+        trusted_server_js::TSJS_CORE_BUNDLE
+    } else if normalized == trusted_server_js::TSJS_EXT_FILENAME {
+        trusted_server_js::TSJS_EXT_BUNDLE
+    } else if normalized == trusted_server_js::TSJS_CREATIVE_FILENAME {
+        trusted_server_js::TSJS_CREATIVE_BUNDLE
+    } else {
+        return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+    };
+
+    let mut resp = serve_static_with_etag(body, &req, "application/javascript; charset=utf-8");
+    resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
 
@@ -498,7 +499,6 @@ mod tests {
     use super::*;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
-    use sha2::{Digest, Sha256};
 
     #[test]
     fn test_detect_request_scheme() {
@@ -538,54 +538,6 @@ mod tests {
         req.set_header("forwarded", "proto=https");
         req.set_header("x-forwarded-proto", "http");
         assert_eq!(detect_request_scheme(&req), "https");
-    }
-
-    #[test]
-    fn test_handle_tsjs_js_serves_with_headers() {
-        let settings = create_test_settings();
-        let req = Request::new(
-            Method::GET,
-            "https://edge.example.com/static/tsjs-core.min.js",
-        );
-
-        let mut resp = handle_tsjs_js_core(&settings, req).expect("should serve tsjs asset");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let ct = resp
-            .get_header(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(ct.starts_with("application/javascript"));
-
-        // Body should contain recognizable marker
-        let body = resp.take_body_str();
-        assert!(body.contains("Trusted Server"));
-    }
-
-    #[test]
-    fn test_handle_tsjs_js_etag_304() {
-        let settings = create_test_settings();
-        // First call to compute ETag
-        let bundle = trusted_server_js::TSJS_CORE_BUNDLE;
-        let etag = format!(
-            "\"sha256-{}\"",
-            hex::encode(Sha256::digest(bundle.as_bytes()))
-        );
-
-        let mut req = Request::new(
-            Method::GET,
-            "https://edge.example.com/static/tsjs-core.min.js",
-        );
-        req.set_header(header::IF_NONE_MATCH, &etag);
-
-        let resp = handle_tsjs_js_core(&settings, req).expect("should serve tsjs 304");
-        assert_eq!(resp.get_status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(
-            resp.get_header(header::ETAG)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or_default(),
-            etag
-        );
     }
 
     #[test]

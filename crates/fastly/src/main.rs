@@ -13,10 +13,11 @@ use trusted_server_common::partners::handle_partner_asset;
 use trusted_server_common::prebid::handle_prebid_test;
 use trusted_server_common::prebid_proxy::{handle_prebid_auction, handle_prebid_cookie_sync};
 use trusted_server_common::privacy::handle_privacy_policy;
-use trusted_server_common::proxy::handle_first_party_proxy;
+use trusted_server_common::proxy::{
+    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
+};
 use trusted_server_common::publisher::{
-    handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_ext_js,
-    handle_tsjs_js_core,
+    handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
@@ -108,13 +109,18 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/why-trusted-server", _) => handle_why_trusted_server(&settings, req),
 
         // Serve the tsjs library
-        (&Method::GET, "/static/tsjs-core.min.js", _) => handle_tsjs_js_core(&settings, req),
-        (&Method::GET, "/static/tsjs-ext.min.js", _) => handle_tsjs_ext_js(&settings, req),
+        (&Method::GET, path, _) if path.starts_with("/static/tsjs=") => {
+            handle_tsjs_dynamic(&settings, req)
+        }
 
         // tsjs endpoints
         (&Method::GET, "/first-party/ad", _) => handle_server_ad_get(&settings, req).await,
         (&Method::POST, "/third-party/ad", _) => handle_server_ad(&settings, req).await,
         (&Method::GET, "/first-party/proxy", _) => handle_first_party_proxy(&settings, req).await,
+        (&Method::GET, "/first-party/click", _) => handle_first_party_click(&settings, req).await,
+        (&Method::POST, "/first-party/proxy-rebuild", _) => {
+            handle_first_party_proxy_rebuild(&settings, req).await
+        }
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
