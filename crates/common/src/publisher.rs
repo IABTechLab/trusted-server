@@ -347,6 +347,24 @@ pub fn handle_publisher_request(
 
     log::info!("Request host: {}, scheme: {}", request_host, request_scheme);
 
+    // Generate synthetic identifiers before the request body is consumed.
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    let has_synthetic_cookie = req
+        .get_header(header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .map(|cookies| {
+            cookies
+                .split(';')
+                .any(|cookie| cookie.trim_start().starts_with("synthetic_id="))
+        })
+        .unwrap_or(false);
+
+    log::info!(
+        "Proxy synthetic IDs - trusted: {}, has_cookie: {}",
+        synthetic_id,
+        has_synthetic_cookie
+    );
+
     // Extract host from the origin_url using the Publisher's origin_host method
     let origin_host = settings.publisher.origin_host();
 
@@ -431,6 +449,14 @@ pub fn handle_publisher_request(
             "Skipping response processing - should_process: {}, request_host: '{}'",
             should_process,
             request_host
+        );
+    }
+
+    response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, synthetic_id.as_str());
+    if !has_synthetic_cookie {
+        response.set_header(
+            header::SET_COOKIE,
+            create_synthetic_cookie(settings, synthetic_id.as_str()),
         );
     }
 
