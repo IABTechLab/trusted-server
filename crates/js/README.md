@@ -103,6 +103,33 @@ use trusted_server_js::{
 - When auto-configure is enabled, the HTML processor injects the core loader and rewrites any Prebid script URLs to `/static/tsjs=tsjs-ext.min.js`. The extension aliases `window.pbjs` to `window.tsjs` and flushes `pbjs.que`.
 - Proxied creative HTML injects the creative helper once at the top of `<body>`: `/static/tsjs=tsjs-creative.min.js`. The helper monitors anchors for script-driven rewrites and rebuilds first-party click URLs whenever creatives mutate them.
 
+## First-Party Proxy Flows
+
+The Rust services (`trusted-server-common`) expose several proxy entry points that work together to keep all ad traffic on the publisher’s domain while propagating the synthetic identifier generated for the user.
+
+### Publisher Origin Proxy
+
+- Endpoint: `handle_publisher_request` (`crates/common/src/publisher.rs`).
+- Retrieves or generates the trusted synthetic identifier before Fastly consumes the request body.
+- Always stamps the proxied response with `X-Synthetic-Fresh` and `X-Synthetic-Trusted-Server` headers and, when the browser does not already present one, sets the `synthetic_id=<value>` cookie (Secure + SameSite=Lax) bound to the configured publisher domain.
+- Result: downstream assets fetched through the same first-party origin automatically include the synthetic ID header/cookie so subsequent proxy layers can read it.
+
+### Creative Asset Proxy
+
+- Endpoint: `handle_first_party_proxy` (`crates/common/src/proxy.rs`).
+- Accepts the signed `/first-party/proxy?tsurl=...` URLs injected by the HTML rewriter and streams the creative from the third-party origin.
+- Extracts the synthetic ID from the inbound cookie or header and forwards it to the creative origin by appending `synthetic_id=<value>` to the rewritten target URL (while preserving existing query parameters).
+- Ensures the response body is rewritten when it is HTML/CSS/JS so all nested asset requests loop back through the same first-party proxy.
+
+### Click-Through Proxy
+
+- Endpoint: `handle_first_party_click` (`crates/common/src/proxy.rs`).
+- Validates the signed `/first-party/click` URL generated for anchors inside proxied creatives.
+- On success, issues an HTTP 302 to the reconstructed destination and appends `synthetic_id=<value>` if the user presented one, letting downstream measurement end points correlate the click with the original synthetic identifier.
+- Ensures click responses are never cached (`Cache-Control: no-store, private`).
+
+Together these layers guarantee that the synthetic identifier generated on the publisher response is preserved throughout page loads, asset fetches, and click-throughs without exposing the third-party origins directly to the browser.
+
 ## Notes
 
 - By default, the build fails if `tsjs-core.js` cannot be produced. To change behavior:

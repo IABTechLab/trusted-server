@@ -10,6 +10,7 @@ use crate::constants::{
 };
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::synthetic::get_synthetic_id;
 
 /// Copy a curated set of request headers to a proxied request.
 fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
@@ -168,31 +169,71 @@ pub async fn handle_first_party_proxy(
         reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
     // Validate URL
-    let Ok(u) = url::Url::parse(&target_url) else {
+    let Ok(mut target_url_parsed) = url::Url::parse(&target_url) else {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid url".to_string(),
         }));
     };
-    let scheme = u.scheme().to_ascii_lowercase();
+    let scheme = target_url_parsed.scheme().to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported scheme".to_string(),
         }));
     }
-    let host = u.host_str().unwrap_or("");
+    let host = target_url_parsed.host_str().unwrap_or("").to_string();
     if host.is_empty() {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "missing host".to_string(),
         }));
     }
 
+    let synthetic_id_param = match get_synthetic_id(&req) {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(
+                "proxy: failed to extract synthetic ID for forwarding: {:?}",
+                e
+            );
+            None
+        }
+    };
+
+    if let Some(synthetic_id) = synthetic_id_param {
+        let mut pairs: Vec<(String, String)> = target_url_parsed
+            .query_pairs()
+            .filter(|(k, _)| k.as_ref() != "synthetic_id")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        pairs.push(("synthetic_id".to_string(), synthetic_id));
+
+        target_url_parsed.set_query(None);
+        if !pairs.is_empty() {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (k, v) in &pairs {
+                serializer.append_pair(k, v);
+            }
+            let query_str = serializer.finish();
+            target_url_parsed.set_query(Some(&query_str));
+        }
+
+        log::debug!(
+            "proxy: forwarding synthetic_id to origin url {}",
+            target_url_parsed.as_str()
+        );
+    } else {
+        log::debug!("proxy: no synthetic_id to forward to origin");
+    }
+
     // Ensure a backend exists
     // No tstoken is included in target_url by design; nothing to strip.
+    let port = target_url_parsed.port();
+    let backend_name = crate::backend::ensure_origin_backend(&scheme, &host, port)?;
 
-    let backend_name = crate::backend::ensure_origin_backend(&scheme, host, u.port())?;
+    let target_url_for_request = target_url_parsed.to_string();
 
     // Build proxied request with selected headers
-    let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
+    let mut proxy_req = Request::new(req.get_method().clone(), &target_url_for_request);
     copy_proxy_forward_headers(&req, &mut proxy_req);
 
     let beresp = proxy_req
@@ -203,7 +244,7 @@ pub async fn handle_first_party_proxy(
     Ok(finalize_proxied_response(
         settings,
         &req,
-        &target_url,
+        &target_url_for_request,
         beresp,
     ))
 }
@@ -223,6 +264,52 @@ pub async fn handle_first_party_click(
         tsurl,
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
+
+    let mut redirect_target = full_for_token.clone();
+    if let Some(synthetic_id) = match get_synthetic_id(&req) {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(
+                "click: failed to extract synthetic ID for forwarding: {:?}",
+                e
+            );
+            None
+        }
+    } {
+        match url::Url::parse(&redirect_target) {
+            Ok(mut url) => {
+                let mut pairs: Vec<(String, String)> = url
+                    .query_pairs()
+                    .filter(|(k, _)| k.as_ref() != "synthetic_id")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                pairs.push(("synthetic_id".to_string(), synthetic_id));
+
+                url.set_query(None);
+                if !pairs.is_empty() {
+                    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                    for (k, v) in &pairs {
+                        serializer.append_pair(k, v);
+                    }
+                    let query_str = serializer.finish();
+                    url.set_query(Some(&query_str));
+                }
+
+                let final_target = url.to_string();
+                log::debug!(
+                    "click: forwarding synthetic_id to target url {}",
+                    final_target
+                );
+                redirect_target = final_target;
+            }
+            Err(e) => {
+                log::warn!(
+                    "click: failed to parse target url for synthetic forwarding: {:?}",
+                    e
+                );
+            }
+        }
+    }
 
     // Log click metadata for observability
     let ua = req
@@ -249,7 +336,7 @@ pub async fn handle_first_party_click(
 
     // 302 redirect to target URL
     Ok(Response::from_status(fastly::http::StatusCode::FOUND)
-        .with_header(header::LOCATION, &full_for_token)
+        .with_header(header::LOCATION, &redirect_target)
         .with_header(header::CACHE_CONTROL, "no-store, private"))
 }
 
@@ -571,6 +658,48 @@ mod tests {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         assert_eq!(loc, full);
+    }
+
+    #[tokio::test]
+    async fn click_appends_synthetic_id_when_present() {
+        let settings = create_test_settings();
+        let tsurl = "https://cdn.example/a.png";
+        let params = "foo=1";
+        let full = format!("{}?{}", tsurl, params);
+        let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
+        let mut req = Request::new(
+            Method::GET,
+            format!(
+                "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                params,
+                sig
+            ),
+        );
+        req.set_header(
+            crate::constants::HEADER_SYNTHETIC_TRUSTED_SERVER,
+            "synthetic-123",
+        );
+
+        let resp = handle_first_party_click(&settings, req)
+            .await
+            .expect("should redirect");
+
+        let loc = resp
+            .get_header(header::LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap();
+        let parsed = url::Url::parse(loc).expect("should parse location");
+        let mut pairs: std::collections::HashMap<String, String> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
+        assert_eq!(
+            pairs.remove("synthetic_id").as_deref(),
+            Some("synthetic-123")
+        );
+        assert!(pairs.is_empty());
     }
 
     #[tokio::test]
