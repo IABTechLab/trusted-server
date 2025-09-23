@@ -265,8 +265,7 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
-    let mut redirect_target = full_for_token.clone();
-    if let Some(synthetic_id) = match get_synthetic_id(&req) {
+    let synthetic_id = match get_synthetic_id(&req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!(
@@ -275,7 +274,10 @@ pub async fn handle_first_party_click(
             );
             None
         }
-    } {
+    };
+
+    let mut redirect_target = full_for_token.clone();
+    if let Some(ref synthetic_id_value) = synthetic_id {
         match url::Url::parse(&redirect_target) {
             Ok(mut url) => {
                 let mut pairs: Vec<(String, String)> = url
@@ -283,7 +285,7 @@ pub async fn handle_first_party_click(
                     .filter(|(k, _)| k.as_ref() != "synthetic_id")
                     .map(|(k, v)| (k.into_owned(), v.into_owned()))
                     .collect();
-                pairs.push(("synthetic_id".to_string(), synthetic_id));
+                pairs.push(("synthetic_id".to_string(), synthetic_id_value.clone()));
 
                 url.set_query(None);
                 if !pairs.is_empty() {
@@ -320,18 +322,14 @@ pub async fn handle_first_party_click(
         .get_header(HEADER_REFERER)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    let potsi = req
-        .get_header(crate::constants::HEADER_SYNTHETIC_TRUSTED_SERVER)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
     log::info!(
-        "click: redirect tsurl={} params_present={} target={} referer={} ua={} potsi={}",
+        "click: redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
         tsurl,
         had_params,
         full_for_token,
         referer,
         ua,
-        potsi
+        synthetic_id.as_deref().unwrap_or("")
     );
 
     // 302 redirect to target URL
