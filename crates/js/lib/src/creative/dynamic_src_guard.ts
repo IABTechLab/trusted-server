@@ -5,8 +5,14 @@ type ElementWithSrc = Element & { src: string };
 
 type ElementCtor<E extends ElementWithSrc> = {
   prototype: E;
-  new (...args: any[]): E;
+  new (...args: unknown[]): E;
 };
+
+type FactoryFunction<E extends ElementWithSrc> = {
+  length: number;
+  prototype: E;
+  new (...args: unknown[]): E;
+} & ((...args: unknown[]) => E);
 
 export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   elementConstructor: ElementCtor<E> | undefined;
@@ -205,27 +211,24 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
     const globalObj = globalThis as Record<string, unknown>;
     const factory = globalObj[options.factoryName];
     if (typeof factory !== 'function') return;
+    const factoryFn = factory as FactoryFunction<E>;
 
     const WrappedFactory = function (this: unknown, ...args: unknown[]) {
-      const instance = Reflect.construct(
-        factory as (...args: unknown[]) => unknown,
-        args,
-        new.target ?? WrappedFactory
-      ) as E;
+      const instance = Reflect.construct(factoryFn, args, new.target ?? WrappedFactory) as E;
       ensureInstancePatched(instance);
       return instance;
     };
 
     Object.defineProperty(WrappedFactory, 'length', {
-      value: (factory as Function).length,
+      value: factoryFn.length,
       configurable: true,
     });
     Object.defineProperty(WrappedFactory, 'name', {
       value: options.factoryName,
       configurable: true,
     });
-    WrappedFactory.prototype = (factory as Function).prototype;
-    Object.setPrototypeOf(WrappedFactory, factory);
+    WrappedFactory.prototype = factoryFn.prototype;
+    Object.setPrototypeOf(WrappedFactory, factoryFn);
 
     globalObj[options.factoryName] = WrappedFactory as unknown;
     factoryPatched = true;
@@ -245,11 +248,13 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
     }
 
     nativeSet = descriptor.set as typeof nativeSet;
-    nativeGet = typeof descriptor.get === 'function' ? (descriptor.get as typeof nativeGet) : undefined;
+    nativeGet =
+      typeof descriptor.get === 'function' ? (descriptor.get as typeof nativeGet) : undefined;
     nativeSetAttribute = ctor.prototype.setAttribute as typeof nativeSetAttribute;
-    nativeSetAttributeNS = typeof ctor.prototype.setAttributeNS === 'function'
-      ? (ctor.prototype.setAttributeNS as typeof nativeSetAttributeNS)
-      : undefined;
+    nativeSetAttributeNS =
+      typeof ctor.prototype.setAttributeNS === 'function'
+        ? (ctor.prototype.setAttributeNS as typeof nativeSetAttributeNS)
+        : undefined;
 
     let prototypePatched = false;
     if (descriptor.configurable !== false) {
@@ -276,7 +281,11 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
       log.debug(`${options.logPrefix}: prototype ${attr} not configurable; using fallback`);
     }
 
-    ctor.prototype.setAttribute = function patchedSetAttribute(this: E, name: string, value: string) {
+    ctor.prototype.setAttribute = function patchedSetAttribute(
+      this: E,
+      name: string,
+      value: string
+    ) {
       log.debug(`${options.logPrefix}: ${ctor.name} setAttribute`, { name, value });
       if (typeof name === 'string' && name.toLowerCase() === attr) {
         proxyAssignment(this, String(value ?? ''));
@@ -307,9 +316,7 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
     if (!prototypePatched) {
       log.info(`${options.logPrefix}: using instance-level proxy fallback`);
       if (typeof document !== 'undefined') {
-        document
-          .querySelectorAll(options.selector)
-          .forEach((el) => ensureInstancePatched(el as E));
+        document.querySelectorAll(options.selector).forEach((el) => ensureInstancePatched(el as E));
       }
       patchDocumentCreateElement();
       patchFactory();

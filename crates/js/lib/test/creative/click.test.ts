@@ -1,11 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  FIRST_PARTY_CLICK,
-  MUTATED_CLICK,
-  PROXY_RESPONSE,
-  importCreativeModule,
-} from './helpers';
+import { FIRST_PARTY_CLICK, MUTATED_CLICK, PROXY_RESPONSE, importCreativeModule } from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
 
