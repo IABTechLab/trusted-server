@@ -205,13 +205,7 @@ pub fn handle_tsjs_dynamic(
     // Normalize .min.js to .js for matching
     let normalized = filename.replace(".min.js", ".js");
 
-    let body: &str = if normalized == trusted_server_js::TSJS_CORE_FILENAME {
-        trusted_server_js::TSJS_CORE_BUNDLE
-    } else if normalized == trusted_server_js::TSJS_EXT_FILENAME {
-        trusted_server_js::TSJS_EXT_BUNDLE
-    } else if normalized == trusted_server_js::TSJS_CREATIVE_FILENAME {
-        trusted_server_js::TSJS_CREATIVE_BUNDLE
-    } else {
+    let Some(body) = trusted_server_js::bundle_for_filename(&normalized) else {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     };
 

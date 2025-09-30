@@ -157,8 +157,10 @@ cargo test
     - Reconstructs the full target URL from `tsurl` + provided parameters in order, computes `tstoken` by encrypting with XChaCha20‑Poly1305 (deterministic nonce) and hashing the bytes with SHA‑256, and validates it.
     - HTML responses: proxied and rewritten (images/iframes/pixels) via creative rewriter
     - Image responses: proxied; if content‑type is missing, sets `image/*`; logs likely 1×1 pixels via size/URL heuristics
+    - Follows HTTP redirects (301/302/303/307/308) up to four hops, reapplying the forwarded synthetic ID and switching to `GET` after a 303; logs when the redirect limit is reached.
     - When forwarding to the target URL, no `tstoken` is included (it is not part of the target URL).
 - Synthetic ID propagation: reads the trusted ID from the incoming cookie/header and appends `synthetic_id=<value>` to the target URL sent to the third-party origin while preserving existing query strings.
+  - Redirect following re-applies the identifier on each hop so downstream origins see a consistent ID even when assets bounce through intermediate trackers.
 
 - `/first-party/click` (GET): first‑party click redirect handler for anchors and clickable areas.
   - Query params: same as `/first-party/proxy` (uses `tsurl`, original params, `tstoken`).

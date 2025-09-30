@@ -1,19 +1,15 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
+import {
+  FIRST_PARTY_CLICK,
+  MUTATED_CLICK,
+  PROXY_RESPONSE,
+  importCreativeModule,
+} from './helpers';
+
 const ORIGINAL_FETCH = global.fetch;
 
-const FIRST_PARTY_CLICK =
-  '/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&tstoken=token123';
-const MUTATED_CLICK = 'https://example.com/landing?bar=2';
-const PROXY_RESPONSE =
-  '/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&bar=2&tstoken=newtoken';
-
-async function importCreativeModule() {
-  delete (globalThis as any).__ts_creative_installed;
-  await import('../../src/creative/index');
-}
-
-describe('tsjs creative guard', () => {
+describe('creative/click.ts', () => {
   beforeEach(() => {
     vi.resetModules();
     document.body.innerHTML = '';
@@ -24,7 +20,7 @@ describe('tsjs creative guard', () => {
     vi.useRealTimers();
   });
 
-  it('repairs anchor href using proxy rebuild fallback when fetch is unavailable', async () => {
+  it('repairs anchors via proxy rebuild fallback when fetch is unavailable', async () => {
     vi.useFakeTimers();
     global.fetch = undefined as any;
 
@@ -46,7 +42,7 @@ describe('tsjs creative guard', () => {
     expect(finalHref).toContain('del=%5B%22foo%22%5D');
   });
 
-  it('updates href and data-tsclick using proxy rebuild response', async () => {
+  it('updates anchors using proxy rebuild response payload', async () => {
     vi.useFakeTimers();
 
     const fetchMock = vi.fn().mockResolvedValue({

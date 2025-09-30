@@ -8,6 +8,7 @@ use lol_html::{element, html_content::ContentType, Settings as RewriterSettings}
 
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+use crate::tsjs;
 
 /// Configuration for HTML processing
 #[derive(Clone)]
@@ -73,7 +74,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     });
 
     let injected_tsjs = Rc::new(Cell::new(false));
-    let tsjs_loader: &'static str = include_str!("../../../static/tsjs/tsjs-core.html");
 
     fn is_prebid_script_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
@@ -92,7 +92,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 let injected_tsjs = injected_tsjs.clone();
                 move |el| {
                     if !injected_tsjs.get() {
-                        el.prepend(tsjs_loader, ContentType::Html);
+                        let loader = tsjs::core_script_tag();
+                        el.prepend(&loader, ContentType::Html);
                         injected_tsjs.set(true);
                     }
                     Ok(())
@@ -106,7 +107,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if let Some(href) = el.get_attribute("href") {
                         // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
                         if rewrite_prebid && is_prebid_script_url(&href) {
-                            el.set_attribute("href", "/static/tsjs=tsjs-ext.min.js")?;
+                            let ext_src = tsjs::ext_script_src();
+                            el.set_attribute("href", &ext_src)?;
                         } else {
                             let new_href = href
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -126,7 +128,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
                         if rewrite_prebid && is_prebid_script_url(&src) {
-                            el.set_attribute("src", "/static/tsjs=tsjs-ext.min.js")?;
+                            let ext_src = tsjs::ext_script_src();
+                            el.set_attribute("src", &ext_src)?;
                         } else {
                             let new_src = src
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())

@@ -1,3 +1,4 @@
+// Shared logger used across tsjs with console output gated by a runtime log level.
 export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
 
 const LEVELS: Record<LogLevel, number> = { silent: -1, error: 0, warn: 1, info: 2, debug: 3 };
@@ -46,6 +47,7 @@ function print(method: 'log' | 'info' | 'warn' | 'error', ...args: unknown[]) {
   }
 }
 
+// Thin wrapper around console that keeps timestamped output and honours a runtime log level.
 export const log = {
   setLevel(l: LogLevel) {
     currentLevel = l;

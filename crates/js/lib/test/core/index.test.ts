@@ -1,104 +1,80 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import '../../src/core/index';
 
 declare global {
   interface Window {
-    tsjs: any;
+    tsjs?: any;
   }
-}
-
-function cleanupDom() {
-  document.body.innerHTML = '';
 }
 
 const ORIGINAL_FETCH = global.fetch;
 
-describe('tsjs', () => {
-  beforeEach(() => {
-    cleanupDom();
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: {
-        get: (key: string) => (key.toLowerCase() === 'content-type' ? 'application/json' : null),
-      },
-      json: async () => ({ ads: [] }),
-    }) as unknown as typeof fetch;
+describe('core/index', () => {
+  beforeEach(async () => {
+    await vi.resetModules();
+    document.body.innerHTML = '';
+    delete (window as any).tsjs;
   });
 
   afterEach(() => {
     global.fetch = ORIGINAL_FETCH;
   });
 
-  it('exposes version and queue', () => {
-    expect(window.tsjs).toBeDefined();
-    expect(typeof window.tsjs.version).toBe('string');
-    expect(Array.isArray(window.tsjs.que)).toBe(true);
+  it('initializes tsjs API with expected surface', async () => {
+    await import('../../src/core/index');
+    const api = window.tsjs;
+    expect(api).toBeDefined();
+    expect(typeof api.version).toBe('string');
+    expect(Array.isArray(api.que)).toBe(true);
+    expect(typeof api.addAdUnits).toBe('function');
+    expect(typeof api.renderAdUnit).toBe('function');
+    expect(typeof api.renderAllAdUnits).toBe('function');
+    expect(typeof api.setConfig).toBe('function');
+    expect(typeof api.getConfig).toBe('function');
+    expect(typeof api.requestAds).toBe('function');
   });
 
-  it('adds ad units and renders one', () => {
-    window.tsjs.addAdUnits({ code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
-    window.tsjs.renderAdUnit('slot-1');
-    const el = document.getElementById('slot-1')!;
-    expect(el).toBeTruthy();
-    expect(el.textContent).toContain('Trusted Server — 300x250');
+  it('flushes queued callbacks that existed before initialization', async () => {
+    const callback = vi.fn(function () {
+      expect(this).toBe(window.tsjs);
+    });
+    (window as any).tsjs = { que: [callback] };
+
+    await import('../../src/core/index');
+
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 
-  it('renders all ad units', () => {
-    window.tsjs.addAdUnits([
-      { code: 'a', mediaTypes: { banner: { sizes: [[320, 50]] } } },
-      { code: 'b', mediaTypes: { banner: { sizes: [[728, 90]] } } },
+  it('installs queue that executes callbacks immediately with api context', async () => {
+    await import('../../src/core/index');
+    const api = window.tsjs;
+    const fn = vi.fn();
+
+    api.que.push(fn);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn.mock.instances[0]).toBe(api);
+  });
+
+  it('renders registered ad units using core rendering helpers', async () => {
+    await import('../../src/core/index');
+    const api = window.tsjs;
+
+    api.addAdUnits([
+      { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } },
+      { code: 'slot-2', mediaTypes: { banner: { sizes: [[320, 50]] } } },
     ]);
-    window.tsjs.renderAllAdUnits();
-    expect(document.getElementById('a')!.textContent).toContain('320x50');
-    expect(document.getElementById('b')!.textContent).toContain('728x90');
+
+    api.renderAllAdUnits();
+
+    expect(document.getElementById('slot-1')?.textContent).toContain('300x250');
+    expect(document.getElementById('slot-2')?.textContent).toContain('320x50');
   });
 
-  it('aliases pbjs to the same object and flushes pbjs.que', async () => {
-    cleanupDom();
-    (window as any).pbjs = { que: [] };
-    (window as any).pbjs.que.push(function () {
-      window.pbjs.setConfig({ debug: true, mode: 'thirdParty' });
-      window.pbjs.addAdUnits({ code: 'pbslot', mediaTypes: { banner: { sizes: [[300, 250]] } } });
-      window.pbjs.requestBids({ bidsBackHandler: () => {} });
-    });
-    vi.resetModules();
+  it('exposes requestAds from the core request module', async () => {
+    const { requestAds } = await import('../../src/core/request');
     await import('../../src/core/index');
-    await import('../../src/ext/index');
+    const api = window.tsjs;
 
-    expect(window.tsjs).toBe(window.pbjs);
-    const el = document.getElementById('pbslot');
-    expect(el).toBeTruthy();
-    expect(el!.textContent).toContain('300x250');
-  });
-
-  it('requestBids invokes callback and renders', () => {
-    // Ensure prebid extension is installed
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    import('../../src/ext/index');
-    let called = false;
-    window.tsjs.setConfig({ mode: 'thirdParty' } as any);
-    window.tsjs.addAdUnits({ code: 'rb', mediaTypes: { banner: { sizes: [[320, 50]] } } });
-    window.pbjs.requestBids({
-      bidsBackHandler: () => {
-        called = true;
-      },
-    });
-    expect(called).toBe(true);
-    expect(document.getElementById('rb')!.textContent).toContain('320x50');
-  });
-
-  it('flushes pre-init queue', async () => {
-    cleanupDom();
-    (window as any).tsjs = { que: [] };
-    (window as any).tsjs.que.push(function () {
-      window.tsjs.addAdUnits({ code: 'qslot', mediaTypes: { banner: { sizes: [[300, 250]] } } });
-      window.tsjs.renderAllAdUnits();
-    });
-    vi.resetModules();
-    await import('../../src/core/index');
-    const el = document.getElementById('qslot');
-    expect(el).toBeTruthy();
-    expect(el!.textContent).toContain('300x250');
+    expect(api.requestAds).toBe(requestAds);
   });
 });

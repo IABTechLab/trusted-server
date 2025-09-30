@@ -1,3 +1,4 @@
+// Prebid.js compatibility shim: exposes tsjs API through the legacy pbjs global.
 import type { TsjsApi, HighestCpmBid, RequestAdsCallback, RequestAdsOptions } from '../core/types';
 import { log } from '../core/log';
 import { installQueue } from '../core/queue';
@@ -52,6 +53,7 @@ function requestBidsShim(api: TsjsApi): RequestBidsFunction {
   };
 }
 
+// Guarantee a tsjs API stub exists so we can alias pbjs onto it.
 function ensureTsjsApi(win: PrebidWindow): TsjsApi {
   if (win.tsjs) return win.tsjs;
   const stub: TsjsApi = {
@@ -65,6 +67,7 @@ function ensureTsjsApi(win: PrebidWindow): TsjsApi {
   return stub;
 }
 
+// Bridge the minimal tsjs API onto the legacy pbjs global so existing tags keep working.
 export function installPrebidJsShim(): boolean {
   const w = resolvePrebidWindow();
 

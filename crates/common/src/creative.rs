@@ -39,6 +39,7 @@
 
 use crate::http_util::compute_encrypted_sha256_token;
 use crate::settings::Settings;
+use crate::tsjs;
 use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings as HtmlSettings};
 
 // Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
@@ -127,15 +128,24 @@ pub(super) fn rewrite_style_urls(style: &str, settings: &Settings) -> String {
 }
 
 #[inline]
-fn build_signed_url_for(settings: &Settings, clear_url: &str, base_path: &str) -> String {
+fn build_signed_url_for(
+    settings: &Settings,
+    clear_url: &str,
+    base_path: &str,
+    extra: &[(String, String)],
+) -> String {
     let Ok(mut u) = url::Url::parse(clear_url) else {
         return clear_url.to_string();
     };
 
-    let pairs: Vec<(String, String)> = u
+    let mut pairs: Vec<(String, String)> = u
         .query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
+
+    if !extra.is_empty() {
+        pairs.extend(extra.iter().cloned());
+    }
 
     u.set_query(None);
     u.set_fragment(None);
@@ -164,12 +174,21 @@ fn build_signed_url_for(settings: &Settings, clear_url: &str, base_path: &str) -
 
 #[inline]
 pub(super) fn build_proxy_url(settings: &Settings, clear_url: &str) -> String {
-    build_signed_url_for(settings, clear_url, "/first-party/proxy")
+    build_signed_url_for(settings, clear_url, "/first-party/proxy", &[])
+}
+
+#[inline]
+pub(super) fn build_proxy_url_with_extras(
+    settings: &Settings,
+    clear_url: &str,
+    extra: &[(String, String)],
+) -> String {
+    build_signed_url_for(settings, clear_url, "/first-party/proxy", extra)
 }
 
 #[inline]
 pub(super) fn build_click_url(settings: &Settings, clear_url: &str) -> String {
-    build_signed_url_for(settings, clear_url, "/first-party/click")
+    build_signed_url_for(settings, clear_url, "/first-party/click", &[])
 }
 
 // Note: previously we exposed canonical without token; now we store the full signed
@@ -286,10 +305,8 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                     let injected = injected_ts_creative.clone();
                     move |el| {
                         if !injected.get() {
-                            el.prepend(
-                                "<script src=\"/static/tsjs=tsjs-creative.min.js\" async></script>",
-                                ContentType::Html,
-                            );
+                            let script_tag = tsjs::creative_script_tag();
+                            el.prepend(&script_tag, ContentType::Html);
                             injected.set(true);
                         }
                         Ok(())

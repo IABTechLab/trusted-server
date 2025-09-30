@@ -1,3 +1,4 @@
+// Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
 export interface Banner {

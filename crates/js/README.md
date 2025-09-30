@@ -41,7 +41,7 @@ This Rust crate builds those bundles (via Vite) and embeds them so other crates 
 - `dist/tsjs-core.js` — core bundle (IIFE, via Vite library mode)
 - `dist/tsjs-ext.js` — PrebidJS shim extension (IIFE)
 - `dist/tsjs-creative.js` — creative click‑guard bundle (IIFE)
-- Rust crate exposes `TSJS_CORE_BUNDLE`, `TSJS_EXT_BUNDLE`, and `TSJS_CREATIVE_BUNDLE`
+- Rust crate exposes `TsjsBundle`, `bundle_for_filename`, and `bundle_hash`
 - `build.rs` — runs `npm run build` inside `ts/` if Node is available
 
 ## Build the JS Bundle
@@ -58,14 +58,14 @@ This Rust crate builds those bundles (via Vite) and embeds them so other crates 
 ## Serving From Rust
 
 ```rust
-use trusted_server_js::{
-    TSJS_CORE_BUNDLE, TSJS_CORE_FILENAME,
-    TSJS_EXT_BUNDLE, TSJS_EXT_FILENAME,
-    TSJS_CREATIVE_BUNDLE, TSJS_CREATIVE_FILENAME,
-};
+use trusted_server_js::{bundle_for_filename, bundle_hash, TsjsBundle};
+
 // Recommend serving via a unified endpoint your router handles:
 //   /static/tsjs=<filename>
-// where <filename> is one of TSJS_CORE_FILENAME, TSJS_EXT_FILENAME, TSJS_CREATIVE_FILENAME.
+// `bundle_for_filename` accepts the plain `.js` filename and returns the bundle contents.
+let filename = "tsjs-core.js";
+let bundle = bundle_for_filename(filename).expect("unknown bundle");
+let hash = bundle_hash(TsjsBundle::Core);
 ```
 
 ## HTML Usage
@@ -119,6 +119,7 @@ The Rust services (`trusted-server-common`) expose several proxy entry points th
 - Endpoint: `handle_first_party_proxy` (`crates/common/src/proxy.rs`).
 - Accepts the signed `/first-party/proxy?tsurl=...` URLs injected by the HTML rewriter and streams the creative from the third-party origin.
 - Extracts the synthetic ID from the inbound cookie or header and forwards it to the creative origin by appending `synthetic_id=<value>` to the rewritten target URL (while preserving existing query parameters).
+- Follows HTTP redirects (301/302/303/307/308) up to four hops, re-validating each `Location`, switching to `GET` after 303 responses, and propagating the synthetic ID on every hop.
 - Ensures the response body is rewritten when it is HTML/CSS/JS so all nested asset requests loop back through the same first-party proxy.
 
 ### Click-Through Proxy

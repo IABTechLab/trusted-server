@@ -1,8 +1,9 @@
 use crate::http_util::compute_encrypted_sha256_token;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, HeaderValue};
+use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -11,6 +12,17 @@ use crate::constants::{
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::synthetic::get_synthetic_id;
+
+#[derive(Deserialize)]
+struct ProxySignReq {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct ProxySignResp {
+    href: String,
+    base: String,
+}
 
 /// Copy a curated set of request headers to a proxied request.
 fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
@@ -174,18 +186,6 @@ pub async fn handle_first_party_proxy(
             message: "invalid url".to_string(),
         }));
     };
-    let scheme = target_url_parsed.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "unsupported scheme".to_string(),
-        }));
-    }
-    let host = target_url_parsed.host_str().unwrap_or("").to_string();
-    if host.is_empty() {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "missing host".to_string(),
-        }));
-    }
 
     let synthetic_id_param = match get_synthetic_id(&req) {
         Ok(id) => id,
@@ -225,28 +225,121 @@ pub async fn handle_first_party_proxy(
         log::debug!("proxy: no synthetic_id to forward to origin");
     }
 
-    // Ensure a backend exists
-    // No tstoken is included in target_url by design; nothing to strip.
-    let port = target_url_parsed.port();
-    let backend_name = crate::backend::ensure_origin_backend(&scheme, &host, port)?;
+    const MAX_REDIRECTS: usize = 4;
+    let mut current_url = target_url_parsed.to_string();
+    let mut current_method: Method = req.get_method().clone();
 
-    let target_url_for_request = target_url_parsed.to_string();
-
-    // Build proxied request with selected headers
-    let mut proxy_req = Request::new(req.get_method().clone(), &target_url_for_request);
-    copy_proxy_forward_headers(&req, &mut proxy_req);
-
-    let beresp = proxy_req
-        .send(&backend_name)
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy".to_string(),
+    for redirect_attempt in 0..=MAX_REDIRECTS {
+        let parsed_url = url::Url::parse(&current_url).map_err(|_| {
+            Report::new(TrustedServerError::Proxy {
+                message: "invalid url".to_string(),
+            })
         })?;
-    Ok(finalize_proxied_response(
-        settings,
-        &req,
-        &target_url_for_request,
-        beresp,
-    ))
+
+        let scheme = parsed_url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "unsupported scheme".to_string(),
+            }));
+        }
+
+        let host = parsed_url.host_str().unwrap_or("");
+        if host.is_empty() {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "missing host".to_string(),
+            }));
+        }
+
+        let backend_name = crate::backend::ensure_origin_backend(&scheme, host, parsed_url.port())?;
+
+        let mut proxy_req = Request::new(current_method.clone(), &current_url);
+        copy_proxy_forward_headers(&req, &mut proxy_req);
+
+        let beresp = proxy_req
+            .send(&backend_name)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to proxy".to_string(),
+            })?;
+
+        let status = beresp.get_status();
+        let is_redirect = matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        );
+
+        if !is_redirect {
+            return Ok(finalize_proxied_response(
+                settings,
+                &req,
+                &current_url,
+                beresp,
+            ));
+        }
+
+        let Some(location) = beresp
+            .get_header(header::LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(finalize_proxied_response(
+                settings,
+                &req,
+                &current_url,
+                beresp,
+            ));
+        };
+
+        if redirect_attempt == MAX_REDIRECTS {
+            log::warn!(
+                "proxy: redirect limit reached for {}; returning redirect response",
+                current_url
+            );
+            return Ok(finalize_proxied_response(
+                settings,
+                &req,
+                &current_url,
+                beresp,
+            ));
+        }
+
+        let next_url = url::Url::parse(location)
+            .or_else(|_| parsed_url.join(location))
+            .map_err(|_| {
+                Report::new(TrustedServerError::Proxy {
+                    message: "invalid redirect".to_string(),
+                })
+            })?;
+
+        let next_scheme = next_url.scheme().to_ascii_lowercase();
+        if next_scheme != "http" && next_scheme != "https" {
+            return Ok(finalize_proxied_response(
+                settings,
+                &req,
+                &current_url,
+                beresp,
+            ));
+        }
+
+        log::info!(
+            "proxy: following redirect {} => {} (status {})",
+            current_url,
+            next_url,
+            status.as_u16()
+        );
+
+        current_url = next_url.to_string();
+        if status == StatusCode::SEE_OTHER {
+            current_method = Method::GET;
+        }
+    }
+
+    Err(Report::new(TrustedServerError::Proxy {
+        message: "redirect handling failed".to_string(),
+    }))
 }
 
 /// First-party click redirect endpoint.
@@ -326,7 +419,7 @@ pub async fn handle_first_party_click(
         "click: redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
         tsurl,
         had_params,
-        full_for_token,
+        redirect_target,
         referer,
         ua,
         synthetic_id.as_deref().unwrap_or("")
@@ -336,6 +429,94 @@ pub async fn handle_first_party_click(
     Ok(Response::from_status(fastly::http::StatusCode::FOUND)
         .with_header(header::LOCATION, &redirect_target)
         .with_header(header::CACHE_CONTROL, "no-store, private"))
+}
+
+/// Sign an arbitrary asset URL so creatives can request first-party proxying at runtime.
+/// Supports POST JSON and GET query (`?url=`) payloads. Embeds a short-lived `tsexp` (30s)
+/// in the signature so the signed URL cannot be replayed indefinitely. Returns JSON
+/// `{ href, base }` where `href` is the signed `/first-party/proxy?...` path and `base`
+/// is the normalized clear URL.
+pub async fn handle_first_party_proxy_sign(
+    settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let method = req.get_method().clone();
+
+    let payload = if method == fastly::http::Method::POST {
+        let body = req.take_body_str();
+        serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
+            message: "invalid JSON".to_string(),
+        })?
+    } else {
+        let parsed =
+            url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
+                message: "Invalid URL".to_string(),
+            })?;
+        let url = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "url")
+            .map(|(_, v)| v.into_owned())
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::Proxy {
+                    message: "missing url".to_string(),
+                })
+            })?;
+        ProxySignReq { url }
+    };
+
+    let trimmed = payload.url.trim();
+    let abs = if trimmed.starts_with("//") {
+        let default_scheme = url::Url::parse(req.get_url_str())
+            .ok()
+            .map(|u| u.scheme().to_ascii_lowercase())
+            .filter(|scheme| !scheme.is_empty())
+            .unwrap_or_else(|| "https".to_string());
+        format!("{}:{}", default_scheme, trimmed)
+    } else {
+        crate::creative::to_abs(trimmed).ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "unsupported url".to_string(),
+            })
+        })?
+    };
+
+    let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
+        message: "invalid url".to_string(),
+    })?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported scheme".to_string(),
+        }));
+    }
+
+    let now = SystemTime::now();
+    let expires = now.checked_add(Duration::from_secs(30)).unwrap_or(now);
+    let tsexp = expires
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+        .to_string();
+    let extras = vec![(String::from("tsexp"), tsexp)];
+
+    let mut base = parsed.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    let proxied = crate::creative::build_proxy_url_with_extras(settings, &abs, &extras);
+
+    let resp = ProxySignResp {
+        href: proxied,
+        base: base.to_string(),
+    };
+
+    let mut response = Response::from_status(fastly::http::StatusCode::OK);
+    response.set_header(header::CONTENT_TYPE, "application/json; charset=utf-8");
+    response.set_body(
+        serde_json::to_string(&resp).change_context(TrustedServerError::Proxy {
+            message: "failed to serialize".to_string(),
+        })?,
+    );
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -513,12 +694,27 @@ pub async fn handle_first_party_proxy_rebuild(
 }
 
 // Shared: reconstruct and validate a signed target URL using tsurl + params + tstoken
+#[derive(Debug)]
 struct SignedTarget {
     target_url: String,
     tsurl: String,
     had_params: bool,
 }
 
+/// Validate a `/first-party/proxy|click` request and reconstruct the clear target URL.
+///
+/// The first-party URL encodes the clear target in `tsurl=...` along with any
+/// original query params and a deterministic `tstoken` signature. This helper:
+///
+/// 1. Parses the incoming request URL and extracts `tsurl`, `tstoken`, and the
+///    remaining query parameters in their original order.
+/// 2. Rebuilds the clear-text URL (`target_url`) using the preserved parameter order
+///    so signature validation matches what the creative signed.
+/// 3. Verifies `tstoken` using the publisher secret. A mismatch yields
+///    `TrustedServerError::Proxy`.
+/// 4. Validates optional `tsexp` expirations to prevent replay of old signatures.
+/// 5. Returns the reconstructed target URL, the base `tsurl` (without extra params),
+///    and a flag indicating if the original clear URL had query params.
 fn reconstruct_and_validate_signed_target(
     settings: &Settings,
     req_url: &str,
@@ -532,17 +728,24 @@ fn reconstruct_and_validate_signed_target(
     let mut sig: Option<String> = None;
     let mut ser = url::form_urlencoded::Serializer::new(String::new());
     let mut had_params = false;
+    let mut tsexp: Option<String> = None;
     for (k, v) in parsed.query_pairs() {
         let key = k.as_ref();
+        let value = v.into_owned();
         if key == "tsurl" {
-            tsurl = Some(v.into_owned());
+            tsurl = Some(value);
             continue;
         }
         if key == "tstoken" {
-            sig = Some(v.into_owned());
+            sig = Some(value);
             continue;
         }
-        ser.append_pair(key, &v);
+        if key == "tsexp" {
+            tsexp = Some(value.clone());
+            ser.append_pair(key, &value);
+            continue;
+        }
+        ser.append_pair(key, &value);
         had_params = true;
     }
 
@@ -571,6 +774,23 @@ fn reconstruct_and_validate_signed_target(
         }));
     }
 
+    if let Some(exp_str) = tsexp {
+        let exp = exp_str.parse::<u64>().map_err(|_| {
+            Report::new(TrustedServerError::Proxy {
+                message: "invalid tsexp".to_string(),
+            })
+        })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+        if exp < now {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "expired tsexp".to_string(),
+            }));
+        }
+    }
+
     Ok(SignedTarget {
         target_url: full_for_token,
         tsurl,
@@ -582,7 +802,8 @@ fn reconstruct_and_validate_signed_target(
 mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
-        handle_first_party_proxy_rebuild, reconstruct_and_validate_signed_target,
+        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        reconstruct_and_validate_signed_target,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -618,6 +839,69 @@ mod tests {
         let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
             .await
             .expect_err("expected error");
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn proxy_sign_returns_signed_url() {
+        let settings = create_test_settings();
+        let body = serde_json::json!({
+            "url": "https://cdn.example/asset.js?c=3&b=2",
+        });
+        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
+        req.set_body(body.to_string());
+        let mut resp = handle_first_party_proxy_sign(&settings, req)
+            .await
+            .expect("sign ok");
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        let json = resp.take_body_str();
+        assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
+        assert!(json.contains("tsexp"), "{}", json);
+        assert!(
+            json.contains("\"base\":\"https://cdn.example/asset.js\""),
+            "{}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_sign_rejects_invalid_url() {
+        let settings = create_test_settings();
+        let body = serde_json::json!({
+            "url": "data:image/png;base64,AAAA",
+        });
+        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
+        req.set_body(body.to_string());
+        let err: Report<TrustedServerError> = handle_first_party_proxy_sign(&settings, req)
+            .await
+            .expect_err("expected error");
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rejects_expired_tsexp() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let settings = create_test_settings();
+        let tsurl = "https://cdn.example/asset.js";
+        let expired = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+        let canonical = format!("{}?tsexp={}", tsurl, expired);
+        let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &canonical);
+        let tsurl_encoded =
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>();
+        let url = format!(
+            "https://edge.example/first-party/proxy?tsurl={}&tsexp={}&tstoken={}",
+            tsurl_encoded, expired, sig
+        );
+
+        let err: Report<TrustedServerError> =
+            reconstruct_and_validate_signed_target(&settings, &url)
+                .expect_err("expected expiration failure");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 

@@ -49,4 +49,5 @@ pub mod streaming_replacer;
 pub mod synthetic;
 pub mod templates;
 pub mod test_support;
+pub mod tsjs;
 pub mod why;

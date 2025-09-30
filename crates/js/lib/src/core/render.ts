@@ -1,3 +1,5 @@
+// Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
+// and inject creatives into sandboxed iframes.
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
@@ -9,6 +11,7 @@ function normalizeId(raw: string): string {
   return s.startsWith('#') ? s.slice(1) : s;
 }
 
+// Locate an ad slot element by id, tolerating funky selectors provided by tag managers.
 export function findSlot(id: string): HTMLElement | null {
   const nid = normalizeId(id);
   // Fast path
@@ -46,6 +49,7 @@ function ensureSlot(id: string): HTMLElement {
   return el;
 }
 
+// Drop a placeholder message into the slot so pages don't sit empty pre-render.
 export function renderAdUnit(codeOrUnit: string | AdUnit): void {
   const code = typeof codeOrUnit === 'string' ? codeOrUnit : codeOrUnit?.code;
   if (!code) return;
@@ -60,6 +64,7 @@ export function renderAdUnit(codeOrUnit: string | AdUnit): void {
   }
 }
 
+// Render placeholders for every registered ad unit (used in simple publisher demos).
 export function renderAllAdUnits(): void {
   try {
     const parentReady =
@@ -78,6 +83,7 @@ export function renderAllAdUnits(): void {
   }
 }
 
+// Swap the slot contents for a creative iframe and write HTML into it safely.
 export function renderCreativeIntoSlot(slotId: string, html: string): void {
   const el = findSlot(slotId);
   if (!el) {
@@ -105,6 +111,7 @@ export function renderCreativeIntoSlot(slotId: string, html: string): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
+// Construct a sandboxed iframe sized for the ad so we can render arbitrary HTML.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}

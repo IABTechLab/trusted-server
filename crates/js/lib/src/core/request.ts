@@ -1,3 +1,4 @@
+// Request orchestration for tsjs: fires first-party iframe loads or third-party fetches.
 import { delay } from '../shared/async';
 
 import { log } from './log';
@@ -9,6 +10,7 @@ import type { RequestAdsCallback, RequestAdsOptions } from './types';
 
 // getHighestCpmBids is provided by the Prebid extension (shim) to mirror Prebid's API
 
+// Entry point matching Prebid's requestBids signature; decides first/third-party mode.
 export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
   maybeOpts?: RequestAdsOptions
@@ -43,6 +45,7 @@ export function requestAds(
   }
 }
 
+// Create per-slot first-party iframe requests served directly from the edge.
 async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
   for (const unit of adUnits) {
     const size = (firstSize(unit) ?? [300, 250]) as readonly [number, number];
@@ -85,6 +88,7 @@ async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
   }
 }
 
+// Fire a JSON POST to the third-party ad endpoint and render returned creatives.
 function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) {
   // Render simple placeholders immediately so pages have content
   renderAllAdUnits();
@@ -133,6 +137,7 @@ function isSeatBidArray(x: unknown): x is RtSeatBid[] {
   return Array.isArray(x);
 }
 
+// Minimal OpenRTB seatbid parser—just enough to render adm by impid.
 function parseSeatBids(data: unknown): RtBid[] {
   const out: RtBid[] = [];
   const resp = data as Partial<RtResponse>;

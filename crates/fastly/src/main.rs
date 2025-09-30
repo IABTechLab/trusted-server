@@ -15,6 +15,7 @@ use trusted_server_common::prebid_proxy::{handle_prebid_auction, handle_prebid_c
 use trusted_server_common::privacy::handle_privacy_policy;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
+    handle_first_party_proxy_sign,
 };
 use trusted_server_common::publisher::{
     handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_dynamic,
@@ -118,6 +119,9 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::POST, "/third-party/ad", _) => handle_server_ad(&settings, req).await,
         (&Method::GET, "/first-party/proxy", _) => handle_first_party_proxy(&settings, req).await,
         (&Method::GET, "/first-party/click", _) => handle_first_party_click(&settings, req).await,
+        (&Method::GET, "/first-party/sign", _) | (&Method::POST, "/first-party/sign", _) => {
+            handle_first_party_proxy_sign(&settings, req).await
+        }
         (&Method::POST, "/first-party/proxy-rebuild", _) => {
             handle_first_party_proxy_rebuild(&settings, req).await
         }
