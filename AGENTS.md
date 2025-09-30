@@ -91,7 +91,7 @@ cargo check
 
 - `fastly.toml`: Fastly service configuration and build settings.
 - `trusted-server.toml`: Application settings (ad servers, KV stores, ID templates).
-- `rust-toolchain.toml`: Pins Rust version to 1.87.0.
+- `rust-toolchain.toml`: Pins Rust version to 1.90.0.
 
 ### Key Functionality Areas
 

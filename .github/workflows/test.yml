@@ -37,8 +37,8 @@ jobs:
       - name: Add wasm32-wasi target
         run: rustup target add wasm32-wasip1
 
-      - name: Setup Viceroy
-        run: cargo install viceroy
+      - name: Setup Viceroy (from main since 0.14.3 is broken)
+        run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
       - name: Run tests
         run: cargo test

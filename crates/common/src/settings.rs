@@ -38,7 +38,9 @@ impl Publisher {
     /// let publisher = Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
+    ///     origin_backend: "edgepubs_main_be".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
+    ///     proxy_secret: "proxy-secret".to_string(),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```

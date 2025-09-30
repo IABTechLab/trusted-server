@@ -65,7 +65,7 @@ fn build_openrtb_from_ts(req: &AdRequest, settings: &Settings) -> openrtb::OpenR
                 .map(|b| {
                     b.sizes
                         .iter()
-                        .filter(|&s| (s.len() >= 2))
+                        .filter(|&s| s.len() >= 2)
                         .map(|s| Format { w: s[0], h: s[1] })
                         .collect::<Vec<_>>()
                 })
