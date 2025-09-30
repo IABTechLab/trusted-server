@@ -15,8 +15,8 @@ repository = "https://example.invalid/trusted-server"
 readme = "README.md"
 
 [build-dependencies]
-which = "8"
+which = { workspace = true }
 
 [dependencies]
-hex = "0.4"
-sha2 = "0.10"
+hex = { workspace = true }
+sha2 = { workspace = true }

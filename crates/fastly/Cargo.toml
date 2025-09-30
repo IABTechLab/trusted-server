@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chrono = "0.4.41"
-error-stack = "0.6"
-fastly = "0.11.6"
-fern = "0.7.1"
-futures = "0.3"
-log = "0.4.20"
-log-fastly = "0.11.6"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.140"   
+chrono = { workspace = true }
+error-stack = { workspace = true }
+fastly = { workspace = true }
+fern = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+log-fastly = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 trusted-server-common = { path = "../common" }
 trusted-server-js = { path = "../js" }
