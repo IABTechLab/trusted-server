@@ -23,7 +23,7 @@ describe('creative/image.ts', () => {
     });
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule();
+    await importCreativeModule({ renderGuard: true });
 
     const img = new Image();
     img.src = 'https://img.example/pixel.gif?cb=1';
@@ -42,7 +42,7 @@ describe('creative/image.ts', () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule();
+    await importCreativeModule({ renderGuard: true });
 
     const img = new Image();
     img.src = 'https://img.example/fallback.png';

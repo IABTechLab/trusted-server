@@ -23,7 +23,7 @@ describe('creative/iframe.ts', () => {
     });
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule();
+    await importCreativeModule({ renderGuard: true });
 
     const iframe = document.createElement('iframe');
     iframe.src = 'https://frame.example/widget.html?cb=1';
@@ -42,7 +42,7 @@ describe('creative/iframe.ts', () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule();
+    await importCreativeModule({ renderGuard: true });
 
     const iframe = document.createElement('iframe');
     iframe.src = 'https://frame.example/fallback.html';

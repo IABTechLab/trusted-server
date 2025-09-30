@@ -3,13 +3,26 @@ import type { TsjsApi } from '../core/types';
 
 export interface TsCreativeApi {
   installGuards(): void;
+  setConfig?(cfg: TsCreativeConfig): void;
+  getConfig?(): TsCreativeConfig;
 }
 
-export type CreativeWindow = Window & { __ts_creative_installed?: boolean };
+export interface TsCreativeConfig {
+  /** Enable click guard runtime. Defaults to true. */
+  clickGuard?: boolean;
+  /** Enable render guard (dynamic image/iframe src proxies). Defaults to false. */
+  renderGuard?: boolean;
+}
+
+export type CreativeWindow = Window & {
+  __ts_creative_installed?: boolean;
+  tsCreativeConfig?: TsCreativeConfig;
+};
 
 export type CreativeGlobal = typeof globalThis & {
   localStorage?: Storage;
   tscreative?: TsCreativeApi;
+  tsCreativeConfig?: TsCreativeConfig;
 };
 
 export const creativeGlobal = globalThis as CreativeGlobal;

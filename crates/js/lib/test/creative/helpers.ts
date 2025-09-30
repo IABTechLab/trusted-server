@@ -17,7 +17,19 @@ export const MUTATED_CLICK = 'https://example.com/landing?bar=2';
 export const PROXY_RESPONSE =
   '/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&bar=2&tstoken=newtoken';
 
-export async function importCreativeModule(): Promise<void> {
-  delete (globalThis as { __ts_creative_installed?: boolean }).__ts_creative_installed;
+import type { TsCreativeConfig } from '../../src/shared/globals';
+
+export async function importCreativeModule(config?: TsCreativeConfig): Promise<void> {
+  const globalRef = globalThis as {
+    __ts_creative_installed?: boolean;
+    tsCreativeConfig?: TsCreativeConfig;
+  };
+  delete globalRef.__ts_creative_installed;
+  if (config) {
+    globalRef.tsCreativeConfig = config;
+  }
   await import('../../src/creative/index');
+  if (config) {
+    delete globalRef.tsCreativeConfig;
+  }
 }
