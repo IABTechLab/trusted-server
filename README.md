@@ -50,7 +50,7 @@ brew install fastly/tap/fastly
 fastly version
 ```
 
-:warning: fastly cli version should be at least v11.3.0
+:warning: fastly cli version should be at least v12.1.0
 
 #### Create profile and follow interactive prompt for pasting your API Token created earlier:
 ```sh	
@@ -64,6 +64,16 @@ fastly profile create
 brew install asdf
 asdf plugin add rust
 asdf install rust $(grep '^rust ' .tool-versions | awk '{print $2}')
+asdf reshim
+```
+
+### NodeJS
+
+#### Install NodeJS with asdf
+```sh
+brew install asdf
+asdf plugin add nodejs
+asdf install nodejs $(grep '^nodejs ' .tool-versions | awk '{print $2}')
 asdf reshim
 ```
 
