@@ -2,7 +2,9 @@ use core::str;
 
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde_json::Value as JsonValue;
+use url::Url;
 
 use crate::error::TrustedServerError;
 
@@ -19,12 +21,77 @@ pub struct AdServer {
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
+    pub origin_backend: String,
     pub origin_url: String,
+    /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
+    /// Keep this secret stable to allow existing links to decode.
+    pub proxy_secret: String,
+}
+
+impl Publisher {
+    /// Extracts the host (including port if present) from the origin_url.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trusted_server_common::settings::Publisher;
+    /// let publisher = Publisher {
+    ///     domain: "example.com".to_string(),
+    ///     cookie_domain: ".example.com".to_string(),
+    ///     origin_backend: "edgepubs_main_be".to_string(),
+    ///     origin_url: "https://origin.example.com:8080".to_string(),
+    ///     proxy_secret: "proxy-secret".to_string(),
+    /// };
+    /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
+    /// ```
+    #[allow(dead_code)]
+    pub fn origin_host(&self) -> String {
+        Url::parse(&self.origin_url)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| match url.port() {
+                    Some(port) => format!("{}:{}", host, port),
+                    None => host.to_string(),
+                })
+            })
+            .unwrap_or_else(|| self.origin_url.clone())
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Prebid {
     pub server_url: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u32,
+    #[serde(default = "default_bidders", deserialize_with = "vec_from_seq_or_map")]
+    pub bidders: Vec<String>,
+    #[serde(default = "default_auto_configure")]
+    pub auto_configure: bool,
+    #[serde(default)]
+    pub debug: bool,
+}
+
+fn default_account_id() -> String {
+    "1001".to_string()
+}
+
+fn default_timeout_ms() -> u32 {
+    1000
+}
+
+fn default_bidders() -> Vec<String> {
+    vec![
+        "kargo".to_string(),
+        "rubicon".to_string(),
+        "appnexus".to_string(),
+        "openx".to_string(),
+    ]
+}
+
+fn default_auto_configure() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -68,6 +135,11 @@ pub struct Partners {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Experimental {
+    pub enable_edge_pub: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub ad_server: AdServer,
     pub publisher: Publisher,
@@ -75,6 +147,7 @@ pub struct Settings {
     pub gam: Gam,
     pub synthetic: Synthetic,
     pub partners: Option<Partners>,
+    pub experimental: Option<Experimental>,
 }
 
 #[allow(unused)]
@@ -133,6 +206,63 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize configuration".to_string(),
             })
+    }
+}
+
+// Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
+// This lets env vars like TRUSTED_SERVER__PREBID__BIDDERS__0=smartadserver work, which the config env source
+// represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
+// JSON arrays or comma-separated values.
+fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let v = JsonValue::deserialize(deserializer)?;
+    match v {
+        JsonValue::Array(arr) => arr
+            .into_iter()
+            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
+            .collect(),
+        JsonValue::Object(map) => {
+            let mut items: Vec<(usize, T)> = Vec::with_capacity(map.len());
+            for (k, val) in map.into_iter() {
+                let idx = k.parse::<usize>().map_err(|_| {
+                    serde::de::Error::custom(format!("Invalid index '{}' in map for Vec field", k))
+                })?;
+                let parsed: T = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+                items.push((idx, parsed));
+            }
+            items.sort_by_key(|(idx, _)| *idx);
+            Ok(items.into_iter().map(|(_, v)| v).collect())
+        }
+        JsonValue::String(s) => {
+            let txt = s.trim();
+            if txt.starts_with('[') {
+                serde_json::from_str::<Vec<T>>(txt).map_err(serde::de::Error::custom)
+            } else {
+                let parts = if txt.contains(',') {
+                    txt.split(',')
+                        .map(|p| p.trim())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![txt]
+                };
+                let mut out: Vec<T> = Vec::with_capacity(parts.len());
+                for p in parts {
+                    let json = format!("\"{}\"", p.replace('"', "\\\""));
+                    let parsed: T =
+                        serde_json::from_str(&json).map_err(serde::de::Error::custom)?;
+                    out.push(parsed);
+                }
+                Ok(out)
+            }
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "expected array, map of indices, or parseable string, got {}",
+            other
+        ))),
     }
 }
 
@@ -253,6 +383,90 @@ mod tests {
     }
 
     #[test]
+    fn test_prebid_bidders_override_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let env_key = format!(
+            "{}{}PREBID{}BIDDERS",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        // Ensure no external override interferes
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
+                    let res = Settings::from_toml(&toml_str);
+                    if res.is_err() {
+                        eprintln!("JSON override error: {:?}", res.as_ref().err());
+                    }
+                    let settings = res.expect("Settings should parse with JSON env override");
+                    assert_eq!(
+                        settings.prebid.bidders,
+                        vec!["smartadserver".to_string(), "rubicon".to_string()]
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn test_prebid_bidders_override_with_indexed_env() {
+        let toml_str = crate_test_settings_str();
+
+        let env_key0 = format!(
+            "{}{}PREBID{}BIDDERS{}0",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let env_key1 = format!(
+            "{}{}PREBID{}BIDDERS{}1",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        // Also ensure origin_url env is a plain string (avoid any external env interference)
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(env_key0, Some("smartadserver"), || {
+                    temp_env::with_var(env_key1, Some("openx"), || {
+                        let res = Settings::from_toml(&toml_str);
+                        if res.is_err() {
+                            eprintln!("Indexed override error: {:?}", res.as_ref().err());
+                        }
+                        let settings =
+                            res.expect("Settings should parse with indexed env override");
+                        assert_eq!(
+                            settings.prebid.bidders,
+                            vec!["smartadserver".to_string(), "openx".to_string()]
+                        );
+                    });
+                });
+            },
+        );
+    }
+
+    #[test]
     fn test_settings_extra_fields() {
         let toml_str = crate_test_settings_str() + "\nhello = 1";
 
@@ -308,5 +522,68 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_publisher_origin_host() {
+        // Test with full URL including port
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "https://origin.example.com:8080".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "origin.example.com:8080");
+
+        // Test with URL without port (default HTTPS port)
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "origin.example.com");
+
+        // Test with HTTP URL with explicit port
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://localhost:9090".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "localhost:9090");
+
+        // Test with URL without protocol (fallback to original)
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "localhost:9090".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "localhost:9090");
+
+        // Test with IPv4 address
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://192.168.1.1:8080".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
+
+        // Test with IPv6 address
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_backend: "publisher_origin".to_string(),
+            origin_url: "http://[::1]:8080".to_string(),
+            proxy_secret: "test-secret".to_string(),
+        };
+        assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
 }

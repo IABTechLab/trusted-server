@@ -92,32 +92,38 @@ pub fn generate_synthetic_id(
 ///
 /// - [`TrustedServerError::Template`] if template rendering fails during generation
 /// - [`TrustedServerError::SyntheticId`] if ID generation fails
-pub fn get_or_generate_synthetic_id(
-    settings: &Settings,
-    req: &Request,
-) -> Result<String, Report<TrustedServerError>> {
-    // First try to get existing Trusted Server ID from header
+pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(synthetic_id) = req
         .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
     {
-        log::info!("Using existing Synthetic ID from header: {}", synthetic_id);
-        return Ok(synthetic_id);
+        let id = synthetic_id.to_string();
+        log::info!("Using existing Synthetic ID from header: {}", id);
+        return Ok(Some(id));
     }
 
-    // Try to get synthetic ID from cookies
     match handle_request_cookies(req)? {
         Some(jar) => {
             if let Some(cookie) = jar.get("synthetic_id") {
                 let id = cookie.value().to_string();
                 log::info!("Using existing Trusted Server ID from cookie: {}", id);
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
         None => {
             log::debug!("No cookie header found in request");
         }
+    }
+
+    Ok(None)
+}
+
+pub fn get_or_generate_synthetic_id(
+    settings: &Settings,
+    req: &Request,
+) -> Result<String, Report<TrustedServerError>> {
+    if let Some(id) = get_synthetic_id(req)? {
+        return Ok(id);
     }
 
     // If no existing Synthetic ID found, generate a fresh one
@@ -170,26 +176,39 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_generate_synthetic_id_with_header() {
+    fn test_get_synthetic_id_with_header() {
         let settings = create_test_settings();
         let req = create_test_request(vec![(
             HEADER_SYNTHETIC_TRUSTED_SERVER,
             "existing_synthetic_id",
         )]);
 
+        let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
+        assert_eq!(synthetic_id, Some("existing_synthetic_id".to_string()));
+
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
-            .expect("should get or generate synthetic ID");
+            .expect("should reuse header synthetic ID");
         assert_eq!(synthetic_id, "existing_synthetic_id");
     }
 
     #[test]
-    fn test_get_or_generate_synthetic_id_with_cookie() {
+    fn test_get_synthetic_id_with_cookie() {
         let settings = create_test_settings();
         let req = create_test_request(vec![(header::COOKIE, "synthetic_id=existing_cookie_id")]);
 
+        let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
+        assert_eq!(synthetic_id, Some("existing_cookie_id".to_string()));
+
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
-            .expect("should get or generate synthetic ID");
+            .expect("should reuse cookie synthetic ID");
         assert_eq!(synthetic_id, "existing_cookie_id");
+    }
+
+    #[test]
+    fn test_get_synthetic_id_none() {
+        let req = create_test_request(vec![]);
+        let synthetic_id = get_synthetic_id(&req).expect("should handle missing ID");
+        assert!(synthetic_id.is_none());
     }
 
     #[test]

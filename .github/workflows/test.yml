@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  test-rust:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
@@ -37,8 +37,39 @@ jobs:
       - name: Add wasm32-wasi target
         run: rustup target add wasm32-wasip1
 
-      - name: Setup Viceroy
-        run: cargo install viceroy
+      - name: Setup Viceroy (from main since 0.14.3 is broken)
+        run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
       - name: Run tests
         run: cargo test
+
+  test-typescript:
+    name: vitest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/js/lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Node.js version
+        id: node-version
+        working-directory: .
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: crates/js/lib/package.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build bundle
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm test -- --run
