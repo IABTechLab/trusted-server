@@ -67,10 +67,6 @@ build = """
         [local_server.backends.googleads_doubleclick_backend]
             url = "https://securepubads.g.doubleclick.net"
 
-        [local_server.backends.publisher_origin]
-            url = "http://localhost:9090"
-            override_host = "localhost:9090"
-        
         # Backend for proxying ad creatives and tracking pixels
         [local_server.backends.ad_cdn_backend]
             url = "https://cdn.adsrvr.org"  # Default, will be overridden dynamically

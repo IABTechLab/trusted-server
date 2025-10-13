@@ -21,6 +21,7 @@ pub struct AdServer {
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
+    #[deprecated(note = "Use origin_url instead - dynamic backends are created automatically")]
     pub origin_backend: String,
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
