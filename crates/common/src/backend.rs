@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::backend::Backend;
+use url::Url;
 
 use crate::error::TrustedServerError;
 
@@ -65,6 +66,21 @@ pub fn ensure_origin_backend(
             }
         }
     }
+}
+pub fn ensure_backend_from_url(origin_url: &str) -> Result<String, Report<TrustedServerError>> {
+    let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
+        message: format!("Invalid origin_url: {}", origin_url),
+    })?;
+
+    let scheme = parsed_url.scheme();
+    let host = parsed_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in origin_url".to_string(),
+        })
+    })?;
+    let port = parsed_url.port();
+
+    ensure_origin_backend(scheme, host, port)
 }
 
 #[cfg(test)]

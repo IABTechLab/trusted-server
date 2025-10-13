@@ -9,6 +9,7 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde_json::{json, Value};
 
+use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::gdpr::get_consent_from_request;
@@ -78,10 +79,12 @@ pub async fn handle_prebid_auction(
 
     log::info!("Sending request to Prebid Server");
 
+    let backend_name = ensure_backend_from_url(&settings.prebid.server_url)?;
+
     // 5. Send to PBS and get response
     let mut pbs_response =
         pbs_req
-            .send("prebid_backend")
+            .send(backend_name)
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to send request to Prebid Server".to_string(),
             })?;
@@ -175,9 +178,12 @@ pub async fn handle_prebid_cookie_sync(
         })?;
 
     // 4. Get response and transform sync URLs
+
+    let backend_name = ensure_backend_from_url(&settings.prebid.server_url)?;
+
     let mut pbs_response =
         pbs_req
-            .send("prebid_backend")
+            .send(backend_name)
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to send cookie sync request".to_string(),
             })?;

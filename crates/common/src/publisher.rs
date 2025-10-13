@@ -1,9 +1,8 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
-use url::Url;
 
-use crate::backend::ensure_origin_backend;
+use crate::backend::ensure_backend_from_url;
 use crate::http_util::serve_static_with_etag;
 
 use crate::constants::{
@@ -361,27 +360,15 @@ pub fn handle_publisher_request(
         has_synthetic_cookie
     );
 
-    let parsed_url =
-        Url::parse(&settings.publisher.origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", settings.publisher.origin_url),
-        })?;
-
-    let scheme = parsed_url.scheme();
-    let origin_host = parsed_url.host_str().ok_or_else(|| {
-        Report::new(TrustedServerError::Proxy {
-            message: "Missing host in origin_url".to_string(),
-        })
-    })?;
-    let port = parsed_url.port();
-
-    let backend_name = ensure_origin_backend(scheme, origin_host, port)?;
+    let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
+    let origin_host = settings.publisher.origin_host();
 
     log::info!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
         settings.publisher.origin_url
     );
-    req.set_header("host", origin_host);
+    req.set_header("host", &origin_host);
 
     let mut response = req
         .send(&backend_name)
