@@ -5,8 +5,6 @@ sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-# DEPRECATED origin backend is now dynamically created
-origin_backend = "publisher_origin"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
