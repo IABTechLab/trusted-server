@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-10-14
+
+### Changed
+- Publisher origin backend now uses `publisher.origin_url` to dynamically create backends, deprecated `publisher.origin_backend` field
+- Prebid backend now uses `prebid.server_url` to dynamically create backends, deprecated `prebid.prebid_backend` field
+- Removed static backend definitions from `fastly.toml` for publisher and prebid
+
+### Added
+- Added `.rust-analyzer.json` for improved development environment support with Neovim/rust-analyzer
+
 ## [1.1.0] - 2025-10-05
 
 ### Added
@@ -82,7 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial implementation of Trusted Server
 
-[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.0.6...HEAD
+[Unreleased]:https://github.com/IABTechLab/trusted-server/compare/v1.2.0...HEAD
+[1.2.0]:https://github.com/IABTechLab/trusted-server/compare/v1.1.0...v1.2.0
+[1.1.0]:https://github.com/IABTechLab/trusted-server/compare/v1.0.6...v1.1.0
 [1.0.6]:https://github.com/IABTechLab/trusted-server/compare/v1.0.5...v1.0.6
 [1.0.5]:https://github.com/IABTechLab/trusted-server/compare/v1.0.4...v1.0.5
 [1.0.4]:https://github.com/IABTechLab/trusted-server/compare/v1.0.3...v1.0.4
