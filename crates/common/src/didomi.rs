@@ -203,7 +203,7 @@ impl DidomiProxy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_consent_path_extraction() {
