@@ -76,7 +76,7 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, "/why-trusted-server") => handle_why_trusted_server(&settings, req),
 
         // Didomi CMP routes
-        (_, path) if path.starts_with("/consent/") => {
+        (&Method::GET | &Method::POST, path) if path.starts_with("/consent/") => {
             DidomiProxy::handle_consent_request(&settings, req).await
         }
 

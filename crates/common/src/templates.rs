@@ -1122,9 +1122,9 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
         
         <div class="instructions">
             <h4>📋 Instructions for Capture & Replay Phase</h4>
-            <p><strong>Phase 1 Goal:</strong> Capture a complete, successful ad request URL from autoblog.com and replay it from our server.</p>
+            <p><strong>Phase 1 Goal:</strong> Capture a complete, successful ad request URL from test-publisher.com and replay it from our server.</p>
             <ol>
-                <li>Open browser dev tools on autoblog.com</li>
+                <li>Open browser dev tools on test-publisher.com</li>
                 <li>Go to Network tab and filter by "g.doubleclick.net"</li>
                 <li>Refresh the page and look for successful ad requests</li>
                 <li>Copy the complete URL with all parameters</li>
@@ -1134,11 +1134,11 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
 
         <div class="phase">
             <h3>Phase 1: Capture & Replay (Golden URL)</h3>
-            <p>Test the exact captured URL from autoblog.com to prove network connectivity.</p>
+            <p>Test the exact captured URL from test-publisher.com to prove network connectivity.</p>
             
             <div class="test-section">
                 <h4>Golden URL Test</h4>
-                <p>Paste the captured GAM URL from autoblog.com below and test it:</p>
+                <p>Paste the captured GAM URL from test-publisher.com below and test it:</p>
                 <div style="margin: 15px 0;">
                     <textarea 
                         id="goldenUrlInput" 

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Prebid Integration Test - Trusted Server</title>
+    <script async src="https://cdn.jsdelivr.net/npm/prebid.js@latest/dist/not-for-prod/prebid.js"></script>
+    <script>
+        var PREBID_TIMEOUT = 1000;
+        
+        var adUnits = [{
+            code: 'div-gpt-ad-1460505748561-0',
+            mediaTypes: {
+                banner: {
+                    sizes: [[728, 90], [300, 250]]
+                }
+            },
+            bids: [] // Will be populated by s2sConfig
+        }];
+        
+        var pbjs = pbjs || {};
+        pbjs.que = pbjs.que || [];
+        
+        pbjs.que.push(function() {
+            // Configure Prebid to use our trusted-server as the S2S endpoint
+            pbjs.setConfig({
+                debug: true,
+                s2sConfig: {
+                    accountId: '1001',
+                    enabled: true,
+                    defaultVendor: 'appnexus',
+                    bidders: ['kargo', 'rubicon', 'appnexus'],
+                    timeout: 1000,
+                    adapter: 'prebidServer',
+                    endpoint: 'http://localhost:8080/openrtb2/auction',
+                    syncEndpoint: 'http://localhost:8080/cookie_sync',
+                    extPrebid: {
+                        cache: {
+                            vastxml: { returnCreative: false }
+                        }
+                    }
+                }
+            });
+            
+            // Add ad units
+            pbjs.addAdUnits(adUnits);
+            
+            // Request bids
+            pbjs.requestBids({
+                bidsBackHandler: function(bids) {
+                    console.log('Received bids:', bids);
+                    document.getElementById('bid-response').textContent = JSON.stringify(bids, null, 2);
+                    
+                    // Display winning bid info
+                    var winningBid = pbjs.getHighestCpmBids('div-gpt-ad-1460505748561-0')[0];
+                    if (winningBid) {
+                        document.getElementById('winning-bid').innerHTML = 
+                            '<h3>Winning Bid</h3>' +
+                            '<p>Bidder: ' + winningBid.bidder + '</p>' +
+                            '<p>CPM: $' + winningBid.cpm + '</p>' +
+                            '<p>Size: ' + winningBid.width + 'x' + winningBid.height + '</p>';
+                    }
+                },
+                timeout: PREBID_TIMEOUT
+            });
+        });
+    </script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .ad-container {
+            margin: 20px 0;
+            padding: 20px;
+            border: 2px dashed #ccc;
+            background-color: #fafafa;
+            min-height: 100px;
+            text-align: center;
+        }
+        .status {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #e8f4f8;
+            border-radius: 4px;
+        }
+        #bid-response {
+            background-color: #f0f0f0;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .info {
+            background-color: #f8f9fa;
+            border-left: 4px solid #007bff;
+            padding: 15px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Prebid Integration Test - Trusted Server</h1>
+        
+        <div class="info">
+            <h3>Test Configuration</h3>
+            <p><strong>Endpoint:</strong> http://localhost:8080/openrtb2/auction (First-party!)</p>
+            <p><strong>Sync Endpoint:</strong> http://localhost:8080/cookie_sync (First-party!)</p>
+            <p><strong>Bidders:</strong> Kargo, Rubicon, AppNexus (via Prebid Server)</p>
+            <p>All ad serving happens through the trusted-server domain to ensure privacy.</p>
+        </div>
+        
+        <div class="ad-container">
+            <div id="div-gpt-ad-1460505748561-0">
+                <p>Ad slot: 728x90 or 300x250</p>
+                <p>Waiting for bids...</p>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button onclick="location.reload()">Refresh & Request New Bids</button>
+            <button onclick="pbjs.que.push(function() { pbjs.requestBids(); })">Request Bids Again</button>
+            <button onclick="testCookieSync()">Test Cookie Sync</button>
+        </div>
+        
+        <div class="status">
+            <h3>Bid Response</h3>
+            <div id="winning-bid">Waiting for bids...</div>
+            <h4>All Bids:</h4>
+            <pre id="bid-response">Waiting for response...</pre>
+        </div>
+        
+        <div class="status">
+            <h3>Console Output</h3>
+            <p>Open browser console (F12) to see detailed Prebid debug information.</p>
+        </div>
+    </div>
+    
+    <script>
+        function testCookieSync() {
+            fetch('http://localhost:8080/cookie_sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    bidders: ['kargo', 'rubicon'],
+                    gdpr: 0
+                }),
+                credentials: 'include'
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Cookie sync response:', data);
+                alert('Cookie sync completed. Check console for details.');
+            })
+            .catch(error => {
+                console.error('Cookie sync error:', error);
+                alert('Cookie sync failed. Check console for details.');
+            });
+        }
+        
+        // Log all Prebid events
+        pbjs.que.push(function() {
+            pbjs.onEvent('auctionInit', function(data) {
+                console.log('Auction initialized:', data);
+            });
+            
+            pbjs.onEvent('bidRequested', function(data) {
+                console.log('Bid requested:', data);
+            });
+            
+            pbjs.onEvent('bidResponse', function(data) {
+                console.log('Bid response:', data);
+            });
+            
+            pbjs.onEvent('auctionEnd', function(data) {
+                console.log('Auction ended:', data);
+            });
+        });
+    </script>
+</body>
+</html>

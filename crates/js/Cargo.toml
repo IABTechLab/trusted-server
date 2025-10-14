@@ -1,0 +1,22 @@
+[package]
+name = "trusted-server-js"
+version = "0.1.0"
+edition = "2021"
+description = "Trusted Server tsjs — TypeScript-built JS embedded in a Rust crate."
+license = "Apache-2.0"
+build = "build.rs"
+
+[lib]
+name = "trusted_server_js"
+path = "src/lib.rs"
+
+[package.metadata]
+repository = "https://example.invalid/trusted-server"
+readme = "README.md"
+
+[build-dependencies]
+which = { workspace = true }
+
+[dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }

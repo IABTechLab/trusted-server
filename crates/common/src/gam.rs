@@ -1,6 +1,3 @@
-use crate::error::TrustedServerError;
-use crate::gdpr::get_consent_from_request;
-use crate::settings::Settings;
 use error_stack::Report;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
@@ -8,6 +5,11 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::Read;
 use uuid::Uuid;
+
+use crate::error::TrustedServerError;
+use crate::gdpr::get_consent_from_request;
+use crate::settings::Settings;
+use crate::templates::GAM_TEST_TEMPLATE;
 
 /// GAM request builder for server-side ad requests
 pub struct GamRequest {
@@ -62,7 +64,7 @@ impl GamRequest {
 
     /// Build the GAM request URL for the "Golden URL" replay phase
     pub fn build_golden_url(&self) -> String {
-        // This will be replaced with the actual captured URL from autoblog.com
+        // This will be replaced with the actual captured URL from test-publisher.com
         // For now, using a template based on the captured Golden URL
         let mut params = HashMap::new();
 
@@ -312,7 +314,7 @@ pub async fn handle_gam_test(
     };
 
     // For Phase 1, we'll use a hardcoded prmtvctx value from captured request
-    // This will be replaced with the actual value from autoblog.com
+    // This will be replaced with the actual value from test-publisher.com
     let gam_req_with_context = gam_req.with_prmtvctx("129627,137412,138272,139095,139096,139218,141364,143196,143210,143211,143214,143217,144331,144409,144438,144444,144488,144543,144663,144679,144731,144824,144916,145933,146347,146348,146349,146350,146351,146370,146383,146391,146392,146393,146424,146995,147077,147740,148616,148627,148628,149007,150420,150663,150689,150690,150692,150752,150753,150755,150756,150757,150764,150770,150781,150862,154609,155106,155109,156204,164183,164573,165512,166017,166019,166484,166486,166487,166488,166492,166494,166495,166497,166511,167639,172203,172544,173548,176066,178053,178118,178120,178121,178133,180321,186069,199642,199691,202074,202075,202081,233782,238158,adv,bhgp,bhlp,bhgw,bhlq,bhlt,bhgx,bhgv,bhgu,bhhb,rts".to_string());
 
     log::info!(
@@ -349,7 +351,7 @@ pub async fn handle_gam_golden_url(
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Handling GAM golden URL replay");
 
-    // This endpoint will be used to test the exact captured URL from autoblog.com
+    // This endpoint will be used to test the exact captured URL from test-publisher.com
     // For now, return a placeholder response
     Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
@@ -357,7 +359,7 @@ pub async fn handle_gam_golden_url(
             "status": "golden_url_replay",
             "message": "Ready for captured URL testing",
             "next_steps": [
-                "1. Capture complete GAM request URL from autoblog.com",
+                "1. Capture complete GAM request URL from test-publisher.com",
                 "2. Replace placeholder URL in GamRequest::build_golden_url()",
                 "3. Test with exact captured parameters"
             ]
@@ -431,8 +433,8 @@ pub async fn handle_gam_custom_url(
     gam_req.set_header(header::ACCEPT, "application/json, text/plain, */*");
     gam_req.set_header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
     gam_req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br");
-    gam_req.set_header(header::REFERER, "https://www.autoblog.com/");
-    gam_req.set_header(header::ORIGIN, "https://www.autoblog.com");
+    gam_req.set_header(header::REFERER, "https://www.test-publisher.com/");
+    gam_req.set_header(header::ORIGIN, "https://www.test-publisher.com");
 
     // Send the request to the GAM backend
     let backend_name = "gam_backend";
@@ -927,7 +929,7 @@ pub async fn handle_gam_asset(
         log::info!("Applying URL parameter rewriting for GAM ad request");
         full_url = full_url.replace(
             "url=https%3A%2F%2Fedgepubs.com%2F",
-            "url=https%3A%2F%2Fwww.autoblog.com%2F",
+            "url=https%3A%2F%2Fwww.test-publisher.com%2F",
         );
     }
 
@@ -1058,6 +1060,16 @@ pub async fn handle_gam_asset(
             }))
         }
     }
+}
+
+pub fn handle_gam_test_page(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    Ok(Response::from_status(StatusCode::OK)
+        .with_body(GAM_TEST_TEMPLATE)
+        .with_header(header::CONTENT_TYPE, "text/html")
+        .with_header("x-compress-hint", "on"))
 }
 
 #[cfg(test)]

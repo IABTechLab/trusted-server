@@ -15,11 +15,22 @@ use http::StatusCode;
 #[allow(dead_code)]
 #[derive(Debug, Display)]
 pub enum TrustedServerError {
+    /// Client-side input/validation error resulting in a 400 Bad Request.
+    #[display("Bad request: {message}")]
+    BadRequest { message: String },
     /// Configuration errors that prevent the server from starting.
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// GAM (Google Ad Manager) integration error.
+    #[display("GAM error: {message}")]
+    Gam { message: String },
+    /// GDPR consent handling error.
+    #[display("GDPR consent error: {message}")]
+    GdprConsent { message: String },
+
     /// The synthetic secret key is using the insecure default value.
+
     #[display("Synthetic secret key is set to the default value - this is insecure")]
     InsecureSecretKey,
 
@@ -31,29 +42,25 @@ pub enum TrustedServerError {
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
 
-    /// Settings parsing or validation failed.
-    #[display("Settings error: {message}")]
-    Settings { message: String },
-
-    /// GAM (Google Ad Manager) integration error.
-    #[display("GAM error: {message}")]
-    Gam { message: String },
-
-    /// GDPR consent handling error.
-    #[display("GDPR consent error: {message}")]
-    GdprConsent { message: String },
-
-    /// Synthetic ID generation or validation failed.
-    #[display("Synthetic ID error: {message}")]
-    SyntheticId { message: String },
+    /// Key-value store operation failed.
+    #[display("KV store error: {store_name} - {message}")]
+    KvStore { store_name: String, message: String },
 
     /// Prebid integration error.
     #[display("Prebid error: {message}")]
     Prebid { message: String },
 
-    /// Key-value store operation failed.
-    #[display("KV store error: {store_name} - {message}")]
-    KvStore { store_name: String, message: String },
+    /// Proxy error.
+    #[display("Proxy error: {message}")]
+    Proxy { message: String },
+
+    /// Settings parsing or validation failed.
+    #[display("Settings error: {message}")]
+    Settings { message: String },
+
+    /// Synthetic ID generation or validation failed.
+    #[display("Synthetic ID error: {message}")]
+    SyntheticId { message: String },
 
     /// Template rendering error.
     #[display("Template error: {message}")]
@@ -79,15 +86,17 @@ pub trait IntoHttpResponse {
 impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
+            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
-            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::FastlyError { .. } => StatusCode::BAD_GATEWAY,
         }

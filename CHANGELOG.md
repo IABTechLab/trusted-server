@@ -6,27 +6,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-- for new features
-
-### Changed
--  for changes in existing functionality
-
-### Deprecated 
-- for soon-to-be removed features.
-
-### Removed 
-- for now removed features
-
-### Fixed
-- for any bug fixes
-
-### Security
-- in case of vulnerabilities
-
-## [Unreleased]
+## [1.1.0] - 2025-10-05
 
 ### Added
 - Added basic unit tests
@@ -36,20 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add more complete e2e GAM (Google Ad Manager) integration with request construction and ad serving capabilities
 - Add new partners.rs module for partner-specific configurations
 - Created comprehensive publisher IDs audit document identifying hardcoded values
+- Enabled first-party ad endpoints that rewrite creatives in first party domain
+- Added first-party end point to proxy Prebid auctions
+- Added Trusted Server TSJS SDK with bundled build, lint, and test tools for serving creatives in first-party domain
 
 ### Changed
-- Upgrade to rust 1.87.0
-- Upgrade to fastly-cli 11.3.0
+- Upgrade to rust 1.90.0
+- Upgrade to fastly-cli 12.0.0
 - Changed to use constants for headers
 - Changed to use log statements
 - Updated fastly.toml for local development
 - Changed to propagate server errors as HTTP errors
+- Reworked Fastly routing so first-party endpoints and synthetic cookies stay in sync
+- Added TypeScript CI lint, format, and test jobs for TSJS
 
 ### Fixed
-- Rebuild when `TRUSTED_SERVER__*` env variables change 
-
-### Fixed
-- Rebuild when `TRUSTED_SERVER__*` env variables change 
+- Rebuild when `TRUSTED_SERVER__*` env variables change
 
 ## [1.0.6] - 2025-05-29
 
