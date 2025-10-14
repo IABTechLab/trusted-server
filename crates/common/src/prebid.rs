@@ -8,6 +8,7 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use serde_json::json;
 
+use crate::backend::ensure_backend_from_url;
 use crate::constants::{
     HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT,
     HEADER_X_CONSENT_ADVERTISING, HEADER_X_FORWARDED_FOR,
@@ -194,10 +195,17 @@ impl PrebidRequest {
             id
         );
 
-        req.set_body_json(&prebid_body)?;
+        // TrustedServerError doesn't implement std::error::Error
+        match ensure_backend_from_url(&settings.prebid.server_url) {
+            Ok(backend_name) => {
+                req.set_body_json(&prebid_body)?;
 
-        let resp = req.send("prebid_backend")?;
-        Ok(resp)
+                let resp = req.send(backend_name)?;
+                Ok(resp)
+            }
+
+            Err(e) => fastly::error::bail!("Could not get prebid backend: {}", e),
+        }
     }
 }
 

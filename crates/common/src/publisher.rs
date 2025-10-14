@@ -2,6 +2,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
+use crate::backend::ensure_backend_from_url;
 use crate::http_util::serve_static_with_etag;
 
 use crate::constants::{
@@ -359,17 +360,20 @@ pub fn handle_publisher_request(
         has_synthetic_cookie
     );
 
-    // Extract host from the origin_url using the Publisher's origin_host method
+    let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
     let origin_host = settings.publisher.origin_host();
 
-    log::info!("Setting host header to: {}", origin_host);
+    log::info!(
+        "Proxying to dynamic backend: {} (from {})",
+        backend_name,
+        settings.publisher.origin_url
+    );
     req.set_header("host", &origin_host);
 
-    // Send the request to the origin backend
     let mut response = req
-        .send(&settings.publisher.origin_backend)
+        .send(&backend_name)
         .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy request".to_string(),
+            message: "Failed to proxy request to origin".to_string(),
         })?;
 
     // Log all response headers for debugging

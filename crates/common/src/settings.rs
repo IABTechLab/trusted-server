@@ -21,7 +21,6 @@ pub struct AdServer {
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
-    pub origin_backend: String,
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
@@ -38,7 +37,6 @@ impl Publisher {
     /// let publisher = Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
-    ///     origin_backend: "edgepubs_main_be".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     proxy_secret: "proxy-secret".to_string(),
     /// };
@@ -530,7 +528,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
@@ -540,7 +537,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
@@ -550,7 +546,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
@@ -560,7 +555,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
@@ -570,7 +564,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
@@ -580,7 +573,6 @@ mod tests {
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
-            origin_backend: "publisher_origin".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
         };
