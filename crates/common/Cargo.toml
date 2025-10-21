@@ -11,6 +11,8 @@ license = "Apache-2.0"
 [dependencies]
 base64 = { workspace = true }
 brotli = { workspace = true }
+bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
 cookie = { workspace = true }
@@ -22,31 +24,31 @@ futures = { workspace = true }
 handlebars = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
-chacha20poly1305 = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 log-fastly = { workspace = true }
+lol_html = { workspace = true }
+pin-project-lite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
-bytes = { workspace = true }
-url = { workspace = true }
-uuid = { workspace = true }
-urlencoding = { workspace = true }
-lol_html = { workspace = true }
-pin-project-lite = { workspace = true }
 trusted-server-js = { path = "../js" }
+url = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+validator = { workspace = true }
 
 [build-dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
 config = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
+validator = { workspace = true }
 
 [features]
 default = []
