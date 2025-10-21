@@ -67,6 +67,16 @@ asdf install rust $(grep '^rust ' .tool-versions | awk '{print $2}')
 asdf reshim
 ```
 
+### NodeJS
+
+#### Install NodeJS with asdf
+```sh
+brew install asdf
+asdf plugin add nodejs
+asdf install nodejs $(grep '^nodejs ' .tool-versions | awk '{print $2}')
+asdf reshim
+```
+
 #### Fix path for Bash
 
 Edit ~/.bash_profile to add path for asdf shims: 
