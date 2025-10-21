@@ -1,12 +1,12 @@
 # Trusted Server 
 
-:information_source: Trusted Server is an open-source runtime and edge-orchestration layer for modern publishers - executing 3rd-party scripts and your entire ad-stack server-side, all under 1st-party control. Our goal is to move ad-related code execution and control from web browsers to publisher controlled, "trusted" edge-cloud infrastructure. 
+:information_source: Trusted Server is an open-source, cloud based orchestration framework and runtime for publishers. It moves code execution and operations that traditionally occured in browsers (via 3rd party JS) to secure, zero-cold-start [WASM](https://webassembly.org) binaries running in [WASI](https://github.com/WebAssembly/WASI) supported environments. It importantly gives publishers benefits such as: dramatically increasing control over how and who they share their data with (while maintaining user-privacy compliance), increasing revenue from inventory inside cookie restricted or non-JS environments, ability to serve all assets under 1st party context, and provides secure cryptographic functions to ensure trust across the programmatic ad ecosystem. 
 
 Trusted Server is the new execution layer for the open-web - returning control of 1st party data, security, and overall user-experience back to publishers.
 
 At this time, Trusted Server is designed to work with Fastly Compute. Follow these steps to configure Fastly Compute and deploy it.
 
-## Fastly
+## Getting Started: Edge-Cloud Support on Fastly
 - Create account at Fastly if you don’t have one - manage.fastly.com
 - Log in to the Fastly control panel. 
     - Go to Account > API tokens > Personal tokens. 
@@ -25,9 +25,9 @@ At this time, Trusted Server is designed to work with Fastly Compute. Follow the
     - IMPORTANT: when you enter the FQDN or IP ADDR information and click Add you need to enter a “Name” in the first field that will be referenced in your code so something like “my_ad_partner_1” 
     - 
 
-:warning: Fastly gives you a test domain to play on but obviously you’re free to create a CNAME to your domain when you’re ready. Note that Fastly compute ONLY accepts client traffic from TLS 
+:warning: With a dev account, Fastly gives you a test domain by default, but you’re also able to create a CNAME to your own domain when you’re ready, along with 2 free TLS certs (non-wildcard). Note that Fastly Compute ONLY accepts client traffic via TLS, though origins and backends can be non-TLS.
 
-## Installation
+## CLI and OS Tools Installation
 
 ### Brew
 
@@ -50,7 +50,7 @@ brew install fastly/tap/fastly
 fastly version
 ```
 
-:warning: fastly cli version should be at least v11.3.0
+:warning: fastly cli version should be at least v12.1.0
 
 #### Create profile and follow interactive prompt for pasting your API Token created earlier:
 ```sh	
@@ -59,7 +59,7 @@ fastly profile create
 
 ### Rust
 
-#### Install Rust with asdf
+#### Install Rust with asdf (our preference)
 ```sh
 brew install asdf
 asdf plugin add rust
@@ -85,9 +85,9 @@ export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
 See https://asdf-vm.com/guide/getting-started.html#_2-configure-asdf
 
 
-### Configure Build and
+### Clone Trusted Server and Configure Build 
 
-#### Clone Project
+#### Clone Project (assumes you have 'git' installed on your system)
 ```sh
 git clone git@github.com:IABTechLab/trusted-server.git
 ```
@@ -97,7 +97,7 @@ git clone git@github.com:IABTechLab/trusted-server.git
 :information_source: Note that you’ll have to edit the following files for your setup:
 
 - fastly.toml (service ID, author, description) 
-- trusted-server.toml (KV store ID names) 
+- trusted-server.toml (KV store ID names - optional) 
 
 ### Build
 
