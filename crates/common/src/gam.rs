@@ -1078,7 +1078,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::{constants::HEADER_SYNTHETIC_TRUSTED_SERVER, test_support::tests::create_test_settings};
+    use crate::{
+        constants::HEADER_SYNTHETIC_TRUSTED_SERVER, test_support::tests::create_test_settings,
+    };
 
     fn create_test_request() -> Request {
         let mut req = Request::new(Method::GET, "https://example.com/test");

@@ -25,6 +25,14 @@ pub struct Publisher {
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     pub proxy_secret: String,
+    /// Prefix for the publisher-specific ID header (x-{psid}-ts).
+    /// Defaults to "psid" if not specified.
+    #[serde(default = "default_psid")]
+    pub psid: String,
+}
+
+fn default_psid() -> String {
+    "psid".to_string()
 }
 
 impl Publisher {
@@ -530,6 +538,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -539,6 +548,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -548,6 +558,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -557,6 +568,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -566,6 +578,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -575,6 +588,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            psid: "psid".to_string(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
