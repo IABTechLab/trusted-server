@@ -83,7 +83,7 @@ pub fn generate_synthetic_id(
 /// Gets or creates a synthetic ID from the request.
 ///
 /// Attempts to retrieve an existing synthetic ID from:
-/// 1. The `X-Synthetic-Trusted-Server` header
+/// 1. The `x-psid-ts` header
 /// 2. The `synthetic_id` cookie
 ///
 /// If neither exists, generates a new synthetic ID.
