@@ -126,7 +126,7 @@ pub fn handle_main_page(
     let fresh_id = generate_synthetic_id(settings, &req)?;
 
     // Check for existing Trusted Server ID in this specific order:
-    // 1. X-Synthetic-Trusted-Server header
+    // 1. x-psid-ts header
     // 2. Cookie
     // 3. Fall back to fresh ID
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
