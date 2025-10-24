@@ -34,6 +34,7 @@ pub mod gdpr;
 pub mod geo;
 pub mod html_processor;
 pub mod http_util;
+pub mod jose;
 pub mod models;
 pub mod openrtb;
 pub mod partners;
