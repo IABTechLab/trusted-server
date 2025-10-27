@@ -31,6 +31,22 @@ use crate::error::to_error_response;
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
 
+    match trusted_server_common::jose::get_signing_key_from_fastly() {
+        Ok(key_bytes) => {
+            if let Err(e) = trusted_server_common::jose::set_signing_key(&key_bytes) {
+                log::error!("Failed to set signing key: {:?}", e);
+                return Ok(Response::from_status(500)
+                    .with_body_text_plain("Service initialization failed"));
+            }
+            log::info!("Signing key initialized successfully");
+        }
+        Err(e) => {
+            log::error!("Failed to load signing key from Fastly: {:?}", e);
+            return Ok(Response::from_status(500)
+                .with_body_text_plain("Service initialization failed"));
+        }
+    }
+
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
