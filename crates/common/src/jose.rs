@@ -9,7 +9,6 @@ use crate::error::TrustedServerError;
 static SIGNING_KEY: OnceLock<SigningKey> = OnceLock::new();
 
 pub fn set_signing_key(bytes: &[u8]) -> Result<(), TrustedServerError> {
-    println!("{:?}", bytes);
     let bytes = bytes
         .try_into()
         .map_err(|e| TrustedServerError::Configuration {
@@ -40,8 +39,9 @@ pub fn sign(payload: &[u8]) -> Result<String, TrustedServerError> {
 
 pub fn get_current_key_id() -> Result<String, TrustedServerError> {
     let store = ConfigStore::open("jwks_store");
-    
-    store.get("current-kid")
+
+    store
+        .get("current-kid")
         .ok_or_else(|| TrustedServerError::Configuration {
             message: "current-kid not found in config store".into(),
         })
@@ -49,13 +49,14 @@ pub fn get_current_key_id() -> Result<String, TrustedServerError> {
 
 pub fn get_signing_key_from_fastly() -> Result<Vec<u8>, TrustedServerError> {
     let key_id = get_current_key_id()?;
-    
-    let store = SecretStore::open("signing_keys")
-        .map_err(|_| TrustedServerError::Configuration {
+
+    let store =
+        SecretStore::open("signing_keys").map_err(|_| TrustedServerError::Configuration {
             message: "Failed to open signing_keys SecretStore".into(),
         })?;
-    
-    let pk = store.get(&key_id)
+
+    let pk = store
+        .get(&key_id)
         .ok_or_else(|| TrustedServerError::Configuration {
             message: format!("Private key '{}' not found in secret store", key_id),
         })?
@@ -63,8 +64,13 @@ pub fn get_signing_key_from_fastly() -> Result<Vec<u8>, TrustedServerError> {
         .map_err(|_| TrustedServerError::Configuration {
             message: "Failed to get private key plaintext".into(),
         })?;
-    
-    Ok(pk.into_iter().collect())
+
+    // decode base64 if that's what we got
+    if pk.len() > 32 {
+        Ok(general_purpose::STANDARD.decode(pk).unwrap())
+    } else {
+        Ok(pk.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -74,8 +80,7 @@ mod tests {
     fn set_test_key() {
         let key = get_signing_key_from_fastly().unwrap();
 
-        set_signing_key(&key)
-        .expect("signing key should not be initialized");
+        set_signing_key(&key).expect("signing key should not be initialized");
     }
 
     #[test]
