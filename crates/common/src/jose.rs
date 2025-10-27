@@ -9,6 +9,7 @@ use crate::error::TrustedServerError;
 static SIGNING_KEY: OnceLock<SigningKey> = OnceLock::new();
 
 pub fn set_signing_key(bytes: &[u8]) -> Result<(), TrustedServerError> {
+    println!("{:?}", bytes);
     let bytes = bytes
         .try_into()
         .map_err(|e| TrustedServerError::Configuration {
@@ -63,10 +64,7 @@ pub fn get_signing_key_from_fastly() -> Result<Vec<u8>, TrustedServerError> {
             message: "Failed to get private key plaintext".into(),
         })?;
     
-    general_purpose::STANDARD.decode(pk)
-        .map_err(|_| TrustedServerError::Configuration {
-            message: "Failed to decode base64 private key".into(),
-        })
+    Ok(pk.into_iter().collect())
 }
 
 #[cfg(test)]

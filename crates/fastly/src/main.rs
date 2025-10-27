@@ -26,6 +26,32 @@ use trusted_server_common::why::handle_why_trusted_server;
 
 mod error;
 use crate::error::to_error_response;
+use trusted_server_common::error::TrustedServerError;
+use error_stack::Report;
+
+fn handle_test_sign(_settings: &Settings, req: Request) -> Result<Response, Report<TrustedServerError>> {
+    let payload = req
+        .get_query_parameter("payload")
+        .unwrap_or("Hello from Fastly!");
+
+    match trusted_server_common::jose::sign(payload.as_bytes()) {
+        Ok(signature) => {
+            let key_id = trusted_server_common::jose::get_current_key_id()
+                .unwrap_or_else(|_| "unknown".to_string());
+            
+            let json_response = format!(
+                r#"{{"payload":"{}","signature":"{}","key_id":"{}"}}"#,
+                payload,
+                signature,
+                key_id
+            );
+            Ok(Response::from_status(200)
+                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_body_text_plain(&json_response))
+        }
+        Err(e) => Err(Report::from(e)),
+    }
+}
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -36,14 +62,14 @@ fn main(req: Request) -> Result<Response, Error> {
             if let Err(e) = trusted_server_common::jose::set_signing_key(&key_bytes) {
                 log::error!("Failed to set signing key: {:?}", e);
                 return Ok(Response::from_status(500)
-                    .with_body_text_plain("Service initialization failed"));
+                    .with_body_text_plain(format!("Service initialization failed: {}", e).as_str()));
             }
             log::info!("Signing key initialized successfully");
         }
         Err(e) => {
             log::error!("Failed to load signing key from Fastly: {:?}", e);
             return Ok(Response::from_status(500)
-                .with_body_text_plain("Service initialization failed"));
+                .with_body_text_plain(format!("Service initialization failed: {}", e).as_str()));
         }
     }
 
@@ -129,6 +155,9 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, path, _) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)
         }
+
+        // Test endpoint for signing demo
+        (&Method::GET, "/test/sign", _) => handle_test_sign(&settings, req),
 
         // tsjs endpoints
         (&Method::GET, "/first-party/ad", _) => handle_server_ad_get(&settings, req).await,
