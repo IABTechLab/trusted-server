@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMP_DIR="$PROJECT_ROOT/.keys-temp"
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 
 SECRET_STORE_ID="${SECRET_STORE_ID:-signing_keys}"
 CONFIG_STORE_ID="${CONFIG_STORE_ID:-jwks_store}"
 # Use first argument if provided, otherwise use date-based KID
 KID="${1:-ts-$(date +%Y-%m-%d)}"
 
-OPENSSL_BIN="/opt/homebrew/opt/openssl@3.6/bin/openssl"
 
 echo "🔐 Generating Ed25519 keypair for JOSE signing..."
 mkdir -p "$TEMP_DIR"
