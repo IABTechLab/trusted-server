@@ -1,15 +1,11 @@
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey};
 use fastly::{ConfigStore, SecretStore};
-use std::sync::OnceLock;
 
 use crate::error::TrustedServerError;
 
-// Hard coding for now use Fastly KV later
-static SIGNING_KEY: OnceLock<SigningKey> = OnceLock::new();
-
 pub fn sign(payload: &[u8]) -> Result<String, TrustedServerError> {
-    let signing_key = get_or_init_signing_key()?;
+    let signing_key = get_signing_key_from_fastly()?;
     let signature_bytes = signing_key.sign(payload).to_bytes();
 
     Ok(general_purpose::URL_SAFE_NO_PAD.encode(signature_bytes))
@@ -25,35 +21,7 @@ pub fn get_current_key_id() -> Result<String, TrustedServerError> {
         })
 }
 
-fn set_signing_key(bytes: &[u8]) -> Result<(), TrustedServerError> {
-    let bytes = bytes
-        .try_into()
-        .map_err(|e| TrustedServerError::Configuration {
-            message: format!("Could not set signing key: {:?}", e),
-        })?;
-
-    SIGNING_KEY
-        .set(SigningKey::from_bytes(bytes))
-        .map_err(|e| TrustedServerError::Configuration {
-            message: format!("Could not set signing key: {:?}", e),
-        })
-}
-
-fn get_or_init_signing_key<'a>() -> Result<&'a SigningKey, TrustedServerError> {
-    match SIGNING_KEY.get() {
-        Some(key) => Ok(key),
-        None => {
-            let bytes = get_signing_key_from_fastly()?;
-            set_signing_key(&bytes)?;
-
-            Ok(SIGNING_KEY
-                .get()
-                .expect("Signing key should have set above"))
-        }
-    }
-}
-
-fn get_signing_key_from_fastly() -> Result<Vec<u8>, TrustedServerError> {
+fn get_signing_key_from_fastly() -> Result<SigningKey, TrustedServerError> {
     let key_id = get_current_key_id()?;
 
     let store =
@@ -72,17 +40,23 @@ fn get_signing_key_from_fastly() -> Result<Vec<u8>, TrustedServerError> {
         })?;
 
     // decode base64 if that's what we got
-    if pk.len() > 32 {
-        let decoded = general_purpose::STANDARD.decode(pk).map_err(|_| {
-            TrustedServerError::Configuration {
+    let bytes = if pk.len() > 32 {
+        general_purpose::STANDARD
+            .decode(pk)
+            .map_err(|_| TrustedServerError::Configuration {
                 message: "Failed to decode base64 key".into(),
-            }
-        })?;
-
-        Ok(decoded)
+            })?
     } else {
-        Ok(pk.into_iter().collect())
-    }
+        pk.into_iter().collect()
+    };
+
+    let signing_key = SigningKey::from_bytes(&bytes.try_into().map_err(|_| {
+        TrustedServerError::Configuration {
+            message: "failed to create signing key".into(),
+        }
+    })?);
+
+    Ok(signing_key)
 }
 
 #[cfg(test)]
