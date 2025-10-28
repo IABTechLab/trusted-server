@@ -65,6 +65,10 @@ pub enum TrustedServerError {
     /// Template rendering error.
     #[display("Template error: {message}")]
     Template { message: String },
+
+    /// Fastly platform error.
+    #[display("Fastly error: {message}")]
+    FastlyError { message: String },
 }
 
 impl Error for TrustedServerError {}
@@ -94,6 +98,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::FastlyError { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 

@@ -28,6 +28,7 @@ pub mod backend;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
+pub mod didomi;
 pub mod error;
 pub mod gam;
 pub mod gdpr;

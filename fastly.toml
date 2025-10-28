@@ -70,6 +70,12 @@ build = """
         [local_server.backends.ad_cdn_backend]
             url = "https://cdn.adsrvr.org"  # Default, will be overridden dynamically
 
+        # Didomi CMP BAckends
+        [local_server.backends.didomi_sdk]
+            url = "https://sdk.privacy-center.org"
+        [local_server.backends.didomi_api]
+            url = "https://api.privacy-center.org"            
+
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]
             key = "placeholder"
