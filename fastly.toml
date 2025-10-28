@@ -88,5 +88,7 @@ build = """
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]
             ts-2025-10-A = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-A\",\"use\":\"sig\",\"x\":\"UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
+            ts-2025-10-B = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-B\",\"use\":\"sig\",\"x\":\"HVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
             current-kid = "ts-2025-10-A"
+            active-kids = "ts-2025-10-A,ts-2025-10-B"
 

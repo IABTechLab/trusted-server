@@ -1,8 +1,10 @@
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey};
-use fastly::{ConfigStore, SecretStore};
+use error_stack::{Report, ResultExt};
+use fastly::{ConfigStore, Request, Response, SecretStore};
 
 use crate::error::TrustedServerError;
+use crate::settings::Settings;
 
 pub fn sign(payload: &[u8]) -> Result<String, TrustedServerError> {
     let signing_key = get_signing_key_from_fastly()?;
@@ -19,6 +21,61 @@ pub fn get_current_key_id() -> Result<String, TrustedServerError> {
         .ok_or_else(|| TrustedServerError::Configuration {
             message: "current-kid not found in config store".into(),
         })
+}
+
+/// Gets all active JWK public keys from the config store.
+///
+/// Returns a JSON string containing the JWKS (JSON Web Key Set) with all
+/// currently active public keys. The active keys are determined by the
+/// "active-kids" config store entry which contains a comma-separated list.
+pub fn get_active_jwks() -> Result<String, TrustedServerError> {
+    let store = ConfigStore::open("jwks_store");
+
+    // Get the comma-separated list of active key IDs
+    let active_kids =
+        store
+            .get("active-kids")
+            .ok_or_else(|| TrustedServerError::Configuration {
+                message: "active-kids not found in config store".into(),
+            })?;
+
+    // Split by comma and fetch each JWK
+    let mut jwks = Vec::new();
+    for kid in active_kids.split(',') {
+        let kid = kid.trim();
+        if kid.is_empty() {
+            continue;
+        }
+
+        let jwk = store
+            .get(kid)
+            .ok_or_else(|| TrustedServerError::Configuration {
+                message: format!("JWK '{}' not found in config store", kid),
+            })?;
+
+        jwks.push(jwk);
+    }
+
+    // Build the JWKS response
+    let keys_json = jwks.join(",");
+    Ok(format!(r#"{{"keys":[{}]}}"#, keys_json))
+}
+
+/// Handles requests to the JWKS endpoint.
+///
+/// This endpoint serves the JSON Web Key Set (JWKS) containing all currently
+/// active public keys that can be used to verify signatures.
+pub fn handle_jwks_endpoint(
+    _settings: &Settings,
+    _req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let jwks_json = get_active_jwks().change_context(TrustedServerError::Configuration {
+        message: "Failed to retrieve JWKS".into(),
+    })?;
+
+    Ok(Response::from_status(200)
+        .with_content_type(fastly::mime::APPLICATION_JSON)
+        .with_body_text_plain(&jwks_json))
 }
 
 fn get_signing_key_from_fastly() -> Result<SigningKey, TrustedServerError> {
