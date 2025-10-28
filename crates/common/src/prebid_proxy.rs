@@ -13,7 +13,7 @@ use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::gdpr::get_consent_from_request;
-use crate::jose;
+use crate::request_signing;
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -72,7 +72,7 @@ pub async fn handle_prebid_auction(
     // Copy relevant headers
     copy_request_headers(&req, &mut pbs_req);
 
-    let signature = jose::sign(&req.take_body_bytes())?;
+    let signature = request_signing::sign(&req.take_body_bytes())?;
     pbs_req.append_header("x-signature", signature);
 
     pbs_req

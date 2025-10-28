@@ -34,9 +34,9 @@ fn handle_test_sign(_settings: &Settings, req: Request) -> Result<Response, Repo
         .get_query_parameter("payload")
         .unwrap_or("Hello from Fastly!");
 
-    match trusted_server_common::jose::sign(payload.as_bytes()) {
+    match trusted_server_common::request_signing::sign(payload.as_bytes()) {
         Ok(signature) => {
-            let key_id = trusted_server_common::jose::get_current_key_id()
+            let key_id = trusted_server_common::request_signing::get_current_key_id()
                 .unwrap_or_else(|_| "unknown".to_string());
             
             let json_response = format!(
@@ -56,22 +56,6 @@ fn handle_test_sign(_settings: &Settings, req: Request) -> Result<Response, Repo
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
-
-    match trusted_server_common::jose::get_signing_key_from_fastly() {
-        Ok(key_bytes) => {
-            if let Err(e) = trusted_server_common::jose::set_signing_key(&key_bytes) {
-                log::error!("Failed to set signing key: {:?}", e);
-                return Ok(Response::from_status(500)
-                    .with_body_text_plain(format!("Service initialization failed: {}", e).as_str()));
-            }
-            log::info!("Signing key initialized successfully");
-        }
-        Err(e) => {
-            log::error!("Failed to load signing key from Fastly: {:?}", e);
-            return Ok(Response::from_status(500)
-                .with_body_text_plain(format!("Service initialization failed: {}", e).as_str()));
-        }
-    }
 
     let settings = match get_settings() {
         Ok(s) => s,
