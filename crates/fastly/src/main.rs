@@ -144,7 +144,12 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     };
 
     // Convert any errors to HTTP error responses
-    result.map_or_else(|e| Ok(to_error_response(e)), Ok)
+    let mut response = result.unwrap_or_else(to_error_response);
+
+    // Add X-Robots-Tag header to prevent crawlers and indexers
+    response.set_header("X-Robots-Tag", "noindex, nofollow");
+
+    Ok(response)
 }
 
 fn is_partner_asset_path(path: &str) -> bool {
