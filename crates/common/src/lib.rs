@@ -42,6 +42,7 @@ pub mod prebid_proxy;
 pub mod privacy;
 pub mod proxy;
 pub mod publisher;
+pub mod request_signing;
 pub mod settings;
 pub mod settings_data;
 pub mod streaming_processor;

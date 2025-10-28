@@ -37,6 +37,7 @@ urlencoding = { workspace = true }
 lol_html = { workspace = true }
 pin-project-lite = { workspace = true }
 trusted-server-js = { path = "../js" }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 
 [build-dependencies]
 serde = { workspace = true }

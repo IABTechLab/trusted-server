@@ -20,12 +20,40 @@ use trusted_server_common::proxy::{
 use trusted_server_common::publisher::{
     handle_edgepubs_page, handle_main_page, handle_publisher_request, handle_tsjs_dynamic,
 };
+use trusted_server_common::request_signing::handle_jwks_endpoint;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 use trusted_server_common::why::handle_why_trusted_server;
 
 mod error;
 use crate::error::to_error_response;
+use error_stack::Report;
+use trusted_server_common::error::TrustedServerError;
+
+fn handle_test_sign(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let payload = req
+        .get_query_parameter("payload")
+        .unwrap_or("Hello from Fastly!");
+
+    match trusted_server_common::request_signing::sign(payload.as_bytes()) {
+        Ok(signature) => {
+            let key_id = trusted_server_common::request_signing::get_current_key_id()
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            let json_response = format!(
+                r#"{{"payload":"{}","signature":"{}","key_id":"{}"}}"#,
+                payload, signature, key_id
+            );
+            Ok(Response::from_status(200)
+                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_body_text_plain(&json_response))
+        }
+        Err(e) => Err(Report::from(e)),
+    }
+}
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -113,6 +141,12 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, path, _) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)
         }
+
+        // Test endpoint for signing demo
+        (&Method::GET, "/test/sign", _) => handle_test_sign(&settings, req),
+
+        // JWKS endpoint for public key distribution
+        (&Method::GET, "/.well-known/ts.jwks.json", _) => handle_jwks_endpoint(&settings, req),
 
         // tsjs endpoints
         (&Method::GET, "/first-party/ad", _) => handle_server_ad_get(&settings, req).await,
