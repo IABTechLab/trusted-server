@@ -51,8 +51,8 @@ Behavior is covered by an extensive test suite in `crates/common/src/creative.rs
 
 - `synthetic.rs` generates a deterministic synthetic identifier per user request and exposes helpers:
   - `generate_synthetic_id` — creates a fresh HMAC-based ID using request signals.
-  - `get_synthetic_id` — extracts an existing ID from the `X-Synthetic-Trusted-Server` header or `synthetic_id` cookie.
+  - `get_synthetic_id` — extracts an existing ID from the `x-psid-ts` header or `synthetic_id` cookie.
   - `get_or_generate_synthetic_id` — reuses the existing ID when present, otherwise creates one.
-- `publisher.rs::handle_publisher_request` stamps proxied origin responses with `X-Synthetic-Fresh`, `X-Synthetic-Trusted-Server`, and (when absent) issues the `synthetic_id` cookie so the browser keeps the identifier on subsequent requests.
+- `publisher.rs::handle_publisher_request` stamps proxied origin responses with `X-Synthetic-Fresh`, `x-psid-ts`, and (when absent) issues the `synthetic_id` cookie so the browser keeps the identifier on subsequent requests.
 - `proxy.rs::handle_first_party_proxy` replays the identifier to third-party creative origins by appending `synthetic_id=<value>` to the reconstructed target URL, follows redirects (301/302/303/307/308) up to four hops, and keeps downstream fetches linked to the same user scope.
 - `proxy.rs::handle_first_party_click` adds `synthetic_id=<value>` to outbound click redirect URLs so analytics endpoints can associate clicks with impressions without third-party cookies.

@@ -1208,7 +1208,7 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
             try {
                 const response = await fetch('/');
                 const freshId = response.headers.get('X-Synthetic-Fresh');
-                const trustedServerId = response.headers.get('X-Synthetic-Trusted-Server');
+                const trustedServerId = response.headers.get('x-psid-ts');
                 
                 const statusDiv = document.getElementById('syntheticStatus');
                 statusDiv.className = 'status success';
@@ -1280,14 +1280,14 @@ pub const GAM_TEST_TEMPLATE: &str = r#"
                 // First get the main page to ensure we have synthetic IDs
                 const mainResponse = await fetch('/');
                 const freshId = mainResponse.headers.get('X-Synthetic-Fresh');
-                const trustedServerId = mainResponse.headers.get('X-Synthetic-Trusted-Server');
+                const trustedServerId = mainResponse.headers.get('x-psid-ts');
                 
                 // Now test the GAM request
                 const response = await fetch('/gam-test', {
                     headers: {
                         'X-Consent-Advertising': 'true',
                         'X-Synthetic-Fresh': freshId || '',
-                        'X-Synthetic-Trusted-Server': trustedServerId || ''
+                        'x-psid-ts': trustedServerId || ''
                     }
                 });
                 

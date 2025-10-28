@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use uuid::Uuid;
 
+use crate::constants::HEADER_SYNTHETIC_TRUSTED_SERVER;
 use crate::error::TrustedServerError;
 use crate::gdpr::get_consent_from_request;
 use crate::settings::Settings;
@@ -35,7 +36,7 @@ impl GamRequest {
 
         // Get synthetic ID from request headers
         let synthetic_id = req
-            .get_header("X-Synthetic-Trusted-Server")
+            .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
@@ -1077,12 +1078,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::test_support::tests::create_test_settings;
+    use crate::{constants::HEADER_SYNTHETIC_TRUSTED_SERVER, test_support::tests::create_test_settings};
 
     fn create_test_request() -> Request {
         let mut req = Request::new(Method::GET, "https://example.com/test");
         req.set_header(header::USER_AGENT, "Mozilla/5.0 Test Browser");
-        req.set_header("X-Synthetic-Trusted-Server", "test-synthetic-id-123");
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, "test-synthetic-id-123");
         req
     }
 
@@ -1171,7 +1172,7 @@ mod tests {
             Method::GET,
             "https://example.com/test?param=value&special=test%20space",
         );
-        req.set_header("X-Synthetic-Trusted-Server", "test-id");
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, "test-id");
 
         let gam_req = GamRequest::new(&settings, &req).unwrap();
         let url = gam_req.build_golden_url();
@@ -1215,7 +1216,7 @@ mod tests {
         let settings = create_test_settings();
         let mut req = Request::new(Method::GET, "https://example.com/gam-test");
         req.set_header("X-Consent-Advertising", "true");
-        req.set_header("X-Synthetic-Trusted-Server", "test-synthetic-id");
+        req.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, "test-synthetic-id");
 
         // Note: This test will fail when actually sending to GAM backend
         // In a real test environment, we'd mock the backend response
