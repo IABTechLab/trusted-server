@@ -10,6 +10,7 @@ use handlebars::Handlebars;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
+use std::sync::OnceLock;
 
 use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
@@ -17,6 +18,18 @@ use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
+
+static HANDLEBARS: OnceLock<Handlebars<'static>> = OnceLock::new();
+
+/// Returns a global, lazily initialized `Handlebars` instance.
+fn handlebars(hb_template: &str) -> &'static Handlebars<'static> {
+    HANDLEBARS.get_or_init(|| {
+        let mut hbs = Handlebars::new();
+        hbs.register_template_string("synthetic_id", hb_template)
+            .expect("Failed to register synthetic ID template at startup");
+        hbs
+    })
+}
 
 /// Generates a fresh synthetic ID based on request parameters.
 ///
@@ -50,7 +63,8 @@ pub fn generate_synthetic_id(
         .and_then(|h| h.to_str().ok())
         .map(|lang| lang.split(',').next().unwrap_or("unknown"));
 
-    let handlebars = Handlebars::new();
+    let handlebars = handlebars(&settings.synthetic.template);
+
     let data = &json!({
         "client_ip": client_ip.unwrap_or("unknown".to_string()),
         "user_agent": user_agent.unwrap_or("unknown"),
@@ -60,11 +74,12 @@ pub fn generate_synthetic_id(
         "accept_language": accept_language.unwrap_or("unknown")
     });
 
-    let input_string = handlebars
-        .render_template(&settings.synthetic.template, data)
-        .change_context(TrustedServerError::Template {
-            message: "Failed to render synthetic ID template".to_string(),
-        })?;
+    let input_string =
+        handlebars
+            .render("synthetic_id", data)
+            .change_context(TrustedServerError::Template {
+                message: "Failed to render synthetic ID template".to_string(),
+            })?;
 
     log::info!("Input string for fresh ID: {} {}", input_string, data);
 
