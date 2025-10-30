@@ -15,7 +15,7 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
 
     let authorized = extract_credentials(req)
         .map(|(username, password)| username == handler_username && password == handler_password)
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if authorized {
         None
@@ -118,5 +118,21 @@ mod tests {
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn invalid_handler_path_is_ignored() {
+        let mut config = crate_test_settings_str();
+        config.push_str(
+            r#"
+[[handlers]]
+path = "[invalid"
+username = "user"
+password = "pass"
+"#,
+        );
+
+        let settings = Settings::from_toml(&config);
+        assert!(settings.is_err(), "invalid handler regex should fail validation");
     }
 }

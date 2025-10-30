@@ -1,5 +1,5 @@
 [[handlers]]
-path = "^/"
+path = "^/secure"
 username = "user"
 password = "pass"
 
