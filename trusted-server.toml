@@ -1,7 +1,3 @@
-[ad_server]
-ad_partner_url = "equativ_ad_api_2"
-sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={{synthetic_id}}"
-
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
@@ -10,21 +6,10 @@ proxy_secret = "change-me-proxy-secret"
 
 [prebid]
 server_url = "http://68.183.113.79:8000"
-account_id = "1001"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
-
-[gam]
-publisher_id = "88059007"
-server_url = "https://securepubads.g.doubleclick.net/gampad/ads"
-ad_units = [
-    { name = "Flex8:1", size = "flexible" },
-    { name = "Fixed728x90", size = "728x90" },
-    { name = "Static8:1", size = "flexible" },
-    { name = "Static728x90", size = "728x90" }
-]
 
 [synthetic]
 counter_store = "counter_store"
@@ -38,39 +23,3 @@ secret_key = "trusted-server"
 #   - "publisher_domain"
 #   - "accept_language"
 template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_id }}:{{ publisher_domain }}:{{ accept_language }}"
-
-# Partner Proxy Configuration
-[partners]
-
-[partners.gam]
-enabled = true
-name = "Google Ad Manager"
-domains_to_proxy = [
-    "securepubads.g.doubleclick.net",
-    "tpc.googlesyndication.com",
-    "googletagservices.com",
-    "googlesyndication.com"
-]
-proxy_domain = "www.edgepubs.com"
-backend_name = "gam_proxy_backend"
-
-[partners.equativ]
-enabled = true
-name = "Equativ (Smart AdServer)"
-domains_to_proxy = [
-    "creatives.sascdn.com",
-    "adapi-srv-eu.smartadserver.com"
-]
-proxy_domain = "www.edgepubs.com"
-backend_name = "equativ_proxy_backend"
-
-[partners.prebid]
-enabled = true
-name = "Prebid Server"
-domains_to_proxy = ["68.183.113.79"]
-proxy_domain = "www.edgepubs.com"
-backend_name = "prebid_proxy_backend"
-
-# Experimental features
-[experimental]
-enable_edge_pub = false

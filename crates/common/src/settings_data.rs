@@ -1,5 +1,6 @@
 use core::str;
 use error_stack::{Report, ResultExt};
+use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -24,10 +25,12 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
 
     let settings = Settings::from_toml(toml_str)?;
 
-    // Validate that the secret key is not the default
-    if settings.synthetic.secret_key == "secret-key" {
-        return Err(Report::new(TrustedServerError::InsecureSecretKey));
-    }
+    // Validate the settings
+    settings
+        .validate()
+        .change_context(TrustedServerError::Configuration {
+            message: "Failed to validate configuration".to_string(),
+        })?;
 
     Ok(settings)
 }
@@ -44,8 +47,6 @@ mod tests {
 
         let settings = settings.unwrap();
         // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_url.is_empty());
-        assert!(!settings.ad_server.sync_url.is_empty());
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());

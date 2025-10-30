@@ -5,19 +5,14 @@ use error_stack::{Report, ResultExt};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use url::Url;
+use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct AdServer {
-    pub ad_partner_url: String,
-    pub sync_url: String,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
@@ -56,11 +51,9 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Prebid {
     pub server_url: String,
-    #[serde(default = "default_account_id")]
-    pub account_id: String,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
     #[serde(default = "default_bidders", deserialize_with = "vec_from_seq_or_map")]
@@ -71,81 +64,46 @@ pub struct Prebid {
     pub debug: bool,
 }
 
-fn default_account_id() -> String {
-    "1001".to_string()
-}
-
 fn default_timeout_ms() -> u32 {
     1000
 }
 
 fn default_bidders() -> Vec<String> {
-    vec![
-        "kargo".to_string(),
-        "rubicon".to_string(),
-        "appnexus".to_string(),
-        "openx".to_string(),
-    ]
+    vec!["mocktioneer".to_string()]
 }
 
 fn default_auto_configure() -> bool {
     true
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
 #[allow(unused)]
-pub struct GamAdUnit {
-    pub name: String,
-    pub size: String,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[allow(unused)]
-pub struct Gam {
-    pub publisher_id: String,
-    pub server_url: String,
-    pub ad_units: Vec<GamAdUnit>,
-}
-
-#[allow(unused)]
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
+    #[validate(length(min = 1), custom(function = Synthetic::validate_secret_key))]
     pub secret_key: String,
+    #[validate(length(min = 1))]
     pub template: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct PartnerConfig {
-    pub enabled: bool,
-    pub name: String,
-    pub domains_to_proxy: Vec<String>,
-    pub proxy_domain: String,
-    pub backend_name: String,
+impl Synthetic {
+    pub fn validate_secret_key(secret_key: &str) -> Result<(), ValidationError> {
+        match secret_key {
+            "secret_key" => Err(ValidationError::new("Secret key is not valid")),
+            _ => Ok(()),
+        }
+    }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct Partners {
-    pub gam: Option<PartnerConfig>,
-    pub equativ: Option<PartnerConfig>,
-    pub prebid: Option<PartnerConfig>,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct Experimental {
-    pub enable_edge_pub: bool,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
-    pub ad_server: AdServer,
+    #[validate(nested)]
     pub publisher: Publisher,
+    #[validate(nested)]
     pub prebid: Prebid,
-    pub gam: Gam,
+    #[validate(nested)]
     pub synthetic: Synthetic,
-    pub partners: Option<Partners>,
-    pub experimental: Option<Experimental>,
 }
 
 #[allow(unused)]
@@ -278,9 +236,6 @@ mod tests {
         assert!(settings.is_ok(), "Settings should load from embedded TOML");
 
         let settings = settings.unwrap();
-        // Verify basic structure is loaded
-        assert!(!settings.ad_server.ad_partner_url.is_empty());
-        assert!(!settings.ad_server.sync_url.is_empty());
 
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
@@ -292,10 +247,6 @@ mod tests {
         assert!(!settings.synthetic.opid_store.is_empty());
         assert!(!settings.synthetic.secret_key.is_empty());
         assert!(!settings.synthetic.template.is_empty());
-
-        assert!(!settings.gam.publisher_id.is_empty());
-        assert!(!settings.gam.server_url.is_empty());
-        assert!(!settings.gam.ad_units.is_empty());
     }
 
     #[test]
@@ -306,14 +257,6 @@ mod tests {
         assert!(settings.is_ok());
 
         let settings = settings.expect("should parse valid TOML");
-        assert_eq!(
-            settings.ad_server.ad_partner_url,
-            "https://test-adpartner.com"
-        );
-        assert_eq!(
-            settings.ad_server.sync_url,
-            "https://test-adpartner.com/synthetic_id={{synthetic_id}}"
-        );
         assert_eq!(
             settings.prebid.server_url,
             "https://test-prebid.com/openrtb2/auction"
@@ -329,19 +272,12 @@ mod tests {
         assert_eq!(settings.synthetic.secret_key, "test-secret-key");
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
 
-        assert_eq!(settings.gam.publisher_id, "21796327522");
-        assert_eq!(
-            settings.gam.server_url,
-            "https://securepubads.g.doubleclick.net/gampad/ads"
-        );
-        assert_eq!(settings.gam.ad_units.len(), 2);
-        assert_eq!(settings.gam.ad_units[0].name, "test_unit_1");
-        assert_eq!(settings.gam.ad_units[0].size, "320x50");
+        settings.validate().expect("Failed to validate settings");
     }
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new(r"ad_partner_url = .*").unwrap();
+        let re = Regex::new(r"origin_url = .*").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -372,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_settings_partial_config() {
-        let re = Regex::new(r"\[ad_server\]").unwrap();
+        let re = Regex::new(r"\[publisher\]").unwrap();
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -480,19 +416,19 @@ mod tests {
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                "{}{}PUBLISHER{}ORIGIN_URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
             ),
-            Some("https://change-ad.com/serve"),
+            Some("https://change-publisher.com"),
             || {
                 let settings = Settings::from_toml(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_url,
-                    "https://change-ad.com/serve"
+                    settings.unwrap().publisher.origin_url,
+                    "https://change-publisher.com"
                 );
             },
         );
@@ -504,19 +440,19 @@ mod tests {
 
         temp_env::with_var(
             format!(
-                "{}{}AD_SERVER{}AD_PARTNER_URL",
+                "{}{}PUBLISHER{}ORIGIN_URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
             ),
-            Some("https://change-ad.com/serve"),
+            Some("https://change-publisher.com"),
             || {
                 let settings = Settings::from_toml(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().ad_server.ad_partner_url,
-                    "https://change-ad.com/serve"
+                    settings.unwrap().publisher.origin_url,
+                    "https://change-publisher.com"
                 );
             },
         );
