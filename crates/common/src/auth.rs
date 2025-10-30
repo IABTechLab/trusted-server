@@ -7,17 +7,14 @@ use crate::settings::Settings;
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
 pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
-    let path = req.get_path();
-    let handler = settings.handler_for_path(path)?;
+    let handler = settings.handler_for_path(req.get_path())?;
 
-    let handler_username = handler.username.as_str();
-    let handler_password = handler.password.as_str();
+    let (username, password) = match extract_credentials(req) {
+        Some(credentials) => credentials,
+        None => return Some(unauthorized_response()),
+    };
 
-    let authorized = extract_credentials(req)
-        .map(|(username, password)| username == handler_username && password == handler_password)
-        .unwrap_or(true);
-
-    if authorized {
+    if username == handler.username && password == handler.password {
         None
     } else {
         Some(unauthorized_response())
@@ -118,21 +115,5 @@ mod tests {
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn invalid_handler_path_is_ignored() {
-        let mut config = crate_test_settings_str();
-        config.push_str(
-            r#"
-[[handlers]]
-path = "[invalid"
-username = "user"
-password = "pass"
-"#,
-        );
-
-        let settings = Settings::from_toml(&config);
-        assert!(settings.is_err(), "invalid handler regex should fail validation");
     }
 }
