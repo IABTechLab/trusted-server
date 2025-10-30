@@ -5,6 +5,7 @@
 //!
 //! # Modules
 //!
+//! - [`auth`]: Basic authentication enforcement helpers
 //! - [`advertiser`]: Ad serving and advertiser integration functionality
 //! - [`constants`]: Application-wide constants and configuration values
 //! - [`cookies`]: Cookie parsing and generation utilities
@@ -23,6 +24,7 @@
 //! - [`why`]: Debugging and introspection utilities
 
 pub mod ad;
+pub mod auth;
 pub mod backend;
 pub mod constants;
 pub mod cookies;
