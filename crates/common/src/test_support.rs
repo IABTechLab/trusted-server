@@ -4,6 +4,11 @@ pub mod tests {
 
     pub fn crate_test_settings_str() -> String {
         r#"
+            [[handlers]]
+            path = "^/secure"
+            username = "user"
+            password = "pass"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"

@@ -29,6 +29,7 @@ log = { workspace = true }
 log-fastly = { workspace = true }
 lol_html = { workspace = true }
 pin-project-lite = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -44,6 +45,7 @@ config = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -54,6 +56,5 @@ validator = { workspace = true }
 default = []
 
 [dev-dependencies]
-regex = { workspace = true }
 temp-env = { workspace = true }
 tokio-test = { workspace = true }

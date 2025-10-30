@@ -3,6 +3,7 @@ use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
 use trusted_server_common::ad::{handle_server_ad, handle_server_ad_get};
+use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -35,6 +36,10 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         "FASTLY_SERVICE_VERSION: {}",
         ::std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
     );
+
+    if let Some(response) = enforce_basic_auth(&settings, &req) {
+        return Ok(response);
+    }
 
     // Get path and method for routing
     let path = req.get_path();

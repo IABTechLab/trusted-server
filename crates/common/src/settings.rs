@@ -2,8 +2,10 @@ use core::str;
 
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
+use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
 
@@ -97,6 +99,31 @@ impl Synthetic {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct Handler {
+    #[validate(length(min = 1), custom(function = validate_path))]
+    pub path: String,
+    #[validate(length(min = 1))]
+    pub username: String,
+    #[validate(length(min = 1))]
+    pub password: String,
+    #[serde(skip, default)]
+    #[validate(skip)]
+    regex: OnceLock<Regex>,
+}
+
+impl Handler {
+    fn compiled_regex(&self) -> &Regex {
+        self.regex.get_or_init(|| {
+            Regex::new(&self.path).expect("configuration validation should ensure regex compiles")
+        })
+    }
+
+    pub fn matches_path(&self, path: &str) -> bool {
+        self.compiled_regex().is_match(path)
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -104,6 +131,9 @@ pub struct Settings {
     pub prebid: Prebid,
     #[validate(nested)]
     pub synthetic: Synthetic,
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    #[validate(nested)]
+    pub handlers: Vec<Handler>,
 }
 
 #[allow(unused)]
@@ -163,6 +193,22 @@ impl Settings {
                 message: "Failed to deserialize configuration".to_string(),
             })
     }
+
+    #[must_use]
+    pub fn handler_for_path(&self, path: &str) -> Option<&Handler> {
+        self.handlers
+            .iter()
+            .find(|handler| handler.matches_path(path))
+    }
+}
+
+fn validate_path(value: &str) -> Result<(), ValidationError> {
+    Regex::new(value).map(|_| ()).map_err(|err| {
+        let mut validation_error = ValidationError::new("invalid_regex");
+        validation_error.add_param("value".into(), &value);
+        validation_error.add_param("message".into(), &err.to_string());
+        validation_error
+    })
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
@@ -394,6 +440,59 @@ mod tests {
                             settings.prebid.bidders,
                             vec!["smartadserver".to_string(), "openx".to_string()]
                         );
+                    });
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn test_handlers_override_with_env() {
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let path_key = format!(
+            "{}{}HANDLERS{}0{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let username_key = format!(
+            "{}{}HANDLERS{}0{}USERNAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let password_key = format!(
+            "{}{}HANDLERS{}0{}PASSWORD",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(path_key, Some("^/env-handler"), || {
+                    temp_env::with_var(username_key, Some("env-user"), || {
+                        temp_env::with_var(password_key, Some("env-pass"), || {
+                            let settings = Settings::from_toml(&toml_str)
+                                .expect("Settings should load from env");
+                            assert_eq!(settings.handlers.len(), 1);
+                            let handler = &settings.handlers[0];
+                            assert_eq!(handler.path, "^/env-handler");
+                            assert_eq!(handler.username, "env-user");
+                            assert_eq!(handler.password, "env-pass");
+                        });
                     });
                 });
             },
