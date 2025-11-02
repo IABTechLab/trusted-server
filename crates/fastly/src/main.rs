@@ -79,8 +79,12 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(to_error_response);
 
-    // Add X-Robots-Tag header to prevent crawlers and indexers
-    response.set_header("X-Robots-Tag", "noindex, nofollow");
+    // Add X-Robots-Tag header to all responses if configured
+    if let Some(robots_tag) = &settings.publisher.robots_tag {
+        if !robots_tag.is_empty() {
+            response.set_header("X-Robots-Tag", robots_tag);
+        }
+    }
 
     Ok(response)
 }

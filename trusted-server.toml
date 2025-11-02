@@ -3,6 +3,14 @@ domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
+# X-Robots-Tag header value to add to publisher content responses.
+# Common values:
+#   - "noindex, nofollow" (default) - blocks indexing and following links
+#   - "noindex" - blocks indexing but allows following links  
+#   - "nofollow" - allows indexing but blocks following links
+#   - "" (empty string) or omit - no header, allows full indexing (for production)
+# Set to empty string "" to allow search engines and crawlers to index the site.
+robots_tag = "noindex, nofollow"
 
 [prebid]
 server_url = "http://68.183.113.79:8000"

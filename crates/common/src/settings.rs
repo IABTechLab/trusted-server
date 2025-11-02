@@ -20,6 +20,18 @@ pub struct Publisher {
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     pub proxy_secret: String,
+    /// X-Robots-Tag header value to add to publisher content responses.
+    /// Common values:
+    ///   - "noindex, nofollow" (default) - blocks indexing and following links
+    ///   - "noindex" - blocks indexing but allows following links
+    ///   - "nofollow" - allows indexing but blocks following links
+    ///   - "" or omit - no header, allows full indexing (for production)
+    #[serde(default = "default_robots_tag")]
+    pub robots_tag: Option<String>,
+}
+
+fn default_robots_tag() -> Option<String> {
+    Some("noindex, nofollow".to_string())
 }
 
 impl Publisher {
