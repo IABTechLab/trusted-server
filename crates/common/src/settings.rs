@@ -124,6 +124,12 @@ impl Handler {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RequestSigning {
+    pub config_store_id: String,
+    pub secret_store_id: String,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -137,6 +143,7 @@ pub struct Settings {
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    pub request_signing: Option<RequestSigning>,
 }
 
 #[allow(unused)]
