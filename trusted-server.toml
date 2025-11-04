@@ -1,3 +1,8 @@
+[[handlers]]
+path = "^/secure"
+username = "user"
+password = "pass"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
