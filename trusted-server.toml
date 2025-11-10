@@ -28,3 +28,7 @@ secret_key = "trusted-server"
 #   - "publisher_domain"
 #   - "accept_language"
 template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_id }}:{{ publisher_domain }}:{{ accept_language }}"
+
+# Custom headers to be included in every response
+[response_headers]
+X-Custom-Header = "custom header value"

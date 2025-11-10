@@ -5,6 +5,7 @@ use error_stack::{Report, ResultExt};
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
@@ -134,6 +135,8 @@ pub struct Settings {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
+    #[serde(default)]
+    pub response_headers: HashMap<String, String>,
 }
 
 #[allow(unused)]
