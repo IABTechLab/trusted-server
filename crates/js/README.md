@@ -111,7 +111,7 @@ The Rust services (`trusted-server-common`) expose several proxy entry points th
 
 - Endpoint: `handle_publisher_request` (`crates/common/src/publisher.rs`).
 - Retrieves or generates the trusted synthetic identifier before Fastly consumes the request body.
-- Always stamps the proxied response with `X-Synthetic-Fresh` and `X-Synthetic-Trusted-Server` headers and, when the browser does not already present one, sets the `synthetic_id=<value>` cookie (Secure + SameSite=Lax) bound to the configured publisher domain.
+- Always stamps the proxied response with `X-Synthetic-Fresh` and `x-psid-ts` headers and, when the browser does not already present one, sets the `synthetic_id=<value>` cookie (Secure + SameSite=Lax) bound to the configured publisher domain.
 - Result: downstream assets fetched through the same first-party origin automatically include the synthetic ID header/cookie so subsequent proxy layers can read it.
 
 ### Creative Asset Proxy
