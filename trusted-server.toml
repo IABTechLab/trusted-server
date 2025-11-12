@@ -16,6 +16,13 @@ bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
 
+[permutive]
+project_id = ""
+workspace_id = ""
+auto_configure = true
+proxy_events = true
+proxy_sync = true
+
 [synthetic]
 counter_store = "counter_store"
 opid_store = "opid_store"

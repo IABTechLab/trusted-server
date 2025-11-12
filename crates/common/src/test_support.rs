@@ -19,6 +19,13 @@ pub mod tests {
             [prebid]
             server_url = "https://test-prebid.com/openrtb2/auction"  
 
+            [permutive]
+            project_id = "test-project-123"
+            workspace_id = "test-workspace"
+            auto_configure = true
+            proxy_events = true
+            proxy_sync = true
+
             [synthetic] 
             counter_store = "test-counter-store"
             opid_store = "test-opid-store"

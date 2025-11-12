@@ -79,6 +79,24 @@ fn default_auto_configure() -> bool {
     true
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct Permutive {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default = "default_permutive_auto_configure")]
+    pub auto_configure: bool,
+    #[serde(default)]
+    pub proxy_events: bool,
+    #[serde(default)]
+    pub proxy_sync: bool,
+}
+
+fn default_permutive_auto_configure() -> bool {
+    true
+}
+
 #[allow(unused)]
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
@@ -130,6 +148,8 @@ pub struct Settings {
     pub publisher: Publisher,
     #[validate(nested)]
     pub prebid: Prebid,
+    #[validate(nested)]
+    pub permutive: Permutive,
     #[validate(nested)]
     pub synthetic: Synthetic,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
