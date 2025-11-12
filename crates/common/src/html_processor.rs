@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use lol_html::{element, html_content::ContentType, Settings as RewriterSettings};
+use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -194,6 +194,35 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             el.set_attribute("imagesrcset", &new_imagesrcset)?;
                         }
                     }
+                    Ok(())
+                }
+            }),
+            // Replace URLs in script text content (for Next.js and other JS with hardcoded URLs)
+            // This is a hotfix for Next.js links stored in __next_s.push() and __next_f.push() calls
+            text!("script", {
+                let patterns = patterns.clone();
+                move |text| {
+                    let content = text.as_str();
+
+                    // Apply URL replacements to script content
+                    let mut new_content = content.to_string();
+
+                    // Replace all URL patterns
+                    new_content = new_content
+                        .replace(&patterns.https_origin(), &patterns.replacement_url())
+                        .replace(&patterns.http_origin(), &patterns.replacement_url())
+                        .replace(
+                            &patterns.protocol_relative_origin(),
+                            &patterns.protocol_relative_replacement(),
+                        )
+                        // Also replace bare hostname (without protocol) for cases like:
+                        // "domain.com" in JSON or strings
+                        .replace(&patterns.origin_host, &patterns.request_host);
+
+                    if new_content != content {
+                        text.replace(&new_content, ContentType::Text);
+                    }
+
                     Ok(())
                 }
             }),
@@ -631,5 +660,298 @@ mod tests {
                 .rev()
                 .collect::<String>()
         );
+    }
+
+    #[test]
+    fn test_nextjs_script_url_replacement() {
+        // Test Next.js __next_s.push() and __next_f.push() URL rewriting
+        let html = r#"<html><head>
+            <script>(self.__next_s=self.__next_s||[]).push(["https://www.test-publisher.com/news/article",{}])</script>
+            <script>self.__next_f.push([1,"url\":\"https://www.test-publisher.com/page\""])</script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify URLs in script tags were replaced
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/news/article"));
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/page"));
+        assert!(!result.contains("www.test-publisher.com"));
+    }
+
+    #[test]
+    fn test_script_json_ld_url_replacement() {
+        // Test JSON-LD schema URLs in script tags
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "url": "https://www.test-publisher.com/article",
+                "publisher": {
+                    "url": "https://www.test-publisher.com"
+                },
+                "image": "https://www.test-publisher.com/image.jpg"
+            }
+            </script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify URLs in JSON-LD were replaced
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/article"));
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/image.jpg"));
+        assert_eq!(
+            result.matches("test-publisher-ts.edgecompute.app").count(),
+            3
+        );
+        assert!(!result.contains("www.test-publisher.com"));
+    }
+
+    #[test]
+    fn test_script_protocol_relative_url_replacement() {
+        // Test protocol-relative URLs in scripts
+        let html = r#"<html><head>
+            <script>
+            var config = {
+                baseUrl: "//www.test-publisher.com",
+                apiUrl: "//www.test-publisher.com/api"
+            };
+            </script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify protocol-relative URLs were replaced
+        assert!(result.contains("//test-publisher-ts.edgecompute.app"));
+        assert!(result.contains("//test-publisher-ts.edgecompute.app/api"));
+        assert!(!result.contains("//www.test-publisher.com"));
+    }
+
+    #[test]
+    fn test_script_bare_hostname_replacement() {
+        // Test bare hostname (without protocol) in scripts
+        let html = r#"<html><head>
+            <script>
+            var hostname = "www.test-publisher.com";
+            var url = "www.test-publisher.com/path";
+            </script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify bare hostnames were replaced
+        assert!(result.contains("test-publisher-ts.edgecompute.app"));
+        assert!(!result.contains("www.test-publisher.com"));
+    }
+
+    #[test]
+    fn test_script_mixed_urls_replacement() {
+        // Test multiple URL patterns in same script
+        let html = r#"<html><head>
+            <script>
+            (function() {
+                var urls = [
+                    "https://www.test-publisher.com/page1",
+                    "http://www.test-publisher.com/page2",
+                    "//www.test-publisher.com/page3",
+                    "www.test-publisher.com/page4"
+                ];
+            })();
+            </script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify all URL patterns were replaced
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/page1"));
+        assert!(result.contains("https://test-publisher-ts.edgecompute.app/page2")); // http upgraded to https
+        assert!(result.contains("//test-publisher-ts.edgecompute.app/page3"));
+        assert!(result.contains("test-publisher-ts.edgecompute.app/page4"));
+        assert!(!result.contains("www.test-publisher.com"));
+    }
+
+    #[test]
+    fn test_script_preserves_non_url_content() {
+        // Ensure we don't break JavaScript that's not URLs
+        let html = r#"<html><head>
+            <script>
+            function test() {
+                console.log("Hello World");
+                return 42;
+            }
+            var obj = { key: "value", nested: { deep: true } };
+            </script>
+        </head><body></body></html>"#;
+
+        let config = create_test_config();
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify non-URL content is preserved
+        assert!(result.contains("console.log(\"Hello World\")"));
+        assert!(result.contains("return 42"));
+        assert!(result.contains("var obj = { key: \"value\", nested: { deep: true } }"));
+    }
+
+    #[test]
+    fn test_real_nextjs_data_from_test_html() {
+        // Test with actual Next.js patterns from the test HTML file
+        let html = r#"<html><head>
+            <script>(self.__next_s=self.__next_s||[]).push(["https://www.test-publisher.com/news/article",{"id":"test"}])</script>
+            <script id="seo-schema" type="application/ld+json">
+            {
+                "@context":"https://schema.org",
+                "@id":"https://www.test-publisher.com/news/article#article",
+                "url":"https://www.test-publisher.com/news/article",
+                "image":["https://www.test-publisher.com/.image/test.jpg"]
+            }
+            </script>
+            <script>
+            var config = {
+                site: {
+                    page: "https://www.test-publisher.com/news/article",
+                    publisher: { id: "test" }
+                }
+            };
+            </script>
+        </head><body>
+            <a href="https://www.test-publisher.com/news/article">Link</a>
+        </body></html>"#;
+
+        let mut config = create_test_config();
+        config.origin_host = "www.test-publisher.com".to_string();
+        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+
+        // Verify comprehensive URL replacement
+        // Should have replaced all 6 instances of the origin URL
+        assert_eq!(result.matches("www.test-publisher.com").count(), 0);
+        assert_eq!(
+            result.matches("test-publisher-ts.edgecompute.app").count(),
+            6
+        );
+
+        // Specifically check each context
+        assert!(result.contains("self.__next_s=self.__next_s||[]).push([\"https://test-publisher-ts.edgecompute.app/news/article\""));
+        assert!(result.contains(
+            "\"@id\":\"https://test-publisher-ts.edgecompute.app/news/article#article\""
+        ));
+        assert!(
+            result.contains("\"url\":\"https://test-publisher-ts.edgecompute.app/news/article\"")
+        );
+        assert!(result
+            .contains("\"image\":[\"https://test-publisher-ts.edgecompute.app/.image/test.jpg\"]"));
+        assert!(result.contains("page: \"https://test-publisher-ts.edgecompute.app/news/article\""));
+        assert!(result.contains("href=\"https://test-publisher-ts.edgecompute.app/news/article\""));
     }
 }
