@@ -235,9 +235,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let patterns = patterns.clone();
             move |text| {
                 let content = text.as_str();
-                if !content.contains(&patterns.origin_host) {
-                    return Ok(());
-                }
                 if let Some(rewritten) = patterns.rewrite_nextjs_hrefs(content) {
                     text.replace(&rewritten, ContentType::Text);
                 }
@@ -249,7 +246,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let patterns = patterns.clone();
             move |text| {
                 let content = text.as_str();
-                if !content.contains("self.__next_f") || !content.contains(&patterns.origin_host) {
+                if !content.contains("self.__next_f") {
                     return Ok(());
                 }
                 if let Some(rewritten) = patterns.rewrite_nextjs_hrefs(content) {
