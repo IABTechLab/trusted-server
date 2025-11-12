@@ -3,7 +3,10 @@ use core::str;
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{
+    de::{DeserializeOwned, IntoDeserializer},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -83,10 +86,40 @@ fn default_auto_configure() -> bool {
     true
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 pub struct NextJs {
     #[serde(default)]
-    pub rewrite_urls: bool,
+    pub enabled: bool,
+    #[serde(
+        default = "default_nextjs_attributes",
+        deserialize_with = "deserialize_nextjs_attributes"
+    )]
+    pub rewrite_attributes: Vec<String>,
+}
+
+fn default_nextjs_attributes() -> Vec<String> {
+    vec!["href".to_string(), "link".to_string(), "url".to_string()]
+}
+
+impl Default for NextJs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rewrite_attributes: default_nextjs_attributes(),
+        }
+    }
+}
+
+fn deserialize_nextjs_attributes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<JsonValue>::deserialize(deserializer)?;
+    match value {
+        Some(json) => vec_from_seq_or_map(json.into_deserializer())
+            .map_err(<D::Error as serde::de::Error>::custom),
+        None => Ok(default_nextjs_attributes()),
+    }
 }
 
 #[allow(unused)]
@@ -303,8 +336,13 @@ mod tests {
 
         assert!(!settings.prebid.server_url.is_empty());
         assert!(
-            !settings.publisher.nextjs.rewrite_urls,
+            !settings.publisher.nextjs.enabled,
             "Next.js URL rewriting should default to disabled"
+        );
+        assert_eq!(
+            settings.publisher.nextjs.rewrite_attributes,
+            vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            "Next.js rewrite attributes should default to href/link/url"
         );
 
         assert!(!settings.synthetic.counter_store.is_empty());
@@ -326,8 +364,13 @@ mod tests {
             "https://test-prebid.com/openrtb2/auction"
         );
         assert!(
-            !settings.publisher.nextjs.rewrite_urls,
+            !settings.publisher.nextjs.enabled,
             "Next.js URL rewriting should default to disabled"
+        );
+        assert_eq!(
+            settings.publisher.nextjs.rewrite_attributes,
+            vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            "Next.js rewrite attributes should default to href/link/url"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");

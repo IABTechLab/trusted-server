@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
+use regex::Regex;
 
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -17,7 +18,8 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub enable_prebid: bool,
-    pub nextjs_rewrite_urls: bool,
+    pub nextjs_enabled: bool,
+    pub nextjs_attributes: Vec<String>,
 }
 
 impl HtmlProcessorConfig {
@@ -33,7 +35,8 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             enable_prebid: settings.prebid.auto_configure,
-            nextjs_rewrite_urls: settings.publisher.nextjs.rewrite_urls,
+            nextjs_enabled: settings.publisher.nextjs.enabled,
+            nextjs_attributes: settings.publisher.nextjs.rewrite_attributes.clone(),
         }
     }
 }
@@ -68,29 +71,32 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             format!("//{}", self.request_host)
         }
 
-        fn rewrite_nextjs_hrefs(&self, content: &str) -> Option<String> {
+        fn rewrite_nextjs_values(&self, content: &str, attributes: &[String]) -> Option<String> {
             let mut rewritten = content.to_string();
             let mut changed = false;
-            for prefix in ["\"href\":\"", "\\\"href\\\":\\\""] {
-                let https_pattern = format!("{}https://{}", prefix, self.origin_host);
-                let http_pattern = format!("{}http://{}", prefix, self.origin_host);
-                let proto_pattern = format!("{}//{}", prefix, self.origin_host);
-
-                let href_replacement =
-                    format!("{}{}://{}", prefix, self.request_scheme, self.request_host);
-                let proto_replacement = format!("{}//{}", prefix, self.request_host);
-
-                let new_rewritten = rewritten
-                    .replace(&https_pattern, &href_replacement)
-                    .replace(&http_pattern, &href_replacement)
-                    .replace(&proto_pattern, &proto_replacement);
-
-                if new_rewritten != rewritten {
+            let escaped_origin = regex::escape(&self.origin_host);
+            for attribute in attributes {
+                let escaped_attr = regex::escape(attribute);
+                let pattern = format!(
+                    r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}"#,
+                    attr = escaped_attr,
+                    origin = escaped_origin
+                );
+                let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
+                let new_value = regex.replace_all(&rewritten, |caps: &regex::Captures| {
+                    let scheme = &caps["scheme"];
+                    let replacement = if scheme == "//" {
+                        format!("//{}", self.request_host)
+                    } else {
+                        self.replacement_url()
+                    };
+                    format!("{}{}", &caps["prefix"], replacement)
+                });
+                if new_value != rewritten {
                     changed = true;
-                    rewritten = new_rewritten;
+                    rewritten = new_value.into_owned();
                 }
             }
-
             if changed {
                 Some(rewritten)
             } else {
@@ -104,6 +110,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_host: config.request_host.clone(),
         request_scheme: config.request_scheme.clone(),
     });
+
+    let nextjs_attributes = Rc::new(config.nextjs_attributes.clone());
 
     let injected_tsjs = Rc::new(Cell::new(false));
 
@@ -230,12 +238,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
-    if config.nextjs_rewrite_urls {
+    if config.nextjs_enabled && !nextjs_attributes.is_empty() {
         element_content_handlers.push(text!("script#__NEXT_DATA__", {
             let patterns = patterns.clone();
+            let attributes = nextjs_attributes.clone();
             move |text| {
                 let content = text.as_str();
-                if let Some(rewritten) = patterns.rewrite_nextjs_hrefs(content) {
+                if let Some(rewritten) = patterns.rewrite_nextjs_values(content, &attributes) {
                     text.replace(&rewritten, ContentType::Text);
                 }
                 Ok(())
@@ -244,12 +253,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
         element_content_handlers.push(text!("script", {
             let patterns = patterns.clone();
+            let attributes = nextjs_attributes.clone();
             move |text| {
                 let content = text.as_str();
                 if !content.contains("self.__next_f") {
                     return Ok(());
                 }
-                if let Some(rewritten) = patterns.rewrite_nextjs_hrefs(content) {
+                if let Some(rewritten) = patterns.rewrite_nextjs_values(content, &attributes) {
                     text.replace(&rewritten, ContentType::Text);
                 }
                 Ok(())
@@ -299,7 +309,8 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             enable_prebid: false,
-            nextjs_rewrite_urls: false,
+            nextjs_enabled: false,
+            nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
         }
     }
 
@@ -389,7 +400,8 @@ mod tests {
         </body></html>"#;
 
         let mut config = create_test_config();
-        config.nextjs_rewrite_urls = true;
+        config.nextjs_enabled = true;
+        config.nextjs_attributes = vec!["href".to_string(), "link".to_string(), "url".to_string()];
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -403,6 +415,8 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .unwrap();
         let processed = String::from_utf8_lossy(&output);
+        println!("processed={processed}");
+        println!("processed stream payload: {}", processed);
         println!("processed stream payload: {}", processed);
 
         assert!(
@@ -435,12 +449,13 @@ mod tests {
     fn test_rewrites_nextjs_stream_payload() {
         let html = r#"<html><body>
             <script>
-                self.__next_f.push([1,"chunk", "prefix {\"inner\":\"value\"} \"href\":\"http://origin.example.com/dashboard\", \"href\":\"https://origin.example.com/api-test\" suffix", {"dataHost":"https://origin.example.com/api"}]);
+                self.__next_f.push([1,"chunk", "prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix", {"href":"http://origin.example.com/secondary","dataHost":"https://origin.example.com/api"}]);
             </script>
         </body></html>"#;
 
         let mut config = create_test_config();
-        config.nextjs_rewrite_urls = true;
+        config.nextjs_enabled = true;
+        config.nextjs_attributes = vec!["href".to_string(), "link".to_string(), "url".to_string()];
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -454,18 +469,19 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .unwrap();
         let processed = String::from_utf8_lossy(&output);
+        let normalized = processed.replace('\\', "");
         assert!(
-            processed.contains("https://test.example.com/dashboard"),
-            "Should rewrite URLs inside streamed Next.js payloads"
+            normalized.contains("\"href\":\"https://test.example.com/dashboard\""),
+            "Should rewrite escaped href sequences inside streamed payloads. Content: {}",
+            normalized
         );
         assert!(
-            processed.contains("\\\"href\\\":\\\"https://test.example.com/api-test\\\"")
-                || processed.contains("\"href\":\"https://test.example.com/api-test\""),
-            "Should rewrite escaped href sequences inside streamed payloads"
+            normalized.contains("\"href\":\"https://test.example.com/secondary\""),
+            "Should rewrite plain href attributes inside streamed payloads"
         );
         assert!(
-            !processed.contains("\"href\":\"http://origin.example.com/dashboard\""),
-            "Should remove origin host references from href fields"
+            normalized.contains("\"link\":\"https://test.example.com/api-test\""),
+            "Should rewrite additional configured attributes like link"
         );
         assert!(
             processed.contains("\"dataHost\":\"https://origin.example.com/api\""),
@@ -554,8 +570,13 @@ mod tests {
         assert_eq!(config.request_scheme, "https");
         assert!(config.enable_prebid); // Uses default true
         assert!(
-            !config.nextjs_rewrite_urls,
+            !config.nextjs_enabled,
             "Next.js rewrites should default to disabled"
+        );
+        assert_eq!(
+            config.nextjs_attributes,
+            vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            "Should default to rewriting href/link/url attributes"
         );
     }
 

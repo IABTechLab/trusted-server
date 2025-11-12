@@ -10,8 +10,8 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
 [publisher.nextjs]
-# When true, rewrite Next.js JSON payload URLs to the request host
-rewrite_urls = false
+enabled = false
+rewrite_attributes = ["href", "link", "url"]
 
 [prebid]
 server_url = "http://68.183.113.79:8000"
