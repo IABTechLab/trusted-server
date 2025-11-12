@@ -23,6 +23,9 @@ pub struct Publisher {
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     pub proxy_secret: String,
+    #[serde(default)]
+    #[validate(nested)]
+    pub nextjs: NextJs,
 }
 
 impl Publisher {
@@ -37,6 +40,7 @@ impl Publisher {
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     proxy_secret: "proxy-secret".to_string(),
+    ///     nextjs: Default::default(),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -77,6 +81,12 @@ fn default_bidders() -> Vec<String> {
 
 fn default_auto_configure() -> bool {
     true
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct NextJs {
+    #[serde(default)]
+    pub rewrite_urls: bool,
 }
 
 #[allow(unused)]
@@ -130,6 +140,7 @@ pub struct Settings {
     pub publisher: Publisher,
     #[validate(nested)]
     pub prebid: Prebid,
+    #[serde(default)]
     #[validate(nested)]
     pub synthetic: Synthetic,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -291,6 +302,10 @@ mod tests {
         assert!(!settings.publisher.origin_url.is_empty());
 
         assert!(!settings.prebid.server_url.is_empty());
+        assert!(
+            !settings.publisher.nextjs.rewrite_urls,
+            "Next.js URL rewriting should default to disabled"
+        );
 
         assert!(!settings.synthetic.counter_store.is_empty());
         assert!(!settings.synthetic.opid_store.is_empty());
@@ -309,6 +324,10 @@ mod tests {
         assert_eq!(
             settings.prebid.server_url,
             "https://test-prebid.com/openrtb2/auction"
+        );
+        assert!(
+            !settings.publisher.nextjs.rewrite_urls,
+            "Next.js URL rewriting should default to disabled"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -568,6 +587,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -577,6 +597,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -586,6 +607,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -595,6 +617,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -604,6 +627,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -613,6 +637,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
+            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
