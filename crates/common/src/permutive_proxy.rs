@@ -12,6 +12,7 @@ use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 const PERMUTIVE_API_BASE: &str = "https://api.permutive.com";
+const PERMUTIVE_SECURE_SIGNALS_BASE: &str = "https://secure-signals.permutive.app";
 
 /// Handles transparent proxying of Permutive API requests.
 ///
@@ -93,6 +94,86 @@ pub async fn handle_permutive_api_proxy(
     Ok(permutive_response)
 }
 
+/// Handles transparent proxying of Permutive Secure Signals requests.
+///
+/// This function:
+/// 1. Extracts the path after `/permutive/secure-signal/`
+/// 2. Preserves query parameters
+/// 3. Copies request headers and body
+/// 4. Forwards to `secure-signals.permutive.app`
+/// 5. Returns response transparently
+///
+/// # Example Request Flow
+///
+/// ```text
+/// Browser: GET /permutive/secure-signal/data/v1/cohorts
+///     ↓
+/// Trusted Server processes and forwards:
+///     ↓
+/// Permutive: GET https://secure-signals.permutive.app/data/v1/cohorts
+/// ```
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if:
+/// - Path extraction fails
+/// - Backend communication fails
+/// - Request forwarding fails
+pub async fn handle_permutive_secure_signals_proxy(
+    _settings: &Settings,
+    mut req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let original_path = req.get_path();
+    let method = req.get_method();
+
+    log::info!(
+        "Proxying Permutive Secure Signals request: {} {}",
+        method,
+        original_path
+    );
+
+    // Extract the path after /permutive/secure-signal
+    let signals_path = original_path
+        .strip_prefix("/permutive/secure-signal")
+        .ok_or_else(|| TrustedServerError::PermutiveApi {
+            message: format!("Invalid Permutive Secure Signals path: {}", original_path),
+        })?;
+
+    // Build the full Permutive Secure Signals URL with query parameters
+    let permutive_url = build_secure_signals_url(signals_path, &req)?;
+
+    log::info!("Forwarding to Permutive Secure Signals: {}", permutive_url);
+
+    // Create new request to Permutive
+    let mut permutive_req = Request::new(method.clone(), &permutive_url);
+
+    // Copy relevant headers
+    copy_request_headers(&req, &mut permutive_req);
+
+    // Copy body for POST requests
+    if has_body(method) {
+        let body = req.take_body();
+        permutive_req.set_body(body);
+    }
+
+    // Get backend and forward request
+    let backend_name = ensure_backend_from_url(PERMUTIVE_SECURE_SIGNALS_BASE)?;
+
+    let permutive_response = permutive_req
+        .send(backend_name)
+        .change_context(TrustedServerError::PermutiveApi {
+            message: format!("Failed to forward request to {}", permutive_url),
+        })?;
+
+    log::info!(
+        "Permutive Secure Signals responded with status: {}",
+        permutive_response.get_status()
+    );
+
+    // Return response transparently
+    Ok(permutive_response)
+}
+
 /// Builds the full Permutive API URL including query parameters.
 fn build_permutive_url(
     api_path: &str,
@@ -107,6 +188,24 @@ fn build_permutive_url(
 
     // Build full URL
     let url = format!("{}{}{}", PERMUTIVE_API_BASE, api_path, query);
+
+    Ok(url)
+}
+
+/// Builds the full Permutive Secure Signals URL including query parameters.
+fn build_secure_signals_url(
+    signals_path: &str,
+    req: &Request,
+) -> Result<String, Report<TrustedServerError>> {
+    // Get query string if present
+    let query = req
+        .get_url()
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+
+    // Build full URL
+    let url = format!("{}{}{}", PERMUTIVE_SECURE_SIGNALS_BASE, signals_path, query);
 
     Ok(url)
 }
@@ -192,5 +291,39 @@ mod tests {
         assert!(!has_body(&Method::DELETE));
         assert!(!has_body(&Method::HEAD));
         assert!(!has_body(&Method::OPTIONS));
+    }
+
+    #[test]
+    fn test_secure_signals_path_extraction() {
+        let test_cases = vec![
+            ("/permutive/secure-signal/data/v1/cohorts", "/data/v1/cohorts"),
+            ("/permutive/secure-signal/v1/track", "/v1/track"),
+            ("/permutive/secure-signal/", "/"),
+            ("/permutive/secure-signal", ""),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = input.strip_prefix("/permutive/secure-signal").unwrap_or("");
+            assert_eq!(result, expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_secure_signals_url_building() {
+        let signals_path = "/data/v1/cohorts";
+        let expected = "https://secure-signals.permutive.app/data/v1/cohorts";
+
+        let url = format!("{}{}", PERMUTIVE_SECURE_SIGNALS_BASE, signals_path);
+        assert_eq!(url, expected);
+    }
+
+    #[test]
+    fn test_secure_signals_url_building_with_query() {
+        let signals_path = "/data/v1/cohorts";
+        let query = "?key=123";
+        let expected = "https://secure-signals.permutive.app/data/v1/cohorts?key=123";
+
+        let url = format!("{}{}{}", PERMUTIVE_SECURE_SIGNALS_BASE, signals_path, query);
+        assert_eq!(url, expected);
     }
 }
