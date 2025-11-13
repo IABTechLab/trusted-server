@@ -85,16 +85,41 @@ pub struct Permutive {
     pub project_id: String,
     #[serde(default)]
     pub workspace_id: String,
+    /// Organization ID for Permutive edge CDN (e.g., "myorg" from myorg.edge.permutive.app)
+    #[serde(default)]
+    pub organization_id: String,
     #[serde(default = "default_permutive_auto_configure")]
     pub auto_configure: bool,
     #[serde(default)]
     pub proxy_events: bool,
     #[serde(default)]
     pub proxy_sync: bool,
+    /// Cache TTL for Permutive SDK in seconds (default 1 hour)
+    #[serde(default = "default_permutive_cache_ttl")]
+    pub cache_ttl_seconds: u32,
+}
+
+impl Permutive {
+    /// Build the Permutive SDK URL from configuration
+    /// Returns URL like: https://myorg.edge.permutive.app/workspace-12345-web.js
+    #[allow(dead_code)]
+    pub fn sdk_url(&self) -> Option<String> {
+        if self.organization_id.is_empty() || self.workspace_id.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "https://{}.edge.permutive.app/{}-web.js",
+            self.organization_id, self.workspace_id
+        ))
+    }
 }
 
 fn default_permutive_auto_configure() -> bool {
     true
+}
+
+fn default_permutive_cache_ttl() -> u32 {
+    3600 // 1 hour
 }
 
 #[allow(unused)]

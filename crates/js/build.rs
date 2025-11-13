@@ -21,6 +21,10 @@ const BUNDLES: &[BundleSpec] = &[
         filename: "tsjs-creative.js",
         required: false,
     },
+    BundleSpec {
+        filename: "tsjs-permutive.js",
+        required: false,
+    },
 ];
 
 fn main() {

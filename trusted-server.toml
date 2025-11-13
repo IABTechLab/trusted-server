@@ -6,7 +6,7 @@ password = "pass"
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
+origin_url = "http://tauritutorials.com"
 proxy_secret = "change-me-proxy-secret"
 
 [prebid]
@@ -18,10 +18,12 @@ debug = false
 
 [permutive]
 project_id = ""
-workspace_id = ""
+workspace_id = "a530f86f-f672-43fc-a11e-64681a09407d"
+organization_id = "a9695278-4085-40b3-9f02-8d4c38a6ff01"
 auto_configure = true
 proxy_events = true
 proxy_sync = true
+cache_ttl_seconds = 3600
 
 [synthetic]
 counter_store = "counter_store"

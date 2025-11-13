@@ -45,3 +45,13 @@ pub fn ext_script_src() -> String {
 pub fn creative_script_src() -> String {
     script_src_for(TsjsBundle::Creative)
 }
+
+/// `/static` URL for the permutive bundle with cache-busting hash.
+pub fn permutive_script_src() -> String {
+    script_src_for(TsjsBundle::Permutive)
+}
+
+/// `<script>` tag for injecting the permutive runtime.
+pub fn permutive_script_tag() -> String {
+    script_tag_for(TsjsBundle::Permutive, "async")
+}

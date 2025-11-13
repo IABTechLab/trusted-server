@@ -35,6 +35,8 @@ pub mod html_processor;
 pub mod http_util;
 pub mod models;
 pub mod openrtb;
+pub mod permutive_proxy;
+pub mod permutive_sdk;
 pub mod prebid_proxy;
 pub mod proxy;
 pub mod publisher;

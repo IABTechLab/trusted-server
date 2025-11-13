@@ -4,6 +4,8 @@ use log_fastly::Logger;
 
 use trusted_server_common::ad::{handle_server_ad, handle_server_ad_get};
 use trusted_server_common::auth::enforce_basic_auth;
+use trusted_server_common::permutive_proxy::handle_permutive_api_proxy;
+use trusted_server_common::permutive_sdk::handle_permutive_sdk;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -47,6 +49,16 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
 
     // Match known routes and handle them
     let result = match (method, path) {
+        // Permutive API proxy - /permutive/api/* → api.permutive.com/*
+        (&Method::GET | &Method::POST, path) if path.starts_with("/permutive/api/") => {
+            handle_permutive_api_proxy(&settings, req).await
+        }
+
+        // Serve the Permutive SDK (proxied from Permutive CDN)
+        (&Method::GET, path) if path.starts_with("/static/tsjs=tsjs-permutive") => {
+            handle_permutive_sdk(&settings, req).await
+        }
+        
         // Serve the tsjs library
         (&Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)

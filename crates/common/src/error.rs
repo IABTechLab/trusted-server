@@ -50,6 +50,14 @@ pub enum TrustedServerError {
     #[display("Prebid error: {message}")]
     Prebid { message: String },
 
+    /// Permutive SDK proxy error.
+    #[display("Permutive SDK error: {message}")]
+    PermutiveSdk { message: String },
+
+    /// Permutive API proxy error.
+    #[display("Permutive API error: {message}")]
+    PermutiveApi { message: String },
+
     /// Proxy error.
     #[display("Proxy error: {message}")]
     Proxy { message: String },
@@ -91,6 +99,8 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::PermutiveSdk { .. } => StatusCode::BAD_GATEWAY,
+            Self::PermutiveApi { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,

@@ -22,9 +22,11 @@ pub mod tests {
             [permutive]
             project_id = "test-project-123"
             workspace_id = "test-workspace"
+            organization_id = "testorg"
             auto_configure = true
             proxy_events = true
             proxy_sync = true
+            cache_ttl_seconds = 3600
 
             [synthetic] 
             counter_store = "test-counter-store"
