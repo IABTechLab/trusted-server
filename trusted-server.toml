@@ -41,3 +41,16 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_i
 # Custom headers to be included in every response
 [response_headers]
 X-Custom-Header = "custom header value"
+
+# Generic proxy mappings for transparent first-party proxying
+[[proxy_mappings]]
+prefix = "/permutive/api"
+target = "https://api.permutive.com"
+methods = ["GET", "POST"]
+description = "Permutive API"
+
+[[proxy_mappings]]
+prefix = "/permutive/secure-signal"
+target = "https://secure-signals.permutive.app"
+methods = ["GET", "POST"]
+description = "Permutive Secure Signals"

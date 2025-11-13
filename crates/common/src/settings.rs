@@ -142,6 +142,46 @@ impl Synthetic {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct ProxyMapping {
+    /// URL prefix to match (e.g., "/permutive/api")
+    #[validate(length(min = 1))]
+    pub prefix: String,
+    /// Target base URL (e.g., "https://api.permutive.com")
+    #[validate(length(min = 1))]
+    pub target: String,
+    /// HTTP methods to allow (e.g., ["GET", "POST"])
+    #[serde(default = "default_proxy_methods")]
+    pub methods: Vec<String>,
+    /// Optional description for documentation
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_proxy_methods() -> Vec<String> {
+    vec!["GET".to_string(), "POST".to_string()]
+}
+
+impl ProxyMapping {
+    /// Check if this mapping matches the given path
+    #[allow(dead_code)]
+    pub fn matches_path(&self, path: &str) -> bool {
+        path.starts_with(&self.prefix)
+    }
+
+    /// Check if this mapping supports the given HTTP method
+    #[allow(dead_code)]
+    pub fn supports_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+    }
+
+    /// Extract the target path by stripping the prefix
+    #[allow(dead_code)]
+    pub fn extract_target_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.strip_prefix(&self.prefix)
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
@@ -182,6 +222,9 @@ pub struct Settings {
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    #[validate(nested)]
+    pub proxy_mappings: Vec<ProxyMapping>,
 }
 
 #[allow(unused)]

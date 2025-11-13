@@ -30,6 +30,7 @@ pub mod constants;
 pub mod cookies;
 pub mod creative;
 pub mod error;
+pub mod generic_proxy;
 pub mod geo;
 pub mod html_processor;
 pub mod http_util;

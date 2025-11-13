@@ -31,6 +31,9 @@ build = """
         
         [local_server.backends.permutive_api]
             url = "https://api.permutive.com"
+        
+        [local_server.backends.permutive_secure_signals]
+            url = "https://secure-signals.permutive.app"
 
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]

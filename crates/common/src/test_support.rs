@@ -33,6 +33,12 @@ pub mod tests {
             opid_store = "test-opid-store"
             secret_key = "test-secret-key"
             template = "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}"
+
+            [[proxy_mappings]]
+            prefix = "/test-proxy/api"
+            target = "https://api.example.com"
+            methods = ["GET", "POST"]
+            description = "Test API Proxy"
             "#.to_string()
     }
 
