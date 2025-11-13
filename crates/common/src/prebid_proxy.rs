@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -162,9 +163,19 @@ fn enhance_openrtb_request(
     }
 
     // Add geo information if available
-    // Note: get_dma_code requires a mutable reference, but we only have immutable
-    // For now, we'll skip DMA code in the enhancement
-    // TODO: Refactor get_dma_code to accept immutable reference
+    if let Some(geo_info) = GeoInfo::from_request(req) {
+        let geo_obj = json!({
+            "type": 2, // 2 = IP address location
+            "country": geo_info.country, // Note: OpenRTB expects ISO 3166-1 alpha-3, but Fastly provides alpha-2
+            "city": geo_info.city,
+            "region": geo_info.region,
+        });
+
+        if !request["device"].is_object() {
+            request["device"] = json!({});
+        }
+        request["device"]["geo"] = geo_obj.clone();
+    }
 
     // Add site information if missing
     if !request["site"].is_object() {
