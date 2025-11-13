@@ -25,7 +25,9 @@ handlebars = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
+jose-jwk = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 log-fastly = { workspace = true }
 lol_html = { workspace = true }
 pin-project-lite = { workspace = true }
@@ -39,6 +41,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 validator = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [build-dependencies]
 config = { workspace = true }

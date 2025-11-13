@@ -32,3 +32,21 @@ build = """
         [[local_server.kv_stores.opid_store]]
             key = "placeholder"
             data = "placeholder"
+    [local_server.secret_stores]
+        [[local_server.secret_stores.signing_keys]]
+            key = "ts-2025-10-A"
+            data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
+
+        [[local_server.secret_stores.api-keys]]
+            key = "api_key"
+            env = "FASTLY_KEY"
+
+    [local_server.config_stores]
+        [local_server.config_stores.jwks_store]
+            format = "inline-toml"
+        [local_server.config_stores.jwks_store.contents]
+            ts-2025-10-A = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-A\",\"use\":\"sig\",\"x\":\"UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
+            ts-2025-10-B = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-B\",\"use\":\"sig\",\"x\":\"HVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
+            current-kid = "ts-2025-10-A"
+            active-kids = "ts-2025-10-A,ts-2025-10-B"
+

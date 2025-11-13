@@ -13,6 +13,7 @@ use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::request_signing::RequestSigner;
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -183,6 +184,28 @@ fn enhance_openrtb_request(
             "domain": settings.publisher.domain,
             "page": format!("https://{}", settings.publisher.domain),
         });
+    }
+
+    // Add trusted server signature (if enabled)
+    if let Some(request_signing_config) = &settings.request_signing {
+        if request_signing_config.enabled && request["id"].is_string() {
+            log::info!("signing openrtb request...");
+            if !request["ext"].is_object() {
+                request["ext"] = json!({});
+            }
+
+            let id = request["id"]
+                .as_str()
+                .expect("as_str guaranteed by is_string check");
+
+            let signer = RequestSigner::from_config()?;
+            let signature = signer.sign(id.as_bytes())?;
+
+            request["ext"]["trusted_server"] = json!({
+                "signature": signature,
+                "kid": signer.kid
+            });
+        }
     }
 
     Ok(())

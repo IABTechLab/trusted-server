@@ -24,6 +24,7 @@ chrono = "0.4.42"
 config = "0.15.18"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 error-stack = "0.6"
 fastly = "0.11.9"
 fern = "0.7.1"
@@ -38,6 +39,8 @@ log-fastly = "0.11.9"
 lol_html = "2.7.0"
 pin-project-lite = "0.2"
 regex = "1.12.2"
+jose-jwk = "0.1.2"
+rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"

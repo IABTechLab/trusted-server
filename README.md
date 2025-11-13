@@ -104,10 +104,10 @@ git clone git@github.com:IABTechLab/trusted-server.git
 
 ### Configure
 #### Edit configuration files
-:information_source: Note that you’ll have to edit the following files for your setup:
+:information_source: Note that you'll have to edit the following files for your setup:
 
-- fastly.toml (service ID, author, description) 
-- trusted-server.toml (KV store ID names - optional) 
+- fastly.toml (service ID, author, description, Config/Secret Store IDs for request signing) 
+- trusted-server.toml (KV store ID names - optional, request signing configuration)
 
 ### Build
 
@@ -152,6 +152,47 @@ cargo test
 - `cargo clippy`: Ensure idiomatic code
 - `cargo check`: Ensure compilation succeeds on Linux, MacOS, Windows and WebAssembly
 - `cargo bench`: Run all benchmarks
+
+## Request Signing
+
+Trusted Server supports cryptographic signing of OpenRTB requests and other API calls using Ed25519 keys.
+
+### Configuration
+
+Request signing requires Fastly Config Store and Secret Store for key management:
+
+1. **Create Fastly Stores** (via Fastly Control Panel or CLI):
+   - Config Store: `jwks_store` - stores public keys (JWKs) and key metadata
+   - Secret Store: `signing_keys` - stores private signing keys
+
+2. **Configure in trusted-server.toml**:
+```toml
+[request_signing]
+enabled = true  # Set to true to enable request signing
+config_store_id = "<your-fastly-config-store-id>"  # Config Store ID from Fastly
+secret_store_id = "<your-fastly-secret-store-id>"  # Secret Store ID from Fastly
+```
+
+### Key Management Endpoints
+
+Once configured, the following endpoints are available:
+
+- **`GET /.well-known/ts.jwks.json`**: Returns active public keys in JWKS format for signature verification
+- **`POST /verify-signature`**: Verifies a signature against a payload and key ID (useful for testing)
+  - Request body: `{"payload": "...", "signature": "...", "kid": "..."}`
+  - Response: `{"verified": true/false, "kid": "...", "message": "..."}`
+
+#### Admin Endpoints (Key Rotation)
+
+- **`POST /admin/keys/rotate`**: Generates and activates a new signing key
+  - Optional body: `{"kid": "custom-key-id"}` (auto-generates date-based ID if omitted)
+  - Response includes new key ID, previous key ID, and active keys list
+  
+- **`POST /admin/keys/deactivate`**: Deactivates or deletes a key
+  - Request body: `{"kid": "key-to-deactivate", "delete": false}`
+  - Set `delete: true` to permanently remove the key (also deactivates it)
+
+:warning: Key rotation keeps both the new and previous key active to allow for graceful transitions. Deactivate old keys manually when no longer needed.
 
 ## First-Party Endpoints
 
