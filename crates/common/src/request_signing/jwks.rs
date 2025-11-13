@@ -74,8 +74,7 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose, Engine};
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, Verifier};
     use jose_jwk::Key;
 
     #[test]

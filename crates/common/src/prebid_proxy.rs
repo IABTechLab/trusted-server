@@ -186,23 +186,26 @@ fn enhance_openrtb_request(
         });
     }
 
-    // Add trusted server signature
-    if request["id"].is_string() {
-        if !request["ext"].is_object() {
-            request["ext"] = json!({});
+    // Add trusted server signature (if enabled)
+    if let Some(request_signing_config) = &settings.request_signing {
+        if request_signing_config.enabled && request["id"].is_string() {
+            log::info!("signing openrtb request...");
+            if !request["ext"].is_object() {
+                request["ext"] = json!({});
+            }
+
+            let id = request["id"]
+                .as_str()
+                .expect("as_str guaranteed by is_string check");
+
+            let signer = RequestSigner::from_config()?;
+            let signature = signer.sign(id.as_bytes())?;
+
+            request["ext"]["trusted_server"] = json!({
+                "signature": signature,
+                "kid": signer.kid
+            });
         }
-
-        let id = request["id"]
-            .as_str()
-            .expect("as_str guaranteed by is_string check");
-
-        let signer = RequestSigner::from_config()?;
-        let signature = signer.sign(id.as_bytes())?;
-
-        request["ext"]["trusted_server"] = json!({
-            "signature": signature,
-            "kid": signer.kid
-        });
     }
 
     Ok(())
