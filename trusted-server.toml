@@ -9,6 +9,10 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
+[publisher.nextjs]
+enabled = false
+rewrite_attributes = ["href", "link", "url"]
+
 [prebid]
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
