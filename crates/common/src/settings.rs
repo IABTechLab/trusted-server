@@ -100,6 +100,41 @@ impl Synthetic {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct Rewrite {
+    /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
+    /// URLs from these domains will not be proxied through first-party endpoints.
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
+}
+
+impl Rewrite {
+    /// Checks if a URL should be excluded from rewriting based on domain matching
+    #[allow(dead_code)]
+    pub fn is_excluded(&self, url: &str) -> bool {
+        // Parse URL to extract host
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+
+        let host = parsed.host_str().unwrap_or("");
+
+        // Check exact domain matches (with wildcard support)
+        for domain in &self.exclude_domains {
+            if let Some(suffix) = domain.strip_prefix("*.") {
+                // Wildcard: *.example.com matches both example.com and sub.example.com
+                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
+                    return true;
+                }
+            } else if host == domain {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -137,6 +172,9 @@ pub struct Settings {
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub rewrite: Rewrite,
 }
 
 #[allow(unused)]
@@ -615,5 +653,31 @@ mod tests {
             proxy_secret: "test-secret".to_string(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
+    }
+
+    #[test]
+    fn test_rewrite_is_excluded() {
+        let rewrite = Rewrite {
+            exclude_domains: vec!["cdn.example.com".to_string(), "*.example2.com".to_string()],
+        };
+
+        // Exact domain match
+        assert!(rewrite.is_excluded("http://cdn.example.com/image.png"));
+
+        // Wildcard match - base domain
+        assert!(rewrite.is_excluded("https://example2.com/cdn.js"));
+        // Wildcard match - subdomains
+        assert!(rewrite.is_excluded("https://cdnjs.example2.com/lib.js"));
+        assert!(rewrite.is_excluded("https://sub.domain.example2.com/asset.js"));
+
+        // Should NOT match
+        assert!(!rewrite.is_excluded("https://other.example.com/asset.js"));
+        assert!(!rewrite.is_excluded("https://sub.cdn.example.com/asset.js"));
+        assert!(!rewrite.is_excluded("https://example2.com.fake.com/asset.js"));
+        assert!(!rewrite.is_excluded("https://notexample.com/asset.js"));
+
+        // Invalid URLs should not crash and should return false
+        assert!(!rewrite.is_excluded("not a url"));
+        assert!(!rewrite.is_excluded(""));
     }
 }

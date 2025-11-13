@@ -473,7 +473,7 @@ pub async fn handle_first_party_proxy_sign(
             .unwrap_or_else(|| "https".to_string());
         format!("{}:{}", default_scheme, trimmed)
     } else {
-        crate::creative::to_abs(trimmed).ok_or_else(|| {
+        crate::creative::to_abs(trimmed, settings).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
                 message: "unsupported url".to_string(),
             })
