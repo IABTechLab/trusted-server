@@ -47,10 +47,28 @@ X-Custom-Header = "custom header value"
 prefix = "/permutive/api"
 target = "https://api.permutive.com"
 methods = ["GET", "POST"]
-description = "Permutive API"
+description = "Permutive API - Configuration & segment updates"
 
 [[proxy_mappings]]
 prefix = "/permutive/secure-signal"
 target = "https://secure-signals.permutive.app"
 methods = ["GET", "POST"]
 description = "Permutive Secure Signals"
+
+[[proxy_mappings]]
+prefix = "/permutive/events"
+target = "https://events.permutive.app"
+methods = ["GET", "POST"]
+description = "Permutive Events - Event collection endpoint"
+
+[[proxy_mappings]]
+prefix = "/permutive/sync"
+target = "https://sync.permutive.com"
+methods = ["GET", "POST"]
+description = "Permutive Sync - Identity synchronization"
+
+[[proxy_mappings]]
+prefix = "/permutive/cdn"
+target = "https://cdn.permutive.com"
+methods = ["GET"]
+description = "Permutive CDN - Static assets"

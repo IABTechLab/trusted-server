@@ -44,11 +44,25 @@ declare const permutive: {
 };
 
 export function installPermutiveShim() {
+  log.info('Installing Permutive shim - rewriting API hosts to first-party domain');
 
+  const host = window.location.host;
+  const protocol = window.location.protocol === "https:" ? "https" : "http";
 
+  permutive.config.apiHost = host + '/permutive/api';
+  permutive.config.apiProtocol = protocol;
 
-  permutive.config.apiHost = window.location.host + '/permutive/api';
-  permutive.config.apiProtocol = window.location.protocol === "https:" ? "https" : "http";
+  permutive.config.secureSignalsApiHost = host + '/permutive/secure-signal';
 
-  permutive.config.secureSignalsApiHost = window.location.host + '/permutive/secure-signal';
+  permutive.config.segmentSyncApiHost = host + '/permutive/sync';
+
+  permutive.config.cdnBaseUrl = host + '/permutive/cdn';
+  permutive.config.cdnProtocol = protocol;
+
+  log.info('Permutive shim installed', {
+    apiHost: permutive.config.apiHost,
+    secureSignalsApiHost: permutive.config.secureSignalsApiHost,
+    segmentSyncApiHost: permutive.config.segmentSyncApiHost,
+    cdnBaseUrl: permutive.config.cdnBaseUrl,
+  });
 }
