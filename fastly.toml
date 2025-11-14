@@ -23,6 +23,17 @@ build = """
     tls_key_path = "./localhost+2-key.pem"
     
     [local_server.backends]
+        [local_server.backends.permutive_cdn]
+            url = "https://cdn.permutive.app"
+        
+        [local_server.backends.permutive_edge]
+            url = "https://edge.permutive.app"
+        
+        [local_server.backends.permutive_api]
+            url = "https://api.permutive.com"
+        
+        [local_server.backends.permutive_secure_signals]
+            url = "https://secure-signals.permutive.app"
 
     [local_server.kv_stores]
         [[local_server.kv_stores.counter_store]]

@@ -6,7 +6,7 @@ password = "pass"
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
+origin_url = "http://tauritutorials.com"
 proxy_secret = "change-me-proxy-secret"
 
 [prebid]
@@ -15,6 +15,15 @@ timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
+
+[permutive]
+project_id = ""
+workspace_id = "a530f86f-f672-43fc-a11e-64681a09407d"
+organization_id = "a9695278-4085-40b3-9f02-8d4c38a6ff01"
+auto_configure = true
+proxy_events = true
+proxy_sync = true
+cache_ttl_seconds = 3600
 
 [synthetic]
 counter_store = "counter_store"
@@ -32,3 +41,34 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_i
 # Custom headers to be included in every response
 [response_headers]
 X-Custom-Header = "custom header value"
+
+# Generic proxy mappings for transparent first-party proxying
+[[proxy_mappings]]
+prefix = "/permutive/api"
+target = "https://api.permutive.com"
+methods = ["GET", "POST"]
+description = "Permutive API - Configuration & segment updates"
+
+[[proxy_mappings]]
+prefix = "/permutive/secure-signal"
+target = "https://secure-signals.permutive.app"
+methods = ["GET", "POST"]
+description = "Permutive Secure Signals"
+
+[[proxy_mappings]]
+prefix = "/permutive/events"
+target = "https://events.permutive.app"
+methods = ["GET", "POST"]
+description = "Permutive Events - Event collection endpoint"
+
+[[proxy_mappings]]
+prefix = "/permutive/sync"
+target = "https://sync.permutive.com"
+methods = ["GET", "POST"]
+description = "Permutive Sync - Identity synchronization"
+
+[[proxy_mappings]]
+prefix = "/permutive/cdn"
+target = "https://cdn.permutive.com"
+methods = ["GET"]
+description = "Permutive CDN - Static assets"

@@ -79,6 +79,49 @@ fn default_auto_configure() -> bool {
     true
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct Permutive {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    /// Organization ID for Permutive edge CDN (e.g., "myorg" from myorg.edge.permutive.app)
+    #[serde(default)]
+    pub organization_id: String,
+    #[serde(default = "default_permutive_auto_configure")]
+    pub auto_configure: bool,
+    #[serde(default)]
+    pub proxy_events: bool,
+    #[serde(default)]
+    pub proxy_sync: bool,
+    /// Cache TTL for Permutive SDK in seconds (default 1 hour)
+    #[serde(default = "default_permutive_cache_ttl")]
+    pub cache_ttl_seconds: u32,
+}
+
+impl Permutive {
+    /// Build the Permutive SDK URL from configuration
+    /// Returns URL like: https://myorg.edge.permutive.app/workspace-12345-web.js
+    #[allow(dead_code)]
+    pub fn sdk_url(&self) -> Option<String> {
+        if self.organization_id.is_empty() || self.workspace_id.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "https://{}.edge.permutive.app/{}-web.js",
+            self.organization_id, self.workspace_id
+        ))
+    }
+}
+
+fn default_permutive_auto_configure() -> bool {
+    true
+}
+
+fn default_permutive_cache_ttl() -> u32 {
+    3600 // 1 hour
+}
+
 #[allow(unused)]
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
@@ -96,6 +139,46 @@ impl Synthetic {
             "secret_key" => Err(ValidationError::new("Secret key is not valid")),
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct ProxyMapping {
+    /// URL prefix to match (e.g., "/permutive/api")
+    #[validate(length(min = 1))]
+    pub prefix: String,
+    /// Target base URL (e.g., "https://api.permutive.com")
+    #[validate(length(min = 1))]
+    pub target: String,
+    /// HTTP methods to allow (e.g., ["GET", "POST"])
+    #[serde(default = "default_proxy_methods")]
+    pub methods: Vec<String>,
+    /// Optional description for documentation
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_proxy_methods() -> Vec<String> {
+    vec!["GET".to_string(), "POST".to_string()]
+}
+
+impl ProxyMapping {
+    /// Check if this mapping matches the given path
+    #[allow(dead_code)]
+    pub fn matches_path(&self, path: &str) -> bool {
+        path.starts_with(&self.prefix)
+    }
+
+    /// Check if this mapping supports the given HTTP method
+    #[allow(dead_code)]
+    pub fn supports_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+    }
+
+    /// Extract the target path by stripping the prefix
+    #[allow(dead_code)]
+    pub fn extract_target_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.strip_prefix(&self.prefix)
     }
 }
 
@@ -131,12 +214,17 @@ pub struct Settings {
     #[validate(nested)]
     pub prebid: Prebid,
     #[validate(nested)]
+    pub permutive: Permutive,
+    #[validate(nested)]
     pub synthetic: Synthetic,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    #[validate(nested)]
+    pub proxy_mappings: Vec<ProxyMapping>,
 }
 
 #[allow(unused)]

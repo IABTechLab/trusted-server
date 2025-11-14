@@ -19,11 +19,26 @@ pub mod tests {
             [prebid]
             server_url = "https://test-prebid.com/openrtb2/auction"  
 
+            [permutive]
+            project_id = "test-project-123"
+            workspace_id = "test-workspace"
+            organization_id = "testorg"
+            auto_configure = true
+            proxy_events = true
+            proxy_sync = true
+            cache_ttl_seconds = 3600
+
             [synthetic] 
             counter_store = "test-counter-store"
             opid_store = "test-opid-store"
             secret_key = "test-secret-key"
             template = "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}"
+
+            [[proxy_mappings]]
+            prefix = "/test-proxy/api"
+            target = "https://api.example.com"
+            methods = ["GET", "POST"]
+            description = "Test API Proxy"
             "#.to_string()
     }
 

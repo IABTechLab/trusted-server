@@ -17,6 +17,7 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub enable_prebid: bool,
+    pub enable_permutive: bool,
 }
 
 impl HtmlProcessorConfig {
@@ -32,6 +33,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             enable_prebid: settings.prebid.auto_configure,
+            enable_permutive: settings.permutive.auto_configure,
         }
     }
 }
@@ -85,6 +87,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         )
     }
 
+    fn is_permutive_sdk_url(url: &str) -> bool {
+        let lower = url.to_ascii_lowercase();
+        // Match: https://*.edge.permutive.app/*-web.js
+        // Match: https://cdn.permutive.com/*-web.js
+        (lower.contains(".edge.permutive.app") || lower.contains("cdn.permutive.com"))
+            && lower.ends_with("-web.js")
+    }
+
     let rewriter_settings = RewriterSettings {
         element_content_handlers: vec![
             // Inject tsjs once at the start of <head>
@@ -103,12 +113,16 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("[href]", {
                 let patterns = patterns.clone();
                 let rewrite_prebid = config.enable_prebid;
+                let rewrite_permutive = config.enable_permutive;
                 move |el| {
                     if let Some(href) = el.get_attribute("href") {
                         // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
                         if rewrite_prebid && is_prebid_script_url(&href) {
                             let ext_src = tsjs::ext_script_src();
                             el.set_attribute("href", &ext_src)?;
+                        } else if rewrite_permutive && is_permutive_sdk_url(&href) {
+                            let permutive_src = tsjs::permutive_script_src();
+                            el.set_attribute("href", &permutive_src)?;
                         } else {
                             let new_href = href
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -125,11 +139,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             element!("[src]", {
                 let patterns = patterns.clone();
                 let rewrite_prebid = config.enable_prebid;
+                let rewrite_permutive = config.enable_permutive;
                 move |el| {
                     if let Some(src) = el.get_attribute("src") {
                         if rewrite_prebid && is_prebid_script_url(&src) {
                             let ext_src = tsjs::ext_script_src();
                             el.set_attribute("src", &ext_src)?;
+                        } else if rewrite_permutive && is_permutive_sdk_url(&src) {
+                            let permutive_src = tsjs::permutive_script_src();
+                            el.set_attribute("src", &permutive_src)?;
                         } else {
                             let new_src = src
                                 .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -238,6 +256,7 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             enable_prebid: false,
+            enable_permutive: false,
         }
     }
 
@@ -316,6 +335,81 @@ mod tests {
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
         assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+    }
+
+    #[test]
+    fn test_injects_tsjs_script_and_rewrites_permutive_refs() {
+        let html = r#"<html><head>
+            <script async src="https://myorg.edge.permutive.app/workspace-12345-web.js"></script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.enable_permutive = true; // enable rewriting of Permutive URLs
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+        // Permutive references are rewritten to our permutive bundle when auto-configure is on
+        assert!(processed.contains("/static/tsjs=tsjs-permutive.min.js"));
+        assert!(!processed.contains("edge.permutive.app"));
+    }
+
+    #[test]
+    fn test_permutive_cdn_url_rewriting() {
+        let html = r#"<html><head>
+            <script async src="https://cdn.permutive.com/autoblog-abc123-web.js"></script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.enable_permutive = true;
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/static/tsjs=tsjs-permutive.min.js"));
+        assert!(!processed.contains("cdn.permutive.com"));
+    }
+
+    #[test]
+    fn test_permutive_disabled_does_not_rewrite() {
+        let html = r#"<html><head>
+            <script async src="https://myorg.edge.permutive.app/workspace-12345-web.js"></script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.enable_permutive = false; // disabled
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        // When disabled, Permutive URL should remain unchanged
+        assert!(processed.contains("edge.permutive.app"));
+        assert!(!processed.contains("tsjs-permutive"));
     }
 
     #[test]

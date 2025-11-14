@@ -18,6 +18,7 @@ define_tsjs_bundles!(
     Core => "tsjs-core.js",
     Ext => "tsjs-ext.js",
     Creative => "tsjs-creative.js",
+    Permutive => "tsjs-permutive.js",
 );
 
 pub fn bundle_hash(bundle: TsjsBundle) -> String {

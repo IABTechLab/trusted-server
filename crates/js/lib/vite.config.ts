@@ -3,7 +3,7 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 import type { Plugin } from 'vite';
 
-type BundleName = 'core' | 'ext' | 'creative';
+type BundleName = 'core' | 'ext' | 'creative' | 'permutive';
 
 type BundleConfig = {
   input: string;
@@ -28,6 +28,11 @@ const BUNDLES: Record<BundleName, BundleConfig> = {
     input: path.resolve(__dirname, 'src/creative/index.ts'),
     fileName: 'tsjs-creative.js',
     name: 'tscreative',
+  },
+  permutive: {
+    input: path.resolve(__dirname, 'src/permutive/index.ts'),
+    fileName: 'tsjs-permutive.js',
+    name: 'permutive',
   },
 };
 
