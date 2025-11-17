@@ -2,6 +2,7 @@
 
 use crate::settings::Settings;
 
+pub mod permutive;
 mod registry;
 pub mod testlight;
 
@@ -15,5 +16,5 @@ pub use registry::{
 type IntegrationBuilder = fn(&Settings) -> Option<IntegrationRegistration>;
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
-    &[testlight::register]
+    &[permutive::register, testlight::register]
 }
