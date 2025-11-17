@@ -2,15 +2,11 @@
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 use regex::Regex;
 
-use crate::integrations::{
-    IntegrationAttributeContext, IntegrationRegistry, IntegrationScriptContext,
-};
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -22,36 +18,25 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub enable_prebid: bool,
-    pub integrations: IntegrationRegistry,
     pub nextjs_enabled: bool,
     pub nextjs_attributes: Vec<String>,
-    pub integration_assets: Vec<String>,
 }
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
     pub fn from_settings(
         settings: &Settings,
-        integrations: &IntegrationRegistry,
         origin_host: &str,
         request_host: &str,
         request_scheme: &str,
     ) -> Self {
-        let asset_set: BTreeSet<String> = integrations
-            .registered_integrations()
-            .into_iter()
-            .flat_map(|meta| meta.assets)
-            .collect();
-
         Self {
             origin_host: origin_host.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             enable_prebid: settings.prebid.auto_configure,
-            integrations: integrations.clone(),
             nextjs_enabled: settings.publisher.nextjs.enabled,
             nextjs_attributes: settings.publisher.nextjs.rewrite_attributes.clone(),
-            integration_assets: asset_set.into_iter().collect(),
         }
     }
 }
@@ -129,10 +114,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let nextjs_attributes = Rc::new(config.nextjs_attributes.clone());
 
     let injected_tsjs = Rc::new(Cell::new(false));
-    let integration_assets = Rc::new(config.integration_assets.clone());
-    let injected_assets = Rc::new(Cell::new(false));
-    let integration_registry = config.integrations.clone();
-    let script_rewriters = integration_registry.script_rewriters();
 
     fn is_prebid_script_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
@@ -145,142 +126,82 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     let mut element_content_handlers = vec![
+        // Inject unified tsjs bundle once at the start of <head>
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
-            let integration_assets = integration_assets.clone();
-            let injected_assets = injected_assets.clone();
             move |el| {
                 if !injected_tsjs.get() {
-                    let loader = tsjs::core_script_tag();
+                    let loader = tsjs::unified_script_tag();
                     el.prepend(&loader, ContentType::Html);
                     injected_tsjs.set(true);
-                }
-                if !integration_assets.is_empty() && !injected_assets.get() {
-                    for asset in integration_assets.iter() {
-                        let attrs = format!("async data-tsjs-integration=\"{}\"", asset);
-                        let tag = tsjs::integration_script_tag(asset, &attrs);
-                        el.append(&tag, ContentType::Html);
-                    }
-                    injected_assets.set(true);
                 }
                 Ok(())
             }
         }),
+        // Replace URLs in href attributes
         element!("[href]", {
             let patterns = patterns.clone();
             let rewrite_prebid = config.enable_prebid;
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut href) = el.get_attribute("href") {
-                    let original_href = href.clone();
+                if let Some(href) = el.get_attribute("href") {
+                    // If Prebid auto-config is enabled and this looks like a Prebid script href,
+                    // remove it since the unified bundle already includes Prebid integration
                     if rewrite_prebid && is_prebid_script_url(&href) {
-                        href = tsjs::ext_script_src();
+                        el.remove();
                     } else {
                         let new_href = href
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_href != href {
-                            href = new_href;
+                            el.set_attribute("href", &new_href)?;
                         }
-                    }
-
-                    if let Some(integration_href) = integrations.rewrite_attribute(
-                        "href",
-                        &href,
-                        &IntegrationAttributeContext {
-                            attribute_name: "href",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        href = integration_href;
-                    }
-
-                    if href != original_href {
-                        el.set_attribute("href", &href)?;
                     }
                 }
                 Ok(())
             }
         }),
+        // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
             let rewrite_prebid = config.enable_prebid;
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut src) = el.get_attribute("src") {
-                    let original_src = src.clone();
+                if let Some(src) = el.get_attribute("src") {
+                    // If Prebid auto-config is enabled and this looks like a Prebid script,
+                    // remove it since the unified bundle already includes Prebid integration
                     if rewrite_prebid && is_prebid_script_url(&src) {
-                        src = tsjs::ext_script_src();
+                        el.remove();
                     } else {
                         let new_src = src
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_src != src {
-                            src = new_src;
+                            el.set_attribute("src", &new_src)?;
                         }
-                    }
-
-                    if let Some(integration_src) = integrations.rewrite_attribute(
-                        "src",
-                        &src,
-                        &IntegrationAttributeContext {
-                            attribute_name: "src",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        src = integration_src;
-                    }
-
-                    if src != original_src {
-                        el.set_attribute("src", &src)?;
                     }
                 }
                 Ok(())
             }
         }),
+        // Replace URLs in action attributes
         element!("[action]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut action) = el.get_attribute("action") {
-                    let original_action = action.clone();
+                if let Some(action) = el.get_attribute("action") {
                     let new_action = action
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url());
                     if new_action != action {
-                        action = new_action;
-                    }
-
-                    if let Some(integration_action) = integrations.rewrite_attribute(
-                        "action",
-                        &action,
-                        &IntegrationAttributeContext {
-                            attribute_name: "action",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        action = integration_action;
-                    }
-
-                    if action != original_action {
-                        el.set_attribute("action", &action)?;
+                        el.set_attribute("action", &new_action)?;
                     }
                 }
                 Ok(())
             }
         }),
+        // Replace URLs in srcset attributes (for responsive images)
         element!("[srcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut srcset) = el.get_attribute("srcset") {
-                    let original_srcset = srcset.clone();
+                if let Some(srcset) = el.get_attribute("srcset") {
                     let new_srcset = srcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -289,36 +210,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             &patterns.protocol_relative_replacement(),
                         )
                         .replace(&patterns.origin_host, &patterns.request_host);
+
                     if new_srcset != srcset {
-                        srcset = new_srcset;
-                    }
-
-                    if let Some(integration_srcset) = integrations.rewrite_attribute(
-                        "srcset",
-                        &srcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "srcset",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        srcset = integration_srcset;
-                    }
-
-                    if srcset != original_srcset {
-                        el.set_attribute("srcset", &srcset)?;
+                        el.set_attribute("srcset", &new_srcset)?;
                     }
                 }
                 Ok(())
             }
         }),
+        // Replace URLs in imagesrcset attributes (for link preload)
         element!("[imagesrcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
-                    let original_imagesrcset = imagesrcset.clone();
+                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
                     let new_imagesrcset = imagesrcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -327,52 +231,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             &patterns.protocol_relative_replacement(),
                         );
                     if new_imagesrcset != imagesrcset {
-                        imagesrcset = new_imagesrcset;
-                    }
-
-                    if let Some(integration_imagesrcset) = integrations.rewrite_attribute(
-                        "imagesrcset",
-                        &imagesrcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "imagesrcset",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        imagesrcset = integration_imagesrcset;
-                    }
-
-                    if imagesrcset != original_imagesrcset {
-                        el.set_attribute("imagesrcset", &imagesrcset)?;
+                        el.set_attribute("imagesrcset", &new_imagesrcset)?;
                     }
                 }
                 Ok(())
             }
         }),
     ];
-
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            move |text| {
-                let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
-                };
-                if let Some(rewritten) = rewriter.rewrite(text.as_str(), &ctx) {
-                    text.replace(&rewritten, ContentType::Text);
-                }
-                Ok(())
-            }
-        }));
-    }
 
     if config.nextjs_enabled && !nextjs_attributes.is_empty() {
         element_content_handlers.push(text!("script#__NEXT_DATA__", {
@@ -405,28 +270,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     let rewriter_settings = RewriterSettings {
         element_content_handlers,
-
-        // TODO: Consider adding text content replacement if needed with settings
-        // // Replace URLs in text content
-        // document_content_handlers: vec![lol_html::doc_text!({
-        //     move |text| {
-        //         let content = text.as_str();
-
-        //         // Apply URL replacements
-        //         let mut new_content = content.to_string();
-        //         for replacement in replacer.replacements.iter() {
-        //             if new_content.contains(&replacement.find) {
-        //                 new_content = new_content.replace(&replacement.find, &replacement.replace_with);
-        //             }
-        //         }
-
-        //         if new_content != content {
-        //             text.replace(&new_content, lol_html::html_content::ContentType::Text);
-        //         }
-
-        //         Ok(())
-        //     }
-        // })],
         ..RewriterSettings::default()
     };
 
@@ -437,23 +280,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 mod tests {
     use super::*;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::tsjs;
     use std::io::Cursor;
-
-    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
-
-    struct MockBundleGuard;
-
-    fn mock_testlight_bundle() -> MockBundleGuard {
-        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
-        MockBundleGuard
-    }
-
-    impl Drop for MockBundleGuard {
-        fn drop(&mut self) {
-            tsjs::clear_mock_integration_bundles();
-        }
-    }
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
@@ -461,22 +288,20 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             enable_prebid: false,
-            integrations: IntegrationRegistry::default(),
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
-            integration_assets: Vec::new(),
         }
     }
 
     #[test]
-    fn test_injects_tsjs_script_and_rewrites_prebid_refs() {
+    fn test_injects_unified_bundle_and_removes_prebid_refs() {
         let html = r#"<html><head>
             <script src="/js/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
         </head><body></body></html>"#;
 
         let mut config = create_test_config();
-        config.enable_prebid = true; // enable rewriting of Prebid URLs
+        config.enable_prebid = true; // enable removal of Prebid URLs
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -489,19 +314,21 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
-        // Prebid references are rewritten to our extension when auto-configure is on
-        assert!(processed.contains("/static/tsjs=tsjs-ext.min.js"));
+        // Should inject unified bundle (includes core + ext + creative + permutive)
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
+        // Prebid script references should be removed when auto-configure is on
+        assert!(!processed.contains("prebid.min.js"));
+        assert!(!processed.contains("cdn.prebid.org/prebid.js"));
     }
 
     #[test]
-    fn test_injects_tsjs_script_and_rewrites_prebid_with_query_string() {
+    fn test_injects_unified_bundle_and_removes_prebid_with_query_string() {
         let html = r#"<html><head>
             <script src="/wp-content/plugins/prebidjs/js/prebidjs.min.js?v=1.2.3"></script>
         </head><body></body></html>"#;
 
         let mut config = create_test_config();
-        config.enable_prebid = true; // enable rewriting of Prebid URLs
+        config.enable_prebid = true; // enable removal of Prebid URLs
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -514,19 +341,21 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
-        assert!(processed.contains("/static/tsjs=tsjs-ext.min.js"));
+        // Should inject unified bundle
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
+        // Prebid script should be removed
+        assert!(!processed.contains("prebidjs.min.js"));
     }
 
     #[test]
-    fn test_always_injects_tsjs_script() {
+    fn test_always_injects_unified_bundle() {
         let html = r#"<html><head>
             <script src="/js/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
         </head><body></body></html>"#;
 
         let mut config = create_test_config();
-        config.enable_prebid = false; // No longer affects tsjs injection
+        config.enable_prebid = false; // When disabled, don't remove Prebid scripts
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -539,10 +368,11 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        // When auto-configure is disabled, do not rewrite Prebid references
+        // When auto-configure is disabled, do not remove Prebid references
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+        // But still inject unified bundle
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
     }
 
     #[test]
@@ -712,10 +542,8 @@ mod tests {
         use crate::test_support::tests::create_test_settings;
 
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings);
         let config = HtmlProcessorConfig::from_settings(
             &settings,
-            &registry,
             "origin.test-publisher.com",
             "proxy.example.com",
             "https",
@@ -805,58 +633,6 @@ mod tests {
         assert!(
             !result.contains("window.__trustedServerPrebid"),
             "HtmlProcessor should not inject Prebid config"
-        );
-    }
-
-    #[test]
-    fn test_integration_registry_rewrites_integration_scripts() {
-        use serde_json::json;
-
-        let html = r#"<html><head>
-            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
-        </head><body></body></html>"#;
-
-        let _bundle_guard = mock_testlight_bundle();
-        let mut settings = Settings::default();
-        let shim_src = tsjs::integration_script_src("testlight");
-        settings
-            .integrations
-            .insert_config(
-                "testlight",
-                &json!({
-                    "enabled": true,
-                    "endpoint": "https://example.com/openrtb2/auction",
-                    "rewrite_scripts": true,
-                    "shim_src": shim_src,
-                }),
-            )
-            .expect("should insert testlight config");
-
-        let registry = IntegrationRegistry::new(&settings);
-        let mut config = create_test_config();
-        config.integrations = registry;
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-
-        let processed = String::from_utf8_lossy(&output);
-        let expected_src = tsjs::integration_script_src("testlight");
-        assert!(
-            processed.contains(&expected_src),
-            "Integration shim should replace integration script reference"
-        );
-        assert!(
-            !processed.contains("cdn.testlight.com"),
-            "Original integration URL should be removed"
         );
     }
 

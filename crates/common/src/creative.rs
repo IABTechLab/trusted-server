@@ -300,12 +300,13 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
     let mut rewriter = HtmlRewriter::new(
         HtmlSettings {
             element_content_handlers: vec![
-                // Inject tsjs-creative at the top of body once
+                // Inject unified tsjs bundle at the top of body once
+                // This includes core + creative guards + ext + permutive modules
                 element!("body", {
                     let injected = injected_ts_creative.clone();
                     move |el| {
                         if !injected.get() {
-                            let script_tag = tsjs::creative_script_tag();
+                            let script_tag = tsjs::unified_script_tag();
                             el.prepend(&script_tag, ContentType::Html);
                             injected.set(true);
                         }
@@ -490,20 +491,20 @@ mod tests {
         let html = r#"<html><body><p>hello</p></body></html>"#;
         let out = rewrite_creative_html(html, &settings);
         assert!(
-            out.contains("/static/tsjs=tsjs-creative.min.js"),
-            "expected tsjs-creative injection: {}",
+            out.contains("/static/tsjs=tsjs-unified.min.js"),
+            "expected unified tsjs injection: {}",
             out
         );
         // Inject only once
-        assert_eq!(out.matches("/static/tsjs=tsjs-creative.min.js").count(), 1);
+        assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
     }
 
     #[test]
-    fn injects_tsjs_creative_once_with_multiple_bodies() {
+    fn injects_tsjs_unified_once_with_multiple_bodies() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<html><body>one</body><body>two</body></html>"#;
         let out = rewrite_creative_html(html, &settings);
-        assert_eq!(out.matches("/static/tsjs=tsjs-creative.min.js").count(), 1);
+        assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
     }
 
     #[test]
