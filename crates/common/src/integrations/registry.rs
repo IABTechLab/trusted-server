@@ -89,7 +89,6 @@ struct IntegrationRegistryInner {
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
 }
 
-
 /// In-memory registry of integrations discovered from settings.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
