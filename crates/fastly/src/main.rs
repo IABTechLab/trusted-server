@@ -9,6 +9,9 @@ use trusted_server_common::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_common::request_signing::{
+    handle_deactivate_key, handle_jwks_endpoint, handle_rotate_key, handle_verify_signature,
+};
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 
@@ -51,6 +54,16 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
         (&Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)
         }
+
+        // JWKS endpoint for public key distribution
+        (&Method::GET, "/.well-known/ts.jwks.json") => handle_jwks_endpoint(&settings, req),
+
+        // Signature verification endpoint
+        (&Method::POST, "/verify-signature") => handle_verify_signature(&settings, req),
+
+        // Key rotation admin endpoints
+        (&Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
+        (&Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
 
         // tsjs endpoints
         (&Method::GET, "/first-party/ad") => handle_server_ad_get(&settings, req).await,

@@ -36,3 +36,10 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_i
 # Custom headers to be included in every response
 [response_headers]
 X-Custom-Header = "custom header value"
+
+# Request Signing Configuration
+# Enable signing of OpenRTB requests and other API calls
+[request_signing]
+enabled = false  # Set to true to enable request signing
+config_store_id = "<fastly-config-store-id>" # set config/secret store ids for key rotation
+secret_store_id = "<fastly-secret-store-id>"

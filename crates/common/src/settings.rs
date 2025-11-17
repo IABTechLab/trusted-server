@@ -167,6 +167,18 @@ impl Handler {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RequestSigning {
+    #[serde(default = "default_request_signing_enabled")]
+    pub enabled: bool,
+    pub config_store_id: String,
+    pub secret_store_id: String,
+}
+
+fn default_request_signing_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -181,6 +193,7 @@ pub struct Settings {
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    pub request_signing: Option<RequestSigning>,
 }
 
 #[allow(unused)]
