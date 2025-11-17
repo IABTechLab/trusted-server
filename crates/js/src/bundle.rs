@@ -1,31 +1,22 @@
-use super::macros::{count_variants, define_tsjs_bundles};
 use hex::encode;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
-#[derive(Copy, Clone)]
-struct TsjsMeta {
-    filename: &'static str,
-    bundle: &'static str,
-}
+include!(concat!(env!("OUT_DIR"), "/bundle_manifest.rs"));
 
-impl TsjsMeta {
-    const fn new(filename: &'static str, bundle: &'static str) -> Self {
-        Self { filename, bundle }
-    }
-}
+static BUNDLE_MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
 
-define_tsjs_bundles!(
-    Core => "tsjs-core.js",
-    Ext => "tsjs-ext.js",
-    Creative => "tsjs-creative.js",
-);
-
-pub fn bundle_hash(bundle: TsjsBundle) -> String {
-    hash_bundle(bundle.bundle())
+fn bundles() -> &'static HashMap<&'static str, &'static str> {
+    BUNDLE_MAP.get_or_init(|| BUNDLES.iter().copied().collect())
 }
 
 pub fn bundle_for_filename(name: &str) -> Option<&'static str> {
-    TsjsBundle::from_filename(name).map(|bundle| bundle.bundle())
+    bundles().get(name).copied()
+}
+
+pub fn bundle_hash(filename: &str) -> Option<String> {
+    bundle_for_filename(filename).map(hash_bundle)
 }
 
 fn hash_bundle(bundle: &'static str) -> String {

@@ -1,27 +1,10 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct BundleSpec {
-    filename: &'static str,
-    required: bool,
-}
-
-const BUNDLES: &[BundleSpec] = &[
-    BundleSpec {
-        filename: "tsjs-core.js",
-        required: true,
-    },
-    BundleSpec {
-        filename: "tsjs-ext.js",
-        required: false,
-    },
-    BundleSpec {
-        filename: "tsjs-creative.js",
-        required: false,
-    },
-];
+const REQUIRED_BUNDLES: &[&str] = &["tsjs-core.js", "tsjs-ext.js", "tsjs-creative.js"];
 
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under ts/
@@ -92,35 +75,28 @@ fn main() {
     }
 
     // Copy the result into OUT_DIR for include_str!
-    for bundle in BUNDLES {
-        copy_bundle(bundle, &crate_dir, &dist_dir, &out_dir);
-    }
+    let bundle_files = discover_bundles(&dist_dir);
+    ensure_required_bundles(&bundle_files);
+    copy_bundles(&bundle_files, &dist_dir, &out_dir);
+    generate_manifest(&bundle_files, &out_dir);
 }
 
-fn copy_bundle(spec: &BundleSpec, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
-    let primary = dist_dir.join(spec.filename);
-    let fallback = crate_dir.join("dist").join(spec.filename);
-    let target = out_dir.join(spec.filename);
-
-    for source in [&primary, &fallback] {
-        if source.exists() {
-            if let Err(e) = fs::copy(source, &target) {
-                if spec.required {
-                    panic!("tsjs: failed to copy {:?} to {:?}: {}", source, target, e);
-                }
+fn discover_bundles(dist_dir: &Path) -> Vec<String> {
+    let mut bundles = Vec::new();
+    let entries = match fs::read_dir(dist_dir) {
+        Ok(entries) => entries,
+        Err(_) => return bundles,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("js") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                bundles.push(name.to_string());
             }
-            return;
         }
     }
-
-    if spec.required {
-        panic!(
-            "tsjs: bundle {} not found: {:?} (and fallback {:?}). Ensure Node is installed and `npm run build` succeeds, or commit dist/{}.",
-            spec.filename, primary, fallback, spec.filename
-        );
-    }
-
-    let _ = fs::write(&target, "");
+    bundles.sort();
+    bundles
 }
 
 fn watch_dir_recursively(root: &Path) {
@@ -144,4 +120,41 @@ fn watch_dir_recursively(root: &Path) {
             }
         }
     }
+}
+
+fn ensure_required_bundles(bundles: &[String]) {
+    for required in REQUIRED_BUNDLES {
+        if !bundles.iter().any(|bundle| bundle == required) {
+            panic!("tsjs: required bundle {} not found in dist/", required);
+        }
+    }
+}
+
+fn copy_bundles(bundles: &[String], dist_dir: &Path, out_dir: &Path) {
+    for bundle in bundles {
+        let source = dist_dir.join(bundle);
+        let target = out_dir.join(bundle);
+        if let Err(e) = fs::copy(&source, &target) {
+            panic!(
+                "tsjs: failed to copy bundle {:?} to {:?}: {}",
+                source, target, e
+            );
+        }
+    }
+}
+
+fn generate_manifest(bundles: &[String], out_dir: &Path) {
+    let manifest_path = out_dir.join("bundle_manifest.rs");
+    let mut file = File::create(&manifest_path)
+        .unwrap_or_else(|e| panic!("tsjs: failed to create manifest: {}", e));
+    writeln!(&mut file, "pub const BUNDLES: &[(&str, &str)] = &[").unwrap();
+    for bundle in bundles {
+        writeln!(
+            &mut file,
+            "    (\"{name}\", include_str!(concat!(env!(\"OUT_DIR\"), \"/{name}\"))),",
+            name = bundle
+        )
+        .unwrap();
+    }
+    writeln!(&mut file, "];").unwrap();
 }

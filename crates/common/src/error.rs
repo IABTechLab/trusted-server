@@ -50,6 +50,13 @@ pub enum TrustedServerError {
     #[display("Prebid error: {message}")]
     Prebid { message: String },
 
+    /// Integration module error.
+    #[display("Integration error ({integration}): {message}")]
+    Integration {
+        integration: String,
+        message: String,
+    },
+
     /// Proxy error.
     #[display("Proxy error: {message}")]
     Proxy { message: String },
@@ -91,6 +98,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
+            Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,

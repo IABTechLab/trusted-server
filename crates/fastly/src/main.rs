@@ -1,9 +1,12 @@
+use error_stack::Report;
 use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
 use trusted_server_common::ad::{handle_server_ad, handle_server_ad_get};
 use trusted_server_common::auth::enforce_basic_auth;
+use trusted_server_common::error::TrustedServerError;
+use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -30,11 +33,16 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
+    let integration_registry = IntegrationRegistry::new(&settings);
 
-    futures::executor::block_on(route_request(settings, req))
+    futures::executor::block_on(route_request(settings, integration_registry, req))
 }
 
-async fn route_request(settings: Settings, req: Request) -> Result<Response, Error> {
+async fn route_request(
+    settings: Settings,
+    integration_registry: IntegrationRegistry,
+    req: Request,
+) -> Result<Response, Error> {
     log::info!(
         "FASTLY_SERVICE_VERSION: {}",
         ::std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
@@ -45,37 +53,45 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
     }
 
     // Get path and method for routing
-    let path = req.get_path();
-    let method = req.get_method();
+    let path = req.get_path().to_string();
+    let method = req.get_method().clone();
 
     // Match known routes and handle them
-    let result = match (method, path) {
+    let result = match (method, path.as_str()) {
         // Serve the tsjs library
-        (&Method::GET, path) if path.starts_with("/static/tsjs=") => {
+        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)
         }
 
         // JWKS endpoint for public key distribution
-        (&Method::GET, "/.well-known/ts.jwks.json") => handle_jwks_endpoint(&settings, req),
+        (Method::GET, "/.well-known/ts.jwks.json") => handle_jwks_endpoint(&settings, req),
 
         // Signature verification endpoint
-        (&Method::POST, "/verify-signature") => handle_verify_signature(&settings, req),
+        (Method::POST, "/verify-signature") => handle_verify_signature(&settings, req),
 
         // Key rotation admin endpoints
-        (&Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
-        (&Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
+        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
+        (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
 
         // tsjs endpoints
-        (&Method::GET, "/first-party/ad") => handle_server_ad_get(&settings, req).await,
-        (&Method::POST, "/third-party/ad") => handle_server_ad(&settings, req).await,
-        (&Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
-        (&Method::GET, "/first-party/click") => handle_first_party_click(&settings, req).await,
-        (&Method::GET, "/first-party/sign") | (&Method::POST, "/first-party/sign") => {
+        (Method::GET, "/first-party/ad") => handle_server_ad_get(&settings, req).await,
+        (Method::POST, "/third-party/ad") => handle_server_ad(&settings, req).await,
+        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
+        (Method::GET, "/first-party/click") => handle_first_party_click(&settings, req).await,
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
             handle_first_party_proxy_sign(&settings, req).await
         }
-        (&Method::POST, "/first-party/proxy-rebuild") => {
+        (Method::POST, "/first-party/proxy-rebuild") => {
             handle_first_party_proxy_rebuild(&settings, req).await
         }
+        (m, path) if integration_registry.has_route(&m, path) => integration_registry
+            .handle_proxy(&m, path, &settings, req)
+            .await
+            .unwrap_or_else(|| {
+                Err(Report::new(TrustedServerError::BadRequest {
+                    message: format!("Unknown integration route: {path}"),
+                }))
+            }),
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
@@ -84,7 +100,7 @@ async fn route_request(settings: Settings, req: Request) -> Result<Response, Err
                 path
             );
 
-            match handle_publisher_request(&settings, req) {
+            match handle_publisher_request(&settings, &integration_registry, req) {
                 Ok(response) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);

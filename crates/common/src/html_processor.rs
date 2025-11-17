@@ -7,6 +7,7 @@ use std::rc::Rc;
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 use regex::Regex;
 
+use crate::integrations::{IntegrationAttributeContext, IntegrationRegistry};
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -18,6 +19,7 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub enable_prebid: bool,
+    pub integrations: IntegrationRegistry,
     pub nextjs_enabled: bool,
     pub nextjs_attributes: Vec<String>,
 }
@@ -26,6 +28,7 @@ impl HtmlProcessorConfig {
     /// Create from settings and request parameters
     pub fn from_settings(
         settings: &Settings,
+        integrations: &IntegrationRegistry,
         origin_host: &str,
         request_host: &str,
         request_scheme: &str,
@@ -35,6 +38,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             enable_prebid: settings.prebid.auto_configure,
+            integrations: integrations.clone(),
             nextjs_enabled: settings.publisher.nextjs.enabled,
             nextjs_attributes: settings.publisher.nextjs.rewrite_attributes.clone(),
         }
@@ -114,6 +118,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let nextjs_attributes = Rc::new(config.nextjs_attributes.clone());
 
     let injected_tsjs = Rc::new(Cell::new(false));
+    let integration_registry = config.integrations.clone();
 
     fn is_prebid_script_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
@@ -126,7 +131,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     let mut element_content_handlers = vec![
-        // Inject tsjs once at the start of <head>
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
             move |el| {
@@ -138,69 +142,121 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 Ok(())
             }
         }),
-        // Replace URLs in href attributes
         element!("[href]", {
             let patterns = patterns.clone();
             let rewrite_prebid = config.enable_prebid;
+            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(href) = el.get_attribute("href") {
-                    // If Prebid auto-config is enabled and this looks like a Prebid script href, rewrite to our extension
+                if let Some(mut href) = el.get_attribute("href") {
+                    let original_href = href.clone();
                     if rewrite_prebid && is_prebid_script_url(&href) {
-                        let ext_src = tsjs::ext_script_src();
-                        el.set_attribute("href", &ext_src)?;
+                        href = tsjs::ext_script_src();
                     } else {
                         let new_href = href
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_href != href {
-                            el.set_attribute("href", &new_href)?;
+                            href = new_href;
                         }
+                    }
+
+                    if let Some(integration_href) = integrations.rewrite_attribute(
+                        "href",
+                        &href,
+                        &IntegrationAttributeContext {
+                            attribute_name: "href",
+                            request_host: &patterns.request_host,
+                            request_scheme: &patterns.request_scheme,
+                            origin_host: &patterns.origin_host,
+                        },
+                    ) {
+                        href = integration_href;
+                    }
+
+                    if href != original_href {
+                        el.set_attribute("href", &href)?;
                     }
                 }
                 Ok(())
             }
         }),
-        // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
             let rewrite_prebid = config.enable_prebid;
+            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(src) = el.get_attribute("src") {
+                if let Some(mut src) = el.get_attribute("src") {
+                    let original_src = src.clone();
                     if rewrite_prebid && is_prebid_script_url(&src) {
-                        let ext_src = tsjs::ext_script_src();
-                        el.set_attribute("src", &ext_src)?;
+                        src = tsjs::ext_script_src();
                     } else {
                         let new_src = src
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
                             .replace(&patterns.http_origin(), &patterns.replacement_url());
                         if new_src != src {
-                            el.set_attribute("src", &new_src)?;
+                            src = new_src;
                         }
+                    }
+
+                    if let Some(integration_src) = integrations.rewrite_attribute(
+                        "src",
+                        &src,
+                        &IntegrationAttributeContext {
+                            attribute_name: "src",
+                            request_host: &patterns.request_host,
+                            request_scheme: &patterns.request_scheme,
+                            origin_host: &patterns.origin_host,
+                        },
+                    ) {
+                        src = integration_src;
+                    }
+
+                    if src != original_src {
+                        el.set_attribute("src", &src)?;
                     }
                 }
                 Ok(())
             }
         }),
-        // Replace URLs in action attributes
         element!("[action]", {
             let patterns = patterns.clone();
+            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(action) = el.get_attribute("action") {
+                if let Some(mut action) = el.get_attribute("action") {
+                    let original_action = action.clone();
                     let new_action = action
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url());
                     if new_action != action {
-                        el.set_attribute("action", &new_action)?;
+                        action = new_action;
+                    }
+
+                    if let Some(integration_action) = integrations.rewrite_attribute(
+                        "action",
+                        &action,
+                        &IntegrationAttributeContext {
+                            attribute_name: "action",
+                            request_host: &patterns.request_host,
+                            request_scheme: &patterns.request_scheme,
+                            origin_host: &patterns.origin_host,
+                        },
+                    ) {
+                        action = integration_action;
+                    }
+
+                    if action != original_action {
+                        el.set_attribute("action", &action)?;
                     }
                 }
                 Ok(())
             }
         }),
-        // Replace URLs in srcset attributes (for responsive images)
         element!("[srcset]", {
             let patterns = patterns.clone();
+            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(srcset) = el.get_attribute("srcset") {
+                if let Some(mut srcset) = el.get_attribute("srcset") {
+                    let original_srcset = srcset.clone();
                     let new_srcset = srcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -209,19 +265,36 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             &patterns.protocol_relative_replacement(),
                         )
                         .replace(&patterns.origin_host, &patterns.request_host);
-
                     if new_srcset != srcset {
-                        el.set_attribute("srcset", &new_srcset)?;
+                        srcset = new_srcset;
+                    }
+
+                    if let Some(integration_srcset) = integrations.rewrite_attribute(
+                        "srcset",
+                        &srcset,
+                        &IntegrationAttributeContext {
+                            attribute_name: "srcset",
+                            request_host: &patterns.request_host,
+                            request_scheme: &patterns.request_scheme,
+                            origin_host: &patterns.origin_host,
+                        },
+                    ) {
+                        srcset = integration_srcset;
+                    }
+
+                    if srcset != original_srcset {
+                        el.set_attribute("srcset", &srcset)?;
                     }
                 }
                 Ok(())
             }
         }),
-        // Replace URLs in imagesrcset attributes (for link preload)
         element!("[imagesrcset]", {
             let patterns = patterns.clone();
+            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
+                if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
+                    let original_imagesrcset = imagesrcset.clone();
                     let new_imagesrcset = imagesrcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -230,7 +303,24 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             &patterns.protocol_relative_replacement(),
                         );
                     if new_imagesrcset != imagesrcset {
-                        el.set_attribute("imagesrcset", &new_imagesrcset)?;
+                        imagesrcset = new_imagesrcset;
+                    }
+
+                    if let Some(integration_imagesrcset) = integrations.rewrite_attribute(
+                        "imagesrcset",
+                        &imagesrcset,
+                        &IntegrationAttributeContext {
+                            attribute_name: "imagesrcset",
+                            request_host: &patterns.request_host,
+                            request_scheme: &patterns.request_scheme,
+                            origin_host: &patterns.origin_host,
+                        },
+                    ) {
+                        imagesrcset = integration_imagesrcset;
+                    }
+
+                    if imagesrcset != original_imagesrcset {
+                        el.set_attribute("imagesrcset", &imagesrcset)?;
                     }
                 }
                 Ok(())
@@ -301,6 +391,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 mod tests {
     use super::*;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::tsjs;
     use std::io::Cursor;
 
     fn create_test_config() -> HtmlProcessorConfig {
@@ -309,6 +400,7 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             enable_prebid: false,
+            integrations: IntegrationRegistry::default(),
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
         }
@@ -558,8 +650,10 @@ mod tests {
         use crate::test_support::tests::create_test_settings;
 
         let settings = create_test_settings();
+        let registry = IntegrationRegistry::new(&settings);
         let config = HtmlProcessorConfig::from_settings(
             &settings,
+            &registry,
             "origin.test-publisher.com",
             "proxy.example.com",
             "https",
@@ -649,6 +743,54 @@ mod tests {
         assert!(
             !result.contains("window.__trustedServerPrebid"),
             "HtmlProcessor should not inject Prebid config"
+        );
+    }
+
+    #[test]
+    fn test_integration_registry_rewrites_integration_scripts() {
+        use serde_json::json;
+
+        let html = r#"<html><head>
+            <script src="https://cdn.starlight.com/v1/starlight.js"></script>
+        </head><body></body></html>"#;
+
+        let mut settings = Settings::default();
+        let shim_src = tsjs::script_src("tsjs-starlight.js")
+            .expect("Starlight tsjs bundle should exist for tests");
+        settings.integrations.insert(
+            "starlight".to_string(),
+            json!({
+                "endpoint": "https://example.com/openrtb2/auction",
+                "rewrite_scripts": true,
+                "shim_src": shim_src,
+            }),
+        );
+
+        let registry = IntegrationRegistry::new(&settings);
+        let mut config = create_test_config();
+        config.integrations = registry;
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+
+        let processed = String::from_utf8_lossy(&output);
+        let expected_src = tsjs::script_src("tsjs-starlight.js").expect("tsjs bundle missing");
+        assert!(
+            processed.contains(&expected_src),
+            "Integration shim should replace integration script reference"
+        );
+        assert!(
+            !processed.contains("cdn.starlight.com"),
+            "Original integration URL should be removed"
         );
     }
 

@@ -188,6 +188,8 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub synthetic: Synthetic,
+    #[serde(default)]
+    pub integrations: HashMap<String, JsonValue>,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
@@ -259,6 +261,11 @@ impl Settings {
         self.handlers
             .iter()
             .find(|handler| handler.matches_path(path))
+    }
+
+    #[must_use]
+    pub fn integration_config(&self, integration_id: &str) -> Option<&JsonValue> {
+        self.integrations.get(integration_id)
     }
 }
 
@@ -587,10 +594,6 @@ mod tests {
 
     #[test]
     fn test_set_env() {
-        let re = Regex::new(r"ad_partner_url = .*").unwrap();
-        let toml_str = crate_test_settings_str();
-        let toml_str = re.replace(&toml_str, "");
-
         temp_env::with_var(
             format!(
                 "{}{}PUBLISHER{}ORIGIN_URL",
@@ -600,7 +603,7 @@ mod tests {
             ),
             Some("https://change-publisher.com"),
             || {
-                let settings = Settings::from_toml(&toml_str);
+                let settings = Settings::from_toml(&crate_test_settings_str());
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(

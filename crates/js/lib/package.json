@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Trusted Server tsjs TypeScript library with queue and simple banner rendering.",
   "scripts": {
-    "build": "vite build --mode core && vite build --mode ext && vite build --mode creative",
+    "build": "node scripts/build-all.mjs",
     "dev": "node scripts/watch-all.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
