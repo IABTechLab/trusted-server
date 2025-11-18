@@ -2377,6 +2377,7 @@ dependencies = [
  "log",
  "log-fastly",
  "lol_html",
+ "once_cell",
  "pin-project-lite",
  "rand",
  "regex",

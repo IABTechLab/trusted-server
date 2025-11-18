@@ -9,6 +9,7 @@ use serde::{
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
@@ -110,6 +111,107 @@ impl Default for NextJs {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct IntegrationSettings {
+    #[serde(flatten)]
+    entries: HashMap<String, JsonValue>,
+}
+
+pub trait IntegrationConfig: DeserializeOwned + Validate {
+    fn is_enabled(&self) -> bool;
+}
+
+impl IntegrationSettings {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn insert_config<T>(
+        &mut self,
+        integration_id: impl Into<String>,
+        value: &T,
+    ) -> Result<(), Report<TrustedServerError>>
+    where
+        T: Serialize,
+    {
+        let json =
+            serde_json::to_value(value).change_context(TrustedServerError::Configuration {
+                message: "Failed to serialize integration configuration".to_string(),
+            })?;
+        self.entries.insert(integration_id.into(), json);
+        Ok(())
+    }
+
+    fn normalize_env_value(value: JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Object(map) => JsonValue::Object(
+                map.into_iter()
+                    .map(|(key, val)| (key, Self::normalize_env_value(val)))
+                    .collect(),
+            ),
+            JsonValue::Array(items) => {
+                JsonValue::Array(items.into_iter().map(Self::normalize_env_value).collect())
+            }
+            JsonValue::String(raw) => {
+                if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
+                    parsed
+                } else {
+                    JsonValue::String(raw)
+                }
+            }
+            other => other,
+        }
+    }
+
+    pub fn get_typed<T>(
+        &self,
+        integration_id: &str,
+    ) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: IntegrationConfig,
+    {
+        let raw = match self.entries.get(integration_id) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let normalized = Self::normalize_env_value(raw.clone());
+
+        let config: T = serde_json::from_value(normalized).change_context(
+            TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration could not be parsed"
+                ),
+            },
+        )?;
+
+        config.validate().map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration failed validation: {err}"
+                ),
+            })
+        })?;
+
+        if !config.is_enabled() {
+            return Ok(None);
+        }
+
+        Ok(Some(config))
+    }
+}
+
+impl Deref for IntegrationSettings {
+    type Target = HashMap<String, JsonValue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl DerefMut for IntegrationSettings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
 fn deserialize_nextjs_attributes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -189,7 +291,7 @@ pub struct Settings {
     #[validate(nested)]
     pub synthetic: Synthetic,
     #[serde(default)]
-    pub integrations: HashMap<String, JsonValue>,
+    pub integrations: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
@@ -263,9 +365,14 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
-    #[must_use]
-    pub fn integration_config(&self, integration_id: &str) -> Option<&JsonValue> {
-        self.integrations.get(integration_id)
+    pub fn integration_config<T>(
+        &self,
+        integration_id: &str,
+    ) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: IntegrationConfig,
+    {
+        self.integrations.get_typed(integration_id)
     }
 }
 
@@ -340,7 +447,7 @@ mod tests {
     use super::*;
     use regex::Regex;
 
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
     fn test_settings_new() {
@@ -699,5 +806,91 @@ mod tests {
             nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
+    }
+
+    #[test]
+    fn test_integration_settings_from_env() {
+        use crate::integrations::testlight::TestlightConfig;
+
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        let integration_prefix = format!(
+            "{}{}INTEGRATIONS{}TESTLIGHT{}",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
+        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
+        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
+        let enabled_key = format!("{}ENABLED", integration_prefix);
+
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(
+                    endpoint_key,
+                    Some("https://testlight-env.test/auction"),
+                    || {
+                        temp_env::with_var(timeout_key, Some("2500"), || {
+                            temp_env::with_var(rewrite_key, Some("true"), || {
+                                temp_env::with_var(enabled_key, Some("true"), || {
+                                    let settings = Settings::from_toml(&toml_str)
+                                        .expect("Settings should load");
+
+                                    let config = settings
+                                        .integration_config::<TestlightConfig>("testlight")
+                                        .expect("integration parsing should succeed")
+                                        .expect("integration should be enabled");
+
+                                    assert_eq!(
+                                        config.endpoint,
+                                        "https://testlight-env.test/auction"
+                                    );
+                                    assert_eq!(config.timeout_ms, 2500);
+                                    assert!(config.rewrite_scripts);
+                                    assert!(config.enabled);
+                                });
+                            });
+                        });
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_disabled_integration_does_not_register() {
+        use crate::integrations::testlight::TestlightConfig;
+        use serde_json::json;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "testlight",
+                &json!({
+                    "enabled": false,
+                    "endpoint": "https://testlight.test/auction",
+                    "rewrite_scripts": true,
+                }),
+            )
+            .expect("should insert integration config");
+
+        let config = settings
+            .integration_config::<TestlightConfig>("testlight")
+            .expect("integration parsing should succeed");
+
+        assert!(config.is_none(), "Disabled integrations should be skipped");
     }
 }

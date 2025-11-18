@@ -13,39 +13,50 @@ use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy,
+    IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::Settings;
+use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::tsjs;
 
-const STARLIGHT_INTEGRATION_ID: &str = "starlight";
+const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
-#[derive(Debug, Deserialize)]
-pub struct StarlightConfig {
+#[derive(Debug, Deserialize, Validate)]
+pub struct TestlightConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[validate(url)]
     pub endpoint: String,
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 10, max = 60000))]
     pub timeout_ms: u32,
     #[serde(default = "default_shim_src")]
+    #[validate(length(min = 1))]
     pub shim_src: String,
     #[serde(default)]
     pub rewrite_scripts: bool,
 }
 
+impl IntegrationConfigTrait for TestlightConfig {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Validate)]
-struct StarlightRequestBody {
+struct TestlightRequestBody {
     #[validate(nested)]
     #[serde(default)]
-    user: StarlightUserSection,
+    user: TestlightUserSection,
     #[validate(nested)]
     #[serde(default)]
-    imp: Vec<StarlightImp>,
+    imp: Vec<TestlightImp>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
-struct StarlightUserSection {
+struct TestlightUserSection {
     #[serde(default)]
     #[validate(length(min = 1))]
     id: Option<String>,
@@ -54,7 +65,7 @@ struct StarlightUserSection {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
-struct StarlightImp {
+struct TestlightImp {
     #[serde(default)]
     #[validate(length(min = 1))]
     id: Option<String>,
@@ -63,38 +74,56 @@ struct StarlightImp {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct StarlightResponseBody {
+struct TestlightResponseBody {
     #[serde(flatten)]
     fields: Map<String, Value>,
 }
 
-pub struct StarlightIntegration {
-    config: StarlightConfig,
+pub struct TestlightIntegration {
+    config: TestlightConfig,
 }
 
-impl StarlightIntegration {
-    fn new(config: StarlightConfig) -> Arc<Self> {
+impl TestlightIntegration {
+    fn new(config: TestlightConfig) -> Arc<Self> {
         Arc::new(Self { config })
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: STARLIGHT_INTEGRATION_ID.to_string(),
+            integration: TESTLIGHT_INTEGRATION_ID.to_string(),
             message: message.into(),
         }
     }
 }
 
-pub fn build(settings: &Settings) -> Option<Arc<StarlightIntegration>> {
-    let raw = settings.integration_config(STARLIGHT_INTEGRATION_ID)?;
-    let config: StarlightConfig = serde_json::from_value(raw.clone()).ok()?;
-    Some(StarlightIntegration::new(config))
+fn build(settings: &Settings) -> Option<Arc<TestlightIntegration>> {
+    let config = match settings.integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID) {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(err) => {
+            log::error!("Failed to load Testlight integration config: {err:?}");
+            return None;
+        }
+    };
+
+    Some(TestlightIntegration::new(config))
+}
+
+pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
+    let integration = build(settings)?;
+    Some(
+        IntegrationRegistration::builder(TESTLIGHT_INTEGRATION_ID)
+            .with_proxy(integration.clone())
+            .with_attribute_rewriter(integration)
+            .with_asset("testlight")
+            .build(),
+    )
 }
 
 #[async_trait(?Send)]
-impl IntegrationProxy for StarlightIntegration {
+impl IntegrationProxy for TestlightIntegration {
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::post("/integrations/starlight/auction")]
+        vec![IntegrationEndpoint::post("/integrations/testlight/auction")]
     }
 
     async fn handle(
@@ -102,7 +131,7 @@ impl IntegrationProxy for StarlightIntegration {
         settings: &Settings,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        let mut payload = serde_json::from_slice::<StarlightRequestBody>(&req.take_body_bytes())
+        let mut payload = serde_json::from_slice::<TestlightRequestBody>(&req.take_body_bytes())
             .change_context(Self::error("Failed to parse request body"))?;
         payload
             .validate()
@@ -133,7 +162,7 @@ impl IntegrationProxy for StarlightIntegration {
 
         // Attempt to parse response into structured form for logging/future transforms.
         let response_body = response.take_body_bytes();
-        match serde_json::from_slice::<StarlightResponseBody>(&response_body) {
+        match serde_json::from_slice::<TestlightResponseBody>(&response_body) {
             Ok(body) => {
                 response
                     .set_body_json(&body)
@@ -151,9 +180,9 @@ impl IntegrationProxy for StarlightIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for StarlightIntegration {
+impl IntegrationAttributeRewriter for TestlightIntegration {
     fn integration_id(&self) -> &'static str {
-        STARLIGHT_INTEGRATION_ID
+        TESTLIGHT_INTEGRATION_ID
     }
 
     fn handles_attribute(&self, attribute: &str) -> bool {
@@ -171,7 +200,7 @@ impl IntegrationAttributeRewriter for StarlightIntegration {
         }
 
         let lowered = attr_value.to_ascii_lowercase();
-        if lowered.contains("starlight.js") {
+        if lowered.contains("testlight.js") {
             Some(self.config.shim_src.clone())
         } else {
             None
@@ -184,21 +213,24 @@ fn default_timeout_ms() -> u32 {
 }
 
 fn default_shim_src() -> String {
-    tsjs::script_src("tsjs-starlight.js")
-        .unwrap_or_else(|| "/static/tsjs=tsjs-starlight.min.js".to_string())
+    tsjs::integration_script_src("testlight")
 }
 
-impl Default for StarlightRequestBody {
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for TestlightRequestBody {
     fn default() -> Self {
         Self {
-            user: StarlightUserSection::default(),
+            user: TestlightUserSection::default(),
             imp: Vec::new(),
             extra: Map::new(),
         }
     }
 }
 
-impl Default for StarlightResponseBody {
+impl Default for TestlightResponseBody {
     fn default() -> Self {
         Self { fields: Map::new() }
     }
@@ -211,6 +243,21 @@ mod tests {
     use fastly::http::Method;
     use serde_json::json;
 
+    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
+
+    struct MockBundleGuard;
+
+    fn mock_testlight_bundle() -> MockBundleGuard {
+        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
+        MockBundleGuard
+    }
+
+    impl Drop for MockBundleGuard {
+        fn drop(&mut self) {
+            tsjs::clear_mock_integration_bundles();
+        }
+    }
+
     #[test]
     fn build_requires_config() {
         let settings = create_test_settings();
@@ -222,15 +269,16 @@ mod tests {
 
     #[test]
     fn html_rewriter_replaces_integration_script() {
-        let shim_src = tsjs::script_src("tsjs-starlight.js")
-            .expect("tsjs starlight bundle should exist for tests");
-        let config = StarlightConfig {
+        let _bundle_guard = mock_testlight_bundle();
+        let shim_src = tsjs::integration_script_src("testlight");
+        let config = TestlightConfig {
+            enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
             timeout_ms: 1000,
             shim_src: shim_src.clone(),
             rewrite_scripts: true,
         };
-        let integration = StarlightIntegration::new(config);
+        let integration = TestlightIntegration::new(config);
 
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
@@ -240,7 +288,7 @@ mod tests {
         };
 
         let rewritten =
-            integration.rewrite("src", "https://cdn.starlight.net/v1/starlight.js", &ctx);
+            integration.rewrite("src", "https://cdn.testlight.net/v1/testlight.js", &ctx);
         assert_eq!(
             rewritten.as_deref(),
             Some(shim_src.as_str()),
@@ -250,15 +298,16 @@ mod tests {
 
     #[test]
     fn html_rewriter_is_noop_when_disabled() {
-        let shim_src = tsjs::script_src("tsjs-starlight.js")
-            .expect("tsjs starlight bundle should exist for tests");
-        let config = StarlightConfig {
+        let _bundle_guard = mock_testlight_bundle();
+        let shim_src = tsjs::integration_script_src("testlight");
+        let config = TestlightConfig {
+            enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
             timeout_ms: 1000,
             shim_src,
             rewrite_scripts: false,
         };
-        let integration = StarlightIntegration::new(config);
+        let integration = TestlightIntegration::new(config);
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             request_host: "edge.example.com",
@@ -267,27 +316,31 @@ mod tests {
         };
 
         assert!(integration
-            .rewrite("src", "https://cdn.starlight.net/script.js", &ctx)
+            .rewrite("src", "https://cdn.testlight.net/script.js", &ctx)
             .is_none());
     }
 
     #[test]
     fn build_uses_settings_integration_block() {
         let mut settings = create_test_settings();
-        settings.integrations.insert(
-            STARLIGHT_INTEGRATION_ID.to_string(),
-            json!({
-                "endpoint": "https://example.com/bid",
-                "rewrite_scripts": true,
-            }),
-        );
+        settings
+            .integrations
+            .insert_config(
+                TESTLIGHT_INTEGRATION_ID.to_string(),
+                &json!({
+                    "enabled": true,
+                    "endpoint": "https://example.com/bid",
+                    "rewrite_scripts": true,
+                }),
+            )
+            .expect("should insert integration config");
 
         let integration = build(&settings).expect("Integration should build with config");
         let routes = integration.routes();
         assert!(
             routes.iter().any(|route| route.method == Method::POST
-                && route.path == "/integrations/starlight/auction"),
-            "Integration should register POST /integrations/starlight/auction"
+                && route.path == "/integrations/testlight/auction"),
+            "Integration should register POST /integrations/testlight/auction"
         );
     }
 }

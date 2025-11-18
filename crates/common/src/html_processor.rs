@@ -2,12 +2,15 @@
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 use regex::Regex;
 
-use crate::integrations::{IntegrationAttributeContext, IntegrationRegistry};
+use crate::integrations::{
+    IntegrationAttributeContext, IntegrationRegistry, IntegrationScriptContext,
+};
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -22,6 +25,7 @@ pub struct HtmlProcessorConfig {
     pub integrations: IntegrationRegistry,
     pub nextjs_enabled: bool,
     pub nextjs_attributes: Vec<String>,
+    pub integration_assets: Vec<String>,
 }
 
 impl HtmlProcessorConfig {
@@ -33,6 +37,12 @@ impl HtmlProcessorConfig {
         request_host: &str,
         request_scheme: &str,
     ) -> Self {
+        let asset_set: BTreeSet<String> = integrations
+            .registered_integrations()
+            .into_iter()
+            .flat_map(|meta| meta.assets)
+            .collect();
+
         Self {
             origin_host: origin_host.to_string(),
             request_host: request_host.to_string(),
@@ -41,6 +51,7 @@ impl HtmlProcessorConfig {
             integrations: integrations.clone(),
             nextjs_enabled: settings.publisher.nextjs.enabled,
             nextjs_attributes: settings.publisher.nextjs.rewrite_attributes.clone(),
+            integration_assets: asset_set.into_iter().collect(),
         }
     }
 }
@@ -118,7 +129,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let nextjs_attributes = Rc::new(config.nextjs_attributes.clone());
 
     let injected_tsjs = Rc::new(Cell::new(false));
+    let integration_assets = Rc::new(config.integration_assets.clone());
+    let injected_assets = Rc::new(Cell::new(false));
     let integration_registry = config.integrations.clone();
+    let script_rewriters = integration_registry.script_rewriters();
 
     fn is_prebid_script_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
@@ -133,11 +147,21 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let mut element_content_handlers = vec![
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
+            let integration_assets = integration_assets.clone();
+            let injected_assets = injected_assets.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let loader = tsjs::core_script_tag();
                     el.prepend(&loader, ContentType::Html);
                     injected_tsjs.set(true);
+                }
+                if !integration_assets.is_empty() && !injected_assets.get() {
+                    for asset in integration_assets.iter() {
+                        let attrs = format!("async data-tsjs-integration=\"{}\"", asset);
+                        let tag = tsjs::integration_script_tag(asset, &attrs);
+                        el.append(&tag, ContentType::Html);
+                    }
+                    injected_assets.set(true);
                 }
                 Ok(())
             }
@@ -328,6 +352,28 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
+    for script_rewriter in script_rewriters {
+        let selector = script_rewriter.selector();
+        let rewriter = script_rewriter.clone();
+        let patterns = patterns.clone();
+        element_content_handlers.push(text!(selector, {
+            let rewriter = rewriter.clone();
+            let patterns = patterns.clone();
+            move |text| {
+                let ctx = IntegrationScriptContext {
+                    selector,
+                    request_host: &patterns.request_host,
+                    request_scheme: &patterns.request_scheme,
+                    origin_host: &patterns.origin_host,
+                };
+                if let Some(rewritten) = rewriter.rewrite(text.as_str(), &ctx) {
+                    text.replace(&rewritten, ContentType::Text);
+                }
+                Ok(())
+            }
+        }));
+    }
+
     if config.nextjs_enabled && !nextjs_attributes.is_empty() {
         element_content_handlers.push(text!("script#__NEXT_DATA__", {
             let patterns = patterns.clone();
@@ -394,6 +440,21 @@ mod tests {
     use crate::tsjs;
     use std::io::Cursor;
 
+    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
+
+    struct MockBundleGuard;
+
+    fn mock_testlight_bundle() -> MockBundleGuard {
+        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
+        MockBundleGuard
+    }
+
+    impl Drop for MockBundleGuard {
+        fn drop(&mut self) {
+            tsjs::clear_mock_integration_bundles();
+        }
+    }
+
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
@@ -403,6 +464,7 @@ mod tests {
             integrations: IntegrationRegistry::default(),
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            integration_assets: Vec::new(),
         }
     }
 
@@ -751,20 +813,24 @@ mod tests {
         use serde_json::json;
 
         let html = r#"<html><head>
-            <script src="https://cdn.starlight.com/v1/starlight.js"></script>
+            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
         </head><body></body></html>"#;
 
+        let _bundle_guard = mock_testlight_bundle();
         let mut settings = Settings::default();
-        let shim_src = tsjs::script_src("tsjs-starlight.js")
-            .expect("Starlight tsjs bundle should exist for tests");
-        settings.integrations.insert(
-            "starlight".to_string(),
-            json!({
-                "endpoint": "https://example.com/openrtb2/auction",
-                "rewrite_scripts": true,
-                "shim_src": shim_src,
-            }),
-        );
+        let shim_src = tsjs::integration_script_src("testlight");
+        settings
+            .integrations
+            .insert_config(
+                "testlight",
+                &json!({
+                    "enabled": true,
+                    "endpoint": "https://example.com/openrtb2/auction",
+                    "rewrite_scripts": true,
+                    "shim_src": shim_src,
+                }),
+            )
+            .expect("should insert testlight config");
 
         let registry = IntegrationRegistry::new(&settings);
         let mut config = create_test_config();
@@ -783,13 +849,13 @@ mod tests {
         assert!(result.is_ok());
 
         let processed = String::from_utf8_lossy(&output);
-        let expected_src = tsjs::script_src("tsjs-starlight.js").expect("tsjs bundle missing");
+        let expected_src = tsjs::integration_script_src("testlight");
         assert!(
             processed.contains(&expected_src),
             "Integration shim should replace integration script reference"
         );
         assert!(
-            !processed.contains("cdn.starlight.com"),
+            !processed.contains("cdn.testlight.com"),
             "Original integration URL should be removed"
         );
     }

@@ -1,17 +1,17 @@
 # Integration Guide
 
 This document explains how to integrate a new integration module with the Trusted Server
-runtime. The workflow mirrors the built‑in `starlight` sample in
-`crates/common/src/integrations/starlight.rs`.
+runtime. The workflow mirrors the built‑in `testlight` sample in
+`crates/common/src/integrations/testlight.rs`.
 
 ## Architecture Overview
 
-| Component | Purpose |
-| --- | --- |
-| `crates/common/src/integrations/registry.rs` | Defines the `IntegrationProxy` and `IntegrationAttributeRewriter` traits and hosts the `IntegrationRegistry`, which drives proxy routing and HTML rewrites. |
-| `Settings::integrations` (`crates/common/src/settings.rs`) | Free‑form JSON blob keyed by integration ID. Each module deserializes its own config so the core settings schema stays stable. |
-| Fastly entrypoint (`crates/fastly/src/main.rs`) | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware. |
-| `html_processor.rs` | Applies first‑party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs). |
+| Component                                                  | Purpose                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/common/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, and `IntegrationScriptRewriter` traits and hosts the `IntegrationRegistry`, which drives proxy routing and HTML/text rewrites.                                                               |
+| `Settings::integrations` (`crates/common/src/settings.rs`) | Free‑form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
+| Fastly entrypoint (`crates/fastly/src/main.rs`)            | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
+| `html_processor.rs`                                        | Applies first‑party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
 
 ## Step-by-Step Integration
 
@@ -31,27 +31,81 @@ rewrite_scripts = true
 ### 2. Create the integration module
 
 Add a module under `crates/common/src/integrations/<id>/mod.rs` (see
-`crates/common/src/integrations/starlight.rs` for reference) and expose it in
+`crates/common/src/integrations/testlight.rs` for reference) and expose it in
 `crates/common/src/integrations/mod.rs`.
 
 Key pieces:
 
 ```rust
-#[derive(Deserialize)]
-struct MyIntegrationConfig { /* … */ }
+#[derive(Deserialize, Validate)]
+struct MyIntegrationConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    // …
+}
+
+impl IntegrationConfig for MyIntegrationConfig {
+    fn is_enabled(&self) -> bool { self.enabled }
+}
 
 pub struct MyIntegration {
     config: MyIntegrationConfig,
 }
 
 pub fn build(settings: &Settings) -> Option<Arc<MyIntegration>> {
-    let raw = settings.integration_config("my_integration")?;
-    let config: MyIntegrationConfig = serde_json::from_value(raw.clone()).ok()?;
+    let config = settings
+        .integration_config::<MyIntegrationConfig>("my_integration")
+        .ok()
+        .flatten()?;
     Some(Arc::new(MyIntegration { config }))
+}
+
+// Tests or scaffolding code can seed configs without hand-writing JSON:
+settings
+    .integrations
+    .insert_config(
+        "my_integration",
+        &serde_json::json!({
+            "enabled": true,
+            "endpoint": "https://example.com/api"
+        }),
+    )?;
+```
+
+`Settings::integration_config::<T>` automatically deserializes the raw JSON blob,
+runs [`validator`](https://docs.rs/validator/latest/validator/) on the type, and
+drops configs whose `is_enabled` returns `false`. Always derive/implement
+`Validate` for schema enforcement and implement `IntegrationConfig` (typically
+wrapping a `#[serde(default)] enabled` flag) so operators can toggle
+integrations without code changes.
+
+### 3. Return an `IntegrationRegistration`
+
+Each integration registers itself via a `register` function that returns an
+`IntegrationRegistration`. This object describes which HTTP proxies and HTML
+rewrites the integration exposes:
+
+```rust
+pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
+    let integration = build(settings)?;
+    Some(
+        IntegrationRegistration::builder("my_integration")
+            .with_proxy(integration.clone())
+            .with_attribute_rewriter(integration.clone())
+            .with_script_rewriter(integration)
+            .with_asset("my_integration")
+            .build(),
+    )
 }
 ```
 
-### 3. Implement `IntegrationProxy` for endpoints
+Any combination of the three vectors may be populated. Modules that only need
+HTML rewrites can skip the `proxies` field altogether, and vice versa. The
+registry automatically iterates over the static builder list in
+`crates/common/src/integrations/mod.rs`, so adding the new `register` function
+is enough to make the integration discoverable.
+
+### 4. Implement `IntegrationProxy` for endpoints
 
 Implement the trait from `registry.rs` when your integration needs its own HTTP entrypoint:
 
@@ -81,10 +135,11 @@ already injects Trusted Server logging, headers, and error handling; the handler
 needs to deserialize the request, call the upstream endpoint, and stamp integration-specific
 headers.
 
-### 4. Implement `IntegrationAttributeRewriter` for shims (optional)
+### 5. Implement HTML rewrite hooks (optional)
 
-If the integration needs to rewrite script/link tags or inject HTML, implement the
-`IntegrationAttributeRewriter` trait:
+If the integration needs to rewrite script/link tags or inject HTML, implement
+`IntegrationAttributeRewriter` for attribute mutation and
+`IntegrationScriptRewriter` for inline `<script>` or text content rewrites.
 
 ```rust
 impl IntegrationAttributeRewriter for MyIntegration {
@@ -103,47 +158,63 @@ impl IntegrationAttributeRewriter for MyIntegration {
         // Return Some(new_value) to replace the attribute or None to leave it unchanged.
     }
 }
-```
 
-`html_processor.rs` calls this hook after applying the standard origin→first‑party rewrite,
-so you can simply swap URLs or append query parameters. Use this to point `<script>` tags
-at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-starlight.min.js`).
+impl IntegrationScriptRewriter for MyIntegration {
+    fn integration_id(&self) -> &'static str { "my_integration" }
+    fn selector(&self) -> &'static str { "script#__NEXT_DATA__" }
 
-### 5. Register the module
-
-Update `IntegrationRegistry::new` (`crates/common/src/integrations/registry.rs`) to call your
-`build` helper and push the resulting `Arc` into the `proxies` and/or `html_rewriters`
-collections:
-
-```rust
-if let Some(integration) = crate::integrations::my_integration::build(settings) {
-    inner.proxies.push(integration.clone());
-    inner.html_rewriters.push(integration);
+    fn rewrite(
+        &self,
+        content: &str,
+        ctx: &IntegrationScriptContext<'_>,
+    ) -> Option<String> {
+        // Inspect or mutate inline script payloads.
+    }
 }
 ```
 
-Once registered:
+`html_processor.rs` calls these hooks after applying the standard
+origin→first-party rewrite, so you can simply swap URLs, append query
+parameters, or mutate inline JSON. Use this to point `<script>` tags at your own
+tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to
+rewrite embedded Next.js payloads.
+
+### 6. Register the module
+
+Add the module to `crates/common/src/integrations/mod.rs`'s builder list. The
+registry will call its `register` function automatically. Once registered:
 
 - `crates/fastly/src/main.rs` automatically exposes the declared route(s).
 - `handle_publisher_request` receives the same registry so HTML responses get integration
   shims without further code changes.
+- `IntegrationRegistry::registered_integrations()` exposes a machine-readable summary of
+  hooks for tests, tooling, or diagnostics.
+- Declared assets are injected automatically into `<head>`; the runtime emits
+  `<script async data-tsjs-integration="<name>">` tags for every bundle
+  discovered through `.with_asset(...)`.
 
-### 6. Provide static assets (if needed)
+### 7. Provide static assets (if needed)
 
 Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/integrations/`
-(for example, `crates/js/lib/src/integrations/starlight.ts`). The shared `npm run build`
+(for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build`
 script automatically discovers every file in that directory and produces a bundle named
 `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
-In your Rust module, call `tsjs::script_src("tsjs-<entry>.js")` to obtain the cache-busted
-URL for rewrites (see the Starlight example for reference).
+In your Rust module, call `tsjs::integration_script_src("<entry>")` to obtain the cache-busted
+URL for rewrites (see the Testlight example for reference). Register each bundle with
+`IntegrationRegistration::with_asset("<entry>")` to have the HTML processor inject the
+corresponding `<script>` tag automatically.
 
-### 7. Test locally
+### 8. Test locally
 
 1. Add minimal config (`trusted-server.toml` + `.env.*` overrides).
 2. Run `cargo fmt && cargo clippy --all-targets --all-features`.
 3. Execute targeted tests, e.g. `cargo test -p trusted-server-common html_processor`.
 4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and
    fetch HTML from your origin to confirm rewrites are applied.
+
+For unit tests, `tsjs::mock_integration_bundle("<entry>", "https://example.com/mock.js")`
+can stub bundle URLs; call `tsjs::clear_mock_integration_bundles()` in teardown to avoid
+leaking state between tests.
 
 By following these steps you can ship independent integration modules that plug into the
 Trusted Server runtime without modifying the Fastly entrypoint or HTML processor each

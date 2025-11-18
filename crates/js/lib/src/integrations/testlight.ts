@@ -3,17 +3,17 @@ import { installQueue } from '../core/queue';
 import { log } from '../core/log';
 import { resolvePrebidWindow, PrebidWindow } from '../shared/globals';
 
-type StarlightCallback = () => void;
+type TestlightCallback = () => void;
 
-type StarlightGlobal = {
-  que?: StarlightCallback[];
+type TestlightGlobal = {
+  que?: TestlightCallback[];
 };
 
-type StarlightWindow = PrebidWindow & {
-  starlight?: StarlightGlobal;
+type TestlightWindow = PrebidWindow & {
+  testlight?: TestlightGlobal;
 };
 
-function ensureTsjsApi(win: StarlightWindow): TsjsApi {
+function ensureTsjsApi(win: TestlightWindow): TsjsApi {
   if (win.tsjs) return win.tsjs;
   const stub: TsjsApi = {
     version: '0.0.0',
@@ -26,13 +26,13 @@ function ensureTsjsApi(win: StarlightWindow): TsjsApi {
   return stub;
 }
 
-function installStarlightQueue(api: TsjsApi, win: StarlightWindow): void {
+function installTestlightQueue(api: TsjsApi, win: TestlightWindow): void {
   if (!Array.isArray(api.que)) {
     installQueue(api, win);
   }
 }
 
-function flushCallbacks(queue: StarlightCallback[], api: TsjsApi): void {
+function flushCallbacks(queue: TestlightCallback[], api: TsjsApi): void {
   while (queue.length > 0) {
     const fn = queue.shift();
     if (typeof fn !== 'function') {
@@ -44,25 +44,25 @@ function flushCallbacks(queue: StarlightCallback[], api: TsjsApi): void {
       } else {
         fn.call(api);
       }
-      log.debug('starlight shim: flushed callback');
+      log.debug('testlight shim: flushed callback');
     } catch (err) {
-      log.debug('starlight shim: queued callback threw', err);
+      log.debug('testlight shim: queued callback threw', err);
     }
   }
 }
 
-export function installStarlightShim(): boolean {
-  const win = resolvePrebidWindow() as StarlightWindow;
+export function installTestlightShim(): boolean {
+  const win = resolvePrebidWindow() as TestlightWindow;
   const api = ensureTsjsApi(win);
-  installStarlightQueue(api, win);
+  installTestlightQueue(api, win);
 
-  const starlight = (win.starlight = win.starlight ?? {});
-  const pending: StarlightCallback[] = Array.isArray(starlight.que) ? [...starlight.que] : [];
-  const queue: StarlightCallback[] = [];
-  starlight.que = queue;
+  const testlight = (win.testlight = win.testlight ?? {});
+  const pending: TestlightCallback[] = Array.isArray(testlight.que) ? [...testlight.que] : [];
+  const queue: TestlightCallback[] = [];
+  testlight.que = queue;
 
   const originalPush = queue.push.bind(queue);
-  queue.push = function (...callbacks: StarlightCallback[]): number {
+  queue.push = function (...callbacks: TestlightCallback[]): number {
     const len = originalPush(...callbacks);
     flushCallbacks(queue, api);
     return len;
@@ -72,10 +72,10 @@ export function installStarlightShim(): boolean {
     queue.push(...pending);
   }
 
-  log.info('starlight shim installed', { queuedCallbacks: queue.length });
+  log.info('testlight shim installed', { queuedCallbacks: queue.length });
   return true;
 }
 
 if (typeof window !== 'undefined') {
-  installStarlightShim();
+  installTestlightShim();
 }
