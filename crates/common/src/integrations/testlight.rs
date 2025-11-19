@@ -200,6 +200,10 @@ impl IntegrationAttributeRewriter for TestlightIntegration {
 
         let lowered = attr_value.to_ascii_lowercase();
         if lowered.contains("testlight.js") {
+            // TODO: need a way to remove the whole script tag
+            // None will still load external script Some will only rewrite attr
+            // but testlight script is now backed into the unified build
+            // for now this is loading the unified js again.
             Some(self.config.shim_src.clone())
         } else {
             None

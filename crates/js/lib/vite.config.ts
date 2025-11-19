@@ -16,11 +16,9 @@ function createModuleDiscoveryPlugin(): Plugin {
       const integrationsDir = path.join(srcDir, 'integrations');
 
       // Read TSJS_MODULES env var: creative,ext,testlight
-      // - If not set: include all integrations (default behavior)
-      // - If set to empty string: core only
+      // - If not set or empty string: include all integrations (default behavior)
       // - If set to comma-separated list: include only those integrations
       const modulesEnv = process.env.TSJS_MODULES;
-      const useAllIntegrations = modulesEnv === undefined;
       const requestedModules = (modulesEnv || '')
         .split(',')
         .map((s) => s.trim())
@@ -44,17 +42,16 @@ function createModuleDiscoveryPlugin(): Plugin {
       const finalModules = ['core'];
 
       // Add requested integrations based on TSJS_MODULES env var
-      if (useAllIntegrations) {
-        // TSJS_MODULES not set: include all discovered integrations
+      if (requestedModules.length === 0) {
+        // TSJS_MODULES not set or empty: include all discovered integrations
         finalModules.push(...integrationModules);
-      } else if (requestedModules.length > 0) {
+      } else {
         // TSJS_MODULES set to list: include only requested integrations (excluding 'core' as it's always added)
         const requestedIntegrations = requestedModules.filter((m) => m !== 'core');
         finalModules.push(
           ...integrationModules.filter((m) => requestedIntegrations.includes(m))
         );
       }
-      // else: TSJS_MODULES set to empty string: core only (finalModules already has just 'core')
 
       // Generate import statements
       // Use namespace imports to capture all exports from each module
