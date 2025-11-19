@@ -35,7 +35,7 @@ for (const [moduleName, moduleExports] of Object.entries(modules)) {
     // Log that the module is available
     log.debug(`tsjs: module '${moduleName}' loaded`);
 
-    // Some modules like 'ext' and 'permutive' are self-initializing (they run on import)
+    // Some modules like 'ext' are self-initializing (they run on import)
     // Some modules like 'creative' export an API object
     // We don't need to do anything special here - just importing them is enough
   }

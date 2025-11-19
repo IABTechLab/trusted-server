@@ -435,7 +435,6 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        // Should inject unified bundle (includes core + ext + creative + permutive)
         assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
         // Prebid script references should be removed when auto-configure is on
         assert!(!processed.contains("prebid.min.js"));

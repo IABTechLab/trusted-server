@@ -301,7 +301,6 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
         HtmlSettings {
             element_content_handlers: vec![
                 // Inject unified tsjs bundle at the top of body once
-                // This includes core + creative guards + ext + permutive modules
                 element!("body", {
                     let injected = injected_ts_creative.clone();
                     move |el| {
