@@ -328,7 +328,7 @@ impl IntegrationRegistry {
         for (integration_id, asset) in &self.inner.assets {
             let entry = map
                 .entry(*integration_id)
-                .or_insert_with(|| IntegrationMetadata::new(*integration_id));
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
             entry.assets.push(asset.clone());
         }
 
