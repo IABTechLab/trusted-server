@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { shouldProxyExternalUrl, signProxyUrl } from '../../src/creative/proxy_sign';
+import { shouldProxyExternalUrl, signProxyUrl } from '../../../src/integrations/creative/proxy_sign';
 
 const ORIGINAL_FETCH = global.fetch;
 

@@ -13,39 +13,48 @@ function createModuleDiscoveryPlugin(): Plugin {
     name: 'tsjs-module-discovery',
     buildStart() {
       const srcDir = path.resolve(__dirname, 'src');
+      const integrationsDir = path.join(srcDir, 'integrations');
 
-      // Read TSJS_MODULES env var: core,ext,creative,permutive
-      const modulesEnv = process.env.TSJS_MODULES || '';
-      const requestedModules = modulesEnv
+      // Read TSJS_MODULES env var: creative,ext,testlight
+      // - If not set: include all integrations (default behavior)
+      // - If set to empty string: core only
+      // - If set to comma-separated list: include only those integrations
+      const modulesEnv = process.env.TSJS_MODULES;
+      const useAllIntegrations = modulesEnv === undefined;
+      const requestedModules = (modulesEnv || '')
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
 
-      // Auto-discover all directories in src/ that contain index.ts
-      const allDirs = fs
-        .readdirSync(srcDir)
-        .filter((name) => {
-          const fullPath = path.join(srcDir, name);
-          const stat = fs.statSync(fullPath);
-          return stat.isDirectory();
-        });
+      // Discover integration modules: directories in src/integrations/ with index.ts
+      const integrationModules = fs.existsSync(integrationsDir)
+        ? fs
+            .readdirSync(integrationsDir)
+            .filter((name) => {
+              const fullPath = path.join(integrationsDir, name);
+              const stat = fs.statSync(fullPath);
+              return (
+                stat.isDirectory() &&
+                fs.existsSync(path.join(fullPath, 'index.ts'))
+              );
+            })
+        : [];
 
-      // Find modules: directories with index.ts, excluding 'shared'
-      const discoveredModules = allDirs.filter((folder) => {
-        if (folder === 'shared') return false; // Skip utility folder
-        return fs.existsSync(path.join(srcDir, folder, 'index.ts'));
-      });
+      // Always include core first
+      const finalModules = ['core'];
 
-      // Filter by requested modules (if specified), otherwise include all
-      const finalModules =
-        requestedModules.length > 0
-          ? discoveredModules.filter((folder) => requestedModules.includes(folder))
-          : discoveredModules;
-
-      // Always ensure 'core' is included if it exists
-      if (discoveredModules.includes('core') && !finalModules.includes('core')) {
-        finalModules.unshift('core');
+      // Add requested integrations based on TSJS_MODULES env var
+      if (useAllIntegrations) {
+        // TSJS_MODULES not set: include all discovered integrations
+        finalModules.push(...integrationModules);
+      } else if (requestedModules.length > 0) {
+        // TSJS_MODULES set to list: include only requested integrations (excluding 'core' as it's always added)
+        const requestedIntegrations = requestedModules.filter((m) => m !== 'core');
+        finalModules.push(
+          ...integrationModules.filter((m) => requestedIntegrations.includes(m))
+        );
       }
+      // else: TSJS_MODULES set to empty string: core only (finalModules already has just 'core')
 
       // Generate import statements
       // Use namespace imports to capture all exports from each module
@@ -53,7 +62,13 @@ function createModuleDiscoveryPlugin(): Plugin {
       const exportEntries: string[] = [];
 
       for (const moduleName of finalModules) {
-        importLines.push(`import * as ${moduleName} from './${moduleName}/index';`);
+        if (moduleName === 'core') {
+          importLines.push(`import * as core from './core/index';`);
+        } else {
+          importLines.push(
+            `import * as ${moduleName} from './integrations/${moduleName}/index';`
+          );
+        }
         exportEntries.push(`  ${moduleName},`);
       }
 
@@ -73,7 +88,7 @@ export type ModuleName = ${finalModules.map((m) => `'${m}'`).join(' | ')};
       fs.writeFileSync(generatedFilePath, output);
 
       console.log('[tsjs-module-discovery] Generated src/generated-modules.ts');
-      console.log('[tsjs-module-discovery] Discovered modules:', discoveredModules);
+      console.log('[tsjs-module-discovery] Discovered integrations:', integrationModules);
       console.log('[tsjs-module-discovery] Included modules:', finalModules);
     },
   };

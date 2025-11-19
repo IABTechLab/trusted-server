@@ -26,6 +26,10 @@ pub fn bundle_for_filename(name: &str) -> Option<&'static str> {
     TsjsBundle::from_filename(name).map(|bundle| bundle.bundle())
 }
 
+pub fn bundle_hash_for_filename(name: &str) -> Option<String> {
+    TsjsBundle::from_filename(name).map(|bundle| hash_bundle(bundle.bundle()))
+}
+
 fn hash_bundle(bundle: &'static str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bundle.as_bytes());

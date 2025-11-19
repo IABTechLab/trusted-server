@@ -1,5 +1,5 @@
-import { log } from '../core/log';
-import { createMutationScheduler } from '../shared/scheduler';
+import { log } from '../../core/log';
+import { createMutationScheduler } from '../../shared/scheduler';
 
 type ElementWithSrc = Element & { src: string };
 

@@ -1,4 +1,4 @@
-import { log } from '../core/log';
+import { log } from '../../core/log';
 
 const PROXY_PREFIX = '/first-party/proxy';
 
