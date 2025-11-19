@@ -13,12 +13,6 @@ proxy_secret = "change-me-proxy-secret"
 enabled = false
 rewrite_attributes = ["href", "link", "url"]
 
-[prebid]
-server_url = "http://68.183.113.79:8000"
-timeout_ms = 1000
-bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = false
-debug = false
 
 [synthetic]
 counter_store = "counter_store"
@@ -43,6 +37,14 @@ X-Custom-Header = "custom header value"
 enabled = false  # Set to true to enable request signing
 config_store_id = "<fastly-config-store-id>" # set config/secret store ids for key rotation
 secret_store_id = "<fastly-secret-store-id>"
+
+[integrations.prebid]
+enabled = true
+server_url = "http://68.183.113.79:8000"
+timeout_ms = 1000
+bidders = ["kargo", "rubicon", "appnexus", "openx"]
+auto_configure = false
+debug = false
 
 [integrations.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"

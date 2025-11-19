@@ -220,6 +220,55 @@ By following these steps you can ship independent integration modules that plug 
 Trusted Server runtime without modifying the Fastly entrypoint or HTML processor each
 time.
 
+## Existing integrations
+
+Two built-in integrations demonstrate how the framework pieces fit together:
+
+| Integration | Purpose                                                                                                                                                                                  | Key files                                                                                    |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                   | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
+| `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and auto-configures TSJS to load the shim. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
+
+### Example: Prebid integration
+
+Prebid applies the same steps outlined above with a few notable patterns:
+
+1. **Typed configuration** – `PrebidIntegrationConfig` lives alongside the integration module
+   (`crates/common/src/integrations/prebid.rs`), implements `IntegrationConfig + Validate`, and
+   exposes an `enabled` flag so operators can toggle it without code changes. Configuration lives
+   under `[integrations.prebid]`:
+
+   ```toml
+   [integrations.prebid]
+   enabled = true
+   server_url = "https://prebid.example/openrtb2/auction"
+   timeout_ms = 1200
+   bidders = ["equativ", "sampleBidder"]
+   auto_configure = true
+   ```
+
+   Tests or scaffolding can inject configs by calling
+   `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that
+   other integrations use.
+
+2. **Routes owned by the integration** – `IntegrationProxy::routes` declares the legacy
+   `/first-party/ad` (GET) and `/third-party/ad` (POST) endpoints. Both handlers share helpers that
+   shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via
+   `ensure_backend_from_url`, and run the HTML creative rewrites before responding.
+
+3. **HTML rewrites through the registry** – When `auto_configure` is enabled, the integration’s
+   `IntegrationAttributeRewriter` swaps any `<script src="prebid*.js">` references with
+   `tsjs::ext_script_src()` (the TSJS shim). This removes the need for an `enable_prebid` flag in
+   `html_processor.rs` and keeps the pipeline generic.
+
+4. **TSJS assets & testing** – The shim implementation lives in
+   `crates/js/lib/src/ext/prebidjs.ts`. Rust integration tests that expect the bundle can use
+   `tsjs::mock_integration_bundle("prebid", "https://example.com/mock-prebid.js")` to avoid pulling
+   in real assets.
+
+Reusing these patterns makes it straightforward to convert additional legacy flows (for example,
+Next.js rewrites) into first-class integrations.
+
 ## Future Improvements
 
 We plan to expand integration capabilities in several areas:
