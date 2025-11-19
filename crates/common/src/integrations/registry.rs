@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -163,16 +163,13 @@ impl IntegrationRegistrationBuilder {
     }
 }
 
-struct RegisteredRoute {
-    method: Method,
-    path: &'static str,
-    proxy: Arc<dyn IntegrationProxy>,
-    integration_id: &'static str,
-}
+type RouteKey = (Method, String);
+type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
 
 #[derive(Default)]
 struct IntegrationRegistryInner {
-    routes: Vec<RegisteredRoute>,
+    route_map: HashMap<RouteKey, RouteValue>,
+    routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     assets: Vec<(&'static str, String)>,
@@ -215,12 +212,20 @@ impl IntegrationRegistry {
             if let Some(registration) = builder(settings) {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
-                        inner.routes.push(RegisteredRoute {
-                            method: route.method.clone(),
-                            path: route.path,
-                            proxy: proxy.clone(),
-                            integration_id: registration.integration_id,
-                        });
+                        if inner
+                            .route_map
+                            .insert(
+                                (route.method.clone(), route.path.to_string()),
+                                (proxy.clone(), registration.integration_id),
+                            )
+                            .is_some()
+                        {
+                            panic!(
+                                "Integration route collision detected for {} {}",
+                                route.method, route.path
+                            );
+                        }
+                        inner.routes.push((route, registration.integration_id));
                     }
                 }
                 inner
@@ -246,9 +251,8 @@ impl IntegrationRegistry {
     /// Return true when any proxy is registered for the provided route.
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.inner
-            .routes
-            .iter()
-            .any(|r| r.method == method && r.path == path)
+            .route_map
+            .contains_key(&(method.clone(), path.to_string()))
     }
 
     /// Dispatch a proxy request when an integration handles the path.
@@ -259,12 +263,15 @@ impl IntegrationRegistry {
         settings: &Settings,
         req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
-        for route in &self.inner.routes {
-            if route.method == method && route.path == path {
-                return Some(route.proxy.handle(settings, req).await);
-            }
+        if let Some((proxy, _)) = self
+            .inner
+            .route_map
+            .get(&(method.clone(), path.to_string()))
+        {
+            Some(proxy.handle(settings, req).await)
+        } else {
+            None
         }
-        None
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
@@ -302,10 +309,10 @@ impl IntegrationRegistry {
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
-        for route in &self.inner.routes {
+        for (route, integration_id) in &self.inner.routes {
             let entry = map
-                .entry(route.integration_id)
-                .or_insert_with(|| IntegrationMetadata::new(route.integration_id));
+                .entry(*integration_id)
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
             entry
                 .routes
                 .push(IntegrationEndpoint::new(route.method.clone(), route.path));
