@@ -21,13 +21,12 @@ pub enum TsjsBundle {
     Unified,
 }
 
-const METAS: [TsjsMeta; TSJS_BUNDLE_COUNT] = [
-    TsjsMeta::new("tsjs-unified.js", include_str!(concat!(env!("OUT_DIR"), "/tsjs-unified.js"))),
-];
+const METAS: [TsjsMeta; TSJS_BUNDLE_COUNT] = [TsjsMeta::new(
+    "tsjs-unified.js",
+    include_str!(concat!(env!("OUT_DIR"), "/tsjs-unified.js")),
+)];
 
-const ALL_BUNDLES: [TsjsBundle; TSJS_BUNDLE_COUNT] = [
-    TsjsBundle::Unified,
-];
+const ALL_BUNDLES: [TsjsBundle; TSJS_BUNDLE_COUNT] = [TsjsBundle::Unified];
 
 impl TsjsBundle {
     pub const COUNT: usize = TSJS_BUNDLE_COUNT;
@@ -49,7 +48,8 @@ impl TsjsBundle {
     }
 
     pub(crate) fn filename_map() -> &'static std::collections::HashMap<&'static str, TsjsBundle> {
-        static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, TsjsBundle>> = std::sync::OnceLock::new();
+        static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, TsjsBundle>> =
+            std::sync::OnceLock::new();
 
         MAP.get_or_init(|| {
             ALL_BUNDLES

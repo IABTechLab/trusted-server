@@ -81,13 +81,7 @@ fn main() {
     copy_bundle(UNIFIED_BUNDLE, true, &crate_dir, &dist_dir, &out_dir);
 }
 
-fn copy_bundle(
-    filename: &str,
-    required: bool,
-    crate_dir: &Path,
-    dist_dir: &Path,
-    out_dir: &Path,
-) {
+fn copy_bundle(filename: &str, required: bool, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
     let primary = dist_dir.join(filename);
     let fallback = crate_dir.join("dist").join(filename);
     let target = out_dir.join(filename);
