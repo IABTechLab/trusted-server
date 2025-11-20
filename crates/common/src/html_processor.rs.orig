@@ -141,11 +141,23 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut href) = el.get_attribute("href") {
                     let original_href = href.clone();
+<<<<<<< HEAD
                     let new_href = href
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url());
                     if new_href != href {
                         href = new_href;
+=======
+                    if rewrite_prebid && is_prebid_script_url(&href) {
+                        el.remove();
+                    } else {
+                        let new_href = href
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url());
+                        if new_href != href {
+                            href = new_href;
+                        }
+>>>>>>> feature/standardize-integrations
                     }
 
                     if let Some(integration_href) = integrations.rewrite_attribute(
@@ -175,11 +187,23 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut src) = el.get_attribute("src") {
                     let original_src = src.clone();
+<<<<<<< HEAD
                     let new_src = src
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url());
                     if new_src != src {
                         src = new_src;
+=======
+                    if rewrite_prebid && is_prebid_script_url(&src) {
+                        el.remove();
+                    } else {
+                        let new_src = src
+                            .replace(&patterns.https_origin(), &patterns.replacement_url())
+                            .replace(&patterns.http_origin(), &patterns.replacement_url());
+                        if new_src != src {
+                            src = new_src;
+                        }
+>>>>>>> feature/standardize-integrations
                     }
 
                     if let Some(integration_src) = integrations.rewrite_attribute(
@@ -378,25 +402,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 mod tests {
     use super::*;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+<<<<<<< HEAD
     use crate::test_support::tests::create_test_settings;
     use crate::tsjs;
     use serde_json::json;
+=======
+>>>>>>> feature/standardize-integrations
     use std::io::Cursor;
-
-    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
-
-    struct MockBundleGuard;
-
-    fn mock_testlight_bundle() -> MockBundleGuard {
-        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
-        MockBundleGuard
-    }
-
-    impl Drop for MockBundleGuard {
-        fn drop(&mut self) {
-            tsjs::clear_mock_integration_bundles();
-        }
-    }
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
@@ -406,10 +418,10 @@ mod tests {
             integrations: IntegrationRegistry::default(),
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
-            integration_assets: Vec::new(),
         }
     }
 
+<<<<<<< HEAD
     fn config_from_settings(
         settings: &Settings,
         registry: &IntegrationRegistry,
@@ -421,15 +433,69 @@ mod tests {
             "test.example.com",
             "https",
         )
-    }
-
+=======
     #[test]
-    fn test_always_injects_tsjs_script() {
+    fn test_injects_unified_bundle_and_removes_prebid_refs() {
         let html = r#"<html><head>
             <script src="/js/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
         </head><body></body></html>"#;
 
+        let mut config = create_test_config();
+        config.enable_prebid = true; // enable removal of Prebid URLs
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
+        // Prebid script references should be removed when auto-configure is on
+        assert!(!processed.contains("prebid.min.js"));
+        assert!(!processed.contains("cdn.prebid.org/prebid.js"));
+    }
+
+    #[test]
+    fn test_injects_unified_bundle_and_removes_prebid_with_query_string() {
+        let html = r#"<html><head>
+            <script src="/wp-content/plugins/prebidjs/js/prebidjs.min.js?v=1.2.3"></script>
+        </head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.enable_prebid = true; // enable removal of Prebid URLs
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        // Should inject unified bundle
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
+        // Prebid script should be removed
+        assert!(!processed.contains("prebidjs.min.js"));
+>>>>>>> feature/standardize-integrations
+    }
+
+    #[test]
+    fn test_always_injects_unified_bundle() {
+        let html = r#"<html><head>
+            <script src="/js/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+<<<<<<< HEAD
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -447,6 +513,10 @@ mod tests {
             .expect("should update prebid config");
         let registry = IntegrationRegistry::new(&settings);
         let config = config_from_settings(&settings, &registry);
+=======
+        let mut config = create_test_config();
+        config.enable_prebid = false; // When disabled, don't remove Prebid scripts
+>>>>>>> feature/standardize-integrations
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -459,10 +529,11 @@ mod tests {
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
         assert!(result.is_ok());
         let processed = String::from_utf8_lossy(&output);
-        // When auto-configure is disabled, do not rewrite Prebid references
+        // When auto-configure is disabled, do not remove Prebid references
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+        // But still inject unified bundle
+        assert!(processed.contains("/static/tsjs=tsjs-unified.min.js"));
     }
 
     #[test]
@@ -630,10 +701,10 @@ mod tests {
     #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings);
+        let integrations = IntegrationRegistry::default();
         let config = HtmlProcessorConfig::from_settings(
             &settings,
-            &registry,
+            &integrations,
             "origin.test-publisher.com",
             "proxy.example.com",
             "https",
@@ -721,58 +792,6 @@ mod tests {
         assert!(
             !result.contains("window.__trustedServerPrebid"),
             "HtmlProcessor should not inject Prebid config"
-        );
-    }
-
-    #[test]
-    fn test_integration_registry_rewrites_integration_scripts() {
-        use serde_json::json;
-
-        let html = r#"<html><head>
-            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
-        </head><body></body></html>"#;
-
-        let _bundle_guard = mock_testlight_bundle();
-        let mut settings = Settings::default();
-        let shim_src = tsjs::integration_script_src("testlight");
-        settings
-            .integrations
-            .insert_config(
-                "testlight",
-                &json!({
-                    "enabled": true,
-                    "endpoint": "https://example.com/openrtb2/auction",
-                    "rewrite_scripts": true,
-                    "shim_src": shim_src,
-                }),
-            )
-            .expect("should insert testlight config");
-
-        let registry = IntegrationRegistry::new(&settings);
-        let mut config = create_test_config();
-        config.integrations = registry;
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-
-        let processed = String::from_utf8_lossy(&output);
-        let expected_src = tsjs::integration_script_src("testlight");
-        assert!(
-            processed.contains(&expected_src),
-            "Integration shim should replace integration script reference"
-        );
-        assert!(
-            !processed.contains("cdn.testlight.com"),
-            "Original integration URL should be removed"
         );
     }
 
@@ -968,4 +987,3 @@ mod tests {
         );
     }
 }
-

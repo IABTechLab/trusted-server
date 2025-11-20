@@ -1,10 +1,9 @@
 use std::env;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const REQUIRED_BUNDLES: &[&str] = &["tsjs-core.js", "tsjs-ext.js", "tsjs-creative.js"];
+const UNIFIED_BUNDLE: &str = "tsjs-unified.js";
 
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under ts/
@@ -61,11 +60,15 @@ fn main() {
             .status();
     }
 
-    // Build bundle
+    // Build unified bundle
     if !skip {
         if let Some(npm_path) = npm.clone() {
-            let status = Command::new(npm_path)
-                .args(["run", "build"])
+            println!("cargo:warning=tsjs: Building unified bundle");
+            let js_modules = env::var("TSJS_MODULES").unwrap_or("".to_string());
+
+            let status = Command::new(&npm_path)
+                .env("TSJS_MODULES", js_modules)
+                .args(["run", "build:custom"])
                 .current_dir(&ts_dir)
                 .status();
             if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
@@ -74,29 +77,34 @@ fn main() {
         }
     }
 
-    // Copy the result into OUT_DIR for include_str!
-    let bundle_files = discover_bundles(&dist_dir);
-    ensure_required_bundles(&bundle_files);
-    copy_bundles(&bundle_files, &dist_dir, &out_dir);
-    generate_manifest(&bundle_files, &out_dir);
+    // Copy unified bundle into OUT_DIR for include_str!
+    copy_bundle(UNIFIED_BUNDLE, true, &crate_dir, &dist_dir, &out_dir);
 }
 
-fn discover_bundles(dist_dir: &Path) -> Vec<String> {
-    let mut bundles = Vec::new();
-    let entries = match fs::read_dir(dist_dir) {
-        Ok(entries) => entries,
-        Err(_) => return bundles,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("js") {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                bundles.push(name.to_string());
+fn copy_bundle(filename: &str, required: bool, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
+    let primary = dist_dir.join(filename);
+    let fallback = crate_dir.join("dist").join(filename);
+    let target = out_dir.join(filename);
+
+    for source in [&primary, &fallback] {
+        if source.exists() {
+            if let Err(e) = fs::copy(source, &target) {
+                if required {
+                    panic!("tsjs: failed to copy {:?} to {:?}: {}", source, target, e);
+                }
             }
+            return;
         }
     }
-    bundles.sort();
-    bundles
+
+    if required {
+        panic!(
+            "tsjs: bundle {} not found: {:?} (and fallback {:?}). Ensure Node is installed and `npm run build` succeeds, or commit dist/{}.",
+            filename, primary, fallback, filename
+        );
+    }
+
+    let _ = fs::write(&target, "");
 }
 
 fn watch_dir_recursively(root: &Path) {
@@ -120,41 +128,4 @@ fn watch_dir_recursively(root: &Path) {
             }
         }
     }
-}
-
-fn ensure_required_bundles(bundles: &[String]) {
-    for required in REQUIRED_BUNDLES {
-        if !bundles.iter().any(|bundle| bundle == required) {
-            panic!("tsjs: required bundle {} not found in dist/", required);
-        }
-    }
-}
-
-fn copy_bundles(bundles: &[String], dist_dir: &Path, out_dir: &Path) {
-    for bundle in bundles {
-        let source = dist_dir.join(bundle);
-        let target = out_dir.join(bundle);
-        if let Err(e) = fs::copy(&source, &target) {
-            panic!(
-                "tsjs: failed to copy bundle {:?} to {:?}: {}",
-                source, target, e
-            );
-        }
-    }
-}
-
-fn generate_manifest(bundles: &[String], out_dir: &Path) {
-    let manifest_path = out_dir.join("bundle_manifest.rs");
-    let mut file = File::create(&manifest_path)
-        .unwrap_or_else(|e| panic!("tsjs: failed to create manifest: {}", e));
-    writeln!(&mut file, "pub const BUNDLES: &[(&str, &str)] = &[").unwrap();
-    for bundle in bundles {
-        writeln!(
-            &mut file,
-            "    (\"{name}\", include_str!(concat!(env!(\"OUT_DIR\"), \"/{name}\"))),",
-            name = bundle
-        )
-        .unwrap();
-    }
-    writeln!(&mut file, "];").unwrap();
 }
