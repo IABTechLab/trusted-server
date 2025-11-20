@@ -1,16 +1,9 @@
 // Unified tsjs bundle entry point
 // This file conditionally imports modules based on build-time configuration
-import type { TsjsApi } from './core/types';
 import { modules, type ModuleName } from './generated-modules';
 import { log } from './core/log';
 
 const VERSION = '0.1.0-unified';
-
-// Ensure we have a window object
-const w: Window & { tsjs?: TsjsApi } =
-  ((globalThis as unknown as { window?: Window }).window as Window & {
-    tsjs?: TsjsApi;
-  }) || ({} as Window & { tsjs?: TsjsApi });
 
 // Log which modules are included in this build
 const includedModules = Object.keys(modules) as ModuleName[];

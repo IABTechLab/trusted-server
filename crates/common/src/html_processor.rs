@@ -8,7 +8,8 @@ use lol_html::{element, html_content::ContentType, text, Settings as RewriterSet
 use regex::Regex;
 
 use crate::integrations::{
-    IntegrationAttributeContext, IntegrationRegistry, IntegrationScriptContext,
+    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
+    IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -148,7 +149,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         href = new_href;
                     }
 
-                    if let Some(integration_href) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "href",
                         &href,
                         &IntegrationAttributeContext {
@@ -158,7 +159,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        href = integration_href;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_href) => {
+                            href = integration_href;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if href != original_href {
@@ -181,8 +189,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if new_src != src {
                         src = new_src;
                     }
-
-                    if let Some(integration_src) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "src",
                         &src,
                         &IntegrationAttributeContext {
@@ -192,7 +199,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        src = integration_src;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_src) => {
+                            src = integration_src;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if src != original_src {
@@ -216,7 +230,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         action = new_action;
                     }
 
-                    if let Some(integration_action) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "action",
                         &action,
                         &IntegrationAttributeContext {
@@ -226,7 +240,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        action = integration_action;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_action) => {
+                            action = integration_action;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if action != original_action {
@@ -255,7 +276,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         srcset = new_srcset;
                     }
 
-                    if let Some(integration_srcset) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "srcset",
                         &srcset,
                         &IntegrationAttributeContext {
@@ -265,7 +286,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        srcset = integration_srcset;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_srcset) => {
+                            srcset = integration_srcset;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if srcset != original_srcset {
@@ -293,7 +321,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         imagesrcset = new_imagesrcset;
                     }
 
-                    if let Some(integration_imagesrcset) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "imagesrcset",
                         &imagesrcset,
                         &IntegrationAttributeContext {
@@ -303,7 +331,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        imagesrcset = integration_imagesrcset;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_imagesrcset) => {
+                            imagesrcset = integration_imagesrcset;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if imagesrcset != original_imagesrcset {
@@ -329,8 +364,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     request_scheme: &patterns.request_scheme,
                     origin_host: &patterns.origin_host,
                 };
-                if let Some(rewritten) = rewriter.rewrite(text.as_str(), &ctx) {
-                    text.replace(&rewritten, ContentType::Text);
+                match rewriter.rewrite(text.as_str(), &ctx) {
+                    ScriptRewriteAction::Keep => {}
+                    ScriptRewriteAction::Replace(rewritten) => {
+                        text.replace(&rewritten, ContentType::Text);
+                    }
+                    ScriptRewriteAction::RemoveNode => {
+                        text.remove();
+                    }
                 }
                 Ok(())
             }
@@ -377,26 +418,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::{
+        AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
-    use crate::tsjs;
     use serde_json::json;
     use std::io::Cursor;
-
-    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
-
-    struct MockBundleGuard;
-
-    fn mock_testlight_bundle() -> MockBundleGuard {
-        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
-        MockBundleGuard
-    }
-
-    impl Drop for MockBundleGuard {
-        fn drop(&mut self) {
-            tsjs::clear_mock_integration_bundles();
-        }
-    }
+    use std::sync::Arc;
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
@@ -406,7 +435,6 @@ mod tests {
             integrations: IntegrationRegistry::default(),
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
-            integration_assets: Vec::new(),
         }
     }
 
@@ -462,7 +490,111 @@ mod tests {
         // When auto-configure is disabled, do not rewrite Prebid references
         assert!(processed.contains("/js/prebid.min.js"));
         assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("/static/tsjs=tsjs-core.min.js"));
+        assert!(processed.contains("tsjs-unified"));
+    }
+
+    #[test]
+    fn prebid_auto_config_removes_prebid_scripts() {
+        let html = r#"<html><head>
+            <script src="https://cdn.prebid.org/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "auto_configure": true,
+                    "debug": false
+                }),
+            )
+            .expect("should update prebid config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains("tsjs-unified"),
+            "Unified bundle should be injected"
+        );
+        assert!(
+            !processed.contains("prebid.min.js"),
+            "Prebid script should be removed"
+        );
+        assert!(
+            !processed.contains("cdn.prebid.org/prebid.js"),
+            "Prebid preload should be removed"
+        );
+    }
+
+    #[test]
+    fn integration_attribute_rewriter_can_remove_elements() {
+        struct RemovingLinkRewriter;
+
+        impl IntegrationAttributeRewriter for RemovingLinkRewriter {
+            fn integration_id(&self) -> &'static str {
+                "removing"
+            }
+
+            fn handles_attribute(&self, attribute: &str) -> bool {
+                attribute == "href"
+            }
+
+            fn rewrite(
+                &self,
+                _attr_name: &str,
+                attr_value: &str,
+                _ctx: &IntegrationAttributeContext<'_>,
+            ) -> AttributeRewriteAction {
+                if attr_value.contains("remove-me") {
+                    AttributeRewriteAction::remove_element()
+                } else {
+                    AttributeRewriteAction::keep()
+                }
+            }
+        }
+
+        let html = r#"<html><body>
+            <a href="https://origin.example.com/remove-me">remove</a>
+            <a href="https://origin.example.com/keep-me">keep</a>
+        </body></html>"#;
+
+        let mut config = create_test_config();
+        config.integrations =
+            IntegrationRegistry::from_rewriters(vec![Arc::new(RemovingLinkRewriter)], Vec::new());
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let processed = String::from_utf8(output).unwrap();
+
+        assert!(processed.contains("keep-me"));
+        assert!(!processed.contains("remove-me"));
     }
 
     #[test]
@@ -726,15 +858,12 @@ mod tests {
 
     #[test]
     fn test_integration_registry_rewrites_integration_scripts() {
-        use serde_json::json;
-
         let html = r#"<html><head>
             <script src="https://cdn.testlight.com/v1/testlight.js"></script>
         </head><body></body></html>"#;
 
-        let _bundle_guard = mock_testlight_bundle();
         let mut settings = Settings::default();
-        let shim_src = tsjs::integration_script_src("testlight");
+        let shim_src = "https://edge.example.com/static/testlight.js".to_string();
         settings
             .integrations
             .insert_config(
@@ -765,9 +894,8 @@ mod tests {
         assert!(result.is_ok());
 
         let processed = String::from_utf8_lossy(&output);
-        let expected_src = tsjs::integration_script_src("testlight");
         assert!(
-            processed.contains(&expected_src),
+            processed.contains(&shim_src),
             "Integration shim should replace integration script reference"
         );
         assert!(
@@ -968,4 +1096,3 @@ mod tests {
         );
     }
 }
-

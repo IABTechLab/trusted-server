@@ -140,6 +140,8 @@ headers.
 If the integration needs to rewrite script/link tags or inject HTML, implement
 `IntegrationAttributeRewriter` for attribute mutation and
 `IntegrationScriptRewriter` for inline `<script>` or text content rewrites.
+Both traits return typed actions (`AttributeRewriteAction`, `ScriptRewriteAction`) so you can
+keep existing markup, swap values, or drop elements entirely.
 
 ```rust
 impl IntegrationAttributeRewriter for MyIntegration {
@@ -154,8 +156,15 @@ impl IntegrationAttributeRewriter for MyIntegration {
         attr_name: &str,
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
-        // Return Some(new_value) to replace the attribute or None to leave it unchanged.
+    ) -> AttributeRewriteAction {
+        if attr_value.contains("cdn.example.com/legacy.js") {
+            // Drop remote script entirely – unified bundle already contains the logic.
+            AttributeRewriteAction::remove_element()
+        } else if attr_name == "src" {
+            AttributeRewriteAction::replace(tsjs::unified_script_src())
+        } else {
+            AttributeRewriteAction::keep()
+        }
     }
 }
 
@@ -167,8 +176,12 @@ impl IntegrationScriptRewriter for MyIntegration {
         &self,
         content: &str,
         ctx: &IntegrationScriptContext<'_>,
-    ) -> Option<String> {
-        // Inspect or mutate inline script payloads.
+    ) -> ScriptRewriteAction {
+        if let Some(rewritten) = try_rewrite_next_payload(content) {
+            ScriptRewriteAction::replace(rewritten)
+        } else {
+            ScriptRewriteAction::keep()
+        }
     }
 }
 ```
@@ -178,6 +191,11 @@ origin→first-party rewrite, so you can simply swap URLs, append query
 parameters, or mutate inline JSON. Use this to point `<script>` tags at your own
 tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to
 rewrite embedded Next.js payloads.
+
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline
+content) removes the element entirely, so integrations can drop publisher-provided markup when the
+Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js`
+because the unified TSJS bundle is injected automatically at the start of `<head>`.
 
 ### 6. Register the module
 
@@ -199,10 +217,9 @@ Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/in
 (for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build`
 script automatically discovers every file in that directory and produces a bundle named
 `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
-In your Rust module, call `tsjs::integration_script_src("<entry>")` to obtain the cache-busted
-URL for rewrites (see the Testlight example for reference). Register each bundle with
-`IntegrationRegistration::with_asset("<entry>")` to have the HTML processor inject the
-corresponding `<script>` tag automatically.
+Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and
+rewrite publisher tags to point at that URL. Others (like Prebid) can simply drop the legacy tag
+because the unified bundle is injected automatically at the start of `<head>`.
 
 ### 8. Test locally
 
@@ -212,9 +229,8 @@ corresponding `<script>` tag automatically.
 4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and
    fetch HTML from your origin to confirm rewrites are applied.
 
-For unit tests, `tsjs::mock_integration_bundle("<entry>", "https://example.com/mock.js")`
-can stub bundle URLs; call `tsjs::clear_mock_integration_bundles()` in teardown to avoid
-leaking state between tests.
+For unit tests, prefer exposing helper constructors that accept a synthetic `shim_src` so your
+tests can point rewriters at a deterministic URL without touching the Tsjs build artifacts.
 
 By following these steps you can ship independent integration modules that plug into the
 Trusted Server runtime without modifying the Fastly entrypoint or HTML processor each
@@ -227,7 +243,7 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 | Integration | Purpose                                                                                                                                                                                  | Key files                                                                                    |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                   | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
-| `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and auto-configures TSJS to load the shim. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
+| `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
 
 ### Example: Prebid integration
 
@@ -257,14 +273,13 @@ Prebid applies the same steps outlined above with a few notable patterns:
    `ensure_backend_from_url`, and run the HTML creative rewrites before responding.
 
 3. **HTML rewrites through the registry** – When `auto_configure` is enabled, the integration’s
-   `IntegrationAttributeRewriter` swaps any `<script src="prebid*.js">` references with
-   `tsjs::ext_script_src()` (the TSJS shim). This removes the need for an `enable_prebid` flag in
-   `html_processor.rs` and keeps the pipeline generic.
+   `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>`
+   references outright. The unified TSJS bundle is injected at the start of `<head>`, so dropping the
+   publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
 
 4. **TSJS assets & testing** – The shim implementation lives in
-   `crates/js/lib/src/ext/prebidjs.ts`. Rust integration tests that expect the bundle can use
-   `tsjs::mock_integration_bundle("prebid", "https://example.com/mock-prebid.js")` to avoid pulling
-   in real assets.
+   `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear,
+   relying on the html processor’s unified bundle injection to deliver the shim.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example,
 Next.js rewrites) into first-class integrations.

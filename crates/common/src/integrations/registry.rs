@@ -9,6 +9,67 @@ use fastly::{Request, Response};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
+/// Action returned by attribute rewriters to describe how the runtime should mutate the element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeRewriteAction {
+    /// Leave the attribute and element untouched.
+    Keep,
+    /// Replace the attribute value with the provided string.
+    Replace(String),
+    /// Remove the entire element from the HTML stream.
+    RemoveElement,
+}
+
+impl AttributeRewriteAction {
+    #[must_use]
+    pub fn keep() -> Self {
+        Self::Keep
+    }
+
+    #[must_use]
+    pub fn replace(value: impl Into<String>) -> Self {
+        Self::Replace(value.into())
+    }
+
+    #[must_use]
+    pub fn remove_element() -> Self {
+        Self::RemoveElement
+    }
+}
+
+/// Outcome returned by the registry after running every matching attribute rewriter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeRewriteOutcome {
+    Unchanged,
+    Replaced(String),
+    RemoveElement,
+}
+
+/// Action returned by inline script rewriters to describe how to mutate the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptRewriteAction {
+    Keep,
+    Replace(String),
+    RemoveNode,
+}
+
+impl ScriptRewriteAction {
+    #[must_use]
+    pub fn keep() -> Self {
+        Self::Keep
+    }
+
+    #[must_use]
+    pub fn replace(value: impl Into<String>) -> Self {
+        Self::Replace(value.into())
+    }
+
+    #[must_use]
+    pub fn remove_node() -> Self {
+        Self::RemoveNode
+    }
+}
+
 /// Context provided to integration HTML attribute rewriters.
 #[derive(Debug)]
 pub struct IntegrationAttributeContext<'a> {
@@ -77,14 +138,14 @@ pub trait IntegrationAttributeRewriter: Send + Sync {
     fn integration_id(&self) -> &'static str;
     /// Return true when this rewriter wants to inspect a given attribute.
     fn handles_attribute(&self, attribute: &str) -> bool;
-    /// Attempt to rewrite the attribute value. Return `Some(new_value)` to
-    /// update the attribute or `None` to keep the original value.
+    /// Attempt to rewrite the attribute value. Return `AttributeRewriteAction::Replace`
+    /// to update the attribute, `Keep` to leave it untouched, or `RemoveElement` to drop the node.
     fn rewrite(
         &self,
         attr_name: &str,
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String>;
+    ) -> AttributeRewriteAction;
 }
 
 /// Trait for integration-provided inline script/text rewrite hooks.
@@ -94,7 +155,7 @@ pub trait IntegrationScriptRewriter: Send + Sync {
     /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
     fn selector(&self) -> &'static str;
     /// Attempt to rewrite the inline text content for the selector.
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> Option<String>;
+    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 
 /// Registration payload returned by integration builders.
@@ -263,23 +324,29 @@ impl IntegrationRegistry {
         attr_name: &str,
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
+    ) -> AttributeRewriteOutcome {
         let mut current = attr_value.to_string();
         let mut changed = false;
         for rewriter in &self.inner.html_rewriters {
             if !rewriter.handles_attribute(attr_name) {
                 continue;
             }
-            if let Some(next_value) = rewriter.rewrite(attr_name, &current, ctx) {
-                current = next_value;
-                changed = true;
+            match rewriter.rewrite(attr_name, &current, ctx) {
+                AttributeRewriteAction::Keep => {}
+                AttributeRewriteAction::Replace(next_value) => {
+                    current = next_value;
+                    changed = true;
+                }
+                AttributeRewriteAction::RemoveElement => {
+                    return AttributeRewriteOutcome::RemoveElement;
+                }
             }
         }
 
         if changed {
-            Some(current)
+            AttributeRewriteOutcome::Replaced(current)
         } else {
-            None
+            AttributeRewriteOutcome::Unchanged
         }
     }
 
@@ -316,5 +383,20 @@ impl IntegrationRegistry {
         }
 
         map.into_values().collect()
+    }
+
+    #[cfg(test)]
+    pub fn from_rewriters(
+        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
+        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                route_map: HashMap::new(),
+                routes: Vec::new(),
+                html_rewriters: attribute_rewriters,
+                script_rewriters,
+            }),
+        }
     }
 }

@@ -17,14 +17,13 @@ use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::integrations::{
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
-use crate::tsjs;
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
@@ -292,11 +291,11 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         _attr_name: &str,
         attr_value: &str,
         _ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
+    ) -> AttributeRewriteAction {
         if self.config.auto_configure && is_prebid_script_url(attr_value) {
-            Some(tsjs::ext_script_src())
+            AttributeRewriteAction::remove_element()
         } else {
-            None
+            AttributeRewriteAction::keep()
         }
     }
 }
@@ -671,6 +670,7 @@ fn get_request_scheme(req: &Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::AttributeRewriteAction;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_swaps_prebid_scripts() {
+    fn attribute_rewriter_removes_prebid_scripts() {
         let integration = PrebidIntegration {
             config: base_config(),
         };
@@ -704,10 +704,10 @@ mod tests {
         };
 
         let rewritten = integration.rewrite("src", "https://cdn.prebid.org/prebid.min.js", &ctx);
-        assert_eq!(rewritten, Some(tsjs::ext_script_src()));
+        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
 
         let untouched = integration.rewrite("src", "https://cdn.example.com/app.js", &ctx);
-        assert!(untouched.is_none());
+        assert!(matches!(untouched, AttributeRewriteAction::Keep));
     }
 
     #[test]
@@ -724,11 +724,7 @@ mod tests {
 
         let rewritten =
             integration.rewrite("href", "https://cdn.prebid.org/prebid.js?v=1.2.3", &ctx);
-        assert_eq!(
-            rewritten,
-            Some(tsjs::ext_script_src()),
-            "query string URLs should still be rewritten"
-        );
+        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
     }
 
     #[test]
