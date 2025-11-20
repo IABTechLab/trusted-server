@@ -20,6 +20,10 @@ pub mod tests {
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"  
 
+            [integrations.nextjs]
+            enabled = false
+            rewrite_attributes = ["href", "link", "url"]
+
             [synthetic] 
             counter_store = "test-counter-store"
             opid_store = "test-opid-store"
