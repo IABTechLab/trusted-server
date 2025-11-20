@@ -6,9 +6,10 @@ mod registry;
 pub mod testlight;
 
 pub use registry::{
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationMetadata, IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder,
-    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter,
+    AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationMetadata, IntegrationProxy,
+    IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
+    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
 type IntegrationBuilder = fn(&Settings) -> Option<IntegrationRegistration>;

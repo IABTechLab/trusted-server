@@ -140,6 +140,8 @@ headers.
 If the integration needs to rewrite script/link tags or inject HTML, implement
 `IntegrationAttributeRewriter` for attribute mutation and
 `IntegrationScriptRewriter` for inline `<script>` or text content rewrites.
+Both traits return typed actions (`AttributeRewriteAction`, `ScriptRewriteAction`) so you can
+keep existing markup, swap values, or drop elements entirely.
 
 ```rust
 impl IntegrationAttributeRewriter for MyIntegration {
@@ -154,8 +156,15 @@ impl IntegrationAttributeRewriter for MyIntegration {
         attr_name: &str,
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
-        // Return Some(new_value) to replace the attribute or None to leave it unchanged.
+    ) -> AttributeRewriteAction {
+        if attr_value.contains("cdn.example.com/legacy.js") {
+            // Drop remote script entirely – unified bundle already contains the logic.
+            AttributeRewriteAction::remove_element()
+        } else if attr_name == "src" {
+            AttributeRewriteAction::replace(tsjs::integration_script_src("my_integration"))
+        } else {
+            AttributeRewriteAction::keep()
+        }
     }
 }
 
@@ -167,8 +176,12 @@ impl IntegrationScriptRewriter for MyIntegration {
         &self,
         content: &str,
         ctx: &IntegrationScriptContext<'_>,
-    ) -> Option<String> {
-        // Inspect or mutate inline script payloads.
+    ) -> ScriptRewriteAction {
+        if let Some(rewritten) = try_rewrite_next_payload(content) {
+            ScriptRewriteAction::replace(rewritten)
+        } else {
+            ScriptRewriteAction::keep()
+        }
     }
 }
 ```
@@ -178,6 +191,10 @@ origin→first-party rewrite, so you can simply swap URLs, append query
 parameters, or mutate inline JSON. Use this to point `<script>` tags at your own
 tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to
 rewrite embedded Next.js payloads.
+
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline
+content) removes the element entirely, so integrations can drop publisher-provided markup when the
+Trusted Server already injects a safe alternative.
 
 ### 6. Register the module
 

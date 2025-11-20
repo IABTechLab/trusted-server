@@ -1,5 +1,10 @@
 // Prebid.js compatibility shim: exposes tsjs API through the legacy pbjs global.
-import type { TsjsApi, HighestCpmBid, RequestAdsCallback, RequestAdsOptions } from '../../core/types';
+import type {
+  TsjsApi,
+  HighestCpmBid,
+  RequestAdsCallback,
+  RequestAdsOptions,
+} from '../../core/types';
 import { log } from '../../core/log';
 import { installQueue } from '../../core/queue';
 import { getAllCodes, getAllUnits, firstSize } from '../../core/registry';

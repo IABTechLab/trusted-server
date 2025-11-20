@@ -8,7 +8,8 @@ use lol_html::{element, html_content::ContentType, text, Settings as RewriterSet
 use regex::Regex;
 
 use crate::integrations::{
-    IntegrationAttributeContext, IntegrationRegistry, IntegrationScriptContext,
+    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
+    IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -156,6 +157,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let original_href = href.clone();
                     if rewrite_prebid && is_prebid_script_url(&href) {
                         el.remove();
+                        return Ok(());
                     } else {
                         let new_href = href
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -165,7 +167,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         }
                     }
 
-                    if let Some(integration_href) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "href",
                         &href,
                         &IntegrationAttributeContext {
@@ -175,7 +177,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        href = integration_href;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_href) => {
+                            href = integration_href;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if href != original_href {
@@ -195,6 +204,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let original_src = src.clone();
                     if rewrite_prebid && is_prebid_script_url(&src) {
                         el.remove();
+                        return Ok(());
                     } else {
                         let new_src = src
                             .replace(&patterns.https_origin(), &patterns.replacement_url())
@@ -204,7 +214,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         }
                     }
 
-                    if let Some(integration_src) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "src",
                         &src,
                         &IntegrationAttributeContext {
@@ -214,7 +224,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        src = integration_src;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_src) => {
+                            src = integration_src;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if src != original_src {
@@ -238,7 +255,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         action = new_action;
                     }
 
-                    if let Some(integration_action) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "action",
                         &action,
                         &IntegrationAttributeContext {
@@ -248,7 +265,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        action = integration_action;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_action) => {
+                            action = integration_action;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if action != original_action {
@@ -277,7 +301,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         srcset = new_srcset;
                     }
 
-                    if let Some(integration_srcset) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "srcset",
                         &srcset,
                         &IntegrationAttributeContext {
@@ -287,7 +311,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        srcset = integration_srcset;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_srcset) => {
+                            srcset = integration_srcset;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if srcset != original_srcset {
@@ -315,7 +346,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         imagesrcset = new_imagesrcset;
                     }
 
-                    if let Some(integration_imagesrcset) = integrations.rewrite_attribute(
+                    match integrations.rewrite_attribute(
                         "imagesrcset",
                         &imagesrcset,
                         &IntegrationAttributeContext {
@@ -325,7 +356,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             origin_host: &patterns.origin_host,
                         },
                     ) {
-                        imagesrcset = integration_imagesrcset;
+                        AttributeRewriteOutcome::Unchanged => {}
+                        AttributeRewriteOutcome::Replaced(integration_imagesrcset) => {
+                            imagesrcset = integration_imagesrcset;
+                        }
+                        AttributeRewriteOutcome::RemoveElement => {
+                            el.remove();
+                            return Ok(());
+                        }
                     }
 
                     if imagesrcset != original_imagesrcset {
@@ -351,8 +389,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     request_scheme: &patterns.request_scheme,
                     origin_host: &patterns.origin_host,
                 };
-                if let Some(rewritten) = rewriter.rewrite(text.as_str(), &ctx) {
-                    text.replace(&rewritten, ContentType::Text);
+                match rewriter.rewrite(text.as_str(), &ctx) {
+                    ScriptRewriteAction::Keep => {}
+                    ScriptRewriteAction::Replace(rewritten) => {
+                        text.replace(&rewritten, ContentType::Text);
+                    }
+                    ScriptRewriteAction::RemoveNode => {
+                        text.remove();
+                    }
                 }
                 Ok(())
             }
@@ -399,8 +443,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::{AttributeRewriteAction, IntegrationAttributeRewriter};
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use std::io::Cursor;
+    use std::sync::Arc;
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
@@ -412,6 +458,66 @@ mod tests {
             nextjs_enabled: false,
             nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
         }
+    }
+
+    #[test]
+    fn integration_attribute_rewriter_can_remove_elements() {
+        struct RemovingLinkRewriter;
+
+        impl IntegrationAttributeRewriter for RemovingLinkRewriter {
+            fn integration_id(&self) -> &'static str {
+                "removing"
+            }
+
+            fn handles_attribute(&self, attribute: &str) -> bool {
+                attribute == "href"
+            }
+
+            fn rewrite(
+                &self,
+                _attr_name: &str,
+                attr_value: &str,
+                _ctx: &IntegrationAttributeContext<'_>,
+            ) -> AttributeRewriteAction {
+                if attr_value.contains("remove-me") {
+                    AttributeRewriteAction::remove_element()
+                } else {
+                    AttributeRewriteAction::keep()
+                }
+            }
+        }
+
+        let html = r#"<html><body>
+            <a href="https://origin.example.com/remove-me">remove</a>
+            <a href="https://origin.example.com/keep-me">keep</a>
+        </body></html>"#;
+
+        let mut config = create_test_config();
+        config.integrations =
+            IntegrationRegistry::from_rewriters(vec![Arc::new(RemovingLinkRewriter)], Vec::new());
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let processed = String::from_utf8(output).unwrap();
+
+        assert!(
+            processed.contains("keep-me"),
+            "Expected keep link to remain"
+        );
+        assert!(
+            !processed.contains("remove-me"),
+            "Removing rewriter should drop matching elements"
+        );
     }
 
     #[test]

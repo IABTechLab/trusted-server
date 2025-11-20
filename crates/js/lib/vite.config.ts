@@ -26,16 +26,11 @@ function createModuleDiscoveryPlugin(): Plugin {
 
       // Discover integration modules: directories in src/integrations/ with index.ts
       const integrationModules = fs.existsSync(integrationsDir)
-        ? fs
-            .readdirSync(integrationsDir)
-            .filter((name) => {
-              const fullPath = path.join(integrationsDir, name);
-              const stat = fs.statSync(fullPath);
-              return (
-                stat.isDirectory() &&
-                fs.existsSync(path.join(fullPath, 'index.ts'))
-              );
-            })
+        ? fs.readdirSync(integrationsDir).filter((name) => {
+            const fullPath = path.join(integrationsDir, name);
+            const stat = fs.statSync(fullPath);
+            return stat.isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'));
+          })
         : [];
 
       // Always include core first
@@ -48,9 +43,7 @@ function createModuleDiscoveryPlugin(): Plugin {
       } else {
         // TSJS_MODULES set to list: include only requested integrations (excluding 'core' as it's always added)
         const requestedIntegrations = requestedModules.filter((m) => m !== 'core');
-        finalModules.push(
-          ...integrationModules.filter((m) => requestedIntegrations.includes(m))
-        );
+        finalModules.push(...integrationModules.filter((m) => requestedIntegrations.includes(m)));
       }
 
       // Generate import statements
@@ -62,9 +55,7 @@ function createModuleDiscoveryPlugin(): Plugin {
         if (moduleName === 'core') {
           importLines.push(`import * as core from './core/index';`);
         } else {
-          importLines.push(
-            `import * as ${moduleName} from './integrations/${moduleName}/index';`
-          );
+          importLines.push(`import * as ${moduleName} from './integrations/${moduleName}/index';`);
         }
         exportEntries.push(`  ${moduleName},`);
       }

@@ -12,8 +12,8 @@ use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -193,20 +193,16 @@ impl IntegrationAttributeRewriter for TestlightIntegration {
         _attr_name: &str,
         attr_value: &str,
         _ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
+    ) -> AttributeRewriteAction {
         if !self.config.rewrite_scripts {
-            return None;
+            return AttributeRewriteAction::keep();
         }
 
         let lowered = attr_value.to_ascii_lowercase();
         if lowered.contains("testlight.js") {
-            // TODO: need a way to remove the whole script tag
-            // None will still load external script Some will only rewrite attr
-            // but testlight script is now backed into the unified build
-            // for now this is loading the unified js again.
-            Some(self.config.shim_src.clone())
+            AttributeRewriteAction::replace(self.config.shim_src.clone())
         } else {
-            None
+            AttributeRewriteAction::keep()
         }
     }
 }
@@ -277,9 +273,11 @@ mod tests {
 
         let rewritten =
             integration.rewrite("src", "https://cdn.testlight.net/v1/testlight.js", &ctx);
-        assert_eq!(
-            rewritten.as_deref(),
-            Some(shim_src.as_str()),
+        assert!(
+            matches!(
+                rewritten,
+                AttributeRewriteAction::Replace(ref value) if value == &shim_src
+            ),
             "Should swap integration script for trusted shim"
         );
     }
@@ -302,9 +300,10 @@ mod tests {
             origin_host: "origin.example.com",
         };
 
-        assert!(integration
-            .rewrite("src", "https://cdn.testlight.net/script.js", &ctx)
-            .is_none());
+        assert!(matches!(
+            integration.rewrite("src", "https://cdn.testlight.net/script.js", &ctx),
+            AttributeRewriteAction::Keep
+        ));
     }
 
     #[test]
