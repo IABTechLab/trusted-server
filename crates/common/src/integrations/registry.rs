@@ -103,7 +103,6 @@ pub struct IntegrationRegistration {
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    pub assets: Vec<String>,
 }
 
 impl IntegrationRegistration {
@@ -125,7 +124,6 @@ impl IntegrationRegistrationBuilder {
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
-                assets: Vec::new(),
             },
         }
     }
@@ -152,12 +150,6 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
-    pub fn with_asset(mut self, asset: impl Into<String>) -> Self {
-        self.registration.assets.push(asset.into());
-        self
-    }
-
-    #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
@@ -172,7 +164,6 @@ struct IntegrationRegistryInner {
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    assets: Vec<(&'static str, String)>,
 }
 
 /// Summary of registered integration capabilities.
@@ -182,7 +173,6 @@ pub struct IntegrationMetadata {
     pub routes: Vec<IntegrationEndpoint>,
     pub attribute_rewriters: usize,
     pub script_selectors: Vec<&'static str>,
-    pub assets: Vec<String>,
 }
 
 impl IntegrationMetadata {
@@ -192,7 +182,6 @@ impl IntegrationMetadata {
             routes: Vec::new(),
             attribute_rewriters: 0,
             script_selectors: Vec::new(),
-            assets: Vec::new(),
         }
     }
 }
@@ -234,12 +223,6 @@ impl IntegrationRegistry {
                 inner
                     .script_rewriters
                     .extend(registration.script_rewriters.into_iter());
-                inner.assets.extend(
-                    registration
-                        .assets
-                        .into_iter()
-                        .map(|asset| (registration.integration_id, asset)),
-                );
             }
         }
 
@@ -330,13 +313,6 @@ impl IntegrationRegistry {
                 .entry(rewriter.integration_id())
                 .or_insert_with(|| IntegrationMetadata::new(rewriter.integration_id()));
             entry.script_selectors.push(rewriter.selector());
-        }
-
-        for (integration_id, asset) in &self.inner.assets {
-            let entry = map
-                .entry(*integration_id)
-                .or_insert_with(|| IntegrationMetadata::new(integration_id));
-            entry.assets.push(asset.clone());
         }
 
         map.into_values().collect()

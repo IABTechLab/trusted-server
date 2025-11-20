@@ -115,7 +115,6 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         IntegrationRegistration::builder(TESTLIGHT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
-            .with_asset("testlight")
             .build(),
     )
 }
@@ -201,6 +200,10 @@ impl IntegrationAttributeRewriter for TestlightIntegration {
 
         let lowered = attr_value.to_ascii_lowercase();
         if lowered.contains("testlight.js") {
+            // TODO: need a way to remove the whole script tag
+            // None will still load external script Some will only rewrite attr
+            // but testlight script is now backed into the unified build
+            // for now this is loading the unified js again.
             Some(self.config.shim_src.clone())
         } else {
             None
@@ -213,7 +216,8 @@ fn default_timeout_ms() -> u32 {
 }
 
 fn default_shim_src() -> String {
-    tsjs::integration_script_src("testlight")
+    // Testlight is included in the unified bundle, so we return the unified script source
+    tsjs::unified_script_src()
 }
 
 fn default_enabled() -> bool {
@@ -243,21 +247,6 @@ mod tests {
     use fastly::http::Method;
     use serde_json::json;
 
-    const MOCK_TESTLIGHT_SRC: &str = "https://mock.testassets/testlight.js";
-
-    struct MockBundleGuard;
-
-    fn mock_testlight_bundle() -> MockBundleGuard {
-        tsjs::mock_integration_bundle("testlight", MOCK_TESTLIGHT_SRC);
-        MockBundleGuard
-    }
-
-    impl Drop for MockBundleGuard {
-        fn drop(&mut self) {
-            tsjs::clear_mock_integration_bundles();
-        }
-    }
-
     #[test]
     fn build_requires_config() {
         let settings = create_test_settings();
@@ -269,8 +258,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_replaces_integration_script() {
-        let _bundle_guard = mock_testlight_bundle();
-        let shim_src = tsjs::integration_script_src("testlight");
+        let shim_src = tsjs::unified_script_src();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
@@ -298,8 +286,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_is_noop_when_disabled() {
-        let _bundle_guard = mock_testlight_bundle();
-        let shim_src = tsjs::integration_script_src("testlight");
+        let shim_src = tsjs::unified_script_src();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),

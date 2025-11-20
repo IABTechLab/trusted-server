@@ -1,7 +1,7 @@
-import type { TsjsApi } from '../core/types';
-import { installQueue } from '../core/queue';
-import { log } from '../core/log';
-import { resolvePrebidWindow, PrebidWindow } from '../shared/globals';
+import type { TsjsApi } from '../../core/types';
+import { installQueue } from '../../core/queue';
+import { log } from '../../core/log';
+import { resolvePrebidWindow, PrebidWindow } from '../../shared/globals';
 
 type TestlightCallback = () => void;
 
