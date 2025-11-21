@@ -127,7 +127,10 @@ impl IntegrationScriptRewriter for NextJsScriptRewriter {
         match self.mode {
             NextJsRewriteMode::Structured => self.rewrite_values(content, ctx),
             NextJsRewriteMode::Streamed => {
-                if !content.contains("self.__next_f") {
+                // Check for Next.js streaming patterns:
+                // - self.__next_f = Flight data (component streaming)
+                // - self.__next_s = Script streaming (for <Script> components)
+                if !content.contains("self.__next_f") && !content.contains("self.__next_s") {
                     return ScriptRewriteAction::keep();
                 }
                 self.rewrite_values(content, ctx)
@@ -353,5 +356,66 @@ mod tests {
             }
             _ => panic!("Expected prebid file removal from Next.js payload"),
         }
+    }
+
+    #[test]
+    fn streamed_rewriter_handles_next_s_script_streaming() {
+        // Real-world example from autoblog.com using self.__next_s for script streaming
+        let payload = r#"(self.__next_s=self.__next_s||[]).push([0,{"children":"if(window.innerWidth>=768){var s=document.createElement('script');s.src='/js/prebid.min.js?v=2025-11-20-233540-a956a5e-008356';document.head.appendChild(s)}","id":"pbjs-bundle"}])"#;
+        let rewriter = NextJsScriptRewriter::new(
+            test_config_with_prebid_removal(),
+            NextJsRewriteMode::Streamed,
+        );
+        let result = rewriter.rewrite(payload, &ctx("script"));
+
+        match result {
+            ScriptRewriteAction::Replace(value) => {
+                assert!(
+                    !value.contains("prebid.min.js"),
+                    "Should remove prebid file references from __next_s payloads"
+                );
+                assert!(
+                    !value.contains("/js/prebid.min.js"),
+                    "Should remove full prebid path"
+                );
+                assert!(
+                    value.contains("self.__next_s"),
+                    "Should preserve __next_s structure"
+                );
+            }
+            _ => panic!("Expected prebid file removal from __next_s payload"),
+        }
+    }
+
+    #[test]
+    fn streamed_rewriter_only_processes_next_payloads() {
+        let rewriter = NextJsScriptRewriter::new(
+            test_config_with_prebid_removal(),
+            NextJsRewriteMode::Streamed,
+        );
+
+        // Non-Next.js script should be kept
+        let regular_script = r#"console.log('hello'); var x = 123;"#;
+        let result = rewriter.rewrite(regular_script, &ctx("script"));
+        assert!(
+            matches!(result, ScriptRewriteAction::Keep),
+            "Should skip non-Next.js scripts"
+        );
+
+        // __next_f with content to rewrite should be processed
+        let next_f = r#"self.__next_f.push([1, "{\"href\":\"https://origin.example.com/page\"}"]);"#;
+        let result_f = rewriter.rewrite(next_f, &ctx("script"));
+        assert!(
+            matches!(result_f, ScriptRewriteAction::Replace(_)),
+            "Should process __next_f payloads"
+        );
+
+        // __next_s with content to rewrite should be processed
+        let next_s = r#"self.__next_s.push([0, {"children":"code","src":"/js/prebid.min.js"}]);"#;
+        let result_s = rewriter.rewrite(next_s, &ctx("script"));
+        assert!(
+            matches!(result_s, ScriptRewriteAction::Replace(_)),
+            "Should process __next_s payloads"
+        );
     }
 }
