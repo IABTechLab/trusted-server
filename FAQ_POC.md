@@ -25,7 +25,7 @@ NOT all the capabilities. Tech Lab will build and support core services to enabl
 **Does the Trusteed Server preclude using third party tags?**
 No, it does not. You should be able to begin migrating certain modules and parts of your content and experience as you go, without a forklift upgrade. We plan to support server side tagging capabilities to enable third party support.
 
-**Why are you only using two vendors in the POC?** 
+**Why are you only using two partners in the POC?** 
 Fastly and Equativ volunteered time and resources to us and they fit the technical needs and requirements for Trusted Server. For the sake of getting to market ASAP, we chose to double down on these two partners. We do not play favorites or have any financial incentive with these two companies and will begin implementing on other partners in the near future.  Any ad exchange supporting prebid server requests should already find support. We will prioritize modules for other edge cloud providers based on industry priorities
 
 **How will this project be managed?**
@@ -39,4 +39,3 @@ Yes. As long as your managed service provider can separate the edge from the CMS
 
 **How will this comply with Privacy regulations?**
 The trusted server will have modules to support Consent Management Providers (CMP) and send the GPP or TCF string as required in the ad request.
-

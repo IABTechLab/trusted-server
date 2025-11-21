@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import installPrebidJsShim from '../../src/ext/prebidjs';
+import installPrebidJsShim from '../../../src/integrations/ext/prebidjs';
 
 const ORIGINAL_WINDOW = global.window;
 

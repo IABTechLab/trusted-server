@@ -34,6 +34,7 @@ pub mod fastly_storage;
 pub mod geo;
 pub mod html_processor;
 pub mod http_util;
+pub mod integrations;
 pub mod models;
 pub mod openrtb;
 pub mod prebid_proxy;

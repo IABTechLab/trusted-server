@@ -21,27 +21,12 @@ fn script_tag_for(bundle: TsjsBundle, attrs: &str) -> String {
     )
 }
 
-/// `<script>` tag for injecting the core runtime.
-pub fn core_script_tag() -> String {
-    script_tag_for(TsjsBundle::Core, "id=\"trustedserver-js\"")
+/// `/static` URL for the unified bundle with cache-busting hash.
+pub fn unified_script_src() -> String {
+    script_src_for(TsjsBundle::Unified)
 }
 
-/// `<script>` tag for injecting the creative guard runtime.
-pub fn creative_script_tag() -> String {
-    script_tag_for(TsjsBundle::Creative, "async")
-}
-
-/// `/static` URL for the core bundle with cache-busting hash.
-pub fn core_script_src() -> String {
-    script_src_for(TsjsBundle::Core)
-}
-
-/// `/static` URL for the extension bundle with cache-busting hash.
-pub fn ext_script_src() -> String {
-    script_src_for(TsjsBundle::Ext)
-}
-
-/// `/static` URL for the creative bundle with cache-busting hash.
-pub fn creative_script_src() -> String {
-    script_src_for(TsjsBundle::Creative)
+/// `<script>` tag for injecting the unified bundle.
+pub fn unified_script_tag() -> String {
+    script_tag_for(TsjsBundle::Unified, "id=\"trustedserver-js\"")
 }

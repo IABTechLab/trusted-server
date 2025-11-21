@@ -3,25 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct BundleSpec {
-    filename: &'static str,
-    required: bool,
-}
-
-const BUNDLES: &[BundleSpec] = &[
-    BundleSpec {
-        filename: "tsjs-core.js",
-        required: true,
-    },
-    BundleSpec {
-        filename: "tsjs-ext.js",
-        required: false,
-    },
-    BundleSpec {
-        filename: "tsjs-creative.js",
-        required: false,
-    },
-];
+const UNIFIED_BUNDLE: &str = "tsjs-unified.js";
 
 fn main() {
     // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under ts/
@@ -78,11 +60,15 @@ fn main() {
             .status();
     }
 
-    // Build bundle
+    // Build unified bundle
     if !skip {
         if let Some(npm_path) = npm.clone() {
-            let status = Command::new(npm_path)
-                .args(["run", "build"])
+            println!("cargo:warning=tsjs: Building unified bundle");
+            let js_modules = env::var("TSJS_MODULES").unwrap_or("".to_string());
+
+            let status = Command::new(&npm_path)
+                .env("TSJS_MODULES", js_modules)
+                .args(["run", "build:custom"])
                 .current_dir(&ts_dir)
                 .status();
             if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
@@ -91,21 +77,19 @@ fn main() {
         }
     }
 
-    // Copy the result into OUT_DIR for include_str!
-    for bundle in BUNDLES {
-        copy_bundle(bundle, &crate_dir, &dist_dir, &out_dir);
-    }
+    // Copy unified bundle into OUT_DIR for include_str!
+    copy_bundle(UNIFIED_BUNDLE, true, &crate_dir, &dist_dir, &out_dir);
 }
 
-fn copy_bundle(spec: &BundleSpec, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
-    let primary = dist_dir.join(spec.filename);
-    let fallback = crate_dir.join("dist").join(spec.filename);
-    let target = out_dir.join(spec.filename);
+fn copy_bundle(filename: &str, required: bool, crate_dir: &Path, dist_dir: &Path, out_dir: &Path) {
+    let primary = dist_dir.join(filename);
+    let fallback = crate_dir.join("dist").join(filename);
+    let target = out_dir.join(filename);
 
     for source in [&primary, &fallback] {
         if source.exists() {
             if let Err(e) = fs::copy(source, &target) {
-                if spec.required {
+                if required {
                     panic!("tsjs: failed to copy {:?} to {:?}: {}", source, target, e);
                 }
             }
@@ -113,10 +97,10 @@ fn copy_bundle(spec: &BundleSpec, crate_dir: &Path, dist_dir: &Path, out_dir: &P
         }
     }
 
-    if spec.required {
+    if required {
         panic!(
             "tsjs: bundle {} not found: {:?} (and fallback {:?}). Ensure Node is installed and `npm run build` succeeds, or commit dist/{}.",
-            spec.filename, primary, fallback, spec.filename
+            filename, primary, fallback, filename
         );
     }
 

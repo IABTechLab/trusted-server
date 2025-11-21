@@ -8,6 +8,7 @@ use crate::http_util::serve_static_with_etag;
 use crate::constants::{HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationRegistry;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
@@ -105,6 +106,7 @@ struct ProcessResponseParams<'a> {
     request_scheme: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
+    integration_registry: &'a IntegrationRegistry,
 }
 
 /// Process response body in streaming fashion with compression preservation
@@ -129,6 +131,7 @@ fn process_response_streaming(
             params.request_host,
             params.request_scheme,
             params.settings,
+            params.integration_registry,
         )?;
 
         let config = PipelineConfig {
@@ -171,11 +174,17 @@ fn create_html_stream_processor(
     request_host: &str,
     request_scheme: &str,
     settings: &Settings,
+    integration_registry: &IntegrationRegistry,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
-    let config =
-        HtmlProcessorConfig::from_settings(settings, origin_host, request_host, request_scheme);
+    let config = HtmlProcessorConfig::from_settings(
+        settings,
+        integration_registry,
+        origin_host,
+        request_host,
+        request_scheme,
+    );
 
     Ok(create_html_processor(config))
 }
@@ -193,6 +202,7 @@ fn create_html_stream_processor(
 /// - The origin backend is unreachable
 pub fn handle_publisher_request(
     settings: &Settings,
+    integration_registry: &IntegrationRegistry,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Proxying request to publisher_origin");
@@ -300,6 +310,7 @@ pub fn handle_publisher_request(
             request_scheme: &request_scheme,
             settings,
             content_type: &content_type,
+            integration_registry,
         };
         match process_response_streaming(body, params) {
             Ok(processed_body) => {

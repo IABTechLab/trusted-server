@@ -1,7 +1,7 @@
 // Entry point for the creative runtime: wires up click + image + iframe guards globally.
-import { log } from '../core/log';
-import type { TsCreativeConfig, CreativeWindow, TsCreativeApi } from '../shared/globals';
-import { creativeGlobal, resolveWindow } from '../shared/globals';
+import { log } from '../../core/log';
+import type { TsCreativeConfig, CreativeWindow, TsCreativeApi } from '../../shared/globals';
+import { creativeGlobal, resolveWindow } from '../../shared/globals';
 
 import { installClickGuard } from './click';
 import { installDynamicImageProxy } from './image';

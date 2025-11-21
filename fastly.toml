@@ -14,7 +14,7 @@ build = """
     cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always
 """
 
-# Production Backends for Partner Asset Serving (like auburndao.com)
+# Direct integrations will be initialized as dynamic backends and don't need to be declared here.
 [backends]
 
 [local_server]
@@ -49,4 +49,3 @@ build = """
             ts-2025-10-B = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-B\",\"use\":\"sig\",\"x\":\"HVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
             current-kid = "ts-2025-10-A"
             active-kids = "ts-2025-10-A,ts-2025-10-B"
-
