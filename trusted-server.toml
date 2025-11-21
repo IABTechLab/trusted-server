@@ -42,7 +42,7 @@ auto_configure = false
 debug = false
 
 [integrations.nextjs]
-enabled = false
+enabled = true
 rewrite_attributes = ["href", "link", "url"]
 
 [integrations.testlight]
