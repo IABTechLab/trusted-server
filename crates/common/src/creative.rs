@@ -43,11 +43,18 @@ use crate::tsjs;
 use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings as HtmlSettings};
 
 // Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
-pub(super) fn to_abs(u: &str) -> Option<String> {
+// Checks against the rewrite blacklist to exclude configured domains/patterns from proxying.
+pub(super) fn to_abs(u: &str, settings: &Settings) -> Option<String> {
     let t = u.trim();
     if t.is_empty() {
         return None;
     }
+
+    // Skip if excluded from rewrites in settings
+    if settings.rewrite.is_excluded(t) {
+        return None;
+    }
+
     // Skip non-network schemes commonly found in creatives
     let lower = t.to_ascii_lowercase();
     if lower.starts_with("data:")
@@ -59,6 +66,7 @@ pub(super) fn to_abs(u: &str) -> Option<String> {
     {
         return None;
     }
+
     if t.starts_with("//") {
         Some(format!("https:{}", t))
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -106,7 +114,7 @@ pub(super) fn rewrite_style_urls(style: &str, settings: &Settings) -> String {
             (s, e)
         };
         let url_val = &style[qs..qe];
-        let new_val = if let Some(abs) = to_abs(url_val) {
+        let new_val = if let Some(abs) = to_abs(url_val, settings) {
             build_proxy_url(settings, &abs)
         } else {
             url_val.to_string()
@@ -196,7 +204,7 @@ pub(super) fn build_click_url(settings: &Settings, clear_url: &str) -> String {
 
 #[inline]
 pub(super) fn proxy_if_abs(settings: &Settings, val: &str) -> Option<String> {
-    to_abs(val).map(|abs| build_proxy_url(settings, &abs))
+    to_abs(val, settings).map(|abs| build_proxy_url(settings, &abs))
 }
 
 /// Split a srcset/imagesrcset attribute into candidate strings.
@@ -259,7 +267,7 @@ pub(super) fn rewrite_srcset(srcset: &str, settings: &Settings) -> String {
         let mut parts = it.split_whitespace();
         let url = parts.next().unwrap_or("");
         let descriptor = parts.collect::<Vec<_>>().join(" ");
-        let rewritten = if let Some(abs) = to_abs(url) {
+        let rewritten = if let Some(abs) = to_abs(url, settings) {
             build_proxy_url(settings, &abs)
         } else {
             url.to_string()
@@ -404,7 +412,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // Click-through links
                 element!("a[href], area[href]", |el| {
                     if let Some(href) = el.get_attribute("href") {
-                        if let Some(abs) = to_abs(&href) {
+                        if let Some(abs) = to_abs(&href, settings) {
                             let click = build_click_url(settings, &abs);
                             let _ = el.set_attribute("href", &click);
                             let _ = el.set_attribute("data-tsclick", &click);
@@ -508,26 +516,27 @@ mod tests {
 
     #[test]
     fn to_abs_conversions() {
+        let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
-            to_abs("//cdn.example/x"),
+            to_abs("//cdn.example/x", &settings),
             Some("https://cdn.example/x".to_string())
         );
         assert_eq!(
-            to_abs("HTTPS://cdn.example/x"),
+            to_abs("HTTPS://cdn.example/x", &settings),
             Some("HTTPS://cdn.example/x".to_string())
         );
         assert_eq!(
-            to_abs("http://cdn.example/x"),
+            to_abs("http://cdn.example/x", &settings),
             Some("http://cdn.example/x".to_string())
         );
-        assert_eq!(to_abs("/local/x"), None);
+        assert_eq!(to_abs("/local/x", &settings), None);
         assert_eq!(
-            to_abs("   //cdn.example/y  "),
+            to_abs("   //cdn.example/y  ", &settings),
             Some("https://cdn.example/y".to_string())
         );
-        assert_eq!(to_abs("data:image/png;base64,abcd"), None);
-        assert_eq!(to_abs("javascript:alert(1)"), None);
-        assert_eq!(to_abs("mailto:test@example.com"), None);
+        assert_eq!(to_abs("data:image/png;base64,abcd", &settings), None);
+        assert_eq!(to_abs("javascript:alert(1)", &settings), None);
+        assert_eq!(to_abs("mailto:test@example.com", &settings), None);
     }
 
     #[test]
@@ -981,13 +990,14 @@ mod tests {
 
     #[test]
     fn to_abs_additional_cases() {
+        let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
-            to_abs("   https://cdn.example/a   "),
+            to_abs("   https://cdn.example/a   ", &settings),
             Some("https://cdn.example/a".to_string())
         );
-        assert_eq!(to_abs("blob:xyz"), None);
-        assert_eq!(to_abs("tel:+123"), None);
-        assert_eq!(to_abs("about:blank"), None);
+        assert_eq!(to_abs("blob:xyz", &settings), None);
+        assert_eq!(to_abs("tel:+123", &settings), None);
+        assert_eq!(to_abs("about:blank", &settings), None);
     }
 
     #[test]
@@ -1002,5 +1012,135 @@ mod tests {
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
         assert!(out.contains("/local/img.png 1x"));
+    }
+
+    #[test]
+    fn to_abs_respects_exclude_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_string()];
+
+        // Excluded domain should return None (not proxied)
+        assert_eq!(
+            to_abs("https://trusted-cdn.example.com/lib.js", &settings),
+            None
+        );
+
+        // Non-excluded domain should return Some
+        assert_eq!(
+            to_abs("https://other-cdn.example.com/lib.js", &settings),
+            Some("https://other-cdn.example.com/lib.js".to_string())
+        );
+    }
+
+    #[test]
+    fn to_abs_respects_wildcard_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_string()];
+
+        // Should exclude base domain
+        assert_eq!(to_abs("https://cloudflare.com/cdn.js", &settings), None);
+
+        // Should exclude subdomain
+        assert_eq!(
+            to_abs("https://cdnjs.cloudflare.com/lib.js", &settings),
+            None
+        );
+
+        // Should not exclude different domain
+        assert_eq!(
+            to_abs("https://notcloudflare.com/lib.js", &settings),
+            Some("https://notcloudflare.com/lib.js".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_html_excludes_blacklisted_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_string()];
+
+        let html = r#"
+            <img src="https://trusted-cdn.example.com/logo.png">
+            <img src="https://other-cdn.example.com/banner.jpg">
+        "#;
+
+        let out = rewrite_creative_html(html, &settings);
+
+        // Excluded domain should NOT be rewritten
+        assert!(out.contains(r#"src="https://trusted-cdn.example.com/logo.png"#));
+
+        // Non-excluded domain SHOULD be rewritten
+        assert!(out.contains("/first-party/proxy?tsurl="));
+        assert!(out.contains("other-cdn.example.com"));
+    }
+
+    #[test]
+    fn rewrite_srcset_excludes_blacklisted_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["trusted.example.com".to_string()];
+
+        let html = r#"
+            <img srcset="https://trusted.example.com/img-1x.png 1x, https://cdn.example.com/img-2x.png 2x">
+        "#;
+
+        let out = rewrite_creative_html(html, &settings);
+
+        // Excluded domain should remain as-is
+        assert!(out.contains("https://trusted.example.com/img-1x.png 1x"));
+
+        // Non-excluded should be proxied
+        assert!(out.contains("/first-party/proxy?tsurl="));
+        assert!(out.contains("cdn.example.com"));
+    }
+
+    #[test]
+    fn rewrite_style_urls_excludes_blacklisted_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["fonts.googleapis.com".to_string()];
+
+        let html = r#"
+            <style>
+                @font-face {
+                    font-family: 'Test';
+                    src: url(https://fonts.googleapis.com/font.woff2);
+                }
+                body {
+                    background: url(https://cdn.example.com/bg.png);
+                }
+            </style>
+        "#;
+
+        let out = rewrite_creative_html(html, &settings);
+
+        // Excluded domain should remain unchanged
+        assert!(out.contains("url(https://fonts.googleapis.com/font.woff2)"));
+
+        // Non-excluded should be proxied
+        assert!(out.contains("/first-party/proxy?tsurl="));
+        assert!(out.contains("cdn.example.com"));
+    }
+
+    #[test]
+    fn rewrite_click_urls_excludes_blacklisted_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["trusted-landing.example.com".to_string()];
+
+        let html = r#"
+            <a href="https://trusted-landing.example.com/page">Trusted Link</a>
+            <a href="https://advertiser.example.com/landing">Ad Link</a>
+        "#;
+
+        let out = rewrite_creative_html(html, &settings);
+
+        // Excluded domain should NOT be rewritten to first-party click
+        assert!(out.contains(r#"href="https://trusted-landing.example.com/page"#));
+        // The excluded link should NOT have data-tsclick since it wasn't rewritten
+        assert!(
+            !out.contains(r#"<a href="https://trusted-landing.example.com/page" data-tsclick="#)
+        );
+
+        // Non-excluded should be rewritten and SHOULD have data-tsclick
+        assert!(out.contains("/first-party/click?tsurl="));
+        assert!(out.contains("advertiser.example.com"));
+        assert!(out.contains("data-tsclick=\"/first-party/click"));
     }
 }
