@@ -49,6 +49,14 @@ endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1200
 rewrite_scripts = true
 
+[integrations.lockr]
+enabled = false
+app_id = ""
+api_endpoint = "https://identity.lockr.kr"
+sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
 # Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")
