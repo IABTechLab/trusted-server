@@ -62,31 +62,6 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
-pub struct Prebid {
-    pub server_url: String,
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u32,
-    #[serde(default = "default_bidders", deserialize_with = "vec_from_seq_or_map")]
-    pub bidders: Vec<String>,
-    #[serde(default = "default_auto_configure")]
-    pub auto_configure: bool,
-    #[serde(default)]
-    pub debug: bool,
-}
-
-fn default_timeout_ms() -> u32 {
-    1000
-}
-
-fn default_bidders() -> Vec<String> {
-    vec!["mocktioneer".to_string()]
-}
-
-fn default_auto_configure() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize, Serialize, Validate)]
 pub struct NextJs {
     #[serde(default)]
@@ -320,8 +295,6 @@ fn default_request_signing_enabled() -> bool {
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
-    #[validate(nested)]
-    pub prebid: Prebid,
     #[serde(default)]
     #[validate(nested)]
     pub synthetic: Synthetic,
@@ -424,10 +397,10 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
-// This lets env vars like TRUSTED_SERVER__PREBID__BIDDERS__0=smartadserver work, which the config env source
+// This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
 // represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
 // JSON arrays or comma-separated values.
-fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+pub(crate) fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned,
@@ -485,6 +458,7 @@ mod tests {
     use super::*;
     use regex::Regex;
 
+    use crate::integrations::prebid::PrebidIntegrationConfig;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
@@ -499,7 +473,11 @@ mod tests {
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());
 
-        assert!(!settings.prebid.server_url.is_empty());
+        let prebid_cfg = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("Prebid config query should succeed")
+            .expect("Prebid config should load from default settings");
+        assert!(!prebid_cfg.server_url.is_empty());
         assert!(
             !settings.publisher.nextjs.enabled,
             "Next.js URL rewriting should default to disabled"
@@ -524,8 +502,12 @@ mod tests {
         assert!(settings.is_ok());
 
         let settings = settings.expect("should parse valid TOML");
+        let prebid_cfg = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("Prebid config query should succeed")
+            .expect("Prebid config should load from test settings");
         assert_eq!(
-            settings.prebid.server_url,
+            prebid_cfg.server_url,
             "https://test-prebid.com/openrtb2/auction"
         );
         assert!(
@@ -596,8 +578,9 @@ mod tests {
     fn test_prebid_bidders_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{}{}PREBID{}BIDDERS",
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -619,8 +602,12 @@ mod tests {
                         eprintln!("JSON override error: {:?}", res.as_ref().err());
                     }
                     let settings = res.expect("Settings should parse with JSON env override");
+                    let cfg = settings
+                        .integration_config::<PrebidIntegrationConfig>("prebid")
+                        .expect("Prebid config query should succeed")
+                        .expect("Prebid config should exist with env override");
                     assert_eq!(
-                        settings.prebid.bidders,
+                        cfg.bidders,
                         vec!["smartadserver".to_string(), "rubicon".to_string()]
                     );
                 });
@@ -633,15 +620,17 @@ mod tests {
         let toml_str = crate_test_settings_str();
 
         let env_key0 = format!(
-            "{}{}PREBID{}BIDDERS{}0",
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}0",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let env_key1 = format!(
-            "{}{}PREBID{}BIDDERS{}1",
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}1",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
@@ -666,8 +655,12 @@ mod tests {
                         }
                         let settings =
                             res.expect("Settings should parse with indexed env override");
+                        let cfg = settings
+                            .integration_config::<PrebidIntegrationConfig>("prebid")
+                            .expect("Prebid config query should succeed")
+                            .expect("Prebid config should exist with indexed env override");
                         assert_eq!(
-                            settings.prebid.bidders,
+                            cfg.bidders,
                             vec!["smartadserver".to_string(), "openx".to_string()]
                         );
                     });

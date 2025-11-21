@@ -50,7 +50,6 @@ mod tests {
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.prebid.server_url.is_empty());
         assert!(!settings.synthetic.counter_store.is_empty());
         assert!(!settings.synthetic.opid_store.is_empty());
         assert!(!settings.synthetic.secret_key.is_empty());

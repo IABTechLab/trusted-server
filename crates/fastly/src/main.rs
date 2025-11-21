@@ -3,7 +3,6 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
-use trusted_server_common::ad::{handle_server_ad, handle_server_ad_get};
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -74,8 +73,6 @@ async fn route_request(
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
 
         // tsjs endpoints
-        (Method::GET, "/first-party/ad") => handle_server_ad_get(&settings, req).await,
-        (Method::POST, "/third-party/ad") => handle_server_ad(&settings, req).await,
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
         (Method::GET, "/first-party/click") => handle_first_party_click(&settings, req).await,
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
