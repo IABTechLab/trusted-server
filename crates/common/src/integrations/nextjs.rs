@@ -22,6 +22,8 @@ pub struct NextJsIntegrationConfig {
     )]
     #[validate(length(min = 1))]
     pub rewrite_attributes: Vec<String>,
+    #[serde(default = "default_remove_prebid")]
+    pub remove_prebid: bool,
 }
 
 impl IntegrationConfig for NextJsIntegrationConfig {
@@ -36,6 +38,10 @@ fn default_enabled() -> bool {
 
 fn default_rewrite_attributes() -> Vec<String> {
     vec!["href".to_string(), "link".to_string(), "url".to_string()]
+}
+
+fn default_remove_prebid() -> bool {
+    true
 }
 
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
@@ -92,6 +98,7 @@ impl NextJsScriptRewriter {
             ctx.request_host,
             ctx.request_scheme,
             &self.config.rewrite_attributes,
+            self.config.remove_prebid,
         ) {
             ScriptRewriteAction::replace(rewritten)
         } else {
@@ -120,7 +127,10 @@ impl IntegrationScriptRewriter for NextJsScriptRewriter {
         match self.mode {
             NextJsRewriteMode::Structured => self.rewrite_values(content, ctx),
             NextJsRewriteMode::Streamed => {
-                if !content.contains("self.__next_f") {
+                // Check for Next.js streaming patterns:
+                // - self.__next_f = Flight data (component streaming)
+                // - self.__next_s = Script streaming (for <Script> components)
+                if !content.contains("self.__next_f") && !content.contains("self.__next_s") {
                     return ScriptRewriteAction::keep();
                 }
                 self.rewrite_values(content, ctx)
@@ -135,6 +145,7 @@ fn rewrite_nextjs_values(
     request_host: &str,
     request_scheme: &str,
     attributes: &[String],
+    remove_prebid: bool,
 ) -> Option<String> {
     if origin_host.is_empty() || request_host.is_empty() || attributes.is_empty() {
         return None;
@@ -145,6 +156,7 @@ fn rewrite_nextjs_values(
     let escaped_origin = escape(origin_host);
     let replacement_scheme = format!("{}://{}", request_scheme, request_host);
 
+    // Rewrite URL attributes
     for attribute in attributes {
         let escaped_attr = escape(attribute);
         let pattern = format!(
@@ -168,6 +180,20 @@ fn rewrite_nextjs_values(
         }
     }
 
+    if remove_prebid {
+        if rewritten.contains("prebid") && rewritten.contains(".js") {
+            if let Ok(prebid_file_pattern) =
+                Regex::new(r#"[/\\][^"'\s]*?prebid[^"'\s]*?\.js[^"'\s]*?"#)
+            {
+                let new_value = prebid_file_pattern.replace_all(&rewritten, "");
+                if new_value != rewritten {
+                    changed = true;
+                    rewritten = new_value.into_owned();
+                }
+            }
+        }
+    }
+
     changed.then_some(rewritten)
 }
 
@@ -180,6 +206,15 @@ mod tests {
         Arc::new(NextJsIntegrationConfig {
             enabled: true,
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
+            remove_prebid: false,
+        })
+    }
+
+    fn test_config_with_prebid_removal() -> Arc<NextJsIntegrationConfig> {
+        Arc::new(NextJsIntegrationConfig {
+            enabled: true,
+            rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
+            remove_prebid: true,
         })
     }
 
@@ -236,9 +271,151 @@ mod tests {
             "ts.example.com",
             "https",
             &["link".into()],
+            false,
         )
         .expect("should rewrite protocol relative link");
 
         assert!(rewritten.contains(r#""link":"//ts.example.com/image.png""#));
+    }
+
+    #[test]
+    fn rewrite_helper_removes_prebid_files_from_nextjs_payload() {
+        let payload = r#"self.__next_f.push([1,"[\"$\",\"link\",{\"href\":\"/js/prebid.min.js?v=2025-11-20\"}],[\"$\",\"script\",{\"src\":\"/js/prebid.js\",\"children\":\"var pbjs=pbjs||{};pbjs.que=pbjs.que||[];\"}]"]);"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["href".into()],
+            true, // remove_prebid enabled
+        )
+        .expect("should remove prebid file references");
+
+        assert!(
+            !rewritten.contains("prebid.min.js"),
+            "Should remove prebid.min.js file references"
+        );
+        assert!(
+            !rewritten.contains("/js/prebid.js"),
+            "Should remove prebid.js file references"
+        );
+        assert!(
+            rewritten.contains("pbjs=pbjs||{}"),
+            "Should KEEP pbjs initialization (needed by shim)"
+        );
+        assert!(
+            rewritten.contains("pbjs.que"),
+            "Should KEEP pbjs.que (needed by shim)"
+        );
+        assert!(
+            rewritten.contains("self.__next_f"),
+            "Should preserve Next.js payload structure"
+        );
+    }
+
+    #[test]
+    fn rewrite_helper_respects_remove_prebid_flag() {
+        let payload = r#"self.__next_f.push([1,"var pbjs=pbjs||{};"]);"#;
+
+        // With remove_prebid = false, should keep prebid code
+        let not_removed = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["href".into()],
+            false, // remove_prebid disabled
+        );
+
+        // Should return None since no attributes to rewrite and prebid removal disabled
+        assert!(
+            not_removed.is_none(),
+            "Should not modify when remove_prebid is false"
+        );
+    }
+
+    #[test]
+    fn streamed_rewriter_removes_prebid_files_when_configured() {
+        let payload = r#"self.__next_f.push([1,"[\"$\",\"script\",{\"src\":\"/js/prebid.min.js\"}],[\"$\",\"script\",{\"children\":\"var pbjs=pbjs||{};\"}]"]);"#;
+        let rewriter = NextJsScriptRewriter::new(
+            test_config_with_prebid_removal(),
+            NextJsRewriteMode::Streamed,
+        );
+        let result = rewriter.rewrite(payload, &ctx("script"));
+
+        match result {
+            ScriptRewriteAction::Replace(value) => {
+                assert!(
+                    !value.contains("prebid.min.js"),
+                    "Should remove prebid file references from Next.js payloads"
+                );
+                assert!(
+                    value.contains("var pbjs=pbjs||{}"),
+                    "Should keep pbjs initialization code (shim needs it)"
+                );
+            }
+            _ => panic!("Expected prebid file removal from Next.js payload"),
+        }
+    }
+
+    #[test]
+    fn streamed_rewriter_handles_next_s_script_streaming() {
+        // Real-world example from autoblog.com using self.__next_s for script streaming
+        let payload = r#"(self.__next_s=self.__next_s||[]).push([0,{"children":"if(window.innerWidth>=768){var s=document.createElement('script');s.src='/js/prebid.min.js?v=2025-11-20-233540-a956a5e-008356';document.head.appendChild(s)}","id":"pbjs-bundle"}])"#;
+        let rewriter = NextJsScriptRewriter::new(
+            test_config_with_prebid_removal(),
+            NextJsRewriteMode::Streamed,
+        );
+        let result = rewriter.rewrite(payload, &ctx("script"));
+
+        match result {
+            ScriptRewriteAction::Replace(value) => {
+                assert!(
+                    !value.contains("prebid.min.js"),
+                    "Should remove prebid file references from __next_s payloads"
+                );
+                assert!(
+                    !value.contains("/js/prebid.min.js"),
+                    "Should remove full prebid path"
+                );
+                assert!(
+                    value.contains("self.__next_s"),
+                    "Should preserve __next_s structure"
+                );
+            }
+            _ => panic!("Expected prebid file removal from __next_s payload"),
+        }
+    }
+
+    #[test]
+    fn streamed_rewriter_only_processes_next_payloads() {
+        let rewriter = NextJsScriptRewriter::new(
+            test_config_with_prebid_removal(),
+            NextJsRewriteMode::Streamed,
+        );
+
+        // Non-Next.js script should be kept
+        let regular_script = r#"console.log('hello'); var x = 123;"#;
+        let result = rewriter.rewrite(regular_script, &ctx("script"));
+        assert!(
+            matches!(result, ScriptRewriteAction::Keep),
+            "Should skip non-Next.js scripts"
+        );
+
+        // __next_f with content to rewrite should be processed
+        let next_f = r#"self.__next_f.push([1, "{\"href\":\"https://origin.example.com/page\"}"]);"#;
+        let result_f = rewriter.rewrite(next_f, &ctx("script"));
+        assert!(
+            matches!(result_f, ScriptRewriteAction::Replace(_)),
+            "Should process __next_f payloads"
+        );
+
+        // __next_s with content to rewrite should be processed
+        let next_s = r#"self.__next_s.push([0, {"children":"code","src":"/js/prebid.min.js"}]);"#;
+        let result_s = rewriter.rewrite(next_s, &ctx("script"));
+        assert!(
+            matches!(result_s, ScriptRewriteAction::Replace(_)),
+            "Should process __next_s payloads"
+        );
     }
 }
