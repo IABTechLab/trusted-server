@@ -10,7 +10,9 @@ use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_common::publisher::{
+    handle_publisher_request, handle_ts_blank, handle_tsjs_dynamic,
+};
 use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_jwks_endpoint, handle_rotate_key, handle_verify_signature,
 };
@@ -60,6 +62,10 @@ async fn route_request(
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&settings, req)
+        }
+
+        (Method::GET, path) if path.starts_with("/static/scripts/") => {
+            handle_ts_blank(&settings, req)
         }
 
         // JWKS endpoint for public key distribution

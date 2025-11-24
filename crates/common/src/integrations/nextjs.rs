@@ -22,6 +22,8 @@ pub struct NextJsIntegrationConfig {
     )]
     #[validate(length(min = 1))]
     pub rewrite_attributes: Vec<String>,
+    #[serde(default = "default_rewrite_prebid")]
+    pub rewrite_prebid: bool,
 }
 
 impl IntegrationConfig for NextJsIntegrationConfig {
@@ -36,6 +38,10 @@ fn default_enabled() -> bool {
 
 fn default_rewrite_attributes() -> Vec<String> {
     vec!["href".to_string(), "link".to_string(), "url".to_string()]
+}
+
+fn default_rewrite_prebid() -> bool {
+    true
 }
 
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
@@ -92,6 +98,7 @@ impl NextJsScriptRewriter {
             ctx.request_host,
             ctx.request_scheme,
             &self.config.rewrite_attributes,
+            self.config.rewrite_prebid,
         ) {
             ScriptRewriteAction::replace(rewritten)
         } else {
@@ -135,33 +142,72 @@ fn rewrite_nextjs_values(
     request_host: &str,
     request_scheme: &str,
     attributes: &[String],
+    rewrite_prebid: bool,
 ) -> Option<String> {
-    if origin_host.is_empty() || request_host.is_empty() || attributes.is_empty() {
+    if origin_host.is_empty() || request_host.is_empty() {
         return None;
     }
 
     let mut rewritten = content.to_string();
     let mut changed = false;
-    let escaped_origin = escape(origin_host);
-    let replacement_scheme = format!("{}://{}", request_scheme, request_host);
 
-    for attribute in attributes {
-        let escaped_attr = escape(attribute);
-        let pattern = format!(
-            r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}"#,
-            attr = escaped_attr,
-            origin = escaped_origin,
-        );
-        let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
-        let next_value = regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
-            let scheme = &caps["scheme"];
-            let replacement = if scheme == "//" {
-                format!("//{}", request_host)
+    // First, rewrite attribute-based URLs (href, link, url, etc.)
+    if !attributes.is_empty() {
+        let escaped_origin = escape(origin_host);
+        let replacement_scheme = format!("{}://{}", request_scheme, request_host);
+
+        for attribute in attributes {
+            let escaped_attr = escape(attribute);
+            let pattern = format!(
+                r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}"#,
+                attr = escaped_attr,
+                origin = escaped_origin,
+            );
+            let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
+            let next_value = regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+                let scheme = &caps["scheme"];
+                let replacement = if scheme == "//" {
+                    format!("//{}", request_host)
+                } else {
+                    replacement_scheme.clone()
+                };
+                format!("{}{}", &caps["prefix"], replacement)
+            });
+            if next_value != rewritten {
+                changed = true;
+                rewritten = next_value.into_owned();
+            }
+        }
+    }
+
+    // Second, rewrite prebid script URLs to our static shim endpoint
+    if rewrite_prebid {
+        // Match any URL containing "prebid" and ".js" (with optional query params)
+        // This matches:
+        // - "https://cdn.com/prebid.js"
+        // - "//cdn.com/prebid.min.js?v=1.2.3"
+        // - "/js/prebid.js"
+        // - "/path/to/prebid.min.js"
+        // Handle both escaped (\") and unescaped (") quotes in JSON
+        let prebid_pattern =
+            r#"(?P<quote>\\*")(?P<url>[^"\\]*prebid[^"\\]*\.js[^"\\]*)(?P<endquote>\\*")"#;
+        let prebid_regex = Regex::new(prebid_pattern).expect("valid prebid URL regex");
+
+        let next_value = prebid_regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+            let url = &caps["url"];
+            // Check: if it contains "prebid" and ".js" (anywhere, including before query params)
+            let lower = url.to_lowercase();
+            if lower.contains("prebid") && lower.contains(".js") {
+                changed = true;
+                format!(
+                    "{}/static/scripts/prebid.min.js{}",
+                    &caps["quote"], &caps["endquote"]
+                )
             } else {
-                replacement_scheme.clone()
-            };
-            format!("{}{}", &caps["prefix"], replacement)
+                caps[0].to_string()
+            }
         });
+
         if next_value != rewritten {
             changed = true;
             rewritten = next_value.into_owned();
@@ -180,6 +226,7 @@ mod tests {
         Arc::new(NextJsIntegrationConfig {
             enabled: true,
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
+            rewrite_prebid: true,
         })
     }
 
@@ -236,9 +283,143 @@ mod tests {
             "ts.example.com",
             "https",
             &["link".into()],
+            false,
         )
         .expect("should rewrite protocol relative link");
 
         assert!(rewritten.contains(r#""link":"//ts.example.com/image.png""#));
+    }
+
+    #[test]
+    fn rewrite_prebid_urls_in_structured_payload() {
+        let payload = r#"{"props":{"pageProps":{"scripts":[{"src":"https://cdn.example.com/prebid.js"},{"src":"https://cdn.example.com/app.js"}]}}}"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite prebid URL");
+
+        assert!(
+            rewritten.contains(r#""src":"/static/scripts/prebid.min.js""#),
+            "prebid script should be rewritten to static endpoint"
+        );
+        assert!(
+            rewritten.contains(r#""src":"https://cdn.example.com/app.js""#),
+            "non-prebid script should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_urls_with_min_and_query_params() {
+        let payload = r#"{"script":"https://cdn.prebid.org/prebid.min.js?v=1.2.3"}"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite prebid URL with query params");
+
+        assert!(
+            rewritten.contains(r#""/static/scripts/prebid.min.js""#),
+            "prebid.min.js with query params should be rewritten"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_protocol_relative_urls() {
+        let payload = r#"{"src":"//cdn.example.com/prebidjs.min.js"}"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite protocol-relative prebid URL");
+
+        assert!(
+            rewritten.contains(r#""/static/scripts/prebid.min.js""#),
+            "protocol-relative prebid URL should be rewritten"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_urls_with_escaped_quotes() {
+        // Simulate escaped JSON strings as they appear in Next.js streaming payloads
+        let payload =
+            r#"self.__next_f.push([1,"{\"src\":\"https://cdn.example.com/prebid.js\"}"]);"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite prebid URL with escaped quotes");
+
+        assert!(
+            rewritten.contains(r#"\"/static/scripts/prebid.min.js\""#),
+            "escaped prebid URL should be rewritten and remain escaped"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_respects_config_flag() {
+        let payload = r#"{"src":"https://cdn.example.com/prebid.js"}"#;
+
+        // With rewrite_prebid = true
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        );
+        assert!(rewritten.is_some(), "should rewrite when flag is true");
+
+        // With rewrite_prebid = false
+        let not_rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            false,
+        );
+        assert!(
+            not_rewritten.is_none(),
+            "should not rewrite when flag is false"
+        );
+    }
+
+    #[test]
+    fn integration_test_rewriter_with_prebid() {
+        let payload = r#"self.__next_f.push([1, "{\"props\":{\"scripts\":[{\"src\":\"https://cdn.example.com/prebid.min.js\"},{\"src\":\"/app.js\"}]}}"]);"#;
+        let rewriter = NextJsScriptRewriter::new(test_config(), NextJsRewriteMode::Streamed);
+        let result = rewriter.rewrite(payload, &ctx("script"));
+
+        match result {
+            ScriptRewriteAction::Replace(value) => {
+                assert!(
+                    value.contains(r#"\"/static/scripts/prebid.min.js\""#),
+                    "prebid URL should be rewritten in streaming payload"
+                );
+                assert!(
+                    value.contains(r#"\"/app.js\""#),
+                    "non-prebid script should remain unchanged"
+                );
+            }
+            _ => panic!("Expected rewrite action"),
+        }
     }
 }

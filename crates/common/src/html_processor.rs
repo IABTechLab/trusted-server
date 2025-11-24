@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn prebid_auto_config_removes_prebid_scripts() {
+    fn prebid_auto_config_rewrites_prebid_scripts() {
         let html = r#"<html><head>
             <script src="https://cdn.prebid.org/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
@@ -463,12 +463,12 @@ mod tests {
             "Unified bundle should be injected"
         );
         assert!(
-            !processed.contains("prebid.min.js"),
-            "Prebid script should be removed"
+            !processed.contains("cdn.prebid.org"),
+            "Original prebid CDN URL should be rewritten"
         );
         assert!(
-            !processed.contains("cdn.prebid.org/prebid.js"),
-            "Prebid preload should be removed"
+            processed.contains("/static/scripts/prebid.min.js"),
+            "Prebid scripts should be rewritten to blank endpoint"
         );
     }
 

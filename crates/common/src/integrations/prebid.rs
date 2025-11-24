@@ -293,7 +293,8 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if self.config.auto_configure && is_prebid_script_url(attr_value) {
-            AttributeRewriteAction::remove_element()
+            // Rewrite prebid URLs to our blank script endpoint
+            AttributeRewriteAction::replace("/static/scripts/prebid.min.js")
         } else {
             AttributeRewriteAction::keep()
         }
@@ -692,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_removes_prebid_scripts() {
+    fn attribute_rewriter_rewrites_prebid_scripts() {
         let integration = PrebidIntegration {
             config: base_config(),
         };
@@ -704,7 +705,12 @@ mod tests {
         };
 
         let rewritten = integration.rewrite("src", "https://cdn.prebid.org/prebid.min.js", &ctx);
-        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
+        match rewritten {
+            AttributeRewriteAction::Replace(url) => {
+                assert_eq!(url, "/static/scripts/prebid.min.js");
+            }
+            _ => panic!("Expected Replace action"),
+        }
 
         let untouched = integration.rewrite("src", "https://cdn.example.com/app.js", &ctx);
         assert!(matches!(untouched, AttributeRewriteAction::Keep));
@@ -724,7 +730,12 @@ mod tests {
 
         let rewritten =
             integration.rewrite("href", "https://cdn.prebid.org/prebid.js?v=1.2.3", &ctx);
-        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
+        match rewritten {
+            AttributeRewriteAction::Replace(url) => {
+                assert_eq!(url, "/static/scripts/prebid.min.js");
+            }
+            _ => panic!("Expected Replace action"),
+        }
     }
 
     #[test]

@@ -97,6 +97,28 @@ pub fn handle_tsjs_dynamic(
     Ok(resp)
 }
 
+/// Serve blank scripts for `/static/scripts/*.js` requests
+/// Returns empty JavaScript to neutralize third-party dependencies
+pub fn handle_ts_blank(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    const PREFIX: &str = "/static/scripts/";
+    let path = req.get_path();
+
+    if !path.starts_with(PREFIX) {
+        return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+    }
+
+    // Serve an empty script for any request under /static/scripts/
+    // This allows neutralizing third-party scripts like prebid.js
+    let empty_script = "/* Blank script served by Trusted Server */\n";
+    let mut resp =
+        serve_static_with_etag(empty_script, &req, "application/javascript; charset=utf-8");
+    resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+    Ok(resp)
+}
+
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
