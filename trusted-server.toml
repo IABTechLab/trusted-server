@@ -56,3 +56,11 @@ rewrite_scripts = true
 # exclude_domains = [
 #     "*.edgecompute.app",
 # ]
+
+# Script Override Configuration
+# Define paths that should return empty JavaScript responses
+# Useful for blocking specific script versions or third-party scripts
+[script_overrides]
+paths = [
+    "/.static/prebid/1.0.8/prebid.min.js",
+]

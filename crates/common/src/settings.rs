@@ -252,6 +252,14 @@ pub struct Rewrite {
     pub exclude_domains: Vec<String>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+pub struct ScriptOverrides {
+    /// List of URL paths that should return empty JavaScript responses.
+    /// Supports exact path matching only.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 impl Rewrite {
     /// Checks if a URL should be excluded from rewriting based on domain matching
     #[allow(dead_code)]
@@ -276,6 +284,14 @@ impl Rewrite {
         }
 
         false
+    }
+}
+
+impl ScriptOverrides {
+    /// Checks if a path should be overridden with an empty script
+    #[allow(dead_code)]
+    pub fn is_overridden(&self, path: &str) -> bool {
+        self.paths.iter().any(|p| p == path)
     }
 }
 
@@ -336,6 +352,9 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub rewrite: Rewrite,
+    #[serde(default)]
+    #[validate(nested)]
+    pub script_overrides: ScriptOverrides,
 }
 
 #[allow(unused)]
@@ -956,5 +975,84 @@ mod tests {
         // Invalid URLs should not crash and should return false
         assert!(!rewrite.is_excluded("not a url"));
         assert!(!rewrite.is_excluded(""));
+    }
+
+    #[test]
+    fn test_script_overrides_is_overridden() {
+        let overrides = ScriptOverrides {
+            paths: vec![
+                "/.static/prebid/1.0.8/prebid.min.js".to_string(),
+                "/js/analytics.js".to_string(),
+            ],
+        };
+
+        // Should match exact paths
+        assert!(overrides.is_overridden("/.static/prebid/1.0.8/prebid.min.js"));
+        assert!(overrides.is_overridden("/js/analytics.js"));
+
+        // Should not match similar but different paths
+        assert!(!overrides.is_overridden("/.static/prebid/1.0.9/prebid.min.js"));
+        assert!(!overrides.is_overridden("/js/analytics.min.js"));
+        assert!(!overrides.is_overridden("/other/path.js"));
+        assert!(!overrides.is_overridden(""));
+    }
+
+    #[test]
+    fn test_script_overrides_empty() {
+        let overrides = ScriptOverrides { paths: vec![] };
+
+        assert!(!overrides.is_overridden("/.static/prebid/1.0.8/prebid.min.js"));
+        assert!(!overrides.is_overridden("/js/analytics.js"));
+    }
+
+    #[test]
+    fn test_script_overrides_from_toml() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[prebid]
+server_url = "https://test-prebid.com/openrtb2/auction"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[script_overrides]
+paths = [
+    "/.static/prebid/1.0.8/prebid.min.js",
+    "/js/old-analytics.js"
+]
+"#;
+
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+
+        assert_eq!(settings.script_overrides.paths.len(), 2);
+        assert!(settings
+            .script_overrides
+            .is_overridden("/.static/prebid/1.0.8/prebid.min.js"));
+        assert!(settings
+            .script_overrides
+            .is_overridden("/js/old-analytics.js"));
+        assert!(!settings
+            .script_overrides
+            .is_overridden("/js/other-script.js"));
+    }
+
+    #[test]
+    fn test_script_overrides_default_empty() {
+        let toml_str = crate_test_settings_str();
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
+
+        // When not specified, script_overrides should default to empty
+        assert_eq!(settings.script_overrides.paths.len(), 0);
+        assert!(!settings
+            .script_overrides
+            .is_overridden("/.static/prebid/1.0.8/prebid.min.js"));
     }
 }

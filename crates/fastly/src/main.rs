@@ -15,6 +15,7 @@ use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dyn
 use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_jwks_endpoint, handle_rotate_key, handle_verify_signature,
 };
+use trusted_server_common::script_overrides::handle_script_override;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 
@@ -55,6 +56,12 @@ async fn route_request(
     // Get path and method for routing
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
+
+    // Check if this path should return an empty script override
+    if settings.script_overrides.is_overridden(&path) {
+        log::info!("Returning script override for path: {}", path);
+        return Ok(handle_script_override(&settings));
+    }
 
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
