@@ -185,54 +185,33 @@ fn rewrite_nextjs_values(
 
     // Second, rewrite prebid script URLs to our static shim endpoint
     if rewrite_prebid {
-        // Pattern 1: Double quotes (JSON strings and escaped JSON)
-        // Matches: "https://cdn.com/prebid.js", \"https://cdn.com/prebid.js\"
-        let prebid_pattern_double =
-            r#"(?P<quote>\\*")(?P<url>[^"\\]*prebid[^"\\]*\.js[^"\\]*)(?P<endquote>\\*")"#;
-        let prebid_regex_double =
-            Regex::new(prebid_pattern_double).expect("valid prebid URL regex");
+        // Match URL-like strings containing "prebid" and ending with ".js"
+        // Must start with / or http to avoid matching code blocks
+        // This handles JSON strings and escaped JSON (like in Next.js payloads)
+        let prebid_pattern = r#"(?P<quote>\\*")(?P<url>(?:https?:|/)[^"\\]*prebid[^"\\]*\.js[^"\\]*)(?P<endquote>\\*")"#;
+        let prebid_regex = Regex::new(prebid_pattern).expect("valid prebid URL regex");
 
-        let next_value =
-            prebid_regex_double.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
-                let url = &caps["url"];
-                let lower = url.to_lowercase();
-                if lower.contains("prebid") && lower.contains(".js") {
-                    changed = true;
-                    format!(
-                        "{}/static/scripts/prebid.min.js{}",
-                        &caps["quote"], &caps["endquote"]
-                    )
-                } else {
-                    caps[0].to_string()
-                }
-            });
-
-        if next_value != rewritten {
-            changed = true;
-            rewritten = next_value.into_owned();
-        }
-
-        // Pattern 2: Single quotes (JavaScript strings)
-        // Matches: s.src='/.static/prebid/1.0.8/prebid.min.js'
-        let prebid_pattern_single =
-            r#"(?P<quote>')(?P<url>[^']*prebid[^']*\.js[^']*)(?P<endquote>')"#;
-        let prebid_regex_single =
-            Regex::new(prebid_pattern_single).expect("valid prebid URL regex");
-
-        let next_value =
-            prebid_regex_single.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
-                let url = &caps["url"];
-                let lower = url.to_lowercase();
-                if lower.contains("prebid") && lower.contains(".js") {
-                    changed = true;
-                    format!(
-                        "{}/static/scripts/prebid.min.js{}",
-                        &caps["quote"], &caps["endquote"]
-                    )
-                } else {
-                    caps[0].to_string()
-                }
-            });
+        let next_value = prebid_regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+            let url = &caps["url"];
+            let lower = url.to_lowercase();
+            // Extra validation: check it's actually a URL-like string
+            // URLs should start with /, http:, or https: and not contain spaces or parens
+            if (lower.starts_with('/') || lower.starts_with("http"))
+                && lower.contains("prebid")
+                && lower.contains(".js")
+                && !url.contains(' ')
+                && !url.contains('(')
+                && !url.contains(')')
+            {
+                changed = true;
+                format!(
+                    "{}/static/scripts/prebid.min.js{}",
+                    &caps["quote"], &caps["endquote"]
+                )
+            } else {
+                caps[0].to_string()
+            }
+        });
 
         if next_value != rewritten {
             changed = true;
@@ -429,26 +408,26 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_prebid_in_javascript_single_quotes() {
-        // Test JavaScript code with single quotes (like in dynamic script creation)
-        let payload = r#"var s=document.createElement('script');s.src='/.static/prebid/1.0.8/prebid.min.js';document.head.appendChild(s)"#;
-        let rewritten = rewrite_nextjs_values(
+    fn rewrite_prebid_in_javascript_inside_json() {
+        // Test JavaScript code with single quotes inside a JSON string (like dangerouslySetInnerHTML)
+        // The outer JSON uses double quotes, inner JavaScript uses single quotes
+        let payload = r#"{"__html":"var s=document.createElement('script');s.src='/.static/prebid/1.0.8/prebid.min.js';document.head.appendChild(s)"}"#;
+
+        // This should NOT rewrite because single quotes are inside the JSON string value
+        // We only rewrite double-quoted URLs to avoid breaking JavaScript inside JSON strings
+        let result = rewrite_nextjs_values(
             payload,
             "origin.example.com",
             "ts.example.com",
             "https",
             &[],
             true,
-        )
-        .expect("should rewrite single-quoted prebid URL");
-
-        assert!(
-            rewritten.contains("'/static/scripts/prebid.min.js'"),
-            "single-quoted prebid URL should be rewritten"
         );
+
+        // Should not rewrite (returns None because nothing changed)
         assert!(
-            !rewritten.contains("/.static/prebid/"),
-            "original path should be replaced"
+            result.is_none(),
+            "should not rewrite single quotes inside JSON string values to avoid breaking JavaScript"
         );
     }
 
