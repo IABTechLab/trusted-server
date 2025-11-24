@@ -135,6 +135,47 @@ already injects Trusted Server logging, headers, and error handling; the handler
 needs to deserialize the request, call the upstream endpoint, and stamp integration-specific
 headers.
 
+#### Proxying upstream requests
+
+Use the shared helper in `crates/common/src/proxy.rs` to forward requests so you automatically get
+the same header copying, redirect handling, HTML/CSS rewrite behavior, and synthetic ID handling the
+first‑party proxy uses:
+
+```rust
+use crate::proxy::{proxy_request, ProxyRequestConfig};
+use fastly::http::{header, HeaderValue};
+
+let payload = serde_json::to_vec(&my_body)?;
+let response = proxy_request(
+    settings,
+    req,
+    ProxyRequestConfig::new(&self.config.endpoint)
+        .with_body(payload)
+        .with_header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .with_streaming(), // stream passthrough; disable if you need HTML rewrites
+)
+.await?;
+```
+
+Set `forward_synthetic_id` to `false` if the upstream should not receive the caller’s synthetic ID
+(`Testlight` does this), and disable `follow_redirects` if you need to surface redirects directly to
+the caller.
+
+**Streaming passthrough example**
+
+```rust
+let response = proxy_request(
+    settings,
+    req,
+    ProxyRequestConfig::new("https://example.com/pixel")
+        .with_streaming() // no HTML/CSS rewrites; preserves origin compression
+);
+```
+
+Use streaming when the upstream response is binary or large and you do not need creative rewrites.
+Keep the default (non-streaming) mode when you want HTML/CSS content rewritten through the existing
+creative pipeline.
+
 ### 5. Implement HTML rewrite hooks (optional)
 
 If the integration needs to rewrite script/link tags or inject HTML, implement

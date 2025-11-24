@@ -49,3 +49,11 @@ rewrite_attributes = ["href", "link", "url"]
 endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1200
 rewrite_scripts = true
+
+# Rewrite configuration for creative HTML/CSS processing
+# [rewrite]
+# Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")
+# URLs from these domains will be left as-is and not proxied
+# exclude_domains = [
+#     "*.edgecompute.app",
+# ]
