@@ -40,6 +40,7 @@ timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
+# script_handler = "/prebid.js"
 
 [integrations.nextjs]
 enabled = false
