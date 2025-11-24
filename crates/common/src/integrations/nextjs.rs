@@ -127,7 +127,10 @@ impl IntegrationScriptRewriter for NextJsScriptRewriter {
         match self.mode {
             NextJsRewriteMode::Structured => self.rewrite_values(content, ctx),
             NextJsRewriteMode::Streamed => {
-                if !content.contains("self.__next_f") {
+                // Check for Next.js streaming patterns:
+                // - self.__next_f = Flight data (component streaming)
+                // - self.__next_s = Script streaming (for <Script> components)
+                if !content.contains("self.__next_f") && !content.contains("self.__next_s") {
                     return ScriptRewriteAction::keep();
                 }
                 self.rewrite_values(content, ctx)
@@ -182,31 +185,54 @@ fn rewrite_nextjs_values(
 
     // Second, rewrite prebid script URLs to our static shim endpoint
     if rewrite_prebid {
-        // Match any URL containing "prebid" and ".js" (with optional query params)
-        // This matches:
-        // - "https://cdn.com/prebid.js"
-        // - "//cdn.com/prebid.min.js?v=1.2.3"
-        // - "/js/prebid.js"
-        // - "/path/to/prebid.min.js"
-        // Handle both escaped (\") and unescaped (") quotes in JSON
-        let prebid_pattern =
+        // Pattern 1: Double quotes (JSON strings and escaped JSON)
+        // Matches: "https://cdn.com/prebid.js", \"https://cdn.com/prebid.js\"
+        let prebid_pattern_double =
             r#"(?P<quote>\\*")(?P<url>[^"\\]*prebid[^"\\]*\.js[^"\\]*)(?P<endquote>\\*")"#;
-        let prebid_regex = Regex::new(prebid_pattern).expect("valid prebid URL regex");
+        let prebid_regex_double =
+            Regex::new(prebid_pattern_double).expect("valid prebid URL regex");
 
-        let next_value = prebid_regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
-            let url = &caps["url"];
-            // Check: if it contains "prebid" and ".js" (anywhere, including before query params)
-            let lower = url.to_lowercase();
-            if lower.contains("prebid") && lower.contains(".js") {
-                changed = true;
-                format!(
-                    "{}/static/scripts/prebid.min.js{}",
-                    &caps["quote"], &caps["endquote"]
-                )
-            } else {
-                caps[0].to_string()
-            }
-        });
+        let next_value =
+            prebid_regex_double.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+                let url = &caps["url"];
+                let lower = url.to_lowercase();
+                if lower.contains("prebid") && lower.contains(".js") {
+                    changed = true;
+                    format!(
+                        "{}/static/scripts/prebid.min.js{}",
+                        &caps["quote"], &caps["endquote"]
+                    )
+                } else {
+                    caps[0].to_string()
+                }
+            });
+
+        if next_value != rewritten {
+            changed = true;
+            rewritten = next_value.into_owned();
+        }
+
+        // Pattern 2: Single quotes (JavaScript strings)
+        // Matches: s.src='/.static/prebid/1.0.8/prebid.min.js'
+        let prebid_pattern_single =
+            r#"(?P<quote>')(?P<url>[^']*prebid[^']*\.js[^']*)(?P<endquote>')"#;
+        let prebid_regex_single =
+            Regex::new(prebid_pattern_single).expect("valid prebid URL regex");
+
+        let next_value =
+            prebid_regex_single.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+                let url = &caps["url"];
+                let lower = url.to_lowercase();
+                if lower.contains("prebid") && lower.contains(".js") {
+                    changed = true;
+                    format!(
+                        "{}/static/scripts/prebid.min.js{}",
+                        &caps["quote"], &caps["endquote"]
+                    )
+                } else {
+                    caps[0].to_string()
+                }
+            });
 
         if next_value != rewritten {
             changed = true;
@@ -399,6 +425,50 @@ mod tests {
         assert!(
             not_rewritten.is_none(),
             "should not rewrite when flag is false"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_in_javascript_single_quotes() {
+        // Test JavaScript code with single quotes (like in dynamic script creation)
+        let payload = r#"var s=document.createElement('script');s.src='/.static/prebid/1.0.8/prebid.min.js';document.head.appendChild(s)"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite single-quoted prebid URL");
+
+        assert!(
+            rewritten.contains("'/static/scripts/prebid.min.js'"),
+            "single-quoted prebid URL should be rewritten"
+        );
+        assert!(
+            !rewritten.contains("/.static/prebid/"),
+            "original path should be replaced"
+        );
+    }
+
+    #[test]
+    fn rewrite_prebid_in_next_s_streaming() {
+        // Test self.__next_s pattern (script streaming)
+        let payload = r#"(self.__next_s=self.__next_s||[]).push(["https://cdn.example.com/prebid.js",{"id":"prebid-script"}])"#;
+        let rewritten = rewrite_nextjs_values(
+            payload,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[],
+            true,
+        )
+        .expect("should rewrite prebid URL in __next_s");
+
+        assert!(
+            rewritten.contains("\"/static/scripts/prebid.min.js\""),
+            "prebid URL in __next_s should be rewritten"
         );
     }
 
