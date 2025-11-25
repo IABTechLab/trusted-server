@@ -288,22 +288,17 @@ impl IntegrationProxy for PrebidIntegration {
         let path = req.get_path().to_string();
         let method = req.get_method().clone();
 
-        if method == Method::GET {
-            if let Some(script_path) = &self.config.script_handler {
-                if path == *script_path {
-                    return self.handle_script_handler();
-                }
+        match method {
+            Method::GET if self.config.script_handler.as_ref() == Some(&path) => self.handle_script_handler(),
+            Method::GET if path == ROUTE_FIRST_PARTY_AD => {
+                self.handle_first_party_ad(settings, req).await
             }
-        }
-
-        if method == Method::GET && path == ROUTE_FIRST_PARTY_AD {
-            self.handle_first_party_ad(settings, req).await
-        } else if method == Method::POST && path == ROUTE_THIRD_PARTY_AD {
-            self.handle_third_party_ad(settings, req).await
-        } else {
-            Err(Report::new(Self::error(format!(
+            Method::POST if path == ROUTE_THIRD_PARTY_AD => {
+                self.handle_third_party_ad(settings, req).await
+            }
+            _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
-            ))))
+            )))),
         }
     }
 }
