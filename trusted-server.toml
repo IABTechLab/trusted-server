@@ -45,6 +45,7 @@ timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
+# script_handler = "/prebid.js"
 
 [integrations.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
