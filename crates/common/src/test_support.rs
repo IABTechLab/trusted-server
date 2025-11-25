@@ -16,7 +16,8 @@ pub mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [prebid]
+            [integrations.prebid]
+            enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"  
 
             [synthetic] 
