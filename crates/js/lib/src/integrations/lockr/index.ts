@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import { installNextJsGuard } from './nextjs_guard';
 
 // Type definition for Lockr global
 declare global {
@@ -105,5 +106,10 @@ function waitForLockrSDK(callback: () => void, maxAttempts = 50) {
 
 // Auto-install when running in browser
 if (typeof window !== 'undefined') {
+  // Install Next.js guard FIRST to intercept dynamic script loading
+  // This must run before the Lockr SDK script is loaded by Next.js
+  installNextJsGuard();
+
+  // Then wait for SDK to load and install the API shim
   waitForLockrSDK(() => installLockrShim());
 }

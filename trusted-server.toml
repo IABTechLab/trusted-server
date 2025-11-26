@@ -51,7 +51,7 @@ rewrite_scripts = true
 
 [integrations.lockr]
 enabled = false
-app_id = ""
+app_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 api_endpoint = "https://identity.lockr.kr"
 sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
