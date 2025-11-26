@@ -5,7 +5,6 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
-use regex::Regex;
 
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
@@ -22,14 +21,12 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
-    pub nextjs_enabled: bool,
-    pub nextjs_attributes: Vec<String>,
 }
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
     pub fn from_settings(
-        settings: &Settings,
+        _settings: &Settings,
         integrations: &IntegrationRegistry,
         origin_host: &str,
         request_host: &str,
@@ -40,8 +37,6 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             integrations: integrations.clone(),
-            nextjs_enabled: settings.publisher.nextjs.enabled,
-            nextjs_attributes: settings.publisher.nextjs.rewrite_attributes.clone(),
         }
     }
 }
@@ -75,39 +70,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         fn protocol_relative_replacement(&self) -> String {
             format!("//{}", self.request_host)
         }
-
-        fn rewrite_nextjs_values(&self, content: &str, attributes: &[String]) -> Option<String> {
-            let mut rewritten = content.to_string();
-            let mut changed = false;
-            let escaped_origin = regex::escape(&self.origin_host);
-            for attribute in attributes {
-                let escaped_attr = regex::escape(attribute);
-                let pattern = format!(
-                    r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}"#,
-                    attr = escaped_attr,
-                    origin = escaped_origin
-                );
-                let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
-                let new_value = regex.replace_all(&rewritten, |caps: &regex::Captures| {
-                    let scheme = &caps["scheme"];
-                    let replacement = if scheme == "//" {
-                        format!("//{}", self.request_host)
-                    } else {
-                        self.replacement_url()
-                    };
-                    format!("{}{}", &caps["prefix"], replacement)
-                });
-                if new_value != rewritten {
-                    changed = true;
-                    rewritten = new_value.into_owned();
-                }
-            }
-            if changed {
-                Some(rewritten)
-            } else {
-                None
-            }
-        }
     }
 
     let patterns = Rc::new(UrlPatterns {
@@ -115,8 +77,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_host: config.request_host.clone(),
         request_scheme: config.request_scheme.clone(),
     });
-
-    let nextjs_attributes = Rc::new(config.nextjs_attributes.clone());
 
     let injected_tsjs = Rc::new(Cell::new(false));
     let integration_registry = config.integrations.clone();
@@ -378,35 +338,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
-    if config.nextjs_enabled && !nextjs_attributes.is_empty() {
-        element_content_handlers.push(text!("script#__NEXT_DATA__", {
-            let patterns = patterns.clone();
-            let attributes = nextjs_attributes.clone();
-            move |text| {
-                let content = text.as_str();
-                if let Some(rewritten) = patterns.rewrite_nextjs_values(content, &attributes) {
-                    text.replace(&rewritten, ContentType::Text);
-                }
-                Ok(())
-            }
-        }));
-
-        element_content_handlers.push(text!("script", {
-            let patterns = patterns.clone();
-            let attributes = nextjs_attributes.clone();
-            move |text| {
-                let content = text.as_str();
-                if !content.contains("self.__next_f") {
-                    return Ok(());
-                }
-                if let Some(rewritten) = patterns.rewrite_nextjs_values(content, &attributes) {
-                    text.replace(&rewritten, ContentType::Text);
-                }
-                Ok(())
-            }
-        }));
-    }
-
     let rewriter_settings = RewriterSettings {
         element_content_handlers,
         ..RewriterSettings::default()
@@ -433,114 +364,7 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
-            nextjs_enabled: false,
-            nextjs_attributes: vec!["href".to_string(), "link".to_string(), "url".to_string()],
         }
-    }
-
-    fn config_from_settings(
-        settings: &Settings,
-        registry: &IntegrationRegistry,
-    ) -> HtmlProcessorConfig {
-        HtmlProcessorConfig::from_settings(
-            settings,
-            registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
-    }
-
-    #[test]
-    fn test_always_injects_tsjs_script() {
-        let html = r#"<html><head>
-            <script src="/js/prebid.min.js"></script>
-            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
-        </head><body></body></html>"#;
-
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
-                    "auto_configure": false,
-                    "debug": false
-                }),
-            )
-            .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
-        let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-        let processed = String::from_utf8_lossy(&output);
-        // When auto-configure is disabled, do not rewrite Prebid references
-        assert!(processed.contains("/js/prebid.min.js"));
-        assert!(processed.contains("cdn.prebid.org/prebid.js"));
-        assert!(processed.contains("tsjs-unified"));
-    }
-
-    #[test]
-    fn prebid_auto_config_removes_prebid_scripts() {
-        let html = r#"<html><head>
-            <script src="https://cdn.prebid.org/prebid.min.js"></script>
-            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
-        </head><body></body></html>"#;
-
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
-                    "auto_configure": true,
-                    "debug": false
-                }),
-            )
-            .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
-        let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-        let processed = String::from_utf8_lossy(&output);
-        assert!(
-            processed.contains("tsjs-unified"),
-            "Unified bundle should be injected"
-        );
-        assert!(
-            !processed.contains("prebid.min.js"),
-            "Prebid script should be removed"
-        );
-        assert!(
-            !processed.contains("cdn.prebid.org/prebid.js"),
-            "Prebid preload should be removed"
-        );
     }
 
     #[test]
@@ -598,137 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrites_nextjs_script_when_enabled() {
-        let html = r#"<html><body>
-            <script id="__NEXT_DATA__" type="application/json">
-                {"props":{"pageProps":{"primary":{"href":"https://origin.example.com/reviews"},"secondary":{"href":"http://origin.example.com/sign-in"},"fallbackHref":"http://origin.example.com/legacy","protoRelative":"//origin.example.com/assets/logo.png"}}}
-            </script>
-        </body></html>"#;
-
-        let mut config = create_test_config();
-        config.nextjs_enabled = true;
-        config.nextjs_attributes = vec!["href".to_string(), "link".to_string(), "url".to_string()];
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let processed = String::from_utf8_lossy(&output);
-        println!("processed={processed}");
-        println!("processed stream payload: {}", processed);
-        println!("processed stream payload: {}", processed);
-
-        assert!(
-            processed.contains(r#""href":"https://test.example.com/reviews""#),
-            "Should rewrite https Next.js href values"
-        );
-        assert!(
-            processed.contains(r#""href":"https://test.example.com/sign-in""#),
-            "Should rewrite http Next.js href values"
-        );
-        assert!(
-            processed.contains(r#""fallbackHref":"http://origin.example.com/legacy""#),
-            "Should leave other fields untouched"
-        );
-        assert!(
-            processed.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#),
-            "Should not rewrite non-href keys"
-        );
-        assert!(
-            !processed.contains("\"href\":\"https://origin.example.com/reviews\""),
-            "Should remove origin https href"
-        );
-        assert!(
-            !processed.contains("\"href\":\"http://origin.example.com/sign-in\""),
-            "Should remove origin http href"
-        );
-    }
-
-    #[test]
-    fn test_rewrites_nextjs_stream_payload() {
-        let html = r#"<html><body>
-            <script>
-                self.__next_f.push([1,"chunk", "prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix", {"href":"http://origin.example.com/secondary","dataHost":"https://origin.example.com/api"}]);
-            </script>
-        </body></html>"#;
-
-        let mut config = create_test_config();
-        config.nextjs_enabled = true;
-        config.nextjs_attributes = vec!["href".to_string(), "link".to_string(), "url".to_string()];
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let processed = String::from_utf8_lossy(&output);
-        let normalized = processed.replace('\\', "");
-        assert!(
-            normalized.contains("\"href\":\"https://test.example.com/dashboard\""),
-            "Should rewrite escaped href sequences inside streamed payloads. Content: {}",
-            normalized
-        );
-        assert!(
-            normalized.contains("\"href\":\"https://test.example.com/secondary\""),
-            "Should rewrite plain href attributes inside streamed payloads"
-        );
-        assert!(
-            normalized.contains("\"link\":\"https://test.example.com/api-test\""),
-            "Should rewrite additional configured attributes like link"
-        );
-        assert!(
-            processed.contains("\"dataHost\":\"https://origin.example.com/api\""),
-            "Should leave non-href properties untouched"
-        );
-    }
-
-    #[test]
-    fn test_nextjs_rewrite_respects_flag() {
-        let html = r#"<html><body>
-            <script id="__NEXT_DATA__" type="application/json">
-                {"props":{"pageProps":{"href":"https://origin.example.com/reviews"}}}
-            </script>
-        </body></html>"#;
-
-        let config = create_test_config();
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let processed = String::from_utf8_lossy(&output);
-
-        assert!(
-            processed.contains("origin.example.com"),
-            "Should leave Next.js data untouched when disabled"
-        );
-        assert!(
-            !processed.contains("test.example.com/reviews"),
-            "Should not rewrite Next.js data when flag is off"
-        );
-    }
-
-    #[test]
     fn test_create_html_processor_url_replacement() {
         let config = create_test_config();
         let processor = create_html_processor(config);
@@ -774,15 +467,6 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
-        assert!(
-            !config.nextjs_enabled,
-            "Next.js rewrites should default to disabled"
-        );
-        assert_eq!(
-            config.nextjs_attributes,
-            vec!["href".to_string(), "link".to_string(), "url".to_string()],
-            "Should default to rewriting href/link/url attributes"
-        );
     }
 
     #[test]

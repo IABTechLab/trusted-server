@@ -3,10 +3,7 @@ use core::str;
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
-use serde::{
-    de::{DeserializeOwned, IntoDeserializer},
-    Deserialize, Deserializer, Serialize,
-};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -27,9 +24,6 @@ pub struct Publisher {
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     pub proxy_secret: String,
-    #[serde(default)]
-    #[validate(nested)]
-    pub nextjs: NextJs,
 }
 
 impl Publisher {
@@ -44,7 +38,6 @@ impl Publisher {
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     proxy_secret: "proxy-secret".to_string(),
-    ///     nextjs: Default::default(),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -59,30 +52,6 @@ impl Publisher {
                 })
             })
             .unwrap_or_else(|| self.origin_url.clone())
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Validate)]
-pub struct NextJs {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(
-        default = "default_nextjs_attributes",
-        deserialize_with = "deserialize_nextjs_attributes"
-    )]
-    pub rewrite_attributes: Vec<String>,
-}
-
-fn default_nextjs_attributes() -> Vec<String> {
-    vec!["href".to_string(), "link".to_string(), "url".to_string()]
-}
-
-impl Default for NextJs {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            rewrite_attributes: default_nextjs_attributes(),
-        }
     }
 }
 
@@ -184,18 +153,6 @@ impl Deref for IntegrationSettings {
 impl DerefMut for IntegrationSettings {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.entries
-    }
-}
-
-fn deserialize_nextjs_attributes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<JsonValue>::deserialize(deserializer)?;
-    match value {
-        Some(json) => vec_from_seq_or_map(json.into_deserializer())
-            .map_err(<D::Error as serde::de::Error>::custom),
-        None => Ok(default_nextjs_attributes()),
     }
 }
 
@@ -457,8 +414,9 @@ where
 mod tests {
     use super::*;
     use regex::Regex;
+    use serde_json::json;
 
-    use crate::integrations::prebid::PrebidIntegrationConfig;
+    use crate::integrations::{nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
@@ -479,12 +437,20 @@ mod tests {
             .expect("Prebid config should load from default settings");
         assert!(!prebid_cfg.server_url.is_empty());
         assert!(
-            !settings.publisher.nextjs.enabled,
-            "Next.js URL rewriting should default to disabled"
+            settings
+                .integration_config::<NextJsIntegrationConfig>("nextjs")
+                .expect("Next.js config query should succeed")
+                .is_none(),
+            "Next.js integration should be disabled by default"
         );
+        let raw_nextjs = settings
+            .integrations
+            .get("nextjs")
+            .expect("embedded config should include nextjs block");
+        assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
-            settings.publisher.nextjs.rewrite_attributes,
-            vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            raw_nextjs["rewrite_attributes"],
+            json!(["href", "link", "url"]),
             "Next.js rewrite attributes should default to href/link/url"
         );
 
@@ -511,12 +477,20 @@ mod tests {
             "https://test-prebid.com/openrtb2/auction"
         );
         assert!(
-            !settings.publisher.nextjs.enabled,
-            "Next.js URL rewriting should default to disabled"
+            settings
+                .integration_config::<NextJsIntegrationConfig>("nextjs")
+                .expect("Next.js config query should succeed")
+                .is_none(),
+            "Next.js integration should default to disabled"
         );
+        let raw_nextjs = settings
+            .integrations
+            .get("nextjs")
+            .expect("test settings should include nextjs block");
+        assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
-            settings.publisher.nextjs.rewrite_attributes,
-            vec!["href".to_string(), "link".to_string(), "url".to_string()],
+            raw_nextjs["rewrite_attributes"],
+            json!(["href", "link", "url"]),
             "Next.js rewrite attributes should default to href/link/url"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
@@ -784,7 +758,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -794,7 +767,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -804,7 +776,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -814,7 +785,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -824,7 +794,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -834,7 +803,6 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: "test-secret".to_string(),
-            nextjs: NextJs::default(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }

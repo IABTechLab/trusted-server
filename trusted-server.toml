@@ -9,11 +9,6 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
-[publisher.nextjs]
-enabled = false
-rewrite_attributes = ["href", "link", "url"]
-
-
 [synthetic]
 counter_store = "counter_store"
 opid_store = "opid_store"
@@ -45,6 +40,10 @@ timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
+
+[integrations.nextjs]
+enabled = false
+rewrite_attributes = ["href", "link", "url"]
 
 [integrations.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
