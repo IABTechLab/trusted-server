@@ -133,7 +133,7 @@ cargo build
 fastly compute publish
 ```
 
-## Devleopment
+## Development
 
 #### Install viceroy for running tests
 
