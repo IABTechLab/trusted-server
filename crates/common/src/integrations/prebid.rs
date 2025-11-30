@@ -670,11 +670,14 @@ fn get_request_scheme(req: &Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::AttributeRewriteAction;
+    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
     use crate::settings::Settings;
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
     use serde_json::json;
+    use std::io::Cursor;
 
     fn make_settings() -> Settings {
         Settings::from_toml(&crate_test_settings_str()).expect("should parse settings")
@@ -689,6 +692,19 @@ mod tests {
             auto_configure: true,
             debug: false,
         }
+    }
+
+    fn config_from_settings(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+    ) -> HtmlProcessorConfig {
+        HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
     }
 
     #[test]
@@ -725,6 +741,106 @@ mod tests {
         let rewritten =
             integration.rewrite("href", "https://cdn.prebid.org/prebid.js?v=1.2.3", &ctx);
         assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
+    }
+
+    #[test]
+    fn html_processor_keeps_prebid_scripts_when_auto_config_disabled() {
+        let html = r#"<html><head>
+            <script src="https://cdn.prebid.org/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "auto_configure": false,
+                    "debug": false
+                }),
+            )
+            .expect("should update prebid config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains("tsjs-unified"),
+            "Unified bundle should be injected"
+        );
+        assert!(
+            processed.contains("prebid.min.js"),
+            "Prebid script should remain when auto-config is disabled"
+        );
+        assert!(
+            processed.contains("cdn.prebid.org/prebid.js"),
+            "Prebid preload should remain when auto-config is disabled"
+        );
+    }
+
+    #[test]
+    fn html_processor_removes_prebid_scripts_when_auto_config_enabled() {
+        let html = r#"<html><head>
+            <script src="https://cdn.prebid.org/prebid.min.js"></script>
+            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
+        </head><body></body></html>"#;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "auto_configure": true,
+                    "debug": false
+                }),
+            )
+            .expect("should update prebid config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains("tsjs-unified"),
+            "Unified bundle should be injected"
+        );
+        assert!(
+            !processed.contains("prebid.min.js"),
+            "Prebid script should be removed when auto-config is enabled"
+        );
+        assert!(
+            !processed.contains("cdn.prebid.org/prebid.js"),
+            "Prebid preload should be removed when auto-config is enabled"
+        );
     }
 
     #[test]

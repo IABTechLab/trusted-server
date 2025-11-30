@@ -174,7 +174,12 @@ fn rewrite_nextjs_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::{IntegrationScriptContext, ScriptRewriteAction};
+    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::integrations::{IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction};
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::tests::create_test_settings;
+    use serde_json::json;
+    use std::io::Cursor;
 
     fn test_config() -> Arc<NextJsIntegrationConfig> {
         Arc::new(NextJsIntegrationConfig {
@@ -240,5 +245,144 @@ mod tests {
         .expect("should rewrite protocol relative link");
 
         assert!(rewritten.contains(r#""link":"//ts.example.com/image.png""#));
+    }
+
+    fn config_from_settings(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+    ) -> HtmlProcessorConfig {
+        HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
+    }
+
+    #[test]
+    fn html_processor_rewrites_nextjs_script_when_enabled() {
+        let html = r#"<html><body>
+            <script id="__NEXT_DATA__" type="application/json">
+                {"props":{"pageProps":{"primary":{"href":"https://origin.example.com/reviews"},"secondary":{"href":"http://origin.example.com/sign-in"},"fallbackHref":"http://origin.example.com/legacy","protoRelative":"//origin.example.com/assets/logo.png"}}}
+            </script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains(r#""href":"https://test.example.com/reviews""#),
+            "should rewrite https Next.js href values"
+        );
+        assert!(
+            processed.contains(r#""href":"https://test.example.com/sign-in""#),
+            "should rewrite http Next.js href values"
+        );
+        assert!(
+            processed.contains(r#""fallbackHref":"http://origin.example.com/legacy""#),
+            "should leave other fields untouched"
+        );
+        assert!(
+            processed.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#),
+            "should not rewrite non-href keys"
+        );
+        assert!(
+            !processed.contains("\"href\":\"https://origin.example.com/reviews\""),
+            "should remove origin https href"
+        );
+        assert!(
+            !processed.contains("\"href\":\"http://origin.example.com/sign-in\""),
+            "should remove origin http href"
+        );
+    }
+
+    #[test]
+    fn html_processor_rewrites_nextjs_stream_payload() {
+        let html = r#"<html><body>
+            <script>
+                self.__next_f.push([1,"chunk", "prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix", {"href":"http://origin.example.com/secondary","dataHost":"https://origin.example.com/api"}]);
+            </script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let processed = String::from_utf8_lossy(&output);
+        let normalized = processed.replace('\\', "");
+        assert!(
+            normalized.contains("\"href\":\"https://test.example.com/dashboard\""),
+            "should rewrite escaped href sequences inside streamed payloads: {}",
+            normalized
+        );
+        assert!(
+            normalized.contains("\"href\":\"https://test.example.com/secondary\""),
+            "should rewrite plain href attributes inside streamed payloads"
+        );
+        assert!(
+            normalized.contains("\"link\":\"https://test.example.com/api-test\""),
+            "should rewrite additional configured attributes like link"
+        );
+        assert!(
+            processed.contains("\"dataHost\":\"https://origin.example.com/api\""),
+            "should leave non-href properties untouched"
+        );
+    }
+
+    #[test]
+    fn register_respects_enabled_flag() {
+        let settings = create_test_settings();
+        let registration = register(&settings);
+
+        assert!(
+            registration.is_none(),
+            "should skip registration when integration is disabled"
+        );
     }
 }
