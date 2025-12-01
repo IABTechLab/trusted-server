@@ -292,11 +292,36 @@ impl IntegrationRegistry {
         }
     }
 
+    fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
+        // First try exact match
+        let key = (method.clone(), path.to_string());
+        if let Some(route_value) = self.inner.route_map.get(&key) {
+            return Some(route_value);
+        }
+
+        // If no exact match, try wildcard matching
+        // Routes ending with /* should match any path with that prefix + additional segments
+        for ((route_method, route_path), route_value) in &self.inner.route_map {
+            if route_method != method {
+                continue;
+            }
+
+            if let Some(prefix) = route_path.strip_suffix("/*") {
+                if path.starts_with(prefix)
+                    && path.len() > prefix.len()
+                    && path[prefix.len()..].starts_with('/')
+                {
+                    return Some(route_value);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Return true when any proxy is registered for the provided route.
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
-        self.inner
-            .route_map
-            .contains_key(&(method.clone(), path.to_string()))
+        self.find_route(method, path).is_some()
     }
 
     /// Dispatch a proxy request when an integration handles the path.
@@ -307,11 +332,7 @@ impl IntegrationRegistry {
         settings: &Settings,
         req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
-        if let Some((proxy, _)) = self
-            .inner
-            .route_map
-            .get(&(method.clone(), path.to_string()))
-        {
+        if let Some((proxy, _)) = self.find_route(method, path) {
             Some(proxy.handle(settings, req).await)
         } else {
             None
@@ -398,5 +419,193 @@ impl IntegrationRegistry {
                 script_rewriters,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn from_routes(routes: HashMap<RouteKey, RouteValue>) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                route_map: routes,
+                routes: Vec::new(),
+                html_rewriters: Vec::new(),
+                script_rewriters: Vec::new(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mock integration proxy for testing
+    struct MockProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for MockProxy {
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _req: Request,
+        ) -> Result<Response, Report<TrustedServerError>> {
+            Ok(Response::new())
+        }
+    }
+
+    #[test]
+    fn test_exact_route_matching() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/integrations/test/exact".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Should match exact route
+        assert!(registry.has_route(&Method::GET, "/integrations/test/exact"));
+
+        // Should not match different paths
+        assert!(!registry.has_route(&Method::GET, "/integrations/test/other"));
+        assert!(!registry.has_route(&Method::GET, "/integrations/test/exact/nested"));
+
+        // Should not match different methods
+        assert!(!registry.has_route(&Method::POST, "/integrations/test/exact"));
+    }
+
+    #[test]
+    fn test_wildcard_route_matching() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/integrations/lockr/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Should match paths under the wildcard prefix
+        assert!(registry.has_route(&Method::GET, "/integrations/lockr/api/settings"));
+        assert!(registry.has_route(
+            &Method::GET,
+            "/integrations/lockr/api/publisher/app/v1/identityLockr/settings"
+        ));
+        assert!(registry.has_route(&Method::GET, "/integrations/lockr/api/page-view"));
+        assert!(registry.has_route(&Method::GET, "/integrations/lockr/api/a/b/c/d/e"));
+
+        // Should not match paths that don't start with the prefix
+        assert!(!registry.has_route(&Method::GET, "/integrations/lockr/sdk"));
+        assert!(!registry.has_route(&Method::GET, "/integrations/lockr/other"));
+        assert!(!registry.has_route(&Method::GET, "/integrations/other/api/settings"));
+
+        // Should not match different methods
+        assert!(!registry.has_route(&Method::POST, "/integrations/lockr/api/settings"));
+    }
+
+    #[test]
+    fn test_wildcard_and_exact_routes_coexist() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/integrations/test/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+        );
+        routes.insert(
+            (Method::GET, "/integrations/test/exact".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Exact route should match
+        assert!(registry.has_route(&Method::GET, "/integrations/test/exact"));
+
+        // Wildcard routes should match
+        assert!(registry.has_route(&Method::GET, "/integrations/test/api/anything"));
+        assert!(registry.has_route(&Method::GET, "/integrations/test/api/nested/path"));
+
+        // Non-matching should fail
+        assert!(!registry.has_route(&Method::GET, "/integrations/test/other"));
+    }
+
+    #[test]
+    fn test_multiple_wildcard_routes() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/integrations/lockr/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
+        );
+        routes.insert(
+            (Method::POST, "/integrations/lockr/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
+        );
+        routes.insert(
+            (Method::GET, "/integrations/testlight/api/*".to_string()),
+            (
+                Arc::new(MockProxy) as Arc<dyn IntegrationProxy>,
+                "testlight",
+            ),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Lockr GET routes should match
+        assert!(registry.has_route(&Method::GET, "/integrations/lockr/api/settings"));
+
+        // Lockr POST routes should match
+        assert!(registry.has_route(&Method::POST, "/integrations/lockr/api/settings"));
+
+        // Testlight routes should match
+        assert!(registry.has_route(&Method::GET, "/integrations/testlight/api/auction"));
+        assert!(registry.has_route(&Method::GET, "/integrations/testlight/api/any-path"));
+
+        // Cross-integration paths should not match
+        assert!(!registry.has_route(&Method::GET, "/integrations/lockr/other-endpoint"));
+        assert!(!registry.has_route(&Method::GET, "/integrations/other/api/test"));
+    }
+
+    #[test]
+    fn test_wildcard_preserves_casing() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/integrations/lockr/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Should match with camelCase preserved
+        assert!(registry.has_route(
+            &Method::GET,
+            "/integrations/lockr/api/publisher/app/v1/identityLockr/settings"
+        ));
+        assert!(registry.has_route(
+            &Method::GET,
+            "/integrations/lockr/api/publisher/app/v1/identitylockr/settings"
+        ));
+    }
+
+    #[test]
+    fn test_wildcard_edge_cases() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            (Method::GET, "/api/*".to_string()),
+            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+        );
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Should match paths under /api/
+        assert!(registry.has_route(&Method::GET, "/api/v1"));
+        assert!(registry.has_route(&Method::GET, "/api/v1/users"));
+
+        // Should not match /api without trailing content
+        // The current implementation requires a / after the prefix
+        assert!(!registry.has_route(&Method::GET, "/api"));
+
+        // Should not match partial prefix matches
+        assert!(!registry.has_route(&Method::GET, "/apiv1"));
     }
 }
