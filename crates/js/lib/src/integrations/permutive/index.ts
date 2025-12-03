@@ -1,4 +1,4 @@
-import { log } from '../core/log';
+import { log } from '../../core/log';
 
 declare const permutive: {
   config: {
@@ -49,14 +49,14 @@ function installPermutiveShim() {
   const host = window.location.host;
   const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
 
-  permutive.config.apiHost = host + '/permutive/api';
+  permutive.config.apiHost = host + '/integrations/permutive/api';
   permutive.config.apiProtocol = protocol;
 
-  permutive.config.secureSignalsApiHost = host + '/permutive/secure-signal';
+  permutive.config.secureSignalsApiHost = host + '/integrations/permutive/secure-signal';
 
-  permutive.config.segmentSyncApiHost = host + '/permutive/sync';
+  permutive.config.segmentSyncApiHost = host + '/integrations/permutive/sync';
 
-  permutive.config.cdnBaseUrl = host + '/permutive/cdn';
+  permutive.config.cdnBaseUrl = host + '/integrations/permutive/cdn';
   permutive.config.cdnProtocol = protocol;
 
   log.info('Permutive shim installed', {
