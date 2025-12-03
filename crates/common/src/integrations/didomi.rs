@@ -14,6 +14,7 @@ use crate::integrations::{IntegrationEndpoint, IntegrationProxy, IntegrationRegi
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
+const DIDOMI_PREFIX: &str = "/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -179,8 +180,8 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 impl IntegrationProxy for DidomiIntegration {
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         vec![
-            IntegrationEndpoint::get_prefix("/consent"),
-            IntegrationEndpoint::post_prefix("/consent"),
+            IntegrationEndpoint::get_prefix(DIDOMI_PREFIX),
+            IntegrationEndpoint::post_prefix(DIDOMI_PREFIX),
         ]
     }
 
@@ -190,7 +191,7 @@ impl IntegrationProxy for DidomiIntegration {
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
-        let consent_path = path.strip_prefix("/consent").unwrap_or(path);
+        let consent_path = path.strip_prefix(DIDOMI_PREFIX).unwrap_or(path);
         let backend = self.backend_for_path(consent_path);
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
@@ -271,8 +272,8 @@ mod tests {
             .expect("should insert config");
 
         let registry = IntegrationRegistry::new(&settings);
-        assert!(registry.has_route(&Method::GET, "/consent/loader.js"));
-        assert!(registry.has_route(&Method::POST, "/consent/api/events"));
+        assert!(registry.has_route(&Method::GET, "/didomi/consent/loader.js"));
+        assert!(registry.has_route(&Method::POST, "/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
     }
 }
