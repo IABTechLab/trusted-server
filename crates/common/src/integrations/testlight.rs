@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method};
+use fastly::http::{header, HeaderValue};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
+use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::tsjs;
@@ -143,20 +143,20 @@ impl IntegrationProxy for TestlightIntegration {
 
         payload.user.id = Some(synthetic_id.clone());
 
-        let mut upstream = Request::new(Method::POST, self.config.endpoint.clone());
-        upstream.set_header(header::CONTENT_TYPE, "application/json");
-        upstream
-            .set_body_json(&payload)
+        let payload_bytes = serde_json::to_vec(&payload)
             .change_context(Self::error("Failed to serialize request body"))?;
 
-        if let Some(user_agent) = req.get_header(header::USER_AGENT) {
-            upstream.set_header(header::USER_AGENT, user_agent);
-        }
+        let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint);
+        proxy_config.forward_synthetic_id = false;
+        proxy_config.body = Some(payload_bytes);
+        proxy_config.stream_passthrough = true;
+        proxy_config.headers.push((
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        ));
 
-        let backend = ensure_backend_from_url(&self.config.endpoint)
-            .change_context(Self::error("Failed to determine backend"))?;
-        let mut response = upstream
-            .send(backend)
+        let mut response = proxy_request(settings, req, proxy_config)
+            .await
             .change_context(Self::error("Failed to contact upstream integration"))?;
 
         // Attempt to parse response into structured form for logging/future transforms.
