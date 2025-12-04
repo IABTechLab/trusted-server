@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
+use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
 
@@ -29,7 +30,6 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
-use crate::streaming_replacer::StreamingReplacer;
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
@@ -103,21 +103,24 @@ impl LockrIntegration {
     /// Rewrite the host variable in the Lockr SDK JavaScript.
     ///
     /// Replaces the obfuscated host assignment with a direct assignment to the
-    /// first-party API proxy endpoint.
+    /// first-party API proxy endpoint. Uses regex to match varying obfuscation patterns.
     fn rewrite_sdk_host(&self, sdk_body: Vec<u8>) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        // Pattern to find: 'host': _0x3a740e(0x3d1) + _0x3a740e(0x367) + _0x3a740e(0x14e)
-        // This is the obfuscated way Lockr sets the API host
-        // We'll replace it with a relative URL to use the first-party proxy
+        // Convert bytes to string
+        let sdk_string = String::from_utf8(sdk_body)
+            .change_context(Self::error("SDK content is not valid UTF-8"))?;
 
-        let mut replacer = StreamingReplacer::new_single(
-            "'host': _0x3a740e(0x3d1) + _0x3a740e(0x367) + _0x3a740e(0x14e)",
-            "'host': '/integrations/lockr/api'",
-        );
+        // Pattern matches: 'host': _0xABCDEF(0x123) + _0xABCDEF(0x456) + _0xABCDEF(0x789)
+        // This is the obfuscated way Lockr constructs the API host
+        // The function names and hex values change with each build, so we use regex
+        let pattern = Regex::new(
+            r"'host':\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)",
+        )
+        .change_context(Self::error("Failed to compile regex pattern"))?;
 
-        // Process the entire SDK in one chunk
-        let processed = replacer.process_chunk(&sdk_body, true);
+        // Replace with first-party API proxy endpoint
+        let rewritten = pattern.replace(&sdk_string, "'host': '/integrations/lockr/api'");
 
-        Ok(processed)
+        Ok(rewritten.as_bytes().to_vec())
     }
 
     /// Handle SDK serving - fetch from Lockr CDN and serve through first-party domain.
@@ -551,8 +554,8 @@ mod tests {
         };
         let integration = LockrIntegration::new(config);
 
-        // Mock obfuscated SDK JavaScript with the host pattern
-        let mock_sdk = r#"
+        // Mock obfuscated SDK JavaScript with the host pattern (old pattern)
+        let mock_sdk_old = r#"
 const identityLockr = {
     'host': _0x3a740e(0x3d1) + _0x3a740e(0x367) + _0x3a740e(0x14e),
     'app_id': null,
@@ -562,7 +565,7 @@ const identityLockr = {
 };
         "#;
 
-        let result = integration.rewrite_sdk_host(mock_sdk.as_bytes().to_vec());
+        let result = integration.rewrite_sdk_host(mock_sdk_old.as_bytes().to_vec());
         assert!(result.is_ok());
 
         let rewritten = String::from_utf8(result.unwrap()).unwrap();
@@ -572,6 +575,48 @@ const identityLockr = {
 
         // Verify the obfuscated pattern was removed
         assert!(!rewritten.contains("_0x3a740e(0x3d1) + _0x3a740e(0x367) + _0x3a740e(0x14e)"));
+
+        // Verify other parts of the code remain intact
+        assert!(rewritten.contains("'app_id': null"));
+        assert!(rewritten.contains("'firstPartyCookies': []"));
+    }
+
+    #[test]
+    fn test_sdk_host_rewriting_real_pattern() {
+        let config = LockrConfig {
+            enabled: true,
+            app_id: "test-app-id".to_string(),
+            api_endpoint: default_api_endpoint(),
+            sdk_url: default_sdk_url(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+            rewrite_sdk_host: true,
+        };
+        let integration = LockrIntegration::new(config);
+
+        // Real obfuscated SDK JavaScript from actual Lockr SDK
+        let mock_sdk_real = r#"
+const identityLockr = {
+    'host': _0x4ed951(0xcb) + _0x4ed951(0x173) + _0x4ed951(0x1c2),
+    'app_id': null,
+    'expiryDateKeys': localStorage['getItem']('identityLockr_expiryDateKeys') ? JSON['parse'](localStorage['getItem']('identityLockr_expiryDateKeys')) : [],
+    'firstPartyCookies': [],
+    'canRefreshToken': !![]
+};
+        "#;
+
+        let result = integration.rewrite_sdk_host(mock_sdk_real.as_bytes().to_vec());
+        assert!(result.is_ok());
+
+        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+
+        // Verify the host was rewritten to the proxy endpoint
+        assert!(rewritten.contains("'host': '/integrations/lockr/api'"));
+
+        // Verify the obfuscated pattern was removed
+        assert!(!rewritten.contains("_0x4ed951(0xcb)"));
+        assert!(!rewritten.contains("_0x4ed951(0x173)"));
+        assert!(!rewritten.contains("_0x4ed951(0x1c2)"));
 
         // Verify other parts of the code remain intact
         assert!(rewritten.contains("'app_id': null"));
