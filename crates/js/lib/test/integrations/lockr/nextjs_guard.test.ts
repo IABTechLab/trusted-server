@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { installNextJsGuard, isGuardInstalled, resetGuardState } from '../../../src/integrations/lockr/nextjs_guard';
+import {
+  installNextJsGuard,
+  isGuardInstalled,
+  resetGuardState,
+} from '../../../src/integrations/lockr/nextjs_guard';
 
 describe('Lockr SDK Script Interception Guard', () => {
   let originalAppendChild: typeof Element.prototype.appendChild;
@@ -113,7 +117,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://aim.loc.kr/identity-lockr-v1.0.js';
 
       container.appendChild(script);
@@ -242,7 +246,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://aim.loc.kr/identity-lockr-v1.0.js';
 
       container.appendChild(script);
@@ -255,7 +259,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://identity.loc.kr/identity-lockr-v2.0.js';
 
       container.appendChild(script);
@@ -268,7 +272,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://AIM.LOC.KR/identity-lockr-v1.0.js';
 
       container.appendChild(script);
@@ -281,7 +285,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://identity.loc.kr/other-script.js';
 
       container.appendChild(script);
@@ -294,7 +298,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       const container = document.createElement('div');
       const script = document.createElement('script');
-      
+
       script.src = 'https://identity.loc.kr/identity-lockr-v1.0.css';
 
       container.appendChild(script);
@@ -527,7 +531,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
       // Add script tag
       const script = document.createElement('script');
-      
+
       script.src = 'https://aim.loc.kr/identity-lockr-v1.0.js';
 
       container.appendChild(link);

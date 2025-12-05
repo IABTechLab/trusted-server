@@ -44,7 +44,7 @@ function isLockrSdkUrl(url: string): boolean {
 /**
  * Rewrite a Lockr SDK URL to use the first-party domain proxy endpoint.
  */
-function rewriteToFirstParty(originalUrl: string): string {
+function rewriteToFirstParty(): string {
   const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
   const host = window.location.host;
   return `${protocol}://${host}/integrations/lockr/sdk`;

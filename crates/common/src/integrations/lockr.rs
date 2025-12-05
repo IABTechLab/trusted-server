@@ -311,14 +311,12 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for LockrIntegration {
+    fn integration_name(&self) -> &'static str {
+        LOCKR_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            // SDK serving
-            IntegrationEndpoint::get("/integrations/lockr/sdk"),
-            // API proxy endpoints
-            IntegrationEndpoint::post("/integrations/lockr/api/*"),
-            IntegrationEndpoint::get("/integrations/lockr/api/*"),
-        ]
+        vec![self.get("/sdk"), self.post("/api/*"), self.get("/api/*")]
     }
 
     async fn handle(

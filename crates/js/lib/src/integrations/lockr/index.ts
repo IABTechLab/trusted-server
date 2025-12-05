@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+
 import { installNextJsGuard } from './nextjs_guard';
 
 // Type definition for Lockr global
