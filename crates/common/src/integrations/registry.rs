@@ -93,12 +93,23 @@ pub struct IntegrationScriptContext<'a> {
 pub struct IntegrationEndpoint {
     pub method: Method,
     pub path: &'static str,
+    pub match_type: RouteMatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteMatch {
+    Exact,
+    Prefix,
 }
 
 impl IntegrationEndpoint {
     #[must_use]
     pub fn new(method: Method, path: &'static str) -> Self {
-        Self { method, path }
+        Self {
+            method,
+            path,
+            match_type: RouteMatch::Exact,
+        }
     }
 
     #[must_use]
@@ -106,6 +117,7 @@ impl IntegrationEndpoint {
         Self {
             method: Method::GET,
             path,
+            match_type: RouteMatch::Exact,
         }
     }
 
@@ -114,6 +126,37 @@ impl IntegrationEndpoint {
         Self {
             method: Method::POST,
             path,
+            match_type: RouteMatch::Exact,
+        }
+    }
+
+    #[must_use]
+    pub fn prefix(method: Method, path: &'static str) -> Self {
+        Self {
+            method,
+            path,
+            match_type: RouteMatch::Prefix,
+        }
+    }
+
+    #[must_use]
+    pub fn get_prefix(path: &'static str) -> Self {
+        Self::prefix(Method::GET, path)
+    }
+
+    #[must_use]
+    pub fn post_prefix(path: &'static str) -> Self {
+        Self::prefix(Method::POST, path)
+    }
+
+    #[must_use]
+    fn matches(&self, method: &Method, path: &str) -> bool {
+        if self.method != method {
+            return false;
+        }
+        match self.match_type {
+            RouteMatch::Exact => path == self.path,
+            RouteMatch::Prefix => path.starts_with(self.path),
         }
     }
 }
@@ -222,6 +265,7 @@ type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
 #[derive(Default)]
 struct IntegrationRegistryInner {
     route_map: HashMap<RouteKey, RouteValue>,
+    prefix_routes: Vec<(IntegrationEndpoint, Arc<dyn IntegrationProxy>, &'static str)>,
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -262,18 +306,29 @@ impl IntegrationRegistry {
             if let Some(registration) = builder(settings) {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
-                        if inner
-                            .route_map
-                            .insert(
-                                (route.method.clone(), route.path.to_string()),
-                                (proxy.clone(), registration.integration_id),
-                            )
-                            .is_some()
-                        {
-                            panic!(
-                                "Integration route collision detected for {} {}",
-                                route.method, route.path
-                            );
+                        match route.match_type {
+                            RouteMatch::Exact => {
+                                if inner
+                                    .route_map
+                                    .insert(
+                                        (route.method.clone(), route.path.to_string()),
+                                        (proxy.clone(), registration.integration_id),
+                                    )
+                                    .is_some()
+                                {
+                                    panic!(
+                                        "Integration route collision detected for {} {}",
+                                        route.method, route.path
+                                    );
+                                }
+                            }
+                            RouteMatch::Prefix => {
+                                inner.prefix_routes.push((
+                                    route.clone(),
+                                    proxy.clone(),
+                                    registration.integration_id,
+                                ));
+                            }
                         }
                         inner.routes.push((route, registration.integration_id));
                     }
@@ -297,6 +352,11 @@ impl IntegrationRegistry {
         self.inner
             .route_map
             .contains_key(&(method.clone(), path.to_string()))
+            || self
+                .inner
+                .prefix_routes
+                .iter()
+                .any(|(route, _, _)| route.matches(method, path))
     }
 
     /// Dispatch a proxy request when an integration handles the path.
@@ -307,15 +367,21 @@ impl IntegrationRegistry {
         settings: &Settings,
         req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
-        if let Some((proxy, _)) = self
+        let proxy = self
             .inner
             .route_map
             .get(&(method.clone(), path.to_string()))
-        {
-            Some(proxy.handle(settings, req).await)
-        } else {
-            None
-        }
+            .map(|(proxy, _)| Arc::clone(proxy))
+            .or_else(|| {
+                self.inner
+                    .prefix_routes
+                    .iter()
+                    .filter(|(route, _, _)| route.matches(method, path))
+                    .max_by_key(|(route, _, _)| route.path.len())
+                    .map(|(_, proxy, _)| Arc::clone(proxy))
+            })?;
+
+        Some(proxy.handle(settings, req).await)
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
@@ -363,9 +429,7 @@ impl IntegrationRegistry {
             let entry = map
                 .entry(*integration_id)
                 .or_insert_with(|| IntegrationMetadata::new(integration_id));
-            entry
-                .routes
-                .push(IntegrationEndpoint::new(route.method.clone(), route.path));
+            entry.routes.push(route.clone());
         }
 
         for rewriter in &self.inner.html_rewriters {
@@ -393,10 +457,136 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner {
                 route_map: HashMap::new(),
+                prefix_routes: Vec::new(),
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::HEADER_X_FORWARDED_FOR;
+    use crate::test_support::tests::create_test_settings;
+    use fastly::http::{Method, StatusCode};
+    use fastly::{Request, Response};
+    use futures::executor::block_on;
+
+    struct TestProxy {
+        id: &'static str,
+        routes: Vec<IntegrationEndpoint>,
+    }
+
+    impl TestProxy {
+        fn new(id: &'static str, routes: Vec<IntegrationEndpoint>) -> Arc<Self> {
+            Arc::new(Self { id, routes })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for TestProxy {
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            self.routes.clone()
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _req: Request,
+        ) -> Result<Response, Report<TrustedServerError>> {
+            Ok(Response::from_status(StatusCode::OK).with_header(HEADER_X_FORWARDED_FOR, self.id))
+        }
+    }
+
+    fn registry_with_proxies(proxies: Vec<Arc<dyn IntegrationProxy>>) -> IntegrationRegistry {
+        let mut inner = IntegrationRegistryInner::default();
+        for proxy in proxies {
+            for route in proxy.routes() {
+                match route.match_type {
+                    RouteMatch::Exact => {
+                        if inner
+                            .route_map
+                            .insert(
+                                (route.method.clone(), route.path.to_string()),
+                                (proxy.clone(), "test"),
+                            )
+                            .is_some()
+                        {
+                            panic!("duplicate route {:?}", (route.method.clone(), route.path));
+                        }
+                    }
+                    RouteMatch::Prefix => {
+                        inner
+                            .prefix_routes
+                            .push((route.clone(), proxy.clone(), "test"));
+                    }
+                }
+                inner.routes.push((route, "test"));
+            }
+        }
+
+        IntegrationRegistry {
+            inner: Arc::new(inner),
+        }
+    }
+
+    #[test]
+    fn has_route_handles_prefix_routes() {
+        let registry = registry_with_proxies(vec![TestProxy::new(
+            "prefix",
+            vec![IntegrationEndpoint::get_prefix("/consent")],
+        )]);
+
+        assert!(registry.has_route(&Method::GET, "/consent/loader.js"));
+        assert!(!registry.has_route(&Method::POST, "/other/path"));
+    }
+
+    #[test]
+    fn handle_proxy_prefers_exact_over_prefix() {
+        let settings = create_test_settings();
+        let exact = TestProxy::new(
+            "exact",
+            vec![IntegrationEndpoint::get("/consent/api/events")],
+        );
+        let prefix = TestProxy::new("prefix", vec![IntegrationEndpoint::get_prefix("/consent")]);
+        let registry = registry_with_proxies(vec![prefix, exact]);
+
+        let req = Request::new(Method::GET, "https://edge.example.com/consent/api/events");
+        let result =
+            block_on(registry.handle_proxy(&Method::GET, "/consent/api/events", &settings, req));
+        let response = result.expect("should find route").expect("should proxy");
+
+        assert_eq!(
+            response
+                .get_header(&HEADER_X_FORWARDED_FOR)
+                .and_then(|v| v.to_str().ok()),
+            Some("exact")
+        );
+    }
+
+    #[test]
+    fn handle_proxy_selects_longest_prefix_match() {
+        let settings = create_test_settings();
+        let shorter = TestProxy::new("short", vec![IntegrationEndpoint::get_prefix("/consent")]);
+        let longer = TestProxy::new(
+            "long",
+            vec![IntegrationEndpoint::get_prefix("/consent/api")],
+        );
+        let registry = registry_with_proxies(vec![shorter, longer]);
+
+        let req = Request::new(Method::GET, "https://edge.example.com/consent/api/events");
+        let result =
+            block_on(registry.handle_proxy(&Method::GET, "/consent/api/events", &settings, req));
+        let response = result.expect("should find route").expect("should proxy");
+
+        assert_eq!(
+            response
+                .get_header(&HEADER_X_FORWARDED_FOR)
+                .and_then(|v| v.to_str().ok()),
+            Some("long")
+        );
     }
 }

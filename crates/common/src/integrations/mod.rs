@@ -2,6 +2,7 @@
 
 use crate::settings::Settings;
 
+pub mod didomi;
 pub mod nextjs;
 pub mod prebid;
 mod registry;
@@ -11,11 +12,16 @@ pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationMetadata, IntegrationProxy,
     IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
+    IntegrationScriptContext, IntegrationScriptRewriter, RouteMatch, ScriptRewriteAction,
 };
 
 type IntegrationBuilder = fn(&Settings) -> Option<IntegrationRegistration>;
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
-    &[prebid::register, testlight::register, nextjs::register]
+    &[
+        prebid::register,
+        testlight::register,
+        nextjs::register,
+        didomi::register,
+    ]
 }
