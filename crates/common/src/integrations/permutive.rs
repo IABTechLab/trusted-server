@@ -533,24 +533,28 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for PermutiveIntegration {
+    fn integration_name(&self) -> &'static str {
+        PERMUTIVE_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         vec![
             // API proxy endpoints
-            IntegrationEndpoint::get("/integrations/permutive/api/*"),
-            IntegrationEndpoint::post("/integrations/permutive/api/*"),
+            self.get("/api/*"),
+            self.post("/api/*"),
             // Secure Signals endpoints
-            IntegrationEndpoint::get("/integrations/permutive/secure-signal/*"),
-            IntegrationEndpoint::post("/integrations/permutive/secure-signal/*"),
+            self.get("/secure-signal/*"),
+            self.post("/secure-signal/*"),
             // Events endpoints
-            IntegrationEndpoint::get("/integrations/permutive/events/*"),
-            IntegrationEndpoint::post("/integrations/permutive/events/*"),
+            self.get("/events/*"),
+            self.post("/events/*"),
             // Sync endpoints
-            IntegrationEndpoint::get("/integrations/permutive/sync/*"),
-            IntegrationEndpoint::post("/integrations/permutive/sync/*"),
+            self.get("/sync/*"),
+            self.post("/sync/*"),
             // CDN endpoint
-            IntegrationEndpoint::get("/integrations/permutive/cdn/*"),
+            self.get("/cdn/*"),
             // SDK serving
-            IntegrationEndpoint::get("/integrations/permutive/sdk"),
+            self.get("/sdk"),
         ]
     }
 
