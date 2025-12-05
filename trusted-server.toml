@@ -58,6 +58,12 @@ workspace_id = ""
 project_id = ""
 api_endpoint = "https://api.permutive.com"
 secure_signals_endpoint = "https://secure-signals.permutive.app"
+
+[integrations.lockr]
+enabled = false
+app_id = ""
+api_endpoint = "https://identity.loc.kr"
+sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 

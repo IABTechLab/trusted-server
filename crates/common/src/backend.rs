@@ -39,7 +39,7 @@ pub fn ensure_origin_backend(
         .first_byte_timeout(Duration::from_secs(15))
         .between_bytes_timeout(Duration::from_secs(10));
     if scheme.eq_ignore_ascii_case("https") {
-        builder = builder.enable_ssl();
+        builder = builder.enable_ssl().sni_hostname(host);
     }
 
     match builder.finish() {
