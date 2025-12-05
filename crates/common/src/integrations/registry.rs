@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use error_stack::Report;
 use fastly::http::Method;
 use fastly::{Request, Response};
+use matchit::Router;
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -116,6 +117,30 @@ impl IntegrationEndpoint {
             path,
         }
     }
+
+    #[must_use]
+    pub fn put(path: &'static str) -> Self {
+        Self {
+            method: Method::PUT,
+            path,
+        }
+    }
+
+    #[must_use]
+    pub fn delete(path: &'static str) -> Self {
+        Self {
+            method: Method::DELETE,
+            path,
+        }
+    }
+
+    #[must_use]
+    pub fn patch(path: &'static str) -> Self {
+        Self {
+            method: Method::PATCH,
+            path,
+        }
+    }
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
@@ -154,11 +179,47 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.namespaced_post("/auction")  // becomes /integrations/my_integration/auction
+    /// self.post("/auction")  // becomes /integrations/my_integration/auction
     /// ```
     fn post(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
         IntegrationEndpoint::post(Box::leak(full_path.into_boxed_str()))
+    }
+
+    /// Helper to create a namespaced PUT endpoint.
+    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// self.put("/users")  // becomes /integrations/my_integration/users
+    /// ```
+    fn put(&self, path: &str) -> IntegrationEndpoint {
+        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        IntegrationEndpoint::put(Box::leak(full_path.into_boxed_str()))
+    }
+
+    /// Helper to create a namespaced DELETE endpoint.
+    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// self.delete("/users")  // becomes /integrations/my_integration/users
+    /// ```
+    fn delete(&self, path: &str) -> IntegrationEndpoint {
+        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        IntegrationEndpoint::delete(Box::leak(full_path.into_boxed_str()))
+    }
+
+    /// Helper to create a namespaced PATCH endpoint.
+    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// self.patch("/users")  // becomes /integrations/my_integration/users
+    /// ```
+    fn patch(&self, path: &str) -> IntegrationEndpoint {
+        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        IntegrationEndpoint::patch(Box::leak(full_path.into_boxed_str()))
     }
 }
 
@@ -246,15 +307,35 @@ impl IntegrationRegistrationBuilder {
     }
 }
 
-type RouteKey = (Method, String);
 type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
 
-#[derive(Default)]
 struct IntegrationRegistryInner {
-    route_map: HashMap<RouteKey, RouteValue>,
+    // Method-specific routers for O(log n) lookups
+    get_router: Router<RouteValue>,
+    post_router: Router<RouteValue>,
+    put_router: Router<RouteValue>,
+    delete_router: Router<RouteValue>,
+    patch_router: Router<RouteValue>,
+
+    // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+}
+
+impl Default for IntegrationRegistryInner {
+    fn default() -> Self {
+        Self {
+            get_router: Router::new(),
+            post_router: Router::new(),
+            put_router: Router::new(),
+            delete_router: Router::new(),
+            patch_router: Router::new(),
+            routes: Vec::new(),
+            html_rewriters: Vec::new(),
+            script_rewriters: Vec::new(),
+        }
+    }
 }
 
 /// Summary of registered integration capabilities.
@@ -292,19 +373,39 @@ impl IntegrationRegistry {
             if let Some(registration) = builder(settings) {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
-                        if inner
-                            .route_map
-                            .insert(
-                                (route.method.clone(), route.path.to_string()),
-                                (proxy.clone(), registration.integration_id),
-                            )
-                            .is_some()
-                        {
+                        let value = (proxy.clone(), registration.integration_id);
+
+                        // Convert /* wildcard to matchit's {*rest} syntax
+                        let matchit_path = if route.path.ends_with("/*") {
+                            format!("{}/{{*rest}}", route.path.strip_suffix("/*").unwrap())
+                        } else {
+                            route.path.to_string()
+                        };
+
+                        // Select appropriate router and insert
+                        let router = match route.method {
+                            Method::GET => &mut inner.get_router,
+                            Method::POST => &mut inner.post_router,
+                            Method::PUT => &mut inner.put_router,
+                            Method::DELETE => &mut inner.delete_router,
+                            Method::PATCH => &mut inner.patch_router,
+                            _ => {
+                                log::warn!(
+                                    "Unsupported HTTP method {} for route {}",
+                                    route.method,
+                                    route.path
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = router.insert(&matchit_path, value) {
                             panic!(
-                                "Integration route collision detected for {} {}",
-                                route.method, route.path
+                                "Integration route registration failed for {} {}: {:?}",
+                                route.method, route.path, e
                             );
                         }
+
                         inner.routes.push((route, registration.integration_id));
                     }
                 }
@@ -323,30 +424,16 @@ impl IntegrationRegistry {
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
-        // First try exact match
-        let key = (method.clone(), path.to_string());
-        if let Some(route_value) = self.inner.route_map.get(&key) {
-            return Some(route_value);
-        }
+        let router = match *method {
+            Method::GET => &self.inner.get_router,
+            Method::POST => &self.inner.post_router,
+            Method::PUT => &self.inner.put_router,
+            Method::DELETE => &self.inner.delete_router,
+            Method::PATCH => &self.inner.patch_router,
+            _ => return None, // Unsupported method
+        };
 
-        // If no exact match, try wildcard matching
-        // Routes ending with /* should match any path with that prefix + additional segments
-        for ((route_method, route_path), route_value) in &self.inner.route_map {
-            if route_method != method {
-                continue;
-            }
-
-            if let Some(prefix) = route_path.strip_suffix("/*") {
-                if path.starts_with(prefix)
-                    && path.len() > prefix.len()
-                    && path[prefix.len()..].starts_with('/')
-                {
-                    return Some(route_value);
-                }
-            }
-        }
-
-        None
+        router.at(path).ok().map(|matched| matched.value)
     }
 
     /// Return true when any proxy is registered for the provided route.
@@ -443,7 +530,11 @@ impl IntegrationRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner {
-                route_map: HashMap::new(),
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
@@ -452,10 +543,40 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
-    pub fn from_routes(routes: HashMap<RouteKey, RouteValue>) -> Self {
+    pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
+        let mut get_router = Router::new();
+        let mut post_router = Router::new();
+        let mut put_router = Router::new();
+        let mut delete_router = Router::new();
+        let mut patch_router = Router::new();
+
+        for (method, path, value) in routes {
+            // Convert /* wildcard to matchit's {*rest} syntax
+            let matchit_path = if path.ends_with("/*") {
+                format!("{}/{{*rest}}", path.strip_suffix("/*").unwrap())
+            } else {
+                path.to_string()
+            };
+
+            let router = match method {
+                Method::GET => &mut get_router,
+                Method::POST => &mut post_router,
+                Method::PUT => &mut put_router,
+                Method::DELETE => &mut delete_router,
+                Method::PATCH => &mut patch_router,
+                _ => continue,
+            };
+
+            router.insert(&matchit_path, value).unwrap();
+        }
+
         Self {
             inner: Arc::new(IntegrationRegistryInner {
-                route_map: routes,
+                get_router,
+                post_router,
+                put_router,
+                delete_router,
+                patch_router,
                 routes: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -492,11 +613,11 @@ mod tests {
 
     #[test]
     fn test_exact_route_matching() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/integrations/test/exact".to_string()),
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/exact",
             (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
-        );
+        )];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -513,11 +634,11 @@ mod tests {
 
     #[test]
     fn test_wildcard_route_matching() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/integrations/lockr/api/*".to_string()),
+        let routes = vec![(
+            Method::GET,
+            "/integrations/lockr/api/*",
             (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
-        );
+        )];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -541,15 +662,18 @@ mod tests {
 
     #[test]
     fn test_wildcard_and_exact_routes_coexist() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/integrations/test/api/*".to_string()),
-            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
-        );
-        routes.insert(
-            (Method::GET, "/integrations/test/exact".to_string()),
-            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
-        );
+        let routes = vec![
+            (
+                Method::GET,
+                "/integrations/test/api/*",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+            ),
+            (
+                Method::GET,
+                "/integrations/test/exact",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+            ),
+        ];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -566,22 +690,26 @@ mod tests {
 
     #[test]
     fn test_multiple_wildcard_routes() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/integrations/lockr/api/*".to_string()),
-            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
-        );
-        routes.insert(
-            (Method::POST, "/integrations/lockr/api/*".to_string()),
-            (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
-        );
-        routes.insert(
-            (Method::GET, "/integrations/testlight/api/*".to_string()),
+        let routes = vec![
             (
-                Arc::new(MockProxy) as Arc<dyn IntegrationProxy>,
-                "testlight",
+                Method::GET,
+                "/integrations/lockr/api/*",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
             ),
-        );
+            (
+                Method::POST,
+                "/integrations/lockr/api/*",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
+            ),
+            (
+                Method::GET,
+                "/integrations/testlight/api/*",
+                (
+                    Arc::new(MockProxy) as Arc<dyn IntegrationProxy>,
+                    "testlight",
+                ),
+            ),
+        ];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -602,11 +730,11 @@ mod tests {
 
     #[test]
     fn test_wildcard_preserves_casing() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/integrations/lockr/api/*".to_string()),
+        let routes = vec![(
+            Method::GET,
+            "/integrations/lockr/api/*",
             (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "lockr"),
-        );
+        )];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -623,11 +751,11 @@ mod tests {
 
     #[test]
     fn test_wildcard_edge_cases() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            (Method::GET, "/api/*".to_string()),
+        let routes = vec![(
+            Method::GET,
+            "/api/*",
             (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
-        );
+        )];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
@@ -641,5 +769,63 @@ mod tests {
 
         // Should not match partial prefix matches
         assert!(!registry.has_route(&Method::GET, "/apiv1"));
+    }
+
+    #[test]
+    fn test_helper_methods_create_namespaced_routes() {
+        let proxy = Arc::new(MockProxy);
+
+        // Test all HTTP method helpers
+        let get_endpoint = proxy.get("/users");
+        assert_eq!(get_endpoint.method, Method::GET);
+        assert_eq!(get_endpoint.path, "/integrations/test/users");
+
+        let post_endpoint = proxy.post("/users");
+        assert_eq!(post_endpoint.method, Method::POST);
+        assert_eq!(post_endpoint.path, "/integrations/test/users");
+
+        let put_endpoint = proxy.put("/users");
+        assert_eq!(put_endpoint.method, Method::PUT);
+        assert_eq!(put_endpoint.path, "/integrations/test/users");
+
+        let delete_endpoint = proxy.delete("/users");
+        assert_eq!(delete_endpoint.method, Method::DELETE);
+        assert_eq!(delete_endpoint.path, "/integrations/test/users");
+
+        let patch_endpoint = proxy.patch("/users");
+        assert_eq!(patch_endpoint.method, Method::PATCH);
+        assert_eq!(patch_endpoint.path, "/integrations/test/users");
+    }
+
+    #[test]
+    fn test_put_delete_patch_routes() {
+        let routes = vec![
+            (
+                Method::PUT,
+                "/integrations/test/users",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+            ),
+            (
+                Method::DELETE,
+                "/integrations/test/users",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+            ),
+            (
+                Method::PATCH,
+                "/integrations/test/users",
+                (Arc::new(MockProxy) as Arc<dyn IntegrationProxy>, "test"),
+            ),
+        ];
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Should match PUT, DELETE, and PATCH routes
+        assert!(registry.has_route(&Method::PUT, "/integrations/test/users"));
+        assert!(registry.has_route(&Method::DELETE, "/integrations/test/users"));
+        assert!(registry.has_route(&Method::PATCH, "/integrations/test/users"));
+
+        // Should not match other methods on same path
+        assert!(!registry.has_route(&Method::GET, "/integrations/test/users"));
+        assert!(!registry.has_route(&Method::POST, "/integrations/test/users"));
     }
 }
