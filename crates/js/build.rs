@@ -72,7 +72,7 @@ fn main() {
                 .current_dir(&ts_dir)
                 .status();
             if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
-                println!("cargo:warning=tsjs: npm run build failed; will try fallback if allowed");
+                panic!("tsjs: npm run build:custom failed - refusing to use stale bundle");
             }
         }
     }
