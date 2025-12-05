@@ -121,8 +121,12 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for TestlightIntegration {
+    fn integration_name(&self) -> &'static str {
+        TESTLIGHT_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::post("/integrations/testlight/auction")]
+        vec![self.post("/auction")]
     }
 
     async fn handle(

@@ -264,6 +264,10 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for PrebidIntegration {
+    fn integration_name(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         let mut routes = vec![
             IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),
