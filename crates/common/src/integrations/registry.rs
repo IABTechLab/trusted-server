@@ -121,7 +121,13 @@ impl IntegrationEndpoint {
 /// Trait implemented by integration proxies that expose HTTP endpoints.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
-    /// Routes handled by this integration (e.g. `/integrations/example/auction`).
+    /// Integration identifier used for logging and optional URL namespace.
+    /// Use this with the `namespaced_*` helper methods to automatically prefix routes.
+    fn integration_name(&self) -> &'static str;
+
+    /// Routes handled by this integration.
+    /// to automatically namespace routes under `/integrations/{integration_name()}/`,
+    /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
     /// Handle the proxied request.
@@ -130,6 +136,30 @@ pub trait IntegrationProxy: Send + Sync {
         settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
+
+    /// Helper to create a namespaced GET endpoint.
+    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// self.namespaced_get("/auction")  // becomes /integrations/my_integration/auction
+    /// ```
+    fn get(&self, path: &str) -> IntegrationEndpoint {
+        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        IntegrationEndpoint::get(Box::leak(full_path.into_boxed_str()))
+    }
+
+    /// Helper to create a namespaced POST endpoint.
+    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// self.namespaced_post("/auction")  // becomes /integrations/my_integration/auction
+    /// ```
+    fn post(&self, path: &str) -> IntegrationEndpoint {
+        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        IntegrationEndpoint::post(Box::leak(full_path.into_boxed_str()))
+    }
 }
 
 /// Trait for integration-provided HTML attribute rewrite hooks.
@@ -443,6 +473,10 @@ mod tests {
 
     #[async_trait(?Send)]
     impl IntegrationProxy for MockProxy {
+        fn integration_name(&self) -> &'static str {
+            "test"
+        }
+
         fn routes(&self) -> Vec<IntegrationEndpoint> {
             vec![]
         }

@@ -26,6 +26,8 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
+
+// Legacy route paths (kept for backwards compatibility)
 const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
 const ROUTE_THIRD_PARTY_AD: &str = "/third-party/ad";
 
@@ -136,7 +138,11 @@ impl PrebidIntegration {
             },
         )?;
 
-        log::info!("/third-party/ad: received {} adUnits", body.ad_units.len());
+        log::info!(
+            "{}: received {} adUnits",
+            ROUTE_THIRD_PARTY_AD,
+            body.ad_units.len()
+        );
         for unit in &body.ad_units {
             if let Some(mt) = &unit.media_types {
                 if let Some(banner) = &mt.banner {
@@ -264,6 +270,10 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for PrebidIntegration {
+    fn integration_name(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         let mut routes = vec![
             IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),

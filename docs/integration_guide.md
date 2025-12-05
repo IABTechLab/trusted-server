@@ -112,10 +112,14 @@ Implement the trait from `registry.rs` when your integration needs its own HTTP 
 ```rust
 #[async_trait(?Send)]
 impl IntegrationProxy for MyIntegration {
+    fn integration_name(&self) -> &'static str {
+        "my_integration"
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         vec![
-            IntegrationEndpoint::post("/integrations/my-integration/auction"),
-            IntegrationEndpoint::get("/integrations/my-integration/status"),
+            self.post("/auction"),
+            self.get("/status"),
         ]
     }
 
@@ -129,11 +133,20 @@ impl IntegrationProxy for MyIntegration {
 }
 ```
 
-Routes are matched verbatim in `crates/fastly/src/main.rs`, so stick to stable paths
-(`/integrations/<id>/…`) and register whichever HTTP methods you need. The shared context
-already injects Trusted Server logging, headers, and error handling; the handler only
-needs to deserialize the request, call the upstream endpoint, and stamp integration-specific
-headers.
+**Recommended:** Use the provided helper methods `get()` or `post()` 
+to automatically namespace your routes under `/integrations/{integration_name()}/`.
+This lets you define routes with just their relative paths (e.g., `self.post("/auction")` becomes 
+`"/integrations/my_integration/auction"`). You can also define routes manually using
+`IntegrationEndpoint::get()` / `IntegrationEndpoint::post()` for backwards compatibility or 
+special cases.
+
+Routes are matched verbatim in `crates/fastly/src/main.rs`, so stick to stable paths and 
+register whichever HTTP methods you need. **New integrations should namespace their routes under
+`/integrations/{INTEGRATION_NAME}/`** using the helper methods (`self.get()` or `self.post()`)
+for consistency, but you can define routes manually if needed (e.g., for backwards compatibility).
+The shared context already injects Trusted Server logging, headers, 
+and error handling; the handler only needs to deserialize the request, call the upstream endpoint,
+and stamp integration-specific headers.
 
 #### Proxying upstream requests
 
@@ -308,10 +321,12 @@ Prebid applies the same steps outlined above with a few notable patterns:
    `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that
    other integrations use.
 
-2. **Routes owned by the integration** – `IntegrationProxy::routes` declares the legacy
-   `/first-party/ad` (GET) and `/third-party/ad` (POST) endpoints. Both handlers share helpers that
-   shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via
-   `ensure_backend_from_url`, and run the HTML creative rewrites before responding.
+2. **Routes owned by the integration** – `IntegrationProxy::routes` declares the
+   `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST)
+   endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs +
+   geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML
+   creative rewrites before responding. All routes are properly namespaced under
+   `/integrations/prebid/` to follow the integration routing pattern.
 
 3. **HTML rewrites through the registry** – When `auto_configure` is enabled, the integration’s
    `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>`
