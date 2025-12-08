@@ -47,6 +47,8 @@ pub struct PrebidIntegrationConfig {
     pub debug: bool,
     #[serde(default)]
     pub script_handler: Option<String>,
+    #[serde(default)]
+    pub debug_query_params: Option<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -275,7 +277,7 @@ fn build_openrtb_from_ts(
         imp: imps,
         site: Some(Site {
             domain: Some(settings.publisher.domain.clone()),
-            page: Some(format!("https://{}", settings.publisher.domain)),
+            page: Some(format!("https://{}", &settings.publisher.domain)),
         }),
     }
 }
@@ -318,6 +320,7 @@ async fn handle_prebid_auction(
         &fresh_id,
         settings,
         &req,
+        config,
     )?;
 
     let mut pbs_req = Request::new(
@@ -332,6 +335,7 @@ async fn handle_prebid_auction(
         })?;
 
     log::info!("Sending request to Prebid Server");
+
     let backend_name = ensure_backend_from_url(&config.server_url)?;
     let mut pbs_response =
         pbs_req
@@ -377,6 +381,7 @@ fn enhance_openrtb_request(
     fresh_id: &str,
     settings: &Settings,
     req: &Request,
+    config: &PrebidIntegrationConfig,
 ) -> Result<(), Report<TrustedServerError>> {
     if !request["user"].is_object() {
         request["user"] = json!({});
@@ -413,10 +418,31 @@ fn enhance_openrtb_request(
     }
 
     if !request["site"].is_object() {
+        let mut page_url = format!("https://{}", settings.publisher.domain);
+
+        // Append debug query params if configured
+        if let Some(ref params) = config.debug_query_params {
+            page_url = format!("{}?{}", page_url, params);
+        }
+
         request["site"] = json!({
             "domain": settings.publisher.domain,
-            "page": format!("https://{}", settings.publisher.domain),
+            "page": page_url,
         });
+    } else if config.debug_query_params.is_some() {
+        // If site already exists, append debug params to existing page URL
+        if let Some(page_url) = request["site"]["page"].as_str() {
+            let params = config.debug_query_params.as_ref().unwrap();
+            // Only append if params aren't already present
+            if !page_url.contains(params.as_str()) {
+                let updated_url = if page_url.contains('?') {
+                    format!("{}&{}", page_url, params)
+                } else {
+                    format!("{}?{}", page_url, params)
+                };
+                request["site"]["page"] = json!(updated_url);
+            }
+        }
     }
 
     if let Some(request_signing_config) = &settings.request_signing {
@@ -435,6 +461,16 @@ fn enhance_openrtb_request(
                 "kid": signer.kid
             });
         }
+    }
+
+    if config.debug {
+        if !request["ext"].is_object() {
+            request["ext"] = json!({});
+        }
+        if !request["ext"]["prebid"].is_object() {
+            request["ext"]["prebid"] = json!({});
+        }
+        request["ext"]["prebid"]["debug"] = json!(true);
     }
 
     Ok(())
@@ -590,10 +626,12 @@ impl PrebidAuctionProvider {
                     })
                     .collect();
 
-                let mut bidder = std::collections::HashMap::new();
-                for bidder_name in &self.config.bidders {
-                    bidder.insert(bidder_name.clone(), Json::Object(serde_json::Map::new()));
-                }
+                // Use bidder params from the slot (passed through from the request)
+                let bidder: std::collections::HashMap<String, Json> = slot
+                    .bidders
+                    .iter()
+                    .map(|(name, params)| (name.clone(), params.clone()))
+                    .collect();
 
                 Imp {
                     id: slot.id.clone(),
@@ -778,6 +816,33 @@ impl AuctionProvider for PrebidAuctionProvider {
             }
         }
 
+        // Add debug flag if enabled
+        if self.config.debug {
+            if !openrtb_json["ext"]["prebid"].is_object() {
+                openrtb_json["ext"]["prebid"] = json!({});
+            }
+            openrtb_json["ext"]["prebid"]["debug"] = json!(true);
+        }
+
+        // Append debug query params to page URL if configured
+        if let Some(ref params) = self.config.debug_query_params {
+            if !params.is_empty() {
+                if let Some(page_url) = openrtb_json["site"]["page"].as_str() {
+                    // Only append if params aren't already present
+                    if !page_url.contains(params.as_str()) {
+                        let updated_url = if page_url.contains('?') {
+                            format!("{}&{}", page_url, params)
+                        } else {
+                            format!("{}?{}", page_url, params)
+                        };
+                        openrtb_json["site"]["page"] = json!(updated_url);
+                    }
+                }
+            }
+        }
+
+        log::info!("Prebid OpenRTB request: {:#?}", openrtb_json);
+
         // Create HTTP request
         let mut pbs_req = Request::new(
             Method::POST,
@@ -818,6 +883,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         let body_bytes = response.take_body_bytes();
+        log::info!("Prebid OpenRTB response: {}", String::from_utf8_lossy(&body_bytes));
+
         let mut response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
                 message: "Failed to parse Prebid response".to_string(),
@@ -913,6 +980,7 @@ mod tests {
             auto_configure: true,
             debug: false,
             script_handler: None,
+            debug_query_params: None,
         }
     }
 
@@ -1077,8 +1145,17 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
-            .expect("should enhance request");
+        let config = base_config();
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         assert_eq!(request_json["user"]["id"], synthetic_id);
         assert_eq!(request_json["user"]["ext"]["synthetic_fresh"], fresh_id);
@@ -1096,6 +1173,66 @@ mod tests {
                 .unwrap()
                 .starts_with("https://"),
             "site page should be populated"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_adds_debug_flag_when_enabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/auction");
+
+        let mut config = base_config();
+        config.debug = true;
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        assert_eq!(
+            request_json["ext"]["prebid"]["debug"], true,
+            "debug flag should be set to true when config.debug is enabled"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_does_not_add_debug_flag_when_disabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/auction");
+
+        let mut config = base_config();
+        config.debug = false;
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        assert!(
+            request_json["ext"]["prebid"]["debug"].is_null(),
+            "debug flag should not be set when config.debug is disabled"
         );
     }
 
@@ -1227,6 +1364,7 @@ server_url = "https://prebid.example"
             auto_configure: false,
             debug: false,
             script_handler: Some("/prebid.js".to_string()),
+            debug_query_params: None,
         };
         let integration = PrebidIntegration::new(config);
 
@@ -1261,6 +1399,7 @@ server_url = "https://prebid.example"
             auto_configure: false,
             debug: false,
             script_handler: Some("/prebid.js".to_string()),
+            debug_query_params: None,
         };
         let integration = PrebidIntegration::new(config);
 
@@ -1284,5 +1423,111 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script handler configured
         assert_eq!(routes.len(), 0);
+    }
+
+    #[test]
+    fn debug_query_params_appended_to_existing_site_page_in_enhance() {
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with existing site.page
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        assert_eq!(page, "https://example.com/page?kargo_debug=true");
+    }
+
+    #[test]
+    fn debug_query_params_appended_to_url_with_existing_query() {
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with existing query params in site.page
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page?existing=param"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        assert_eq!(
+            page,
+            "https://example.com/page?existing=param&kargo_debug=true"
+        );
+    }
+
+    #[test]
+    fn debug_query_params_not_duplicated() {
+        // Verify that if params are already in the URL, they aren't added again
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with URL that already has the debug params
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page?kargo_debug=true"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        // Should still only have params once
+        assert_eq!(page, "https://example.com/page?kargo_debug=true");
+        // Verify params appear exactly once
+        assert_eq!(page.matches("kargo_debug=true").count(), 1);
     }
 }
