@@ -9,9 +9,15 @@ export interface MediaTypes {
   banner?: Banner;
 }
 
+export interface Bid {
+  bidder: string;
+  params?: Record<string, unknown>;
+}
+
 export interface AdUnit {
   code: string;
   mediaTypes?: MediaTypes;
+  bids?: Bid[];
 }
 
 export interface TsjsApi {

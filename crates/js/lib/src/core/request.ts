@@ -46,7 +46,7 @@ export function requestAds(
 }
 
 // Create per-slot first-party iframe requests served directly from the edge.
-async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
+async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string; bids?: unknown }>) {
   for (const unit of adUnits) {
     const size = (firstSize(unit) ?? [300, 250]) as readonly [number, number];
     const slotId = unit.code;
@@ -60,7 +60,9 @@ async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
           width: size[0],
           height: size[1],
         });
-        iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
+        // Serialize bids to JSON and add to URL if present
+        const bidsParam = unit.bids ? `&bids=${encodeURIComponent(JSON.stringify(unit.bids))}` : '';
+        iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}${bidsParam}`;
         return;
       }
 

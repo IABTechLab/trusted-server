@@ -150,6 +150,7 @@ impl PrebidIntegration {
                 &preview.chars().take(512).collect::<String>()
             );
         }
+        log::info!("openrtb: {:#?}", openrtb);
 
         req.set_body_json(&openrtb)
             .change_context(TrustedServerError::Prebid {
@@ -187,6 +188,16 @@ impl PrebidIntegration {
             }));
         }
 
+        // Parse bids from query parameter if present
+        let bids = qp.get("bids").and_then(|json_str| {
+            serde_json::from_str::<Vec<Bid>>(json_str)
+                .map_err(|e| {
+                    log::warn!("Failed to parse bids parameter: {}", e);
+                    e
+                })
+                .ok()
+        });
+
         let ad_req = AdRequest {
             ad_units: vec![AdUnit {
                 code: slot.clone(),
@@ -195,7 +206,7 @@ impl PrebidIntegration {
                         sizes: vec![vec![w, h]],
                     }),
                 }),
-                bids: None,
+                bids,
             }],
             config: None,
         };
@@ -441,6 +452,8 @@ async fn handle_prebid_auction(
         })?;
 
     log::info!("Sending request to Prebid Server");
+    log::info!("request: {:#?}", openrtb_request);
+
     let backend_name = ensure_backend_from_url(&config.server_url)?;
     let mut pbs_response =
         pbs_req
@@ -448,6 +461,9 @@ async fn handle_prebid_auction(
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to send request to Prebid Server".to_string(),
             })?;
+
+    log::info!("pbs_response: {:#?}", pbs_response.take_body_str());
+
 
     if pbs_response.get_status().is_success() {
         let response_body = pbs_response.take_body_bytes();
