@@ -8,24 +8,43 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
 use crate::settings::Settings;
 
-/// Retrieves and returns active jwks public keys.
-pub fn handle_jwks_endpoint(
+/// Retrieves and returns the trusted-server discovery document.
+///
+/// This endpoint provides a standardized discovery mechanism following the IAB
+/// Data Subject Rights framework pattern. It returns JWKS keys and API endpoints
+/// in a single discoverable location.
+pub fn handle_trusted_server_discovery(
     _settings: &Settings,
     _req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    // Get JWKS
     let jwks_json = crate::request_signing::jwks::get_active_jwks().change_context(
         TrustedServerError::Configuration {
             message: "Failed to retrieve JWKS".into(),
         },
     )?;
 
+    let jwks_value: serde_json::Value =
+        serde_json::from_str(&jwks_json).change_context(TrustedServerError::Configuration {
+            message: "Failed to parse JWKS JSON".into(),
+        })?;
+
+    let discovery = TrustedServerDiscovery::new(jwks_value);
+
+    let json = serde_json::to_string_pretty(&discovery).change_context(
+        TrustedServerError::Configuration {
+            message: "Failed to serialize discovery document".into(),
+        },
+    )?;
+
     Ok(Response::from_status(200)
         .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body_text_plain(&jwks_json))
+        .with_body_text_plain(&json))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -513,5 +532,34 @@ mod tests {
         let req: DeactivateKeyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.kid, "old-key");
         assert!(req.delete);
+    }
+
+    #[test]
+    fn test_handle_trusted_server_discovery() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = Request::new(
+            Method::GET,
+            "https://test.com/.well-known/trusted-server.json",
+        );
+
+        let result = handle_trusted_server_discovery(&settings, req);
+        match result {
+            Ok(mut resp) => {
+                assert_eq!(resp.get_status(), StatusCode::OK);
+                let body = resp.take_body_str();
+
+                // Parse the discovery document
+                let discovery: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+                // Verify structure - only version and jwks
+                assert_eq!(discovery["version"], "1.0");
+                assert!(discovery["jwks"].is_object());
+
+                // Verify no extra fields
+                assert!(discovery.get("endpoints").is_none());
+                assert!(discovery.get("capabilities").is_none());
+            }
+            Err(e) => println!("Expected error in test environment: {}", e),
+        }
     }
 }

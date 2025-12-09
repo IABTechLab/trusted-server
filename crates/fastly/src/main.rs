@@ -12,7 +12,8 @@ use trusted_server_common::proxy::{
 };
 use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
 use trusted_server_common::request_signing::{
-    handle_deactivate_key, handle_jwks_endpoint, handle_rotate_key, handle_verify_signature,
+    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
+    handle_verify_signature,
 };
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
@@ -62,8 +63,10 @@ async fn route_request(
             handle_tsjs_dynamic(&settings, req)
         }
 
-        // JWKS endpoint for public key distribution
-        (Method::GET, "/.well-known/ts.jwks.json") => handle_jwks_endpoint(&settings, req),
+        // Discovery endpoint for trusted-server capabilities and JWKS
+        (Method::GET, "/.well-known/trusted-server.json") => {
+            handle_trusted_server_discovery(&settings, req)
+        }
 
         // Signature verification endpoint
         (Method::POST, "/verify-signature") => handle_verify_signature(&settings, req),
