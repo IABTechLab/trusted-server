@@ -361,8 +361,8 @@ fn build_openrtb_from_ts(
         id: Uuid::new_v4().to_string(),
         imp: imps,
         site: Some(Site {
-            domain: Some(settings.publisher.domain.clone()),
-            page: Some(format!("https://{}", settings.publisher.domain)),
+            domain: Some("www.autoblog.com".into()),
+            page: Some("https://www.autoblog.com".into()),
         }),
     }
 }
@@ -462,7 +462,7 @@ async fn handle_prebid_auction(
                 message: "Failed to send request to Prebid Server".to_string(),
             })?;
 
-    log::info!("pbs_response: {:#?}", pbs_response.take_body_str());
+    log::info!("pbs_response {}: {:#?}", pbs_response.get_status(), pbs_response.take_body_str());
 
 
     if pbs_response.get_status().is_success() {
