@@ -45,6 +45,8 @@ uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 once_cell = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-javascript = { workspace = true }
 
 [build-dependencies]
 config = { workspace = true }

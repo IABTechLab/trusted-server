@@ -43,4 +43,5 @@ pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod synthetic;
 pub mod test_support;
+pub mod tree_sitter_test;
 pub mod tsjs;

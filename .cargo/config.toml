@@ -4,5 +4,9 @@ test_details = ["test", "--target", "aarch64-apple-darwin"]
 [build]
 target = "wasm32-wasip1"
 
+[env]
+CC_wasm32_wasip1 = { value = "/Users/christian/.wasi-sdk/bin/clang", force = true }
+CFLAGS_wasm32_wasip1 = { value = "--sysroot=/Users/christian/.wasi-sdk/share/wasi-sysroot", force = true }
+
 [target.'cfg(all(target_arch = "wasm32"))']
 runner = "viceroy run -C ../../fastly.toml -- "
