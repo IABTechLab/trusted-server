@@ -56,3 +56,6 @@ urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
 which = "8"
+tree-sitter = { version = "0.26.2" }
+tree-sitter-javascript = { version = "0.25.0" }
+
