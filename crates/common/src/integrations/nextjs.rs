@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use regex::{escape, Regex};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -141,50 +140,66 @@ fn rewrite_nextjs_values(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
-    attributes: &[String],
+    _attributes: &[String], // Unused in blanket rewrite mode, kept for API compatibility
 ) -> Option<String> {
-    if origin_host.is_empty() || request_host.is_empty() || attributes.is_empty() {
+    if origin_host.is_empty() || request_host.is_empty() {
         return None;
     }
 
     let mut rewritten = content.to_string();
     let mut changed = false;
-    let escaped_origin = escape(origin_host);
-    let replacement_scheme = format!("{}://{}", request_scheme, request_host);
 
-    for attribute in attributes {
-        let escaped_attr = escape(attribute);
-        let pattern = format!(
-            r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?:\\?/\\?/|\\?/\\?/){origin}"#,
-            attr = escaped_attr,
-            origin = escaped_origin,
+    // Blanket rewrite: Replace ALL occurrences of origin URLs with proxy URLs
+    // This ensures consistency and prevents React hydration mismatches
+
+    // Pattern 1: https://origin.example.com -> https://proxy.example.com
+    let https_origin = format!("https://{}", origin_host);
+    let https_replacement = format!("{}://{}", request_scheme, request_host);
+    if rewritten.contains(&https_origin) {
+        rewritten = rewritten.replace(&https_origin, &https_replacement);
+        changed = true;
+    }
+
+    // Pattern 2: http://origin.example.com -> https://proxy.example.com (upgrade to https)
+    let http_origin = format!("http://{}", origin_host);
+    if rewritten.contains(&http_origin) {
+        rewritten = rewritten.replace(&http_origin, &https_replacement);
+        changed = true;
+    }
+
+    // Pattern 3: Escaped slashes - https:\/\/origin.example.com -> https:\/\/proxy.example.com
+    if rewritten.contains(&format!("https:\\/\\/{}", origin_host)) {
+        rewritten = rewritten.replace(
+            &format!("https:\\/\\/{}", origin_host),
+            &format!("https:\\/\\/{}", request_host),
         );
-        let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
-        let next_value = regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
-            let scheme = &caps["scheme"];
-            let replacement = if scheme == "//" || scheme == "\\/" {
-                // Protocol-relative: just replace the host
-                format!("//{}", request_host)
-            } else if scheme.contains('\\') {
-                // Escaped slashes (e.g., "https:\/\/" or "https:\\/\\/"): preserve escaping
-                // Count the backslashes and reconstruct with same escaping level
-                let backslash_count = scheme.matches('\\').count();
-                let slash_pair = match backslash_count {
-                    2 => "\\/\\/",    // https:\/\/ (single-escaped)
-                    4 => "\\\\/\\\\", // https:\\/\\/ (double-escaped)
-                    _ => "://",       // Fallback to unescaped
-                };
-                format!("{}:{}{}", request_scheme, slash_pair, request_host)
-            } else {
-                // Normal unescaped scheme
-                replacement_scheme.clone()
-            };
-            format!("{}{}", &caps["prefix"], replacement)
-        });
-        if next_value != rewritten {
-            changed = true;
-            rewritten = next_value.into_owned();
-        }
+        changed = true;
+    }
+
+    // Pattern 4: Escaped slashes - http:\/\/origin.example.com -> https:\/\/proxy.example.com
+    if rewritten.contains(&format!("http:\\/\\/{}", origin_host)) {
+        rewritten = rewritten.replace(
+            &format!("http:\\/\\/{}", origin_host),
+            &format!("https:\\/\\/{}", request_host),
+        );
+        changed = true;
+    }
+
+    // Pattern 5: Protocol-relative - //origin.example.com -> //proxy.example.com
+    let protocol_relative_origin = format!("//{}", origin_host);
+    let protocol_relative_replacement = format!("//{}", request_host);
+    if rewritten.contains(&protocol_relative_origin) {
+        rewritten = rewritten.replace(&protocol_relative_origin, &protocol_relative_replacement);
+        changed = true;
+    }
+
+    // Pattern 6: Protocol-relative with escaped slashes - \/\/origin.example.com -> \/\/proxy.example.com
+    if rewritten.contains(&format!("\\/\\/{}", origin_host)) {
+        rewritten = rewritten.replace(
+            &format!("\\/\\/{}", origin_host),
+            &format!("\\/\\/{}", request_host),
+        );
+        changed = true;
     }
 
     changed.then_some(rewritten)
@@ -233,8 +248,23 @@ mod tests {
             ScriptRewriteAction::Replace(value) => {
                 assert!(value.contains(r#""href":"https://ts.example.com/reviews""#));
                 assert!(value.contains(r#""href":"https://ts.example.com/sign-in""#));
-                assert!(value.contains(r#""fallbackHref":"http://origin.example.com/legacy""#));
-                assert!(value.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#));
+                // Blanket rewrite: ALL URLs are rewritten
+                assert!(
+                    value.contains(r#""fallbackHref":"https://ts.example.com/legacy""#),
+                    "blanket rewrite should rewrite fallbackHref: {}",
+                    value
+                );
+                assert!(
+                    value.contains(r#""protoRelative":"//ts.example.com/assets/logo.png""#),
+                    "blanket rewrite should rewrite protocol-relative URLs: {}",
+                    value
+                );
+                // Origin should not appear anywhere
+                assert!(
+                    !value.contains("origin.example.com"),
+                    "blanket rewrite should remove all origin URLs: {}",
+                    value
+                );
             }
             _ => panic!("Expected rewrite to update payload"),
         }
@@ -438,6 +468,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blanket_rewrite_catches_all_url_fields() {
+        // Test that blanket rewrite catches fields not in the rewrite_attributes list
+        // This prevents React hydration mismatches from inconsistent URL rewriting
+        let content = r#"{
+            "url":"https://origin.example.com/news",
+            "featured_image":"https://origin.example.com/.image/img.jpg",
+            "favicon":"https://origin.example.com/favicon.ico",
+            "siteBaseUrl":"https://origin.example.com",
+            "source_url":"https://origin.example.com/source",
+            "thumbnail":"http://origin.example.com/thumb.jpg",
+            "logo":"//origin.example.com/logo.png"
+        }"#;
+
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["url".into()], // Only "url" in attributes, but should catch ALL fields
+        )
+        .expect("should rewrite all URLs");
+
+        // All URLs should be rewritten, regardless of field name
+        assert!(
+            rewritten.contains(r#""url":"https://ts.example.com/news""#),
+            "should rewrite url field"
+        );
+        assert!(
+            rewritten.contains(r#""featured_image":"https://ts.example.com/.image/img.jpg""#),
+            "should rewrite featured_image field: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""favicon":"https://ts.example.com/favicon.ico""#),
+            "should rewrite favicon field: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""siteBaseUrl":"https://ts.example.com""#),
+            "should rewrite siteBaseUrl field: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""source_url":"https://ts.example.com/source""#),
+            "should rewrite source_url field: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""thumbnail":"https://ts.example.com/thumb.jpg""#),
+            "should rewrite thumbnail and upgrade http to https: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""logo":"//ts.example.com/logo.png""#),
+            "should rewrite protocol-relative logo: {}",
+            rewritten
+        );
+
+        // Origin domain should not appear anywhere
+        assert!(
+            !rewritten.contains("origin.example.com"),
+            "should not contain origin domain anywhere: {}",
+            rewritten
+        );
+    }
+
+    #[test]
+    fn blanket_rewrite_handles_escaped_slashes_in_all_fields() {
+        // Test that escaped slashes are preserved for any field, not just listed attributes
+        let content = r#"{"featured_image":"https:\/\/origin.example.com\/img.jpg","siteBaseUrl":"https:\/\/origin.example.com"}"#;
+
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[], // Empty attribute list - blanket rewrite should still work
+        )
+        .expect("should rewrite with escaped slashes");
+
+        assert!(
+            rewritten.contains(r#""featured_image":"https:\/\/ts.example.com\/img.jpg""#),
+            "should preserve escaped slashes in featured_image: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""siteBaseUrl":"https:\/\/ts.example.com""#),
+            "should preserve escaped slashes in siteBaseUrl: {}",
+            rewritten
+        );
+
+        // Verify escape count preserved
+        let original_backslashes = content.matches('\\').count();
+        let rewritten_backslashes = rewritten.matches('\\').count();
+        assert_eq!(
+            original_backslashes, rewritten_backslashes,
+            "backslash count must be preserved"
+        );
+    }
+
     fn config_from_settings(
         settings: &Settings,
         registry: &IntegrationRegistry,
@@ -494,21 +625,22 @@ mod tests {
             processed.contains(r#""href":"https://test.example.com/sign-in""#),
             "should rewrite http Next.js href values"
         );
+        // Blanket rewrite: ALL fields with URLs are rewritten, not just "href"
         assert!(
-            processed.contains(r#""fallbackHref":"http://origin.example.com/legacy""#),
-            "should leave other fields untouched"
+            processed.contains(r#""fallbackHref":"https://test.example.com/legacy""#),
+            "should rewrite fallbackHref field with blanket rewrite: {}",
+            processed
         );
         assert!(
-            processed.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#),
-            "should not rewrite non-href keys"
+            processed.contains(r#""protoRelative":"//test.example.com/assets/logo.png""#),
+            "should rewrite protocol-relative URLs in all fields: {}",
+            processed
         );
+        // Origin domain should not appear anywhere due to blanket rewrite
         assert!(
-            !processed.contains("\"href\":\"https://origin.example.com/reviews\""),
-            "should remove origin https href"
-        );
-        assert!(
-            !processed.contains("\"href\":\"http://origin.example.com/sign-in\""),
-            "should remove origin http href"
+            !processed.contains("origin.example.com"),
+            "should remove ALL origin URLs with blanket rewrite: {}",
+            processed
         );
     }
 
@@ -560,9 +692,11 @@ mod tests {
             normalized.contains("\"link\":\"https://test.example.com/api-test\""),
             "should rewrite additional configured attributes like link"
         );
+        // Blanket rewrite: ALL URLs are rewritten
         assert!(
-            processed.contains("\"dataHost\":\"https://origin.example.com/api\""),
-            "should leave non-href properties untouched"
+            processed.contains("\"dataHost\":\"https://test.example.com/api\""),
+            "should rewrite ALL fields with blanket rewrite: {}",
+            processed
         );
     }
 
