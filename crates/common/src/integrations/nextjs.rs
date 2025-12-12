@@ -35,7 +35,14 @@ fn default_enabled() -> bool {
 }
 
 fn default_rewrite_attributes() -> Vec<String> {
-    vec!["href".to_string(), "link".to_string(), "url".to_string()]
+    vec![
+        "href".to_string(),
+        "link".to_string(),
+        "url".to_string(),
+        "src".to_string(),    // For scripts/images/iframes
+        "action".to_string(), // For form actions
+        "poster".to_string(), // For video posters
+    ]
 }
 
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
@@ -148,7 +155,7 @@ fn rewrite_nextjs_values(
     for attribute in attributes {
         let escaped_attr = escape(attribute);
         let pattern = format!(
-            r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}"#,
+            r#"(?P<prefix>(?:\\*")?{attr}(?:\\*")?:\\*")(?P<scheme>https?:\\?/\\?/|\\?/\\?/){origin}"#,
             attr = escaped_attr,
             origin = escaped_origin,
         );
@@ -184,7 +191,14 @@ mod tests {
     fn test_config() -> Arc<NextJsIntegrationConfig> {
         Arc::new(NextJsIntegrationConfig {
             enabled: true,
-            rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
+            rewrite_attributes: vec![
+                "href".into(),
+                "link".into(),
+                "url".into(),
+                "src".into(),
+                "action".into(),
+                "poster".into(),
+            ],
         })
     }
 
@@ -215,6 +229,40 @@ mod tests {
     }
 
     #[test]
+    fn structured_rewriter_handles_escaped_forward_slashes() {
+        let payload = r#"{"props":{"pageProps":{"href":"https:\/\/origin.example.com\/page","src":"https:\/\/origin.example.com\/script.js","link":"http:\/\/origin.example.com\/api"}}}"#;
+        let rewriter = NextJsScriptRewriter::new(test_config(), NextJsRewriteMode::Structured);
+        let result = rewriter.rewrite(payload, &ctx("script#__NEXT_DATA__"));
+
+        match result {
+            ScriptRewriteAction::Replace(value) => {
+                // When input has escaped slashes, output preserves them
+                assert!(
+                    value.contains("ts.example.com") && value.contains("page"),
+                    "should rewrite escaped https href to ts.example.com: {}",
+                    value
+                );
+                assert!(
+                    value.contains("ts.example.com") && value.contains("script.js"),
+                    "should rewrite escaped https src to ts.example.com: {}",
+                    value
+                );
+                assert!(
+                    value.contains("ts.example.com") && value.contains("api"),
+                    "should rewrite escaped http link to ts.example.com: {}",
+                    value
+                );
+                assert!(
+                    !value.contains("origin.example.com"),
+                    "should not contain origin domain: {}",
+                    value
+                );
+            }
+            _ => panic!("Expected rewrite to update payload with escaped slashes"),
+        }
+    }
+
+    #[test]
     fn streamed_rewriter_only_runs_for_next_payloads() {
         let rewriter = NextJsScriptRewriter::new(test_config(), NextJsRewriteMode::Streamed);
 
@@ -233,6 +281,39 @@ mod tests {
     }
 
     #[test]
+    fn streamed_rewriter_handles_escaped_forward_slashes() {
+        let rewriter = NextJsScriptRewriter::new(test_config(), NextJsRewriteMode::Streamed);
+
+        // Test with escaped forward slashes in URLs
+        // Note: using regular string (not raw) to properly represent the escaping
+        // This simulates JSON where forward slashes are escaped: https:\/\/domain.com
+        let payload = "self.__next_f.push([1, \"\\\"src\\\":\\\"https:\\/\\/origin.example.com\\/app.js\\\"\"]);";
+
+        let rewritten = rewriter.rewrite(payload, &ctx("script"));
+        match rewritten {
+            ScriptRewriteAction::Replace(value) => {
+                // The rewriter should handle escaped slashes and produce output with them rewritten
+                assert!(
+                    value.contains("ts.example.com"),
+                    "should rewrite to ts.example.com in streamed payload: {}",
+                    value
+                );
+                // Make sure origin is gone
+                assert!(
+                    !value.contains("origin.example.com"),
+                    "should not contain origin domain: {}",
+                    value
+                );
+            }
+            ScriptRewriteAction::Keep => {
+                // If Keep is returned, the content didn't change. Let's see what's in the payload.
+                panic!("Expected rewrite but got Keep. Payload was: {:?}", payload);
+            }
+            _ => panic!("Expected Replace action for streamed payload with escaped slashes"),
+        }
+    }
+
+    #[test]
     fn rewrite_helper_handles_protocol_relative_urls() {
         let content = r#"{"props":{"pageProps":{"link":"//origin.example.com/image.png"}}}"#;
         let rewritten = rewrite_nextjs_values(
@@ -245,6 +326,57 @@ mod tests {
         .expect("should rewrite protocol relative link");
 
         assert!(rewritten.contains(r#""link":"//ts.example.com/image.png""#));
+    }
+
+    #[test]
+    fn rewrites_src_action_and_poster_attributes() {
+        let content = r#"{"props":{"pageProps":{"script":{"src":"https://origin.example.com/app.js"},"form":{"action":"https://origin.example.com/submit"},"video":{"poster":"https://origin.example.com/thumb.jpg"}}}}"#;
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["src".into(), "action".into(), "poster".into()],
+        )
+        .expect("should rewrite src, action, and poster attributes");
+
+        assert!(
+            rewritten.contains(r#""src":"https://ts.example.com/app.js""#),
+            "should rewrite src attribute"
+        );
+        assert!(
+            rewritten.contains(r#""action":"https://ts.example.com/submit""#),
+            "should rewrite action attribute"
+        );
+        assert!(
+            rewritten.contains(r#""poster":"https://ts.example.com/thumb.jpg""#),
+            "should rewrite poster attribute"
+        );
+    }
+
+    #[test]
+    fn rewrites_urls_with_escaped_forward_slashes() {
+        // Test the core rewrite function with escaped forward slashes
+        let content = r#"{"href":"https:\/\/origin.example.com\/page","src":"http:\/\/origin.example.com\/script.js"}"#;
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["href".into(), "src".into()],
+        )
+        .expect("should rewrite URLs with escaped slashes");
+
+        assert!(
+            rewritten.contains("ts.example.com"),
+            "should contain rewritten domain: {}",
+            rewritten
+        );
+        assert!(
+            !rewritten.contains("origin.example.com"),
+            "should not contain origin domain: {}",
+            rewritten
+        );
     }
 
     fn config_from_settings(

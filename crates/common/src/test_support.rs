@@ -22,7 +22,7 @@ pub mod tests {
 
             [integrations.nextjs]
             enabled = false
-            rewrite_attributes = ["href", "link", "url"]
+            rewrite_attributes = ["href", "link", "url", "src", "action", "poster"]
 
             [synthetic] 
             counter_store = "test-counter-store"

@@ -450,8 +450,8 @@ mod tests {
         assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
             raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "url"]),
-            "Next.js rewrite attributes should default to href/link/url"
+            json!(["href", "link", "url", "src", "action", "poster"]),
+            "Next.js rewrite attributes should include href/link/url/src/action/poster"
         );
 
         assert!(!settings.synthetic.counter_store.is_empty());
@@ -490,8 +490,8 @@ mod tests {
         assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
             raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "url"]),
-            "Next.js rewrite attributes should default to href/link/url"
+            json!(["href", "link", "url", "src", "action", "poster"]),
+            "Next.js rewrite attributes should include href/link/url/src/action/poster"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
