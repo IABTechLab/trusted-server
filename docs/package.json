@@ -1,0 +1,16 @@
+{
+  "name": "trusted-server-docs",
+  "version": "1.0.0",
+  "description": "Documentation site for Trusted Server",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.5.0"
+  }
+}
