@@ -162,9 +162,21 @@ fn rewrite_nextjs_values(
         let regex = Regex::new(&pattern).expect("valid Next.js rewrite regex");
         let next_value = regex.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
             let scheme = &caps["scheme"];
-            let replacement = if scheme == "//" {
+            let replacement = if scheme == "//" || scheme == "\\/" {
+                // Protocol-relative: just replace the host
                 format!("//{}", request_host)
+            } else if scheme.contains('\\') {
+                // Escaped slashes (e.g., "https:\/\/" or "https:\\/\\/"): preserve escaping
+                // Count the backslashes and reconstruct with same escaping level
+                let backslash_count = scheme.matches('\\').count();
+                let slash_pair = match backslash_count {
+                    2 => "\\/\\/",    // https:\/\/ (single-escaped)
+                    4 => "\\\\/\\\\", // https:\\/\\/ (double-escaped)
+                    _ => "://",       // Fallback to unescaped
+                };
+                format!("{}:{}{}", request_scheme, slash_pair, request_host)
             } else {
+                // Normal unescaped scheme
                 replacement_scheme.clone()
             };
             format!("{}{}", &caps["prefix"], replacement)
@@ -367,15 +379,62 @@ mod tests {
         )
         .expect("should rewrite URLs with escaped slashes");
 
+        // The key assertion: escaping must be preserved!
         assert!(
-            rewritten.contains("ts.example.com"),
-            "should contain rewritten domain: {}",
+            rewritten.contains(r#""href":"https:\/\/ts.example.com\/page""#),
+            "should preserve escaped slashes in href: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains(r#""src":"https:\/\/ts.example.com\/script.js""#),
+            "should preserve escaped slashes in src and upgrade http to https: {}",
             rewritten
         );
         assert!(
             !rewritten.contains("origin.example.com"),
             "should not contain origin domain: {}",
             rewritten
+        );
+
+        // Verify escape count is preserved
+        let original_backslashes = content.matches('\\').count();
+        let rewritten_backslashes = rewritten.matches('\\').count();
+        assert_eq!(
+            original_backslashes, rewritten_backslashes,
+            "backslash count must be preserved (was {}, now {}): {}",
+            original_backslashes, rewritten_backslashes, rewritten
+        );
+    }
+
+    #[test]
+    fn rewrites_urls_in_rsc_streaming_payload() {
+        // Test realistic RSC streaming payload with escaped JSON inside JavaScript string
+        // This simulates: self.__next_f.push([1,"{\"url\":\"https:\/\/origin.example.com\/api\"}"])
+        let content =
+            r#"self.__next_f.push([1,"{\"url\":\"https:\/\/origin.example.com\/api\"}"])"#;
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["url".into()],
+        )
+        .expect("should rewrite URLs in RSC streaming payload");
+
+        // Must preserve the escaped slashes in the JSON
+        assert!(
+            rewritten.contains(r#"\"url\":\"https:\/\/ts.example.com\/api\""#),
+            "should preserve escaped slashes in RSC payload: {}",
+            rewritten
+        );
+
+        // Verify escape count is preserved (critical for JSON parsing)
+        let original_backslashes = content.matches('\\').count();
+        let rewritten_backslashes = rewritten.matches('\\').count();
+        assert_eq!(
+            original_backslashes, rewritten_backslashes,
+            "backslash count must be preserved in RSC payload (was {}, now {}): {}",
+            original_backslashes, rewritten_backslashes, rewritten
         );
     }
 
