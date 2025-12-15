@@ -249,12 +249,34 @@ pub trait IntegrationScriptRewriter: Send + Sync {
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 
+/// Context for HTML post-processors.
+#[derive(Debug)]
+pub struct IntegrationHtmlContext<'a> {
+    pub request_host: &'a str,
+    pub request_scheme: &'a str,
+    pub origin_host: &'a str,
+}
+
+/// Trait for integration-provided HTML post-processors.
+/// These run after streaming HTML processing to handle cases that require
+/// access to the complete HTML (e.g., cross-script RSC T-chunks).
+pub trait IntegrationHtmlPostProcessor: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+
+    /// Post-process complete HTML content.
+    /// This is called after streaming HTML processing with the complete HTML.
+    /// Return the modified HTML or the original if no changes needed.
+    fn post_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> String;
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+    pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
 }
 
 impl IntegrationRegistration {
@@ -276,6 +298,7 @@ impl IntegrationRegistrationBuilder {
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
             },
         }
     }
@@ -302,6 +325,15 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
+    pub fn with_html_post_processor(
+        mut self,
+        processor: Arc<dyn IntegrationHtmlPostProcessor>,
+    ) -> Self {
+        self.registration.html_post_processors.push(processor);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
@@ -321,6 +353,7 @@ struct IntegrationRegistryInner {
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+    html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -334,6 +367,7 @@ impl Default for IntegrationRegistryInner {
             routes: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
+            html_post_processors: Vec::new(),
         }
     }
 }
@@ -415,6 +449,9 @@ impl IntegrationRegistry {
                 inner
                     .script_rewriters
                     .extend(registration.script_rewriters.into_iter());
+                inner
+                    .html_post_processors
+                    .extend(registration.html_post_processors.into_iter());
             }
         }
 
@@ -493,6 +530,11 @@ impl IntegrationRegistry {
         self.inner.script_rewriters.clone()
     }
 
+    /// Expose registered HTML post-processors.
+    pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
+        self.inner.html_post_processors.clone()
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
@@ -538,6 +580,7 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
+                html_post_processors: Vec::new(),
             }),
         }
     }
@@ -580,6 +623,7 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
             }),
         }
     }

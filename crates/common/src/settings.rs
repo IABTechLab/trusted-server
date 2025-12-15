@@ -450,8 +450,8 @@ mod tests {
         assert_eq!(raw_nextjs["enabled"], json!(false));
         assert_eq!(
             raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "url"]),
-            "Next.js rewrite attributes should default to href/link/url"
+            json!(["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]),
+            "Next.js rewrite attributes should include href/link/siteBaseUrl/siteProductionDomain/url for RSC navigation"
         );
 
         assert!(!settings.synthetic.counter_store.is_empty());
