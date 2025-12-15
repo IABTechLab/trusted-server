@@ -1,7 +1,6 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
-use std::io::Write;
 
 use crate::backend::ensure_backend_from_url;
 use crate::http_util::serve_static_with_etag;
@@ -9,66 +8,12 @@ use crate::http_util::serve_static_with_etag;
 use crate::constants::{HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
-use crate::integrations::{IntegrationHtmlContext, IntegrationRegistry};
+use crate::integrations::IntegrationRegistry;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
-
-/// Compress data using the specified compression algorithm
-fn compress_data(
-    data: &[u8],
-    compression: Compression,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match compression {
-        Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => {
-            use flate2::write::GzEncoder;
-            use flate2::Compression as GzCompression;
-            let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-            encoder
-                .write_all(data)
-                .change_context(TrustedServerError::Proxy {
-                    message: "Failed to gzip compress data".to_string(),
-                })?;
-            encoder.finish().change_context(TrustedServerError::Proxy {
-                message: "Failed to finish gzip compression".to_string(),
-            })
-        }
-        Compression::Deflate => {
-            use flate2::write::ZlibEncoder;
-            use flate2::Compression as ZlibCompression;
-            let mut encoder = ZlibEncoder::new(Vec::new(), ZlibCompression::default());
-            encoder
-                .write_all(data)
-                .change_context(TrustedServerError::Proxy {
-                    message: "Failed to deflate compress data".to_string(),
-                })?;
-            encoder.finish().change_context(TrustedServerError::Proxy {
-                message: "Failed to finish deflate compression".to_string(),
-            })
-        }
-        Compression::Brotli => {
-            use brotli::enc::writer::CompressorWriter;
-            use brotli::enc::BrotliEncoderParams;
-            let params = BrotliEncoderParams {
-                quality: 4, // Balance speed and compression
-                ..Default::default()
-            };
-            let mut output = Vec::new();
-            {
-                let mut writer = CompressorWriter::with_params(&mut output, 4096, &params);
-                writer
-                    .write_all(data)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to brotli compress data".to_string(),
-                    })?;
-            }
-            Ok(output)
-        }
-    }
-}
 
 /// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
 ///
@@ -199,67 +144,14 @@ fn process_response_streaming(
             params.integration_registry,
         )?;
 
-        // Check if we have post-processors that need uncompressed HTML
-        let post_processors = params.integration_registry.html_post_processors();
-        let needs_post_processing = !post_processors.is_empty();
-
-        // If we have post-processors, output uncompressed HTML so they can work with it,
-        // then compress only once at the end. This avoids double decompression/compression.
-        let output_compression = if needs_post_processing {
-            Compression::None
-        } else {
-            compression
-        };
-
         let config = PipelineConfig {
             input_compression: compression,
-            output_compression,
+            output_compression: compression,
             chunk_size: 8192,
         };
 
         let mut pipeline = StreamingPipeline::new(config, processor);
         pipeline.process(body, &mut output)?;
-
-        // Post-process HTML through registered integration post-processors.
-        // This handles cross-script T-chunks for RSC and other integration-specific
-        // processing that requires the complete HTML document.
-        log::info!(
-            "HTML post-processors: count={}, output_len={}, needs_post_processing={}",
-            post_processors.len(),
-            output.len(),
-            needs_post_processing
-        );
-        if needs_post_processing {
-            // Output is already uncompressed, convert to string for post-processing
-            if let Ok(html) = std::str::from_utf8(&output) {
-                log::info!(
-                    "NextJs post-processor called with {} bytes of HTML",
-                    html.len()
-                );
-                let ctx = IntegrationHtmlContext {
-                    request_host: params.request_host,
-                    request_scheme: params.request_scheme,
-                    origin_host: params.origin_host,
-                };
-                let mut processed = html.to_string();
-                for processor in post_processors {
-                    processed = processor.post_process(&processed, &ctx);
-                }
-
-                // Now compress if original content was compressed
-                if compression != Compression::None {
-                    output = compress_data(processed.as_bytes(), compression)?;
-                } else {
-                    output = processed.into_bytes();
-                }
-            } else {
-                log::warn!("HTML post-processing skipped: content is not valid UTF-8");
-                // If not valid UTF-8, recompress the output as-is
-                if compression != Compression::None {
-                    output = compress_data(&output, compression)?;
-                }
-            }
-        }
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.

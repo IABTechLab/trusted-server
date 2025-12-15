@@ -2,17 +2,83 @@
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
 use std::cell::Cell;
+use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 
 use crate::integrations::{
-    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
-    IntegrationScriptContext, ScriptRewriteAction,
+    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationHtmlContext,
+    IntegrationHtmlPostProcessor, IntegrationRegistry, IntegrationScriptContext,
+    ScriptRewriteAction,
 };
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
+
+struct HtmlWithPostProcessing {
+    inner: HtmlRewriterAdapter,
+    post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    origin_host: String,
+    request_host: String,
+    request_scheme: String,
+}
+
+impl StreamProcessor for HtmlWithPostProcessing {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        let output = self.inner.process_chunk(chunk, is_last)?;
+        if !is_last || output.is_empty() || self.post_processors.is_empty() {
+            return Ok(output);
+        }
+
+        let Ok(output_str) = std::str::from_utf8(&output) else {
+            return Ok(output);
+        };
+
+        let ctx = IntegrationHtmlContext {
+            request_host: &self.request_host,
+            request_scheme: &self.request_scheme,
+            origin_host: &self.origin_host,
+        };
+
+        // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
+        if !self
+            .post_processors
+            .iter()
+            .any(|p| p.should_process(output_str, &ctx))
+        {
+            return Ok(output);
+        }
+
+        let mut html = String::from_utf8(output).map_err(|e| {
+            io::Error::other(format!(
+                "HTML post-processing expected valid UTF-8 output: {e}"
+            ))
+        })?;
+
+        let mut changed = false;
+        for processor in &self.post_processors {
+            if processor.should_process(&html, &ctx) {
+                changed |= processor.post_process(&mut html, &ctx);
+            }
+        }
+
+        if changed {
+            log::info!(
+                "HTML post-processing complete: origin_host={}, output_len={}",
+                self.origin_host,
+                html.len()
+            );
+        }
+
+        Ok(html.into_bytes())
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
 
 /// Configuration for HTML processing
 #[derive(Clone)]
@@ -43,6 +109,8 @@ impl HtmlProcessorConfig {
 
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    let post_processors = config.integrations.html_post_processors();
+
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
         origin_host: String,
@@ -343,7 +411,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         ..RewriterSettings::default()
     };
 
-    HtmlRewriterAdapter::new(rewriter_settings)
+    HtmlWithPostProcessing {
+        inner: HtmlRewriterAdapter::new(rewriter_settings),
+        post_processors,
+        origin_host: config.origin_host,
+        request_host: config.request_host,
+        request_scheme: config.request_scheme,
+    }
 }
 
 #[cfg(test)]

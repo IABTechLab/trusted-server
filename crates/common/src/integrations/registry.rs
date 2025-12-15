@@ -264,10 +264,19 @@ pub trait IntegrationHtmlPostProcessor: Send + Sync {
     /// Identifier for logging/diagnostics.
     fn integration_id(&self) -> &'static str;
 
+    /// Fast preflight check to decide whether post-processing should run for this document.
+    ///
+    /// Implementations should keep this cheap (e.g., a substring check) because it may run on
+    /// every HTML response when the integration is enabled.
+    fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
+        let _ = (html, ctx);
+        true
+    }
+
     /// Post-process complete HTML content.
     /// This is called after streaming HTML processing with the complete HTML.
-    /// Return the modified HTML or the original if no changes needed.
-    fn post_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> String;
+    /// Implementations should mutate `html` in-place and return `true` when changes were made.
+    fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
 }
 
 /// Registration payload returned by integration builders.

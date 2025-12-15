@@ -95,43 +95,40 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
         NEXTJS_INTEGRATION_ID
     }
 
-    fn post_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> String {
+    fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
+        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
+            return false;
+        }
+
+        // Only Next.js App Router pages will contain `__next_f` pushes.
+        // Also require an origin host hit to avoid running on already-rewritten pages.
+        html.contains("__next_f.push") && html.contains(ctx.origin_host)
+    }
+
+    fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool {
+        if !self.should_process(html, ctx) {
+            return false;
+        }
+
+        let origin_before = html.matches(ctx.origin_host).count();
         log::info!(
-            "NextJs post-processor called: enabled={}, rewrite_attributes={:?}, html_len={}, origin={}, proxy={}://{}",
-            self.config.enabled,
-            self.config.rewrite_attributes,
+            "NextJs post-processor running: html_len={}, origin_matches={}, origin={}, proxy={}://{}",
             html.len(),
+            origin_before,
             ctx.origin_host,
             ctx.request_scheme,
             ctx.request_host
         );
 
-        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
-            log::info!("NextJs post-processor skipped (disabled or no attributes)");
-            return html.to_string();
-        }
-
-        // Count origin URLs before
-        let origin_before = html.matches(ctx.origin_host).count();
-        log::info!(
-            "NextJs post-processor: {} origin URLs before rewrite",
-            origin_before
-        );
-
         let result =
             post_process_rsc_html(html, ctx.origin_host, ctx.request_host, ctx.request_scheme);
 
-        // Count after
-        let origin_after = result.matches(ctx.origin_host).count();
-        let proxy_after = result.matches(ctx.request_host).count();
-        log::info!(
-            "NextJs post-processor complete: input_len={}, output_len={}, origin_remaining={}, proxy_urls={}",
-            html.len(),
-            result.len(),
-            origin_after,
-            proxy_after
-        );
-        result
+        if result == *html {
+            return false;
+        }
+
+        *html = result;
+        true
     }
 }
 
@@ -291,14 +288,14 @@ impl IntegrationScriptRewriter for NextJsScriptRewriter {
         match self.mode {
             NextJsRewriteMode::Structured => self.rewrite_structured(content, ctx),
             NextJsRewriteMode::Streamed => {
-                // RSC push scripts (self.__next_f.push) are handled by the post-processor
+                // RSC push scripts (__next_f.push) are handled by the post-processor
                 // because T-chunks can span multiple scripts and require combined processing.
                 // Only handle non-RSC scripts here.
-                if content.contains("self.__next_f.push") {
+                if content.contains("__next_f.push") {
                     return ScriptRewriteAction::keep();
                 }
                 // For other __next_f scripts (like initialization), use simple URL rewriting
-                if content.contains("self.__next_f") {
+                if content.contains("__next_f") {
                     return self.rewrite_streamed(content, ctx);
                 }
                 ScriptRewriteAction::keep()

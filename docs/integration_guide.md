@@ -133,19 +133,19 @@ impl IntegrationProxy for MyIntegration {
 }
 ```
 
-**Recommended:** Use the provided helper methods to automatically namespace your routes under 
-`/integrations/{integration_name()}/`. Available helpers: `get()`, `post()`, `put()`, `delete()`, 
-and `patch()`. This lets you define routes with just their relative paths (e.g., `self.post("/auction")` 
+**Recommended:** Use the provided helper methods to automatically namespace your routes under
+`/integrations/{integration_name()}/`. Available helpers: `get()`, `post()`, `put()`, `delete()`,
+and `patch()`. This lets you define routes with just their relative paths (e.g., `self.post("/auction")`
 becomes `"/integrations/my_integration/auction"`). You can also define routes manually using
-`IntegrationEndpoint::get()` / `IntegrationEndpoint::post()` / etc. for backwards compatibility or 
+`IntegrationEndpoint::get()` / `IntegrationEndpoint::post()` / etc. for backwards compatibility or
 special cases.
 
-Routes are matched verbatim in `crates/fastly/src/main.rs`, so stick to stable paths and 
+Routes are matched verbatim in `crates/fastly/src/main.rs`, so stick to stable paths and
 register whichever HTTP methods you need. **New integrations should namespace their routes under
-`/integrations/{INTEGRATION_NAME}/`** using the helper methods (`self.get()`, `self.post()`, 
-`self.put()`, `self.delete()`, `self.patch()`) for consistency, but you can define routes manually 
+`/integrations/{INTEGRATION_NAME}/`** using the helper methods (`self.get()`, `self.post()`,
+`self.put()`, `self.delete()`, `self.patch()`) for consistency, but you can define routes manually
 if needed (e.g., for backwards compatibility).
-The shared context already injects Trusted Server logging, headers, 
+The shared context already injects Trusted Server logging, headers,
 and error handling; the handler only needs to deserialize the request, call the upstream endpoint,
 and stamp integration-specific headers.
 
@@ -295,9 +295,9 @@ time.
 
 Two built-in integrations demonstrate how the framework pieces fit together:
 
-| Integration | Purpose                                                                                                                                                                                  | Key files                                                                                    |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                   | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
+| Integration | Purpose                                                                                                                                                                                                                                               | Key files                                                                                    |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                                                                                | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
 | `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
 
 ### Example: Prebid integration
