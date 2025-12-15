@@ -1476,8 +1476,8 @@ mod tests {
     #[test]
     fn html_processor_rewrites_rsc_stream_payload_with_length_preservation() {
         // RSC payloads (self.__next_f.push) are rewritten via post-processing.
-        // The streaming phase skips RSC push scripts, and the post-processor handles them
-        // to correctly handle cross-script T-chunks.
+        // The streaming phase skips RSC push scripts, and the HTML post-processor handles them
+        // at end-of-document to correctly handle cross-script T-chunks.
         let html = r#"<html><body>
             <script>self.__next_f.push([1,"prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix"])</script>
         </body></html>"#;
@@ -1508,16 +1508,9 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .unwrap();
 
-        // Apply post-processing (this is what handles RSC push scripts)
-        let processed_str = String::from_utf8_lossy(&output);
-        let final_html = post_process_rsc_html(
-            &processed_str,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        );
+        let final_html = String::from_utf8_lossy(&output);
 
-        // RSC payloads should be rewritten via post-processing
+        // RSC payloads should be rewritten via end-of-document post-processing
         assert!(
             final_html.contains("test.example.com"),
             "RSC stream payloads should be rewritten to proxy host via post-processing. Output: {}",
@@ -1558,16 +1551,9 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .unwrap();
 
-        // Apply post-processing (this is what handles RSC push scripts)
-        let processed_str = String::from_utf8_lossy(&output);
-        let final_html = post_process_rsc_html(
-            &processed_str,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        );
+        let final_html = String::from_utf8_lossy(&output);
 
-        // RSC payloads should be rewritten via post-processing
+        // RSC payloads should be rewritten via end-of-document post-processing
         assert!(
             final_html.contains("test.example.com"),
             "RSC stream payloads should be rewritten to proxy host with chunked input. Output: {}",
@@ -1621,18 +1607,7 @@ mod tests {
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
             .unwrap();
-
-        // Apply post-processing (this is what handles RSC push scripts)
-        let processed_str = String::from_utf8_lossy(&output);
-        let final_html = post_process_rsc_html(
-            &processed_str,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        );
-
-        println!("=== Final HTML ===");
-        println!("{}", final_html);
+        let final_html = String::from_utf8_lossy(&output);
 
         // RSC payloads should be rewritten via post-processing
         assert!(

@@ -156,6 +156,10 @@ pub fn create_url_replacer(
     request_host: &str,
     request_scheme: &str,
 ) -> StreamingReplacer {
+    // Normalize because some configs include a trailing slash (e.g. `https://origin/`).
+    // If we keep the trailing slash, replacing `origin_url` inside `origin_url + "/path"`
+    // would drop the delimiter and yield `https://proxyhostpath`.
+    let origin_url = origin_url.trim_end_matches('/');
     let request_url = format!("{}://{}", request_scheme, request_host);
 
     let mut replacements = vec![
@@ -362,6 +366,29 @@ mod tests {
         assert!(result.contains("http://test.example.com"));
         assert!(!result.contains("https://test.example.com"));
         assert!(result.contains("//test.example.com/script.js"));
+    }
+
+    #[test]
+    fn test_url_replacer_handles_trailing_slash_origin_url() {
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com/",
+            "test.example.com",
+            "https",
+        );
+
+        let content = r#"Visit https://origin.example.com/news for more info"#;
+        let processed = replacer.process_chunk(content.as_bytes(), true);
+        let result = String::from_utf8(processed).expect("should be valid UTF-8");
+
+        assert!(
+            result.contains("https://test.example.com/news"),
+            "URL should keep the slash between host and path. Got: {result}"
+        );
+        assert!(
+            !result.contains("https://test.example.comnews"),
+            "URL should not lose the slash between host and path. Got: {result}"
+        );
     }
 
     #[test]

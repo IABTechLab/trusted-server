@@ -47,6 +47,11 @@ impl RscFlightUrlRewriter {
         request_host: &str,
         request_scheme: &str,
     ) -> Self {
+        // Normalize because some configs include a trailing slash (e.g. `https://origin/`).
+        // If we keep the trailing slash, replacing `origin_url` inside `origin_url + "/path"`
+        // would drop the delimiter and yield `https://proxyhostpath`.
+        let origin_url = origin_url.trim_end_matches('/');
+
         let request_url = format!("{request_scheme}://{request_host}");
         let origin_protocol_relative = format!("//{origin_host}");
         let request_protocol_relative = format!("//{request_host}");
@@ -303,6 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_newline_rows_with_trailing_slash_origin_url() {
+        let input = b"0:[\"https://origin.example.com/page\"]\n";
+
+        let mut rewriter = RscFlightUrlRewriter::new(
+            "origin.example.com",
+            "https://origin.example.com/",
+            "proxy.example.com",
+            "https",
+        );
+
+        let output = run_rewriter(&mut rewriter, input, 8);
+        let output_str = String::from_utf8(output).expect("should be valid UTF-8");
+        assert_eq!(
+            output_str, "0:[\"https://proxy.example.com/page\"]\n",
+            "Output should rewrite URLs without dropping the path slash"
+        );
+    }
+
+    #[test]
     fn rewrites_t_rows_and_updates_length() {
         let t_content = r#"{"url":"https://origin.example.com/page"}"#;
         let json_row = "2:[\"ok\"]\n";
@@ -329,6 +353,36 @@ mod tests {
         assert_eq!(
             output_str, expected,
             "Output should update T row lengths after rewriting"
+        );
+    }
+
+    #[test]
+    fn rewrites_t_rows_with_trailing_slash_origin_url() {
+        let t_content = r#"{"url":"https://origin.example.com/page"}"#;
+        let json_row = "2:[\"ok\"]\n";
+        let input = format!("1:T{:x},{}{}", t_content.len(), t_content, json_row);
+
+        let mut rewriter = RscFlightUrlRewriter::new(
+            "origin.example.com",
+            "https://origin.example.com/",
+            "proxy.example.com",
+            "https",
+        );
+
+        let output = run_rewriter(&mut rewriter, input.as_bytes(), 7);
+        let output_str = String::from_utf8(output).expect("should be valid UTF-8");
+
+        let rewritten_t_content = r#"{"url":"https://proxy.example.com/page"}"#;
+        let expected = format!(
+            "1:T{:x},{}{}",
+            rewritten_t_content.len(),
+            rewritten_t_content,
+            json_row
+        );
+
+        assert_eq!(
+            output_str, expected,
+            "Output should update T row lengths after rewriting without dropping the path slash"
         );
     }
 
