@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use once_cell::sync::Lazy;
 use regex::{escape, Regex};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
@@ -11,6 +12,32 @@ use crate::integrations::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
+
+// =============================================================================
+// Cached Regex Patterns
+// =============================================================================
+
+/// T-chunk header pattern: hex_id:Thex_length,
+static TCHUNK_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
+
+/// RSC push payload pattern for extraction
+static RSC_PUSH_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"self\.__next_f\.push\(\[\s*1\s*,\s*(['"])"#).expect("valid RSC push regex")
+});
+
+/// RSC push script pattern for HTML post-processing
+static RSC_SCRIPT_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"<script\b[^>]*>\s*self\.__next_f\.push\(\[\s*1\s*,\s*(['"])"#)
+        .expect("valid RSC script regex")
+});
+
+/// RSC script ending pattern
+static RSC_SCRIPT_ENDING: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*\]\s*\)\s*;?\s*</script>"#).expect("valid RSC ending regex"));
+
+/// Marker used to track script boundaries when combining RSC content
+const RSC_MARKER: &str = "\x00SPLIT\x00";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct NextJsIntegrationConfig {
@@ -106,19 +133,20 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
     }
 
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool {
-        if !self.should_process(html, ctx) {
-            return false;
-        }
+        // Note: should_process is already called by the HtmlWithPostProcessing wrapper,
+        // so we skip the redundant check here.
 
-        let origin_before = html.matches(ctx.origin_host).count();
-        log::info!(
-            "NextJs post-processor running: html_len={}, origin_matches={}, origin={}, proxy={}://{}",
-            html.len(),
-            origin_before,
-            ctx.origin_host,
-            ctx.request_scheme,
-            ctx.request_host
-        );
+        if log::log_enabled!(log::Level::Debug) {
+            let origin_before = html.matches(ctx.origin_host).count();
+            log::debug!(
+                "NextJs post-processor running: html_len={}, origin_matches={}, origin={}, proxy={}://{}",
+                html.len(),
+                origin_before,
+                ctx.origin_host,
+                ctx.request_scheme,
+                ctx.request_host
+            );
+        }
 
         let result =
             post_process_rsc_html(html, ctx.origin_host, ctx.request_host, ctx.request_scheme);
@@ -227,11 +255,7 @@ impl NextJsScriptRewriter {
 /// Returns (payload_content, quote_char, start_pos, end_pos)
 /// Handles various whitespace patterns in the push call.
 fn extract_rsc_push_payload(content: &str) -> Option<(&str, char, usize, usize)> {
-    // Match pattern: self.__next_f.push([ followed by whitespace, then 1, then whitespace, then quote
-    // Use regex to be more flexible with whitespace
-    let pattern = Regex::new(r#"self\.__next_f\.push\(\[\s*1\s*,\s*(['"])"#).ok()?;
-
-    let cap = pattern.captures(content)?;
+    let cap = RSC_PUSH_PATTERN.captures(content)?;
     let quote_match = cap.get(1)?;
     let quote = quote_match.as_str().chars().next()?;
     let content_start = quote_match.end();
@@ -601,53 +625,126 @@ impl UrlRewriter {
 // T-chunks, the header script won't have URLs to rewrite (just the header),
 // and the content script will be rewritten with correct byte counting.
 
-/// Calculate the unescaped byte length of a JS string with escape sequences.
-/// This accounts for \n, \r, \t, \\, \", \xHH, \uHHHH, and surrogate pairs.
-fn calculate_unescaped_byte_length(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut result = 0;
-    let mut i = 0;
+// =============================================================================
+// Escape Sequence Parsing
+// =============================================================================
+//
+// JS escape sequences are parsed by a shared iterator to avoid code duplication.
+// The iterator yields (source_len, unescaped_byte_count) for each logical unit.
 
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            let esc = bytes[i + 1];
+/// A single parsed element from a JS string
+struct EscapeElement {
+    /// Number of unescaped bytes this represents
+    byte_count: usize,
+}
+
+/// Iterator over escape sequences in a JS string.
+/// Yields (source_len, unescaped_byte_count) for each element.
+struct EscapeSequenceIter<'a> {
+    bytes: &'a [u8],
+    str_ref: &'a str,
+    pos: usize,
+    skip_marker: Option<&'a [u8]>,
+}
+
+impl<'a> EscapeSequenceIter<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: 0,
+            skip_marker: None,
+        }
+    }
+
+    fn with_marker(s: &'a str, marker: &'a [u8]) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: 0,
+            skip_marker: Some(marker),
+        }
+    }
+
+    fn from_position(s: &'a str, start: usize) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: start,
+            skip_marker: None,
+        }
+    }
+
+    fn from_position_with_marker(s: &'a str, start: usize, marker: &'a [u8]) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: start,
+            skip_marker: Some(marker),
+        }
+    }
+
+    /// Current position in the source string
+    fn position(&self) -> usize {
+        self.pos
+    }
+}
+
+impl Iterator for EscapeSequenceIter<'_> {
+    type Item = EscapeElement;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+
+        // Check for marker to skip
+        if let Some(marker) = self.skip_marker {
+            if self.pos + marker.len() <= self.bytes.len()
+                && &self.bytes[self.pos..self.pos + marker.len()] == marker
+            {
+                self.pos += marker.len();
+                return Some(EscapeElement { byte_count: 0 }); // Markers don't count
+            }
+        }
+
+        // Check for escape sequence
+        if self.bytes[self.pos] == b'\\' && self.pos + 1 < self.bytes.len() {
+            let esc = self.bytes[self.pos + 1];
 
             // Simple escape sequences: \n, \r, \t, \b, \f, \v, \", \', \\, \/
             if matches!(
                 esc,
                 b'n' | b'r' | b't' | b'b' | b'f' | b'v' | b'"' | b'\'' | b'\\' | b'/'
             ) {
-                result += 1;
-                i += 2;
-                continue;
+                self.pos += 2;
+                return Some(EscapeElement { byte_count: 1 });
             }
 
             // \xHH - hex escape (1 byte)
-            if esc == b'x' && i + 3 < bytes.len() {
-                result += 1;
-                i += 4;
-                continue;
+            if esc == b'x' && self.pos + 3 < self.bytes.len() {
+                self.pos += 4;
+                return Some(EscapeElement { byte_count: 1 });
             }
 
             // \uHHHH - unicode escape
-            if esc == b'u' && i + 5 < bytes.len() {
-                let hex = &s[i + 2..i + 6];
+            if esc == b'u' && self.pos + 5 < self.bytes.len() {
+                let hex = &self.str_ref[self.pos + 2..self.pos + 6];
                 if hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     if let Ok(code_unit) = u16::from_str_radix(hex, 16) {
                         // Check for surrogate pair
                         if (0xD800..=0xDBFF).contains(&code_unit)
-                            && i + 11 < bytes.len()
-                            && bytes[i + 6] == b'\\'
-                            && bytes[i + 7] == b'u'
+                            && self.pos + 11 < self.bytes.len()
+                            && self.bytes[self.pos + 6] == b'\\'
+                            && self.bytes[self.pos + 7] == b'u'
                         {
-                            let hex2 = &s[i + 8..i + 12];
+                            let hex2 = &self.str_ref[self.pos + 8..self.pos + 12];
                             if hex2.chars().all(|c| c.is_ascii_hexdigit()) {
                                 if let Ok(code_unit2) = u16::from_str_radix(hex2, 16) {
                                     if (0xDC00..=0xDFFF).contains(&code_unit2) {
                                         // Full surrogate pair = 4 UTF-8 bytes
-                                        result += 4;
-                                        i += 12;
-                                        continue;
+                                        self.pos += 12;
+                                        return Some(EscapeElement { byte_count: 4 });
                                     }
                                 }
                             }
@@ -655,96 +752,48 @@ fn calculate_unescaped_byte_length(s: &str) -> usize {
 
                         // Single unicode escape - calculate UTF-8 byte length
                         let c = char::from_u32(code_unit as u32).unwrap_or('\u{FFFD}');
-                        result += c.len_utf8();
-                        i += 6;
-                        continue;
+                        self.pos += 6;
+                        return Some(EscapeElement {
+                            byte_count: c.len_utf8(),
+                        });
                     }
                 }
             }
         }
 
         // Regular character - count its UTF-8 byte length
-        // For ASCII, this is 1 byte
-        if bytes[i] < 0x80 {
-            result += 1;
-            i += 1;
+        if self.bytes[self.pos] < 0x80 {
+            self.pos += 1;
+            Some(EscapeElement { byte_count: 1 })
         } else {
             // Multi-byte UTF-8 character
-            let c = s[i..].chars().next().unwrap_or('\u{FFFD}');
-            result += c.len_utf8();
-            i += c.len_utf8();
+            let c = self.str_ref[self.pos..].chars().next().unwrap_or('\u{FFFD}');
+            let len = c.len_utf8();
+            self.pos += len;
+            Some(EscapeElement { byte_count: len })
         }
     }
+}
 
-    result
+/// Calculate the unescaped byte length of a JS string with escape sequences.
+/// This accounts for \n, \r, \t, \\, \", \xHH, \uHHHH, and surrogate pairs.
+fn calculate_unescaped_byte_length(s: &str) -> usize {
+    EscapeSequenceIter::new(s).map(|e| e.byte_count).sum()
 }
 
 /// Consume a specified number of unescaped bytes from a JS string, returning the end position.
 fn consume_unescaped_bytes(s: &str, start_pos: usize, byte_count: usize) -> (usize, usize) {
-    let bytes = s.as_bytes();
+    let mut iter = EscapeSequenceIter::from_position(s, start_pos);
     let mut consumed = 0;
-    let mut pos = start_pos;
 
-    while pos < bytes.len() && consumed < byte_count {
-        if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
-            let esc = bytes[pos + 1];
-
-            if matches!(
-                esc,
-                b'n' | b'r' | b't' | b'b' | b'f' | b'v' | b'"' | b'\'' | b'\\' | b'/'
-            ) {
-                consumed += 1;
-                pos += 2;
-                continue;
-            }
-
-            if esc == b'x' && pos + 3 < bytes.len() {
-                consumed += 1;
-                pos += 4;
-                continue;
-            }
-
-            if esc == b'u' && pos + 5 < bytes.len() {
-                let hex = &s[pos + 2..pos + 6];
-                if hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    if let Ok(code_unit) = u16::from_str_radix(hex, 16) {
-                        if (0xD800..=0xDBFF).contains(&code_unit)
-                            && pos + 11 < bytes.len()
-                            && bytes[pos + 6] == b'\\'
-                            && bytes[pos + 7] == b'u'
-                        {
-                            let hex2 = &s[pos + 8..pos + 12];
-                            if hex2.chars().all(|c| c.is_ascii_hexdigit()) {
-                                if let Ok(code_unit2) = u16::from_str_radix(hex2, 16) {
-                                    if (0xDC00..=0xDFFF).contains(&code_unit2) {
-                                        consumed += 4;
-                                        pos += 12;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        let c = char::from_u32(code_unit as u32).unwrap_or('\u{FFFD}');
-                        consumed += c.len_utf8();
-                        pos += 6;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if bytes[pos] < 0x80 {
-            consumed += 1;
-            pos += 1;
-        } else {
-            let c = s[pos..].chars().next().unwrap_or('\u{FFFD}');
-            consumed += c.len_utf8();
-            pos += c.len_utf8();
+    while consumed < byte_count {
+        match iter.next() {
+            Some(elem) => consumed += elem.byte_count,
+            None => break,
         }
     }
 
-    (pos, consumed)
+    (iter.position(), consumed)
 }
 
 /// Information about a T-chunk found in the combined RSC content
@@ -759,16 +808,18 @@ struct TChunkInfo {
     content_end: usize,
 }
 
-/// Find all T-chunks in the combined RSC content.
-/// T-chunks have format: ID:T<hex_length>,<content>
-fn find_tchunks(content: &str) -> Vec<TChunkInfo> {
-    // Match pattern: hex_id:Thex_length,
-    let pattern = Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").unwrap();
+/// Find all T-chunks in content, optionally skipping markers.
+fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
     let mut chunks = Vec::new();
     let mut search_pos = 0;
+    let marker = if skip_markers {
+        Some(RSC_MARKER.as_bytes())
+    } else {
+        None
+    };
 
     while search_pos < content.len() {
-        if let Some(cap) = pattern.captures(&content[search_pos..]) {
+        if let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) {
             let m = cap.get(0).unwrap();
             let match_start = search_pos + m.start();
             let header_end = search_pos + m.end();
@@ -777,8 +828,22 @@ fn find_tchunks(content: &str) -> Vec<TChunkInfo> {
             let length_hex = cap.get(2).unwrap().as_str();
             let declared_length = usize::from_str_radix(length_hex, 16).unwrap_or(0);
 
-            // Consume the declared number of unescaped bytes, skipping markers
-            let (content_end, _) = consume_unescaped_bytes(content, header_end, declared_length);
+            // Consume bytes using the appropriate iterator
+            let content_end = if let Some(marker_bytes) = marker {
+                let mut iter =
+                    EscapeSequenceIter::from_position_with_marker(content, header_end, marker_bytes);
+                let mut consumed = 0;
+                while consumed < declared_length {
+                    match iter.next() {
+                        Some(elem) => consumed += elem.byte_count,
+                        None => break,
+                    }
+                }
+                iter.position()
+            } else {
+                let (pos, _) = consume_unescaped_bytes(content, header_end, declared_length);
+                pos
+            };
 
             chunks.push(TChunkInfo {
                 id,
@@ -794,6 +859,11 @@ fn find_tchunks(content: &str) -> Vec<TChunkInfo> {
     }
 
     chunks
+}
+
+/// Find all T-chunks in RSC content (no markers).
+fn find_tchunks(content: &str) -> Vec<TChunkInfo> {
+    find_tchunks_impl(content, false)
 }
 
 /// Rewrite URLs in a string, handling various URL formats in RSC content.
@@ -899,139 +969,16 @@ fn rewrite_rsc_tchunks(
 // 4. Split back on markers
 //
 
-/// Marker used to track script boundaries when combining RSC content
-const RSC_MARKER: &str = "\x00SPLIT\x00";
-
-/// Consume unescaped bytes, skipping RSC markers.
-/// Returns (end_position, bytes_consumed)
-fn consume_unescaped_bytes_skip_markers(
-    s: &str,
-    start_pos: usize,
-    byte_count: usize,
-) -> (usize, usize) {
-    let bytes = s.as_bytes();
-    let mut consumed = 0;
-    let mut pos = start_pos;
-    let marker_bytes = RSC_MARKER.as_bytes();
-
-    while pos < bytes.len() && consumed < byte_count {
-        // Check for marker - skip it without counting bytes
-        if pos + marker_bytes.len() <= bytes.len()
-            && &bytes[pos..pos + marker_bytes.len()] == marker_bytes
-        {
-            pos += marker_bytes.len();
-            continue;
-        }
-
-        if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
-            let esc = bytes[pos + 1];
-
-            if matches!(
-                esc,
-                b'n' | b'r' | b't' | b'b' | b'f' | b'v' | b'"' | b'\'' | b'\\' | b'/'
-            ) {
-                consumed += 1;
-                pos += 2;
-                continue;
-            }
-
-            if esc == b'x' && pos + 3 < bytes.len() {
-                consumed += 1;
-                pos += 4;
-                continue;
-            }
-
-            if esc == b'u' && pos + 5 < bytes.len() {
-                let hex = &s[pos + 2..pos + 6];
-                if hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    if let Ok(code_unit) = u16::from_str_radix(hex, 16) {
-                        if (0xD800..=0xDBFF).contains(&code_unit)
-                            && pos + 11 < bytes.len()
-                            && bytes[pos + 6] == b'\\'
-                            && bytes[pos + 7] == b'u'
-                        {
-                            let hex2 = &s[pos + 8..pos + 12];
-                            if hex2.chars().all(|c| c.is_ascii_hexdigit()) {
-                                if let Ok(code_unit2) = u16::from_str_radix(hex2, 16) {
-                                    if (0xDC00..=0xDFFF).contains(&code_unit2) {
-                                        consumed += 4;
-                                        pos += 12;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        let c = char::from_u32(code_unit as u32).unwrap_or('\u{FFFD}');
-                        consumed += c.len_utf8();
-                        pos += 6;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if bytes[pos] < 0x80 {
-            consumed += 1;
-            pos += 1;
-        } else {
-            let c = s[pos..].chars().next().unwrap_or('\u{FFFD}');
-            consumed += c.len_utf8();
-            pos += c.len_utf8();
-        }
-    }
-
-    (pos, consumed)
-}
-
 /// Calculate unescaped byte length excluding RSC markers.
 fn calculate_unescaped_byte_length_skip_markers(s: &str) -> usize {
-    let without_markers = s.replace(RSC_MARKER, "");
-    calculate_unescaped_byte_length(&without_markers)
-}
-
-/// Information about a T-chunk in marker-combined content
-struct MarkedTChunkInfo {
-    id: String,
-    match_start: usize,
-    header_end: usize,
-    content_end: usize,
+    EscapeSequenceIter::with_marker(s, RSC_MARKER.as_bytes())
+        .map(|e| e.byte_count)
+        .sum()
 }
 
 /// Find T-chunks in marker-combined RSC content.
-fn find_tchunks_with_markers(content: &str) -> Vec<MarkedTChunkInfo> {
-    let pattern = Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").unwrap();
-    let mut chunks = Vec::new();
-    let mut search_pos = 0;
-
-    while search_pos < content.len() {
-        if let Some(cap) = pattern.captures(&content[search_pos..]) {
-            let m = cap.get(0).unwrap();
-            let match_start = search_pos + m.start();
-            let header_end = search_pos + m.end();
-
-            let id = cap.get(1).unwrap().as_str().to_string();
-            let length_hex = cap.get(2).unwrap().as_str();
-            let declared_length = usize::from_str_radix(length_hex, 16).unwrap_or(0);
-
-            // Consume bytes, skipping markers
-            let (content_end, _) =
-                consume_unescaped_bytes_skip_markers(content, header_end, declared_length);
-
-            chunks.push(MarkedTChunkInfo {
-                id,
-                match_start,
-                header_end,
-                content_end,
-            });
-
-            search_pos = content_end;
-        } else {
-            break;
-        }
-    }
-
-    chunks
+fn find_tchunks_with_markers(content: &str) -> Vec<TChunkInfo> {
+    find_tchunks_impl(content, true)
 }
 
 /// Process multiple RSC script payloads together, handling cross-script T-chunks.
@@ -1161,16 +1108,10 @@ struct RscPushScript {
 /// ```
 fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScript> {
     let mut scripts = Vec::new();
-    // Match <script ...> (optionally with attributes like nonce=...) followed by whitespace,
-    // then a Next.js RSC push call with a string payload.
-    let pattern =
-        Regex::new(r#"<script\b[^>]*>\s*self\.__next_f\.push\(\[\s*1\s*,\s*(['"])"#).unwrap();
-    let ending_pattern = Regex::new(r#"^\s*\]\s*\)\s*;?\s*</script>"#).unwrap();
-
     let mut search_pos = 0;
 
     while search_pos < html.len() {
-        let Some(cap) = pattern.captures(&html[search_pos..]) else {
+        let Some(cap) = RSC_SCRIPT_PATTERN.captures(&html[search_pos..]) else {
             break;
         };
 
@@ -1199,7 +1140,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScript> {
         // After the closing quote, look for ])</script> with optional whitespace
         let after_quote = &html[i + 1..];
 
-        let Some(ending_match) = ending_pattern.find(after_quote) else {
+        let Some(ending_match) = RSC_SCRIPT_ENDING.find(after_quote) else {
             search_pos = payload_start;
             continue;
         };
@@ -1247,51 +1188,47 @@ pub fn post_process_rsc_html(
 ) -> String {
     let scripts = find_rsc_push_scripts(html);
 
-    log::info!(
-        "post_process_rsc_html: found {} RSC push scripts, origin={}, proxy={}://{}",
-        scripts.len(),
-        origin_host,
-        request_scheme,
-        request_host
-    );
-
     if scripts.is_empty() {
-        log::info!("post_process_rsc_html: no RSC scripts found, returning unchanged");
         return html.to_string();
     }
 
     // Extract payloads
     let payloads: Vec<&str> = scripts.iter().map(|s| s.payload.as_str()).collect();
 
-    // Count origin URLs before rewriting
-    let origin_count_before: usize = payloads
-        .iter()
-        .map(|p| p.matches(origin_host).count())
-        .sum();
-    log::info!(
-        "post_process_rsc_html: {} occurrences of '{}' in payloads before rewriting",
-        origin_count_before,
-        origin_host
-    );
+    if log::log_enabled!(log::Level::Debug) {
+        let origin_count_before: usize = payloads
+            .iter()
+            .map(|p| p.matches(origin_host).count())
+            .sum();
+        log::debug!(
+            "post_process_rsc_html: {} scripts, {} origin URLs, origin={}, proxy={}://{}",
+            scripts.len(),
+            origin_count_before,
+            origin_host,
+            request_scheme,
+            request_host
+        );
+    }
 
     // Process all scripts together
     let rewritten_payloads =
         rewrite_rsc_scripts_combined(&payloads, origin_host, request_host, request_scheme);
 
-    // Count origin URLs after rewriting
-    let origin_count_after: usize = rewritten_payloads
-        .iter()
-        .map(|p| p.matches(origin_host).count())
-        .sum();
-    let proxy_count: usize = rewritten_payloads
-        .iter()
-        .map(|p| p.matches(request_host).count())
-        .sum();
-    log::info!(
-        "post_process_rsc_html: after rewriting - {} origin URLs remaining, {} proxy URLs",
-        origin_count_after,
-        proxy_count
-    );
+    if log::log_enabled!(log::Level::Debug) {
+        let origin_count_after: usize = rewritten_payloads
+            .iter()
+            .map(|p| p.matches(origin_host).count())
+            .sum();
+        let proxy_count: usize = rewritten_payloads
+            .iter()
+            .map(|p| p.matches(request_host).count())
+            .sum();
+        log::debug!(
+            "post_process_rsc_html: after rewriting - {} origin URLs remaining, {} proxy URLs",
+            origin_count_after,
+            proxy_count
+        );
+    }
 
     // Replace payload contents in-place (apply replacements in reverse order to keep indices valid).
     let mut result = html.to_string();
