@@ -22,6 +22,10 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// Auction orchestration error.
+    #[display("Auction error: {message}")]
+    Auction { message: String },
+
     /// GAM (Google Ad Manager) integration error.
     #[display("GAM error: {message}")]
     Gam { message: String },
@@ -89,6 +93,7 @@ pub trait IntoHttpResponse {
 impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
+            Self::Auction { .. } => StatusCode::BAD_GATEWAY,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,

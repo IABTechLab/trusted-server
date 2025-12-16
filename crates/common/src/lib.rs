@@ -21,6 +21,8 @@
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`why`]: Debugging and introspection utilities
 
+pub mod auction;
+pub mod auction_config_types;
 pub mod auth;
 pub mod backend;
 pub mod constants;

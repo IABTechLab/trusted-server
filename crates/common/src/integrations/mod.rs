@@ -2,6 +2,8 @@
 
 use crate::settings::Settings;
 
+pub mod aps;
+pub mod gam;
 pub mod nextjs;
 pub mod permutive;
 pub mod prebid;

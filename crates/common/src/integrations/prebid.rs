@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -11,6 +12,14 @@ use serde_json::{json, Value as Json, Value as JsonValue};
 use url::Url;
 use validator::Validate;
 
+use crate::auction::orchestrator::AuctionOrchestrator;
+use crate::auction::provider::AuctionProvider;
+use crate::auction::types::{
+    AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid,
+    DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
+};
+use crate::integrations::aps::{ApsAuctionProvider, ApsConfig, MockApsConfig, MockApsProvider};
+use crate::integrations::gam::{GamAuctionProvider, GamConfig, MockGamConfig, MockGamProvider};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
@@ -145,6 +154,19 @@ impl PrebidIntegration {
             }
         }
 
+        // Check if auction orchestrator is enabled
+        if settings.auction.enabled {
+            log::info!(
+                "Using auction orchestrator with strategy: {}",
+                settings.auction.strategy
+            );
+            return self
+                .handle_orchestrated_auction(settings, &req, &body)
+                .await;
+        }
+
+        // Legacy flow: direct Prebid Server call
+        log::info!("Using legacy Prebid flow (orchestrator disabled)");
         let openrtb = build_openrtb_from_ts(&body, settings, &self.config);
         if let Ok(preview) = serde_json::to_string(&openrtb) {
             log::debug!(
@@ -159,6 +181,71 @@ impl PrebidIntegration {
             })?;
 
         handle_prebid_auction(settings, req, &self.config).await
+    }
+
+    async fn handle_orchestrated_auction(
+        &self,
+        settings: &Settings,
+        req: &Request,
+        body: &AdRequest,
+    ) -> Result<Response, Report<TrustedServerError>> {
+        // Build orchestrator and register providers
+        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+        // Register Prebid provider
+        orchestrator.register_provider(Arc::new(PrebidAuctionProvider::new(self.config.clone())));
+
+        // Register real APS if configured
+        if let Some(aps_config) = settings.integration_config::<ApsConfig>("aps")? {
+            log::info!("Registering real APS provider");
+            orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
+        }
+
+        // Register mock APS if configured
+        if let Some(mock_aps_config) = settings.integration_config::<MockApsConfig>("aps_mock")? {
+            log::info!("Registering mock APS provider");
+            orchestrator.register_provider(Arc::new(MockApsProvider::new(mock_aps_config)));
+        }
+
+        // Register real GAM if configured
+        if let Some(gam_config) = settings.integration_config::<GamConfig>("gam")? {
+            log::info!("Registering real GAM provider");
+            orchestrator.register_provider(Arc::new(GamAuctionProvider::new(gam_config)));
+        }
+
+        // Register mock GAM if configured
+        if let Some(mock_gam_config) = settings.integration_config::<MockGamConfig>("gam_mock")? {
+            log::info!("Registering mock GAM provider");
+            orchestrator.register_provider(Arc::new(MockGamProvider::new(mock_gam_config)));
+        }
+
+        // Convert tsjs request to auction request
+        let auction_request = convert_tsjs_to_auction_request(body, settings, req)?;
+
+        // Create auction context
+        let context = AuctionContext {
+            settings,
+            request: req,
+            timeout_ms: settings.auction.timeout_ms,
+        };
+
+        // Run the auction
+        let result = orchestrator
+            .run_auction(&auction_request, &context)
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Auction orchestration failed".to_string(),
+            })?;
+
+        log::info!(
+            "Auction completed: {} bidders, {} winning bids, {}ms total",
+            result.bidder_responses.len(),
+            result.winning_bids.len(),
+            result.total_time_ms
+        );
+
+        // Convert orchestration result to OpenRTB response format
+        convert_orchestration_result_to_response(&result, settings, req)
     }
 
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
@@ -699,6 +786,146 @@ fn get_request_scheme(req: &Request) -> String {
     "https".to_string()
 }
 
+/// Convert tsjs AdRequest to unified AuctionRequest
+fn convert_tsjs_to_auction_request(
+    body: &AdRequest,
+    settings: &Settings,
+    req: &Request,
+) -> Result<AuctionRequest, Report<TrustedServerError>> {
+    use uuid::Uuid;
+
+    let synthetic_id = get_or_generate_synthetic_id(settings, req)?;
+    let fresh_id = generate_synthetic_id(settings, req)?;
+
+    let slots: Vec<AdSlot> = body
+        .ad_units
+        .iter()
+        .map(|unit| {
+            let formats = unit
+                .media_types
+                .as_ref()
+                .and_then(|mt| mt.banner.as_ref())
+                .map(|b| {
+                    b.sizes
+                        .iter()
+                        .filter(|s| s.len() >= 2)
+                        .map(|s| AdFormat {
+                            media_type: MediaType::Banner,
+                            width: s[0],
+                            height: s[1],
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![AdFormat {
+                        media_type: MediaType::Banner,
+                        width: 300,
+                        height: 250,
+                    }]
+                });
+
+            AdSlot {
+                id: unit.code.clone(),
+                formats,
+                floor_price: None,
+                targeting: HashMap::new(),
+            }
+        })
+        .collect();
+
+    let geo_info = GeoInfo::from_request(req);
+
+    let device = Some(DeviceInfo {
+        user_agent: req
+            .get_header(header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string()),
+        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
+        geo: geo_info.map(|g| crate::auction::types::GeoInfo {
+            country: Some(g.country),
+            region: g.region,
+            city: Some(g.city),
+        }),
+    });
+
+    Ok(AuctionRequest {
+        id: Uuid::new_v4().to_string(),
+        slots,
+        publisher: PublisherInfo {
+            domain: settings.publisher.domain.clone(),
+            page_url: Some(format!("https://{}", settings.publisher.domain)),
+        },
+        user: UserInfo {
+            id: synthetic_id,
+            fresh_id,
+            consent: None,
+        },
+        device,
+        site: Some(SiteInfo {
+            domain: settings.publisher.domain.clone(),
+            page: format!("https://{}", settings.publisher.domain),
+        }),
+        context: HashMap::new(),
+    })
+}
+
+/// Convert OrchestrationResult to OpenRTB response format
+fn convert_orchestration_result_to_response(
+    result: &crate::auction::orchestrator::OrchestrationResult,
+    settings: &Settings,
+    req: &Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    use serde_json::json;
+
+    let request_host = get_request_host(req);
+    let request_scheme = get_request_scheme(req);
+
+    // Build OpenRTB-style seatbid array
+    let mut seatbids = Vec::new();
+
+    for (slot_id, bid) in &result.winning_bids {
+        let rewritten_creative = creative::rewrite_creative_html(&bid.creative, settings);
+
+        let bid_obj = json!({
+            "id": format!("{}-{}", bid.bidder, slot_id),
+            "impid": slot_id,
+            "price": bid.price,
+            "adm": rewritten_creative,
+            "crid": format!("{}-creative", bid.bidder),
+            "w": bid.width,
+            "h": bid.height,
+            "adomain": bid.adomain.clone().unwrap_or_default(),
+        });
+
+        seatbids.push(json!({
+            "seat": bid.bidder,
+            "bid": [bid_obj]
+        }));
+    }
+
+    let response_body = json!({
+        "id": "auction-response",
+        "seatbid": seatbids,
+        "ext": {
+            "orchestrator": {
+                "strategy": settings.auction.strategy,
+                "bidders": result.bidder_responses.len(),
+                "total_bids": result.total_bids(),
+                "time_ms": result.total_time_ms
+            }
+        }
+    });
+
+    let body_bytes =
+        serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {
+            message: "Failed to serialize auction response".to_string(),
+        })?;
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_body(body_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,5 +1344,253 @@ server_url = "https://prebid.example"
 
         // Should only have 2 routes: first-party ad and third-party ad
         assert_eq!(routes.len(), 2);
+    }
+}
+
+// ============================================================================
+// Prebid Auction Provider
+// ============================================================================
+
+/// Prebid Server auction provider.
+pub struct PrebidAuctionProvider {
+    config: PrebidIntegrationConfig,
+}
+
+impl PrebidAuctionProvider {
+    /// Create a new Prebid auction provider.
+    pub fn new(config: PrebidIntegrationConfig) -> Self {
+        Self { config }
+    }
+
+    /// Convert auction request to OpenRTB format.
+    fn to_openrtb(&self, request: &AuctionRequest) -> OpenRtbRequest {
+        let imps: Vec<Imp> = request
+            .slots
+            .iter()
+            .map(|slot| {
+                let formats: Vec<Format> = slot
+                    .formats
+                    .iter()
+                    .filter(|f| f.media_type == MediaType::Banner)
+                    .map(|f| Format {
+                        w: f.width,
+                        h: f.height,
+                    })
+                    .collect();
+
+                let mut bidder = std::collections::HashMap::new();
+                for bidder_name in &self.config.bidders {
+                    bidder.insert(bidder_name.clone(), Json::Object(serde_json::Map::new()));
+                }
+
+                Imp {
+                    id: slot.id.clone(),
+                    banner: Some(Banner { format: formats }),
+                    ext: Some(ImpExt {
+                        prebid: PrebidImpExt { bidder },
+                    }),
+                }
+            })
+            .collect();
+
+        OpenRtbRequest {
+            id: request.id.clone(),
+            imp: imps,
+            site: Some(Site {
+                domain: Some(request.publisher.domain.clone()),
+                page: request.publisher.page_url.clone(),
+            }),
+        }
+    }
+
+    /// Parse OpenRTB response into auction response.
+    fn parse_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
+        let mut bids = Vec::new();
+
+        if let Some(seatbids) = json.get("seatbid").and_then(|v| v.as_array()) {
+            for seatbid in seatbids {
+                let seat = seatbid
+                    .get("seat")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                if let Some(bid_array) = seatbid.get("bid").and_then(|v| v.as_array()) {
+                    for bid_obj in bid_array {
+                        if let Ok(bid) = self.parse_bid(bid_obj, seat) {
+                            bids.push(bid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if bids.is_empty() {
+            AuctionResponse::no_bid("prebid", response_time_ms)
+        } else {
+            AuctionResponse::success("prebid", bids, response_time_ms)
+        }
+    }
+
+    /// Parse a single bid from OpenRTB response.
+    fn parse_bid(&self, bid_obj: &Json, seat: &str) -> Result<AuctionBid, ()> {
+        let slot_id = bid_obj
+            .get("impid")
+            .and_then(|v| v.as_str())
+            .ok_or(())?
+            .to_string();
+
+        let price = bid_obj.get("price").and_then(|v| v.as_f64()).ok_or(())?;
+
+        let creative = bid_obj
+            .get("adm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let width = bid_obj.get("w").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+        let height = bid_obj.get("h").and_then(|v| v.as_u64()).unwrap_or(250) as u32;
+
+        let nurl = bid_obj
+            .get("nurl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let burl = bid_obj
+            .get("burl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let adomain = bid_obj
+            .get("adomain")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+
+        Ok(AuctionBid {
+            slot_id,
+            price,
+            currency: "USD".to_string(),
+            creative,
+            adomain,
+            bidder: seat.to_string(),
+            width,
+            height,
+            nurl,
+            burl,
+            metadata: std::collections::HashMap::new(),
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl AuctionProvider for PrebidAuctionProvider {
+    fn provider_name(&self) -> &'static str {
+        "prebid"
+    }
+
+    async fn request_bids(
+        &self,
+        request: &AuctionRequest,
+        _context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let start = Instant::now();
+
+        log::info!("Prebid: requesting bids for {} slots", request.slots.len());
+
+        // Convert to OpenRTB
+        let openrtb = self.to_openrtb(request);
+        let mut openrtb_json =
+            serde_json::to_value(&openrtb).change_context(TrustedServerError::Prebid {
+                message: "Failed to serialize OpenRTB request".to_string(),
+            })?;
+
+        // Enhance with user info
+        if !openrtb_json["user"].is_object() {
+            openrtb_json["user"] = json!({});
+        }
+        openrtb_json["user"]["id"] = json!(&request.user.id);
+        if !openrtb_json["user"]["ext"].is_object() {
+            openrtb_json["user"]["ext"] = json!({});
+        }
+        openrtb_json["user"]["ext"]["synthetic_fresh"] = json!(&request.user.fresh_id);
+
+        // Add device info if available
+        if let Some(device) = &request.device {
+            if let Some(geo) = &device.geo {
+                let geo_obj = json!({
+                    "type": 2,
+                    "country": geo.country,
+                    "city": geo.city,
+                    "region": geo.region,
+                });
+                if !openrtb_json["device"].is_object() {
+                    openrtb_json["device"] = json!({});
+                }
+                openrtb_json["device"]["geo"] = geo_obj;
+            }
+        }
+
+        // Create HTTP request
+        let mut pbs_req = Request::new(
+            Method::POST,
+            format!("{}/openrtb2/auction", self.config.server_url),
+        );
+
+        pbs_req
+            .set_body_json(&openrtb_json)
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to set request body".to_string(),
+            })?;
+
+        // Send request
+        let backend_name = ensure_backend_from_url(&self.config.server_url)?;
+        let mut pbs_response =
+            pbs_req
+                .send(backend_name)
+                .change_context(TrustedServerError::Prebid {
+                    message: "Failed to send request to Prebid Server".to_string(),
+                })?;
+
+        let response_time_ms = start.elapsed().as_millis() as u64;
+
+        // Parse response
+        if !pbs_response.get_status().is_success() {
+            log::warn!(
+                "Prebid returned non-success status: {}",
+                pbs_response.get_status()
+            );
+            return Ok(AuctionResponse::error("prebid", response_time_ms));
+        }
+
+        let body_bytes = pbs_response.take_body_bytes();
+        let response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+                message: "Failed to parse Prebid response".to_string(),
+            })?;
+
+        let auction_response = self.parse_response(&response_json, response_time_ms);
+
+        log::info!(
+            "Prebid returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
+
+    fn supports_media_type(&self, media_type: &MediaType) -> bool {
+        matches!(media_type, MediaType::Banner)
+    }
+
+    fn timeout_ms(&self) -> u32 {
+        self.config.timeout_ms
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.enabled
     }
 }

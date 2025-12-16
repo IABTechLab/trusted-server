@@ -5,6 +5,8 @@ use validator::Validate;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
+pub use crate::auction_config_types::AuctionConfig;
+
 const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.toml");
 
 /// Creates a new [`Settings`] instance from the embedded configuration file.

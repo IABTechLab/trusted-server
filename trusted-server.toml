@@ -68,3 +68,42 @@ rewrite_sdk = true
 # exclude_domains = [
 #     "*.edgecompute.app",
 # ]
+
+# Auction orchestration configuration
+[auction]
+enabled = true
+strategy = "parallel_mediation"  # Options: "parallel_mediation", "parallel_only", "waterfall"
+bidders = ["prebid", "aps_mock"]  # Use mock providers for testing
+mediator = "gam_mock"
+timeout_ms = 2000
+
+# Mock APS Configuration (for testing)
+[integrations.aps_mock]
+enabled = true
+timeout_ms = 800
+bid_price = 2.50
+latency_ms = 80
+fill_rate = 1.0  # 1.0 = always bid, 0.5 = bid 50% of the time
+
+# Real APS Configuration (disabled by default - enable when real integration is ready)
+[integrations.aps]
+enabled = false
+pub_id = "your-aps-publisher-id"
+endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+timeout_ms = 800
+
+# Mock GAM Configuration (for testing)
+[integrations.gam_mock]
+enabled = true
+timeout_ms = 500
+inject_house_bids = true
+house_bid_price = 1.75
+win_rate = 30  # Percentage (0-100) - GAM house ads win this % of time
+latency_ms = 40
+
+# Real GAM Configuration (disabled by default - enable when real integration is ready)
+[integrations.gam]
+enabled = false
+network_id = "your-gam-network-id"
+endpoint = "https://securepubads.g.doubleclick.net/gampad/ads"
+timeout_ms = 500
