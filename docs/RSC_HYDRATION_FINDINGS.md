@@ -199,7 +199,7 @@ The marker `\x00SPLIT\x00` is chosen because:
 - Easily identifiable for splitting
 - Won't be confused with any escape sequence
 
-**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11) and combine/split logic in [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)
+**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11) and combine/split logic in [rsc.rs:417](crates/common/src/integrations/nextjs/rsc.rs#L417)
 
 #### Step 2: Find T-Chunks Across Combined Content
 
@@ -207,7 +207,7 @@ Scan the combined stream for `ID:T<hex_length>,` headers, then consume exactly `
 
 The key insight: markers don't count toward byte consumption. When a T-chunk declares 1679 bytes, we consume 1679 bytes of actual content, skipping over any markers we encounter.
 
-**Implementation:** T-chunk discovery at [rsc.rs:194](crates/common/src/integrations/nextjs/rsc.rs#L194) with marker-aware escape sequence iterator at [rsc.rs:29](crates/common/src/integrations/nextjs/rsc.rs#L29)
+**Implementation:** T-chunk discovery at [rsc.rs:198](crates/common/src/integrations/nextjs/rsc.rs#L198) with marker-aware escape sequence iterator at [rsc.rs:68](crates/common/src/integrations/nextjs/rsc.rs#L68)
 
 #### Step 3: Rewrite URLs and Recalculate Lengths
 
@@ -250,10 +250,11 @@ The post-processing is implemented as an integration hook, allowing other integr
 
 `T`-chunk lengths use the **unescaped** byte count of the payload (after decoding JavaScript string escapes). Correct handling requires:
 
-- Shared escape sequence iterator handles `\\n`, `\\xHH`, `\\uHHHH`, and surrogate pairs: [rsc.rs:29](crates/common/src/integrations/nextjs/rsc.rs#L29)
-- Counting unescaped bytes: [rsc.rs:158](crates/common/src/integrations/nextjs/rsc.rs#L158)
-- Consuming exactly _N unescaped bytes_ to locate the end of a declared `T` chunk: [rsc.rs:163](crates/common/src/integrations/nextjs/rsc.rs#L163)
-- Marker-aware byte length calculation for cross-script processing: [rsc.rs:378](crates/common/src/integrations/nextjs/rsc.rs#L378)
+- Shared escape sequence iterator handles `\\n`, `\\xHH`, `\\uHHHH`, and surrogate pairs: [rsc.rs:33](crates/common/src/integrations/nextjs/rsc.rs#L33)
+- Counting unescaped bytes: [rsc.rs:162](crates/common/src/integrations/nextjs/rsc.rs#L162)
+- Consuming exactly _N unescaped bytes_ to locate the end of a declared `T` chunk: [rsc.rs:167](crates/common/src/integrations/nextjs/rsc.rs#L167)
+- Marker-aware byte length calculation for cross-script processing: [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)
+- Size-limited combined payload allocation (10 MB max): [rsc.rs:395](crates/common/src/integrations/nextjs/rsc.rs#L395)
 
 ---
 
@@ -272,7 +273,7 @@ The solution handles multiple URL formats in RSC content:
 
 ### Regex Pattern
 
-**Implementation:** Regex-based rewriting in [rsc.rs:276](crates/common/src/integrations/nextjs/rsc.rs#L276)
+**Implementation:** Regex-based rewriting in [rsc.rs:272](crates/common/src/integrations/nextjs/rsc.rs#L272)
 
 This pattern handles:
 
@@ -435,18 +436,18 @@ Because post-processing runs inside the HTML processor (before recompression), `
 
 | Symbol                                         | Location                                                                                    | Purpose                                              |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `extract_rsc_push_payload`                     | [script_rewriter.rs:86](crates/common/src/integrations/nextjs/script_rewriter.rs#L86)       | Extract string from `self.__next_f.push([1, '...'])` |
-| `EscapeSequenceIter`                           | [rsc.rs:29](crates/common/src/integrations/nextjs/rsc.rs#L29)                               | Shared iterator for escape sequence parsing          |
-| `calculate_unescaped_byte_length`              | [rsc.rs:158](crates/common/src/integrations/nextjs/rsc.rs#L158)                             | Count unescaped bytes with escape handling           |
-| `consume_unescaped_bytes`                      | [rsc.rs:163](crates/common/src/integrations/nextjs/rsc.rs#L163)                             | Advance through string consuming N bytes             |
-| `find_tchunks`                                 | [rsc.rs:252](crates/common/src/integrations/nextjs/rsc.rs#L252)                             | Find T-chunks in a single payload                    |
-| `RscUrlRewriter`                               | [rsc.rs:266](crates/common/src/integrations/nextjs/rsc.rs#L266)                             | Regex URL rewriting (compiled once per rewrite call) |
-| `rewrite_rsc_tchunks_with_rewriter`            | [rsc.rs:336](crates/common/src/integrations/nextjs/rsc.rs#L336)                             | Single-payload T-chunk processing                    |
-| `calculate_unescaped_byte_length_skip_markers` | [rsc.rs:378](crates/common/src/integrations/nextjs/rsc.rs#L378)                             | Count unescaped bytes, excluding markers             |
-| `find_tchunks_with_markers`                    | [rsc.rs:256](crates/common/src/integrations/nextjs/rsc.rs#L256)                             | Find T-chunks in marker-combined content             |
-| `rewrite_rsc_scripts_combined`                 | [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)                             | Cross-script T-chunk processing                      |
+| `extract_rsc_push_payload`                     | [script_rewriter.rs:94](crates/common/src/integrations/nextjs/script_rewriter.rs#L94)       | Extract string from `self.__next_f.push([1, '...'])` |
+| `EscapeSequenceIter`                           | [rsc.rs:33](crates/common/src/integrations/nextjs/rsc.rs#L33)                               | Shared iterator for escape sequence parsing          |
+| `calculate_unescaped_byte_length`              | [rsc.rs:162](crates/common/src/integrations/nextjs/rsc.rs#L162)                             | Count unescaped bytes with escape handling           |
+| `consume_unescaped_bytes`                      | [rsc.rs:167](crates/common/src/integrations/nextjs/rsc.rs#L167)                             | Advance through string consuming N bytes             |
+| `find_tchunks`                                 | [rsc.rs:256](crates/common/src/integrations/nextjs/rsc.rs#L256)                             | Find T-chunks in a single payload                    |
+| `RscUrlRewriter`                               | [rsc.rs:272](crates/common/src/integrations/nextjs/rsc.rs#L272)                             | Regex URL rewriting (compiled once per rewrite call) |
+| `rewrite_rsc_tchunks_with_rewriter`            | [rsc.rs:343](crates/common/src/integrations/nextjs/rsc.rs#L343)                             | Single-payload T-chunk processing                    |
+| `calculate_unescaped_byte_length_skip_markers` | [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)                             | Count unescaped bytes, excluding markers             |
+| `find_tchunks_with_markers`                    | [rsc.rs:260](crates/common/src/integrations/nextjs/rsc.rs#L260)                             | Find T-chunks in marker-combined content             |
+| `rewrite_rsc_scripts_combined`                 | [rsc.rs:392](crates/common/src/integrations/nextjs/rsc.rs#L392)                             | Cross-script T-chunk processing                      |
 | `find_rsc_push_scripts`                        | [html_post_process.rs:67](crates/common/src/integrations/nextjs/html_post_process.rs#L67)   | Find all RSC scripts in HTML                         |
-| `post_process_rsc_html_in_place`               | [html_post_process.rs:132](crates/common/src/integrations/nextjs/html_post_process.rs#L132) | Complete HTML post-processing                        |
+| `post_process_rsc_html_in_place`               | [html_post_process.rs:135](crates/common/src/integrations/nextjs/html_post_process.rs#L135) | Complete HTML post-processing                        |
 
 ---
 
@@ -480,7 +481,7 @@ For typical pages with 100-300 RSC scripts, this adds ~1-5ms to processing time.
 
 ## Deconstruction and Reconstruction Logic
 
-The RSC rewriting process involves carefully deconstructing RSC payloads, rewriting URLs, and reconstructing them with correct T-chunk lengths. The main entry point is `post_process_rsc_html_in_place()` at [html_post_process.rs:132](crates/common/src/integrations/nextjs/html_post_process.rs#L132).
+The RSC rewriting process involves carefully deconstructing RSC payloads, rewriting URLs, and reconstructing them with correct T-chunk lengths. The main entry point is `post_process_rsc_html_in_place()` at [html_post_process.rs:136](crates/common/src/integrations/nextjs/html_post_process.rs#L136).
 
 ### Step 1: Find RSC Push Scripts
 
@@ -492,13 +493,13 @@ Find all `self.__next_f.push([1, "..."])` scripts in the HTML and extract their 
 
 Join all payloads with a marker string (`\x00SPLIT\x00`) that cannot appear in valid JSON/RSC content. This allows T-chunks to be processed across script boundaries while preserving the ability to split back later.
 
-**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11), combining logic in `rewrite_rsc_scripts_combined()` at [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)
+**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11), combining logic in `rewrite_rsc_scripts_combined()` at [rsc.rs:392](crates/common/src/integrations/nextjs/rsc.rs#L392)
 
 ### Step 3: Find T-Chunks Across Combined Content
 
 Parse T-chunk headers (`ID:T<hex_length>,`) and consume exactly the declared number of unescaped bytes, skipping over markers.
 
-**Implementation:** `find_tchunks_with_markers()` at [rsc.rs:256](crates/common/src/integrations/nextjs/rsc.rs#L256), using `EscapeSequenceIter::from_position_with_marker()` at [rsc.rs:64](crates/common/src/integrations/nextjs/rsc.rs#L64)
+**Implementation:** `find_tchunks_with_markers()` at [rsc.rs:260](crates/common/src/integrations/nextjs/rsc.rs#L260), using `EscapeSequenceIter::from_position_with_marker()` at [rsc.rs:68](crates/common/src/integrations/nextjs/rsc.rs#L68)
 
 ### Step 4: Rewrite URLs in T-Chunk Content
 
@@ -509,25 +510,25 @@ Rewrite all URL patterns in the T-chunk content:
 - `\\/\\/origin.example.com` → `\\/\\/proxy.example.com` (JSON-escaped)
 - `\\\\//origin.example.com` → `\\\\//proxy.example.com` (double-escaped)
 
-**Implementation:** `RscUrlRewriter::rewrite()` at [rsc.rs:297](crates/common/src/integrations/nextjs/rsc.rs#L297)
+**Implementation:** `RscUrlRewriter::rewrite()` at [rsc.rs:301](crates/common/src/integrations/nextjs/rsc.rs#L301)
 
 ### Step 5: Recalculate T-Chunk Length
 
 Calculate the new unescaped byte length (excluding markers) and update the T-chunk header with the new hex length.
 
-**Implementation:** `calculate_unescaped_byte_length_skip_markers()` at [rsc.rs:378](crates/common/src/integrations/nextjs/rsc.rs#L378)
+**Implementation:** `calculate_unescaped_byte_length_skip_markers()` at [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)
 
 ### Step 6: Split Back on Markers
 
 Split the combined rewritten content back into individual payloads on the marker boundaries. Each payload corresponds to one original script, with T-chunk lengths now correct across script boundaries.
 
-**Implementation:** Part of `rewrite_rsc_scripts_combined()` at [rsc.rs:385](crates/common/src/integrations/nextjs/rsc.rs#L385)
+**Implementation:** Part of `rewrite_rsc_scripts_combined()` at [rsc.rs:392](crates/common/src/integrations/nextjs/rsc.rs#L392)
 
 ### Step 7: Reconstruct HTML
 
 Replace each original script with its rewritten version in the HTML.
 
-**Implementation:** Part of `post_process_rsc_html_in_place()` at [html_post_process.rs:132](crates/common/src/integrations/nextjs/html_post_process.rs#L132)
+**Implementation:** Part of `post_process_rsc_html_in_place()` at [html_post_process.rs:135](crates/common/src/integrations/nextjs/html_post_process.rs#L135)
 
 ### Visual Example
 

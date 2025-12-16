@@ -21,6 +21,14 @@ enum RowState {
 ///
 /// For `T` rows, the length prefix is the UTF-8 byte length of the content bytes. If we rewrite
 /// URLs inside the content, we must recompute the length and rewrite the header.
+///
+/// ## Limitations
+///
+/// This rewriter performs simple string replacement and does NOT handle JSON escape sequences.
+/// URLs like `\/\/origin.example.com` (JSON-escaped slashes) will not be rewritten. This is
+/// acceptable because Flight responses from client-side navigation typically contain plain URLs,
+/// not doubly-escaped JSON-in-JS content. For inlined `__next_f` data in HTML (which can have
+/// escape sequences), the HTML post-processor in `integrations/nextjs/` handles those cases.
 pub struct RscFlightUrlRewriter {
     origin_url: String,
     origin_http_url: Option<String>,

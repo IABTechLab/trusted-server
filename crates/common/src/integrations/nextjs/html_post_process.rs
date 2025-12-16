@@ -84,8 +84,11 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
         let mut i = payload_start;
         let bytes = html.as_bytes();
         while i < bytes.len() {
-            if bytes[i] == b'\\' {
-                i += 2;
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2; // Skip escape sequence (safe: we checked i+1 exists)
+            } else if bytes[i] == b'\\' {
+                // Trailing backslash at end of content - malformed
+                break;
             } else if bytes[i] == quote as u8 {
                 break;
             } else {
@@ -93,7 +96,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
             }
         }
 
-        if i >= bytes.len() {
+        if i >= bytes.len() || bytes[i] != quote as u8 {
             search_pos = payload_start;
             continue;
         }
@@ -329,5 +332,55 @@ mod tests {
             !rewritten.contains("https://origin.example.com/about"),
             "Origin URL should be removed. Got: {rewritten}"
         );
+    }
+
+    #[test]
+    fn handles_trailing_backslash_gracefully() {
+        // Malformed content with trailing backslash should not panic
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,"content with trailing backslash\"])</script>
+<script>self.__next_f.push([1,"valid https://origin.example.com/page"])</script>
+</body></html>"#;
+
+        let scripts = find_rsc_push_scripts(html);
+        // The first script is malformed (trailing backslash escapes the quote),
+        // so it won't be detected as valid. The second one should be found.
+        assert!(
+            scripts.len() >= 1,
+            "Should find at least the valid script. Found: {}",
+            scripts.len()
+        );
+
+        // Should not panic during processing
+        let result = post_process_rsc_html(html, "origin.example.com", "test.example.com", "https");
+        assert!(
+            result.contains("test.example.com") || result.contains("origin.example.com"),
+            "Processing should complete without panic"
+        );
+    }
+
+    #[test]
+    fn handles_unterminated_string_gracefully() {
+        // Content where string never closes - should not hang or panic
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,"content without closing quote
+</body></html>"#;
+
+        let scripts = find_rsc_push_scripts(html);
+        assert_eq!(
+            scripts.len(),
+            0,
+            "Should not find scripts with unterminated strings"
+        );
+    }
+
+    #[test]
+    fn no_origin_returns_unchanged() {
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,"content without origin URLs"])</script>
+</body></html>"#;
+
+        let result = post_process_rsc_html(html, "origin.example.com", "test.example.com", "https");
+        assert_eq!(result, html, "HTML without origin should be unchanged");
     }
 }

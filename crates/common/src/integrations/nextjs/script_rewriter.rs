@@ -36,14 +36,22 @@ impl NextJsScriptRewriter {
         content: &str,
         ctx: &IntegrationScriptContext<'_>,
     ) -> ScriptRewriteAction {
-        if let Some(rewritten) = rewrite_nextjs_values(
-            content,
+        if ctx.origin_host.is_empty()
+            || ctx.request_host.is_empty()
+            || self.config.rewrite_attributes.is_empty()
+        {
+            return ScriptRewriteAction::keep();
+        }
+
+        let rewriter = UrlRewriter::new(
             ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
             &self.config.rewrite_attributes,
-            false,
-        ) {
+            false, // preserve_length not used for structured payloads
+        );
+
+        if let Some(rewritten) = rewrite_nextjs_values_with_rewriter(content, &rewriter) {
             ScriptRewriteAction::replace(rewritten)
         } else {
             ScriptRewriteAction::keep()
@@ -151,6 +159,11 @@ impl IntegrationScriptRewriter for NextJsScriptRewriter {
     }
 }
 
+fn rewrite_nextjs_values_with_rewriter(content: &str, rewriter: &UrlRewriter) -> Option<String> {
+    rewriter.rewrite_embedded(content)
+}
+
+#[cfg(test)]
 fn rewrite_nextjs_values(
     content: &str,
     origin_host: &str,
@@ -171,15 +184,26 @@ fn rewrite_nextjs_values(
         preserve_length,
     );
 
-    rewriter.rewrite_embedded(content)
+    rewrite_nextjs_values_with_rewriter(content, &rewriter)
 }
 
+/// Rewrites URLs in structured Next.js JSON payloads (e.g., `__NEXT_DATA__`).
+///
+/// This rewriter uses attribute-specific regex patterns to find and replace URLs
+/// in JSON content. It handles full URLs, protocol-relative URLs, and bare hostnames.
+///
+/// The `preserve_length` option adds whitespace padding to maintain byte length,
+/// which was an early attempt at RSC compatibility. This is no longer needed for
+/// RSC payloads (T-chunk lengths are recalculated instead), but is kept for
+/// potential future use cases where length preservation is required.
 struct UrlRewriter {
     origin_host: String,
     request_host: String,
     request_scheme: String,
     embedded_patterns: Vec<Regex>,
     bare_host_patterns: Vec<Regex>,
+    /// When true, adds whitespace padding to maintain original byte length.
+    /// Currently unused in production (always false).
     preserve_length: bool,
 }
 

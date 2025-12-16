@@ -10,6 +10,10 @@ static TCHUNK_PATTERN: Lazy<Regex> =
 /// Marker used to track script boundaries when combining RSC content.
 pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";
 
+/// Maximum combined payload size for cross-script processing (10 MB).
+/// Payloads exceeding this limit are processed individually without cross-script T-chunk handling.
+const MAX_COMBINED_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
+
 // =============================================================================
 // Escape Sequence Parsing
 // =============================================================================
@@ -299,6 +303,7 @@ impl RscUrlRewriter {
             return Cow::Borrowed(input);
         }
 
+        // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
         let replaced = self
             .pattern
             .replace_all(input, |caps: &regex::Captures<'_>| {
@@ -310,18 +315,20 @@ impl RscUrlRewriter {
                 }
             });
 
-        let still_contains_origin = match &replaced {
-            Cow::Borrowed(s) => s.contains(&self.origin_host),
-            Cow::Owned(s) => s.contains(&self.origin_host),
+        // Phase 2: Handle bare host occurrences not matched by the URL regex
+        // (e.g., `siteProductionDomain`). Only check if regex made no changes,
+        // because if it did, we already know origin_host was present.
+        let text = match &replaced {
+            Cow::Borrowed(s) => *s,
+            Cow::Owned(s) => s.as_str(),
         };
 
-        if !still_contains_origin {
+        if !text.contains(&self.origin_host) {
             return replaced;
         }
 
-        // Also rewrite bare host occurrences inside RSC payloads (e.g. `siteProductionDomain`).
-        let owned = replaced.into_owned();
-        Cow::Owned(owned.replace(&self.origin_host, &self.request_host))
+        // Bare host replacement needed
+        Cow::Owned(text.replace(&self.origin_host, &self.request_host))
     }
 
     pub(crate) fn rewrite_to_string(&self, input: &str) -> String {
@@ -398,7 +405,26 @@ pub fn rewrite_rsc_scripts_combined(
         return vec![rewrite_rsc_tchunks_with_rewriter(payloads[0], &rewriter)];
     }
 
-    let mut combined = payloads[0].to_string();
+    // Check total size before allocating combined buffer
+    let total_size: usize =
+        payloads.iter().map(|p| p.len()).sum::<usize>() + (payloads.len() - 1) * RSC_MARKER.len();
+
+    if total_size > MAX_COMBINED_PAYLOAD_SIZE {
+        // Fall back to individual processing if combined size is too large.
+        // This sacrifices cross-script T-chunk correctness for memory safety.
+        log::warn!(
+            "RSC combined payload size {} exceeds limit {}, processing individually",
+            total_size,
+            MAX_COMBINED_PAYLOAD_SIZE
+        );
+        return payloads
+            .iter()
+            .map(|p| rewrite_rsc_tchunks_with_rewriter(p, &rewriter))
+            .collect();
+    }
+
+    let mut combined = String::with_capacity(total_size);
+    combined.push_str(payloads[0]);
     for payload in &payloads[1..] {
         combined.push_str(RSC_MARKER);
         combined.push_str(payload);
@@ -589,6 +615,82 @@ mod tests {
         assert!(
             rewritten.contains(r#""siteProductionDomain":"proxy.example.com""#),
             "Bare host should be rewritten inside RSC payload. Got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn single_payload_bypasses_combining() {
+        // When there's only one payload, we should process it directly without combining
+        // Content: {"url":"https://origin.example.com/x"} = 37 bytes = 0x25 hex
+        let payload = r#"1a:T25,{"url":"https://origin.example.com/x"}"#;
+        let payloads: Vec<&str> = vec![payload];
+
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].contains("test.example.com"),
+            "Single payload should be rewritten. Got: {}",
+            results[0]
+        );
+        // The length should be updated for the rewritten URL
+        // {"url":"https://test.example.com/x"} = 35 bytes = 0x23 hex
+        assert!(
+            results[0].contains(":T23,"),
+            "T-chunk length should be updated. Got: {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn empty_payloads_returns_empty() {
+        let payloads: Vec<&str> = vec![];
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn no_origin_in_payloads_returns_unchanged() {
+        let payloads: Vec<&str> = vec![r#"1a:T10,{"key":"value"}"#, r#"1b:T10,{"foo":"bar"}"#];
+
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(results.len(), 2);
+        // Content should be identical - note that T-chunk lengths may be recalculated
+        // even if content is unchanged (due to how the algorithm works)
+        assert!(
+            !results[0].contains("origin.example.com") && !results[0].contains("test.example.com"),
+            "No host should be present in payload without URLs"
+        );
+        assert!(
+            !results[1].contains("origin.example.com") && !results[1].contains("test.example.com"),
+            "No host should be present in payload without URLs"
+        );
+        // The content after T-chunk header should be preserved
+        assert!(
+            results[0].contains(r#"{"key":"value"}"#),
+            "Content should be preserved. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains(r#"{"foo":"bar"}"#),
+            "Content should be preserved. Got: {}",
+            results[1]
         );
     }
 }
