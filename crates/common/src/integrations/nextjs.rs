@@ -767,7 +767,10 @@ impl Iterator for EscapeSequenceIter<'_> {
             Some(EscapeElement { byte_count: 1 })
         } else {
             // Multi-byte UTF-8 character
-            let c = self.str_ref[self.pos..].chars().next().unwrap_or('\u{FFFD}');
+            let c = self.str_ref[self.pos..]
+                .chars()
+                .next()
+                .unwrap_or('\u{FFFD}');
             let len = c.len_utf8();
             self.pos += len;
             Some(EscapeElement { byte_count: len })
@@ -830,8 +833,11 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
 
             // Consume bytes using the appropriate iterator
             let content_end = if let Some(marker_bytes) = marker {
-                let mut iter =
-                    EscapeSequenceIter::from_position_with_marker(content, header_end, marker_bytes);
+                let mut iter = EscapeSequenceIter::from_position_with_marker(
+                    content,
+                    header_end,
+                    marker_bytes,
+                );
                 let mut consumed = 0;
                 while consumed < declared_length {
                     match iter.next() {
