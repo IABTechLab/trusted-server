@@ -118,7 +118,7 @@ fn process_response_streaming(
     // Check if this is HTML content
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
-    log::info!(
+    log::debug!(
         "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
         params.content_type,
         params.content_encoding,
@@ -189,7 +189,7 @@ fn process_response_streaming(
         pipeline.process(body, &mut output)?;
     }
 
-    log::info!(
+    log::debug!(
         "Streaming processing complete - output size: {} bytes",
         output.len()
     );
@@ -233,7 +233,7 @@ pub fn handle_publisher_request(
     integration_registry: &IntegrationRegistry,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    log::info!("Proxying request to publisher_origin");
+    log::debug!("Proxying request to publisher_origin");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor rewrites
     // any Prebid script references to `/static/tsjs-ext.min.js` when auto-configure is enabled.
@@ -249,7 +249,7 @@ pub fn handle_publisher_request(
     let request_scheme = detect_request_scheme(&req);
 
     // Log detection details for debugging
-    log::info!(
+    log::debug!(
         "Scheme detection - TLS Protocol: {:?}, TLS Cipher: {:?}, Forwarded: {:?}, X-Forwarded-Proto: {:?}, Fastly-SSL: {:?}, Result: {}",
         req.get_tls_protocol(),
         req.get_tls_cipher_openssl_name(),
@@ -259,7 +259,7 @@ pub fn handle_publisher_request(
         request_scheme
     );
 
-    log::info!("Request host: {}, scheme: {}", request_host, request_scheme);
+    log::debug!("Request host: {}, scheme: {}", request_host, request_scheme);
 
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
@@ -273,7 +273,7 @@ pub fn handle_publisher_request(
         })
         .unwrap_or(false);
 
-    log::info!(
+    log::debug!(
         "Proxy synthetic IDs - trusted: {}, has_cookie: {}",
         synthetic_id,
         has_synthetic_cookie
@@ -282,7 +282,7 @@ pub fn handle_publisher_request(
     let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
     let origin_host = settings.publisher.origin_host();
 
-    log::info!(
+    log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
         settings.publisher.origin_url
@@ -296,9 +296,9 @@ pub fn handle_publisher_request(
         })?;
 
     // Log all response headers for debugging
-    log::info!("Response headers:");
+    log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
-        log::info!("  {}: {:?}", name, value);
+        log::debug!("  {}: {:?}", name, value);
     }
 
     // Check if the response has a text-based content type that we should process
@@ -321,7 +321,7 @@ pub fn handle_publisher_request(
             .to_lowercase();
 
         // Log response details for debugging
-        log::info!(
+        log::debug!(
             "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
             content_type, content_encoding, request_host, origin_host
         );
@@ -349,12 +349,12 @@ pub fn handle_publisher_request(
                 response.remove_header(header::CONTENT_LENGTH);
 
                 // Keep Content-Encoding header since we're returning compressed content
-                log::info!(
+                log::debug!(
                     "Preserved Content-Encoding: {} for compressed response",
                     content_encoding
                 );
 
-                log::info!("Completed streaming processing of response body");
+                log::debug!("Completed streaming processing of response body");
             }
             Err(e) => {
                 log::error!("Failed to process response body: {:?}", e);
@@ -363,7 +363,7 @@ pub fn handle_publisher_request(
             }
         }
     } else {
-        log::info!(
+        log::debug!(
             "Skipping response processing - should_process: {}, request_host: '{}'",
             should_process,
             request_host

@@ -53,6 +53,17 @@ impl Publisher {
             })
             .unwrap_or_else(|| self.origin_url.clone())
     }
+
+    fn normalize(&mut self) {
+        let trimmed = self.origin_url.trim_end_matches('/');
+        if trimmed != self.origin_url {
+            log::warn!(
+                "publisher.origin_url ends with '/': normalizing to {}",
+                trimmed
+            );
+            self.origin_url = trimmed.to_string();
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -318,12 +329,15 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to build configuration".to_string(),
             })?;
-        // You can deserialize (and thus freeze) the entire configuration as
-        config
-            .try_deserialize()
-            .change_context(TrustedServerError::Configuration {
-                message: "Failed to deserialize configuration".to_string(),
-            })
+        let mut settings: Self =
+            config
+                .try_deserialize()
+                .change_context(TrustedServerError::Configuration {
+                    message: "Failed to deserialize configuration".to_string(),
+                })?;
+
+        settings.publisher.normalize();
+        Ok(settings)
     }
 
     #[must_use]
@@ -417,6 +431,7 @@ mod tests {
     use serde_json::json;
 
     use crate::integrations::{nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig};
+    use crate::streaming_replacer::create_url_replacer;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
@@ -505,6 +520,35 @@ mod tests {
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn from_toml_normalizes_trailing_slash_in_origin_url() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"origin_url = "https://origin.test-publisher.com""#,
+            r#"origin_url = "https://origin.test-publisher.com/""#,
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        assert_eq!(
+            settings.publisher.origin_url, "https://origin.test-publisher.com",
+            "origin_url should be normalized by trimming trailing slashes"
+        );
+
+        let origin_host = settings.publisher.origin_host();
+        let mut replacer = create_url_replacer(
+            &origin_host,
+            &settings.publisher.origin_url,
+            "proxy.example.com",
+            "https",
+        );
+
+        let processed = replacer.process_chunk(b"https://origin.test-publisher.com/news", true);
+        let rewritten = String::from_utf8(processed).expect("should be valid UTF-8");
+        assert_eq!(
+            rewritten, "https://proxy.example.com/news",
+            "rewriting should keep the delimiter slash between host and path"
+        );
     }
 
     #[test]

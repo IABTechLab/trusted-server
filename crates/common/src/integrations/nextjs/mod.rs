@@ -1,0 +1,345 @@
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+use crate::integrations::IntegrationRegistration;
+use crate::settings::{IntegrationConfig, Settings};
+
+const NEXTJS_INTEGRATION_ID: &str = "nextjs";
+
+mod html_post_process;
+mod rsc;
+mod script_rewriter;
+
+pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
+pub use rsc::rewrite_rsc_scripts_combined;
+
+use html_post_process::NextJsHtmlPostProcessor;
+use script_rewriter::{NextJsRewriteMode, NextJsScriptRewriter};
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct NextJsIntegrationConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_rewrite_attributes",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    #[validate(length(min = 1))]
+    pub rewrite_attributes: Vec<String>,
+}
+
+impl IntegrationConfig for NextJsIntegrationConfig {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+fn default_enabled() -> bool {
+    false
+}
+
+fn default_rewrite_attributes() -> Vec<String> {
+    vec!["href".to_string(), "link".to_string(), "url".to_string()]
+}
+
+pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
+    let config = match build(settings) {
+        Some(config) => {
+            log::info!(
+                "NextJS integration registered: enabled={}, rewrite_attributes={:?}",
+                config.enabled,
+                config.rewrite_attributes
+            );
+            config
+        }
+        None => {
+            log::info!("NextJS integration not registered (disabled or missing config)");
+            return None;
+        }
+    };
+
+    // Register both structured (Pages Router __NEXT_DATA__) and streamed (App Router RSC)
+    // rewriters. RSC payloads require LENGTH-PRESERVING URL replacement to avoid breaking
+    // React hydration - the RSC format uses byte positions for record boundaries.
+    let structured = Arc::new(NextJsScriptRewriter::new(
+        config.clone(),
+        NextJsRewriteMode::Structured,
+    ));
+
+    let streamed = Arc::new(NextJsScriptRewriter::new(
+        config.clone(),
+        NextJsRewriteMode::Streamed,
+    ));
+
+    // Register post-processor for cross-script RSC T-chunks
+    let post_processor = Arc::new(NextJsHtmlPostProcessor::new(config));
+
+    Some(
+        IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
+            .with_script_rewriter(structured)
+            .with_script_rewriter(streamed)
+            .with_html_post_processor(post_processor)
+            .build(),
+    )
+}
+
+fn build(settings: &Settings) -> Option<Arc<NextJsIntegrationConfig>> {
+    let config = settings
+        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+        .ok()
+        .flatten()?;
+    Some(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::integrations::IntegrationRegistry;
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::tests::create_test_settings;
+    use serde_json::json;
+    use std::io::Cursor;
+
+    fn config_from_settings(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+    ) -> HtmlProcessorConfig {
+        HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
+    }
+
+    #[test]
+    fn html_processor_rewrites_nextjs_script_when_enabled() {
+        let html = r#"<html><body>
+            <script id="__NEXT_DATA__" type="application/json">
+                {"props":{"pageProps":{"primary":{"href":"https://origin.example.com/reviews"},"secondary":{"href":"http://origin.example.com/sign-in"},"fallbackHref":"http://origin.example.com/legacy","protoRelative":"//origin.example.com/assets/logo.png"}}}
+            </script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let processed = String::from_utf8_lossy(&output);
+
+        // Note: URLs may have padding characters for length preservation
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "should rewrite https Next.js href values to test.example.com"
+        );
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/sign-in"),
+            "should rewrite http Next.js href values to test.example.com"
+        );
+        assert!(
+            processed.contains(r#""fallbackHref":"http://origin.example.com/legacy""#),
+            "should leave other fields untouched"
+        );
+        assert!(
+            processed.contains(r#""protoRelative":"//origin.example.com/assets/logo.png""#),
+            "should not rewrite non-href keys"
+        );
+        assert!(
+            !processed.contains("\"href\":\"https://origin.example.com/reviews\""),
+            "should remove origin https href"
+        );
+        assert!(
+            !processed.contains("\"href\":\"http://origin.example.com/sign-in\""),
+            "should remove origin http href"
+        );
+    }
+
+    #[test]
+    fn html_processor_rewrites_rsc_stream_payload_with_length_preservation() {
+        // RSC payloads (self.__next_f.push) are rewritten via post-processing.
+        // The streaming phase skips RSC push scripts, and the HTML post-processor handles them
+        // at end-of-document to correctly handle cross-script T-chunks.
+        let html = r#"<html><body>
+            <script>self.__next_f.push([1,"prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix"])</script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let final_html = String::from_utf8_lossy(&output);
+
+        // RSC payloads should be rewritten via end-of-document post-processing
+        assert!(
+            final_html.contains("test.example.com"),
+            "RSC stream payloads should be rewritten to proxy host via post-processing. Output: {}",
+            final_html
+        );
+    }
+
+    #[test]
+    fn html_processor_rewrites_rsc_stream_payload_with_chunked_input() {
+        // RSC payloads are rewritten via post-processing, even with chunked streaming input
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","url":"http://origin.example.com/api"}'])</script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let final_html = String::from_utf8_lossy(&output);
+
+        // RSC payloads should be rewritten via end-of-document post-processing
+        assert!(
+            final_html.contains("test.example.com"),
+            "RSC stream payloads should be rewritten to proxy host with chunked input. Output: {}",
+            final_html
+        );
+    }
+
+    #[test]
+    fn register_respects_enabled_flag() {
+        let settings = create_test_settings();
+        let registration = register(&settings);
+
+        assert!(
+            registration.is_none(),
+            "should skip registration when integration is disabled"
+        );
+    }
+
+    #[test]
+    fn html_processor_rewrites_rsc_payloads_with_length_preservation() {
+        // RSC payloads (self.__next_f.push) are rewritten via post-processing.
+        // This allows navigation to stay on proxy while correctly handling cross-script T-chunks.
+
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,'458:{"ID":879000,"title":"Makes","url":"https://origin.example.com/makes","children":"$45a"}\n442:["$443"]'])</script>
+</body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let final_html = String::from_utf8_lossy(&output);
+
+        // RSC payloads should be rewritten via post-processing
+        assert!(
+            final_html.contains("test.example.com"),
+            "RSC payload URLs should be rewritten to proxy host. Output: {}",
+            final_html
+        );
+
+        // Verify the RSC payload structure is preserved
+        assert!(
+            final_html.contains(r#""ID":879000"#),
+            "RSC payload ID should be preserved"
+        );
+        assert!(
+            final_html.contains(r#""title":"Makes""#),
+            "RSC payload title should be preserved"
+        );
+        assert!(
+            final_html.contains(r#""children":"$45a""#),
+            "RSC payload children reference should be preserved"
+        );
+
+        // Verify \n separators are preserved (crucial for RSC parsing)
+        assert!(
+            final_html.contains(r#"\n442:"#),
+            "RSC record separator \\n should be preserved. Output: {}",
+            final_html
+        );
+    }
+}
