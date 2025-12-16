@@ -346,7 +346,7 @@ mod tests {
         // The first script is malformed (trailing backslash escapes the quote),
         // so it won't be detected as valid. The second one should be found.
         assert!(
-            scripts.len() >= 1,
+            !scripts.is_empty(),
             "Should find at least the valid script. Found: {}",
             scripts.len()
         );
