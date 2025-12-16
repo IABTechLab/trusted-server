@@ -149,7 +149,7 @@ fn finalize_proxied_response(
 
     if ct.contains("text/html") {
         // HTML: rewrite and serve as HTML (safe to read as string)
-        let body = beresp.take_body_str();
+        let body = beresp.take_body_str(); // TODO: don't panic!
         let rewritten = crate::creative::rewrite_creative_html(&body, settings);
         return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
     }

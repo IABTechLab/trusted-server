@@ -81,3 +81,23 @@ rewrite_sdk = true
 # exclude_domains = [
 #     "*.edgecompute.app",
 # ]
+
+
+[auction]
+enabled = true
+providers = ["prebid", "aps"]
+mediator = "adserver_mock"  # will use mediator when set
+timeout_ms = 2000
+
+[integrations.aps]
+enabled = true
+pub_id = "your-aps-publisher-id"
+endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
+timeout_ms = 1000
+
+[integrations.adserver_mock]
+enabled = true
+endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
+timeout_ms = 1000
+
+

@@ -8,12 +8,14 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json, Value as JsonValue};
-use url::Url;
 use validator::Validate;
 
+use crate::auction::provider::AuctionProvider;
+use crate::auction::types::{
+    AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
+};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
-use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::integrations::{
@@ -26,8 +28,6 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
-const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
-const ROUTE_THIRD_PARTY_AD: &str = "/third-party/ad";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -71,37 +71,39 @@ fn default_enabled() -> bool {
     true
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BannerUnit {
     sizes: Vec<Vec<u32>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaTypes {
-    #[allow(dead_code)]
     banner: Option<BannerUnit>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AdUnit {
     code: String,
-    #[allow(dead_code)]
     media_types: Option<MediaTypes>,
     #[serde(default)]
     bids: Option<Vec<Bid>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AdRequest {
     ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     config: Option<JsonValue>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Bid {
     bidder: String,
@@ -125,42 +127,6 @@ impl PrebidIntegration {
         }
     }
 
-    async fn handle_third_party_ad(
-        &self,
-        settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-            TrustedServerError::Prebid {
-                message: "Failed to parse tsjs auction request".to_string(),
-            },
-        )?;
-
-        log::info!("/third-party/ad: received {} adUnits", body.ad_units.len());
-        for unit in &body.ad_units {
-            if let Some(mt) = &unit.media_types {
-                if let Some(banner) = &mt.banner {
-                    log::debug!("unit={} sizes={:?}", unit.code, banner.sizes);
-                }
-            }
-        }
-
-        let openrtb = build_openrtb_from_ts(&body, settings, &self.config);
-        if let Ok(preview) = serde_json::to_string(&openrtb) {
-            log::debug!(
-                "OpenRTB payload (truncated): {}",
-                &preview.chars().take(512).collect::<String>()
-            );
-        }
-
-        req.set_body_json(&openrtb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
-        handle_prebid_auction(settings, req, &self.config).await
-    }
-
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
 
@@ -171,69 +137,6 @@ impl PrebidIntegration {
             )
             .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .with_body(body))
-    }
-
-    async fn handle_first_party_ad(
-        &self,
-        settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let url = req.get_url_str();
-        let parsed = Url::parse(url).change_context(TrustedServerError::Prebid {
-            message: "Invalid first-party serve-ad URL".to_string(),
-        })?;
-        let qp = parsed
-            .query_pairs()
-            .into_owned()
-            .collect::<std::collections::HashMap<_, _>>();
-        let slot = qp.get("slot").cloned().unwrap_or_default();
-        let w = qp
-            .get("w")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(300);
-        let h = qp
-            .get("h")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(250);
-        if slot.is_empty() {
-            return Err(Report::new(TrustedServerError::BadRequest {
-                message: "missing slot".to_string(),
-            }));
-        }
-
-        let ad_req = AdRequest {
-            ad_units: vec![AdUnit {
-                code: slot.clone(),
-                media_types: Some(MediaTypes {
-                    banner: Some(BannerUnit {
-                        sizes: vec![vec![w, h]],
-                    }),
-                }),
-                bids: None,
-            }],
-            config: None,
-        };
-
-        let ortb = build_openrtb_from_ts(&ad_req, settings, &self.config);
-        req.set_body_json(&ortb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
-        let mut pbs_resp = pbs_auction_for_get(settings, req, &self.config).await?;
-
-        let body_bytes = pbs_resp.take_body_bytes();
-        let html = match serde_json::from_slice::<Json>(&body_bytes) {
-            Ok(json) => extract_adm_for_slot(&json, &slot)
-                .unwrap_or_else(|| "<!-- no creative -->".to_string()),
-            Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
-        };
-
-        let rewritten = creative::rewrite_creative_html(&html, settings);
-
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(rewritten))
     }
 }
 
@@ -269,16 +172,10 @@ impl IntegrationProxy for PrebidIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        let mut routes = vec![
-            IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),
-            IntegrationEndpoint::post(ROUTE_THIRD_PARTY_AD),
-        ];
+        let mut routes = vec![];
 
         if let Some(script_path) = &self.config.script_handler {
-            // We need to leak the string to get a 'static str for IntegrationEndpoint
-            // This is safe because the config lives for the lifetime of the application
-            let static_path: &'static str = Box::leak(script_path.clone().into_boxed_str());
-            routes.push(IntegrationEndpoint::get(static_path));
+            routes.push(IntegrationEndpoint::get(script_path.clone()));
         }
 
         routes
@@ -286,7 +183,7 @@ impl IntegrationProxy for PrebidIntegration {
 
     async fn handle(
         &self,
-        settings: &Settings,
+        _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -295,12 +192,6 @@ impl IntegrationProxy for PrebidIntegration {
         match method {
             Method::GET if self.config.script_handler.as_ref() == Some(&path) => {
                 self.handle_script_handler()
-            }
-            Method::GET if path == ROUTE_FIRST_PARTY_AD => {
-                self.handle_first_party_ad(settings, req).await
-            }
-            Method::POST if path == ROUTE_THIRD_PARTY_AD => {
-                self.handle_third_party_ad(settings, req).await
             }
             _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
@@ -332,6 +223,7 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 }
 
+#[allow(dead_code)]
 fn build_openrtb_from_ts(
     req: &AdRequest,
     settings: &Settings,
@@ -398,40 +290,7 @@ fn is_prebid_script_url(url: &str) -> bool {
     )
 }
 
-async fn pbs_auction_for_get(
-    settings: &Settings,
-    req: Request,
-    config: &PrebidIntegrationConfig,
-) -> Result<Response, Report<TrustedServerError>> {
-    handle_prebid_auction(settings, req, config).await
-}
-
-fn extract_adm_for_slot(json: &Json, slot: &str) -> Option<String> {
-    let seatbids = json.get("seatbid")?.as_array()?;
-    for sb in seatbids {
-        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
-            for bid in bids {
-                let impid = bid.get("impid").and_then(|v| v.as_str()).unwrap_or("");
-                if impid == slot {
-                    if let Some(adm) = bid.get("adm").and_then(|v| v.as_str()) {
-                        return Some(adm.to_string());
-                    }
-                }
-            }
-        }
-    }
-    for sb in seatbids {
-        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
-            for bid in bids {
-                if let Some(adm) = bid.get("adm").and_then(|v| v.as_str()) {
-                    return Some(adm.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
+#[allow(dead_code)]
 async fn handle_prebid_auction(
     settings: &Settings,
     mut req: Request,
@@ -511,6 +370,7 @@ async fn handle_prebid_auction(
     }
 }
 
+#[allow(dead_code)]
 fn enhance_openrtb_request(
     request: &mut Json,
     synthetic_id: &str,
@@ -699,6 +559,335 @@ fn get_request_scheme(req: &Request) -> String {
     "https".to_string()
 }
 
+// ============================================================================
+// Prebid Auction Provider
+// ============================================================================
+
+/// Prebid Server auction provider.
+pub struct PrebidAuctionProvider {
+    config: PrebidIntegrationConfig,
+}
+
+impl PrebidAuctionProvider {
+    /// Create a new Prebid auction provider.
+    pub fn new(config: PrebidIntegrationConfig) -> Self {
+        Self { config }
+    }
+
+    /// Convert auction request to OpenRTB format.
+    fn to_openrtb(&self, request: &AuctionRequest) -> OpenRtbRequest {
+        let imps: Vec<Imp> = request
+            .slots
+            .iter()
+            .map(|slot| {
+                let formats: Vec<Format> = slot
+                    .formats
+                    .iter()
+                    .filter(|f| f.media_type == MediaType::Banner)
+                    .map(|f| Format {
+                        w: f.width,
+                        h: f.height,
+                    })
+                    .collect();
+
+                let mut bidder = std::collections::HashMap::new();
+                for bidder_name in &self.config.bidders {
+                    bidder.insert(bidder_name.clone(), Json::Object(serde_json::Map::new()));
+                }
+
+                Imp {
+                    id: slot.id.clone(),
+                    banner: Some(Banner { format: formats }),
+                    ext: Some(ImpExt {
+                        prebid: PrebidImpExt { bidder },
+                    }),
+                }
+            })
+            .collect();
+
+        OpenRtbRequest {
+            id: request.id.clone(),
+            imp: imps,
+            site: Some(Site {
+                domain: Some(request.publisher.domain.clone()),
+                page: request.publisher.page_url.clone(),
+            }),
+        }
+    }
+
+    /// Parse OpenRTB response into auction response.
+    fn parse_openrtb_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
+        let mut bids = Vec::new();
+
+        if let Some(seatbids) = json.get("seatbid").and_then(|v| v.as_array()) {
+            for seatbid in seatbids {
+                let seat = seatbid
+                    .get("seat")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                if let Some(bid_array) = seatbid.get("bid").and_then(|v| v.as_array()) {
+                    for bid_obj in bid_array {
+                        if let Ok(bid) = self.parse_bid(bid_obj, seat) {
+                            bids.push(bid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if bids.is_empty() {
+            AuctionResponse::no_bid("prebid", response_time_ms)
+        } else {
+            AuctionResponse::success("prebid", bids, response_time_ms)
+        }
+    }
+
+    /// Parse a single bid from OpenRTB response.
+    fn parse_bid(&self, bid_obj: &Json, seat: &str) -> Result<AuctionBid, ()> {
+        let slot_id = bid_obj
+            .get("impid")
+            .and_then(|v| v.as_str())
+            .ok_or(())?
+            .to_string();
+
+        let price = bid_obj.get("price").and_then(|v| v.as_f64()).ok_or(())?;
+
+        let creative = bid_obj
+            .get("adm")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let width = bid_obj.get("w").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+        let height = bid_obj.get("h").and_then(|v| v.as_u64()).unwrap_or(250) as u32;
+
+        let nurl = bid_obj
+            .get("nurl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let burl = bid_obj
+            .get("burl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let adomain = bid_obj
+            .get("adomain")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+
+        Ok(AuctionBid {
+            slot_id,
+            price: Some(price), // Prebid provides decoded prices
+            currency: "USD".to_string(),
+            creative,
+            adomain,
+            bidder: seat.to_string(),
+            width,
+            height,
+            nurl,
+            burl,
+            metadata: std::collections::HashMap::new(),
+        })
+    }
+}
+
+impl AuctionProvider for PrebidAuctionProvider {
+    fn provider_name(&self) -> &'static str {
+        "prebid"
+    }
+
+    fn request_bids(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+        log::info!("Prebid: requesting bids for {} slots", request.slots.len());
+
+        // Convert to OpenRTB
+        let openrtb = self.to_openrtb(request);
+        let mut openrtb_json =
+            serde_json::to_value(&openrtb).change_context(TrustedServerError::Prebid {
+                message: "Failed to serialize OpenRTB request".to_string(),
+            })?;
+
+        // Enhance with user info
+        if !openrtb_json["user"].is_object() {
+            openrtb_json["user"] = json!({});
+        }
+        openrtb_json["user"]["id"] = json!(&request.user.id);
+        if !openrtb_json["user"]["ext"].is_object() {
+            openrtb_json["user"]["ext"] = json!({});
+        }
+        openrtb_json["user"]["ext"]["synthetic_fresh"] = json!(&request.user.fresh_id);
+
+        // Add device info if available
+        if let Some(device) = &request.device {
+            if let Some(geo) = &device.geo {
+                let geo_obj = json!({
+                    "type": 2,
+                    "country": geo.country,
+                    "city": geo.city,
+                    "region": geo.region,
+                });
+                if !openrtb_json["device"].is_object() {
+                    openrtb_json["device"] = json!({});
+                }
+                openrtb_json["device"]["geo"] = geo_obj;
+            }
+        }
+
+        // Add privacy regulations based on Sec-GPC header
+        if context.request.get_header("Sec-GPC").is_some() {
+            if !openrtb_json["regs"].is_object() {
+                openrtb_json["regs"] = json!({});
+            }
+            if !openrtb_json["regs"]["ext"].is_object() {
+                openrtb_json["regs"]["ext"] = json!({});
+            }
+            openrtb_json["regs"]["ext"]["us_privacy"] = json!("1YYN");
+        }
+
+        if !openrtb_json["ext"].is_object() {
+            openrtb_json["ext"] = json!({});
+        }
+        if !openrtb_json["ext"]["trusted_server"].is_object() {
+            openrtb_json["ext"]["trusted_server"] = json!({});
+        }
+
+        let request_host = get_request_host(context.request);
+        let request_scheme = get_request_scheme(context.request);
+        openrtb_json["ext"]["trusted_server"]["request_host"] = json!(request_host);
+        openrtb_json["ext"]["trusted_server"]["request_scheme"] = json!(request_scheme);
+
+        // Add request signing if enabled
+        if let Some(request_signing_config) = &context.settings.request_signing {
+            if request_signing_config.enabled && openrtb_json["id"].is_string() {
+                let id = openrtb_json["id"]
+                    .as_str()
+                    .expect("should have string id when is_string checked");
+                let signer = RequestSigner::from_config()?;
+                let signature = signer.sign(id.as_bytes())?;
+
+                openrtb_json["ext"]["trusted_server"]["signature"] = json!(signature);
+                openrtb_json["ext"]["trusted_server"]["kid"] = json!(signer.kid);
+            }
+        }
+
+        // Create HTTP request
+        let mut pbs_req = Request::new(
+            Method::POST,
+            format!("{}/openrtb2/auction", self.config.server_url),
+        );
+        copy_request_headers(context.request, &mut pbs_req);
+
+        pbs_req
+            .set_body_json(&openrtb_json)
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to set request body".to_string(),
+            })?;
+
+        // Send request asynchronously
+        let backend_name = ensure_backend_from_url(&self.config.server_url)?;
+        let pending =
+            pbs_req
+                .send_async(backend_name)
+                .change_context(TrustedServerError::Prebid {
+                    message: "Failed to send async request to Prebid Server".to_string(),
+                })?;
+
+        Ok(pending)
+    }
+
+    fn parse_response(
+        &self,
+        mut response: fastly::Response,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // Parse response
+        if !response.get_status().is_success() {
+            log::warn!(
+                "Prebid returned non-success status: {}",
+                response.get_status()
+            );
+            return Ok(AuctionResponse::error("prebid", response_time_ms));
+        }
+
+        let body_bytes = response.take_body_bytes();
+        let mut response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+                message: "Failed to parse Prebid response".to_string(),
+            })?;
+
+        let request_host = response_json
+            .get("ext")
+            .and_then(|ext| ext.get("trusted_server"))
+            .and_then(|trusted_server| trusted_server.get("request_host"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let request_scheme = response_json
+            .get("ext")
+            .and_then(|ext| ext.get("trusted_server"))
+            .and_then(|trusted_server| trusted_server.get("request_scheme"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("https")
+            .to_string();
+
+        if request_host.is_empty() {
+            log::warn!("Prebid response missing request host; skipping URL rewrites");
+        } else {
+            transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
+        }
+
+        let auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+
+        log::info!(
+            "Prebid returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
+
+    fn supports_media_type(&self, media_type: &MediaType) -> bool {
+        matches!(media_type, MediaType::Banner)
+    }
+
+    fn timeout_ms(&self) -> u32 {
+        self.config.timeout_ms
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+}
+
+// ============================================================================
+// Provider Auto-Registration
+// ============================================================================
+
+/// Auto-register Prebid provider based on settings configuration.
+///
+/// This function checks the settings for Prebid configuration and returns
+/// the provider if enabled.
+pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+
+    // Prebid provider is always registered if integration is enabled
+    if let Ok(Some(config)) = settings.integration_config::<PrebidIntegrationConfig>("prebid") {
+        log::info!("Registering Prebid auction provider");
+        providers.push(Arc::new(PrebidAuctionProvider::new(config)));
+    }
+
+    providers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,7 +1074,7 @@ mod tests {
 
         let synthetic_id = "synthetic-123";
         let fresh_id = "fresh-456";
-        let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+        let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
         enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
@@ -942,28 +1131,6 @@ mod tests {
                 "tracking URLs should be proxied"
             );
         }
-    }
-
-    #[test]
-    fn extract_adm_for_slot_prefers_exact_match() {
-        let response = json!({
-            "seatbid": [{
-                "bid": [
-                    { "impid": "slot-b", "adm": "<!-- slot B -->" },
-                    { "impid": "slot-a", "adm": "<!-- slot A -->" }
-                ]
-            }]
-        });
-
-        let adm = extract_adm_for_slot(&response, "slot-a").expect("adm should exist");
-        assert_eq!(adm, "<!-- slot A -->");
-
-        let fallback = extract_adm_for_slot(&response, "missing")
-            .expect("should fall back to first available adm");
-        assert!(
-            fallback == "<!-- slot B -->" || fallback == "<!-- slot A -->",
-            "fallback should return some creative"
-        );
     }
 
     #[test]
@@ -1099,8 +1266,8 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should have 3 routes: first-party ad, third-party ad, and script handler
-        assert_eq!(routes.len(), 3);
+        // Should have 1 route: script handler
+        assert_eq!(routes.len(), 1);
 
         let has_script_route = routes
             .iter()
@@ -1115,7 +1282,7 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should only have 2 routes: first-party ad and third-party ad
-        assert_eq!(routes.len(), 2);
+        // Should have 0 routes when no script handler configured
+        assert_eq!(routes.len(), 0);
     }
 }

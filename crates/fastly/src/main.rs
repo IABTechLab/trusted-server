@@ -3,6 +3,8 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
+use trusted_server_common::auction::endpoints::handle_auction;
+use trusted_server_common::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -33,14 +35,24 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
+
+    // Build the auction orchestrator once at startup
+    let orchestrator = build_orchestrator(&settings);
+
     let integration_registry = IntegrationRegistry::new(&settings);
 
-    futures::executor::block_on(route_request(settings, integration_registry, req))
+    futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        req,
+    ))
 }
 
 async fn route_request(
-    settings: Settings,
-    integration_registry: IntegrationRegistry,
+    settings: &Settings,
+    orchestrator: &AuctionOrchestrator,
+    integration_registry: &IntegrationRegistry,
     req: Request,
 ) -> Result<Response, Error> {
     log::info!(
@@ -48,7 +60,7 @@ async fn route_request(
         ::std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
     );
 
-    if let Some(response) = enforce_basic_auth(&settings, &req) {
+    if let Some(response) = enforce_basic_auth(settings, &req) {
         return Ok(response);
     }
 
@@ -60,32 +72,35 @@ async fn route_request(
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&settings, req)
+            handle_tsjs_dynamic(settings, req)
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(&settings, req)
+            handle_trusted_server_discovery(settings, req)
         }
 
         // Signature verification endpoint
-        (Method::POST, "/verify-signature") => handle_verify_signature(&settings, req),
+        (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
 
         // Key rotation admin endpoints
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
-        (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
+        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
+        (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
+
+        // Unified auction endpoint (returns creative HTML inline)
+        (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
-        (Method::GET, "/first-party/click") => handle_first_party_click(&settings, req).await,
+        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
+        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(&settings, req).await
+            handle_first_party_proxy_sign(settings, req).await
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(&settings, req).await
+            handle_first_party_proxy_rebuild(settings, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, &settings, req)
+            .handle_proxy(&m, path, settings, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -100,7 +115,7 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(&settings, &integration_registry, req) {
+            match handle_publisher_request(settings, integration_registry, req) {
                 Ok(response) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);
