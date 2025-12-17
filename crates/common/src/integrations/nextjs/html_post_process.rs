@@ -30,38 +30,62 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
     }
 
     fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
-        let _ = html;
         if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
             return false;
         }
 
-        let Some(state) = ctx
+        // Check if we have captured placeholders from streaming
+        if let Some(state) = ctx
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
-        else {
-            return false;
-        };
+        {
+            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.payloads.is_empty() {
+                return true;
+            }
+        }
 
-        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        !guard.payloads.is_empty()
+        // Also check if HTML contains RSC scripts that weren't captured during streaming
+        // (e.g., fragmented scripts that we skipped during the streaming pass)
+        html.contains("__next_f.push") && html.contains(ctx.origin_host)
     }
 
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool {
-        let Some(state) = ctx
+        // Try to get payloads captured during streaming (placeholder approach)
+        let payloads = ctx
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
-        else {
-            return false;
-        };
+            .map(|state| {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.take_payloads()
+            })
+            .unwrap_or_default();
 
-        let payloads = {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take_payloads()
-        };
-        if payloads.is_empty() {
-            return false;
+        if !payloads.is_empty() {
+            // Placeholder approach: substitute placeholders with rewritten payloads
+            return self.substitute_placeholders(html, ctx, payloads);
         }
 
+        // Fallback: re-parse HTML to find RSC scripts that weren't captured during streaming
+        // (e.g., fragmented scripts that we skipped during the streaming pass)
+        post_process_rsc_html_in_place_with_limit(
+            html,
+            ctx.origin_host,
+            ctx.request_host,
+            ctx.request_scheme,
+            self.config.max_combined_payload_bytes,
+        )
+    }
+}
+
+impl NextJsHtmlPostProcessor {
+    /// Substitute placeholders with rewritten payloads (fast path for unfragmented scripts).
+    fn substitute_placeholders(
+        &self,
+        html: &mut String,
+        ctx: &IntegrationHtmlContext<'_>,
+        payloads: Vec<String>,
+    ) -> bool {
         let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
         let mut rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payload_refs.as_slice(),

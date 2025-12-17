@@ -419,4 +419,73 @@ mod tests {
             final_html
         );
     }
+
+    #[test]
+    fn html_processor_preserves_non_rsc_scripts_with_chunked_streaming() {
+        // Regression test: ensure non-RSC scripts are preserved when streamed alongside RSC scripts.
+        // With small chunk sizes, scripts get fragmented and the buffering logic must correctly
+        // handle non-RSC scripts without corrupting them.
+        let html = r#"<html><body>
+<script>console.log("hello world");</script>
+<script>self.__next_f.push([1,'{"url":"https://origin.example.com/page"}'])</script>
+<script>window.analytics = { track: function(e) { console.log(e); } };</script>
+</body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        // Use small chunk size to force fragmentation
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 16,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+        let final_html = String::from_utf8_lossy(&output);
+
+        // Non-RSC scripts should be preserved
+        assert!(
+            final_html.contains(r#"console.log("hello world");"#),
+            "First non-RSC script should be preserved intact. Output: {}",
+            final_html
+        );
+        assert!(
+            final_html.contains("window.analytics"),
+            "Third non-RSC script should be preserved. Output: {}",
+            final_html
+        );
+        assert!(
+            final_html.contains("track: function(e)"),
+            "Third non-RSC script content should be intact. Output: {}",
+            final_html
+        );
+
+        // RSC scripts should be rewritten
+        assert!(
+            final_html.contains("test.example.com"),
+            "RSC URL should be rewritten. Output: {}",
+            final_html
+        );
+        assert!(
+            !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "No placeholders should remain. Output: {}",
+            final_html
+        );
+    }
 }
