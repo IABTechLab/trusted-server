@@ -3,6 +3,7 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
+use trusted_server_common::auction::handle_auction;
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -71,6 +72,9 @@ async fn route_request(
         // Key rotation admin endpoints
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
+
+        // Auction endpoints (top-level, not an integration)
+        (Method::POST, "/third-party/ad") => handle_auction(&settings, req).await,
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,

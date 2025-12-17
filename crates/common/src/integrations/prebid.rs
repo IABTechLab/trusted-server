@@ -12,12 +12,8 @@ use serde_json::{json, Value as Json, Value as JsonValue};
 use url::Url;
 use validator::Validate;
 
-use crate::auction::get_orchestrator;
 use crate::auction::provider::AuctionProvider;
-use crate::auction::types::{
-    AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid,
-    DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
-};
+use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
@@ -34,7 +30,6 @@ use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
-const ROUTE_THIRD_PARTY_AD: &str = "/third-party/ad";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -132,92 +127,7 @@ impl PrebidIntegration {
         }
     }
 
-    async fn handle_third_party_ad(
-        &self,
-        settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-            TrustedServerError::Prebid {
-                message: "Failed to parse tsjs auction request".to_string(),
-            },
-        )?;
 
-        log::info!("/third-party/ad: received {} adUnits", body.ad_units.len());
-        for unit in &body.ad_units {
-            if let Some(mt) = &unit.media_types {
-                if let Some(banner) = &mt.banner {
-                    log::debug!("unit={} sizes={:?}", unit.code, banner.sizes);
-                }
-            }
-        }
-
-        // Check if auction orchestrator is enabled
-        if settings.auction.enabled {
-            log::info!(
-                "Using auction orchestrator with strategy: {}",
-                settings.auction.strategy
-            );
-            return self
-                .handle_orchestrated_auction(settings, &req, &body)
-                .await;
-        }
-
-        // Legacy flow: direct Prebid Server call
-        log::info!("Using legacy Prebid flow (orchestrator disabled)");
-        let openrtb = build_openrtb_from_ts(&body, settings, &self.config);
-        if let Ok(preview) = serde_json::to_string(&openrtb) {
-            log::debug!(
-                "OpenRTB payload (truncated): {}",
-                &preview.chars().take(512).collect::<String>()
-            );
-        }
-
-        req.set_body_json(&openrtb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
-        handle_prebid_auction(settings, req, &self.config).await
-    }
-
-    async fn handle_orchestrated_auction(
-        &self,
-        settings: &Settings,
-        req: &Request,
-        body: &AdRequest,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        // Get the global orchestrator (initialized once on first access)
-        let orchestrator = get_orchestrator(settings);
-
-        // Convert tsjs request to auction request
-        let auction_request = convert_tsjs_to_auction_request(body, settings, req)?;
-
-        // Create auction context
-        let context = AuctionContext {
-            settings,
-            request: req,
-            timeout_ms: settings.auction.timeout_ms,
-        };
-
-        // Run the auction
-        let result = orchestrator
-            .run_auction(&auction_request, &context)
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: "Auction orchestration failed".to_string(),
-            })?;
-
-        log::info!(
-            "Auction completed: {} bidders, {} winning bids, {}ms total",
-            result.bidder_responses.len(),
-            result.winning_bids.len(),
-            result.total_time_ms
-        );
-
-        // Convert orchestration result to OpenRTB response format
-        convert_orchestration_result_to_response(&result, settings, req)
-    }
 
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
@@ -327,10 +237,7 @@ impl IntegrationProxy for PrebidIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        let mut routes = vec![
-            IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),
-            IntegrationEndpoint::post(ROUTE_THIRD_PARTY_AD),
-        ];
+        let mut routes = vec![IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD)];
 
         if let Some(script_path) = &self.config.script_handler {
             // We need to leak the string to get a 'static str for IntegrationEndpoint
@@ -356,9 +263,6 @@ impl IntegrationProxy for PrebidIntegration {
             }
             Method::GET if path == ROUTE_FIRST_PARTY_AD => {
                 self.handle_first_party_ad(settings, req).await
-            }
-            Method::POST if path == ROUTE_THIRD_PARTY_AD => {
-                self.handle_third_party_ad(settings, req).await
             }
             _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
@@ -757,145 +661,7 @@ fn get_request_scheme(req: &Request) -> String {
     "https".to_string()
 }
 
-/// Convert tsjs AdRequest to unified AuctionRequest
-fn convert_tsjs_to_auction_request(
-    body: &AdRequest,
-    settings: &Settings,
-    req: &Request,
-) -> Result<AuctionRequest, Report<TrustedServerError>> {
-    use uuid::Uuid;
 
-    let synthetic_id = get_or_generate_synthetic_id(settings, req)?;
-    let fresh_id = generate_synthetic_id(settings, req)?;
-
-    let slots: Vec<AdSlot> = body
-        .ad_units
-        .iter()
-        .map(|unit| {
-            let formats = unit
-                .media_types
-                .as_ref()
-                .and_then(|mt| mt.banner.as_ref())
-                .map(|b| {
-                    b.sizes
-                        .iter()
-                        .filter(|s| s.len() >= 2)
-                        .map(|s| AdFormat {
-                            media_type: MediaType::Banner,
-                            width: s[0],
-                            height: s[1],
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    vec![AdFormat {
-                        media_type: MediaType::Banner,
-                        width: 300,
-                        height: 250,
-                    }]
-                });
-
-            AdSlot {
-                id: unit.code.clone(),
-                formats,
-                floor_price: None,
-                targeting: HashMap::new(),
-            }
-        })
-        .collect();
-
-    let geo_info = GeoInfo::from_request(req);
-
-    let device = Some(DeviceInfo {
-        user_agent: req
-            .get_header(header::USER_AGENT)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string()),
-        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        geo: geo_info.map(|g| crate::auction::types::GeoInfo {
-            country: Some(g.country),
-            region: g.region,
-            city: Some(g.city),
-        }),
-    });
-
-    Ok(AuctionRequest {
-        id: Uuid::new_v4().to_string(),
-        slots,
-        publisher: PublisherInfo {
-            domain: settings.publisher.domain.clone(),
-            page_url: Some(format!("https://{}", settings.publisher.domain)),
-        },
-        user: UserInfo {
-            id: synthetic_id,
-            fresh_id,
-            consent: None,
-        },
-        device,
-        site: Some(SiteInfo {
-            domain: settings.publisher.domain.clone(),
-            page: format!("https://{}", settings.publisher.domain),
-        }),
-        context: HashMap::new(),
-    })
-}
-
-/// Convert OrchestrationResult to OpenRTB response format
-fn convert_orchestration_result_to_response(
-    result: &crate::auction::orchestrator::OrchestrationResult,
-    settings: &Settings,
-    req: &Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    use serde_json::json;
-
-    let request_host = get_request_host(req);
-    let request_scheme = get_request_scheme(req);
-
-    // Build OpenRTB-style seatbid array
-    let mut seatbids = Vec::new();
-
-    for (slot_id, bid) in &result.winning_bids {
-        let rewritten_creative = creative::rewrite_creative_html(&bid.creative, settings);
-
-        let bid_obj = json!({
-            "id": format!("{}-{}", bid.bidder, slot_id),
-            "impid": slot_id,
-            "price": bid.price,
-            "adm": rewritten_creative,
-            "crid": format!("{}-creative", bid.bidder),
-            "w": bid.width,
-            "h": bid.height,
-            "adomain": bid.adomain.clone().unwrap_or_default(),
-        });
-
-        seatbids.push(json!({
-            "seat": bid.bidder,
-            "bid": [bid_obj]
-        }));
-    }
-
-    let response_body = json!({
-        "id": "auction-response",
-        "seatbid": seatbids,
-        "ext": {
-            "orchestrator": {
-                "strategy": settings.auction.strategy,
-                "bidders": result.bidder_responses.len(),
-                "total_bids": result.total_bids(),
-                "time_ms": result.total_time_ms
-            }
-        }
-    });
-
-    let body_bytes =
-        serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {
-            message: "Failed to serialize auction response".to_string(),
-        })?;
-
-    Ok(Response::from_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, "application/json")
-        .with_body(body_bytes))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1297,8 +1063,8 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should have 3 routes: first-party ad, third-party ad, and script handler
-        assert_eq!(routes.len(), 3);
+        // Should have 2 routes: first-party ad and script handler
+        assert_eq!(routes.len(), 2);
 
         let has_script_route = routes
             .iter()
@@ -1313,8 +1079,8 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should only have 2 routes: first-party ad and third-party ad
-        assert_eq!(routes.len(), 2);
+        // Should only have 1 route: first-party ad
+        assert_eq!(routes.len(), 1);
     }
 }
 
