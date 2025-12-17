@@ -1,5 +1,6 @@
 use std::io;
 
+use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 use crate::streaming_processor::StreamProcessor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +116,9 @@ impl RscFlightUrlRewriter {
             &self.origin_protocol_relative,
             &self.request_protocol_relative,
         );
-        rewritten = rewritten.replace(&self.origin_host, &self.request_host);
+        rewritten =
+            rewrite_bare_host_at_boundaries(&rewritten, &self.origin_host, &self.request_host)
+                .unwrap_or(rewritten);
 
         rewritten.into_bytes()
     }
@@ -362,6 +365,27 @@ mod tests {
         assert_eq!(
             output_str, expected,
             "Rewriter should handle T rows split across chunks"
+        );
+    }
+
+    #[test]
+    fn bare_host_rewrite_respects_hostname_boundaries() {
+        let input = b"0:[\"cdn.origin.example.com\",\"notorigin.example.com\",\"origin.example.com.uk\",\"origin.example.com/news\",\"origin.example.com\"]\n";
+
+        let mut rewriter = RscFlightUrlRewriter::new(
+            "origin.example.com",
+            "https://origin.example.com",
+            "proxy.example.com",
+            "https",
+        );
+
+        let output = run_rewriter(&mut rewriter, input, 5);
+        let output_str = String::from_utf8(output).expect("should be valid UTF-8");
+
+        assert_eq!(
+            output_str,
+            "0:[\"cdn.origin.example.com\",\"notorigin.example.com\",\"origin.example.com.uk\",\"proxy.example.com/news\",\"proxy.example.com\"]\n",
+            "Output should only rewrite bare host occurrences"
         );
     }
 }

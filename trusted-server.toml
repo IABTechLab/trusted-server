@@ -45,6 +45,8 @@ debug = false
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+# Maximum combined payload size for cross-script RSC processing (bytes). Default is 10 MB.
+max_combined_payload_bytes = 10485760
 
 [integrations.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"

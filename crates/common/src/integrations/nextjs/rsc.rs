@@ -1,7 +1,7 @@
-use std::borrow::Cow;
-
 use once_cell::sync::Lazy;
-use regex::{escape, Regex};
+use regex::Regex;
+
+use super::shared::RscUrlRewriter;
 
 /// T-chunk header pattern: hex_id:Thex_length,
 static TCHUNK_PATTERN: Lazy<Regex> =
@@ -10,9 +10,13 @@ static TCHUNK_PATTERN: Lazy<Regex> =
 /// Marker used to track script boundaries when combining RSC content.
 pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";
 
-/// Maximum combined payload size for cross-script processing (10 MB).
-/// Payloads exceeding this limit are processed individually without cross-script T-chunk handling.
-const MAX_COMBINED_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
+/// Default maximum combined payload size for cross-script processing (10 MB).
+pub(crate) const DEFAULT_MAX_COMBINED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum reasonable T-chunk length to prevent DoS from malformed input (100 MB).
+/// A T-chunk larger than this is almost certainly malformed and would cause excessive
+/// memory allocation or iteration.
+const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
 
 // =============================================================================
 // Escape Sequence Parsing
@@ -184,10 +188,10 @@ fn consume_unescaped_bytes(s: &str, start_pos: usize, byte_count: usize) -> (usi
 
 /// Information about a T-chunk found in the combined RSC content.
 struct TChunkInfo {
-    /// The chunk ID (hex string like "1a", "443").
-    id: String,
     /// Position where the T-chunk header starts (e.g., position of "1a:T...").
     match_start: usize,
+    /// Position right after the chunk ID (position of ":T").
+    id_end: usize,
     /// Position right after the comma (where content begins).
     header_end: usize,
     /// Position where the content ends.
@@ -195,7 +199,7 @@ struct TChunkInfo {
 }
 
 /// Find all T-chunks in content, optionally skipping markers.
-fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
+fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo>> {
     let mut chunks = Vec::new();
     let mut search_pos = 0;
     let marker = if skip_markers {
@@ -210,13 +214,12 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
             let match_start = search_pos + m.start();
             let header_end = search_pos + m.end();
 
-            let id = cap
-                .get(1)
-                .expect("T-chunk id should exist")
-                .as_str()
-                .to_string();
+            let id_match = cap.get(1).expect("T-chunk id should exist");
+            let id_end = search_pos + id_match.end();
             let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
-            let declared_length = usize::from_str_radix(length_hex, 16).unwrap_or(0);
+            let declared_length = usize::from_str_radix(length_hex, 16)
+                .ok()
+                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)?;
 
             let content_end = if let Some(marker_bytes) = marker {
                 let mut iter = EscapeSequenceIter::from_position_with_marker(
@@ -231,15 +234,21 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
                         None => break,
                     }
                 }
+                if consumed < declared_length {
+                    return None;
+                }
                 iter.position()
             } else {
-                let (pos, _) = consume_unescaped_bytes(content, header_end, declared_length);
+                let (pos, consumed) = consume_unescaped_bytes(content, header_end, declared_length);
+                if consumed < declared_length {
+                    return None;
+                }
                 pos
             };
 
             chunks.push(TChunkInfo {
-                id,
                 match_start,
+                id_end,
                 header_end,
                 content_end,
             });
@@ -250,90 +259,15 @@ fn find_tchunks_impl(content: &str, skip_markers: bool) -> Vec<TChunkInfo> {
         }
     }
 
-    chunks
+    Some(chunks)
 }
 
-fn find_tchunks(content: &str) -> Vec<TChunkInfo> {
+fn find_tchunks(content: &str) -> Option<Vec<TChunkInfo>> {
     find_tchunks_impl(content, false)
 }
 
-fn find_tchunks_with_markers(content: &str) -> Vec<TChunkInfo> {
+fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
     find_tchunks_impl(content, true)
-}
-
-// =============================================================================
-// URL rewriting (cached per call)
-// =============================================================================
-
-/// Rewriter for RSC payload URL patterns.
-///
-/// This is constructed per document / payload rewrite so that the origin-host-dependent regex is
-/// compiled once, then reused across multiple calls.
-pub(crate) struct RscUrlRewriter {
-    origin_host: String,
-    request_host: String,
-    request_scheme: String,
-    pattern: Regex,
-}
-
-impl RscUrlRewriter {
-    pub(crate) fn new(origin_host: &str, request_host: &str, request_scheme: &str) -> Self {
-        let escaped_origin = escape(origin_host);
-
-        // Match:
-        // - https://origin_host or http://origin_host
-        // - //origin_host (protocol-relative)
-        // - escaped variants inside JSON-in-JS strings (e.g., \/\/origin_host)
-        let pattern = Regex::new(&format!(
-            r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//){}"#,
-            escaped_origin
-        ))
-        .expect("valid RSC URL rewrite regex");
-
-        Self {
-            origin_host: origin_host.to_string(),
-            request_host: request_host.to_string(),
-            request_scheme: request_scheme.to_string(),
-            pattern,
-        }
-    }
-
-    pub(crate) fn rewrite<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        if !input.contains(&self.origin_host) {
-            return Cow::Borrowed(input);
-        }
-
-        // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
-        let replaced = self
-            .pattern
-            .replace_all(input, |caps: &regex::Captures<'_>| {
-                let slashes = caps.get(3).map_or("//", |m| m.as_str());
-                if caps.get(1).is_some() {
-                    format!("{}:{}{}", self.request_scheme, slashes, self.request_host)
-                } else {
-                    format!("{}{}", slashes, self.request_host)
-                }
-            });
-
-        // Phase 2: Handle bare host occurrences not matched by the URL regex
-        // (e.g., `siteProductionDomain`). Only check if regex made no changes,
-        // because if it did, we already know origin_host was present.
-        let text = match &replaced {
-            Cow::Borrowed(s) => *s,
-            Cow::Owned(s) => s.as_str(),
-        };
-
-        if !text.contains(&self.origin_host) {
-            return replaced;
-        }
-
-        // Bare host replacement needed
-        Cow::Owned(text.replace(&self.origin_host, &self.request_host))
-    }
-
-    pub(crate) fn rewrite_to_string(&self, input: &str) -> String {
-        self.rewrite(input).into_owned()
-    }
 }
 
 // =============================================================================
@@ -344,7 +278,12 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     content: &str,
     rewriter: &RscUrlRewriter,
 ) -> String {
-    let chunks = find_tchunks(content);
+    let Some(chunks) = find_tchunks(content) else {
+        log::warn!(
+            "RSC payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
+        );
+        return content.to_string();
+    };
 
     if chunks.is_empty() {
         return rewriter.rewrite_to_string(content);
@@ -363,7 +302,7 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
         let new_length = calculate_unescaped_byte_length(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
 
-        result.push_str(&chunk.id);
+        result.push_str(&content[chunk.match_start..chunk.id_end]);
         result.push_str(":T");
         result.push_str(&new_length_hex);
         result.push(',');
@@ -395,8 +334,58 @@ pub fn rewrite_rsc_scripts_combined(
     request_host: &str,
     request_scheme: &str,
 ) -> Vec<String> {
+    rewrite_rsc_scripts_combined_with_limit(
+        payloads,
+        origin_host,
+        request_host,
+        request_scheme,
+        DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+    )
+}
+
+fn payload_contains_incomplete_tchunk(payload: &str) -> bool {
+    let mut search_pos = 0;
+    while search_pos < payload.len() {
+        let Some(cap) = TCHUNK_PATTERN.captures(&payload[search_pos..]) else {
+            break;
+        };
+
+        let m = cap.get(0).expect("T-chunk match should exist");
+        let header_end = search_pos + m.end();
+
+        let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
+        let Some(declared_length) = usize::from_str_radix(length_hex, 16)
+            .ok()
+            .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
+        else {
+            return true;
+        };
+
+        let (pos, consumed) = consume_unescaped_bytes(payload, header_end, declared_length);
+        if consumed < declared_length {
+            return true;
+        }
+
+        search_pos = pos;
+    }
+
+    false
+}
+
+pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
+    payloads: &[&str],
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    max_combined_payload_bytes: usize,
+) -> Vec<String> {
     if payloads.is_empty() {
         return Vec::new();
+    }
+
+    // Early exit if no payload contains the origin host - avoids regex compilation
+    if !payloads.iter().any(|p| p.contains(origin_host)) {
+        return payloads.iter().map(|p| (*p).to_string()).collect();
     }
 
     let rewriter = RscUrlRewriter::new(origin_host, request_host, request_scheme);
@@ -405,18 +394,36 @@ pub fn rewrite_rsc_scripts_combined(
         return vec![rewrite_rsc_tchunks_with_rewriter(payloads[0], &rewriter)];
     }
 
+    let max_combined_payload_bytes = if max_combined_payload_bytes == 0 {
+        DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
+    } else {
+        max_combined_payload_bytes
+    };
+
     // Check total size before allocating combined buffer
     let total_size: usize =
         payloads.iter().map(|p| p.len()).sum::<usize>() + (payloads.len() - 1) * RSC_MARKER.len();
 
-    if total_size > MAX_COMBINED_PAYLOAD_SIZE {
-        // Fall back to individual processing if combined size is too large.
-        // This sacrifices cross-script T-chunk correctness for memory safety.
+    if total_size > max_combined_payload_bytes {
+        // Avoid allocating a large combined buffer. If the payloads contain cross-script T-chunks,
+        // per-script rewriting is unsafe because it may rewrite T-chunk content without updating
+        // the original header, breaking React hydration.
         log::warn!(
-            "RSC combined payload size {} exceeds limit {}, processing individually",
+            "RSC combined payload size {} exceeds limit {}, skipping cross-script combining",
             total_size,
-            MAX_COMBINED_PAYLOAD_SIZE
+            max_combined_payload_bytes
         );
+
+        if payloads
+            .iter()
+            .any(|p| payload_contains_incomplete_tchunk(p))
+        {
+            log::warn!(
+                "RSC payloads contain cross-script T-chunks; skipping RSC URL rewriting to avoid breaking hydration (consider increasing integrations.nextjs.max_combined_payload_bytes)"
+            );
+            return payloads.iter().map(|p| (*p).to_string()).collect();
+        }
+
         return payloads
             .iter()
             .map(|p| rewrite_rsc_tchunks_with_rewriter(p, &rewriter))
@@ -430,7 +437,12 @@ pub fn rewrite_rsc_scripts_combined(
         combined.push_str(payload);
     }
 
-    let chunks = find_tchunks_with_markers(&combined);
+    let Some(chunks) = find_tchunks_with_markers(&combined) else {
+        log::warn!(
+            "RSC combined payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
+        );
+        return payloads.iter().map(|p| (*p).to_string()).collect();
+    };
     if chunks.is_empty() {
         return payloads
             .iter()
@@ -451,7 +463,7 @@ pub fn rewrite_rsc_scripts_combined(
         let new_length = calculate_unescaped_byte_length_skip_markers(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
 
-        result.push_str(&chunk.id);
+        result.push_str(&combined[chunk.match_start..chunk.id_end]);
         result.push_str(":T");
         result.push_str(&new_length_hex);
         result.push(',');
@@ -532,7 +544,7 @@ mod tests {
 
     #[test]
     fn cross_script_tchunk_rewriting() {
-        let script0 = r#"other:data\n1a:T40,partial content"#;
+        let script0 = r#"other:data\n1a:T3e,partial content"#;
         let script1 = r#" with https://origin.example.com/page goes here"#;
 
         let combined_content = "partial content with https://origin.example.com/page goes here";
@@ -570,7 +582,7 @@ mod tests {
 
     #[test]
     fn cross_script_preserves_non_tchunk_content() {
-        let script0 = r#"{"url":"https://origin.example.com/first"}\n1a:T40,partial"#;
+        let script0 = r#"{"url":"https://origin.example.com/first"}\n1a:T38,partial"#;
         let script1 = r#" content with https://origin.example.com/page end"#;
 
         let payloads: Vec<&str> = vec![script0, script1];
@@ -615,6 +627,34 @@ mod tests {
         assert!(
             rewritten.contains(r#""siteProductionDomain":"proxy.example.com""#),
             "Bare host should be rewritten inside RSC payload. Got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn bare_host_rewrite_respects_hostname_boundaries() {
+        let input = r#"{"sub":"cdn.origin.example.com","prefix":"notorigin.example.com","suffix":"origin.example.com.uk","path":"origin.example.com/news","exact":"origin.example.com"}"#;
+        let rewriter = RscUrlRewriter::new("origin.example.com", "proxy.example.com", "https");
+        let rewritten = rewriter.rewrite_to_string(input);
+
+        assert!(
+            rewritten.contains(r#""sub":"cdn.origin.example.com""#),
+            "Subdomain should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""prefix":"notorigin.example.com""#),
+            "Prefix substring should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""suffix":"origin.example.com.uk""#),
+            "Suffix domain should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""path":"proxy.example.com/news""#),
+            "Bare host with path should be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""exact":"proxy.example.com""#),
+            "Exact bare host should be rewritten. Got: {rewritten}"
         );
     }
 
@@ -691,6 +731,92 @@ mod tests {
             results[1].contains(r#"{"foo":"bar"}"#),
             "Content should be preserved. Got: {}",
             results[1]
+        );
+    }
+
+    #[test]
+    fn size_limit_skips_rewrite_when_cross_script_tchunk_detected() {
+        let script0 = r#"other:data\n1a:T40,partial content"#;
+        let script1 = r#" with https://origin.example.com/page goes here"#;
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined_with_limit(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+            1,
+        );
+
+        assert_eq!(results.len(), 2, "Should return same number of scripts");
+        assert_eq!(
+            results[0], script0,
+            "Cross-script payload should remain unchanged when size limit is exceeded"
+        );
+        assert_eq!(
+            results[1], script1,
+            "Cross-script payload should remain unchanged when size limit is exceeded"
+        );
+    }
+
+    #[test]
+    fn size_limit_rewrites_individually_when_tchunks_are_complete() {
+        let script0 = r#"1a:T25,{"url":"https://origin.example.com/x"}"#;
+        let script1 = r#"1b:T25,{"url":"https://origin.example.com/y"}"#;
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined_with_limit(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+            1,
+        );
+
+        assert_eq!(results.len(), 2, "Should return same number of scripts");
+        assert!(
+            results[0].contains("test.example.com"),
+            "First payload should be rewritten. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains("test.example.com"),
+            "Second payload should be rewritten. Got: {}",
+            results[1]
+        );
+        assert!(
+            results[0].contains(":T23,"),
+            "First payload T-chunk length should be updated. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains(":T23,"),
+            "Second payload T-chunk length should be updated. Got: {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn invalid_or_unreasonable_tchunk_length_skips_rewriting() {
+        let content = r#"1a:T10000000,{"url":"https://origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new("origin.example.com", "test.example.com", "https");
+        let result = rewrite_rsc_tchunks_with_rewriter(content, &rewriter);
+
+        assert_eq!(
+            result, content,
+            "Should skip rewriting when T-chunk length is unreasonable"
+        );
+    }
+
+    #[test]
+    fn incomplete_tchunk_skips_rewriting() {
+        let content = r#"1a:Tff,{"url":"https://origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new("origin.example.com", "test.example.com", "https");
+        let result = rewrite_rsc_tchunks_with_rewriter(content, &rewriter);
+
+        assert_eq!(
+            result, content,
+            "Should skip rewriting when T-chunk content is incomplete"
         );
     }
 }

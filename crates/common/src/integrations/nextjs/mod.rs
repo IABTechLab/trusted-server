@@ -10,13 +10,19 @@ const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 
 mod html_post_process;
 mod rsc;
+mod rsc_placeholders;
 mod script_rewriter;
+mod shared;
 
+// Re-export deprecated legacy functions for backward compatibility.
+// Production code should use the placeholder-based approach via NextJsHtmlPostProcessor.
+#[allow(deprecated)]
 pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
 pub use rsc::rewrite_rsc_scripts_combined;
 
 use html_post_process::NextJsHtmlPostProcessor;
-use script_rewriter::{NextJsRewriteMode, NextJsScriptRewriter};
+use rsc_placeholders::NextJsRscPlaceholderRewriter;
+use script_rewriter::NextJsNextDataRewriter;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct NextJsIntegrationConfig {
@@ -28,6 +34,8 @@ pub struct NextJsIntegrationConfig {
     )]
     #[validate(length(min = 1))]
     pub rewrite_attributes: Vec<String>,
+    #[serde(default = "default_max_combined_payload_bytes")]
+    pub max_combined_payload_bytes: usize,
 }
 
 impl IntegrationConfig for NextJsIntegrationConfig {
@@ -44,13 +52,18 @@ fn default_rewrite_attributes() -> Vec<String> {
     vec!["href".to_string(), "link".to_string(), "url".to_string()]
 }
 
+fn default_max_combined_payload_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let config = match build(settings) {
         Some(config) => {
             log::info!(
-                "NextJS integration registered: enabled={}, rewrite_attributes={:?}",
+                "NextJS integration registered: enabled={}, rewrite_attributes={:?}, max_combined_payload_bytes={}",
                 config.enabled,
-                config.rewrite_attributes
+                config.rewrite_attributes,
+                config.max_combined_payload_bytes
             );
             config
         }
@@ -60,29 +73,22 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         }
     };
 
-    // Register both structured (Pages Router __NEXT_DATA__) and streamed (App Router RSC)
-    // rewriters. RSC payloads require LENGTH-PRESERVING URL replacement to avoid breaking
-    // React hydration - the RSC format uses byte positions for record boundaries.
-    let structured = Arc::new(NextJsScriptRewriter::new(
-        config.clone(),
-        NextJsRewriteMode::Structured,
-    ));
+    // Register a structured (Pages Router __NEXT_DATA__) rewriter.
+    let structured = Arc::new(NextJsNextDataRewriter::new(config.clone()));
 
-    let streamed = Arc::new(NextJsScriptRewriter::new(
-        config.clone(),
-        NextJsRewriteMode::Streamed,
-    ));
+    // Insert placeholders for App Router RSC payload scripts during the initial HTML rewrite pass,
+    // then substitute them during post-processing without re-parsing HTML.
+    let placeholders = Arc::new(NextJsRscPlaceholderRewriter::new(config.clone()));
 
     // Register post-processor for cross-script RSC T-chunks
-    let post_processor = Arc::new(NextJsHtmlPostProcessor::new(config));
+    let post_processor = Arc::new(NextJsHtmlPostProcessor::new(config.clone()));
 
-    Some(
-        IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
-            .with_script_rewriter(structured)
-            .with_script_rewriter(streamed)
-            .with_html_post_processor(post_processor)
-            .build(),
-    )
+    let builder = IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
+        .with_script_rewriter(structured)
+        .with_script_rewriter(placeholders)
+        .with_html_post_processor(post_processor);
+
+    Some(builder.build())
 }
 
 fn build(settings: &Settings) -> Option<Arc<NextJsIntegrationConfig>> {
@@ -95,6 +101,7 @@ fn build(settings: &Settings) -> Option<Arc<NextJsIntegrationConfig>> {
 
 #[cfg(test)]
 mod tests {
+    use super::rsc_placeholders::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
     use super::*;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::IntegrationRegistry;
@@ -221,6 +228,11 @@ mod tests {
             "RSC stream payloads should be rewritten to proxy host via post-processing. Output: {}",
             final_html
         );
+        assert!(
+            !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "RSC placeholder markers should not appear in final HTML. Output: {}",
+            final_html
+        );
     }
 
     #[test]
@@ -262,6 +274,66 @@ mod tests {
         assert!(
             final_html.contains("test.example.com"),
             "RSC stream payloads should be rewritten to proxy host with chunked input. Output: {}",
+            final_html
+        );
+        assert!(
+            !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "RSC placeholder markers should not appear in final HTML. Output: {}",
+            final_html
+        );
+    }
+
+    #[test]
+    fn html_processor_respects_max_combined_payload_bytes() {
+        // When the combined payload size exceeds `max_combined_payload_bytes` and the document
+        // contains cross-script T-chunks, we skip post-processing to avoid breaking hydration.
+        let html = r#"<html><body>
+<script>self.__next_f.push([1,"other:data\n1a:T40,partial content"])</script>
+<script>self.__next_f.push([1," with https://origin.example.com/page goes here"])</script>
+</body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                    "max_combined_payload_bytes": 1,
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings);
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .unwrap();
+
+        let final_html = String::from_utf8_lossy(&output);
+
+        assert!(
+            final_html.contains("https://origin.example.com/page"),
+            "Origin URL should remain when rewrite is skipped due to size limit. Output: {}",
+            final_html
+        );
+        assert!(
+            !final_html.contains("test.example.com"),
+            "Proxy host should not be introduced when rewrite is skipped. Output: {}",
+            final_html
+        );
+        assert!(
+            !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "RSC placeholder markers should not appear in final HTML. Output: {}",
             final_html
         );
     }
@@ -339,6 +411,11 @@ mod tests {
         assert!(
             final_html.contains(r#"\n442:"#),
             "RSC record separator \\n should be preserved. Output: {}",
+            final_html
+        );
+        assert!(
+            !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "RSC placeholder markers should not appear in final HTML. Output: {}",
             final_html
         );
     }

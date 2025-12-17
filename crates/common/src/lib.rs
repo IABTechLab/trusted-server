@@ -29,6 +29,7 @@ pub mod creative;
 pub mod error;
 pub mod fastly_storage;
 pub mod geo;
+pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
 pub mod integrations;

@@ -9,9 +9,9 @@ use std::sync::Arc;
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 
 use crate::integrations::{
-    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationHtmlContext,
-    IntegrationHtmlPostProcessor, IntegrationRegistry, IntegrationScriptContext,
-    ScriptRewriteAction,
+    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
+    IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
+    IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -23,6 +23,7 @@ struct HtmlWithPostProcessing {
     origin_host: String,
     request_host: String,
     request_scheme: String,
+    document_state: IntegrationDocumentState,
 }
 
 impl StreamProcessor for HtmlWithPostProcessing {
@@ -40,6 +41,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
             request_host: &self.request_host,
             request_scheme: &self.request_scheme,
             origin_host: &self.origin_host,
+            document_state: &self.document_state,
         };
 
         // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
@@ -77,6 +79,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
 
     fn reset(&mut self) {
         self.inner.reset();
+        self.document_state.clear();
     }
 }
 
@@ -110,6 +113,7 @@ impl HtmlProcessorConfig {
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
+    let document_state = IntegrationDocumentState::default();
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -404,15 +408,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
         let patterns = patterns.clone();
+        let document_state = document_state.clone();
         element_content_handlers.push(text!(selector, {
             let rewriter = rewriter.clone();
             let patterns = patterns.clone();
+            let document_state = document_state.clone();
             move |text| {
                 let ctx = IntegrationScriptContext {
                     selector,
                     request_host: &patterns.request_host,
                     request_scheme: &patterns.request_scheme,
                     origin_host: &patterns.origin_host,
+                    is_last_in_text_node: text.last_in_text_node(),
+                    document_state: &document_state,
                 };
                 match rewriter.rewrite(text.as_str(), &ctx) {
                     ScriptRewriteAction::Keep => {}
@@ -439,6 +447,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
+        document_state,
     }
 }
 
