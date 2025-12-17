@@ -74,6 +74,7 @@ pub fn ensure_origin_backend(
         }
     }
 }
+
 pub fn ensure_backend_from_url(origin_url: &str) -> Result<String, Report<TrustedServerError>> {
     let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
         message: format!("Invalid origin_url: {}", origin_url),

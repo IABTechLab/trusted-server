@@ -45,6 +45,8 @@ pub struct PrebidIntegrationConfig {
     pub auto_configure: bool,
     #[serde(default)]
     pub debug: bool,
+    #[serde(default)]
+    pub script_handler: Option<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -159,6 +161,18 @@ impl PrebidIntegration {
         handle_prebid_auction(settings, req, &self.config).await
     }
 
+    fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
+        let body = "// Script overridden by Trusted Server\n";
+
+        Ok(Response::from_status(StatusCode::OK)
+            .with_header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .with_body(body))
+    }
+
     async fn handle_first_party_ad(
         &self,
         settings: &Settings,
@@ -250,11 +264,24 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 
 #[async_trait(?Send)]
 impl IntegrationProxy for PrebidIntegration {
+    fn integration_name(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
+        let mut routes = vec![
             IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),
             IntegrationEndpoint::post(ROUTE_THIRD_PARTY_AD),
-        ]
+        ];
+
+        if let Some(script_path) = &self.config.script_handler {
+            // We need to leak the string to get a 'static str for IntegrationEndpoint
+            // This is safe because the config lives for the lifetime of the application
+            let static_path: &'static str = Box::leak(script_path.clone().into_boxed_str());
+            routes.push(IntegrationEndpoint::get(static_path));
+        }
+
+        routes
     }
 
     async fn handle(
@@ -265,14 +292,19 @@ impl IntegrationProxy for PrebidIntegration {
         let path = req.get_path().to_string();
         let method = req.get_method().clone();
 
-        if method == Method::GET && path == ROUTE_FIRST_PARTY_AD {
-            self.handle_first_party_ad(settings, req).await
-        } else if method == Method::POST && path == ROUTE_THIRD_PARTY_AD {
-            self.handle_third_party_ad(settings, req).await
-        } else {
-            Err(Report::new(Self::error(format!(
+        match method {
+            Method::GET if self.config.script_handler.as_ref() == Some(&path) => {
+                self.handle_script_handler()
+            }
+            Method::GET if path == ROUTE_FIRST_PARTY_AD => {
+                self.handle_first_party_ad(settings, req).await
+            }
+            Method::POST if path == ROUTE_THIRD_PARTY_AD => {
+                self.handle_third_party_ad(settings, req).await
+            }
+            _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
-            ))))
+            )))),
         }
     }
 }
@@ -691,6 +723,7 @@ mod tests {
             bidders: vec!["exampleBidder".to_string()],
             auto_configure: true,
             debug: false,
+            script_handler: None,
         }
     }
 
@@ -956,5 +989,133 @@ mod tests {
             "https://cdn.com/prebid.min.js?version=1"
         ));
         assert!(!is_prebid_script_url("https://cdn.com/app.js"));
+    }
+
+    #[test]
+    fn test_script_handler_config_parsing() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+script_handler = "/prebid.js"
+"#;
+
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("should get config")
+            .expect("should be enabled");
+
+        assert_eq!(config.script_handler, Some("/prebid.js".to_string()));
+    }
+
+    #[test]
+    fn test_script_handler_none_by_default() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+"#;
+
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("should get config")
+            .expect("should be enabled");
+
+        assert_eq!(config.script_handler, None);
+    }
+
+    #[test]
+    fn test_script_handler_returns_empty_js() {
+        let config = PrebidIntegrationConfig {
+            enabled: true,
+            server_url: "https://prebid.example".to_string(),
+            timeout_ms: 1000,
+            bidders: vec![],
+            auto_configure: false,
+            debug: false,
+            script_handler: Some("/prebid.js".to_string()),
+        };
+        let integration = PrebidIntegration::new(config);
+
+        let response = integration
+            .handle_script_handler()
+            .expect("should return response");
+
+        assert_eq!(response.get_status(), StatusCode::OK);
+
+        let content_type = response
+            .get_header_str(header::CONTENT_TYPE)
+            .expect("should have content-type");
+        assert_eq!(content_type, "application/javascript; charset=utf-8");
+
+        let cache_control = response
+            .get_header_str(header::CACHE_CONTROL)
+            .expect("should have cache-control");
+        assert!(cache_control.contains("max-age=31536000"));
+        assert!(cache_control.contains("immutable"));
+
+        let body = response.into_body_str();
+        assert!(body.contains("// Script overridden by Trusted Server"));
+    }
+
+    #[test]
+    fn test_routes_includes_script_handler() {
+        let config = PrebidIntegrationConfig {
+            enabled: true,
+            server_url: "https://prebid.example".to_string(),
+            timeout_ms: 1000,
+            bidders: vec![],
+            auto_configure: false,
+            debug: false,
+            script_handler: Some("/prebid.js".to_string()),
+        };
+        let integration = PrebidIntegration::new(config);
+
+        let routes = integration.routes();
+
+        // Should have 3 routes: first-party ad, third-party ad, and script handler
+        assert_eq!(routes.len(), 3);
+
+        let has_script_route = routes
+            .iter()
+            .any(|r| r.path == "/prebid.js" && r.method == Method::GET);
+        assert!(has_script_route, "should register script handler route");
+    }
+
+    #[test]
+    fn test_routes_without_script_handler() {
+        let config = base_config(); // Has script_handler: None
+        let integration = PrebidIntegration::new(config);
+
+        let routes = integration.routes();
+
+        // Should only have 2 routes: first-party ad and third-party ad
+        assert_eq!(routes.len(), 2);
     }
 }

@@ -1344,6 +1344,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchit"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea5f97102eb9e54ab99fb70bb175589073f554bdadfb74d9bd656482ea73e2a"
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2372,6 +2378,7 @@ dependencies = [
  "log",
  "log-fastly",
  "lol_html",
+ "matchit",
  "once_cell",
  "pin-project-lite",
  "rand",
