@@ -428,3 +428,32 @@ impl AuctionProvider for MockGamProvider {
         self.config.enabled
     }
 }
+
+// ============================================================================
+// Provider Auto-Registration
+// ============================================================================
+
+use std::sync::Arc;
+use crate::settings::Settings;
+
+/// Auto-register GAM providers based on settings configuration.
+///
+/// This function checks the settings for both real and mock GAM configurations
+/// and returns any enabled providers ready for registration with the orchestrator.
+pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+
+    // Check for real GAM provider configuration
+    if let Ok(Some(config)) = settings.integration_config::<GamConfig>("gam") {
+        log::info!("Registering real GAM provider");
+        providers.push(Arc::new(GamAuctionProvider::new(config)));
+    }
+
+    // Check for mock GAM provider configuration
+    if let Ok(Some(config)) = settings.integration_config::<MockGamConfig>("gam_mock") {
+        log::info!("Registering mock GAM provider");
+        providers.push(Arc::new(MockGamProvider::new(config)));
+    }
+
+    providers
+}

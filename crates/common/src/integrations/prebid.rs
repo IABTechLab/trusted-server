@@ -14,12 +14,11 @@ use validator::Validate;
 
 use crate::auction::orchestrator::AuctionOrchestrator;
 use crate::auction::provider::AuctionProvider;
+use crate::auction::provider_builders;
 use crate::auction::types::{
     AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid,
     DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
 };
-use crate::integrations::aps::{ApsAuctionProvider, ApsConfig, MockApsConfig, MockApsProvider};
-use crate::integrations::gam::{GamAuctionProvider, GamConfig, MockGamConfig, MockGamProvider};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
@@ -189,34 +188,14 @@ impl PrebidIntegration {
         req: &Request,
         body: &AdRequest,
     ) -> Result<Response, Report<TrustedServerError>> {
-        // Build orchestrator and register providers
+        // Build orchestrator and auto-register all providers
         let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
 
-        // Register Prebid provider
-        orchestrator.register_provider(Arc::new(PrebidAuctionProvider::new(self.config.clone())));
-
-        // Register real APS if configured
-        if let Some(aps_config) = settings.integration_config::<ApsConfig>("aps")? {
-            log::info!("Registering real APS provider");
-            orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
-        }
-
-        // Register mock APS if configured
-        if let Some(mock_aps_config) = settings.integration_config::<MockApsConfig>("aps_mock")? {
-            log::info!("Registering mock APS provider");
-            orchestrator.register_provider(Arc::new(MockApsProvider::new(mock_aps_config)));
-        }
-
-        // Register real GAM if configured
-        if let Some(gam_config) = settings.integration_config::<GamConfig>("gam")? {
-            log::info!("Registering real GAM provider");
-            orchestrator.register_provider(Arc::new(GamAuctionProvider::new(gam_config)));
-        }
-
-        // Register mock GAM if configured
-        if let Some(mock_gam_config) = settings.integration_config::<MockGamConfig>("gam_mock")? {
-            log::info!("Registering mock GAM provider");
-            orchestrator.register_provider(Arc::new(MockGamProvider::new(mock_gam_config)));
+        // Auto-discover and register all auction providers from settings
+        for builder in provider_builders() {
+            for provider in builder(settings) {
+                orchestrator.register_provider(provider);
+            }
         }
 
         // Convert tsjs request to auction request
@@ -1593,4 +1572,24 @@ impl AuctionProvider for PrebidAuctionProvider {
     fn is_enabled(&self) -> bool {
         self.config.enabled
     }
+}
+
+// ============================================================================
+// Provider Auto-Registration
+// ============================================================================
+
+/// Auto-register Prebid provider based on settings configuration.
+///
+/// This function checks the settings for Prebid configuration and returns
+/// the provider if enabled.
+pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+
+    // Prebid provider is always registered if integration is enabled
+    if let Ok(Some(config)) = settings.integration_config::<PrebidIntegrationConfig>("prebid") {
+        log::info!("Registering Prebid auction provider");
+        providers.push(Arc::new(PrebidAuctionProvider::new(config)));
+    }
+
+    providers
 }

@@ -326,3 +326,32 @@ impl AuctionProvider for MockApsProvider {
         self.config.enabled
     }
 }
+
+// ============================================================================
+// Provider Auto-Registration
+// ============================================================================
+
+use std::sync::Arc;
+use crate::settings::Settings;
+
+/// Auto-register APS providers based on settings configuration.
+///
+/// This function checks the settings for both real and mock APS configurations
+/// and returns any enabled providers ready for registration with the orchestrator.
+pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+
+    // Check for real APS provider configuration
+    if let Ok(Some(config)) = settings.integration_config::<ApsConfig>("aps") {
+        log::info!("Registering real APS provider");
+        providers.push(Arc::new(ApsAuctionProvider::new(config)));
+    }
+
+    // Check for mock APS provider configuration
+    if let Ok(Some(config)) = settings.integration_config::<MockApsConfig>("aps_mock") {
+        log::info!("Registering mock APS provider");
+        providers.push(Arc::new(MockApsProvider::new(config)));
+    }
+
+    providers
+}
