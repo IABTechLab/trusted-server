@@ -2,9 +2,10 @@
 //!
 //! This module provides both real and mock implementations of the APS auction provider.
 
-use async_trait::async_trait;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
+use fastly::{http::StatusCode, Request, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::time::Instant;
 use validator::Validate;
 
@@ -77,19 +78,16 @@ impl ApsAuctionProvider {
     }
 }
 
-#[async_trait(?Send)]
 impl AuctionProvider for ApsAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "aps"
     }
 
-    async fn request_bids(
+    fn request_bids(
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let _start = Instant::now();
-
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!(
             "APS: requesting bids for {} slots (pub_id: {})",
             request.slots.len(),
@@ -100,13 +98,11 @@ impl AuctionProvider for ApsAuctionProvider {
         //
         // Implementation steps:
         // 1. Transform AuctionRequest to APS TAM bid request format
-        // 2. Make HTTP POST to self.config.endpoint with:
+        // 2. Make HTTP POST to self.config.endpoint with send_async():
         //    - Publisher ID (pub_id)
         //    - Slot information (sizes, ad unit codes)
         //    - User agent, page URL from context
-        // 3. Parse APS TAM response
-        // 4. Transform APS bids to our Bid format
-        // 5. Handle timeout according to self.config.timeout_ms
+        // 3. Return PendingRequest
         //
         // Reference: https://aps.amazon.com/aps/transparent-ad-marketplace-api/
 
@@ -116,6 +112,15 @@ impl AuctionProvider for ApsAuctionProvider {
             message: "APS integration not yet implemented. Use 'aps_mock' provider for testing."
                 .to_string(),
         }))
+    }
+
+    fn parse_response(
+        &self,
+        _response: fastly::Response,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // TODO: Parse APS TAM response format
+        Ok(AuctionResponse::error("aps", response_time_ms))
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -272,46 +277,31 @@ impl MockApsProvider {
     }
 }
 
-#[async_trait(?Send)]
 impl AuctionProvider for MockApsProvider {
     fn provider_name(&self) -> &'static str {
         "aps_mock"
     }
 
-    async fn request_bids(
+    fn request_bids(
         &self,
-        request: &AuctionRequest,
+        _request: &AuctionRequest,
         _context: &AuctionContext<'_>,
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+        // TODO: Implement mock provider support for send_async
+        // For now, mock providers are disabled when using concurrent requests
+        log::warn!("APS Mock: Mock providers not yet supported with concurrent requests");
+        
+        Err(Report::new(TrustedServerError::Auction {
+            message: "Mock providers not yet supported with send_async. Disable auction.enabled or remove mock providers.".to_string(),
+        }))
+    }
+
+    fn parse_response(
+        &self,
+        _response: fastly::Response,
+        response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let start = Instant::now();
-
-        log::info!(
-            "APS Mock: requesting bids for {} slots",
-            request.slots.len()
-        );
-
-        // Simulate network latency
-        // Note: In real async code we'd use tokio::time::sleep, but in Fastly we just add to elapsed time
-
-        let bids = self.generate_mock_bids(request);
-        let response_time_ms = start.elapsed().as_millis() as u64 + self.config.latency_ms;
-
-        log::info!(
-            "APS Mock: returning {} bids in {}ms (simulated latency: {}ms)",
-            bids.len(),
-            response_time_ms,
-            self.config.latency_ms
-        );
-
-        let response = if bids.is_empty() {
-            AuctionResponse::no_bid("aps_mock", response_time_ms)
-        } else {
-            AuctionResponse::success("aps_mock", bids, response_time_ms)
-                .with_metadata("mock", serde_json::json!(true))
-                .with_metadata("provider_type", serde_json::json!("aps"))
-        };
-
-        Ok(response)
+        Ok(AuctionResponse::error("aps_mock", response_time_ms))
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {

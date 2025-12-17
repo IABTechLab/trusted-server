@@ -4,7 +4,6 @@
 //! GAM acts as a mediation server that receives bids from other providers and makes
 //! the final ad selection decision.
 
-use async_trait::async_trait;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,38 +81,29 @@ impl GamAuctionProvider {
     }
 }
 
-#[async_trait(?Send)]
 impl AuctionProvider for GamAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "gam"
     }
 
-    async fn request_bids(
+    fn request_bids(
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let _start = Instant::now();
-
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!(
             "GAM: mediating auction for {} slots (network_id: {})",
             request.slots.len(),
             self.config.network_id
         );
 
-        // TODO: Implement real GAM API integration
+        // TODO: Implement real GAM API integration with send_async
         //
         // Implementation steps:
         // 1. Extract bidder responses from request context (see gam_mock implementation for example)
         // 2. Transform bids to GAM key-value targeting format
-        // 3. Make HTTP request to GAM ad server with:
-        //    - Network ID
-        //    - Ad unit codes
-        //    - Key-value targeting (header bidding bids)
-        //    - User context (device, geo, etc.)
-        // 4. Parse GAM response (winning creative)
-        // 5. Transform to our Bid format
-        // 6. Handle timeout according to self.config.timeout_ms
+        // 3. Make HTTP request to GAM ad server using send_async()
+        // 4. Return PendingRequest
         //
         // Reference: https://developers.google.com/ad-manager/api/start
 
@@ -123,6 +113,15 @@ impl AuctionProvider for GamAuctionProvider {
             message: "GAM integration not yet implemented. Use 'gam_mock' provider for testing."
                 .to_string(),
         }))
+    }
+
+    fn parse_response(
+        &self,
+        _response: fastly::Response,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // TODO: Parse GAM response
+        Ok(AuctionResponse::error("gam", response_time_ms))
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -361,55 +360,31 @@ impl MockGamProvider {
     }
 }
 
-#[async_trait(?Send)]
 impl AuctionProvider for MockGamProvider {
     fn provider_name(&self) -> &'static str {
         "gam_mock"
     }
 
-    async fn request_bids(
+    fn request_bids(
         &self,
-        request: &AuctionRequest,
+        _request: &AuctionRequest,
         _context: &AuctionContext<'_>,
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+        // TODO: Implement mock provider support for send_async
+        // For now, mock providers are disabled when using concurrent requests
+        log::warn!("GAM Mock: Mock providers not yet supported with concurrent requests");
+        
+        Err(Report::new(TrustedServerError::Auction {
+            message: "Mock providers not yet supported with send_async. Disable auction.enabled or remove mock providers.".to_string(),
+        }))
+    }
+
+    fn parse_response(
+        &self,
+        _response: fastly::Response,
+        response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let start = Instant::now();
-
-        log::info!(
-            "GAM Mock: mediating auction for {} slots",
-            request.slots.len()
-        );
-
-        // Extract bidder responses from context
-        let bidder_responses = self.extract_bidder_responses(request);
-
-        log::info!(
-            "GAM Mock: received {} bidder responses to mediate",
-            bidder_responses.len()
-        );
-
-        // Simulate GAM processing latency
-        // Note: In real async code we'd use tokio::time::sleep, but in Fastly we just add to elapsed time
-
-        let winning_bids = self.mediate_bids(request, bidder_responses);
-        let response_time_ms = start.elapsed().as_millis() as u64 + self.config.latency_ms;
-
-        log::info!(
-            "GAM Mock: selected {} winning bids in {}ms (simulated latency: {}ms)",
-            winning_bids.len(),
-            response_time_ms,
-            self.config.latency_ms
-        );
-
-        let response = if winning_bids.is_empty() {
-            AuctionResponse::no_bid("gam_mock", response_time_ms)
-        } else {
-            AuctionResponse::success("gam_mock", winning_bids, response_time_ms)
-                .with_metadata("mock", serde_json::json!(true))
-                .with_metadata("mediator", serde_json::json!(true))
-                .with_metadata("provider_type", serde_json::json!("gam"))
-        };
-
-        Ok(response)
+        Ok(AuctionResponse::error("gam_mock", response_time_ms))
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {

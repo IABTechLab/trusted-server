@@ -1141,7 +1141,7 @@ impl PrebidAuctionProvider {
     }
 
     /// Parse OpenRTB response into auction response.
-    fn parse_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
+    fn parse_openrtb_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
         let mut bids = Vec::new();
 
         if let Some(seatbids) = json.get("seatbid").and_then(|v| v.as_array()) {
@@ -1222,19 +1222,16 @@ impl PrebidAuctionProvider {
     }
 }
 
-#[async_trait(?Send)]
 impl AuctionProvider for PrebidAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "prebid"
     }
 
-    async fn request_bids(
+    fn request_bids(
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let start = Instant::now();
-
+    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // Convert to OpenRTB
@@ -1282,33 +1279,38 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to set request body".to_string(),
             })?;
 
-        // Send request
+        // Send request asynchronously
         let backend_name = ensure_backend_from_url(&self.config.server_url)?;
-        let mut pbs_response =
-            pbs_req
-                .send(backend_name)
-                .change_context(TrustedServerError::Prebid {
-                    message: "Failed to send request to Prebid Server".to_string(),
-                })?;
+        let pending = pbs_req
+            .send_async(backend_name)
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to send async request to Prebid Server".to_string(),
+            })?;
 
-        let response_time_ms = start.elapsed().as_millis() as u64;
+        Ok(pending)
+    }
 
+    fn parse_response(
+        &self,
+        mut response: fastly::Response,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Parse response
-        if !pbs_response.get_status().is_success() {
+        if !response.get_status().is_success() {
             log::warn!(
                 "Prebid returned non-success status: {}",
-                pbs_response.get_status()
+                response.get_status()
             );
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
 
-        let body_bytes = pbs_response.take_body_bytes();
+        let body_bytes = response.take_body_bytes();
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
-        let auction_response = self.parse_response(&response_json, response_time_ms);
+        let auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
 
         log::info!(
             "Prebid returned {} bids in {}ms",

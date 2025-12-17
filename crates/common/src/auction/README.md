@@ -219,15 +219,6 @@ assert!(result.total_time_ms < 2000);
 - **Timeouts**: Each provider has independent timeout; global timeout enforced at flow level
 - **Error Handling**: Provider failures don't fail entire auction; partial results returned
 
-## Future Enhancements
-
-- [ ] True parallel execution when runtime supports it
-- [ ] Bid caching and deduplication
-- [ ] A/B testing different auction strategies
-- [ ] Real-time analytics and monitoring
-- [ ] Dynamic floor price optimization
-- [ ] Support for video and native ad formats
-
 ## Related Files
 
 - `src/auction/mod.rs` - Module exports
