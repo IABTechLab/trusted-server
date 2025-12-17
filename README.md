@@ -112,6 +112,26 @@ See https://asdf-vm.com/guide/getting-started.html#_2-configure-asdf
 git clone git@github.com:IABTechLab/trusted-server.git
 ```
 
+### WASI SDK (Required for Tree-sitter)
+
+This project uses tree-sitter for JavaScript parsing, which requires the WASI SDK to compile C code for WebAssembly.
+
+#### Download and Install WASI SDK
+
+```sh
+cd /tmp
+curl -LO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-macos.tar.gz
+tar -xzf wasi-sdk-24.0-arm64-macos.tar.gz
+mv wasi-sdk-24.0-arm64-macos ~/.wasi-sdk
+```
+
+:warning: For Linux or x86_64 macOS, download the appropriate release from [WASI SDK releases](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-24):
+- Linux x86_64: `wasi-sdk-24.0-x86_64-linux.tar.gz`
+- Linux arm64: `wasi-sdk-24.0-arm64-linux.tar.gz`
+- macOS x86_64: `wasi-sdk-24.0-x86_64-macos.tar.gz`
+
+The WASI SDK paths are already configured in `.cargo/config.toml` and will be used automatically during build.
+
 ### Configure
 
 #### Edit configuration files
