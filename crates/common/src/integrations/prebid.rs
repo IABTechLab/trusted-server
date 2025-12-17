@@ -12,9 +12,8 @@ use serde_json::{json, Value as Json, Value as JsonValue};
 use url::Url;
 use validator::Validate;
 
-use crate::auction::orchestrator::AuctionOrchestrator;
+use crate::auction::get_orchestrator;
 use crate::auction::provider::AuctionProvider;
-use crate::auction::provider_builders;
 use crate::auction::types::{
     AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid,
     DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
@@ -188,15 +187,8 @@ impl PrebidIntegration {
         req: &Request,
         body: &AdRequest,
     ) -> Result<Response, Report<TrustedServerError>> {
-        // Build orchestrator and auto-register all providers
-        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-
-        // Auto-discover and register all auction providers from settings
-        for builder in provider_builders() {
-            for provider in builder(settings) {
-                orchestrator.register_provider(provider);
-            }
-        }
+        // Get the global orchestrator (initialized once on first access)
+        let orchestrator = get_orchestrator(settings);
 
         // Convert tsjs request to auction request
         let auction_request = convert_tsjs_to_auction_request(body, settings, req)?;

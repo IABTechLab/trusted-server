@@ -48,6 +48,11 @@ impl AuctionOrchestrator {
         self.providers.insert(name, provider);
     }
 
+    /// Get the number of registered providers.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
     /// Execute an auction using the configured strategy.
     pub async fn run_auction(
         &self,
@@ -449,8 +454,8 @@ mod tests {
         // Verify we got winning bids (GAM mediated)
         assert!(!result.winning_bids.is_empty());
 
-        // Verify timing (>= 0 since WASM test env may have 0 timing)
-        assert!(result.total_time_ms >= 0);
+        // Timing is available (may be 0 in WASM test env, but field exists)
+        let _ = result.total_time_ms;
     }
 
     #[tokio::test]
