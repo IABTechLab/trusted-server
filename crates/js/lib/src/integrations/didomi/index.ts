@@ -1,7 +1,7 @@
 import { log } from '../../core/log';
 
 const DEFAULT_SDK_PATH = 'https://sdk.privacy-center.org/';
-const CONSENT_PROXY_PATH = '/didomi/consent/';
+const CONSENT_PROXY_PATH = '/integrations/didomi/consent/';
 
 type DidomiConfig = {
   sdkPath?: string;

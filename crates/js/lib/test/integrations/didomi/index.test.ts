@@ -26,7 +26,9 @@ describe('integrations/didomi', () => {
     installDidomiSdkProxy();
 
     expect(testWindow.didomiConfig).toBeDefined();
-    expect(testWindow.didomiConfig.sdkPath).toBe('https://example.com/didomi/consent/');
+    expect(testWindow.didomiConfig.sdkPath).toBe(
+      'https://example.com/integrations/didomi/consent/'
+    );
   });
 
   it('preserves existing config fields while overriding sdkPath', () => {
@@ -35,6 +37,8 @@ describe('integrations/didomi', () => {
     installDidomiSdkProxy();
 
     expect(testWindow.didomiConfig.apiKey).toBe('abc');
-    expect(testWindow.didomiConfig.sdkPath).toBe('https://example.com/didomi/consent/');
+    expect(testWindow.didomiConfig.sdkPath).toBe(
+      'https://example.com/integrations/didomi/consent/'
+    );
   });
 });
