@@ -12,7 +12,8 @@ pub mod testlight;
 
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationMetadata, IntegrationProxy,
+    IntegrationAttributeRewriter, IntegrationDocumentState, IntegrationEndpoint,
+    IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy,
     IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };

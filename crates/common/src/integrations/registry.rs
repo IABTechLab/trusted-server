@@ -1,5 +1,6 @@
+use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use error_stack::Report;
@@ -87,6 +88,82 @@ pub struct IntegrationScriptContext<'a> {
     pub request_host: &'a str,
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
+    pub is_last_in_text_node: bool,
+    pub document_state: &'a IntegrationDocumentState,
+}
+
+/// Per-document state shared between HTML/script rewriters and post-processors.
+///
+/// This exists to support multi-phase HTML processing without requiring a second HTML parse.
+#[derive(Clone, Default)]
+pub struct IntegrationDocumentState {
+    inner: Arc<Mutex<BTreeMap<&'static str, Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl std::fmt::Debug for IntegrationDocumentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&'static str> = {
+            let guard = self
+                .inner
+                .lock()
+                .expect("should lock integration document state");
+            guard.keys().copied().collect()
+        };
+        f.debug_struct("IntegrationDocumentState")
+            .field("keys", &keys)
+            .finish()
+    }
+}
+
+impl IntegrationDocumentState {
+    pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let guard = self
+            .inner
+            .lock()
+            .expect("should lock integration document state");
+        guard.get(integration_id).and_then(|value| {
+            let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
+            cloned.downcast::<T>().ok()
+        })
+    }
+
+    pub fn get_or_insert_with<T>(
+        &self,
+        integration_id: &'static str,
+        init: impl FnOnce() -> T,
+    ) -> Arc<T>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("should lock integration document state");
+
+        if let Some(existing) = guard.get(integration_id) {
+            if let Ok(downcast) = Arc::clone(existing).downcast::<T>() {
+                return downcast;
+            }
+        }
+
+        let value: Arc<T> = Arc::new(init());
+        guard.insert(
+            integration_id,
+            Arc::clone(&value) as Arc<dyn Any + Send + Sync>,
+        );
+        value
+    }
+
+    pub fn clear(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("should lock integration document state");
+        guard.clear();
+    }
 }
 
 /// Describes an HTTP endpoint exposed by an integration.
@@ -249,12 +326,44 @@ pub trait IntegrationScriptRewriter: Send + Sync {
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 
+/// Context for HTML post-processors.
+#[derive(Debug)]
+pub struct IntegrationHtmlContext<'a> {
+    pub request_host: &'a str,
+    pub request_scheme: &'a str,
+    pub origin_host: &'a str,
+    pub document_state: &'a IntegrationDocumentState,
+}
+
+/// Trait for integration-provided HTML post-processors.
+/// These run after streaming HTML processing to handle cases that require
+/// access to the complete HTML (e.g., cross-script RSC T-chunks).
+pub trait IntegrationHtmlPostProcessor: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+
+    /// Fast preflight check to decide whether post-processing should run for this document.
+    ///
+    /// Implementations should keep this cheap (e.g., a substring check) because it may run on
+    /// every HTML response when the integration is enabled.
+    fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
+        let _ = (html, ctx);
+        false
+    }
+
+    /// Post-process complete HTML content.
+    /// This is called after streaming HTML processing with the complete HTML.
+    /// Implementations should mutate `html` in-place and return `true` when changes were made.
+    fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+    pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
 }
 
 impl IntegrationRegistration {
@@ -276,6 +385,7 @@ impl IntegrationRegistrationBuilder {
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
             },
         }
     }
@@ -302,6 +412,15 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
+    pub fn with_html_post_processor(
+        mut self,
+        processor: Arc<dyn IntegrationHtmlPostProcessor>,
+    ) -> Self {
+        self.registration.html_post_processors.push(processor);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
@@ -321,6 +440,7 @@ struct IntegrationRegistryInner {
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+    html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -334,6 +454,7 @@ impl Default for IntegrationRegistryInner {
             routes: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
+            html_post_processors: Vec::new(),
         }
     }
 }
@@ -415,6 +536,9 @@ impl IntegrationRegistry {
                 inner
                     .script_rewriters
                     .extend(registration.script_rewriters.into_iter());
+                inner
+                    .html_post_processors
+                    .extend(registration.html_post_processors.into_iter());
             }
         }
 
@@ -493,6 +617,11 @@ impl IntegrationRegistry {
         self.inner.script_rewriters.clone()
     }
 
+    /// Expose registered HTML post-processors.
+    pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
+        self.inner.html_post_processors.clone()
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
@@ -538,6 +667,7 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
+                html_post_processors: Vec::new(),
             }),
         }
     }
@@ -580,6 +710,7 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
             }),
         }
     }
@@ -609,6 +740,35 @@ mod tests {
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
         }
+    }
+
+    struct NoopHtmlPostProcessor;
+
+    impl IntegrationHtmlPostProcessor for NoopHtmlPostProcessor {
+        fn integration_id(&self) -> &'static str {
+            "noop"
+        }
+
+        fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn default_html_post_processor_should_process_is_false() {
+        let processor = NoopHtmlPostProcessor;
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "proxy.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state: &document_state,
+        };
+
+        assert!(
+            !processor.should_process("<html></html>", &ctx),
+            "Default `should_process` should be false to avoid running post-processing unexpectedly"
+        );
     }
 
     #[test]
