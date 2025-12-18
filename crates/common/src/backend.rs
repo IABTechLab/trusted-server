@@ -22,15 +22,18 @@ pub fn ensure_origin_backend(
         }));
     }
 
-    let host_with_port = match port {
-        Some(p) => format!("{}:{}", host, p),
-        None => host.to_string(),
+    let is_https = scheme.eq_ignore_ascii_case("https");
+    let target_port = match (port, is_https) {
+        (Some(p), _) => p,
+        (None, true) => 443,
+        (None, false) => 80,
     };
 
-    // Name: iframe_<scheme>_<host[_port]> (sanitize '.' and ':')
-    let mut name_base = format!("{}_{}", scheme, host_with_port);
-    name_base = name_base.replace(['.', ':'], "_");
-    let backend_name = format!("backend_{}", name_base);
+    let host_with_port = format!("{}:{}", host, target_port);
+
+    // Name: iframe_<scheme>_<host>_<port> (sanitize '.' and ':')
+    let name_base = format!("{}_{}_{}", scheme, host, target_port);
+    let backend_name = format!("backend_{}", name_base.replace(['.', ':'], "_"));
 
     // Target base is host[:port]; SSL is enabled only for https scheme
     let mut builder = Backend::builder(&backend_name, &host_with_port)
@@ -39,7 +42,11 @@ pub fn ensure_origin_backend(
         .first_byte_timeout(Duration::from_secs(15))
         .between_bytes_timeout(Duration::from_secs(10));
     if scheme.eq_ignore_ascii_case("https") {
-        builder = builder.enable_ssl().sni_hostname(host);
+        builder = builder
+            .enable_ssl()
+            .sni_hostname(host)
+            .check_certificate(host);
+        log::info!("enable ssl for backend: {}", backend_name);
     }
 
     match builder.finish() {
@@ -67,6 +74,7 @@ pub fn ensure_origin_backend(
         }
     }
 }
+
 pub fn ensure_backend_from_url(origin_url: &str) -> Result<String, Report<TrustedServerError>> {
     let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
         message: format!("Invalid origin_url: {}", origin_url),
@@ -90,7 +98,7 @@ mod tests {
     #[test]
     fn returns_name_for_https_no_port() {
         let name = ensure_origin_backend("https", "origin.example.com", None).unwrap();
-        assert_eq!(name, "backend_https_origin_example_com");
+        assert_eq!(name, "backend_https_origin_example_com_443");
     }
 
     #[test]
@@ -99,6 +107,12 @@ mod tests {
         assert_eq!(name, "backend_http_api_test-site_org_8080");
         // Explicitly check that ':' was replaced with '_'
         assert!(name.ends_with("_8080"));
+    }
+
+    #[test]
+    fn returns_name_for_http_without_port_defaults_to_80() {
+        let name = ensure_origin_backend("http", "example.org", None).unwrap();
+        assert_eq!(name, "backend_http_example_org_80");
     }
 
     #[test]

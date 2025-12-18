@@ -51,6 +51,11 @@ endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1200
 rewrite_scripts = true
 
+[integrations.didomi]
+enabled = false
+sdk_origin = "https://sdk.privacy-center.org"
+api_origin = "https://api.privacy-center.org"
+
 [integrations.permutive]
 enabled = false
 organization_id = ""
