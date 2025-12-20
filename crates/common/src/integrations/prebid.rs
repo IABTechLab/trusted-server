@@ -313,7 +313,7 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
 
 fn build_openrtb_from_ts(
     req: &AdRequest,
-    settings: &Settings,
+    _settings: &Settings,
     prebid: &PrebidIntegrationConfig,
 ) -> OpenRtbRequest {
     use uuid::Uuid;
@@ -322,18 +322,18 @@ fn build_openrtb_from_ts(
         .ad_units
         .iter()
         .map(|unit| {
-            let formats: Vec<Format> = unit
-                .media_types
-                .as_ref()
-                .and_then(|mt| mt.banner.as_ref())
-                .map(|b| {
-                    b.sizes
-                        .iter()
-                        .filter(|s| s.len() >= 2)
-                        .map(|s| Format { w: s[0], h: s[1] })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec![Format { w: 300, h: 250 }]);
+            let formats: Vec<Format> = vec![
+                Format { w: 300, h: 250 },
+                Format { w: 320, h: 50 },
+                Format { w: 300, h: 50 },
+                Format { w: 300, h: 300 },
+                Format { w: 200, h: 200 },
+                Format { w: 250, h: 250 },
+                Format { w: 336, h: 280 },
+                Format { w: 320, h: 100 },
+                Format { w: 320, h: 250 },
+                Format { w: 840, h: 280 },
+            ];
 
             let mut bidder: HashMap<String, JsonValue> = HashMap::new();
             if let Some(bids) = &unit.bids {
@@ -438,6 +438,7 @@ async fn handle_prebid_auction(
         &fresh_id,
         settings,
         &req,
+        config,
     )?;
 
     let mut pbs_req = Request::new(
@@ -462,8 +463,15 @@ async fn handle_prebid_auction(
                 message: "Failed to send request to Prebid Server".to_string(),
             })?;
 
-    log::info!("pbs_response {}: {:#?}", pbs_response.get_status(), pbs_response.take_body_str());
+    for header in pbs_response.get_headers() {
+        log::info!("\n\nheader {}: {:?}\n\n", header.0, header.1);
+    }
 
+    log::info!(
+        "pbs_response {}: {:#?}",
+        pbs_response.get_status(),
+        pbs_response.take_body_str()
+    );
 
     if pbs_response.get_status().is_success() {
         let response_body = pbs_response.take_body_bytes();
@@ -501,6 +509,7 @@ fn enhance_openrtb_request(
     fresh_id: &str,
     settings: &Settings,
     req: &Request,
+    config: &PrebidIntegrationConfig,
 ) -> Result<(), Report<TrustedServerError>> {
     if !request["user"].is_object() {
         request["user"] = json!({});
@@ -559,6 +568,16 @@ fn enhance_openrtb_request(
                 "kid": signer.kid
             });
         }
+    }
+
+    if config.debug {
+        if !request["ext"].is_object() {
+            request["ext"] = json!({});
+        }
+        if !request["ext"]["prebid"].is_object() {
+            request["ext"]["prebid"] = json!({});
+        }
+        request["ext"]["prebid"]["debug"] = json!(true);
     }
 
     Ok(())
@@ -871,7 +890,9 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
         req.set_header("Sec-GPC", "1");
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
+        let config = base_config();
+
+        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req, &config)
             .expect("should enhance request");
 
         assert_eq!(request_json["user"]["id"], synthetic_id);
@@ -890,6 +911,52 @@ mod tests {
                 .unwrap()
                 .starts_with("https://"),
             "site page should be populated"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_adds_debug_flag_when_enabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+
+        let mut config = base_config();
+        config.debug = true;
+
+        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req, &config)
+            .expect("should enhance request");
+
+        assert_eq!(
+            request_json["ext"]["prebid"]["debug"], true,
+            "debug flag should be set to true when config.debug is enabled"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_does_not_add_debug_flag_when_disabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+
+        let mut config = base_config();
+        config.debug = false;
+
+        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req, &config)
+            .expect("should enhance request");
+
+        assert!(
+            request_json["ext"]["prebid"]["debug"].is_null(),
+            "debug flag should not be set when config.debug is disabled"
         );
     }
 
