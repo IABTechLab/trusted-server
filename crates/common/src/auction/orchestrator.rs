@@ -17,21 +17,6 @@ pub struct AuctionOrchestrator {
     providers: HashMap<String, Arc<dyn AuctionProvider>>,
 }
 
-/// Result of an orchestrated auction.
-#[derive(Debug, Clone)]
-pub struct OrchestrationResult {
-    /// All responses from bidders
-    pub bidder_responses: Vec<AuctionResponse>,
-    /// Final response from mediator (if used)
-    pub mediator_response: Option<AuctionResponse>,
-    /// Winning bids per slot
-    pub winning_bids: HashMap<String, Bid>,
-    /// Total orchestration time in milliseconds
-    pub total_time_ms: u64,
-    /// Metadata about the auction
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
 impl AuctionOrchestrator {
     /// Create a new orchestrator with the given configuration.
     pub fn new(config: AuctionConfig) -> Self {
@@ -422,6 +407,42 @@ impl AuctionOrchestrator {
     }
 }
 
+/// Result of an orchestrated auction.
+#[derive(Debug, Clone)]
+pub struct OrchestrationResult {
+    /// All responses from bidders
+    pub bidder_responses: Vec<AuctionResponse>,
+    /// Final response from mediator (if used)
+    pub mediator_response: Option<AuctionResponse>,
+    /// Winning bids per slot
+    pub winning_bids: HashMap<String, Bid>,
+    /// Total orchestration time in milliseconds
+    pub total_time_ms: u64,
+    /// Metadata about the auction
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl OrchestrationResult {
+    /// Get the winning bid for a specific slot.
+    pub fn get_winning_bid(&self, slot_id: &str) -> Option<&Bid> {
+        self.winning_bids.get(slot_id)
+    }
+
+    /// Get all bids from all providers for a specific slot.
+    pub fn get_all_bids_for_slot(&self, slot_id: &str) -> Vec<&Bid> {
+        self.bidder_responses
+            .iter()
+            .flat_map(|response| &response.bids)
+            .filter(|bid| bid.slot_id == slot_id)
+            .collect()
+    }
+
+    /// Get the total number of bids received.
+    pub fn total_bids(&self) -> usize {
+        self.bidder_responses.iter().map(|r| r.bids.len()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,23 +803,3 @@ mod tests {
     }
 }
 
-impl OrchestrationResult {
-    /// Get the winning bid for a specific slot.
-    pub fn get_winning_bid(&self, slot_id: &str) -> Option<&Bid> {
-        self.winning_bids.get(slot_id)
-    }
-
-    /// Get all bids from all providers for a specific slot.
-    pub fn get_all_bids_for_slot(&self, slot_id: &str) -> Vec<&Bid> {
-        self.bidder_responses
-            .iter()
-            .flat_map(|response| &response.bids)
-            .filter(|bid| bid.slot_id == slot_id)
-            .collect()
-    }
-
-    /// Get the total number of bids received.
-    pub fn total_bids(&self) -> usize {
-        self.bidder_responses.iter().map(|r| r.bids.len()).sum()
-    }
-}
