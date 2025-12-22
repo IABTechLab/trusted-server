@@ -240,10 +240,7 @@ impl IntegrationProxy for PrebidIntegration {
         let mut routes = vec![IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD)];
 
         if let Some(script_path) = &self.config.script_handler {
-            // We need to leak the string to get a 'static str for IntegrationEndpoint
-            // This is safe because the config lives for the lifetime of the application
-            let static_path: &'static str = Box::leak(script_path.clone().into_boxed_str());
-            routes.push(IntegrationEndpoint::get(static_path));
+            routes.push(IntegrationEndpoint::get(script_path.clone()));
         }
 
         routes
