@@ -7,8 +7,8 @@
 //! Note: Individual auction providers are located in the `integrations` module
 //! (e.g., `crate::integrations::aps`, `crate::integrations::gam`, `crate::integrations::prebid`).
 
-use std::sync::{Arc, OnceLock};
 use crate::settings::Settings;
+use std::sync::{Arc, OnceLock};
 
 pub mod config;
 pub mod orchestrator;
@@ -44,20 +44,24 @@ fn provider_builders() -> &'static [ProviderBuilder] {
     ]
 }
 
-/// Get or initialize the global auction orchestrator.
+/// Initialize the global auction orchestrator.
 ///
-/// The orchestrator is created once on first access and reused for all subsequent requests.
-/// All auction providers are automatically discovered and registered during initialization.
+/// This function should be called once at application startup to initialize the orchestrator
+/// with the application settings. All auction providers are automatically discovered and
+/// registered during initialization.
 ///
 /// # Arguments
 /// * `settings` - Application settings used to configure the orchestrator and providers
 ///
 /// # Returns
 /// Reference to the global orchestrator instance
-pub fn get_orchestrator(settings: &Settings) -> &'static AuctionOrchestrator {
+///
+/// # Panics
+/// Panics if called more than once (orchestrator already initialized)
+pub fn init_orchestrator(settings: &Settings) -> &'static AuctionOrchestrator {
     GLOBAL_ORCHESTRATOR.get_or_init(|| {
         log::info!("Initializing global auction orchestrator");
-        
+
         let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
 
         // Auto-discover and register all auction providers from settings
@@ -76,20 +80,31 @@ pub fn get_orchestrator(settings: &Settings) -> &'static AuctionOrchestrator {
     })
 }
 
+/// Get the global auction orchestrator.
+///
+/// Returns a reference to the orchestrator if it has been initialized via `init_orchestrator()`.
+///
+/// # Returns
+/// * `Some(&'static AuctionOrchestrator)` if the orchestrator has been initialized
+/// * `None` if `init_orchestrator()` has not been called yet
+pub fn get_orchestrator() -> Option<&'static AuctionOrchestrator> {
+    GLOBAL_ORCHESTRATOR.get()
+}
+
 // ============================================================================
 // Top-Level Auction Handler
 // ============================================================================
 
 use error_stack::{Report, ResultExt};
-use fastly::{Request, Response};
 use fastly::http::{header, StatusCode};
+use fastly::{Request, Response};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::error::TrustedServerError;
 use crate::creative;
+use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -131,15 +146,24 @@ pub async fn handle_auction(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
-    let body: AdRequest = serde_json::from_slice(&req.take_body_bytes())
-        .change_context(TrustedServerError::Auction {
+    let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
+        TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
-        })?;
+        },
+    )?;
 
-    log::info!("Auction request received for {} ad units", body.ad_units.len());
+    log::info!(
+        "Auction request received for {} ad units",
+        body.ad_units.len()
+    );
 
-    // Get the global orchestrator
-    let orchestrator = get_orchestrator(settings);
+    // Get the global orchestrator (should be initialized at startup)
+    let orchestrator = get_orchestrator().ok_or_else(|| {
+        Report::new(TrustedServerError::Auction {
+            message: "Auction orchestrator not initialized. Call init_orchestrator() at startup."
+                .to_string(),
+        })
+    })?;
 
     // Convert tsjs request format to auction request
     let auction_request = convert_tsjs_to_auction_request(&body, settings, &req)?;
@@ -179,12 +203,13 @@ fn convert_tsjs_to_auction_request(
     use types::{AdSlot, DeviceInfo, PublisherInfo, SiteInfo, UserInfo};
 
     // Generate synthetic ID
-    let synthetic_id = get_or_generate_synthetic_id(settings, req)
-        .change_context(TrustedServerError::Auction {
+    let synthetic_id = get_or_generate_synthetic_id(settings, req).change_context(
+        TrustedServerError::Auction {
             message: "Failed to generate synthetic ID".to_string(),
-        })?;
-    let fresh_id = generate_synthetic_id(settings, req)
-        .change_context(TrustedServerError::Auction {
+        },
+    )?;
+    let fresh_id =
+        generate_synthetic_id(settings, req).change_context(TrustedServerError::Auction {
             message: "Failed to generate fresh ID".to_string(),
         })?;
 
@@ -215,9 +240,7 @@ fn convert_tsjs_to_auction_request(
 
     // Get geo info if available
     let device = GeoInfo::from_request(req).map(|geo| DeviceInfo {
-        user_agent: req
-            .get_header_str("user-agent")
-            .map(|s| s.to_string()),
+        user_agent: req.get_header_str("user-agent").map(|s| s.to_string()),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
         geo: Some(types::GeoInfo {
             country: Some(geo.country),

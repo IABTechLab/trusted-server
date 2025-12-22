@@ -373,7 +373,7 @@ impl AuctionProvider for MockGamProvider {
         // TODO: Implement mock provider support for send_async
         // For now, mock providers are disabled when using concurrent requests
         log::warn!("GAM Mock: Mock providers not yet supported with concurrent requests");
-        
+
         Err(Report::new(TrustedServerError::Auction {
             message: "Mock providers not yet supported with send_async. Disable auction.enabled or remove mock providers.".to_string(),
         }))
@@ -408,8 +408,8 @@ impl AuctionProvider for MockGamProvider {
 // Provider Auto-Registration
 // ============================================================================
 
-use std::sync::Arc;
 use crate::settings::Settings;
+use std::sync::Arc;
 
 /// Auto-register GAM providers based on settings configuration.
 ///

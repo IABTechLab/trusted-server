@@ -3,7 +3,7 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
-use trusted_server_common::auction::handle_auction;
+use trusted_server_common::auction::{handle_auction, init_orchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -33,6 +33,10 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
+
+    // Initialize the auction orchestrator once at startup
+    init_orchestrator(&settings);
+
     let integration_registry = IntegrationRegistry::new(&settings);
 
     futures::executor::block_on(route_request(settings, integration_registry, req))

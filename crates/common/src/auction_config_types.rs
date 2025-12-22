@@ -34,6 +34,7 @@ fn default_timeout() -> u32 {
     2000
 }
 
+#[allow(dead_code)] // Methods used in runtime but not in build script
 impl AuctionConfig {
     /// Get all bidder names.
     pub fn bidder_names(&self) -> &[String] {

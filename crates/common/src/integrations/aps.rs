@@ -290,7 +290,7 @@ impl AuctionProvider for MockApsProvider {
         // TODO: Implement mock provider support for send_async
         // For now, mock providers are disabled when using concurrent requests
         log::warn!("APS Mock: Mock providers not yet supported with concurrent requests");
-        
+
         Err(Report::new(TrustedServerError::Auction {
             message: "Mock providers not yet supported with send_async. Disable auction.enabled or remove mock providers.".to_string(),
         }))
@@ -321,8 +321,8 @@ impl AuctionProvider for MockApsProvider {
 // Provider Auto-Registration
 // ============================================================================
 
-use std::sync::Arc;
 use crate::settings::Settings;
+use std::sync::Arc;
 
 /// Auto-register APS providers based on settings configuration.
 ///

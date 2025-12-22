@@ -13,7 +13,9 @@ use url::Url;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
-use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType};
+use crate::auction::types::{
+    AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
+};
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
@@ -126,8 +128,6 @@ impl PrebidIntegration {
             message: message.into(),
         }
     }
-
-
 
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
@@ -660,8 +660,6 @@ fn get_request_scheme(req: &Request) -> String {
 
     "https".to_string()
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1281,11 +1279,12 @@ impl AuctionProvider for PrebidAuctionProvider {
 
         // Send request asynchronously
         let backend_name = ensure_backend_from_url(&self.config.server_url)?;
-        let pending = pbs_req
-            .send_async(backend_name)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to send async request to Prebid Server".to_string(),
-            })?;
+        let pending =
+            pbs_req
+                .send_async(backend_name)
+                .change_context(TrustedServerError::Prebid {
+                    message: "Failed to send async request to Prebid Server".to_string(),
+                })?;
 
         Ok(pending)
     }

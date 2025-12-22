@@ -200,18 +200,18 @@ impl AuctionOrchestrator {
             }
 
             log::info!("Waterfall: trying provider {}", provider.provider_name());
-            
+
             let start_time = Instant::now();
             match provider.request_bids(request, context) {
                 Ok(pending) => {
                     match pending.wait() {
                         Ok(backend_response) => {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
-                            
+
                             match provider.parse_response(backend_response, response_time_ms) {
                                 Ok(response) => {
-                                    let has_bids =
-                                        !response.bids.is_empty() && response.status == BidStatus::Success;
+                                    let has_bids = !response.bids.is_empty()
+                                        && response.status == BidStatus::Success;
                                     bidder_responses.push(response.clone());
 
                                     if has_bids {
@@ -278,11 +278,14 @@ impl AuctionOrchestrator {
             }));
         }
 
-        log::info!("Running {} bidders in parallel using send_async", bidder_names.len());
+        log::info!(
+            "Running {} bidders in parallel using send_async",
+            bidder_names.len()
+        );
 
         // Phase 1: Launch all requests concurrently
         let mut pending_requests = Vec::new();
-        
+
         for bidder_name in bidder_names {
             let provider = match self.providers.get(bidder_name) {
                 Some(p) => p,
@@ -301,7 +304,7 @@ impl AuctionOrchestrator {
             }
 
             log::info!("Launching bid request to: {}", provider.provider_name());
-            
+
             let start_time = Instant::now();
             match provider.request_bids(request, context) {
                 Ok(pending) => {
@@ -311,7 +314,10 @@ impl AuctionOrchestrator {
                         start_time,
                         provider.as_ref(),
                     ));
-                    log::debug!("Request to '{}' launched successfully", provider.provider_name());
+                    log::debug!(
+                        "Request to '{}' launched successfully",
+                        provider.provider_name()
+                    );
                 }
                 Err(e) => {
                     log::warn!(
@@ -323,16 +329,19 @@ impl AuctionOrchestrator {
             }
         }
 
-        log::info!("Launched {} concurrent requests, waiting for responses...", pending_requests.len());
+        log::info!(
+            "Launched {} concurrent requests, waiting for responses...",
+            pending_requests.len()
+        );
 
         // Phase 2: Wait for all responses
         let mut responses = Vec::new();
-        
+
         for (provider_name, pending, start_time, provider) in pending_requests {
             match pending.wait() {
                 Ok(response) => {
                     let response_time_ms = start_time.elapsed().as_millis() as u64;
-                    
+
                     match provider.parse_response(response, response_time_ms) {
                         Ok(auction_response) => {
                             log::info!(
@@ -345,7 +354,11 @@ impl AuctionOrchestrator {
                             responses.push(auction_response);
                         }
                         Err(e) => {
-                            log::warn!("Provider '{}' failed to parse response: {:?}", provider_name, e);
+                            log::warn!(
+                                "Provider '{}' failed to parse response: {:?}",
+                                provider_name,
+                                e
+                            );
                             responses.push(AuctionResponse::error(provider_name, response_time_ms));
                         }
                     }
@@ -461,8 +474,7 @@ mod tests {
 
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
-        crate::settings::Settings::from_toml(&settings_str)
-            .expect("should parse test settings")
+        crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
     }
 
     fn create_test_context<'a>(
