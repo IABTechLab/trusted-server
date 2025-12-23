@@ -24,7 +24,9 @@ export default defineConfig({
         items: [
           { text: 'Synthetic IDs', link: '/guide/synthetic-ids' },
           { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
-          { text: 'Ad Serving', link: '/guide/ad-serving' }
+          { text: 'Ad Serving', link: '/guide/ad-serving' },
+          { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
+          { text: 'Creative Processing', link: '/guide/creative-processing' }
         ]
       },
       {
