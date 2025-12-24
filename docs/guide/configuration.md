@@ -2,155 +2,504 @@
 
 Learn how to configure Trusted Server for your deployment.
 
+## Overview
+
+Trusted Server uses a flexible configuration system based on:
+
+1. **TOML Files** - `trusted-server.toml` for base configuration
+2. **Environment Variables** - Runtime overrides with `TRUSTED_SERVER__` prefix
+3. **Fastly Stores** - KV/Config/Secret stores for runtime data
+
+::: tip Complete Reference
+See [Configuration Reference](/guide/configuration-reference) for detailed documentation of all configuration options.
+:::
+
+## Quick Start
+
+### Basic Configuration
+
+Create `trusted-server.toml` in your project root:
+
+```toml
+[publisher]
+domain = "publisher.com"
+cookie_domain = ".publisher.com"
+origin_url = "https://origin.publisher.com"
+proxy_secret = "your-secure-secret-here"
+
+[synthetic]
+counter_store = "counter_store"
+opid_store = "opid_store"
+secret_key = "your-hmac-secret"
+template = "{{ client_ip }}:{{ user_agent }}"
+```
+
+### Environment Overrides
+
+Override any setting with environment variables:
+
+```bash
+# Publisher settings
+export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+
+# Synthetic ID settings
+export TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
+export TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}"
+```
+
 ## Configuration Files
 
-### trusted-server.toml
+### `trusted-server.toml`
 
 Main application configuration file.
 
+**Location**: Project root directory
+
+**Format**: TOML (Tom's Obvious, Minimal Language)
+
+**Sections**:
+- `[publisher]` - Publisher domain and origin settings
+- `[synthetic]` - Synthetic ID generation
+- `[request_signing]` - Request signing and JWKS
+- `[response_headers]` - Custom response headers
+- `[rewrite]` - URL rewriting rules
+- `[[handlers]]` - Basic auth handlers
+- `[integrations.*]` - Integration configs (Prebid, Next.js, etc.)
+
+**Example**:
 ```toml
-# Example configuration structure
+[publisher]
+domain = "publisher.com"
+cookie_domain = ".publisher.com"
+origin_url = "https://origin.publisher.com"
+proxy_secret = "change-me-to-secure-value"
 
-[general]
-environment = "production"
-log_level = "info"
+[synthetic]
+counter_store = "counter_store"
+opid_store = "opid_store"
+secret_key = "your-hmac-secret-key"
+template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}"
 
-[synthetic_ids]
-secret_key = "your-secret-key"
-template = "{{domain}}-{{timestamp}}"
-rotation_days = 90
+[response_headers]
+X-Publisher-ID = "pub-12345"
+X-Environment = "production"
 
-[gdpr]
-require_consent = true
-tcf_version = "2.2"
-default_action = "reject"
+[request_signing]
+enabled = false
+config_store_id = "<your-config-store-id>"
+secret_store_id = "<your-secret-store-id>"
 
-[ad_servers.equativ]
-endpoint = "https://ad.example.com"
-timeout_ms = 1000
+[integrations.prebid]
 enabled = true
-
-[prebid]
-timeout_ms = 1500
-cache_ttl = 300
-bidders = ["appnexus", "rubicon"]
-
-[kv_stores]
-counters = "counter_store"
-domains = "domain_store"
+server_url = "https://prebid-server.com/openrtb2/auction"
+timeout_ms = 1200
+bidders = ["kargo", "rubicon", "appnexus"]
+auto_configure = false
 ```
 
-### fastly.toml
+### `fastly.toml`
 
-Fastly service configuration for build and deployment settings.
+Fastly Compute service configuration.
 
+**Purpose**: Build settings, local development, store links
+
+**Example**:
 ```toml
 manifest_version = 2
 name = "trusted-server"
 description = "Privacy-preserving ad serving"
-authors = ["Your Name"]
+authors = ["Your Team"]
 language = "rust"
 
 [local_server]
-  [local_server.backends]
-    [local_server.backends.ad_server]
-      url = "https://ad-server.example.com"
+  [local_server.kv_stores.counter_store]
+    file = "test-data/counter_store.json"
+  
+  [local_server.kv_stores.opid_store]
+    file = "test-data/opid_store.json"
 
 [setup]
-  [setup.dictionaries.config]
-    format = "inline-toml"
-    file = "trusted-server.toml"
+  [setup.config_stores.jwks_store]
+  [setup.secret_stores.signing_keys]
 ```
 
-### .env.dev
+### `.env.*` Files
 
-Local development environment variables.
+Environment-specific variable files.
 
+**`.env.dev`** - Local development:
 ```bash
-FASTLY_SERVICE_ID=your-service-id
-FASTLY_API_TOKEN=your-api-token
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:3000
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=dev-secret
 LOG_LEVEL=debug
 ```
 
-## Configuration Sections
+**`.env.staging`** - Staging environment:
+```bash
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.com
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_key_staging)
+```
 
-### General Settings
+**`.env.production`** - Production (secrets from secure store):
+```bash
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_secret)
+TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=true
+```
 
-- `environment` - Deployment environment (dev/staging/production)
-- `log_level` - Logging verbosity (trace/debug/info/warn/error)
+## Environment Variables
+
+### Format
+
+```
+TRUSTED_SERVER__SECTION__FIELD=value
+```
+
+**Rules**:
+- Prefix: `TRUSTED_SERVER`
+- Separator: `__` (double underscore)
+- Case: UPPERCASE
+- Nested: Use additional `__` for each level
+
+### Examples
+
+**Simple Field**:
+```bash
+TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
+```
+
+**Array (JSON)**:
+```bash
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS='["kargo","rubicon"]'
+```
+
+**Array (Indexed)**:
+```bash
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=kargo
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__1=rubicon
+```
+
+**Array (Comma-Separated)**:
+```bash
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
+```
+
+## Key Configuration Sections
+
+### Publisher Settings
+
+Core settings for your publisher domain and origin.
+
+```toml
+[publisher]
+domain = "publisher.com"
+cookie_domain = ".publisher.com"
+origin_url = "https://origin.publisher.com"
+proxy_secret = "secure-random-secret"
+```
+
+**Key Fields**:
+- `domain` - Your publisher domain
+- `cookie_domain` - Domain for synthetic ID cookies (use `.domain.com` for subdomains)
+- `origin_url` - Backend origin server URL
+- `proxy_secret` - Secret for signing proxy URLs (HMAC-SHA256)
+
+::: warning Security
+Generate `proxy_secret` with cryptographically random values:
+```bash
+openssl rand -base64 32
+```
+:::
 
 ### Synthetic IDs
 
-- `secret_key` - HMAC secret key for ID generation
-- `template` - Template string for ID construction
-- `rotation_days` - Key rotation frequency
+Configure privacy-preserving ID generation.
 
-### GDPR Settings
+```toml
+[synthetic]
+counter_store = "counter_store"
+opid_store = "opid_store"
+secret_key = "your-hmac-secret"
+template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}"
+```
 
-- `require_consent` - Enforce consent checks
-- `tcf_version` - TCF framework version
-- `default_action` - Action when consent unclear (accept/reject)
+**Template Variables**:
+- `client_ip` - Client IP address
+- `user_agent` - User-Agent header
+- `first_party_id` - Publisher-provided ID
+- `auth_user_id` - Authenticated user ID
+- `publisher_domain` - Publisher domain
+- `accept_language` - Accept-Language header
 
-### Ad Server Configuration
+See [Synthetic IDs](/guide/synthetic-ids) for details.
 
-- `endpoint` - Ad server URL
-- `timeout_ms` - Request timeout in milliseconds
-- `enabled` - Enable/disable integration
+### Request Signing
 
-### Prebid Settings
+Enable Ed25519 request signing and JWKS management.
 
-- `timeout_ms` - Auction timeout
-- `cache_ttl` - Bid cache duration
-- `bidders` - List of enabled bidders
+```toml
+[request_signing]
+enabled = true
+config_store_id = "01GXXX"  # From Fastly dashboard
+secret_store_id = "01GYYY"  # From Fastly dashboard
+```
+
+**Setup**:
+1. Create Fastly Config Store for JWKS
+2. Create Fastly Secret Store for private keys
+3. Copy store IDs to configuration
+4. Enable request signing
+
+See [Request Signing](/guide/request-signing) and [Key Rotation](/guide/key-rotation) for setup.
+
+### Integrations
+
+Configure built-in integrations.
+
+**Prebid**:
+```toml
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid-server.com/openrtb2/auction"
+timeout_ms = 1200
+bidders = ["kargo", "rubicon", "appnexus"]
+auto_configure = false
+```
+
+**Next.js**:
+```toml
+[integrations.nextjs]
+enabled = true
+rewrite_attributes = ["href", "link", "url"]
+```
+
+**Permutive**:
+```toml
+[integrations.permutive]
+enabled = true
+organization_id = "org-12345"
+workspace_id = "ws-67890"
+project_id = "proj-abcde"
+```
+
+See [Integration Guide](/guide/integration-guide) for custom integrations.
+
+## Fastly Store Setup
 
 ### KV Stores
 
-- `counters` - Counter storage name
-- `domains` - Domain mapping storage name
+Create stores for synthetic ID data:
 
-## Environment-Specific Configuration
+```bash
+# Create counter store
+fastly kv-store create --name=counter_store
 
-Override settings per environment:
+# Create publisher ID mapping store
+fastly kv-store create --name=opid_store
+```
 
+**Link to Service** (`fastly.toml`):
 ```toml
-[environments.production]
-log_level = "warn"
+[local_server.kv_stores.counter_store]
+  file = "test-data/counter_store.json"
 
-[environments.development]
-log_level = "debug"
+[local_server.kv_stores.opid_store]
+  file = "test-data/opid_store.json"
+```
+
+### Config Stores
+
+For JWKS public keys:
+
+```bash
+# Create config store
+fastly config-store create --name=jwks_store
+
+# Get store ID
+fastly config-store list
+```
+
+### Secret Stores
+
+For private signing keys:
+
+```bash
+# Create secret store
+fastly secret-store create --name=signing_keys
+
+# Get store ID
+fastly secret-store list
+```
+
+## Validation
+
+### Automatic Validation
+
+Configuration is validated at application startup:
+
+**Checks**:
+- Required fields present
+- Data types correct
+- Regex patterns valid
+- Secret keys not default values
+- Integration configs valid
+
+**Failure Behavior**: Application exits with error message.
+
+### Manual Validation
+
+Validate before deployment:
+
+```bash
+# Test TOML syntax
+fastly compute validate
+
+# Test with local server
+fastly compute serve
 ```
 
 ## Secrets Management
 
-Sensitive values should be:
-1. Stored in Fastly Secret Store
-2. Referenced in configuration
-3. Never committed to version control
+### Best Practices
 
-## Validation
-
-Validate configuration before deployment:
-
+**Development**:
 ```bash
-fastly compute validate
+# Use simple secrets for local dev
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=dev-secret
 ```
 
-## Hot Reloading
+**Staging/Production**:
+```bash
+# Load from secure sources
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(vault kv get -field=value secret/synthetic_key)
+```
 
-Some settings support hot reloading via Fastly dictionaries:
-- Ad server endpoints
-- Timeout values
-- Feature flags
+**Do**:
+✅ Use environment variables for secrets  
+✅ Generate cryptographically random values  
+✅ Rotate secrets periodically  
+✅ Store in Fastly Secret Store or Vault  
+✅ Use different secrets per environment  
 
-## Best Practices
+**Don't**:
+❌ Commit secrets to version control  
+❌ Use default placeholder values  
+❌ Share secrets across environments  
+❌ Log secret values  
 
-1. Use environment-specific configurations
-2. Rotate secrets regularly
-3. Document all custom settings
-4. Validate before deployment
-5. Monitor configuration changes
+### `.gitignore`
+
+Protect secret files:
+
+```
+.env.production
+.env.staging
+.env.local
+*.secret
+trusted-server.production.toml
+```
+
+## Configuration Patterns
+
+### Multi-Environment Setup
+
+**Directory Structure**:
+```
+project/
+├── trusted-server.toml           # Base config
+├── trusted-server.dev.toml       # Development overrides
+├── .env.development              # Dev environment vars
+├── .env.staging                  # Staging environment vars
+├── .env.production               # Production (not in git)
+├── .env.example                  # Template (in git)
+└── .gitignore
+```
+
+**Base Config** (`trusted-server.toml`):
+```toml
+# Shared across all environments
+[synthetic]
+template = "{{ client_ip }}:{{ user_agent }}"
+
+[integrations.prebid]
+timeout_ms = 1200
+bidders = ["kargo", "rubicon"]
+```
+
+**Environment Overrides**:
+```bash
+# Development
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:3000
+
+# Staging
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.com
+
+# Production
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+```
+
+### Dynamic Configuration
+
+Use environment variables for runtime changes:
+
+```bash
+# Enable/disable features
+TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=true
+
+# Adjust timeouts
+TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1500
+
+# Update endpoints
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://new-prebid.com/auction
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**"Failed to build configuration"**:
+- Check TOML syntax (commas, quotes, brackets)
+- Verify all required fields present
+- Check environment variable format
+
+**"Secret key is not valid"**:
+- Cannot use `"secret-key"` placeholder
+- Must be non-empty
+- Change to secure random value
+
+**"Invalid regex"**:
+- Handler `path` must be valid regex
+- Escape special characters: `\.`, `\$`
+- Test with: `echo "pattern" | grep -E "pattern"`
+
+**Environment variables not applied**:
+- Verify prefix: `TRUSTED_SERVER__`
+- Check separator: `__` (double underscore)
+- Confirm exported: `echo $VAR_NAME`
+
+### Debug Commands
+
+**Check environment**:
+```bash
+env | grep TRUSTED_SERVER
+```
+
+**Validate TOML**:
+```bash
+cat trusted-server.toml | npx toml-cli validate
+```
+
+**Test local server**:
+```bash
+fastly compute serve --verbose
+```
 
 ## Next Steps
 
-- Set up [Testing](/guide/testing)
-- Review [Architecture](/guide/architecture)
+- See [Configuration Reference](/guide/configuration-reference) for complete options
+- Set up [Request Signing](/guide/request-signing) for secure API calls
+- Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
+- Learn about [Integration Guide](/guide/integration-guide) for custom integrations
+- Review [Testing](/guide/testing) for validation strategies
