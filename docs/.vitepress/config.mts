@@ -27,7 +27,8 @@ export default defineConfig({
           { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
           { text: 'Ad Serving', link: '/guide/ad-serving' },
           { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
-          { text: 'Creative Processing', link: '/guide/creative-processing' }
+          { text: 'Creative Processing', link: '/guide/creative-processing' },
+          { text: 'Integrations Overview', link: '/guide/integrations-overview' }
         ]
       },
       {
@@ -45,6 +46,14 @@ export default defineConfig({
           { text: 'Configuration Reference', link: '/guide/configuration-reference' },
           { text: 'Testing', link: '/guide/testing' },
           { text: 'Integration Guide', link: '/guide/integration-guide' }
+        ]
+      },
+      {
+        text: 'Reference',
+        items: [
+          { text: 'API Reference', link: '/guide/api-reference' },
+          { text: 'Environment Variables', link: '/guide/environment-variables' },
+          { text: 'Error Reference', link: '/guide/error-reference' }
         ]
       }
     ],
