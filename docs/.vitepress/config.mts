@@ -4,6 +4,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: "Trusted Server",
   description: "Privacy-preserving edge computing for ad serving and synthetic ID generation",
+  base: "/trusted-server",
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
