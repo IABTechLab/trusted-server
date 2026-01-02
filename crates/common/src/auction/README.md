@@ -39,6 +39,352 @@ The auction orchestration system allows you to:
   └──────────┘      └──────────┘     └──────────┘
 ```
 
+## Request Flow
+
+When a request arrives at the `/third-party/ad` endpoint, it goes through the following steps:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. HTTP POST /third-party/ad                                        │
+│     - Body: AdRequest (Prebid.js/tsjs format)                        │
+│     - Headers: User-Agent, cookies, etc.                             │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  2. Route Matching (crates/fastly/src/main.rs:81)                    │
+│     - Pattern: (Method::POST, "/third-party/ad")                     │
+│     - Handler: handle_auction(&settings, req).await                  │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  3. Parse Request Body (mod.rs:149)                                  │
+│     - Deserialize JSON → AdRequest struct                            │
+│     - Extract ad units with media types                              │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  4. Generate User IDs (mod.rs:206-214)                               │
+│     - Create/retrieve synthetic ID (persistent)                      │
+│     - Generate fresh ID (per-request)                                │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  5. Transform Request Format (mod.rs:216-240)                        │
+│     - AdRequest → AuctionRequest                                     │
+│     - AdUnit.code → AdSlot.id                                        │
+│     - mediaTypes.banner.sizes → AdFormat[]                           │
+│     - Build PublisherInfo, UserInfo, DeviceInfo                      │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  6. Get Global Orchestrator (mod.rs:161)                             │
+│     - Retrieve from GLOBAL_ORCHESTRATOR singleton                    │
+│     - Contains all registered providers (APS, Prebid, etc.)          │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  7. Create Auction Context (mod.rs:172-176)                          │
+│     - Attach settings                                                │
+│     - Attach original request                                        │
+│     - Set timeout from config                                        │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  8. Run Auction Strategy (orchestrator.rs:42)                        │
+│     ┌────────────────────────────────────────────────────────────┐   │
+│     │  Strategy: waterfall                                       │   │
+│     │  1. Try first bidder (e.g., APS)                           │   │
+│     │  2. If bids received, stop and return                      │   │
+│     │  3. Otherwise try next bidder                              │   │
+│     └────────────────────────────────────────────────────────────┘   │
+│     ┌────────────────────────────────────────────────────────────┐   │
+│     │  Strategy: parallel_only                                   │   │
+│     │  1. Launch all bidders concurrently                        │   │
+│     │  2. Wait for all responses                                 │   │
+│     │  3. Select highest bid per slot                            │   │
+│     └────────────────────────────────────────────────────────────┘   │
+│     ┌────────────────────────────────────────────────────────────┐   │
+│     │  Strategy: parallel_mediation                              │   │
+│     │  1. Launch all bidders concurrently                        │   │
+│     │  2. Collect all bids                                       │   │
+│     │  3. Send to mediator (GAM) for final decision              │   │
+│     └────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  9. Each Provider Processes Request                                  │
+│     - Transform AuctionRequest → Provider format (e.g., APS TAM)     │
+│     - Send HTTP request to provider endpoint                         │
+│     - Parse provider response                                        │
+│     - Transform → AuctionResponse with Bid[]                         │
+│     - Return to orchestrator                                         │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  10. Select Winning Bids (orchestrator.rs:363-385)                   │
+│      - For each slot, find highest CPM bid                           │
+│      - Create HashMap<slot_id, Bid>                                  │
+│      - Log winning selections                                        │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
+│      - Build seatbid array (one per winning bid)                     │
+│      - Rewrite creative HTML for first-party proxy                   │
+│      - Add orchestrator metadata (timing, strategy, bid count)       │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  12. Return HTTP Response                                            │
+│      - Status: 200 OK                                                │
+│      - Content-Type: application/json                                │
+│      - Body: OpenRTB BidResponse                                     │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Step-by-Step Breakdown
+
+#### 1. Request Arrival
+Client (browser, Prebid.js, tsjs) sends a POST request to `/third-party/ad` with ad unit definitions:
+
+```json
+{
+  "adUnits": [
+    {
+      "code": "header-banner",
+      "mediaTypes": {
+        "banner": {
+          "sizes": [[728, 90], [970, 250]]
+        }
+      }
+    }
+  ]
+}
+```
+
+#### 2. Format Transformation
+The system transforms the Prebid.js format into an internal `AuctionRequest`:
+
+```rust
+// From: AdUnit with sizes [[728, 90], [970, 250]]
+// To:   AdSlot with formats
+AdSlot {
+    id: "header-banner",
+    formats: vec![
+        AdFormat { width: 728, height: 90, media_type: Banner },
+        AdFormat { width: 970, height: 250, media_type: Banner },
+    ],
+    floor_price: None,
+    targeting: HashMap::new(),
+}
+```
+
+#### 3. Provider Execution
+Each registered provider (APS, Prebid, etc.) receives the `AuctionRequest` and:
+- Transforms it to their specific format (e.g., APS TAM, OpenRTB)
+- Makes HTTP request to their endpoint
+- Parses the response
+- Returns `AuctionResponse` with `Bid[]`
+
+For example, APS provider:
+```rust
+// Transform AuctionRequest → ApsBidRequest
+let aps_request = ApsBidRequest {
+    pub_id: "5128",
+    slots: vec![
+        ApsSlot {
+            slot_id: "header-banner",
+            sizes: vec![[728, 90], [970, 250]],
+            slot_name: Some("header-banner"),
+        }
+    ],
+    page_url: Some("https://example.com"),
+    ua: Some("Mozilla/5.0..."),
+    timeout: Some(800),
+};
+
+// HTTP POST to http://localhost:6767/e/dtb/bid
+// Parse response → AuctionResponse
+```
+
+#### 4. Response Assembly
+The orchestrator collects all bids and creates an OpenRTB response:
+
+```json
+{
+  "id": "auction-response",
+  "seatbid": [
+    {
+      "seat": "amazon-aps",
+      "bid": [
+        {
+          "id": "amazon-aps-header-banner",
+          "impid": "header-banner",
+          "price": 2.5,
+          "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",
+          "w": 728,
+          "h": 90,
+          "crid": "amazon-aps-creative",
+          "adomain": ["amazon.com"]
+        }
+      ]
+    }
+  ],
+  "ext": {
+    "orchestrator": {
+      "strategy": "waterfall",
+      "bidders": 1,
+      "total_bids": 1,
+      "time_ms": 5
+    }
+  }
+}
+```
+
+Note that creative HTML is rewritten to use the first-party proxy (`/first-party/proxy`) for privacy and security.
+
+## Route Registration & Endpoints
+
+### Auction-Related Routes
+
+The trusted-server handles several types of routes defined in `crates/fastly/src/main.rs`:
+
+| Route                     | Method | Handler                        | Purpose                                          | Line |
+|---------------------------|--------|--------------------------------|--------------------------------------------------|------|
+| `/third-party/ad`         | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 81   |
+| `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
+| `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
+| `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
+| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
+| `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
+| `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
+| `/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 77   |
+| `/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 78   |
+| `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 92   |
+| `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 108  |
+
+### How Routing Works
+
+#### 1. Main Router (main.rs)
+The Fastly Compute entrypoint uses pattern matching on `(Method, path)` tuples:
+
+```rust
+let result = match (method, path.as_str()) {
+    // Auction endpoint
+    (Method::POST, "/third-party/ad") => handle_auction(&settings, req).await,
+    
+    // First-party endpoints
+    (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
+    
+    // Integration registry (dynamic routes)
+    (m, path) if integration_registry.has_route(&m, path) => {
+        integration_registry.handle_proxy(&m, path, &settings, req).await
+    },
+    
+    // Fallback to publisher origin
+    _ => handle_publisher_request(&settings, &integration_registry, req),
+}
+```
+
+#### 2. Integration Registry (Dynamic Routes)
+Some integrations register their own routes dynamically. For example, Prebid registers `/integrations/prebid/auction`:
+
+```rust
+// In integrations/prebid.rs
+impl Integration for PrebidIntegration {
+    fn routes(&self) -> Vec<IntegrationRoute> {
+        vec![
+            IntegrationRoute {
+                path: "/integrations/prebid/auction",
+                method: Method::POST,
+                handler: handle_prebid_auction,
+            }
+        ]
+    }
+}
+```
+
+The integration registry checks if a route matches any registered integration routes before falling back to the publisher origin.
+
+#### 3. Route Priority
+Routes are matched in this order:
+1. **Exact top-level routes** (`/third-party/ad`, `/first-party/proxy`, etc.)
+2. **Admin routes** (`/admin/*`)
+3. **Integration routes** (`/integrations/*`)
+4. **Fallback to publisher origin** (all other paths)
+
+This ensures auction and first-party endpoints take precedence over publisher content.
+
+### Auction Endpoint Deep Dive
+
+The `/third-party/ad` endpoint is the primary entry point for auctions:
+
+**Input Format (Prebid.js compatible):**
+```json
+{
+  "adUnits": [
+    {
+      "code": "div-id",
+      "mediaTypes": {
+        "banner": {
+          "sizes": [[300, 250], [728, 90]]
+        }
+      }
+    }
+  ],
+  "config": { /* optional Prebid.js config */ }
+}
+```
+
+**Output Format (OpenRTB 2.x):**
+```json
+{
+  "id": "auction-response",
+  "seatbid": [
+    {
+      "seat": "bidder-name",
+      "bid": [
+        {
+          "id": "bid-id",
+          "impid": "div-id",
+          "price": 2.5,
+          "adm": "<creative-html>",
+          "w": 300,
+          "h": 250
+        }
+      ]
+    }
+  ],
+  "ext": {
+    "orchestrator": {
+      "strategy": "waterfall",
+      "bidders": 2,
+      "total_bids": 3,
+      "time_ms": 150
+    }
+  }
+}
+```
+
+**Key Transformations:**
+- `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
+- `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
+- Creative HTML is rewritten to use `/first-party/proxy` URLs
+- Multiple bids per slot become separate `seatbid` entries
+- Orchestrator metadata added in `ext.orchestrator`
+
 ## Key Concepts
 
 ### Auction Provider
