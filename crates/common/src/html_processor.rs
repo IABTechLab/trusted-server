@@ -2,17 +2,86 @@
 //!
 //! This module provides a StreamProcessor implementation for HTML content.
 use std::cell::Cell;
+use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
 
 use crate::integrations::{
-    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationRegistry,
+    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
+    IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
     IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
+
+struct HtmlWithPostProcessing {
+    inner: HtmlRewriterAdapter,
+    post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    origin_host: String,
+    request_host: String,
+    request_scheme: String,
+    document_state: IntegrationDocumentState,
+}
+
+impl StreamProcessor for HtmlWithPostProcessing {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        let output = self.inner.process_chunk(chunk, is_last)?;
+        if !is_last || output.is_empty() || self.post_processors.is_empty() {
+            return Ok(output);
+        }
+
+        let Ok(output_str) = std::str::from_utf8(&output) else {
+            return Ok(output);
+        };
+
+        let ctx = IntegrationHtmlContext {
+            request_host: &self.request_host,
+            request_scheme: &self.request_scheme,
+            origin_host: &self.origin_host,
+            document_state: &self.document_state,
+        };
+
+        // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
+        if !self
+            .post_processors
+            .iter()
+            .any(|p| p.should_process(output_str, &ctx))
+        {
+            return Ok(output);
+        }
+
+        let mut html = String::from_utf8(output).map_err(|e| {
+            io::Error::other(format!(
+                "HTML post-processing expected valid UTF-8 output: {e}"
+            ))
+        })?;
+
+        let mut changed = false;
+        for processor in &self.post_processors {
+            if processor.should_process(&html, &ctx) {
+                changed |= processor.post_process(&mut html, &ctx);
+            }
+        }
+
+        if changed {
+            log::debug!(
+                "HTML post-processing complete: origin_host={}, output_len={}",
+                self.origin_host,
+                html.len()
+            );
+        }
+
+        Ok(html.into_bytes())
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.document_state.clear();
+    }
+}
 
 /// Configuration for HTML processing
 #[derive(Clone)]
@@ -43,6 +112,9 @@ impl HtmlProcessorConfig {
 
 /// Create an HTML processor with URL replacement and optional Prebid injection
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    let post_processors = config.integrations.html_post_processors();
+    let document_state = IntegrationDocumentState::default();
+
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
         origin_host: String,
@@ -69,6 +141,37 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
         fn protocol_relative_replacement(&self) -> String {
             format!("//{}", self.request_host)
+        }
+
+        fn rewrite_url_value(&self, value: &str) -> Option<String> {
+            if !value.contains(&self.origin_host) {
+                return None;
+            }
+
+            let https_origin = self.https_origin();
+            let http_origin = self.http_origin();
+            let protocol_relative_origin = self.protocol_relative_origin();
+            let replacement_url = self.replacement_url();
+            let protocol_relative_replacement = self.protocol_relative_replacement();
+
+            let mut rewritten = value
+                .replace(&https_origin, &replacement_url)
+                .replace(&http_origin, &replacement_url)
+                .replace(&protocol_relative_origin, &protocol_relative_replacement);
+
+            if rewritten.starts_with(&self.origin_host) {
+                let suffix = &rewritten[self.origin_host.len()..];
+                let boundary_ok = suffix.is_empty()
+                    || matches!(
+                        suffix.as_bytes().first(),
+                        Some(b'/') | Some(b'?') | Some(b'#')
+                    );
+                if boundary_ok {
+                    rewritten = format!("{}{}", self.request_host, suffix);
+                }
+            }
+
+            (rewritten != value).then_some(rewritten)
         }
     }
 
@@ -102,11 +205,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut href) = el.get_attribute("href") {
                     let original_href = href.clone();
-                    let new_href = href
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url());
-                    if new_href != href {
-                        href = new_href;
+                    if let Some(rewritten) = patterns.rewrite_url_value(&href) {
+                        href = rewritten;
                     }
 
                     match integrations.rewrite_attribute(
@@ -143,11 +243,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut src) = el.get_attribute("src") {
                     let original_src = src.clone();
-                    let new_src = src
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url());
-                    if new_src != src {
-                        src = new_src;
+                    if let Some(rewritten) = patterns.rewrite_url_value(&src) {
+                        src = rewritten;
                     }
                     match integrations.rewrite_attribute(
                         "src",
@@ -183,11 +280,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut action) = el.get_attribute("action") {
                     let original_action = action.clone();
-                    let new_action = action
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url());
-                    if new_action != action {
-                        action = new_action;
+                    if let Some(rewritten) = patterns.rewrite_url_value(&action) {
+                        action = rewritten;
                     }
 
                     match integrations.rewrite_attribute(
@@ -314,15 +408,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
         let patterns = patterns.clone();
+        let document_state = document_state.clone();
         element_content_handlers.push(text!(selector, {
             let rewriter = rewriter.clone();
             let patterns = patterns.clone();
+            let document_state = document_state.clone();
             move |text| {
                 let ctx = IntegrationScriptContext {
                     selector,
                     request_host: &patterns.request_host,
                     request_scheme: &patterns.request_scheme,
                     origin_host: &patterns.origin_host,
+                    is_last_in_text_node: text.last_in_text_node(),
+                    document_state: &document_state,
                 };
                 match rewriter.rewrite(text.as_str(), &ctx) {
                     ScriptRewriteAction::Keep => {}
@@ -343,7 +441,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         ..RewriterSettings::default()
     };
 
-    HtmlRewriterAdapter::new(rewriter_settings)
+    HtmlWithPostProcessing {
+        inner: HtmlRewriterAdapter::new(rewriter_settings),
+        post_processors,
+        origin_host: config.origin_host,
+        request_host: config.request_host,
+        request_scheme: config.request_scheme,
+        document_state,
+    }
 }
 
 #[cfg(test)]
@@ -436,8 +541,12 @@ mod tests {
 
         let html = r#"<html>
             <a href="https://origin.example.com/page">Link</a>
+            <a href="//origin.example.com/proto">Proto</a>
+            <a href="origin.example.com/bare">Bare</a>
             <img src="http://origin.example.com/image.jpg">
+            <img src="//origin.example.com/image2.jpg">
             <form action="https://origin.example.com/submit">
+            <form action="//origin.example.com/submit2">
         </html>"#;
 
         let mut output = Vec::new();
@@ -447,8 +556,12 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         assert!(result.contains(r#"href="https://test.example.com/page""#));
+        assert!(result.contains(r#"href="//test.example.com/proto""#));
+        assert!(result.contains(r#"href="test.example.com/bare""#));
         assert!(result.contains(r#"src="https://test.example.com/image.jpg""#));
+        assert!(result.contains(r#"src="//test.example.com/image2.jpg""#));
         assert!(result.contains(r#"action="https://test.example.com/submit""#));
+        assert!(result.contains(r#"action="//test.example.com/submit2""#));
         assert!(!result.contains("origin.example.com"));
     }
 

@@ -92,12 +92,17 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         ) {
             (Compression::None, Compression::None) => self.process_uncompressed(input, output),
             (Compression::Gzip, Compression::Gzip) => self.process_gzip_to_gzip(input, output),
+            (Compression::Gzip, Compression::None) => self.process_gzip_to_none(input, output),
             (Compression::Deflate, Compression::Deflate) => {
                 self.process_deflate_to_deflate(input, output)
+            }
+            (Compression::Deflate, Compression::None) => {
+                self.process_deflate_to_none(input, output)
             }
             (Compression::Brotli, Compression::Brotli) => {
                 self.process_brotli_to_brotli(input, output)
             }
+            (Compression::Brotli, Compression::None) => self.process_brotli_to_none(input, output),
             _ => Err(Report::new(TrustedServerError::Proxy {
                 message: "Unsupported compression transformation".to_string(),
             })),
@@ -206,6 +211,48 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         Ok(())
     }
 
+    /// Process gzip compressed input to uncompressed output (decompression only)
+    fn process_gzip_to_none<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        mut output: W,
+    ) -> Result<(), Report<TrustedServerError>> {
+        use flate2::read::GzDecoder;
+
+        // Decompress input
+        let mut decoder = GzDecoder::new(input);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to decompress gzip".to_string(),
+            })?;
+
+        log::info!(
+            "[Gzip->None] Decompressed size: {} bytes",
+            decompressed.len()
+        );
+
+        // Process the decompressed content
+        let processed = self
+            .processor
+            .process_chunk(&decompressed, true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process content".to_string(),
+            })?;
+
+        log::info!("[Gzip->None] Processed size: {} bytes", processed.len());
+
+        // Write uncompressed output
+        output
+            .write_all(&processed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to write output".to_string(),
+            })?;
+
+        Ok(())
+    }
+
     /// Process deflate compressed stream
     fn process_deflate_to_deflate<R: Read, W: Write>(
         &mut self,
@@ -220,6 +267,48 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         let encoder = ZlibEncoder::new(output, Compression::default());
 
         self.process_through_compression(decoder, encoder)
+    }
+
+    /// Process deflate compressed input to uncompressed output (decompression only)
+    fn process_deflate_to_none<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        mut output: W,
+    ) -> Result<(), Report<TrustedServerError>> {
+        use flate2::read::ZlibDecoder;
+
+        // Decompress input
+        let mut decoder = ZlibDecoder::new(input);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to decompress deflate".to_string(),
+            })?;
+
+        log::info!(
+            "[Deflate->None] Decompressed size: {} bytes",
+            decompressed.len()
+        );
+
+        // Process the decompressed content
+        let processed = self
+            .processor
+            .process_chunk(&decompressed, true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process content".to_string(),
+            })?;
+
+        log::info!("[Deflate->None] Processed size: {} bytes", processed.len());
+
+        // Write uncompressed output
+        output
+            .write_all(&processed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to write output".to_string(),
+            })?;
+
+        Ok(())
     }
 
     /// Process brotli compressed stream
@@ -241,6 +330,48 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         let encoder = CompressorWriter::with_params(output, 4096, &params);
 
         self.process_through_compression(decoder, encoder)
+    }
+
+    /// Process brotli compressed input to uncompressed output (decompression only)
+    fn process_brotli_to_none<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        mut output: W,
+    ) -> Result<(), Report<TrustedServerError>> {
+        use brotli::Decompressor;
+
+        // Decompress input
+        let mut decoder = Decompressor::new(input, 4096);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to decompress brotli".to_string(),
+            })?;
+
+        log::info!(
+            "[Brotli->None] Decompressed size: {} bytes",
+            decompressed.len()
+        );
+
+        // Process the decompressed content
+        let processed = self
+            .processor
+            .process_chunk(&decompressed, true)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to process content".to_string(),
+            })?;
+
+        log::info!("[Brotli->None] Processed size: {} bytes", processed.len());
+
+        // Write uncompressed output
+        output
+            .write_all(&processed)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to write output".to_string(),
+            })?;
+
+        Ok(())
     }
 
     /// Generic processing through compression layers
