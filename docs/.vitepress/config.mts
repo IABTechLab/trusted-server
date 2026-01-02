@@ -49,6 +49,12 @@ export default defineConfig({
         ]
       },
       {
+        text: 'Advanced',
+        items: [
+          { text: 'RSC Hydration', link: '/guide/rsc-hydration' }
+        ]
+      },
+      {
         text: 'Reference',
         items: [
           { text: 'API Reference', link: '/guide/api-reference' },
