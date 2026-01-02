@@ -2,6 +2,8 @@
 
 use crate::settings::Settings;
 
+pub mod didomi;
+pub mod lockr;
 pub mod nextjs;
 pub mod permutive;
 pub mod prebid;
@@ -24,5 +26,7 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         testlight::register,
         nextjs::register,
         permutive::register,
+        lockr::register,
+        didomi::register,
     ]
 }
