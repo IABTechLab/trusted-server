@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
@@ -23,7 +23,7 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Retrieve Rust version
         id: rust-version
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
@@ -37,7 +37,7 @@ jobs:
 
       - name: Add wasm32-wasi target
         run: rustup target add wasm32-wasip1
-  
+
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
@@ -49,7 +49,7 @@ jobs:
     defaults:
       run:
         working-directory: crates/js/lib
-        
+
     steps:
       - uses: actions/checkout@v4
 
@@ -58,12 +58,12 @@ jobs:
         working-directory: .
         run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
-        
+
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: crates/js/lib/package.json
 
       - name: Install dependencies
@@ -71,7 +71,7 @@ jobs:
 
       - name: Run ESLint
         run: npm run lint
-      
+
       - name: Run Prettier (check)
         run: npm run format
 
@@ -80,7 +80,7 @@ jobs:
     defaults:
       run:
         working-directory: crates/js/lib
-        
+
     steps:
       - uses: actions/checkout@v4
 
@@ -89,12 +89,12 @@ jobs:
         working-directory: .
         run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
-        
+
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: crates/js/lib/package.json
 
       - name: Install dependencies
@@ -102,6 +102,6 @@ jobs:
 
       - name: Run ESLint
         run: npm run lint
-      
+
       - name: Run Prettier (check)
         run: npm run format

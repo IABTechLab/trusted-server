@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
-      - '.github/workflows/deploy-docs.yml'
-  workflow_dispatch:  # Allow manual triggers
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
+  workflow_dispatch: # Allow manual triggers
 
 # Sets permissions for GitHub Pages deployment
 permissions:
@@ -26,7 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # For lastUpdated feature
+          fetch-depth: 0 # For lastUpdated feature
 
       - name: Retrieve Node.js version
         id: node-version
@@ -36,7 +36,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: docs/package-lock.json
 
       - name: Setup Pages
