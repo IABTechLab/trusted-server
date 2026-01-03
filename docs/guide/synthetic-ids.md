@@ -49,8 +49,8 @@ secret_key = "your-secret-key"
 // Placeholder example
 const syntheticId = await trustedServer.generateSyntheticId({
   domain: 'example.com',
-  consent: true
-});
+  consent: true,
+})
 ```
 
 ## Best Practices

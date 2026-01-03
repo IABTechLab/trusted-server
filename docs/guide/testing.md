@@ -24,7 +24,7 @@ Tests are organized alongside source code in `#[cfg(test)]` modules:
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_synthetic_id_generation() {
         // Test implementation
@@ -105,6 +105,7 @@ fn test_ad_request_flow() {
 ## Mock Data
 
 Test fixtures located in:
+
 - `tests/fixtures/` - Test data files
 - `tests/kv_store/` - Mock KV store data
 
@@ -113,6 +114,7 @@ Test fixtures located in:
 ### GitHub Actions
 
 Tests run automatically on:
+
 - Pull requests
 - Main branch commits
 - Release tags
@@ -164,6 +166,7 @@ cargo tarpaulin --out Html
 ### Load Testing
 
 Use tools like:
+
 - `wrk` - HTTP benchmarking
 - `hey` - Load generator
 - `k6` - Modern load testing
@@ -199,6 +202,7 @@ cargo test test_name -- --nocapture --test-threads=1
 ## Continuous Integration
 
 All tests must pass before:
+
 - Merging pull requests
 - Deploying to staging
 - Releasing to production

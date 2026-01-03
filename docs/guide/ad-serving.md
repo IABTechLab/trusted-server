@@ -11,6 +11,7 @@ Trusted Server provides edge-based ad serving with built-in GDPR compliance and 
 ### Equativ
 
 Primary ad server integration with support for:
+
 - Direct ad requests
 - Creative proxying
 - Click tracking
@@ -19,6 +20,7 @@ Primary ad server integration with support for:
 ### Prebid
 
 Real-time bidding integration:
+
 - Header bidding support
 - Bid caching
 - Timeout management
@@ -53,6 +55,7 @@ cache_ttl = 300
 ### Proxy Mode
 
 Creatives can be proxied through Trusted Server for:
+
 - Security scanning
 - Content modification
 - Click tracking injection
@@ -61,6 +64,7 @@ Creatives can be proxied through Trusted Server for:
 ### Direct Mode
 
 Creatives served directly from ad server:
+
 - Lower latency
 - Reduced edge load
 - Less control over content
@@ -72,15 +76,16 @@ Creatives served directly from ad server:
 ```javascript
 // Placeholder example
 trustedServer.trackImpression({
-    adId: 'ad-123',
-    syntheticId: 'synthetic-xyz',
-    consent: true
-});
+  adId: 'ad-123',
+  syntheticId: 'synthetic-xyz',
+  consent: true,
+})
 ```
 
 ### Click Tracking
 
 Click tracking with privacy preservation:
+
 - No PII in URLs
 - Synthetic ID only (with consent)
 - Encrypted parameters
@@ -97,6 +102,7 @@ Click tracking with privacy preservation:
 ### Timeouts
 
 Configurable timeouts for:
+
 - Ad server requests
 - Prebid auctions
 - Creative fetching

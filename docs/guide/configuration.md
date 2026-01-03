@@ -59,6 +59,7 @@ Main application configuration file.
 **Format**: TOML (Tom's Obvious, Minimal Language)
 
 **Sections**:
+
 - `[publisher]` - Publisher domain and origin settings
 - `[synthetic]` - Synthetic ID generation
 - `[request_signing]` - Request signing and JWKS
@@ -68,6 +69,7 @@ Main application configuration file.
 - `[integrations.*]` - Integration configs (Prebid, Next.js, etc.)
 
 **Example**:
+
 ```toml
 [publisher]
 domain = "publisher.com"
@@ -105,6 +107,7 @@ Fastly Compute service configuration.
 **Purpose**: Build settings, local development, store links
 
 **Example**:
+
 ```toml
 manifest_version = 2
 name = "trusted-server"
@@ -115,7 +118,7 @@ language = "rust"
 [local_server]
   [local_server.kv_stores.counter_store]
     file = "test-data/counter_store.json"
-  
+
   [local_server.kv_stores.opid_store]
     file = "test-data/opid_store.json"
 
@@ -129,6 +132,7 @@ language = "rust"
 Environment-specific variable files.
 
 **`.env.dev`** - Local development:
+
 ```bash
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:3000
 TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=dev-secret
@@ -136,16 +140,20 @@ LOG_LEVEL=debug
 ```
 
 **`.env.staging`** - Staging environment:
+
 ```bash
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.com
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_key_staging)
+# Secrets should be set via CI/CD or secret management, not in .env files
+# TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=<injected-by-ci>
 ```
 
 **`.env.production`** - Production (secrets from secure store):
+
 ```bash
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_secret)
 TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=true
+# Secrets should be injected by your deployment system
+# TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=<from-vault-or-secret-manager>
+# TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=<from-vault-or-secret-manager>
 ```
 
 ## Environment Variables
@@ -157,6 +165,7 @@ TRUSTED_SERVER__SECTION__FIELD=value
 ```
 
 **Rules**:
+
 - Prefix: `TRUSTED_SERVER`
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
@@ -165,22 +174,26 @@ TRUSTED_SERVER__SECTION__FIELD=value
 ### Examples
 
 **Simple Field**:
+
 ```bash
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 ```
 
 **Array (JSON)**:
+
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS='["kargo","rubicon"]'
 ```
 
 **Array (Indexed)**:
+
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=kargo
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__1=rubicon
 ```
 
 **Array (Comma-Separated)**:
+
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
 ```
@@ -200,6 +213,7 @@ proxy_secret = "secure-random-secret"
 ```
 
 **Key Fields**:
+
 - `domain` - Your publisher domain
 - `cookie_domain` - Domain for synthetic ID cookies (use `.domain.com` for subdomains)
 - `origin_url` - Backend origin server URL
@@ -207,9 +221,11 @@ proxy_secret = "secure-random-secret"
 
 ::: warning Security
 Generate `proxy_secret` with cryptographically random values:
+
 ```bash
 openssl rand -base64 32
 ```
+
 :::
 
 ### Synthetic IDs
@@ -225,6 +241,7 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}"
 ```
 
 **Template Variables**:
+
 - `client_ip` - Client IP address
 - `user_agent` - User-Agent header
 - `first_party_id` - Publisher-provided ID
@@ -246,6 +263,7 @@ secret_store_id = "01GYYY"  # From Fastly dashboard
 ```
 
 **Setup**:
+
 1. Create Fastly Config Store for JWKS
 2. Create Fastly Secret Store for private keys
 3. Copy store IDs to configuration
@@ -258,6 +276,7 @@ See [Request Signing](/guide/request-signing) and [Key Rotation](/guide/key-rota
 Configure built-in integrations.
 
 **Prebid**:
+
 ```toml
 [integrations.prebid]
 enabled = true
@@ -268,6 +287,7 @@ auto_configure = false
 ```
 
 **Next.js**:
+
 ```toml
 [integrations.nextjs]
 enabled = true
@@ -275,6 +295,7 @@ rewrite_attributes = ["href", "link", "url"]
 ```
 
 **Permutive**:
+
 ```toml
 [integrations.permutive]
 enabled = true
@@ -300,6 +321,7 @@ fastly kv-store create --name=opid_store
 ```
 
 **Link to Service** (`fastly.toml`):
+
 ```toml
 [local_server.kv_stores.counter_store]
   file = "test-data/counter_store.json"
@@ -339,6 +361,7 @@ fastly secret-store list
 Configuration is validated at application startup:
 
 **Checks**:
+
 - Required fields present
 - Data types correct
 - Regex patterns valid
@@ -364,16 +387,18 @@ fastly compute serve
 ### Best Practices
 
 **Development**:
+
 ```bash
 # Use simple secrets for local dev
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=dev-secret
 ```
 
 **Staging/Production**:
+
 ```bash
-# Load from secure sources
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(vault kv get -field=value secret/synthetic_key)
+# Inject secrets via your CI/CD or secret manager
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=<your-proxy-secret>
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=<your-synthetic-secret>
 ```
 
 **Do**:
@@ -381,13 +406,13 @@ TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(vault kv get -field=value secret/synthet
 ✅ Generate cryptographically random values  
 ✅ Rotate secrets periodically  
 ✅ Store in Fastly Secret Store or Vault  
-✅ Use different secrets per environment  
+✅ Use different secrets per environment
 
 **Don't**:
 ❌ Commit secrets to version control  
 ❌ Use default placeholder values  
 ❌ Share secrets across environments  
-❌ Log secret values  
+❌ Log secret values
 
 ### `.gitignore`
 
@@ -406,11 +431,11 @@ trusted-server.production.toml
 ### Multi-Environment Setup
 
 **Directory Structure**:
+
 ```
-project/
+trusted-server/
 ├── trusted-server.toml           # Base config
-├── trusted-server.dev.toml       # Development overrides
-├── .env.development              # Dev environment vars
+├── .env.dev                      # Dev environment vars
 ├── .env.staging                  # Staging environment vars
 ├── .env.production               # Production (not in git)
 ├── .env.example                  # Template (in git)
@@ -418,6 +443,7 @@ project/
 ```
 
 **Base Config** (`trusted-server.toml`):
+
 ```toml
 # Shared across all environments
 [synthetic]
@@ -429,6 +455,7 @@ bidders = ["kargo", "rubicon"]
 ```
 
 **Environment Overrides**:
+
 ```bash
 # Development
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:3000
@@ -460,21 +487,25 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://new-prebid.com/auction
 ### Common Issues
 
 **"Failed to build configuration"**:
+
 - Check TOML syntax (commas, quotes, brackets)
 - Verify all required fields present
 - Check environment variable format
 
 **"Secret key is not valid"**:
+
 - Cannot use `"secret-key"` placeholder
 - Must be non-empty
 - Change to secure random value
 
 **"Invalid regex"**:
+
 - Handler `path` must be valid regex
 - Escape special characters: `\.`, `\$`
 - Test with: `echo "pattern" | grep -E "pattern"`
 
 **Environment variables not applied**:
+
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm exported: `echo $VAR_NAME`
@@ -482,16 +513,19 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://new-prebid.com/auction
 ### Debug Commands
 
 **Check environment**:
+
 ```bash
 env | grep TRUSTED_SERVER
 ```
 
 **Validate TOML**:
+
 ```bash
 cat trusted-server.toml | npx toml-cli validate
 ```
 
 **Test local server**:
+
 ```bash
 fastly compute serve --verbose
 ```
