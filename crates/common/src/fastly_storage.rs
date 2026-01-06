@@ -76,6 +76,7 @@ impl FastlySecretStore {
 pub struct FastlyApiClient {
     api_key: Vec<u8>,
     base_url: String,
+    backend_name: String,
 }
 
 impl FastlyApiClient {
@@ -84,7 +85,7 @@ impl FastlyApiClient {
     }
 
     pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
-        ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
+        let backend_name = ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
             TrustedServerError::Configuration {
                 message: format!("Failed to ensure API backend: {}", e),
             }
@@ -93,9 +94,15 @@ impl FastlyApiClient {
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;
 
+        log::info!(
+            "FastlyApiClient initialized with backend: {}",
+            backend_name
+        );
+
         Ok(Self {
             api_key,
             base_url: "https://api.fastly.com".to_string(),
+            backend_name,
         })
     }
 
@@ -132,7 +139,7 @@ impl FastlyApiClient {
                 .with_body(body_content);
         }
 
-        request.send("backend_https_api_fastly_com").map_err(|e| {
+        request.send(&self.backend_name).map_err(|e| {
             TrustedServerError::Configuration {
                 message: format!("Failed to send API request: {}", e),
             }
