@@ -18,11 +18,13 @@ Trusted Server provides Ed25519-based request signing capabilities to ensure aut
 Keys are stored in two separate Fastly stores:
 
 **Secret Store** (`signing_keys`):
+
 - Private signing keys (Ed25519 private keys)
 - Base64-encoded 32-byte keys
 - Only accessible to the edge application
 
 **Config Store** (`jwks_store`):
+
 - Public verification keys (JWK format)
 - Current key identifier (`current-kid`)
 - Active key identifiers (`active-kids`)
@@ -116,6 +118,7 @@ Trusted Server provides a built-in endpoint for testing signatures:
 **Endpoint**: `POST /admin/verify-signature`
 
 **Request**:
+
 ```json
 {
   "payload": "message to verify",
@@ -125,6 +128,7 @@ Trusted Server provides a built-in endpoint for testing signatures:
 ```
 
 **Response**:
+
 ```json
 {
   "verified": true,
@@ -143,6 +147,7 @@ Public keys are published via a standardized discovery endpoint following IAB pa
 **Endpoint**: `GET /.well-known/trusted-server.json`
 
 **Response**:
+
 ```json
 {
   "version": "1.0",
@@ -166,14 +171,15 @@ Partners can fetch and cache your public keys:
 
 ```javascript
 // Fetch discovery document
-const discovery = await fetch('https://your-domain/.well-known/trusted-server.json')
-  .then(r => r.json());
+const discovery = await fetch(
+  'https://your-domain/.well-known/trusted-server.json'
+).then((r) => r.json())
 
 // Extract JWKS
-const jwks = discovery.jwks;
+const jwks = discovery.jwks
 
 // Verify signatures using JWKS
-const publicKey = jwks.keys.find(k => k.kid === signatureKid);
+const publicKey = jwks.keys.find((k) => k.kid === signatureKid)
 ```
 
 ## Key Format
@@ -181,11 +187,13 @@ const publicKey = jwks.keys.find(k => k.kid === signatureKid);
 ### Ed25519 Keys
 
 **Private Key**:
+
 - 32 bytes
 - Stored base64-encoded in Secret Store
 - Never exposed via API
 
 **Public Key**:
+
 - 32 bytes
 - Stored as JWK in Config Store
 - Published in JWKS endpoint
@@ -194,11 +202,11 @@ const publicKey = jwks.keys.find(k => k.kid === signatureKid);
 
 ```json
 {
-  "kty": "OKP",           // Key type: Octet Key Pair
-  "crv": "Ed25519",       // Curve: Ed25519
-  "x": "public_key_b64",  // Public key (base64url)
+  "kty": "OKP", // Key type: Octet Key Pair
+  "crv": "Ed25519", // Curve: Ed25519
+  "x": "public_key_b64", // Public key (base64url)
   "kid": "ts-2024-01-15", // Key identifier
-  "alg": "EdDSA"          // Algorithm: EdDSA
+  "alg": "EdDSA" // Algorithm: EdDSA
 }
 ```
 
@@ -247,6 +255,7 @@ Link stores to your service in `fastly.toml`:
 ### 2. Validate Signatures
 
 Always verify:
+
 - Signature authenticity
 - Key ID exists in active keys
 - Timestamp freshness (if using timestamps)
@@ -269,23 +278,29 @@ Always verify:
 Common errors and solutions:
 
 **Invalid key length**:
+
 ```
 Error: Invalid key length (expected 32 bytes for Ed25519)
 ```
+
 - Ensure key is exactly 32 bytes
 - Check base64 encoding is correct
 
 **Missing key**:
+
 ```
 Error: Key not found: ts-2024-01-15
 ```
+
 - Verify kid exists in Config Store
 - Check active-kids list includes the kid
 
 **Signature verification failed**:
+
 ```
 verified: false
 ```
+
 - Ensure payload matches exactly (no modifications)
 - Verify correct kid is used
 - Check signature encoding (base64url vs standard)
@@ -302,7 +317,7 @@ fn test_sign_and_verify() {
     let payload = b"test message";
     let signer = RequestSigner::from_config().unwrap();
     let signature = signer.sign(payload).unwrap();
-    
+
     // Verify the signature
     let verified = verify_signature(payload, &signature, &signer.kid).unwrap();
     assert!(verified);

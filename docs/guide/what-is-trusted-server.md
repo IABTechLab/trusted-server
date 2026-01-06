@@ -14,15 +14,19 @@ Trusted Server provides a privacy-first approach to digital advertising by:
 ## Key Features
 
 ### Privacy-Preserving
+
 All tracking and data collection requires explicit user consent through GDPR compliance checks.
 
 ### Edge Computing
+
 Runs on Fastly Compute platform, providing global low-latency performance.
 
 ### Synthetic ID Generation
+
 Uses HMAC-based templates to generate privacy-safe identifiers.
 
 ### Real-Time Bidding
+
 Integrates with Prebid for seamless RTB workflows.
 
 ## Use Cases

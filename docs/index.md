@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  name: "Trusted Server"
-  text: "Privacy-Preserving Edge Computing"
+  name: 'Trusted Server'
+  text: 'Privacy-Preserving Edge Computing'
   tagline: GDPR-compliant ad serving and synthetic ID generation at the edge
   actions:
     - theme: brand
@@ -11,7 +11,7 @@ hero:
       link: /guide/getting-started
     - theme: alt
       text: View on GitHub
-      link: https://github.com/IABTechLab/trusted-server 
+      link: https://github.com/IABTechLab/trusted-server
 features:
   - title: Synthetic ID Generation
     details: HMAC-based synthetic IDs that preserve privacy while enabling tracking with user consent
