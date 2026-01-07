@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -9,7 +8,6 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json, Value as JsonValue};
-use url::Url;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -18,7 +16,6 @@ use crate::auction::types::{
 };
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
-use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::integrations::{
@@ -31,7 +28,6 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
-const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -141,68 +137,6 @@ impl PrebidIntegration {
             .with_body(body))
     }
 
-    async fn handle_first_party_ad(
-        &self,
-        settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let url = req.get_url_str();
-        let parsed = Url::parse(url).change_context(TrustedServerError::Prebid {
-            message: "Invalid first-party serve-ad URL".to_string(),
-        })?;
-        let qp = parsed
-            .query_pairs()
-            .into_owned()
-            .collect::<std::collections::HashMap<_, _>>();
-        let slot = qp.get("slot").cloned().unwrap_or_default();
-        let w = qp
-            .get("w")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(300);
-        let h = qp
-            .get("h")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(250);
-        if slot.is_empty() {
-            return Err(Report::new(TrustedServerError::BadRequest {
-                message: "missing slot".to_string(),
-            }));
-        }
-
-        let ad_req = AdRequest {
-            ad_units: vec![AdUnit {
-                code: slot.clone(),
-                media_types: Some(MediaTypes {
-                    banner: Some(BannerUnit {
-                        sizes: vec![vec![w, h]],
-                    }),
-                }),
-                bids: None,
-            }],
-            config: None,
-        };
-
-        let ortb = build_openrtb_from_ts(&ad_req, settings, &self.config);
-        req.set_body_json(&ortb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
-        let mut pbs_resp = pbs_auction_for_get(settings, req, &self.config).await?;
-
-        let body_bytes = pbs_resp.take_body_bytes();
-        let html = match serde_json::from_slice::<Json>(&body_bytes) {
-            Ok(json) => extract_adm_for_slot(&json, &slot)
-                .unwrap_or_else(|| "<!-- no creative -->".to_string()),
-            Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
-        };
-
-        let rewritten = creative::rewrite_creative_html(&html, settings);
-
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(rewritten))
-    }
 }
 
 fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
@@ -237,7 +171,7 @@ impl IntegrationProxy for PrebidIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        let mut routes = vec![IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD)];
+        let mut routes = vec![];
 
         if let Some(script_path) = &self.config.script_handler {
             routes.push(IntegrationEndpoint::get(script_path.clone()));
@@ -248,7 +182,7 @@ impl IntegrationProxy for PrebidIntegration {
 
     async fn handle(
         &self,
-        settings: &Settings,
+        _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -257,9 +191,6 @@ impl IntegrationProxy for PrebidIntegration {
         match method {
             Method::GET if self.config.script_handler.as_ref() == Some(&path) => {
                 self.handle_script_handler()
-            }
-            Method::GET if path == ROUTE_FIRST_PARTY_AD => {
-                self.handle_first_party_ad(settings, req).await
             }
             _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
@@ -357,39 +288,7 @@ fn is_prebid_script_url(url: &str) -> bool {
     )
 }
 
-async fn pbs_auction_for_get(
-    settings: &Settings,
-    req: Request,
-    config: &PrebidIntegrationConfig,
-) -> Result<Response, Report<TrustedServerError>> {
-    handle_prebid_auction(settings, req, config).await
-}
 
-fn extract_adm_for_slot(json: &Json, slot: &str) -> Option<String> {
-    let seatbids = json.get("seatbid")?.as_array()?;
-    for sb in seatbids {
-        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
-            for bid in bids {
-                let impid = bid.get("impid").and_then(|v| v.as_str()).unwrap_or("");
-                if impid == slot {
-                    if let Some(adm) = bid.get("adm").and_then(|v| v.as_str()) {
-                        return Some(adm.to_string());
-                    }
-                }
-            }
-        }
-    }
-    for sb in seatbids {
-        if let Some(bids) = sb.get("bid").and_then(|b| b.as_array()) {
-            for bid in bids {
-                if let Some(adm) = bid.get("adm").and_then(|v| v.as_str()) {
-                    return Some(adm.to_string());
-                }
-            }
-        }
-    }
-    None
-}
 
 async fn handle_prebid_auction(
     settings: &Settings,
@@ -844,7 +743,7 @@ mod tests {
 
         let synthetic_id = "synthetic-123";
         let fresh_id = "fresh-456";
-        let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+        let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
         enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
@@ -903,27 +802,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_adm_for_slot_prefers_exact_match() {
-        let response = json!({
-            "seatbid": [{
-                "bid": [
-                    { "impid": "slot-b", "adm": "<!-- slot B -->" },
-                    { "impid": "slot-a", "adm": "<!-- slot A -->" }
-                ]
-            }]
-        });
 
-        let adm = extract_adm_for_slot(&response, "slot-a").expect("adm should exist");
-        assert_eq!(adm, "<!-- slot A -->");
-
-        let fallback = extract_adm_for_slot(&response, "missing")
-            .expect("should fall back to first available adm");
-        assert!(
-            fallback == "<!-- slot B -->" || fallback == "<!-- slot A -->",
-            "fallback should return some creative"
-        );
-    }
 
     #[test]
     fn make_first_party_proxy_url_base64_encodes_target() {
@@ -1058,8 +937,8 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should have 2 routes: first-party ad and script handler
-        assert_eq!(routes.len(), 2);
+        // Should have 1 route: script handler
+        assert_eq!(routes.len(), 1);
 
         let has_script_route = routes
             .iter()
@@ -1074,8 +953,8 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        // Should only have 1 route: first-party ad
-        assert_eq!(routes.len(), 1);
+        // Should have 0 routes when no script handler configured
+        assert_eq!(routes.len(), 0);
     }
 }
 

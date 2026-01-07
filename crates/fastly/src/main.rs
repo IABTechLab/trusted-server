@@ -3,7 +3,7 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
-use trusted_server_common::auction::{handle_auction, init_orchestrator};
+use trusted_server_common::auction::{handle_auction, handle_creative_request, init_creative_storage, init_orchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -34,8 +34,9 @@ fn main(req: Request) -> Result<Response, Error> {
     };
     log::info!("Settings {settings:?}");
 
-    // Initialize the auction orchestrator once at startup
+    // Initialize the auction orchestrator and creative storage once at startup
     init_orchestrator(&settings);
+    init_creative_storage();
 
     let integration_registry = IntegrationRegistry::new(&settings);
 
@@ -77,8 +78,11 @@ async fn route_request(
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(&settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(&settings, req),
 
-        // Auction endpoints (top-level, not an integration)
-        (Method::POST, "/third-party/ad") => handle_auction(&settings, req).await,
+        // Unified auction endpoint
+        (Method::POST, "/auction") => handle_auction(&settings, req).await,
+
+        // Creative rendering endpoint
+        (Method::GET, "/auction/creative") => handle_creative_request(&settings, req),
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,

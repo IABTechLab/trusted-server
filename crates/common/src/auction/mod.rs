@@ -9,13 +9,16 @@
 
 use crate::settings::Settings;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 pub mod config;
+pub mod creative_storage;
 pub mod orchestrator;
 pub mod provider;
 pub mod types;
 
 pub use config::AuctionConfig;
+pub use creative_storage::CreativeStorage;
 pub use orchestrator::AuctionOrchestrator;
 pub use provider::AuctionProvider;
 pub use types::{
@@ -27,6 +30,11 @@ pub use types::{
 /// Initialized once on first access with the provided settings.
 /// All providers are registered during initialization.
 static GLOBAL_ORCHESTRATOR: OnceLock<AuctionOrchestrator> = OnceLock::new();
+
+/// Global creative storage singleton.
+///
+/// Used to temporarily store creative HTML between auction execution and rendering.
+static GLOBAL_CREATIVE_STORAGE: OnceLock<CreativeStorage> = OnceLock::new();
 
 /// Type alias for provider builder functions.
 type ProviderBuilder = fn(&Settings) -> Vec<Arc<dyn AuctionProvider>>;
@@ -91,6 +99,28 @@ pub fn get_orchestrator() -> Option<&'static AuctionOrchestrator> {
     GLOBAL_ORCHESTRATOR.get()
 }
 
+/// Initialize the global creative storage.
+///
+/// This function should be called once at application startup.
+/// Creates storage with a 5-minute TTL for creatives.
+pub fn init_creative_storage() -> &'static CreativeStorage {
+    GLOBAL_CREATIVE_STORAGE.get_or_init(|| {
+        log::info!("Initializing global creative storage with 5-minute TTL");
+        CreativeStorage::new(Duration::from_secs(300))
+    })
+}
+
+/// Get the global creative storage.
+///
+/// Returns a reference to the creative storage if it has been initialized.
+///
+/// # Returns
+/// * `Some(&'static CreativeStorage)` if the storage has been initialized
+/// * `None` if `init_creative_storage()` has not been called yet
+pub fn get_creative_storage() -> Option<&'static CreativeStorage> {
+    GLOBAL_CREATIVE_STORAGE.get()
+}
+
 // ============================================================================
 // Top-Level Auction Handler
 // ============================================================================
@@ -136,11 +166,11 @@ struct BannerUnit {
     sizes: Vec<Vec<u32>>,
 }
 
-/// Handle auction request from /third-party/ad or /auction/run endpoints.
+/// Handle auction request from /auction endpoint.
 ///
 /// This is the main entry point for running header bidding auctions.
 /// It orchestrates bids from multiple providers (Prebid, APS, GAM, etc.) and returns
-/// the winning bids in OpenRTB format.
+/// the winning bids in OpenRTB format with creative proxy URLs.
 pub async fn handle_auction(
     settings: &Settings,
     mut req: Request,
@@ -161,6 +191,14 @@ pub async fn handle_auction(
     let orchestrator = get_orchestrator().ok_or_else(|| {
         Report::new(TrustedServerError::Auction {
             message: "Auction orchestrator not initialized. Call init_orchestrator() at startup."
+                .to_string(),
+        })
+    })?;
+
+    // Get the global creative storage
+    let creative_storage = get_creative_storage().ok_or_else(|| {
+        Report::new(TrustedServerError::Auction {
+            message: "Creative storage not initialized. Call init_creative_storage() at startup."
                 .to_string(),
         })
     })?;
@@ -190,8 +228,8 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
-    // Convert to OpenRTB response format
-    convert_to_openrtb_response(&result, settings)
+    // Convert to OpenRTB response format with creative URLs
+    convert_to_openrtb_response(&result, settings, creative_storage, &auction_request.id)
 }
 
 /// Convert tsjs/Prebid.js request format to internal AuctionRequest.
@@ -271,21 +309,44 @@ fn convert_tsjs_to_auction_request(
 }
 
 /// Convert OrchestrationResult to OpenRTB response format.
+///
+/// Stores creative HTML in the creative storage and returns proxy URLs in the `adm` field.
 fn convert_to_openrtb_response(
     result: &orchestrator::OrchestrationResult,
     settings: &Settings,
+    creative_storage: &CreativeStorage,
+    auction_id: &str,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::new();
 
     for (slot_id, bid) in &result.winning_bids {
+        // Rewrite creative HTML with proxy URLs
         let rewritten_creative = creative::rewrite_creative_html(&bid.creative, settings);
+
+        // Store creative in temporary storage
+        let creative_key = format!("{}:{}", auction_id, slot_id);
+        creative_storage.store(creative_key.clone(), rewritten_creative);
+
+        // Generate proxy URL for the creative
+        let creative_url = format!(
+            "/auction/creative?auction_id={}&slot={}",
+            urlencoding::encode(auction_id),
+            urlencoding::encode(slot_id)
+        );
+
+        log::debug!(
+            "Stored creative for auction {} slot {} at key {}",
+            auction_id,
+            slot_id,
+            creative_key
+        );
 
         let bid_obj = json!({
             "id": format!("{}-{}", bid.bidder, slot_id),
             "impid": slot_id,
             "price": bid.price,
-            "adm": rewritten_creative,
+            "adm": creative_url,  // Return URL instead of HTML
             "crid": format!("{}-creative", bid.bidder),
             "w": bid.width,
             "h": bid.height,
@@ -299,7 +360,7 @@ fn convert_to_openrtb_response(
     }
 
     let response_body = json!({
-        "id": "auction-response",
+        "id": auction_id,
         "seatbid": seatbids,
         "ext": {
             "orchestrator": {
@@ -319,4 +380,67 @@ fn convert_to_openrtb_response(
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_body(body_bytes))
+}
+
+/// Handle creative rendering request from /auction/creative endpoint.
+///
+/// Retrieves stored creative HTML and returns it for iframe rendering.
+pub fn handle_creative_request(
+    _settings: &Settings,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    // Get the creative storage
+    let creative_storage = get_creative_storage().ok_or_else(|| {
+        Report::new(TrustedServerError::Auction {
+            message: "Creative storage not initialized".to_string(),
+        })
+    })?;
+
+    // Parse query parameters
+    let url = req.get_url_str();
+    let parsed = url::Url::parse(url).change_context(TrustedServerError::Auction {
+        message: "Invalid creative URL".to_string(),
+    })?;
+
+    let query_pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+
+    let auction_id = query_pairs.get("auction_id").ok_or_else(|| {
+        Report::new(TrustedServerError::BadRequest {
+            message: "Missing auction_id parameter".to_string(),
+        })
+    })?;
+
+    let slot_id = query_pairs.get("slot").ok_or_else(|| {
+        Report::new(TrustedServerError::BadRequest {
+            message: "Missing slot parameter".to_string(),
+        })
+    })?;
+
+    // Construct storage key
+    let creative_key = format!("{}:{}", auction_id, slot_id);
+
+    // Retrieve creative HTML
+    let creative_html = creative_storage.retrieve(&creative_key).ok_or_else(|| {
+        log::warn!(
+            "Creative not found for auction_id={}, slot={}",
+            auction_id,
+            slot_id
+        );
+        Report::new(TrustedServerError::BadRequest {
+            message: format!("Creative not found or expired for slot {}", slot_id),
+        })
+    })?;
+
+    log::info!(
+        "Retrieved creative for auction {} slot {} ({} bytes)",
+        auction_id,
+        slot_id,
+        creative_html.len()
+    );
+
+    // Return HTML response
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "private, max-age=300")
+        .with_body(creative_html))
 }
