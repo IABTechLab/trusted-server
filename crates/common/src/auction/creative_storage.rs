@@ -26,7 +26,7 @@ impl CreativeStorage {
     ///
     /// The key should be unique per auction and slot (e.g., "auction-id:slot-id").
     pub fn store(&self, key: String, html: String) -> Result<(), Report<TrustedServerError>> {
-        log::info!("Storing creative: {}", html);
+        log::info!("Storing creative with key '{}' ({} bytes)", key, html.len());
         let store = KVStore::open(&self.store_name)
             .change_context(TrustedServerError::Configuration {
                 message: format!("Failed to open KV store '{}'", self.store_name),

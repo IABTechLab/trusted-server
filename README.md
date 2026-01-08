@@ -214,7 +214,7 @@ Once configured, the following endpoints are available:
 
 - `/first-party/ad` (GET): returns HTML for a single slot (`slot`, `w`, `h` query params). The server inspects returned creative HTML and rewrites:
 - All absolute images and iframes to `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` (1×1 pixels are detected server‑side heuristically for logging). The `tstoken` is derived from encrypting the full target URL and hashing it.
-- `/third-party/ad` (POST): accepts tsjs ad units and proxies to Prebid Server.
+- `/auction` (POST): accepts tsjs ad units and runs the auction orchestrator.
 - `/first-party/proxy` (GET): unified proxy for resources referenced by creatives.
   - Query params:
     - `tsurl`: Target URL without query (base URL) — required

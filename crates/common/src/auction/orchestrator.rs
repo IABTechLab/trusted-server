@@ -165,9 +165,19 @@ impl AuctionOrchestrator {
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let mut bidder_responses = Vec::new();
         let mut winning_bids = HashMap::new();
+        let waterfall_start = Instant::now();
 
         // Try each bidder sequentially until we get bids
         for bidder_name in self.config.bidder_names() {
+            // Check if timeout has been exceeded
+            if waterfall_start.elapsed().as_millis() as u32 >= context.timeout_ms {
+                log::warn!(
+                    "Waterfall timeout exceeded after {} providers, stopping early",
+                    bidder_responses.len()
+                );
+                break;
+            }
+
             let provider = match self.providers.get(bidder_name) {
                 Some(p) => p,
                 None => {
@@ -447,8 +457,6 @@ impl OrchestrationResult {
 mod tests {
     use super::*;
     use crate::auction::types::*;
-    use crate::integrations::aps::{MockApsConfig, MockApsProvider};
-    use crate::integrations::gam::{MockGamConfig, MockGamProvider};
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::Request;
     use std::collections::HashMap;
@@ -517,255 +525,6 @@ mod tests {
     // 1. Configure dummy backends in fastly.toml for testing
     // 2. Refactor mock providers to use a different pattern
     // 3. Create a test-only mock backend server
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_parallel_mediation_strategy() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "parallel_mediation".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: Some("gam_mock".to_string()),
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let mut orchestrator = AuctionOrchestrator::new(config);
-
-        // Register mock providers
-        let aps_config = MockApsConfig {
-            enabled: true,
-            bid_price: 2.50,
-            ..Default::default()
-        };
-        let gam_config = MockGamConfig {
-            enabled: true,
-            inject_house_bids: true,
-            house_bid_price: 1.75,
-            win_rate: 50,
-            ..Default::default()
-        };
-
-        orchestrator.register_provider(Arc::new(MockApsProvider::new(aps_config)));
-        orchestrator.register_provider(Arc::new(MockGamProvider::new(gam_config)));
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("auction should succeed");
-
-        // Verify bidder ran
-        assert_eq!(result.bidder_responses.len(), 1);
-        assert_eq!(result.bidder_responses[0].provider, "aps_mock");
-
-        // Verify mediator ran
-        assert!(result.mediator_response.is_some());
-        let mediator_resp = result.mediator_response.unwrap();
-        assert_eq!(mediator_resp.provider, "gam_mock");
-
-        // Verify we got winning bids (GAM mediated)
-        assert!(!result.winning_bids.is_empty());
-
-        // Timing is available (may be 0 in WASM test env, but field exists)
-        let _ = result.total_time_ms;
-    }
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_parallel_only_strategy() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "parallel_only".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let mut orchestrator = AuctionOrchestrator::new(config);
-
-        let aps_config = MockApsConfig {
-            enabled: true,
-            bid_price: 2.50,
-            ..Default::default()
-        };
-
-        orchestrator.register_provider(Arc::new(MockApsProvider::new(aps_config)));
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("auction should succeed");
-
-        // No mediator in parallel_only
-        assert!(result.mediator_response.is_none());
-
-        // Should have bids from APS
-        assert_eq!(result.bidder_responses.len(), 1);
-        assert!(result.bidder_responses[0].bids.len() > 0);
-
-        // Winning bids selected directly from bidders
-        assert!(!result.winning_bids.is_empty());
-    }
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_waterfall_strategy() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "waterfall".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let mut orchestrator = AuctionOrchestrator::new(config);
-
-        let aps_config = MockApsConfig {
-            enabled: true,
-            bid_price: 2.50,
-            ..Default::default()
-        };
-
-        orchestrator.register_provider(Arc::new(MockApsProvider::new(aps_config)));
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("auction should succeed");
-
-        // Should have tried APS (first in waterfall)
-        assert_eq!(result.bidder_responses.len(), 1);
-        assert_eq!(result.bidder_responses[0].provider, "aps_mock");
-
-        // No mediator
-        assert!(result.mediator_response.is_none());
-    }
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_multiple_bidders() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "parallel_only".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let mut orchestrator = AuctionOrchestrator::new(config);
-
-        // Register provider with different mock prices
-        let aps_config = MockApsConfig {
-            enabled: true,
-            bid_price: 2.50,
-            ..Default::default()
-        };
-
-        orchestrator.register_provider(Arc::new(MockApsProvider::new(aps_config)));
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("auction should succeed");
-
-        // Should have bids for both slots
-        assert_eq!(result.winning_bids.len(), 2);
-        assert!(result.winning_bids.contains_key("header-banner"));
-        assert!(result.winning_bids.contains_key("sidebar"));
-    }
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_orchestration_result_helpers() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "parallel_only".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let mut orchestrator = AuctionOrchestrator::new(config);
-
-        let aps_config = MockApsConfig {
-            enabled: true,
-            ..Default::default()
-        };
-
-        orchestrator.register_provider(Arc::new(MockApsProvider::new(aps_config)));
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("auction should succeed");
-
-        // Test helper methods
-        let header_bid = result.get_winning_bid("header-banner");
-        assert!(header_bid.is_some());
-
-        let all_header_bids = result.get_all_bids_for_slot("header-banner");
-        assert!(!all_header_bids.is_empty());
-
-        let total_bids = result.total_bids();
-        assert!(total_bids > 0);
-    }
-
-    #[tokio::test]
-    #[ignore = "Mock providers not yet supported with send_async"]
-    async fn test_unknown_strategy_error() {
-        let config = AuctionConfig {
-            enabled: true,
-            strategy: "invalid_strategy".to_string(),
-            bidders: vec!["aps_mock".to_string()],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-        };
-
-        let orchestrator = AuctionOrchestrator::new(config);
-
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
-
-        let result = orchestrator.run_auction(&request, &context).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_msg = format!("{}", err);
-        assert!(err_msg.contains("Unknown auction strategy"));
-        assert!(err_msg.contains("parallel_mediation, parallel_only, waterfall"));
-    }
 
     #[tokio::test]
     async fn test_no_bidders_configured() {

@@ -14,11 +14,11 @@ fastly compute serve
 
 ### 2. Test with Existing Endpoint
 
-The `/third-party/ad` endpoint now uses the orchestrator when `auction.enabled = true` in config.
+The `/auction` endpoint now uses the orchestrator when `auction.enabled = true` in config.
 
 **Test Request:**
 ```bash
-curl -X POST http://localhost:7676/third-party/ad \
+curl -X POST http://localhost:7676/auction \
   -H "Content-Type: application/json" \
   -d '{
     "adUnits": [

@@ -41,19 +41,19 @@ The auction orchestration system allows you to:
 
 ## Request Flow
 
-When a request arrives at the `/third-party/ad` endpoint, it goes through the following steps:
+When a request arrives at the `/auction` endpoint, it goes through the following steps:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  1. HTTP POST /third-party/ad                                        │
+│  1. HTTP POST /auction                                               │
 │     - Body: AdRequest (Prebid.js/tsjs format)                        │
 │     - Headers: User-Agent, cookies, etc.                             │
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  2. Route Matching (crates/fastly/src/main.rs:81)                    │
-│     - Pattern: (Method::POST, "/third-party/ad")                     │
+│  2. Route Matching (crates/fastly/src/main.rs:84)                    │
+│     - Pattern: (Method::POST, "/auction")                            │
 │     - Handler: handle_auction(&settings, req).await                  │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -156,7 +156,7 @@ When a request arrives at the `/third-party/ad` endpoint, it goes through the fo
 ### Step-by-Step Breakdown
 
 #### 1. Request Arrival
-Client (browser, Prebid.js, tsjs) sends a POST request to `/third-party/ad` with ad unit definitions:
+Client (browser, Prebid.js, tsjs) sends a POST request to `/auction` with ad unit definitions:
 
 ```json
 {
@@ -262,7 +262,7 @@ The trusted-server handles several types of routes defined in `crates/fastly/src
 
 | Route                     | Method | Handler                        | Purpose                                          | Line |
 |---------------------------|--------|--------------------------------|--------------------------------------------------|------|
-| `/third-party/ad`         | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 81   |
+| `/auction`                | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 84   |
 | `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
 | `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
 | `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
@@ -283,7 +283,7 @@ The Fastly Compute entrypoint uses pattern matching on `(Method, path)` tuples:
 ```rust
 let result = match (method, path.as_str()) {
     // Auction endpoint
-    (Method::POST, "/third-party/ad") => handle_auction(&settings, req).await,
+    (Method::POST, "/auction") => handle_auction(&settings, req).await,
     
     // First-party endpoints
     (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
@@ -320,7 +320,7 @@ The integration registry checks if a route matches any registered integration ro
 
 #### 3. Route Priority
 Routes are matched in this order:
-1. **Exact top-level routes** (`/third-party/ad`, `/first-party/proxy`, etc.)
+1. **Exact top-level routes** (`/auction`, `/first-party/proxy`, etc.)
 2. **Admin routes** (`/admin/*`)
 3. **Integration routes** (`/integrations/*`)
 4. **Fallback to publisher origin** (all other paths)
@@ -329,7 +329,7 @@ This ensures auction and first-party endpoints take precedence over publisher co
 
 ### Auction Endpoint Deep Dive
 
-The `/third-party/ad` endpoint is the primary entry point for auctions:
+The `/auction` endpoint is the primary entry point for auctions:
 
 **Input Format (Prebid.js compatible):**
 ```json
