@@ -24,6 +24,10 @@ pub struct AuctionConfig {
     /// Timeout in milliseconds
     #[serde(default = "default_timeout")]
     pub timeout_ms: u32,
+
+    /// KV store name for creative storage
+    #[serde(default = "default_creative_store")]
+    pub creative_store: String,
 }
 
 fn default_strategy() -> String {
@@ -32,6 +36,10 @@ fn default_strategy() -> String {
 
 fn default_timeout() -> u32 {
     2000
+}
+
+fn default_creative_store() -> String {
+    "creative_store".to_string()
 }
 
 #[allow(dead_code)] // Methods used in runtime but not in build script

@@ -136,7 +136,6 @@ impl PrebidIntegration {
             .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .with_body(body))
     }
-
 }
 
 fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
@@ -287,8 +286,6 @@ fn is_prebid_script_url(url: &str) -> bool {
         "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
     )
 }
-
-
 
 async fn handle_prebid_auction(
     settings: &Settings,
@@ -802,8 +799,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn make_first_party_proxy_url_base64_encodes_target() {
         let url = "https://cdn.example/path?x=1";
@@ -1055,8 +1050,7 @@ impl PrebidAuctionProvider {
         let creative = bid_obj
             .get("adm")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .map(|s| s.to_string());
 
         let width = bid_obj.get("w").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
         let height = bid_obj.get("h").and_then(|v| v.as_u64()).unwrap_or(250) as u32;

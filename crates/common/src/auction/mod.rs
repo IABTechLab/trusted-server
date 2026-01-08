@@ -49,6 +49,7 @@ fn provider_builders() -> &'static [ProviderBuilder] {
         crate::integrations::prebid::register_auction_provider,
         crate::integrations::aps::register_providers,
         crate::integrations::gam::register_providers,
+        crate::integrations::adserver_mock::register_providers,
     ]
 }
 
@@ -102,11 +103,15 @@ pub fn get_orchestrator() -> Option<&'static AuctionOrchestrator> {
 /// Initialize the global creative storage.
 ///
 /// This function should be called once at application startup.
-/// Creates storage with a 5-minute TTL for creatives.
-pub fn init_creative_storage() -> &'static CreativeStorage {
+/// Creates storage with the KV store name from settings and a 5-minute TTL for creatives.
+pub fn init_creative_storage(settings: &Settings) -> &'static CreativeStorage {
     GLOBAL_CREATIVE_STORAGE.get_or_init(|| {
-        log::info!("Initializing global creative storage with 5-minute TTL");
-        CreativeStorage::new(Duration::from_secs(300))
+        let store_name = settings.auction.creative_store.clone();
+        log::info!(
+            "Initializing global creative storage (KV store: '{}', TTL: 5 minutes)",
+            store_name
+        );
+        CreativeStorage::new(store_name, Duration::from_secs(300))
     })
 }
 
@@ -321,26 +326,47 @@ fn convert_to_openrtb_response(
     let mut seatbids = Vec::new();
 
     for (slot_id, bid) in &result.winning_bids {
-        // Rewrite creative HTML with proxy URLs
-        let rewritten_creative = creative::rewrite_creative_html(&bid.creative, settings);
+        // Process creative HTML if present
+        let creative_url = if let Some(ref creative_html) = bid.creative {
+            // Rewrite creative HTML with proxy URLs
+            let rewritten_creative = creative::rewrite_creative_html(creative_html, settings);
 
-        // Store creative in temporary storage
-        let creative_key = format!("{}:{}", auction_id, slot_id);
-        creative_storage.store(creative_key.clone(), rewritten_creative);
+            // Store creative in KV storage
+            let creative_key = format!("{}:{}", auction_id, slot_id);
+            creative_storage
+                .store(creative_key.clone(), rewritten_creative)
+                .change_context(TrustedServerError::Auction {
+                    message: format!(
+                        "Failed to store creative for auction {} slot {}",
+                        auction_id, slot_id
+                    ),
+                })?;
 
-        // Generate proxy URL for the creative
-        let creative_url = format!(
-            "/auction/creative?auction_id={}&slot={}",
-            urlencoding::encode(auction_id),
-            urlencoding::encode(slot_id)
-        );
+            // Generate proxy URL for the creative
+            let url = format!(
+                "/auction/creative?auction_id={}&slot={}",
+                urlencoding::encode(auction_id),
+                urlencoding::encode(slot_id)
+            );
 
-        log::debug!(
-            "Stored creative for auction {} slot {} at key {}",
-            auction_id,
-            slot_id,
-            creative_key
-        );
+            log::debug!(
+                "Stored creative for auction {} slot {} at key {}",
+                auction_id,
+                slot_id,
+                creative_key
+            );
+
+            url
+        } else {
+            // No creative provided (e.g., from mediation layer that returns iframe URLs)
+            // Use empty string or a placeholder - client should handle appropriately
+            log::debug!(
+                "No creative HTML for auction {} slot {} - mediation should have provided iframe",
+                auction_id,
+                slot_id
+            );
+            String::new()
+        };
 
         let bid_obj = json!({
             "id": format!("{}-{}", bid.bidder, slot_id),
@@ -419,17 +445,22 @@ pub fn handle_creative_request(
     // Construct storage key
     let creative_key = format!("{}:{}", auction_id, slot_id);
 
-    // Retrieve creative HTML
-    let creative_html = creative_storage.retrieve(&creative_key).ok_or_else(|| {
-        log::warn!(
-            "Creative not found for auction_id={}, slot={}",
-            auction_id,
-            slot_id
-        );
-        Report::new(TrustedServerError::BadRequest {
-            message: format!("Creative not found or expired for slot {}", slot_id),
-        })
-    })?;
+    // Retrieve creative HTML from KV store
+    let creative_html = creative_storage
+        .retrieve(&creative_key)
+        .change_context(TrustedServerError::Auction {
+            message: format!("Failed to retrieve creative for slot {}", slot_id),
+        })?
+        .ok_or_else(|| {
+            log::warn!(
+                "Creative not found for auction_id={}, slot={}",
+                auction_id,
+                slot_id
+            );
+            Report::new(TrustedServerError::BadRequest {
+                message: format!("Creative not found or expired for slot {}", slot_id),
+            })
+        })?;
 
     log::info!(
         "Retrieved creative for auction {} slot {} ({} bytes)",

@@ -3,7 +3,9 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
-use trusted_server_common::auction::{handle_auction, handle_creative_request, init_creative_storage, init_orchestrator};
+use trusted_server_common::auction::{
+    handle_auction, handle_creative_request, init_creative_storage, init_orchestrator,
+};
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
@@ -36,7 +38,7 @@ fn main(req: Request) -> Result<Response, Error> {
 
     // Initialize the auction orchestrator and creative storage once at startup
     init_orchestrator(&settings);
-    init_creative_storage();
+    init_creative_storage(&settings);
 
     let integration_registry = IntegrationRegistry::new(&settings);
 

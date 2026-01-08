@@ -274,7 +274,7 @@ impl MockGamProvider {
                         slot_id: slot.id.clone(),
                         price: self.config.house_bid_price,
                         currency: "USD".to_string(),
-                        creative: format!(
+                        creative: Some(format!(
                             r#"<div style="width:{}px;height:{}px;background:#4285F4;display:flex;align-items:center;justify-content:center;color:white;font-family:sans-serif;">
                                 <div style="text-align:center;">
                                     <div style="font-size:24px;font-weight:bold;">Google Ad Manager</div>
@@ -282,7 +282,7 @@ impl MockGamProvider {
                                 </div>
                             </div>"#,
                             format.width, format.height, self.config.house_bid_price
-                        ),
+                        )),
                         adomain: Some(vec!["google.com".to_string()]),
                         bidder: "gam-house-mock".to_string(),
                         width: format.width,

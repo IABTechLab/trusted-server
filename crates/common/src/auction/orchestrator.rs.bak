@@ -527,7 +527,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: Some("gam_mock".to_string()),
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -584,7 +583,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -627,7 +625,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -667,7 +664,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -706,7 +702,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -748,7 +743,6 @@ mod tests {
             bidders: vec!["aps_mock".to_string()],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let orchestrator = AuctionOrchestrator::new(config);
@@ -775,7 +769,6 @@ mod tests {
             bidders: vec![],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
         };
 
         let orchestrator = AuctionOrchestrator::new(config);

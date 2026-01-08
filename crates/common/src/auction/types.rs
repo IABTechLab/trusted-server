@@ -128,7 +128,8 @@ pub struct Bid {
     /// Currency code (e.g., "USD")
     pub currency: String,
     /// Creative markup (HTML/VAST)
-    pub creative: String,
+    /// None when the bidder doesn't provide creative HTML (e.g., APS/TAM)
+    pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
     /// Bidder/seat identifier

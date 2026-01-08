@@ -185,7 +185,7 @@ impl AdServerMockProvider {
                     slot_id: bid["impid"].as_str().unwrap_or("").to_string(),
                     price: bid["price"].as_f64().unwrap_or(0.0),
                     currency: "USD".to_string(),
-                    creative: bid["adm"].as_str().unwrap_or("").to_string(),
+                    creative: bid["adm"].as_str().map(String::from),
                     width: bid["w"].as_u64().unwrap_or(0) as u32,
                     height: bid["h"].as_u64().unwrap_or(0) as u32,
                     bidder: seat_name.to_string(),
@@ -239,6 +239,18 @@ impl AuctionProvider for AdServerMockProvider {
 
         // Create HTTP POST request
         let mut req = Request::new(Method::POST, &self.config.endpoint);
+
+        // Set Host header with port to ensure mocktioneer generates correct iframe URLs
+        if let Ok(url) = url::Url::parse(&self.config.endpoint) {
+            if let Some(host) = url.host_str() {
+                let host_with_port = if let Some(port) = url.port() {
+                    format!("{}:{}", host, port)
+                } else {
+                    host.to_string()
+                };
+                req.set_header("Host", &host_with_port);
+            }
+        }
 
         req.set_body_json(&mediation_req)
             .change_context(TrustedServerError::Auction {
@@ -398,7 +410,7 @@ mod tests {
                     slot_id: "header-banner".to_string(),
                     price: 3.00,
                     currency: "USD".to_string(),
-                    creative: "<div>APS Ad</div>".to_string(),
+                    creative: Some("<div>APS Ad</div>".to_string()),
                     width: 728,
                     height: 90,
                     bidder: "amazon-aps".to_string(),
@@ -417,7 +429,7 @@ mod tests {
                     slot_id: "header-banner".to_string(),
                     price: 3.50,
                     currency: "USD".to_string(),
-                    creative: "<div>Test Ad</div>".to_string(),
+                    creative: Some("<div>Test Ad</div>".to_string()),
                     width: 728,
                     height: 90,
                     bidder: "test-bidder".to_string(),
@@ -510,6 +522,81 @@ mod tests {
 
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
+    }
+
+    #[test]
+    fn test_mediation_request_handles_none_creative() {
+        // Test that bids without creative HTML (e.g., APS) are properly sent to mediation
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let auction_request = AuctionRequest {
+            id: "test-auction".to_string(),
+            slots: vec![AdSlot {
+                id: "slot-1".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "test.com".to_string(),
+                page_url: None,
+            },
+            user: UserInfo {
+                id: "user-1".to_string(),
+                fresh_id: "fresh-1".to_string(),
+                consent: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        };
+
+        let bidder_responses = vec![AuctionResponse {
+            provider: "aps".to_string(),
+            status: BidStatus::Success,
+            bids: vec![Bid {
+                slot_id: "slot-1".to_string(),
+                price: 3.00,
+                currency: "USD".to_string(),
+                creative: None, // APS doesn't provide creative
+                width: 300,
+                height: 250,
+                bidder: "amazon-aps".to_string(),
+                adomain: Some(vec!["amazon.com".to_string()]),
+                nurl: None,
+                burl: None,
+                metadata: HashMap::new(),
+            }],
+            response_time_ms: 100,
+            metadata: HashMap::new(),
+        }];
+
+        let mediation_req = provider
+            .build_mediation_request(&auction_request, &bidder_responses)
+            .expect("should build request");
+
+        // Verify the mediation request structure
+        assert_eq!(mediation_req["id"], "test-auction");
+
+        // Check that the bid was included
+        let bidder_resp = &mediation_req["ext"]["bidder_responses"][0];
+        assert_eq!(bidder_resp["bidder"], "aps");
+
+        let bid = &bidder_resp["bids"][0];
+        assert_eq!(bid["imp_id"], "slot-1");
+        assert_eq!(bid["price"], 3.00);
+
+        // Key assertion: adm should be null (not a string)
+        assert!(
+            bid["adm"].is_null(),
+            "Creative-less bids should have null adm, got: {:?}",
+            bid["adm"]
+        );
     }
 
     #[test]
