@@ -70,22 +70,6 @@ timeout_ms = 2000
 - Best CPM selection
 - All bidders compete equally
 
-### Waterfall
-
-Try APS first, fallback to others:
-
-```toml
-[auction]
-enabled = true
-strategy = "waterfall"
-bidders = ["aps", "prebid"]  # Order matters
-timeout_ms = 2000
-```
-
-**Benefits:**
-- Reduced latency (stops on first bid)
-- Priority to APS demand
-
 ### With Mediation
 
 Use GAM to mediate all bids:

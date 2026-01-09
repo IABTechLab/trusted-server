@@ -99,12 +99,6 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  8. Run Auction Strategy (orchestrator.rs:42)                        │
 │     ┌────────────────────────────────────────────────────────────┐   │
-│     │  Strategy: waterfall                                       │   │
-│     │  1. Try first bidder (e.g., APS)                           │   │
-│     │  2. If bids received, stop and return                      │   │
-│     │  3. Otherwise try next bidder                              │   │
-│     └────────────────────────────────────────────────────────────┘   │
-│     ┌────────────────────────────────────────────────────────────┐   │
 │     │  Strategy: parallel_only                                   │   │
 │     │  1. Launch all bidders concurrently                        │   │
 │     │  2. Wait for all responses                                 │   │
@@ -243,7 +237,7 @@ The orchestrator collects all bids and creates an OpenRTB response:
   ],
   "ext": {
     "orchestrator": {
-      "strategy": "waterfall",
+      "strategy": "parallel_only",
       "bidders": 1,
       "total_bids": 1,
       "time_ms": 5
@@ -369,7 +363,7 @@ The `/auction` endpoint is the primary entry point for auctions:
   ],
   "ext": {
     "orchestrator": {
-      "strategy": "waterfall",
+      "strategy": "parallel_only",
       "bidders": 2,
       "total_bids": 3,
       "time_ms": 150
@@ -393,7 +387,7 @@ Implements the `AuctionProvider` trait to integrate with a specific SSP/ad excha
 ### Auction Flow
 A named configuration that defines:
 - Which providers participate
-- Execution strategy (parallel, waterfall, etc.)
+- Execution strategy (parallel mediation or parallel only)
 - Timeout settings
 - Optional mediator
 
@@ -435,22 +429,6 @@ timeout_ms = 2000
 1. All bidders run in parallel
 2. Highest bid wins
 3. No mediation server involved
-
-### 3. Waterfall
-**Use case:** Sequential fallback when parallel isn't needed
-
-```toml
-[auction]
-enabled = true
-strategy = "waterfall"
-bidders = ["prebid", "aps"]
-timeout_ms = 2000
-```
-
-**Flow:**
-1. Try Prebid first
-2. If Prebid returns no bids, try APS
-3. Return first successful bid
 
 ## Configuration
 

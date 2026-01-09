@@ -51,10 +51,9 @@ impl AuctionOrchestrator {
         let result = match self.config.strategy.as_str() {
             "parallel_mediation" => self.run_parallel_mediation(request, context).await,
             "parallel_only" => self.run_parallel_only(request, context).await,
-            "waterfall" => self.run_waterfall(request, context).await,
             strategy => Err(Report::new(TrustedServerError::Auction {
                 message: format!(
-                    "Unknown auction strategy '{}'. Valid strategies: parallel_mediation, parallel_only, waterfall",
+                    "Unknown auction strategy '{}'. Valid strategies: parallel_mediation, parallel_only",
                     strategy
                 ),
             })),
@@ -147,106 +146,6 @@ impl AuctionOrchestrator {
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let bidder_responses = self.run_bidders_parallel(request, context).await?;
         let winning_bids = self.select_winning_bids(&bidder_responses);
-
-        Ok(OrchestrationResult {
-            bidder_responses,
-            mediator_response: None,
-            winning_bids,
-            total_time_ms: 0,
-            metadata: HashMap::new(),
-        })
-    }
-
-    /// Run auction with waterfall strategy (sequential).
-    async fn run_waterfall(
-        &self,
-        request: &AuctionRequest,
-        context: &AuctionContext<'_>,
-    ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
-        let mut bidder_responses = Vec::new();
-        let mut winning_bids = HashMap::new();
-        let waterfall_start = Instant::now();
-
-        // Try each bidder sequentially until we get bids
-        for bidder_name in self.config.bidder_names() {
-            // Check if timeout has been exceeded
-            if waterfall_start.elapsed().as_millis() as u32 >= context.timeout_ms {
-                log::warn!(
-                    "Waterfall timeout exceeded after {} providers, stopping early",
-                    bidder_responses.len()
-                );
-                break;
-            }
-
-            let provider = match self.providers.get(bidder_name) {
-                Some(p) => p,
-                None => {
-                    log::warn!("Provider '{}' not registered, skipping", bidder_name);
-                    continue;
-                }
-            };
-
-            if !provider.is_enabled() {
-                log::debug!(
-                    "Provider '{}' is disabled, skipping",
-                    provider.provider_name()
-                );
-                continue;
-            }
-
-            log::info!("Waterfall: trying provider {}", provider.provider_name());
-
-            let start_time = Instant::now();
-            match provider.request_bids(request, context) {
-                Ok(pending) => {
-                    match pending.wait() {
-                        Ok(backend_response) => {
-                            let response_time_ms = start_time.elapsed().as_millis() as u64;
-
-                            match provider.parse_response(backend_response, response_time_ms) {
-                                Ok(response) => {
-                                    let has_bids = !response.bids.is_empty()
-                                        && response.status == BidStatus::Success;
-                                    bidder_responses.push(response.clone());
-
-                                    if has_bids {
-                                        // Got bids, stop waterfall
-                                        winning_bids = response
-                                            .bids
-                                            .into_iter()
-                                            .map(|bid| (bid.slot_id.clone(), bid))
-                                            .collect();
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "Provider '{}' failed to parse response in waterfall: {:?}",
-                                        provider.provider_name(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Provider '{}' request failed in waterfall: {:?}",
-                                provider.provider_name(),
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Provider '{}' failed to launch request in waterfall: {:?}",
-                        provider.provider_name(),
-                        e
-                    );
-                    // Continue to next provider
-                }
-            }
-        }
 
         Ok(OrchestrationResult {
             bidder_responses,

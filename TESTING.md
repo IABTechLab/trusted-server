@@ -62,7 +62,7 @@ Edit `trusted-server.toml` to customize the auction:
 # Enable/disable orchestrator
 [auction]
 enabled = true
-strategy = "parallel_mediation"  # or "parallel_only" or "waterfall"
+strategy = "parallel_mediation"  # or "parallel_only"
 bidders = ["prebid", "aps"]
 mediator = "gam"
 timeout_ms = 2000
@@ -113,21 +113,7 @@ bidders = ["prebid", "aps"]
 2. Highest bid wins automatically
 3. No GAM mediation
 
-### Scenario 3: Waterfall
-**Config:**
-```toml
-[auction]
-enabled = true
-strategy = "waterfall"
-bidders = ["prebid", "aps"]
-```
-
-**Expected Flow:**
-1. Try Prebid first
-2. If Prebid returns no bids, try APS
-3. Return first successful bid
-
-### Scenario 4: Legacy Mode (Backward Compatible)
+### Scenario 3: Legacy Mode (Backward Compatible)
 **Config:**
 ```toml
 [auction]

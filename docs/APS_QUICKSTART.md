@@ -113,17 +113,6 @@ server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 ```
 
-### APS First, Prebid Fallback (Waterfall)
-
-Fastest response, APS priority:
-
-```toml
-[auction]
-enabled = true
-strategy = "waterfall"
-bidders = ["aps", "prebid"]  # Order matters!
-```
-
 ### APS + Prebid + GAM Mediation
 
 Let GAM decide winners:

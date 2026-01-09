@@ -9,7 +9,7 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Auction strategy: "parallel_mediation", "waterfall", "parallel_only"
+    /// Auction strategy: "parallel_mediation", "parallel_only"
     #[serde(default = "default_strategy")]
     pub strategy: String,
 

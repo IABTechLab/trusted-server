@@ -72,7 +72,7 @@ rewrite_sdk = true
 # Auction orchestration configuration
 [auction]
 enabled = true
-strategy = "parallel_mediation"  # Options: "parallel_mediation", "parallel_only", "waterfall"
+strategy = "parallel_mediation"  # Options: "parallel_mediation", "parallel_only"
 bidders = ["prebid", "aps_mock"]  # Use mock providers for testing
 mediator = "gam_mock"
 timeout_ms = 2000
