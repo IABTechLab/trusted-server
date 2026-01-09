@@ -62,9 +62,8 @@ Edit `trusted-server.toml` to customize the auction:
 # Enable/disable orchestrator
 [auction]
 enabled = true
-strategy = "parallel_mediation"  # or "parallel_only"
 bidders = ["prebid", "aps"]
-mediator = "gam"
+mediator = "gam"  # If set: mediation, if omitted: highest bid wins
 timeout_ms = 2000
 
 # Mock provider configs
@@ -87,9 +86,8 @@ gam_win_rate = 30  # GAM wins 30% of the time
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_mediation"
 bidders = ["prebid", "aps"]
-mediator = "gam"
+mediator = "gam"  # Mediator configured = parallel mediation strategy
 ```
 
 **Expected Flow:**
@@ -103,9 +101,8 @@ mediator = "gam"
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_only"
 bidders = ["prebid", "aps"]
-# No mediator
+# No mediator = parallel only strategy
 ```
 
 **Expected Flow:**

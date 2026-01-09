@@ -402,9 +402,8 @@ Manages the execution of an auction flow, coordinates providers, and collects re
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_mediation"
 bidders = ["prebid", "aps"]
-mediator = "gam"
+mediator = "gam"  # Setting mediator enables parallel mediation strategy
 timeout_ms = 2000
 ```
 
@@ -420,8 +419,8 @@ timeout_ms = 2000
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_only"
 bidders = ["prebid", "aps"]
+# No mediator = parallel only strategy (highest CPM wins)
 timeout_ms = 2000
 ```
 
@@ -439,11 +438,14 @@ All auction settings are configured directly under `[auction]`:
 ```toml
 [auction]
 enabled = true                      # Enable/disable auction orchestration
-strategy = "parallel_mediation"     # Auction strategy
 bidders = ["prebid", "aps"]        # List of bidder providers
-mediator = "gam"                    # Optional mediator (only for parallel_mediation)
+mediator = "gam"                    # Optional: if set, uses mediation; if omitted, highest bid wins
 timeout_ms = 2000                   # Overall auction timeout
 ```
+
+**Strategy Auto-Detection:**
+- When `mediator` is configured → Runs **parallel mediation** (bidders in parallel, mediator decides winner)
+- When `mediator` is omitted → Runs **parallel only** (bidders in parallel, highest CPM wins)
 
 ### Provider Configuration
 

@@ -60,9 +60,9 @@ Run APS alongside other bidders:
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_only"
 bidders = ["aps", "prebid"]
 timeout_ms = 2000
+# No mediator = parallel only (highest CPM wins)
 ```
 
 **Benefits:**
@@ -77,9 +77,8 @@ Use GAM to mediate all bids:
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_mediation"
 bidders = ["aps", "prebid"]
-mediator = "gam"
+mediator = "gam"  # Enables parallel mediation (GAM decides winner)
 timeout_ms = 2000
 ```
 

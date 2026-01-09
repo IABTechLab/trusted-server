@@ -38,7 +38,11 @@ impl AuctionOrchestrator {
         self.providers.len()
     }
 
-    /// Execute an auction using the configured strategy.
+    /// Execute an auction using the auto-detected strategy.
+    ///
+    /// Strategy is determined by mediator configuration:
+    /// - If mediator is configured: runs parallel mediation (bidders → mediator decides)
+    /// - If no mediator: runs parallel only (bidders → highest CPM wins)
     pub async fn run_auction(
         &self,
         request: &AuctionRequest,
@@ -46,18 +50,23 @@ impl AuctionOrchestrator {
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let start_time = Instant::now();
 
-        log::info!("Running auction with strategy: {}", self.config.strategy);
+        // Auto-detect strategy based on mediator configuration
+        let (strategy_name, result) = if self.config.has_mediator() {
+            (
+                "parallel_mediation",
+                self.run_parallel_mediation(request, context).await?,
+            )
+        } else {
+            (
+                "parallel_only",
+                self.run_parallel_only(request, context).await?,
+            )
+        };
 
-        let result = match self.config.strategy.as_str() {
-            "parallel_mediation" => self.run_parallel_mediation(request, context).await,
-            "parallel_only" => self.run_parallel_only(request, context).await,
-            strategy => Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Unknown auction strategy '{}'. Valid strategies: parallel_mediation, parallel_only",
-                    strategy
-                ),
-            })),
-        }?;
+        log::info!(
+            "Running auction with strategy: {} (auto-detected from mediator config)",
+            strategy_name
+        );
 
         Ok(OrchestrationResult {
             total_time_ms: start_time.elapsed().as_millis() as u64,
@@ -429,7 +438,6 @@ mod tests {
     async fn test_no_bidders_configured() {
         let config = AuctionConfig {
             enabled: true,
-            strategy: "parallel_only".to_string(),
             bidders: vec![],
             mediator: None,
             timeout_ms: 2000,

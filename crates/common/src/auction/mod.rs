@@ -385,12 +385,19 @@ fn convert_to_openrtb_response(
         }));
     }
 
+    // Determine strategy name for response metadata
+    let strategy_name = if settings.auction.has_mediator() {
+        "parallel_mediation"
+    } else {
+        "parallel_only"
+    };
+
     let response_body = json!({
         "id": auction_id,
         "seatbid": seatbids,
         "ext": {
             "orchestrator": {
-                "strategy": settings.auction.strategy,
+                "strategy": strategy_name,
                 "bidders": result.bidder_responses.len(),
                 "total_bids": result.total_bids(),
                 "time_ms": result.total_time_ms

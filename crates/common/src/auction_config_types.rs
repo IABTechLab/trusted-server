@@ -9,16 +9,14 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Auction strategy: "parallel_mediation", "parallel_only"
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
-
     /// Provider names that participate in bidding
     /// Simply list the provider names (e.g., ["prebid", "aps"])
     #[serde(default)]
     pub bidders: Vec<String>,
 
     /// Optional mediator provider name (e.g., "gam")
+    /// When set, runs parallel mediation strategy (bidders in parallel, then mediator decides)
+    /// When omitted, runs parallel only strategy (bidders in parallel, highest CPM wins)
     pub mediator: Option<String>,
 
     /// Timeout in milliseconds
@@ -28,10 +26,6 @@ pub struct AuctionConfig {
     /// KV store name for creative storage
     #[serde(default = "default_creative_store")]
     pub creative_store: String,
-}
-
-fn default_strategy() -> String {
-    "parallel_mediation".to_string()
 }
 
 fn default_timeout() -> u32 {

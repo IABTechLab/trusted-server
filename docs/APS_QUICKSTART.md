@@ -87,8 +87,8 @@ INFO APS returned 2 bids in 150ms
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_only"
 bidders = ["aps"]
+# No mediator = parallel only (highest CPM wins)
 ```
 
 ### APS + Prebid (Parallel)
@@ -98,9 +98,9 @@ Best for maximum revenue:
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_only"
 bidders = ["aps", "prebid"]
 timeout_ms = 2000
+# No mediator = all bidders compete, highest CPM wins
 
 [integrations.aps]
 enabled = true
@@ -120,9 +120,8 @@ Let GAM decide winners:
 ```toml
 [auction]
 enabled = true
-strategy = "parallel_mediation"
 bidders = ["aps", "prebid"]
-mediator = "gam"
+mediator = "gam"  # Setting mediator enables parallel mediation
 ```
 
 ## Testing Without Live Credentials
