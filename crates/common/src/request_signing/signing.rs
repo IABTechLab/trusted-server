@@ -11,7 +11,7 @@ use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 
 pub fn get_current_key_id() -> Result<String, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
-    store.get("current-kid")
+    store.get_required("current-kid")
 }
 
 fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, TrustedServerError> {
@@ -42,7 +42,7 @@ pub struct RequestSigner {
 impl RequestSigner {
     pub fn from_config() -> Result<Self, TrustedServerError> {
         let config_store = FastlyConfigStore::new("jwks_store");
-        let key_id = config_store.get("current-kid")?;
+        let key_id = config_store.get_required("current-kid")?;
 
         let secret_store = FastlySecretStore::new("signing_keys");
         let key_bytes = secret_store.get(&key_id)?;
@@ -67,7 +67,7 @@ pub fn verify_signature(
     kid: &str,
 ) -> Result<bool, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
-    let jwk_json = store.get(kid)?;
+    let jwk_json = store.get_required(kid)?;
 
     let jwk: serde_json::Value =
         serde_json::from_str(&jwk_json).map_err(|e| TrustedServerError::Configuration {

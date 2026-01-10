@@ -5,6 +5,7 @@ use log_fastly::Logger;
 
 use trusted_server_common::auth::enforce_basic_auth;
 use trusted_server_common::error::TrustedServerError;
+use trusted_server_common::fastly_storage::FastlyConfigStore;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -16,7 +17,7 @@ use trusted_server_common::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_common::settings::Settings;
-use trusted_server_common::settings_data::get_settings;
+use trusted_server_common::settings_data::{get_settings_from_store, DEFAULT_SETTINGS_STORE_NAME};
 
 mod error;
 use crate::error::to_error_response;
@@ -25,14 +26,33 @@ use crate::error::to_error_response;
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
 
-    let settings = match get_settings() {
-        Ok(s) => s,
+    // Load settings from Config Store (required - no fallback)
+    let config_store = FastlyConfigStore::new(DEFAULT_SETTINGS_STORE_NAME);
+    let loaded = match get_settings_from_store(&config_store, DEFAULT_SETTINGS_STORE_NAME) {
+        Ok(l) => l,
         Err(e) => {
-            log::error!("Failed to load settings: {:?}", e);
+            log::error!(
+                "Failed to load settings from Config Store '{}': {:?}",
+                DEFAULT_SETTINGS_STORE_NAME,
+                e
+            );
             return Ok(to_error_response(e));
         }
     };
-    log::info!("Settings {settings:?}");
+
+    log::info!(
+        "Settings loaded from Config Store '{}', hash: {}",
+        DEFAULT_SETTINGS_STORE_NAME,
+        loaded.hash
+    );
+
+    let settings = loaded.settings;
+    log::debug!(
+        "Settings loaded: handlers={}, integrations={}, response_headers={}",
+        settings.handlers.len(),
+        settings.integrations.len(),
+        settings.response_headers.len()
+    );
     let integration_registry = IntegrationRegistry::new(&settings);
 
     futures::executor::block_on(route_request(settings, integration_registry, req))

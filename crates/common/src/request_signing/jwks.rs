@@ -53,7 +53,7 @@ impl Keypair {
 
 pub fn get_active_jwks() -> Result<String, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
-    let active_kids_str = store.get("active-kids")?;
+    let active_kids_str = store.get_required("active-kids")?;
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
@@ -63,7 +63,7 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 
     let mut jwks = Vec::new();
     for kid in active_kids {
-        let jwk = store.get(kid)?;
+        let jwk = store.get_required(kid)?;
         jwks.push(jwk);
     }
 

@@ -42,6 +42,10 @@ build = """
             env = "FASTLY_KEY"
 
     [local_server.config_stores]
+        [local_server.config_stores.trusted-server-config]
+            format = "json"
+            file = "target/trusted-server-config.json"
+
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]

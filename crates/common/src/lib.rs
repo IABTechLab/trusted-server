@@ -23,6 +23,7 @@
 
 pub mod auth;
 pub mod backend;
+pub mod config_store;
 pub mod constants;
 pub mod cookies;
 pub mod creative;

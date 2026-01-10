@@ -42,13 +42,15 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 ### Custom Domain Setup
 
 1. **Update CNAME file**: Edit `docs/public/CNAME` with your domain:
+
    ```
    docs.yourdomain.com
    ```
 
 2. **Configure DNS**: Add DNS records at your domain provider:
-   
+
    **Option A - CNAME Record** (recommended for subdomains):
+
    ```
    Type: CNAME
    Name: docs
@@ -56,6 +58,7 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
    ```
 
    **Option B - A Records** (for apex domains):
+
    ```
    Type: A
    Name: @
@@ -73,11 +76,13 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 
 ### Workflow Details
 
-**Trigger**: 
+**Trigger**:
+
 - Push to `main` branch (only when `docs/**` changes)
 - Manual trigger via Actions tab
 
 **Build Process**:
+
 1. Checkout repository with full history (for `lastUpdated` feature)
 2. Setup Node.js (version from `.tool-versions`)
 3. Install dependencies (`npm ci`)
@@ -86,6 +91,7 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 6. Deploy to GitHub Pages
 
 **Permissions Required**:
+
 - `contents: read` - Read repository
 - `pages: write` - Deploy to Pages
 - `id-token: write` - OIDC token for deployment
@@ -95,11 +101,13 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 ### Build Fails in GitHub Actions
 
 **Check**:
+
 - Node.js version matches `.tool-versions`
 - All dependencies in `package.json` are correct
 - Build succeeds locally (`npm run build`)
 
 **View Logs**:
+
 1. Go to **Actions** tab in GitHub
 2. Click on failed workflow run
 3. Review build logs
@@ -107,12 +115,14 @@ The documentation is automatically deployed to GitHub Pages when changes are pus
 ### Custom Domain Not Working
 
 **Check**:
+
 - DNS records propagated (use `dig docs.yourdomain.com`)
 - CNAME file exists in `docs/public/CNAME`
 - Custom domain verified in GitHub Pages settings
 - HTTPS enforced (may take up to 24 hours)
 
 **DNS Verification**:
+
 ```bash
 # Check CNAME record
 dig docs.yourdomain.com CNAME
@@ -124,6 +134,7 @@ dig yourdomain.com A
 ### 404 Errors
 
 **Check**:
+
 - VitePress `base` config (should not be set for custom domains)
 - Links use correct paths (start with `/`)
 - Build output in `docs/.vitepress/dist` is correct
