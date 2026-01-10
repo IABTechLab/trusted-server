@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Trusted Server"
-  text: "Privacy-Preserving Edge Computing"
-  tagline: GDPR-compliant ad serving and synthetic ID generation at the edge
+  text: "The New Execution Layer for the Open-Web"
+  tagline: "Returning control of: content monetization, proprietary data, security, and overall user-experience back to publishers."
   actions:
     - theme: brand
       text: Get Started
