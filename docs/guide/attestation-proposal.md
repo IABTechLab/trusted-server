@@ -163,20 +163,21 @@ Two foundational architectural decisions enable comprehensive attestation:
 
 ### Implementation Path
 
-1. **Phase 1 - Foundation**
-   - Add GitHub Attestations to CI for core binary
-   - Implement Config Store loading with platform abstraction
-   - Build `ts-cli` for config management
+1. **Phase 1 - Config Store Implementation**
+   - Implement `ConfigStore` trait with platform abstraction
+   - Add Fastly, Cloudflare, and Akamai backends
+   - Build `ts-cli` for config management (`config push`, `validate`, `hash`)
+   - Migrate from embedded config to runtime Config Store loading
 
-2. **Phase 2 - Modular Integrations**
-   - Extract `integration-api` crate defining stable ABI
-   - Split integrations into optional feature crates
-   - Each integration includes embedded attestation metadata
+2. **Phase 2 - Attestation**
+   - Add GitHub Attestations (Sigstore/SLSA) to CI for WASM binary
+   - Implement `/.well-known/trusted-server-attestation.json` endpoint
+   - Expose config hash in runtime attestation
 
 3. **Phase 3 - Vendor Code Ownership**
-   - Integrations remain in trusted-server repo with vendor CODEOWNERS
+   - Set up CODEOWNERS for integration directories
    - Vendors review/approve changes to their integration code
-   - IAB CI attests integrations on behalf of vendors after approval
+   - IAB CI attests the unified binary after vendor approval
 
 ## Architecture Diagrams
 
@@ -257,7 +258,7 @@ sequenceDiagram
         Note over TS,VEN: Ad Request Flow
         TS->>VEN: OpenRTB bid request +<br/>attestation claims
         VEN->>TS: GET /.well-known/trusted-server-attestation.json
-        TS-->>VEN: {binary_hash, config_hash}
+        TS-->>VEN: DSSE attestation (binary + config)
         VEN->>SIG: Verify binary_hash against transparency log
         SIG-->>VEN: Binary provenance confirmed
         VEN-->>TS: Bid response
@@ -420,7 +421,7 @@ Config Store keys are standardized:
 
 - `settings` contains the UTF-8 TOML payload
 - `settings-hash` (optional) contains `sha256:<hex>` of the exact bytes stored under `settings`
-- `settings-signature` (optional) contains an Ed25519 signature (or DSSE/JWS envelope) over the exact bytes stored under `settings`
+- `settings-signature` (optional) contains a DSSE envelope whose payload is the exact bytes stored under `settings` (use `payloadType: application/vnd.iab.trusted-server.config+toml`)
 - `settings-metadata` (optional) is JSON containing `version`, `published_at` (RFC3339), `valid_until` (RFC3339), and optional `policy_id` (validated policy/schema identifier)
 
 #### Fastly Implementation
@@ -529,75 +530,84 @@ sequenceDiagram
     TS->>TS: Compute config_hash from stored bytes (or read settings-hash)
 
     VEN->>TS: GET /.well-known/trusted-server-attestation.json
-    TS-->>VEN: {binary_hash, config_hash}
+    TS-->>VEN: DSSE attestation (binary + config)
 
     VEN->>GH: Verify binary_hash (Sigstore)
     VEN->>VEN: Binary is from official IAB repo
 ```
 
-### Attestation Document Structure
+### Runtime Attestation Statement (in-toto)
+
+Sigstore uses DSSE envelopes carrying in-toto Statements. The runtime attestation should follow the same pattern.
 
 ```json
 {
-  "version": "1.0",
-  "binary": {
-    "name": "trusted-server",
-    "version": "1.5.0",
-    "hash": "sha256:abc123...",
-    "git_commit": "def456...",
-    "sigstore_log_index": 123456,
-    "attested_by": {
-      "identity": "iab-tech-lab",
-      "oidc_issuer": "https://token.actions.githubusercontent.com",
-      "certificate_subject": "https://github.com/IABTechLab/trusted-server/.github/workflows/release.yml@refs/tags/v1.5.0"
-    }
-  },
-  "integrations": [
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
     {
-      "name": "prebid",
-      "enabled": true,
-      "codeowner": "@prebid/trusted-server-maintainers"
-    },
-    {
-      "name": "didomi",
-      "enabled": true,
-      "codeowner": "@didomi/trusted-server-maintainers"
+      "name": "trusted-server-fastly.wasm",
+      "digest": {
+        "sha256": "abc123..."
+      }
     }
   ],
-  "config": {
-    "hash": "sha256:789abc...",
-    "source": "config_store",
-    "version": "2026-02-15T10:30:00Z",
-    "published_at": "2026-02-15T10:30:00Z",
-    "valid_until": "2026-02-16T10:30:00Z",
-    "policy_id": "prebid-v1"
-  },
-  "signature": "ed25519:...",
-  "kid": "publisher-2026-A"
+  "predicateType": "https://iab.com/trusted-server/runtime-attestation/v1",
+  "predicate": {
+    "version": "1.0",
+    "binary": {
+      "name": "trusted-server",
+      "version": "1.5.0",
+      "hash": "sha256:abc123...",
+      "git_commit": "def456...",
+      "sigstore_log_index": 123456,
+      "attested_by": {
+        "identity": "iab-tech-lab",
+        "oidc_issuer": "https://token.actions.githubusercontent.com",
+        "certificate_subject": "https://github.com/IABTechLab/trusted-server/.github/workflows/release.yml@refs/tags/v1.5.0"
+      }
+    },
+    "integrations": [
+      {
+        "name": "prebid",
+        "enabled": true,
+        "codeowner": "@prebid/trusted-server-maintainers"
+      },
+      {
+        "name": "didomi",
+        "enabled": true,
+        "codeowner": "@didomi/trusted-server-maintainers"
+      }
+    ],
+    "config": {
+      "hash": "sha256:789abc...",
+      "source": "config_store",
+      "version": "2026-02-15T10:30:00Z",
+      "published_at": "2026-02-15T10:30:00Z",
+      "valid_until": "2026-02-16T10:30:00Z",
+      "policy_id": "prebid-v1"
+    }
+  }
 }
 ```
 
 **Signature and hashing rules:**
 
-- Preferred transport is a DSSE envelope; the JSON shown here is the payload. When using DSSE, omit `signature` and `kid` from the payload.
-- If a bare JSON payload is used, `signature` is computed over a canonical JSON form of this document with `signature` and `kid` omitted (use RFC 8785 JCS to avoid ambiguity)
-- `signature` format is `ed25519:<base64url>`
-- `kid` identifies the deployment signing key published in `/.well-known/trusted-server.json` (reuses the request-signing JWKS)
+- The Statement is wrapped in a DSSE envelope with `payloadType: application/vnd.in-toto+json`
+- `keyid` in the DSSE signature identifies the deployment signing key published in `/.well-known/trusted-server.json` (reuses the request-signing JWKS)
 - `binary.hash` is embedded at build time (the runtime does not compute it from the module)
+- `subject.digest.sha256` must match `binary.hash` (without the `sha256:` prefix)
 - `config.hash` is SHA-256 over the exact bytes stored under `settings` (LF-normalized), represented as `sha256:<hex>`
 - If `settings-signature` is present, it is verified before the config is parsed or used
 
-Vendors verify `binary.hash` against the Sigstore transparency log and verify `signature` using the JWKS.
+Vendors verify `binary.hash` against the Sigstore transparency log and verify the DSSE signature using the JWKS.
 If `sigstore_log_index` is present, vendors can resolve the log entry directly without searching.
 
-#### Attestation Envelope (Recommended)
-
-Wrap the payload in a DSSE envelope to avoid JSON canonicalization ambiguity and to use standard tooling:
+#### Attestation Envelope (Sigstore/DSSE)
 
 ```json
 {
-  "payloadType": "application/vnd.iab.trusted-server-attestation+json",
-  "payload": "eyJ2ZXJzaW9uIjoiMS4wIiwgLi4uIH0",
+  "payloadType": "application/vnd.in-toto+json",
+  "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLC4uLn0",
   "signatures": [
     {
       "keyid": "publisher-2026-A",
@@ -647,7 +657,7 @@ flowchart TB
 | **Config tampering**     | Detectable via hash mismatch                           | Runtime hash computation + attestation             |
 | **Config authenticity**  | Verify signed config payload                           | `settings-signature` checked before parsing config |
 | **Rollback protection**  | Config version + validity window                       | Prevents replay of stale configs                   |
-| **Attestation envelope** | DSSE (or JWS/COSE)                                     | Avoids canonicalization ambiguity, better tooling  |
+| **Attestation envelope** | DSSE (Sigstore standard)                              | Avoids canonicalization ambiguity, better tooling  |
 | **Request binding**      | Include `attestation_hash` in signed request           | Cryptographically binds runtime claims per request |
 | **Provenance lookup**    | Include Sigstore log index or bundle                   | Enables low-latency verification                   |
 | **Multi-platform**       | Abstract via trait                                     | Same WASM binary logic, platform-specific backends |
@@ -914,7 +924,7 @@ pub fn compute_config_hash(path: &Path) -> Result<String, Error> {
 
 `ts-cli` should upload the normalized bytes and store `settings-hash` computed from the same payload so runtime and CLI hashes always match.
 
-If signing is enabled, `ts-cli` should also emit `settings-signature` over the normalized bytes and write `settings-metadata` with `version`, `published_at` (defaulting to now), and optional `valid_until`/`policy_id`.
+If signing is enabled, `ts-cli` should also emit `settings-signature` as a DSSE envelope over the normalized bytes and write `settings-metadata` with `version`, `published_at` (defaulting to now), and optional `valid_until`/`policy_id`.
 
 #### Attestation Document Format
 
@@ -952,6 +962,8 @@ The CLI generates attestation documents compatible with Sigstore/in-toto:
   }
 }
 ```
+
+Publish this Statement as a DSSE envelope (`payloadType: application/vnd.in-toto+json`) to align with Sigstore tooling.
 
 #### Integration with CI/CD
 
@@ -1123,45 +1135,26 @@ trusted-server/
 
 ### Attestation Document
 
-The attestation document exposed at `/.well-known/trusted-server-attestation.json` includes integration metadata:
+The attestation document exposed at `/.well-known/trusted-server-attestation.json` is a DSSE envelope whose payload is the in-toto Statement shown earlier. Integration metadata lives under `predicate.integrations`:
 
 ```json
 {
-  "version": "1.0",
-  "binary": {
-    "name": "trusted-server",
-    "version": "1.5.0",
-    "hash": "sha256:abc123...",
-    "git_commit": "a1b2c3d4e5f6...",
-    "sigstore_log_index": 123456,
-    "attested_by": {
-      "identity": "iab-tech-lab",
-      "oidc_issuer": "https://token.actions.githubusercontent.com",
-      "certificate_subject": "https://github.com/IABTechLab/trusted-server/.github/workflows/release.yml@refs/tags/v1.5.0"
-    }
-  },
-  "integrations": [
-    {
-      "name": "prebid",
-      "enabled": true,
-      "codeowner": "@prebid/trusted-server-maintainers"
-    },
-    {
-      "name": "didomi",
-      "enabled": true,
-      "codeowner": "@didomi/trusted-server-maintainers"
-    }
-  ],
-  "config": {
-    "hash": "sha256:789abc...",
-    "source": "config_store",
-    "version": "2026-02-15T10:30:00Z",
-    "published_at": "2026-02-15T10:30:00Z",
-    "valid_until": "2026-02-16T10:30:00Z",
-    "policy_id": "prebid-v1"
-  },
-  "signature": "ed25519:...",
-  "kid": "publisher-2026-A"
+  "_type": "https://in-toto.io/Statement/v1",
+  "predicateType": "https://iab.com/trusted-server/runtime-attestation/v1",
+  "predicate": {
+    "integrations": [
+      {
+        "name": "prebid",
+        "enabled": true,
+        "codeowner": "@prebid/trusted-server-maintainers"
+      },
+      {
+        "name": "didomi",
+        "enabled": true,
+        "codeowner": "@didomi/trusted-server-maintainers"
+      }
+    ]
+  }
 }
 ```
 
@@ -1293,14 +1286,12 @@ pub struct RuntimeAttestation {
     pub integrations: Vec<IntegrationMetadata>,
     /// Timestamp of attestation computation
     pub computed_at: u64,
-    /// Hash of the attestation payload (for request binding)
+    /// Hash of the in-toto Statement payload (for request binding)
     pub attestation_hash: [u8; 32],
-    /// Signature over this attestation (using deployment signing key)
-    pub signature: String,
 }
 ```
 
-Compute `attestation_hash` over the canonical attestation payload (or DSSE payload) before signing; do not include `attestation_hash` inside the payload itself.
+Compute `attestation_hash` over the in-toto Statement bytes before signing; do not include `attestation_hash` inside the payload itself.
 
 #### Attestation Endpoint
 
@@ -1312,31 +1303,17 @@ pub async fn handle_attestation_request(
 ) -> Result<Response, Report<TrustedServerError>> {
     let attestation = compute_runtime_attestation(settings)?;
 
-    let body = json!({
-        "version": "1.0",
-        "binary": {
-            "name": &attestation.binary_name,
-            "version": &attestation.version,
-            "git_commit": &attestation.git_commit,
-            "sigstore_log_index": &attestation.sigstore_log_index,
-            "hash": format!("sha256:{}", hex::encode(&attestation.binary_hash)),
-        },
-        "config": {
-            "hash": format!("sha256:{}", hex::encode(&attestation.config_hash)),
-            "source": "config_store",
-            "version": &attestation.config_version,
-            "published_at": &attestation.config_published_at,
-            "valid_until": &attestation.config_valid_until,
-            "policy_id": &attestation.config_policy_id,
-        },
-        "integrations": &attestation.integrations,
-        "signature": &attestation.signature,
-        "kid": get_current_key_id()?,
-    });
+    let statement = build_runtime_statement(&attestation)?;
+    let envelope = dsse::sign(
+        serde_json::to_vec(&statement)?,
+        "application/vnd.in-toto+json",
+        &load_signing_key()?,
+        get_current_key_id()?,
+    )?;
 
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
-        .with_body(serde_json::to_vec(&body)?))
+        .with_body(serde_json::to_vec(&envelope)?))
 }
 ```
 
@@ -1406,7 +1383,7 @@ The request signing scheme should cover the attestation claims (or at least `att
 | Publisher replays old attestation     | Timestamp + per-request nonce (e.g., OpenRTB request ID) + freshness window + attestation hash bound to request sign |
 | Config store tampering                | Verify `settings-signature` before parsing or using config                                                           |
 | Rollback to stale config              | `config_version` + `published_at` + `valid_until` checks                                                             |
-| Attestation tampering                 | DSSE/JWS/COSE envelope with verified key id                                                                          |
+| Attestation tampering                 | DSSE envelope with verified key id                                                                                  |
 | Vendor key compromise                 | Key rotation, transparency log, short-lived signatures                                                               |
 | Schema downgrade                      | Version pinning, schema hash in attestation                                                                          |
 | Side-channel config leaks             | Only expose hashes, not actual values                                                                                |
