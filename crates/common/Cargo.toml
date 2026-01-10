@@ -37,6 +37,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 trusted-server-js = { path = "../js" }
 url = { workspace = true }
@@ -45,19 +46,6 @@ uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 once_cell = { workspace = true }
-
-[build-dependencies]
-config = { workspace = true }
-derive_more = { workspace = true }
-error-stack = { workspace = true }
-http = { workspace = true }
-log = { workspace = true }
-regex = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
-url = { workspace = true }
-validator = { workspace = true }
 
 [features]
 default = []

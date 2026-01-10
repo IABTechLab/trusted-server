@@ -5,7 +5,7 @@ use error_stack::{Report, ResultExt};
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
 use url::Url;
@@ -69,7 +69,7 @@ impl Publisher {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
-    entries: HashMap<String, JsonValue>,
+    entries: BTreeMap<String, JsonValue>,
 }
 
 pub trait IntegrationConfig: DeserializeOwned + Validate {
@@ -154,7 +154,7 @@ impl IntegrationSettings {
 }
 
 impl Deref for IntegrationSettings {
-    type Target = HashMap<String, JsonValue>;
+    type Target = BTreeMap<String, JsonValue>;
 
     fn deref(&self) -> &Self::Target {
         &self.entries
@@ -272,7 +272,7 @@ pub struct Settings {
     #[validate(nested)]
     pub handlers: Vec<Handler>,
     #[serde(default)]
-    pub response_headers: HashMap<String, String>,
+    pub response_headers: BTreeMap<String, String>,
     pub request_signing: Option<RequestSigning>,
     #[serde(default)]
     #[validate(nested)]
@@ -338,6 +338,19 @@ impl Settings {
 
         settings.publisher.normalize();
         Ok(settings)
+    }
+
+    /// Serializes [`Settings`] to a deterministic TOML representation.
+    ///
+    /// This is used for hashing and config store storage.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if serialization fails
+    pub fn to_canonical_toml(&self) -> Result<String, Report<TrustedServerError>> {
+        toml::to_string_pretty(self).change_context(TrustedServerError::Configuration {
+            message: "Failed to serialize configuration".to_string(),
+        })
     }
 
     #[must_use]

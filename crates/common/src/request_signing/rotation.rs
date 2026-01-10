@@ -51,7 +51,7 @@ impl KeyRotationManager {
 
         let keypair = Keypair::generate();
         let jwk = keypair.get_jwk(new_kid.clone());
-        let previous_kid = self.config_store.get("current-kid").ok();
+        let previous_kid = self.config_store.get_required("current-kid").ok();
 
         self.store_private_key(&new_kid, &keypair.signing_key)?;
         self.store_public_jwk(&new_kid, &jwk)?;
@@ -119,7 +119,7 @@ impl KeyRotationManager {
     }
 
     pub fn list_active_keys(&self) -> Result<Vec<String>, TrustedServerError> {
-        let active_kids_str = self.config_store.get("active-kids")?;
+        let active_kids_str = self.config_store.get_required("active-kids")?;
 
         let active_kids: Vec<String> = active_kids_str
             .split(',')

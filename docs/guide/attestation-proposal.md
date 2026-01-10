@@ -159,14 +159,14 @@ Two foundational architectural decisions enable comprehensive attestation:
 | **Integration Ownership** | Vendor CODEOWNERS in monorepo; vendors review/approve their integration code                                                      |
 | **Config Store**          | Platform-agnostic loading from Fastly Config Store, Cloudflare KV, or Akamai EdgeKV                                               |
 | **Runtime Verification**  | `/.well-known/trusted-server-attestation.json` exposes binary attestation reference + config hash/metadata + integration metadata |
-| **CLI Tooling**           | `ts-cli` for config deployment, validation, and attestation across platforms                                                      |
+| **CLI Tooling**           | `tscli` for config deployment, validation, and attestation across platforms                                                      |
 
 ### Implementation Path
 
 1. **Phase 1 - Config Store Implementation**
    - Implement `ConfigStore` trait with platform abstraction
    - Add Fastly, Cloudflare, and Akamai backends
-   - Build `ts-cli` for config management (`config push`, `validate`, `hash`)
+   - Build `tscli` for config management (`config push`, `validate`, `hash`)
    - Migrate from embedded config to runtime Config Store loading
 
 2. **Phase 2 - Attestation**
@@ -247,7 +247,7 @@ sequenceDiagram
     SIG-->>GH: Signed provenance + transparency log
 
     Note over PUB,CFG: Config Deployment
-    PUB->>PUB: ts-cli config push --file config.toml
+    PUB->>PUB: tscli config push --file config.toml
     PUB->>CFG: Upload config to Config Store
 
     Note over TS,VEN: Runtime
@@ -624,7 +624,7 @@ flowchart TB
     subgraph PHASE1 ["Phase 1: Config Store Implementation"]
         P1A[Implement ConfigStore trait]
         P1B[Add Fastly/Cloudflare/Akamai backends]
-        P1C[ts-cli config push command]
+        P1C[tscli config push command]
         P1A --> P1B --> P1C
     end
 
@@ -652,7 +652,7 @@ flowchart TB
 | Aspect                   | Design Decision                                        | Rationale                                          |
 | ------------------------ | ------------------------------------------------------ | -------------------------------------------------- |
 | **Config source**        | Config Store only (no embedded fallback in production) | Ensures consistent attestation model               |
-| **Local development**    | Mock config store or env-based loading                 | `ts-cli` can populate local Viceroy config store   |
+| **Local development**    | Mock config store or env-based loading                 | `tscli` can populate local Viceroy config store   |
 | **Cold start latency**   | Accept slight overhead                                 | Config Store reads are fast (<10ms on Fastly)      |
 | **Config tampering**     | Detectable via hash mismatch                           | Runtime hash computation + attestation             |
 | **Config authenticity**  | Verify signed config payload                           | `settings-signature` checked before parsing config |
@@ -663,7 +663,7 @@ flowchart TB
 | **Multi-platform**       | Abstract via trait                                     | Same WASM binary logic, platform-specific backends |
 | **Eventual consistency** | Include config version + publish time                  | Vendors can detect stale configs briefly           |
 
-### CLI Tool: `ts-cli`
+### CLI Tool: `tscli`
 
 To support the Config Store workflow, we need a CLI tool for managing configuration deployment and attestation. This tool bridges local development with edge deployment.
 
@@ -671,30 +671,30 @@ To support the Config Store workflow, we need a CLI tool for managing configurat
 
 ```bash
 # Push config to edge platform (auto-detects from config or --platform flag)
-ts-cli config push --file trusted-server.toml
+tscli config push --file trusted-server.toml
 
 # Push to specific platform
-ts-cli config push --platform fastly --store-id <STORE_ID> --file trusted-server.toml
-ts-cli config push --platform cloudflare --namespace <NS_ID> --file trusted-server.toml
-ts-cli config push --platform akamai --namespace <NS> --group <GRP> --file trusted-server.toml
+tscli config push --platform fastly --store-id <STORE_ID> --file trusted-server.toml
+tscli config push --platform cloudflare --namespace <NS_ID> --file trusted-server.toml
+tscli config push --platform akamai --namespace <NS> --group <GRP> --file trusted-server.toml
 
 # Push with signature + metadata (recommended)
-ts-cli config push --platform fastly --store-id <STORE_ID> --file trusted-server.toml --sign --key signing-key.pem --version 2026-02-15T10:30:00Z
+tscli config push --platform fastly --store-id <STORE_ID> --file trusted-server.toml --sign --key signing-key.pem --version 2026-02-15T10:30:00Z
 
 # Validate config syntax
-ts-cli config validate --file trusted-server.toml
+tscli config validate --file trusted-server.toml
 
 # Show config hash (SHA-256) for attestation
-ts-cli config hash --file trusted-server.toml
+tscli config hash --file trusted-server.toml
 
 # Compare local config with deployed config
-ts-cli config diff --platform fastly --store-id <STORE_ID> --file trusted-server.toml
+tscli config diff --platform fastly --store-id <STORE_ID> --file trusted-server.toml
 
 # Generate attestation document for config
-ts-cli attest config --file trusted-server.toml --sign --key signing-key.pem
+tscli attest config --file trusted-server.toml --sign --key signing-key.pem
 
 # Pull current config from Config Store (for debugging)
-ts-cli config pull --platform fastly --store-id <STORE_ID> --output current.toml
+tscli config pull --platform fastly --store-id <STORE_ID> --output current.toml
 ```
 
 #### Architecture
@@ -703,7 +703,7 @@ ts-cli config pull --platform fastly --store-id <STORE_ID> --output current.toml
 flowchart LR
     subgraph LOCAL ["Local Development"]
         TOML["trusted-server.toml"]
-        CLI["ts-cli"]
+        CLI["tscli"]
     end
 
     subgraph PLATFORMS ["Edge Platforms"]
@@ -744,12 +744,12 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant Dev as Developer
-    participant CLI as ts-cli
+    participant CLI as tscli
     participant Val as Validator
     participant API as Platform API
     participant CS as Config Store
 
-    Dev->>CLI: ts-cli config push --platform fastly --file config.toml
+    Dev->>CLI: tscli config push --platform fastly --file config.toml
     CLI->>CLI: Normalize line endings + parse TOML
     CLI->>Val: Validate against schemas
 
@@ -778,14 +778,14 @@ sequenceDiagram
 
 #### Implementation
 
-The CLI would be implemented as a Rust binary in `crates/ts-cli/`:
+The CLI would be implemented as a Rust binary in `crates/cli/`:
 
 ```rust
-// crates/ts-cli/src/main.rs
+// crates/cli/src/main.rs
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ts-cli")]
+#[command(name = "tscli")]
 #[command(about = "Trusted Server CLI for config and attestation management")]
 struct Cli {
     #[command(subcommand)]
@@ -904,27 +904,24 @@ enum AttestAction {
 #### Config Hash Computation
 
 ```rust
-// crates/ts-cli/src/hash.rs
-use sha2::{Sha256, Digest};
+// crates/cli/src/hash.rs
 use std::fs;
 
 pub fn compute_config_hash(path: &Path) -> Result<String, Error> {
-    // Read and normalize line endings to avoid OS-dependent hashes
     let content = fs::read_to_string(path)?;
-    let normalized = content.replace("\r\n", "\n");
 
-    // Compute SHA-256 over the exact bytes that will be stored
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let hash = hasher.finalize();
+    // Apply environment overrides, validate, and serialize deterministically.
+    let settings = Settings::from_toml(&content)?;
+    settings.validate()?;
+    let canonical = settings.to_canonical_toml()?;
 
-    Ok(format!("sha256:{}", hex::encode(hash)))
+    Ok(compute_settings_hash(&canonical))
 }
 ```
 
-`ts-cli` should upload the normalized bytes and store `settings-hash` computed from the same payload so runtime and CLI hashes always match.
+`tscli` should upload the canonicalized bytes (after env overrides) and store `settings-hash` computed from the same payload so runtime and CLI hashes always match.
 
-If signing is enabled, `ts-cli` should also emit `settings-signature` as a DSSE envelope over the normalized bytes and write `settings-metadata` with `version`, `published_at` (defaulting to now), and optional `valid_until`/`policy_id`.
+If signing is enabled, `tscli` should also emit `settings-signature` as a DSSE envelope over the normalized bytes and write `settings-metadata` with `version`, `published_at` (defaulting to now), and optional `valid_until`/`policy_id`.
 
 #### Attestation Document Format
 
@@ -982,15 +979,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ts-cli
-        run: cargo install --path crates/ts-cli
+      - name: Install tscli
+        run: cargo install --path crates/cli
 
       - name: Validate config
-        run: ts-cli config validate --file trusted-server.toml
+        run: tscli config validate --file trusted-server.toml
 
       - name: Generate attestation
         run: |
-          ts-cli attest config \
+          tscli attest config \
             --file trusted-server.toml \
             --sign \
             --key ${{ secrets.SIGNING_KEY }} \
@@ -1000,7 +997,7 @@ jobs:
         env:
           FASTLY_API_KEY: ${{ secrets.FASTLY_API_KEY }}
         run: |
-          ts-cli config push \
+          tscli config push \
             --platform fastly \
             --store-id ${{ vars.CONFIG_STORE_ID }} \
             --file trusted-server.toml

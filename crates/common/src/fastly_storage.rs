@@ -1,33 +1,47 @@
 use std::io::Read;
 
-use fastly::{ConfigStore, Request, Response, SecretStore};
+use fastly::{ConfigStore as FastlyNativeConfigStore, Request, Response, SecretStore};
 use http::StatusCode;
 
 use crate::backend::ensure_backend_from_url;
+use crate::config_store::ConfigStore;
 use crate::error::TrustedServerError;
 
+/// Fastly Config Store implementation.
+///
+/// Wraps Fastly's native `ConfigStore` and implements the platform-agnostic
+/// [`ConfigStore`] trait for loading settings.
 pub struct FastlyConfigStore {
     store_name: String,
 }
 
 impl FastlyConfigStore {
+    /// Create a new FastlyConfigStore with the given store name.
     pub fn new(store_name: impl Into<String>) -> Self {
         Self {
             store_name: store_name.into(),
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<String, TrustedServerError> {
-        // TODO use try_open and return the error
-        let store = ConfigStore::open(&self.store_name);
-        store
-            .get(key)
+    /// Get a value from the config store, returning an error if not found.
+    ///
+    /// This is a convenience method that treats missing keys as errors.
+    /// For optional lookups, use the [`ConfigStore::get`] trait method instead.
+    pub fn get_required(&self, key: &str) -> Result<String, TrustedServerError> {
+        self.get(key)?
             .ok_or_else(|| TrustedServerError::Configuration {
                 message: format!(
                     "Key '{}' not found in config store '{}'",
                     key, self.store_name
                 ),
             })
+    }
+}
+
+impl ConfigStore for FastlyConfigStore {
+    fn get(&self, key: &str) -> Result<Option<String>, TrustedServerError> {
+        let store = FastlyNativeConfigStore::open(&self.store_name);
+        Ok(store.get(key))
     }
 }
 
@@ -296,7 +310,7 @@ mod tests {
     #[test]
     fn test_config_store_get() {
         let store = FastlyConfigStore::new("jwks_store");
-        let result = store.get("current-kid");
+        let result = store.get_required("current-kid");
         match result {
             Ok(kid) => println!("Current KID: {}", kid),
             Err(e) => println!("Expected error in test environment: {}", e),
@@ -308,7 +322,7 @@ mod tests {
         let store = FastlySecretStore::new("signing_keys");
         let config_store = FastlyConfigStore::new("jwks_store");
 
-        match config_store.get("current-kid") {
+        match config_store.get_required("current-kid") {
             Ok(kid) => match store.get(&kid) {
                 Ok(bytes) => {
                     println!("Successfully loaded secret, {} bytes", bytes.len());
