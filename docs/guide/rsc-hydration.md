@@ -148,7 +148,7 @@ The marker `\x00SPLIT\x00` is chosen because:
 
 When there is only one payload, Trusted Server skips combining and rewrites it directly.
 
-**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11) and combine/split logic in [rsc.rs:433](crates/common/src/integrations/nextjs/rsc.rs#L433)
+**Implementation:** Marker constant at [rsc.rs:11](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L11) and combine/split logic in [rsc.rs:433](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L433)
 
 ### Step 2: Find T-Chunks Across Combined Content
 
@@ -156,7 +156,7 @@ Scan the combined stream for `ID:T<hex_length>,` headers, then consume exactly `
 
 The key insight: markers don't count toward byte consumption. When a T-chunk declares 1679 bytes, we consume 1679 bytes of actual content, skipping over any markers we encounter.
 
-**Implementation:** T-chunk discovery at [rsc.rs:202](crates/common/src/integrations/nextjs/rsc.rs#L202) with marker-aware escape sequence iterator at [rsc.rs:72](crates/common/src/integrations/nextjs/rsc.rs#L72)
+**Implementation:** T-chunk discovery at [rsc.rs:202](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L202) with marker-aware escape sequence iterator at [rsc.rs:72](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L72)
 
 ### Step 3: Rewrite URLs and Recalculate Lengths
 
@@ -179,14 +179,14 @@ Each resulting payload corresponds to one original script, but with:
 
 `T`-chunk lengths use the **unescaped** byte count of the payload (after decoding JavaScript string escapes). Correct handling requires:
 
-- Shared escape sequence iterator handles standard JS escapes (including `\\n`, `\\r`, `\\t`, `\\b`, `\\f`, `\\v`, `\\'`, `\\\"`, `\\\\`, `\\/`, `\\xHH`, `\\uHHHH`, and surrogate pairs): [rsc.rs:37](crates/common/src/integrations/nextjs/rsc.rs#L37)
-- Counting unescaped bytes: [rsc.rs:166](crates/common/src/integrations/nextjs/rsc.rs#L166)
-- Consuming exactly _N unescaped bytes_ to locate the end of a declared `T` chunk: [rsc.rs:171](crates/common/src/integrations/nextjs/rsc.rs#L171)
-- Marker-aware byte length calculation for cross-script processing: [rsc.rs:324](crates/common/src/integrations/nextjs/rsc.rs#L324)
-- Size-limited combined payload allocation (default 10 MB, configurable via `integrations.nextjs.max_combined_payload_bytes`): [rsc.rs:404](crates/common/src/integrations/nextjs/rsc.rs#L404)
-- If the size limit is exceeded and all T-chunks are complete within each payload, Trusted Server rewrites each payload independently: [rsc.rs:427](crates/common/src/integrations/nextjs/rsc.rs#L427)
-- Fail-safe: if `T`-chunk parsing fails or a T-chunk length is unreasonable (over 100 MB), Trusted Server skips rewriting to avoid breaking hydration: [rsc.rs:202](crates/common/src/integrations/nextjs/rsc.rs#L202)
-- If the size limit is exceeded and cross-script T-chunks are present, Trusted Server skips rewriting rather than risk breaking hydration: [rsc.rs:421](crates/common/src/integrations/nextjs/rsc.rs#L421)
+- Shared escape sequence iterator handles standard JS escapes (including `\\n`, `\\r`, `\\t`, `\\b`, `\\f`, `\\v`, `\\'`, `\\\"`, `\\\\`, `\\/`, `\\xHH`, `\\uHHHH`, and surrogate pairs): [rsc.rs:37](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L37)
+- Counting unescaped bytes: [rsc.rs:166](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L166)
+- Consuming exactly _N unescaped bytes_ to locate the end of a declared `T` chunk: [rsc.rs:171](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L171)
+- Marker-aware byte length calculation for cross-script processing: [rsc.rs:324](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L324)
+- Size-limited combined payload allocation (default 10 MB, configurable via `integrations.nextjs.max_combined_payload_bytes`): [rsc.rs:404](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L404)
+- If the size limit is exceeded and all T-chunks are complete within each payload, Trusted Server rewrites each payload independently: [rsc.rs:427](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L427)
+- Fail-safe: if `T`-chunk parsing fails or a T-chunk length is unreasonable (over 100 MB), Trusted Server skips rewriting to avoid breaking hydration: [rsc.rs:202](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L202)
+- If the size limit is exceeded and cross-script T-chunks are present, Trusted Server skips rewriting rather than risk breaking hydration: [rsc.rs:421](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L421)
 
 ## URL Rewriting Patterns
 
@@ -204,7 +204,7 @@ The solution handles multiple URL formats in RSC content:
 
 ### Regex Pattern
 
-**Implementation:** Regex-based rewriting in [shared.rs:79](crates/common/src/integrations/nextjs/shared.rs#L79)
+**Implementation:** Regex-based rewriting in [shared.rs:79](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/shared.rs#L79)
 
 This pattern handles:
 
@@ -267,29 +267,29 @@ End-to-end flow:
 
 Because post-processing runs inside the HTML processor (before recompression), `publisher.rs` does not need to special-case compression for integrations.
 
-**Implementation:** Post-processing entry point at [html_processor.rs:20](crates/common/src/html_processor.rs#L20)
+**Implementation:** Post-processing entry point at [html_processor.rs:20](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/html_processor.rs#L20)
 
 ## Deconstruction and Reconstruction Logic
 
-The RSC rewriting process involves carefully deconstructing RSC payloads, rewriting URLs, and reconstructing them with correct T-chunk lengths. The main runtime entry point is `NextJsHtmlPostProcessor::post_process()` at [html_post_process.rs:53](crates/common/src/integrations/nextjs/html_post_process.rs#L53), operating on payloads captured during phase 1 by `NextJsRscPlaceholderRewriter` ([rsc_placeholders.rs:52](crates/common/src/integrations/nextjs/rsc_placeholders.rs#L52)) when available, and falling back to re-parsing the final HTML when not.
+The RSC rewriting process involves carefully deconstructing RSC payloads, rewriting URLs, and reconstructing them with correct T-chunk lengths. The main runtime entry point is `NextJsHtmlPostProcessor::post_process()` at [html_post_process.rs:53](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/html_post_process.rs#L53), operating on payloads captured during phase 1 by `NextJsRscPlaceholderRewriter` ([rsc_placeholders.rs:52](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc_placeholders.rs#L52)) when available, and falling back to re-parsing the final HTML when not.
 
 ### Step 1: Capture RSC Payloads (placeholders)
 
 During the initial HTML rewrite pass, replace each complete `self.__next_f.push([1, "..."])` payload string with a placeholder token and record the original payload strings in `IntegrationDocumentState`. Fragmented scripts are left untouched and handled by the fallback re-parse path.
 
-**Implementation:** `NextJsRscPlaceholderRewriter::rewrite()` at [rsc_placeholders.rs:52](crates/common/src/integrations/nextjs/rsc_placeholders.rs#L52) and `IntegrationDocumentState` at [registry.rs:99](crates/common/src/integrations/registry.rs#L99)
+**Implementation:** `NextJsRscPlaceholderRewriter::rewrite()` at [rsc_placeholders.rs:52](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc_placeholders.rs#L52) and `IntegrationDocumentState` at [registry.rs:99](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/registry.rs#L99)
 
 ### Step 2: Combine Payloads with Markers
 
 Join all payloads with a marker string (`\x00SPLIT\x00`) that cannot appear in valid JSON/RSC content. This allows T-chunks to be processed across script boundaries while preserving the ability to split back later.
 
-**Implementation:** Marker constant at [rsc.rs:11](crates/common/src/integrations/nextjs/rsc.rs#L11), combining logic in `rewrite_rsc_scripts_combined()` at [rsc.rs:433](crates/common/src/integrations/nextjs/rsc.rs#L433)
+**Implementation:** Marker constant at [rsc.rs:11](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L11), combining logic in `rewrite_rsc_scripts_combined()` at [rsc.rs:433](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L433)
 
 ### Step 3: Find T-Chunks Across Combined Content
 
 Parse T-chunk headers (`ID:T<hex_length>,`) and consume exactly the declared number of unescaped bytes, skipping over markers.
 
-**Implementation:** `find_tchunks_with_markers()` at [rsc.rs:269](crates/common/src/integrations/nextjs/rsc.rs#L269), using `EscapeSequenceIter::from_position_with_marker()` at [rsc.rs:72](crates/common/src/integrations/nextjs/rsc.rs#L72)
+**Implementation:** `find_tchunks_with_markers()` at [rsc.rs:269](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L269), using `EscapeSequenceIter::from_position_with_marker()` at [rsc.rs:72](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L72)
 
 ### Step 4: Rewrite URLs in T-Chunk Content
 
@@ -301,31 +301,31 @@ Rewrite all URL patterns in the T-chunk content:
 - `\\\\//origin.example.com` → `\\\\//proxy.example.com` (double-escaped)
 - `origin.example.com/path` → `proxy.example.com/path` (bare host, boundary-checked)
 
-**Implementation:** `RscUrlRewriter::rewrite()` at [shared.rs:93](crates/common/src/integrations/nextjs/shared.rs#L93)
+**Implementation:** `RscUrlRewriter::rewrite()` at [shared.rs:93](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/shared.rs#L93)
 
 ### Step 5: Recalculate T-Chunk Length
 
 Calculate the new unescaped byte length (excluding markers) and update the T-chunk header with the new hex length.
 
-**Implementation:** `calculate_unescaped_byte_length_skip_markers()` at [rsc.rs:324](crates/common/src/integrations/nextjs/rsc.rs#L324)
+**Implementation:** `calculate_unescaped_byte_length_skip_markers()` at [rsc.rs:324](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L324)
 
 ### Step 6: Split Back on Markers
 
 Split the combined rewritten content back into individual payloads on the marker boundaries. Each payload corresponds to one original script, with T-chunk lengths now correct across script boundaries.
 
-**Implementation:** Part of `rewrite_rsc_scripts_combined()` at [rsc.rs:478](crates/common/src/integrations/nextjs/rsc.rs#L478)
+**Implementation:** Part of `rewrite_rsc_scripts_combined()` at [rsc.rs:478](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs#L478)
 
 ### Step 7: Reconstruct HTML
 
 Substitute placeholder tokens in the final HTML with the rewritten payload strings (fast path, no HTML re-parse).
 
-**Implementation:** `substitute_rsc_payload_placeholders()` at [html_post_process.rs:177](crates/common/src/integrations/nextjs/html_post_process.rs#L177)
+**Implementation:** `substitute_rsc_payload_placeholders()` at [html_post_process.rs:177](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/html_post_process.rs#L177)
 
 ### Fallback Path: Re-parse HTML for Fragmented Scripts
 
 If no placeholders were captured during streaming, the post-processor re-parses the final HTML with `lol_html` to locate `__next_f.push` payload ranges and rewrites them in place. This path is slower, but it handles fragmented script text that could not be captured during the streaming pass.
 
-**Implementation:** `find_rsc_push_scripts()` and `post_process_rsc_html_in_place_with_limit()` in [html_post_process.rs](crates/common/src/integrations/nextjs/html_post_process.rs)
+**Implementation:** `find_rsc_push_scripts()` and `post_process_rsc_html_in_place_with_limit()` in [html_post_process.rs](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/html_post_process.rs)
 
 ### Visual Example
 
@@ -363,17 +363,17 @@ The post-processing is implemented as an integration hook, allowing other integr
 
 ### Trait Definition
 
-**Implementation:** Per-document state at [registry.rs:99](crates/common/src/integrations/registry.rs#L99), context at [registry.rs:331](crates/common/src/integrations/registry.rs#L331), and trait at [registry.rs:341](crates/common/src/integrations/registry.rs#L341)
+**Implementation:** Per-document state at [registry.rs:99](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/registry.rs#L99), context at [registry.rs:331](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/registry.rs#L331), and trait at [registry.rs:341](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/registry.rs#L341)
 
 **Note:** `IntegrationHtmlPostProcessor::should_process` defaults to `false`, so integrations must explicitly opt in to post-processing via a cheap preflight check. The Next.js implementation checks for captured payloads and also scans the final HTML for `__next_f.push` plus the origin host to catch fragmented scripts.
 
 ### Registration
 
-**Implementation:** Next.js registers its placeholder rewriter + HTML post-processor when enabled in [mod.rs:86](crates/common/src/integrations/nextjs/mod.rs#L86)
+**Implementation:** Next.js registers its placeholder rewriter + HTML post-processor when enabled in [mod.rs:86](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/integrations/nextjs/mod.rs#L86)
 
 ### Execution in HTML Processor
 
-**Implementation:** End-of-document post-processing wrapper at [html_processor.rs:20](crates/common/src/html_processor.rs#L20)
+**Implementation:** End-of-document post-processing wrapper at [html_processor.rs:20](https://github.com/InteractiveAdvertisingBureau/trusted-server/blob/main/crates/common/src/html_processor.rs#L20)
 
 ## Implementation Files
 
