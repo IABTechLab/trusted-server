@@ -38,9 +38,8 @@ enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = false
 debug = false
-# script_handler = "/prebid.js"
+# script_remove_patterns = ["/prebid.min.js", "/prebidjs.min.js"]  # defaults to common prebid filenames
 
 [integrations.nextjs]
 enabled = false

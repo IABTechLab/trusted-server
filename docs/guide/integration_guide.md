@@ -315,7 +315,7 @@ Prebid applies the same steps outlined above with a few notable patterns:
    server_url = "https://prebid.example/openrtb2/auction"
    timeout_ms = 1200
    bidders = ["equativ", "sampleBidder"]
-   auto_configure = true
+   # script_remove_patterns = ["/static/prebid/*"]
    ```
 
    Tests or scaffolding can inject configs by calling
@@ -329,10 +329,11 @@ Prebid applies the same steps outlined above with a few notable patterns:
    creative rewrites before responding. All routes are properly namespaced under
    `/integrations/prebid/` to follow the integration routing pattern.
 
-3. **HTML rewrites through the registry** – When `auto_configure` is enabled, the integration’s
+3. **HTML rewrites through the registry** – When the integration is enabled, the
    `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>`
-   references outright. The unified TSJS bundle is injected at the start of `<head>`, so dropping the
-   publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+   references that match `script_remove_patterns`. The unified TSJS bundle is injected at the start
+   of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before
+   any inline `pbjs` config.
 
 4. **TSJS assets & testing** – The shim implementation lives in
    `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear,

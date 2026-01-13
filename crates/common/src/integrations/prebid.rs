@@ -41,12 +41,16 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub bidders: Vec<String>,
-    #[serde(default = "default_auto_configure")]
-    pub auto_configure: bool,
     #[serde(default)]
     pub debug: bool,
-    #[serde(default)]
-    pub script_handler: Option<String>,
+    /// Patterns to match Prebid script URLs for serving empty JS.
+    /// Supports suffix matching (e.g., "/prebid.min.js" matches any path ending with that)
+    /// and wildcard patterns (e.g., "/static/prebid/*" matches paths under that prefix).
+    #[serde(
+        default = "default_script_remove_patterns",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub script_remove_patterns: Vec<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -63,12 +67,29 @@ fn default_bidders() -> Vec<String> {
     vec!["mocktioneer".to_string()]
 }
 
-fn default_auto_configure() -> bool {
+fn default_enabled() -> bool {
     true
 }
 
-fn default_enabled() -> bool {
-    true
+/// Default suffixes that identify Prebid scripts
+const PREBID_SCRIPT_SUFFIXES: &[&str] = &[
+    "/prebid.js",
+    "/prebid.min.js",
+    "/prebidjs.js",
+    "/prebidjs.min.js",
+];
+
+fn default_script_remove_patterns() -> Vec<String> {
+    // Default patterns to intercept Prebid scripts and serve empty JS
+    // - Exact paths like "/prebid.min.js" match only that path
+    // - Wildcard paths like "/static/prebid/*" match anything under that prefix
+    //   and are filtered by PREBID_SCRIPT_SUFFIXES in matches_script_pattern()
+    vec![
+        "/prebid.js".to_string(),
+        "/prebid.min.js".to_string(),
+        "/prebidjs.js".to_string(),
+        "/prebidjs.min.js".to_string(),
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +137,72 @@ pub struct PrebidIntegration {
 impl PrebidIntegration {
     fn new(config: PrebidIntegrationConfig) -> Arc<Self> {
         Arc::new(Self { config })
+    }
+
+    fn matches_script_url(&self, attr_value: &str) -> bool {
+        let trimmed = attr_value.trim();
+        let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+
+        if self.matches_script_pattern(without_query) {
+            return true;
+        }
+
+        if !without_query.starts_with('/')
+            && !without_query.starts_with("//")
+            && !without_query.contains("://")
+        {
+            let with_slash = format!("/{without_query}");
+            if self.matches_script_pattern(&with_slash) {
+                return true;
+            }
+        }
+
+        let parsed = if without_query.starts_with("//") {
+            Url::parse(&format!("https:{without_query}"))
+        } else {
+            Url::parse(without_query)
+        };
+
+        parsed
+            .ok()
+            .is_some_and(|url| self.matches_script_pattern(url.path()))
+    }
+
+    fn matches_script_pattern(&self, path: &str) -> bool {
+        // Normalize path to lowercase for case-insensitive matching
+        let path_lower = path.to_ascii_lowercase();
+
+        // Check if path matches any configured pattern
+        for pattern in &self.config.script_remove_patterns {
+            let pattern_lower = pattern.to_ascii_lowercase();
+
+            // Check for wildcard patterns: /* or {*name}
+            if pattern_lower.ends_with("/*") || pattern_lower.contains("{*") {
+                // Extract prefix before the wildcard
+                let prefix = if pattern_lower.ends_with("/*") {
+                    &pattern_lower[..pattern_lower.len() - 1] // Remove trailing *
+                } else {
+                    // Find {* and extract prefix before it
+                    pattern_lower.split("{*").next().unwrap_or("")
+                };
+
+                if path_lower.starts_with(prefix) {
+                    // Check if it ends with a known Prebid script suffix
+                    if PREBID_SCRIPT_SUFFIXES
+                        .iter()
+                        .any(|suffix| path_lower.ends_with(suffix))
+                    {
+                        return true;
+                    }
+                }
+            } else {
+                // Exact match or suffix match
+                if path_lower.ends_with(&pattern_lower) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -274,10 +361,11 @@ impl IntegrationProxy for PrebidIntegration {
             IntegrationEndpoint::post(ROUTE_THIRD_PARTY_AD),
         ];
 
-        if let Some(script_path) = &self.config.script_handler {
-            // We need to leak the string to get a 'static str for IntegrationEndpoint
-            // This is safe because the config lives for the lifetime of the application
-            let static_path: &'static str = Box::leak(script_path.clone().into_boxed_str());
+        // Register routes for script removal patterns
+        // Patterns can be exact paths (e.g., "/prebid.min.js") or use matchit wildcards
+        // (e.g., "/static/prebid/{*rest}")
+        for pattern in &self.config.script_remove_patterns {
+            let static_path: &'static str = Box::leak(pattern.clone().into_boxed_str());
             routes.push(IntegrationEndpoint::get(static_path));
         }
 
@@ -293,15 +381,14 @@ impl IntegrationProxy for PrebidIntegration {
         let method = req.get_method().clone();
 
         match method {
-            Method::GET if self.config.script_handler.as_ref() == Some(&path) => {
-                self.handle_script_handler()
-            }
             Method::GET if path == ROUTE_FIRST_PARTY_AD => {
                 self.handle_first_party_ad(settings, req).await
             }
             Method::POST if path == ROUTE_THIRD_PARTY_AD => {
                 self.handle_third_party_ad(settings, req).await
             }
+            // Serve empty JS for matching script patterns
+            Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
             _ => Err(Report::new(Self::error(format!(
                 "Unsupported Prebid route: {path}"
             )))),
@@ -315,7 +402,7 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 
     fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.auto_configure && matches!(attribute, "src" | "href")
+        matches!(attribute, "src" | "href")
     }
 
     fn rewrite(
@@ -324,7 +411,7 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         attr_value: &str,
         _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if self.config.auto_configure && is_prebid_script_url(attr_value) {
+        if self.matches_script_url(attr_value) {
             AttributeRewriteAction::remove_element()
         } else {
             AttributeRewriteAction::keep()
@@ -386,16 +473,6 @@ fn build_openrtb_from_ts(
             page: Some(format!("https://{}", settings.publisher.domain)),
         }),
     }
-}
-
-fn is_prebid_script_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    let without_query = lower.split('?').next().unwrap_or("");
-    let filename = without_query.rsplit('/').next().unwrap_or("");
-    matches!(
-        filename,
-        "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
-    )
 }
 
 async fn pbs_auction_for_get(
@@ -702,14 +779,11 @@ fn get_request_scheme(req: &Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
-    use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
+    use crate::integrations::{AttributeRewriteAction, IntegrationAttributeContext};
     use crate::settings::Settings;
-    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
     use serde_json::json;
-    use std::io::Cursor;
 
     fn make_settings() -> Settings {
         Settings::from_toml(&crate_test_settings_str()).expect("should parse settings")
@@ -721,30 +795,14 @@ mod tests {
             server_url: "https://prebid.example".to_string(),
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
-            auto_configure: true,
             debug: false,
-            script_handler: None,
+            script_remove_patterns: default_script_remove_patterns(),
         }
-    }
-
-    fn config_from_settings(
-        settings: &Settings,
-        registry: &IntegrationRegistry,
-    ) -> HtmlProcessorConfig {
-        HtmlProcessorConfig::from_settings(
-            settings,
-            registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
     }
 
     #[test]
     fn attribute_rewriter_removes_prebid_scripts() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             request_host: "pub.example",
@@ -753,17 +811,21 @@ mod tests {
         };
 
         let rewritten = integration.rewrite("src", "https://cdn.prebid.org/prebid.min.js", &ctx);
-        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
+        assert!(
+            matches!(rewritten, AttributeRewriteAction::RemoveElement),
+            "Prebid script tags should be removed"
+        );
 
         let untouched = integration.rewrite("src", "https://cdn.example.com/app.js", &ctx);
-        assert!(matches!(untouched, AttributeRewriteAction::Keep));
+        assert!(
+            matches!(untouched, AttributeRewriteAction::Keep),
+            "Non-Prebid scripts should remain"
+        );
     }
 
     #[test]
-    fn attribute_rewriter_handles_query_strings_and_links() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+    fn attribute_rewriter_handles_query_strings() {
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "href",
             request_host: "pub.example",
@@ -773,107 +835,125 @@ mod tests {
 
         let rewritten =
             integration.rewrite("href", "https://cdn.prebid.org/prebid.js?v=1.2.3", &ctx);
-        assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
-    }
-
-    #[test]
-    fn html_processor_keeps_prebid_scripts_when_auto_config_disabled() {
-        let html = r#"<html><head>
-            <script src="https://cdn.prebid.org/prebid.min.js"></script>
-            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
-        </head><body></body></html>"#;
-
-        let mut settings = make_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
-                    "auto_configure": false,
-                    "debug": false
-                }),
-            )
-            .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
-        let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-        let processed = String::from_utf8_lossy(&output);
         assert!(
-            processed.contains("tsjs-unified"),
-            "Unified bundle should be injected"
-        );
-        assert!(
-            processed.contains("prebid.min.js"),
-            "Prebid script should remain when auto-config is disabled"
-        );
-        assert!(
-            processed.contains("cdn.prebid.org/prebid.js"),
-            "Prebid preload should remain when auto-config is disabled"
+            matches!(rewritten, AttributeRewriteAction::RemoveElement),
+            "Prebid links with query strings should be removed"
         );
     }
 
     #[test]
-    fn html_processor_removes_prebid_scripts_when_auto_config_enabled() {
-        let html = r#"<html><head>
-            <script src="https://cdn.prebid.org/prebid.min.js"></script>
-            <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
-        </head><body></body></html>"#;
-
-        let mut settings = make_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
-                    "auto_configure": true,
-                    "debug": false
-                }),
-            )
-            .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
-        let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
+    fn attribute_rewriter_matches_wildcard_patterns() {
+        let mut config = base_config();
+        config.script_remove_patterns = vec!["/static/prebid/*".to_string()];
+        let integration = PrebidIntegration::new(config);
+        let ctx = IntegrationAttributeContext {
+            attribute_name: "src",
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
         };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
-        let processed = String::from_utf8_lossy(&output);
-        assert!(
-            processed.contains("tsjs-unified"),
-            "Unified bundle should be injected"
+        let rewritten = integration.rewrite(
+            "src",
+            "https://cdn.example.com/static/prebid/v1/prebid.min.js",
+            &ctx,
         );
         assert!(
-            !processed.contains("prebid.min.js"),
-            "Prebid script should be removed when auto-config is enabled"
+            matches!(rewritten, AttributeRewriteAction::RemoveElement),
+            "Wildcard patterns should match prebid assets on full URLs"
         );
+
+        let rewritten_relative = integration.rewrite("src", "static/prebid/prebid.min.js", &ctx);
         assert!(
-            !processed.contains("cdn.prebid.org/prebid.js"),
-            "Prebid preload should be removed when auto-config is enabled"
+            matches!(rewritten_relative, AttributeRewriteAction::RemoveElement),
+            "Wildcard patterns should match relative paths without a leading slash"
         );
+    }
+
+    #[test]
+    fn script_pattern_matching_exact_paths() {
+        let integration = PrebidIntegration::new(base_config());
+
+        // Should match default exact patterns (suffix matching)
+        assert!(integration.matches_script_pattern("/prebid.js"));
+        assert!(integration.matches_script_pattern("/prebid.min.js"));
+        assert!(integration.matches_script_pattern("/prebidjs.js"));
+        assert!(integration.matches_script_pattern("/prebidjs.min.js"));
+
+        // Suffix matching means nested paths also match
+        assert!(integration.matches_script_pattern("/static/prebid.min.js"));
+        assert!(integration.matches_script_pattern("/static/prebid/v8.53.0/prebid.min.js"));
+
+        // Should not match other scripts
+        assert!(!integration.matches_script_pattern("/app.js"));
+        assert!(!integration.matches_script_pattern("/static/bundle.min.js"));
+    }
+
+    #[test]
+    fn script_pattern_matching_wildcard_slash_star() {
+        // Test /* wildcard pattern matching
+        let mut config = base_config();
+        config.script_remove_patterns = vec!["/static/prebid/*".to_string()];
+        let integration = PrebidIntegration::new(config);
+
+        // Should match paths under the prefix with known suffixes
+        assert!(integration.matches_script_pattern("/static/prebid/prebid.min.js"));
+        assert!(integration.matches_script_pattern("/static/prebid/v8.53.0/prebid.min.js"));
+        assert!(integration.matches_script_pattern("/static/prebid/prebidjs.js"));
+
+        // Should not match paths outside prefix
+        assert!(!integration.matches_script_pattern("/prebid.min.js"));
+        assert!(!integration.matches_script_pattern("/other/prebid.min.js"));
+
+        // Should not match non-prebid scripts even under prefix
+        assert!(!integration.matches_script_pattern("/static/prebid/app.js"));
+    }
+
+    #[test]
+    fn script_pattern_matching_wildcard_matchit_syntax() {
+        // Test {*rest} matchit-style wildcard pattern matching
+        let mut config = base_config();
+        config.script_remove_patterns = vec!["/wp-content/plugins/prebidjs/{*rest}".to_string()];
+        let integration = PrebidIntegration::new(config);
+
+        // Should match paths under the prefix with known suffixes
+        assert!(
+            integration.matches_script_pattern("/wp-content/plugins/prebidjs/js/prebidjs.min.js")
+        );
+        assert!(integration.matches_script_pattern("/wp-content/plugins/prebidjs/prebid.min.js"));
+        assert!(integration.matches_script_pattern("/wp-content/plugins/prebidjs/v1/v2/prebid.js"));
+
+        // Should not match paths outside prefix
+        assert!(!integration.matches_script_pattern("/prebid.min.js"));
+        assert!(!integration.matches_script_pattern("/wp-content/other/prebid.min.js"));
+
+        // Should not match non-prebid scripts even under prefix
+        assert!(!integration.matches_script_pattern("/wp-content/plugins/prebidjs/app.js"));
+    }
+
+    #[test]
+    fn script_pattern_matching_case_insensitive() {
+        let integration = PrebidIntegration::new(base_config());
+
+        assert!(integration.matches_script_pattern("/Prebid.JS"));
+        assert!(integration.matches_script_pattern("/PREBID.MIN.JS"));
+        assert!(integration.matches_script_pattern("/Static/Prebid.min.js"));
+    }
+
+    #[test]
+    fn routes_include_script_patterns() {
+        let integration = PrebidIntegration::new(base_config());
+        let routes = integration.routes();
+
+        // Should include the default ad routes
+        assert!(routes.iter().any(|r| r.path == "/first-party/ad"));
+        assert!(routes.iter().any(|r| r.path == "/third-party/ad"));
+
+        // Should include default script removal patterns
+        assert!(routes.iter().any(|r| r.path == "/prebid.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebid.min.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebidjs.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebidjs.min.js"));
     }
 
     #[test]
@@ -983,16 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn is_prebid_script_url_matches_common_variants() {
-        assert!(is_prebid_script_url("https://cdn.com/prebid.js"));
-        assert!(is_prebid_script_url(
-            "https://cdn.com/prebid.min.js?version=1"
-        ));
-        assert!(!is_prebid_script_url("https://cdn.com/app.js"));
-    }
-
-    #[test]
-    fn test_script_handler_config_parsing() {
+    fn test_script_remove_patterns_config_parsing() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1009,7 +1080,7 @@ template = "{{client_ip}}:{{user_agent}}"
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid.example"
-script_handler = "/prebid.js"
+script_remove_patterns = ["/static/prebid/*"]
 "#;
 
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
@@ -1018,11 +1089,11 @@ script_handler = "/prebid.js"
             .expect("should get config")
             .expect("should be enabled");
 
-        assert_eq!(config.script_handler, Some("/prebid.js".to_string()));
+        assert_eq!(config.script_remove_patterns, vec!["/static/prebid/*"]);
     }
 
     #[test]
-    fn test_script_handler_none_by_default() {
+    fn test_script_remove_patterns_default() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1047,21 +1118,16 @@ server_url = "https://prebid.example"
             .expect("should get config")
             .expect("should be enabled");
 
-        assert_eq!(config.script_handler, None);
+        // Should have default patterns
+        assert_eq!(
+            config.script_remove_patterns,
+            default_script_remove_patterns()
+        );
     }
 
     #[test]
     fn test_script_handler_returns_empty_js() {
-        let config = PrebidIntegrationConfig {
-            enabled: true,
-            server_url: "https://prebid.example".to_string(),
-            timeout_ms: 1000,
-            bidders: vec![],
-            auto_configure: false,
-            debug: false,
-            script_handler: Some("/prebid.js".to_string()),
-        };
-        let integration = PrebidIntegration::new(config);
+        let integration = PrebidIntegration::new(base_config());
 
         let response = integration
             .handle_script_handler()
@@ -1085,37 +1151,23 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn test_routes_includes_script_handler() {
-        let config = PrebidIntegrationConfig {
-            enabled: true,
-            server_url: "https://prebid.example".to_string(),
-            timeout_ms: 1000,
-            bidders: vec![],
-            auto_configure: false,
-            debug: false,
-            script_handler: Some("/prebid.js".to_string()),
-        };
+    fn test_routes_with_default_patterns() {
+        let config = base_config(); // Has default script_remove_patterns
         let integration = PrebidIntegration::new(config);
 
         let routes = integration.routes();
 
-        // Should have 3 routes: first-party ad, third-party ad, and script handler
-        assert_eq!(routes.len(), 3);
+        // Should have 2 ad routes + 4 default script patterns
+        assert_eq!(routes.len(), 6);
 
-        let has_script_route = routes
-            .iter()
-            .any(|r| r.path == "/prebid.js" && r.method == Method::GET);
-        assert!(has_script_route, "should register script handler route");
-    }
+        // Verify ad routes
+        assert!(routes.iter().any(|r| r.path == "/first-party/ad"));
+        assert!(routes.iter().any(|r| r.path == "/third-party/ad"));
 
-    #[test]
-    fn test_routes_without_script_handler() {
-        let config = base_config(); // Has script_handler: None
-        let integration = PrebidIntegration::new(config);
-
-        let routes = integration.routes();
-
-        // Should only have 2 routes: first-party ad and third-party ad
-        assert_eq!(routes.len(), 2);
+        // Verify script pattern routes
+        assert!(routes.iter().any(|r| r.path == "/prebid.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebid.min.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebidjs.js"));
+        assert!(routes.iter().any(|r| r.path == "/prebidjs.min.js"));
     }
 }

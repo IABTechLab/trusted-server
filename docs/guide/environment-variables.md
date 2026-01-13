@@ -201,14 +201,15 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
 # Bidders (comma-separated)
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
 
-# Auto-remove Prebid.js scripts
-TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
-
 # Enable debug logging
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 
-# Optional: Script handler path
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_HANDLER="/prebid.js"
+# Script patterns to remove Prebid tags and serve empty JS (indexed format)
+# Default patterns match common Prebid filenames at exact paths
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__0="/prebid.js"
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__1="/prebid.min.js"
+# For versioned paths, use wildcards:
+# TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__0="/static/prebid/{*rest}"
 ```
 
 **TOML Equivalent:**
@@ -218,9 +219,8 @@ enabled = true
 server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon", "openx"]
-auto_configure = true
 debug = false
-script_handler = "/prebid.js"
+script_remove_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 ```
 
 ---
@@ -642,7 +642,6 @@ export TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://prebid-server.com"
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
-export TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
 
 # Optional: Security Headers
 export TRUSTED_SERVER__RESPONSE_HEADERS__STRICT_TRANSPORT_SECURITY="max-age=31536000"

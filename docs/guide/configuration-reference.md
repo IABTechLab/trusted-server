@@ -597,9 +597,15 @@ All integrations support:
 | `server_url` | String | Required | Prebid Server endpoint URL |
 | `timeout_ms` | Integer | `1000` | Request timeout in milliseconds |
 | `bidders` | Array[String] | `[]` | List of enabled bidders |
-| `auto_configure` | Boolean | `false` | Auto-inject Prebid.js shim |
 | `debug` | Boolean | `false` | Enable debug logging |
-| `script_handler` | String | Optional | Custom script endpoint path |
+| `script_remove_patterns` | Array[String] | See below | Patterns for removing Prebid script tags and intercepting requests |
+
+**Default `script_remove_patterns`**:
+```toml
+["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+```
+
+These patterns use suffix matching when stripping HTML, so `/static/prebid/v8/prebid.min.js` matches because it ends with `/prebid.min.js`. For request interception, exact paths are registered unless you use wildcard patterns (e.g., `/static/prebid/*`), which match paths under that prefix.
 
 **Example**:
 ```toml
@@ -608,8 +614,8 @@ enabled = true
 server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = true
 debug = false
+# script_remove_patterns = ["/static/prebid/*"]  # Optional: restrict to specific path
 ```
 
 **Environment Override**:
@@ -618,8 +624,9 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
-TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__0=/prebid.js
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__1=/prebid.min.js
 ```
 
 ### Next.js Integration

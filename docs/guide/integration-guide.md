@@ -276,7 +276,7 @@ enabled = true
 server_url = "https://prebid.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["equativ", "sampleBidder"]
-auto_configure = true
+# script_remove_patterns = ["/static/prebid/*"]
 ```
 
 Tests or scaffolding can inject configs by calling `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that other integrations use.
@@ -287,7 +287,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When `auto_configure` is enabled, the integration's `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references outright. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_remove_patterns`. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
 
 **4. TSJS Assets & Testing**
 

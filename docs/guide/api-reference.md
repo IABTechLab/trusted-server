@@ -421,18 +421,22 @@ See [First-Party Endpoints](#get-first-party-ad) above.
 #### POST /third-party/ad
 See [First-Party Endpoints](#post-third-party-ad) above.
 
-#### GET /prebid.js (Optional)
-Returns empty JavaScript to override Prebid.js when `script_handler` is configured.
+#### GET /prebid.js, /prebid.min.js, etc. (Script Override)
+Returns empty JavaScript to override Prebid.js scripts when the Prebid integration is enabled. By default, exact requests to `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, or `/prebidjs.min.js` will be intercepted and served an empty script.
 
 **Configuration:**
 ```toml
 [integrations.prebid]
-script_handler = "/prebid.js"
+# Default patterns (exact paths)
+script_remove_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+
+# Use wildcard patterns to match paths under a prefix
+# script_remove_patterns = ["/static/prebid/*"]
 ```
 
 **Response:**
 - **Content-Type:** `application/javascript; charset=utf-8`
-- **Body:** `// Prebid.js override by Trusted Server`
+- **Body:** `// Script overridden by Trusted Server`
 - **Cache:** `immutable, max-age=31536000`
 
 ---
