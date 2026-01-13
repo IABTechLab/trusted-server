@@ -381,12 +381,8 @@ impl IntegrationProxy for PrebidIntegration {
         let method = req.get_method().clone();
 
         match method {
-            Method::GET if path == ROUTE_RENDER => {
-                self.handle_render(settings, req).await
-            }
-            Method::POST if path == ROUTE_AUCTION => {
-                self.handle_auction(settings, req).await
-            }
+            Method::GET if path == ROUTE_RENDER => self.handle_render(settings, req).await,
+            Method::POST if path == ROUTE_AUCTION => self.handle_auction(settings, req).await,
             // Serve empty JS for matching script patterns
             Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
             _ => Err(Report::new(Self::error(format!(
