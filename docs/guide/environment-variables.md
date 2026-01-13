@@ -206,10 +206,10 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 
 # Script patterns to remove Prebid tags and serve empty JS (indexed format)
 # Default patterns match common Prebid filenames at exact paths
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__0="/prebid.js"
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__1="/prebid.min.js"
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__0="/prebid.js"
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__1="/prebid.min.js"
 # For versioned paths, use wildcards:
-# TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_REMOVE_PATTERNS__0="/static/prebid/{*rest}"
+# TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__0="/static/prebid/{*rest}"
 ```
 
 **TOML Equivalent:**
@@ -220,7 +220,7 @@ server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon", "openx"]
 debug = false
-script_remove_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 ```
 
 ---

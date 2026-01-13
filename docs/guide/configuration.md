@@ -95,7 +95,7 @@ enabled = true
 server_url = "https://prebid-server.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus"]
-# script_remove_patterns = ["/static/prebid/*"]
+# script_patterns = ["/static/prebid/*"]
 ```
 
 ### `fastly.toml`
@@ -264,7 +264,7 @@ enabled = true
 server_url = "https://prebid-server.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus"]
-# script_remove_patterns = ["/static/prebid/*"]
+# script_patterns = ["/static/prebid/*"]
 ```
 
 **Next.js**:

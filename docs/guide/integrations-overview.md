@@ -33,7 +33,7 @@ server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon"]
 debug = false
-# script_remove_patterns = ["/static/prebid/*"]
+# script_patterns = ["/static/prebid/*"]
 ```
 
 **Endpoints:**

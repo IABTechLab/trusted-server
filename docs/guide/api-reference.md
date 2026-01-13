@@ -428,10 +428,10 @@ Returns empty JavaScript to override Prebid.js scripts when the Prebid integrati
 ```toml
 [integrations.prebid]
 # Default patterns (exact paths)
-script_remove_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
 # Use wildcard patterns to match paths under a prefix
-# script_remove_patterns = ["/static/prebid/*"]
+# script_patterns = ["/static/prebid/*"]
 ```
 
 **Response:**

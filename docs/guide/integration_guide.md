@@ -315,7 +315,7 @@ Prebid applies the same steps outlined above with a few notable patterns:
    server_url = "https://prebid.example/openrtb2/auction"
    timeout_ms = 1200
    bidders = ["equativ", "sampleBidder"]
-   # script_remove_patterns = ["/static/prebid/*"]
+   # script_patterns = ["/static/prebid/*"]
    ```
 
    Tests or scaffolding can inject configs by calling
@@ -331,7 +331,7 @@ Prebid applies the same steps outlined above with a few notable patterns:
 
 3. **HTML rewrites through the registry** – When the integration is enabled, the
    `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>`
-   references that match `script_remove_patterns`. The unified TSJS bundle is injected at the start
+   references that match `script_patterns`. The unified TSJS bundle is injected at the start
    of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before
    any inline `pbjs` config.
 

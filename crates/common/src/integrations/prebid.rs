@@ -47,10 +47,10 @@ pub struct PrebidIntegrationConfig {
     /// Supports suffix matching (e.g., "/prebid.min.js" matches any path ending with that)
     /// and wildcard patterns (e.g., "/static/prebid/*" matches paths under that prefix).
     #[serde(
-        default = "default_script_remove_patterns",
+        default = "default_script_patterns",
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
-    pub script_remove_patterns: Vec<String>,
+    pub script_patterns: Vec<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -79,7 +79,7 @@ const PREBID_SCRIPT_SUFFIXES: &[&str] = &[
     "/prebidjs.min.js",
 ];
 
-fn default_script_remove_patterns() -> Vec<String> {
+fn default_script_patterns() -> Vec<String> {
     // Default patterns to intercept Prebid scripts and serve empty JS
     // - Exact paths like "/prebid.min.js" match only that path
     // - Wildcard paths like "/static/prebid/*" match anything under that prefix
@@ -173,7 +173,7 @@ impl PrebidIntegration {
         let path_lower = path.to_ascii_lowercase();
 
         // Check if path matches any configured pattern
-        for pattern in &self.config.script_remove_patterns {
+        for pattern in &self.config.script_patterns {
             let pattern_lower = pattern.to_ascii_lowercase();
 
             // Check for wildcard patterns: /* or {*name}
@@ -364,7 +364,7 @@ impl IntegrationProxy for PrebidIntegration {
         // Register routes for script removal patterns
         // Patterns can be exact paths (e.g., "/prebid.min.js") or use matchit wildcards
         // (e.g., "/static/prebid/{*rest}")
-        for pattern in &self.config.script_remove_patterns {
+        for pattern in &self.config.script_patterns {
             let static_path: &'static str = Box::leak(pattern.clone().into_boxed_str());
             routes.push(IntegrationEndpoint::get(static_path));
         }
@@ -796,7 +796,7 @@ mod tests {
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
-            script_remove_patterns: default_script_remove_patterns(),
+            script_patterns: default_script_patterns(),
         }
     }
 
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn attribute_rewriter_matches_wildcard_patterns() {
         let mut config = base_config();
-        config.script_remove_patterns = vec!["/static/prebid/*".to_string()];
+        config.script_patterns = vec!["/static/prebid/*".to_string()];
         let integration = PrebidIntegration::new(config);
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
@@ -893,7 +893,7 @@ mod tests {
     fn script_pattern_matching_wildcard_slash_star() {
         // Test /* wildcard pattern matching
         let mut config = base_config();
-        config.script_remove_patterns = vec!["/static/prebid/*".to_string()];
+        config.script_patterns = vec!["/static/prebid/*".to_string()];
         let integration = PrebidIntegration::new(config);
 
         // Should match paths under the prefix with known suffixes
@@ -913,7 +913,7 @@ mod tests {
     fn script_pattern_matching_wildcard_matchit_syntax() {
         // Test {*rest} matchit-style wildcard pattern matching
         let mut config = base_config();
-        config.script_remove_patterns = vec!["/wp-content/plugins/prebidjs/{*rest}".to_string()];
+        config.script_patterns = vec!["/wp-content/plugins/prebidjs/{*rest}".to_string()];
         let integration = PrebidIntegration::new(config);
 
         // Should match paths under the prefix with known suffixes
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_script_remove_patterns_config_parsing() {
+    fn test_script_patterns_config_parsing() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1080,7 +1080,7 @@ template = "{{client_ip}}:{{user_agent}}"
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid.example"
-script_remove_patterns = ["/static/prebid/*"]
+script_patterns = ["/static/prebid/*"]
 "#;
 
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
@@ -1089,11 +1089,11 @@ script_remove_patterns = ["/static/prebid/*"]
             .expect("should get config")
             .expect("should be enabled");
 
-        assert_eq!(config.script_remove_patterns, vec!["/static/prebid/*"]);
+        assert_eq!(config.script_patterns, vec!["/static/prebid/*"]);
     }
 
     #[test]
-    fn test_script_remove_patterns_default() {
+    fn test_script_patterns_default() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1119,10 +1119,7 @@ server_url = "https://prebid.example"
             .expect("should be enabled");
 
         // Should have default patterns
-        assert_eq!(
-            config.script_remove_patterns,
-            default_script_remove_patterns()
-        );
+        assert_eq!(config.script_patterns, default_script_patterns());
     }
 
     #[test]
@@ -1152,7 +1149,7 @@ server_url = "https://prebid.example"
 
     #[test]
     fn test_routes_with_default_patterns() {
-        let config = base_config(); // Has default script_remove_patterns
+        let config = base_config(); // Has default script_patterns
         let integration = PrebidIntegration::new(config);
 
         let routes = integration.routes();
