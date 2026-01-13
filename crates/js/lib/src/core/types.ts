@@ -37,14 +37,14 @@ export interface TsjsApi {
 }
 
 export enum RequestMode {
-  FirstParty = 'firstParty',
-  ThirdParty = 'thirdParty',
+  Render = 'render',
+  Auction = 'auction',
 }
 
 export interface Config {
   debug?: boolean;
   logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
-  /** Select ad serving mode. Default is RequestMode.FirstParty. */
+  /** Select ad serving mode. Default is RequestMode.Render. */
   mode?: RequestMode;
   // Extendable for future fields
   [key: string]: unknown;

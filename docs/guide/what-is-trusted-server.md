@@ -1,6 +1,6 @@
 # What is Trusted Server?
 
-Trusted Server is an open-source, cloud based orchestration framework and runtime for publishers. It moves code execution and operations that traditionally occurs in browsers (via 3rd party JS) to secure, zero-cold-start WASM binaries running in WASI supported environments.
+Trusted Server is an open-source, cloud based orchestration framework and runtime for publishers. It moves code execution and operations that traditionally occurs in browsers (via external JS) to secure, zero-cold-start WASM binaries running in WASI supported environments.
 
 Trusted Server is the new execution layer for the open-web, returning control of 1st party data, security, and overall user-experience back to publishers.
 

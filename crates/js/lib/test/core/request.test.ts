@@ -34,7 +34,7 @@ describe('request.requestAds', () => {
 
     document.body.innerHTML = '<div id="slot1"></div>';
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
+    setConfig({ mode: 'auction' } as any);
 
     requestAds();
     // wait microtasks
@@ -66,7 +66,7 @@ describe('request.requestAds', () => {
     const { requestAds } = await import('../../src/core/request');
 
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
+    setConfig({ mode: 'auction' } as any);
 
     requestAds();
     await Promise.resolve();
@@ -92,7 +92,7 @@ describe('request.requestAds', () => {
     const { requestAds } = await import('../../src/core/request');
 
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
+    setConfig({ mode: 'auction' } as any);
 
     requestAds();
     await Promise.resolve();
@@ -102,7 +102,7 @@ describe('request.requestAds', () => {
     expect(renderMock).not.toHaveBeenCalled();
   });
 
-  it('inserts an iframe per ad unit with correct src (firstParty)', async () => {
+  it('inserts an iframe per ad unit with correct src (render mode)', async () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
@@ -112,8 +112,8 @@ describe('request.requestAds', () => {
     div.id = 'slot1';
     document.body.appendChild(div);
 
-    // Configure first-party mode explicitly
-    setConfig({ mode: 'firstParty' } as any);
+    // Configure render mode explicitly
+    setConfig({ mode: 'render' } as any);
 
     // Add an ad unit and request
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
@@ -122,18 +122,18 @@ describe('request.requestAds', () => {
     // Verify iframe was inserted with expected src
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
     expect(iframe).toBeTruthy();
-    expect(iframe!.getAttribute('src')).toContain('/first-party/ad?');
+    expect(iframe!.getAttribute('src')).toContain('/ad/render?');
     expect(iframe!.getAttribute('src')).toContain('slot=slot1');
     expect(iframe!.getAttribute('src')).toContain('w=300');
     expect(iframe!.getAttribute('src')).toContain('h=250');
   });
 
-  it('skips iframe insertion when slot is missing (firstParty)', async () => {
+  it('skips iframe insertion when slot is missing (render mode)', async () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
-    setConfig({ mode: 'firstParty' } as any);
+    setConfig({ mode: 'render' } as any);
     addAdUnits({ code: 'missing-slot', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
     requestAds();
 

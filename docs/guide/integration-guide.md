@@ -256,7 +256,7 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
+**Purpose**: Production Prebid Server bridge that owns `/ad/render` & `/ad/auction`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
 
 **Key files**:
 - `crates/common/src/integrations/prebid.rs` - Rust implementation  
@@ -283,7 +283,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **2. Routes Owned by the Integration**
 
-`IntegrationProxy::routes` declares the `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. All routes are properly namespaced under `/integrations/prebid/` to follow the integration routing pattern.
+`IntegrationProxy::routes` declares the `/ad/render` (GET) and `/ad/auction` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. These routes are intentionally un-namespaced to match the TSJS client.
 
 **3. HTML Rewrites Through the Registry**
 

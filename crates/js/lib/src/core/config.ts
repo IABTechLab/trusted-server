@@ -3,7 +3,7 @@ import { log, LogLevel } from './log';
 import type { Config } from './types';
 import { RequestMode } from './types';
 
-let CONFIG: Config = { mode: RequestMode.FirstParty };
+let CONFIG: Config = { mode: RequestMode.Render };
 
 // Merge publisher-provided config and adjust the log level accordingly.
 export function setConfig(cfg: Config): void {

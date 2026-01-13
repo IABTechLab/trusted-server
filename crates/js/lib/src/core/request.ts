@@ -1,4 +1,4 @@
-// Request orchestration for tsjs: fires first-party iframe loads or third-party fetches.
+// Request orchestration for tsjs: fires render (iframe) or auction (JSON) requests.
 import { delay } from '../shared/async';
 
 import { log } from './log';
@@ -10,7 +10,7 @@ import type { RequestAdsCallback, RequestAdsOptions } from './types';
 
 // getHighestCpmBids is provided by the Prebid extension (shim) to mirror Prebid's API
 
-// Entry point matching Prebid's requestBids signature; decides first/third-party mode.
+// Entry point matching Prebid's requestBids signature; decides render/auction mode.
 export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
   maybeOpts?: RequestAdsOptions
@@ -25,28 +25,38 @@ export function requestAds(
     callback = opts?.bidsBackHandler;
   }
 
-  const mode: RequestMode = (getConfig().mode as RequestMode | undefined) ?? RequestMode.FirstParty;
+  const mode = resolveRequestMode(getConfig().mode);
   log.info('requestAds: called', { hasCallback: typeof callback === 'function', mode });
   try {
     const adUnits = getAllUnits();
     const payload = { adUnits, config: {} };
     log.debug('requestAds: payload', { units: adUnits.length });
-    if (mode === RequestMode.FirstParty) void requestAdsFirstParty(adUnits);
-    else requestAdsThirdParty(payload);
+    if (mode === RequestMode.Render) void requestAdsRender(adUnits);
+    else requestAdsAuction(payload);
     // Synchronously invoke callback to match test expectations
     try {
       if (callback) callback();
     } catch {
       /* ignore callback errors */
     }
-    // network handled in requestAdsThirdParty; no-op here
+    // network handled in requestAdsAuction; no-op here
   } catch {
     log.warn('requestAds: failed to initiate');
   }
 }
 
-// Create per-slot first-party iframe requests served directly from the edge.
-async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
+function resolveRequestMode(mode: unknown): RequestMode {
+  if (mode === RequestMode.Render || mode === RequestMode.Auction) {
+    return mode;
+  }
+  if (mode !== undefined) {
+    log.warn('requestAds: invalid mode; defaulting to render', { mode });
+  }
+  return RequestMode.Render;
+}
+
+// Create per-slot iframe requests served directly from the edge via /ad/render.
+async function requestAdsRender(adUnits: ReadonlyArray<{ code: string }>) {
   for (const unit of adUnits) {
     const size = (firstSize(unit) ?? [300, 250]) as readonly [number, number];
     const slotId = unit.code;
@@ -60,12 +70,12 @@ async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
           width: size[0],
           height: size[1],
         });
-        iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
+        iframe.src = `/ad/render?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
         return;
       }
 
       if (attemptsRemaining <= 0) {
-        log.warn('requestAds(firstParty): slot not found; skipping iframe', { slotId });
+        log.warn('requestAds(render): slot not found; skipping iframe', { slotId });
         return;
       }
 
@@ -88,18 +98,18 @@ async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
   }
 }
 
-// Fire a JSON POST to the third-party ad endpoint and render returned creatives.
-function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) {
+// Fire a JSON POST to /ad/auction and render returned creatives.
+function requestAdsAuction(payload: { adUnits: unknown[]; config: unknown }) {
   // Render simple placeholders immediately so pages have content
   renderAllAdUnits();
   if (typeof fetch !== 'function') {
     log.warn('requestAds: fetch not available; nothing to render');
     return;
   }
-  log.info('requestAds: sending request to /third-party/ad', {
+  log.info('requestAds: sending request to /ad/auction', {
     units: (payload.adUnits || []).length,
   });
-  void fetch('/third-party/ad', {
+  void fetch('/ad/auction', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',

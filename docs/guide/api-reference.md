@@ -11,9 +11,9 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ---
 
-## First-Party Endpoints
+## Ad and Proxy Endpoints
 
-### GET /first-party/ad
+### GET /ad/render
 
 Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
 
@@ -26,11 +26,11 @@ Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
 
 **Response:**
 - **Content-Type:** `text/html; charset=utf-8`
-- **Body:** Complete HTML creative with first-party proxying applied
+- **Body:** Complete HTML creative with proxy rewrites applied
 
 **Example:**
 ```bash
-curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
+curl "https://edge.example.com/ad/render?slot=header-banner&w=728&h=90"
 ```
 
 **Response Headers:**
@@ -44,7 +44,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 ---
 
-### POST /third-party/ad
+### POST /ad/auction
 
 Client-side auction endpoint for TSJS library.
 
@@ -88,7 +88,7 @@ Client-side auction endpoint for TSJS library.
 
 **Example:**
 ```bash
-curl -X POST https://edge.example.com/third-party/ad \
+curl -X POST https://edge.example.com/ad/auction \
   -H "Content-Type: application/json" \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
@@ -164,7 +164,7 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 ### GET/POST /first-party/sign
 
-URL signing endpoint. Returns signed first-party proxy URL for a given target URL.
+URL signing endpoint. Returns signed proxy URL for a given target URL.
 
 **Request Methods:** GET or POST
 
@@ -415,11 +415,11 @@ See [Configuration](./configuration.md) for TSJS build options.
 
 ### Prebid Integration
 
-#### GET /first-party/ad
-See [First-Party Endpoints](#get-first-party-ad) above.
+#### GET /ad/render
+See [Ad and Proxy Endpoints](#get-ad-render) above.
 
-#### POST /third-party/ad
-See [First-Party Endpoints](#post-third-party-ad) above.
+#### POST /ad/auction
+See [Ad and Proxy Endpoints](#post-ad-auction) above.
 
 #### GET /prebid.js, /prebid.min.js, etc. (Script Override)
 Returns empty JavaScript to override Prebid.js scripts when the Prebid integration is enabled. By default, exact requests to `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, or `/prebidjs.min.js` will be intercepted and served an empty script.

@@ -26,8 +26,8 @@ use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
-const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
-const ROUTE_THIRD_PARTY_AD: &str = "/third-party/ad";
+const ROUTE_RENDER: &str = "/ad/render";
+const ROUTE_AUCTION: &str = "/ad/auction";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -212,7 +212,7 @@ impl PrebidIntegration {
         }
     }
 
-    async fn handle_third_party_ad(
+    async fn handle_auction(
         &self,
         settings: &Settings,
         mut req: Request,
@@ -223,7 +223,7 @@ impl PrebidIntegration {
             },
         )?;
 
-        log::info!("/third-party/ad: received {} adUnits", body.ad_units.len());
+        log::info!("/auction: received {} adUnits", body.ad_units.len());
         for unit in &body.ad_units {
             if let Some(mt) = &unit.media_types {
                 if let Some(banner) = &mt.banner {
@@ -260,14 +260,14 @@ impl PrebidIntegration {
             .with_body(body))
     }
 
-    async fn handle_first_party_ad(
+    async fn handle_render(
         &self,
         settings: &Settings,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let url = req.get_url_str();
         let parsed = Url::parse(url).change_context(TrustedServerError::Prebid {
-            message: "Invalid first-party serve-ad URL".to_string(),
+            message: "Invalid render URL".to_string(),
         })?;
         let qp = parsed
             .query_pairs()
@@ -357,8 +357,8 @@ impl IntegrationProxy for PrebidIntegration {
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         let mut routes = vec![
-            IntegrationEndpoint::get(ROUTE_FIRST_PARTY_AD),
-            IntegrationEndpoint::post(ROUTE_THIRD_PARTY_AD),
+            IntegrationEndpoint::get(ROUTE_RENDER),
+            IntegrationEndpoint::post(ROUTE_AUCTION),
         ];
 
         // Register routes for script removal patterns
@@ -381,11 +381,11 @@ impl IntegrationProxy for PrebidIntegration {
         let method = req.get_method().clone();
 
         match method {
-            Method::GET if path == ROUTE_FIRST_PARTY_AD => {
-                self.handle_first_party_ad(settings, req).await
+            Method::GET if path == ROUTE_RENDER => {
+                self.handle_render(settings, req).await
             }
-            Method::POST if path == ROUTE_THIRD_PARTY_AD => {
-                self.handle_third_party_ad(settings, req).await
+            Method::POST if path == ROUTE_AUCTION => {
+                self.handle_auction(settings, req).await
             }
             // Serve empty JS for matching script patterns
             Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
@@ -946,8 +946,8 @@ mod tests {
         let routes = integration.routes();
 
         // Should include the default ad routes
-        assert!(routes.iter().any(|r| r.path == "/first-party/ad"));
-        assert!(routes.iter().any(|r| r.path == "/third-party/ad"));
+        assert!(routes.iter().any(|r| r.path == "/ad/render"));
+        assert!(routes.iter().any(|r| r.path == "/ad/auction"));
 
         // Should include default script removal patterns
         assert!(routes.iter().any(|r| r.path == "/prebid.js"));
@@ -965,7 +965,7 @@ mod tests {
 
         let synthetic_id = "synthetic-123";
         let fresh_id = "fresh-456";
-        let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+        let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
         enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
@@ -1158,8 +1158,8 @@ server_url = "https://prebid.example"
         assert_eq!(routes.len(), 6);
 
         // Verify ad routes
-        assert!(routes.iter().any(|r| r.path == "/first-party/ad"));
-        assert!(routes.iter().any(|r| r.path == "/third-party/ad"));
+        assert!(routes.iter().any(|r| r.path == "/ad/render"));
+        assert!(routes.iter().any(|r| r.path == "/ad/auction"));
 
         // Verify script pattern routes
         assert!(routes.iter().any(|r| r.path == "/prebid.js"));

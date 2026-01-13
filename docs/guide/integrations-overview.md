@@ -37,8 +37,8 @@ debug = false
 ```
 
 **Endpoints:**
-- `GET /first-party/ad` - Server-side ad rendering
-- `POST /third-party/ad` - Client-side auction endpoint
+- `GET /ad/render` - Server-side ad rendering
+- `POST /ad/auction` - Client-side auction endpoint
 - `GET /prebid.js` - Empty script override (plus any configured patterns)
 
 **When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.
@@ -243,7 +243,7 @@ Minimal impact. HTML rewriting happens during streaming (Next.js), and proxy end
 No. Integration configuration is read at startup. You must redeploy to change integration settings.
 
 ### Are integrations required?
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and first-party proxying.
+No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and proxying.
 
 ### How do I add a new integration?
 See the [Integration Guide](./integration-guide.md) for a complete tutorial on building custom integrations.
