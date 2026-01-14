@@ -204,6 +204,9 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
 # Enable debug logging
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 
+# Default tsjs mode when Prebid integration is enabled (optional)
+TRUSTED_SERVER__INTEGRATIONS__PREBID__MODE="auction" # or "render"
+
 # Script patterns to remove Prebid tags and serve empty JS (indexed format)
 # Default patterns match common Prebid filenames at exact paths
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__0="/prebid.js"
@@ -220,6 +223,7 @@ server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon", "openx"]
 debug = false
+mode = "auction"
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 ```
 

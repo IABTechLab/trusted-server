@@ -18,7 +18,8 @@ use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
 };
 use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
 use crate::request_signing::RequestSigner;
@@ -28,6 +29,24 @@ use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const ROUTE_RENDER: &str = "/ad/render";
 const ROUTE_AUCTION: &str = "/ad/auction";
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Render,
+    Auction,
+}
+
+pub fn config_script_tag(mode: Mode) -> String {
+    let mode_value = match mode {
+        Mode::Render => "render",
+        Mode::Auction => "auction",
+    };
+    format!(
+        r#"<script>window.tsjs=window.tsjs||{{que:[]}};tsjs.que.push(function(){{tsjs.setConfig({{mode:"{}"}});}});</script>"#,
+        mode_value
+    )
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -43,6 +62,9 @@ pub struct PrebidIntegrationConfig {
     pub bidders: Vec<String>,
     #[serde(default)]
     pub debug: bool,
+    /// Optional default mode to enqueue when injecting the unified bundle.
+    #[serde(default)]
+    pub mode: Option<Mode>,
     /// Patterns to match Prebid script URLs for serving empty JS.
     /// Supports suffix matching (e.g., "/prebid.min.js" matches any path ending with that)
     /// and wildcard patterns (e.g., "/static/prebid/*" matches paths under that prefix).
@@ -344,7 +366,8 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_attribute_rewriter(integration.clone())
+            .with_head_injector(integration)
             .build(),
     )
 }
@@ -412,6 +435,19 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         } else {
             AttributeRewriteAction::keep()
         }
+    }
+}
+
+impl IntegrationHeadInjector for PrebidIntegration {
+    fn integration_id(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        self.config
+            .mode
+            .map(|mode| vec![config_script_tag(mode)])
+            .unwrap_or_default()
     }
 }
 
@@ -792,6 +828,7 @@ mod tests {
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
+            mode: None,
             script_patterns: default_script_patterns(),
         }
     }
@@ -1162,5 +1199,56 @@ server_url = "https://prebid.example"
         assert!(routes.iter().any(|r| r.path == "/prebid.min.js"));
         assert!(routes.iter().any(|r| r.path == "/prebidjs.js"));
         assert!(routes.iter().any(|r| r.path == "/prebidjs.min.js"));
+    }
+
+    #[test]
+    fn config_script_tag_generates_render_mode() {
+        let tag = config_script_tag(Mode::Render);
+        assert!(tag.starts_with("<script>"));
+        assert!(tag.ends_with("</script>"));
+        assert!(tag.contains(r#"mode:"render""#));
+        assert!(tag.contains("tsjs.setConfig"));
+        assert!(tag.contains("tsjs.que.push"));
+    }
+
+    #[test]
+    fn config_script_tag_generates_auction_mode() {
+        let tag = config_script_tag(Mode::Auction);
+        assert!(tag.starts_with("<script>"));
+        assert!(tag.ends_with("</script>"));
+        assert!(tag.contains(r#"mode:"auction""#));
+        assert!(tag.contains("tsjs.setConfig"));
+    }
+
+    #[test]
+    fn head_injector_returns_empty_when_mode_not_set() {
+        let integration = PrebidIntegration::new(base_config());
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &Default::default(),
+        };
+        let inserts = integration.head_inserts(&ctx);
+        assert!(
+            inserts.is_empty(),
+            "should not inject config when mode is None"
+        );
+    }
+
+    #[test]
+    fn head_injector_returns_config_script_when_mode_set() {
+        let mut config = base_config();
+        config.mode = Some(Mode::Auction);
+        let integration = PrebidIntegration::new(config);
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &Default::default(),
+        };
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(inserts.len(), 1);
+        assert!(inserts[0].contains(r#"mode:"auction""#));
     }
 }

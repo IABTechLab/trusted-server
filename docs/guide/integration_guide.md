@@ -247,6 +247,11 @@ parameters, or mutate inline JSON. Use this to point `<script>` tags at your own
 tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to
 rewrite embedded Next.js payloads.
 
+If you need to inject HTML into `<head>` (for example to enqueue
+`tsjs.setConfig(...)`), implement `IntegrationHeadInjector` and register it with
+`.with_head_injector(...)`. Snippets are inserted before the unified TSJS
+bundle.
+
 Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline
 content) removes the element entirely, so integrations can drop publisher-provided markup when the
 Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js`
