@@ -3,7 +3,7 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::ensure_backend_from_url;
-use crate::http_util::serve_static_with_etag;
+use crate::http_util::{serve_static_with_etag, RequestInfo};
 
 use crate::constants::{HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT};
 use crate::cookies::create_synthetic_cookie;
@@ -14,65 +14,6 @@ use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
-
-/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
-///
-/// Tries multiple methods in order of reliability:
-/// 1. Fastly SDK TLS detection methods (most reliable)
-/// 2. Forwarded header (RFC 7239)
-/// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (least reliable, can be spoofed)
-/// 5. Default to HTTP
-fn detect_request_scheme(req: &Request) -> String {
-    // 1. First try Fastly SDK's built-in TLS detection methods
-    // These are the most reliable as they check the actual connection
-    if let Some(tls_protocol) = req.get_tls_protocol() {
-        // If we have a TLS protocol, the connection is definitely HTTPS
-        log::debug!("TLS protocol detected: {}", tls_protocol);
-        return "https".to_string();
-    }
-
-    // Also check TLS cipher - if present, connection is HTTPS
-    if req.get_tls_cipher_openssl_name().is_some() {
-        log::debug!("TLS cipher detected, using HTTPS");
-        return "https".to_string();
-    }
-
-    // 2. Try the Forwarded header (RFC 7239)
-    if let Some(forwarded) = req.get_header("forwarded") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // Parse the Forwarded header
-            // Format: Forwarded: for=192.0.2.60;proto=https;by=203.0.113.43
-            if forwarded_str.contains("proto=https") {
-                return "https".to_string();
-            } else if forwarded_str.contains("proto=http") {
-                return "http".to_string();
-            }
-        }
-    }
-
-    // 3. Try X-Forwarded-Proto header
-    if let Some(proto) = req.get_header("x-forwarded-proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            let proto_lower = proto_str.to_lowercase();
-            if proto_lower == "https" || proto_lower == "http" {
-                return proto_lower;
-            }
-        }
-    }
-
-    // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
-    if let Some(ssl) = req.get_header("fastly-ssl") {
-        if let Ok(ssl_str) = ssl.to_str() {
-            if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
-                return "https".to_string();
-            }
-        }
-    }
-
-    // Default to HTTP (changed from HTTPS based on your settings file)
-    "http".to_string()
-}
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
@@ -238,28 +179,19 @@ pub fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor rewrites
     // any Prebid script references to `/static/tsjs-ext.min.js` when auto-configure is enabled.
 
-    // Extract the request host from the incoming request
-    let request_host = req
-        .get_header(header::HOST)
-        .map(|h| h.to_str().unwrap_or_default())
-        .unwrap_or_default()
-        .to_string();
+    // Extract request host and scheme from headers (supports X-Forwarded-Host/Proto for chained proxies)
+    let request_info = RequestInfo::from_request(&req);
+    let request_host = &request_info.host;
+    let request_scheme = &request_info.scheme;
 
-    // Detect the request scheme using multiple methods
-    let request_scheme = detect_request_scheme(&req);
-
-    // Log detection details for debugging
     log::debug!(
-        "Scheme detection - TLS Protocol: {:?}, TLS Cipher: {:?}, Forwarded: {:?}, X-Forwarded-Proto: {:?}, Fastly-SSL: {:?}, Result: {}",
-        req.get_tls_protocol(),
-        req.get_tls_cipher_openssl_name(),
-        req.get_header("forwarded"),
+        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
+        request_host,
+        request_scheme,
+        req.get_header("x-forwarded-host"),
+        req.get_header(header::HOST),
         req.get_header("x-forwarded-proto"),
-        req.get_header("fastly-ssl"),
-        request_scheme
     );
-
-    log::debug!("Request host: {}, scheme: {}", request_host, request_scheme);
 
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
@@ -386,73 +318,6 @@ mod tests {
     use super::*;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
-
-    #[test]
-    fn test_detect_request_scheme() {
-        // Note: In tests, we can't mock the TLS methods on Request, so we test header fallbacks
-
-        // Test Forwarded header with HTTPS
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("forwarded", "for=192.0.2.60;proto=https;by=203.0.113.43");
-        assert_eq!(detect_request_scheme(&req), "https");
-
-        // Test Forwarded header with HTTP
-        let mut req = Request::new(Method::GET, "http://test.example.com/page");
-        req.set_header("forwarded", "for=192.0.2.60;proto=http;by=203.0.113.43");
-        assert_eq!(detect_request_scheme(&req), "http");
-
-        // Test X-Forwarded-Proto with HTTPS
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("x-forwarded-proto", "https");
-        assert_eq!(detect_request_scheme(&req), "https");
-
-        // Test X-Forwarded-Proto with HTTP
-        let mut req = Request::new(Method::GET, "http://test.example.com/page");
-        req.set_header("x-forwarded-proto", "http");
-        assert_eq!(detect_request_scheme(&req), "http");
-
-        // Test Fastly-SSL header
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("fastly-ssl", "1");
-        assert_eq!(detect_request_scheme(&req), "https");
-
-        // Test default to HTTP when no headers present
-        let req = Request::new(Method::GET, "https://test.example.com/page");
-        assert_eq!(detect_request_scheme(&req), "http");
-
-        // Test priority: Forwarded takes precedence over X-Forwarded-Proto
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("forwarded", "proto=https");
-        req.set_header("x-forwarded-proto", "http");
-        assert_eq!(detect_request_scheme(&req), "https");
-    }
-
-    #[test]
-    fn test_handle_publisher_request_extracts_headers() {
-        // Test that the function correctly extracts host and scheme from request headers
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("host", "test.example.com");
-        req.set_header("x-forwarded-proto", "https");
-
-        // Extract headers like the function does
-        let request_host = req
-            .get_header("host")
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_string();
-
-        let request_scheme = req
-            .get_header("x-forwarded-proto")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("https")
-            .to_string();
-
-        assert_eq!(request_host, "test.example.com");
-        assert_eq!(request_scheme, "https");
-    }
-
-    // Note: test_handle_publisher_request_default_https_scheme and test_handle_publisher_request_http_scheme
-    // were removed as they're redundant with test_detect_request_scheme which covers all scheme detection cases
 
     #[test]
     fn test_content_type_detection() {
