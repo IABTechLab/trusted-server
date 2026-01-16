@@ -16,6 +16,7 @@ use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
@@ -594,9 +595,12 @@ async fn handle_prebid_auction(
         let response_body = pbs_response.take_body_bytes();
         match serde_json::from_slice::<Json>(&response_body) {
             Ok(mut response_json) => {
-                let request_host = get_request_host(&req);
-                let request_scheme = get_request_scheme(&req);
-                transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
+                let request_info = RequestInfo::from_request(&req);
+                transform_prebid_response(
+                    &mut response_json,
+                    &request_info.host,
+                    &request_info.scheme,
+                )?;
 
                 let transformed_body = serde_json::to_vec(&response_json).change_context(
                     TrustedServerError::Prebid {
@@ -787,26 +791,7 @@ fn copy_request_headers(from: &Request, to: &mut Request) {
     }
 }
 
-fn get_request_host(req: &Request) -> String {
-    req.get_header(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn get_request_scheme(req: &Request) -> String {
-    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
-        return "https".to_string();
-    }
-
-    if let Some(proto) = req.get_header("X-Forwarded-Proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            return proto_str.to_lowercase();
-        }
-    }
-
-    "https".to_string()
-}
+// Request host/scheme extraction is now centralized in http_util::RequestInfo
 
 #[cfg(test)]
 mod tests {
