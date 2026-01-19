@@ -3,6 +3,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
@@ -11,6 +12,7 @@ use crate::constants::{
 };
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::streaming_processor::Compression;
 use crate::synthetic::get_synthetic_id;
 
 #[derive(Deserialize)]
@@ -77,18 +79,69 @@ impl<'a> ProxyRequestConfig<'a> {
     }
 }
 
+/// Encodings we support decompressing in finalize_proxied_response.
+/// We override the client's Accept-Encoding to only advertise these.
+const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
+
 /// Copy a curated set of request headers to a proxied request.
 fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
     for header_name in [
         HEADER_USER_AGENT,
         HEADER_ACCEPT,
         HEADER_ACCEPT_LANGUAGE,
-        HEADER_ACCEPT_ENCODING,
         HEADER_REFERER,
         HEADER_X_FORWARDED_FOR,
     ] {
         if let Some(v) = src.get_header(&header_name) {
             dst.set_header(&header_name, v);
+        }
+    }
+    // Only advertise encodings we can decompress (excludes zstd, etc.)
+    dst.set_header(HEADER_ACCEPT_ENCODING, SUPPORTED_ENCODINGS);
+}
+
+/// Decompress body bytes based on Content-Encoding header.
+/// Returns decompressed bytes or error on failure.
+fn decompress_body(
+    bytes: Vec<u8>,
+    content_encoding: &str,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let compression = Compression::from_content_encoding(content_encoding);
+
+    match compression {
+        Compression::None => Ok(bytes),
+        Compression::Gzip => {
+            use flate2::read::GzDecoder;
+            let mut decoder = GzDecoder::new(&bytes[..]);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to decompress gzip body".to_string(),
+                })?;
+            Ok(decompressed)
+        }
+        Compression::Deflate => {
+            use flate2::read::ZlibDecoder;
+            let mut decoder = ZlibDecoder::new(&bytes[..]);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to decompress deflate body".to_string(),
+                })?;
+            Ok(decompressed)
+        }
+        Compression::Brotli => {
+            use brotli::Decompressor;
+            let mut decoder = Decompressor::new(&bytes[..], 4096);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to decompress brotli body".to_string(),
+                })?;
+            Ok(decompressed)
         }
     }
 }
@@ -103,7 +156,11 @@ fn rebuild_text_response(beresp: Response, content_type: &'static str, body: Str
         .collect();
     let mut resp = Response::from_status(status);
     for (name, value) in headers {
-        if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
+        // Skip headers we're replacing or that are no longer valid (we decompress)
+        if name == header::CONTENT_LENGTH
+            || name == header::CONTENT_TYPE
+            || name == header::CONTENT_ENCODING
+        {
             continue;
         }
         resp.set_header(name, value);
@@ -118,11 +175,16 @@ fn finalize_proxied_response(
     req: &Request,
     target_url: &str,
     mut beresp: Response,
-) -> Response {
-    // Determine content-type from response headers
+) -> Result<Response, Report<TrustedServerError>> {
+    // Determine content-type and content-encoding from response headers
     let status_code = beresp.get_status().as_u16();
     let ct_raw = beresp
         .get_header(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_encoding = beresp
+        .get_header(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
@@ -136,10 +198,16 @@ fn finalize_proxied_response(
         .unwrap_or("-");
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
+    let ce_for_log: &str = if content_encoding.is_empty() {
+        "-"
+    } else {
+        &content_encoding
+    };
     log::info!(
-        "proxy: origin response status={} ct={} cl={} accept={} url={}",
+        "proxy: origin response status={} ct={} ce={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
+        ce_for_log,
         cl_raw,
         accept_raw,
         target_url
@@ -148,17 +216,33 @@ fn finalize_proxied_response(
     let ct = ct_raw.to_ascii_lowercase();
 
     if ct.contains("text/html") {
-        // HTML: rewrite and serve as HTML (safe to read as string)
-        let body = beresp.take_body_str(); // TODO: don't panic!
+        // HTML: decompress if needed, rewrite, and serve as HTML
+        let raw_bytes = beresp.take_body().into_bytes();
+        let decompressed = decompress_body(raw_bytes, &content_encoding)?;
+        let body = String::from_utf8(decompressed).change_context(TrustedServerError::Proxy {
+            message: "HTML response body is not valid UTF-8".to_string(),
+        })?;
         let rewritten = crate::creative::rewrite_creative_html(&body, settings);
-        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
+        return Ok(rebuild_text_response(
+            beresp,
+            "text/html; charset=utf-8",
+            rewritten,
+        ));
     }
 
     if ct.contains("text/css") {
-        // CSS: rewrite url(...) references in stylesheets (safe to read as string)
-        let body = beresp.take_body_str();
+        // CSS: decompress if needed, rewrite url(...) references in stylesheets
+        let raw_bytes = beresp.take_body().into_bytes();
+        let decompressed = decompress_body(raw_bytes, &content_encoding)?;
+        let body = String::from_utf8(decompressed).change_context(TrustedServerError::Proxy {
+            message: "CSS response body is not valid UTF-8".to_string(),
+        })?;
         let rewritten = crate::creative::rewrite_css_body(&body, settings);
-        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
+        return Ok(rebuild_text_response(
+            beresp,
+            "text/css; charset=utf-8",
+            rewritten,
+        ));
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics
@@ -206,11 +290,11 @@ fn finalize_proxied_response(
             );
         }
 
-        return beresp;
+        return Ok(beresp);
     }
 
     // Passthrough for non-text, non-image responses
-    beresp
+    Ok(beresp)
 }
 
 fn finalize_proxied_response_streaming(
@@ -430,11 +514,11 @@ async fn proxy_with_redirects(
             })?;
 
         if !follow_redirects {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(req, &current_url, beresp))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         let status = beresp.get_status();
@@ -448,11 +532,11 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(req, &current_url, beresp))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         let Some(location) = beresp
@@ -460,11 +544,11 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(req, &current_url, beresp))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         };
 
         if redirect_attempt == MAX_REDIRECTS {
@@ -472,12 +556,7 @@ async fn proxy_with_redirects(
                 "proxy: redirect limit reached for {}; returning redirect response",
                 current_url
             );
-            return Ok(finalize_proxied_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-            ));
+            return finalize_proxied_response(settings, req, &current_url, beresp);
         }
 
         let next_url = url::Url::parse(location)
@@ -490,11 +569,11 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(req, &current_url, beresp))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         log::info!(
@@ -1011,7 +1090,7 @@ mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        reconstruct_and_validate_signed_target, ProxyRequestConfig,
+        reconstruct_and_validate_signed_target, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -1363,12 +1442,13 @@ mod tests {
                 .unwrap(),
             "en-US"
         );
+        // Accept-Encoding is overridden to only include supported encodings
         assert_eq!(
             dst.get_header(HEADER_ACCEPT_ENCODING)
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "gzip"
+            SUPPORTED_ENCODINGS
         );
         assert_eq!(
             dst.get_header(HEADER_REFERER).unwrap().to_str().unwrap(),
@@ -1426,7 +1506,8 @@ mod tests {
         let direct = creative::rewrite_creative_html(html, &settings);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp);
+        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+            .expect("finalize should succeed");
         let ct = out
             .get_header(header::CONTENT_TYPE)
             .unwrap()
@@ -1453,7 +1534,8 @@ mod tests {
             .with_header(header::CONTENT_TYPE, "text/css")
             .with_body(css);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp);
+        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+            .expect("finalize should succeed");
         let body = out.take_body_str();
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         let ct = out
@@ -1470,7 +1552,8 @@ mod tests {
         let beresp = Response::from_status(StatusCode::OK).with_body("PNG");
         let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
         req.set_header(HEADER_ACCEPT, "image/*");
-        let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp);
+        let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
+            .expect("finalize should succeed");
         // Since CT was missing and Accept indicates image, it should set generic image/*
         let ct = out
             .get_header(header::CONTENT_TYPE)
@@ -1487,7 +1570,8 @@ mod tests {
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body("{\"ok\":true}");
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp);
+        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp)
+            .expect("finalize should succeed");
         // Should not rewrite, preserve status and content-type
         assert_eq!(out.get_status(), StatusCode::ACCEPTED);
         let ct = out
@@ -1498,5 +1582,94 @@ mod tests {
         assert_eq!(ct, "application/json");
         let body = out.take_body_str();
         assert_eq!(body, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn html_gzip_response_is_decompressed_and_rewritten() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let settings = create_test_settings();
+        let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
+
+        // Gzip compress the HTML
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(html.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_header(header::CONTENT_ENCODING, "gzip")
+            .with_body(compressed);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let mut out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+            .expect("finalize should decompress and succeed");
+
+        // Should have removed Content-Encoding header
+        assert!(
+            out.get_header(header::CONTENT_ENCODING).is_none(),
+            "Content-Encoding should be removed"
+        );
+
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+
+        let body = out.take_body_str();
+        assert!(
+            body.contains("/first-party/proxy?tsurl="),
+            "HTML should be rewritten: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn css_brotli_response_is_decompressed_and_rewritten() {
+        use brotli::enc::writer::CompressorWriter;
+        use std::io::Write;
+
+        let settings = create_test_settings();
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+
+        // Brotli compress the CSS
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = CompressorWriter::new(&mut compressed, 4096, 4, 22);
+            encoder.write_all(css.as_bytes()).unwrap();
+        }
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/css")
+            .with_header(header::CONTENT_ENCODING, "br")
+            .with_body(compressed);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+            .expect("finalize should decompress brotli and succeed");
+
+        // Should have removed Content-Encoding header
+        assert!(
+            out.get_header(header::CONTENT_ENCODING).is_none(),
+            "Content-Encoding should be removed"
+        );
+
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/css; charset=utf-8");
+
+        let body = out.take_body_str();
+        assert!(
+            body.contains("/first-party/proxy?tsurl="),
+            "CSS should be rewritten: {}",
+            body
+        );
     }
 }
