@@ -506,11 +506,10 @@ The project follows IAB Tech Lab's open-source governance model:
 
 ### Team Roles
 
-| Role                    | Responsibility                                        |
-| ----------------------- | ----------------------------------------------------- |
-| Project Release Manager | Overall project development, write access to repo     |
-| Committer               | Implements final changes, write access to repo        |
-| Developer               | Contributes code/docs, may take on project management |
+| Role         | Responsibility                       |
+| ------------ | ------------------------------------ |
+| Project Lead | Overall project vision and direction |
+| Developer    | Contributes code/docs                |
 
 See [ProjectGovernance.md](../ProjectGovernance.md) for full details.
 
@@ -521,8 +520,8 @@ See [ProjectGovernance.md](../ProjectGovernance.md) for full details.
 | Role         | GitHub Handle                                                |
 | ------------ | ------------------------------------------------------------ |
 | Project Lead | [@jevansnyc](https://github.com/jevansnyc)                   |
-| Engineer     | [@aram356](https://github.com/aram356)                       |
-| Engineer     | [@ChristianPavilonis](https://github.com/ChristianPavilonis) |
+| Developer    | [@aram356](https://github.com/aram356)                       |
+| Developer    | [@ChristianPavilonis](https://github.com/ChristianPavilonis) |
 
 ### Meetings
 
