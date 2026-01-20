@@ -615,7 +615,7 @@ Use this checklist to track your onboarding progress:
 - [ ] Get GitHub access to [IABTechLab/trusted-server](https://github.com/IABTechLab/trusted-server)
 - [ ] Get access to the [Trusted Server project board](https://github.com/orgs/IABTechLab/projects/3)
 - [ ] Create a [Fastly account](https://manage.fastly.com) and obtain an API token
-- [ ] Join the Slack workspace and `#trusted-server` channel
+- [ ] Join the Slack workspace and `#trusted-server-internal` channel
 - [ ] Get calendar invites for Task Force and Development Team meetings
 
 ### Environment Setup
