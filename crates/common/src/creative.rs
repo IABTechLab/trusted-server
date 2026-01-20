@@ -39,8 +39,10 @@
 
 use crate::http_util::compute_encrypted_sha256_token;
 use crate::settings::Settings;
+use crate::streaming_processor::StreamProcessor;
 use crate::tsjs;
 use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings as HtmlSettings};
+use std::io;
 
 // Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
 // Checks against the rewrite blacklist to exclude configured domains/patterns from proxying.
@@ -476,6 +478,84 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
     let _ = rewriter.write(markup.as_bytes());
     let _ = rewriter.end();
     String::from_utf8(out).unwrap_or_else(|_| markup.to_string())
+}
+
+/// Stream processor for creative HTML that rewrites URLs to first-party proxy.
+///
+/// This processor buffers input chunks and processes the complete HTML document
+/// when the stream ends, using `rewrite_creative_html` internally.
+pub struct CreativeHtmlProcessor {
+    settings: Settings,
+    buffer: Vec<u8>,
+}
+
+impl CreativeHtmlProcessor {
+    /// Create a new HTML processor with the given settings.
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            settings: settings.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl StreamProcessor for CreativeHtmlProcessor {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        self.buffer.extend_from_slice(chunk);
+
+        if is_last {
+            let markup = String::from_utf8(std::mem::take(&mut self.buffer))
+                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {}", e)))?;
+
+            let rewritten = rewrite_creative_html(&markup, &self.settings);
+            Ok(rewritten.into_bytes())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+    }
+}
+
+/// Stream processor for CSS that rewrites url() references to first-party proxy.
+///
+/// This processor buffers input chunks and processes the complete CSS
+/// when the stream ends, using `rewrite_css_body` internally.
+pub struct CreativeCssProcessor {
+    settings: Settings,
+    buffer: Vec<u8>,
+}
+
+impl CreativeCssProcessor {
+    /// Create a new CSS processor with the given settings.
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            settings: settings.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl StreamProcessor for CreativeCssProcessor {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        self.buffer.extend_from_slice(chunk);
+
+        if is_last {
+            let css = String::from_utf8(std::mem::take(&mut self.buffer))
+                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {}", e)))?;
+
+            let rewritten = rewrite_css_body(&css, &self.settings);
+            Ok(rewritten.into_bytes())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+    }
 }
 
 #[cfg(test)]
