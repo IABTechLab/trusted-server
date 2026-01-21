@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json, Value as JsonValue};
-use url::Url;
+use serde_json::{Value as Json, Value as JsonValue};
+use url::{form_urlencoded, Url};
 use validator::Validate;
 
 use crate::backend::ensure_backend_from_url;
@@ -16,13 +15,17 @@ use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::http_util::compute_encrypted_sha256_token;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
-use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
+use crate::openrtb::{
+    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, OpenRtbResponse, PrebidImpExt, Regs,
+    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+};
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -31,6 +34,12 @@ const PREBID_INTEGRATION_ID: &str = "prebid";
 const ROUTE_RENDER: &str = "/ad/render";
 const ROUTE_AUCTION: &str = "/ad/auction";
 
+/// Mode determines how TSJS handles ad requests.
+///
+/// - `Render`: Uses iframe-based server-side rendering.
+///   The server handles the full auction and returns ready-to-display HTML.
+/// - `Auction`: Uses client-side OpenRTB auctions.
+///   Clients (for example, Prebid.js) send OpenRTB to /ad/auction.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -38,15 +47,17 @@ pub enum Mode {
     Auction,
 }
 
-pub fn config_script_tag(mode: Mode) -> String {
-    let mode_value = match mode {
-        Mode::Render => "render",
-        Mode::Auction => "auction",
-    };
-    format!(
-        r#"<script>window.tsjs=window.tsjs||{{que:[]}};tsjs.que.push(function(){{tsjs.setConfig({{mode:"{}"}});}});</script>"#,
-        mode_value
-    )
+/// Generate TSJS config script tag based on mode.
+/// This script runs after the unified TSJS bundle has loaded.
+pub fn tsjs_config_script_tag(mode: Mode) -> String {
+    match mode {
+        Mode::Render => {
+            r#"<script>window.tsjs&&tsjs.setConfig({mode:"render"});</script>"#.to_string()
+        }
+        Mode::Auction => {
+            r#"<script>window.tsjs&&tsjs.setConfig({mode:"auction"});</script>"#.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -195,6 +206,12 @@ impl PrebidIntegration {
         // Normalize path to lowercase for case-insensitive matching
         let path_lower = path.to_ascii_lowercase();
 
+        log::debug!(
+            "matches_script_pattern: path='{}', patterns={:?}",
+            path,
+            self.config.script_patterns
+        );
+
         // Check if path matches any configured pattern
         for pattern in &self.config.script_patterns {
             let pattern_lower = pattern.to_ascii_lowercase();
@@ -209,22 +226,36 @@ impl PrebidIntegration {
                     pattern_lower.split("{*").next().unwrap_or("")
                 };
 
+                log::debug!(
+                    "  wildcard pattern='{}', prefix='{}', path_starts_with_prefix={}",
+                    pattern,
+                    prefix,
+                    path_lower.starts_with(prefix)
+                );
+
                 if path_lower.starts_with(prefix) {
                     // Check if it ends with a known Prebid script suffix
-                    if PREBID_SCRIPT_SUFFIXES
+                    let has_suffix = PREBID_SCRIPT_SUFFIXES
                         .iter()
-                        .any(|suffix| path_lower.ends_with(suffix))
-                    {
+                        .any(|suffix| path_lower.ends_with(suffix));
+                    log::debug!(
+                        "  checking suffixes: path ends with known suffix={}",
+                        has_suffix
+                    );
+                    if has_suffix {
                         return true;
                     }
                 }
             } else {
                 // Exact match or suffix match
-                if path_lower.ends_with(&pattern_lower) {
+                let matches = path_lower.ends_with(&pattern_lower);
+                log::debug!("  exact/suffix pattern='{}', matches={}", pattern, matches);
+                if matches {
                     return true;
                 }
             }
         }
+        log::debug!("  no pattern matched, returning false");
         false
     }
 
@@ -238,49 +269,22 @@ impl PrebidIntegration {
     async fn handle_auction(
         &self,
         settings: &Settings,
-        mut req: Request,
+        req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-            TrustedServerError::Prebid {
-                message: "Failed to parse tsjs auction request".to_string(),
-            },
-        )?;
-
-        log::info!("/auction: received {} adUnits", body.ad_units.len());
-        for unit in &body.ad_units {
-            if let Some(mt) = &unit.media_types {
-                if let Some(banner) = &mt.banner {
-                    log::debug!("unit={} sizes={:?}", unit.code, banner.sizes);
-                }
-            }
-        }
-
-        let openrtb = build_openrtb_from_ts(&body, settings, &self.config);
-        if let Ok(preview) = serde_json::to_string(&openrtb) {
-            log::debug!(
-                "OpenRTB payload (truncated): {}",
-                &preview.chars().take(512).collect::<String>()
-            );
-        }
-
-        req.set_body_json(&openrtb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
         handle_prebid_auction(settings, req, &self.config).await
     }
 
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
-        let body = "// Script overridden by Trusted Server\n";
-
+        // Serve empty JS - Prebid.js is already bundled in the unified TSJS bundle
+        // that gets injected into the page. We just need to prevent the original
+        // Prebid script from loading/executing.
         Ok(Response::from_status(StatusCode::OK)
             .with_header(
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
             .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-            .with_body(body))
+            .with_body("/* prebid.js replaced by tsjs-unified */"))
     }
 
     async fn handle_render(
@@ -404,14 +408,34 @@ impl IntegrationProxy for PrebidIntegration {
         let path = req.get_path().to_string();
         let method = req.get_method().clone();
 
+        log::debug!(
+            "Prebid handle: method={}, path='{}', script_patterns={:?}",
+            method,
+            path,
+            self.config.script_patterns
+        );
+
         match method {
             Method::GET if path == ROUTE_RENDER => self.handle_render(settings, req).await,
             Method::POST if path == ROUTE_AUCTION => self.handle_auction(settings, req).await,
-            // Serve empty JS for matching script patterns
-            Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
-            _ => Err(Report::new(Self::error(format!(
-                "Unsupported Prebid route: {path}"
-            )))),
+            // Serve empty JS for any other GET request that was routed here by matchit
+            // (i.e., matched one of our script_patterns wildcards).
+            // Prebid.js is already bundled in tsjs-unified, so we just need to
+            // prevent the original script from loading.
+            Method::GET => {
+                log::debug!("Prebid: serving empty JS stub for path '{}'", path);
+                self.handle_script_handler()
+            }
+            _ => {
+                log::debug!(
+                    "Prebid: no handler matched for {} '{}', returning error",
+                    method,
+                    path
+                );
+                Err(Report::new(Self::error(format!(
+                    "Unsupported Prebid route: {path}"
+                ))))
+            }
         }
     }
 }
@@ -445,9 +469,12 @@ impl IntegrationHeadInjector for PrebidIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        // Only inject TSJS mode config if mode is set
+        // The Prebid bundle (served via script interception) already has s2sConfig built-in
+        // GAM config is now handled by the separate GAM integration
         self.config
             .mode
-            .map(|mode| vec![config_script_tag(mode)])
+            .map(|mode| vec![tsjs_config_script_tag(mode)])
             .unwrap_or_default()
     }
 }
@@ -490,10 +517,15 @@ fn build_openrtb_from_ts(
 
             Imp {
                 id: unit.code.clone(),
-                banner: Some(Banner { format: formats }),
-                ext: Some(ImpExt {
-                    prebid: PrebidImpExt { bidder },
+                banner: Some(Banner {
+                    format: formats,
+                    extra: HashMap::new(),
                 }),
+                ext: Some(ImpExt {
+                    prebid: Some(PrebidImpExt { bidder }),
+                    extra: HashMap::new(),
+                }),
+                extra: HashMap::new(),
             }
         })
         .collect();
@@ -504,7 +536,13 @@ fn build_openrtb_from_ts(
         site: Some(Site {
             domain: Some(settings.publisher.domain.clone()),
             page: Some(format!("https://{}", settings.publisher.domain)),
+            extra: HashMap::new(),
         }),
+        user: None,
+        regs: None,
+        device: None,
+        ext: None,
+        extra: HashMap::new(),
     }
 }
 
@@ -548,11 +586,10 @@ async fn handle_prebid_auction(
     config: &PrebidIntegrationConfig,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::info!("Handling Prebid auction request");
-    let mut openrtb_request: Json = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Prebid {
+    let mut openrtb_request: OpenRtbRequest = serde_json::from_slice(&req.take_body_bytes())
+        .change_context(TrustedServerError::Prebid {
             message: "Failed to parse OpenRTB request".to_string(),
-        },
-    )?;
+        })?;
 
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
     let fresh_id = generate_synthetic_id(settings, &req)?;
@@ -570,6 +607,7 @@ async fn handle_prebid_auction(
         settings,
         &req,
     )?;
+    override_prebid_bidders(&mut openrtb_request, &config.bidders);
 
     let mut pbs_req = Request::new(
         Method::POST,
@@ -583,7 +621,8 @@ async fn handle_prebid_auction(
         })?;
 
     log::info!("Sending request to Prebid Server");
-    let backend_name = ensure_backend_from_url(&config.server_url)?;
+    let backend_name =
+        ensure_backend_from_url(&config.server_url, settings.proxy.certificate_check)?;
     let mut pbs_response =
         pbs_req
             .send(backend_name)
@@ -593,20 +632,20 @@ async fn handle_prebid_auction(
 
     if pbs_response.get_status().is_success() {
         let response_body = pbs_response.take_body_bytes();
-        match serde_json::from_slice::<Json>(&response_body) {
-            Ok(mut response_json) => {
+        match serde_json::from_slice::<OpenRtbResponse>(&response_body) {
+            Ok(mut response) => {
                 let request_info = RequestInfo::from_request(&req);
                 transform_prebid_response(
-                    &mut response_json,
+                    &mut response,
+                    settings,
                     &request_info.host,
                     &request_info.scheme,
                 )?;
 
-                let transformed_body = serde_json::to_vec(&response_json).change_context(
-                    TrustedServerError::Prebid {
+                let transformed_body =
+                    serde_json::to_vec(&response).change_context(TrustedServerError::Prebid {
                         message: "Failed to serialize transformed response".to_string(),
-                    },
-                )?;
+                    })?;
 
                 Ok(Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
@@ -625,105 +664,127 @@ async fn handle_prebid_auction(
 }
 
 fn enhance_openrtb_request(
-    request: &mut Json,
+    request: &mut OpenRtbRequest,
     synthetic_id: &str,
     fresh_id: &str,
     settings: &Settings,
     req: &Request,
 ) -> Result<(), Report<TrustedServerError>> {
-    if !request["user"].is_object() {
-        request["user"] = json!({});
-    }
-    request["user"]["id"] = json!(synthetic_id);
-
-    if !request["user"]["ext"].is_object() {
-        request["user"]["ext"] = json!({});
-    }
-    request["user"]["ext"]["synthetic_fresh"] = json!(fresh_id);
+    let user = request.user.get_or_insert_with(User::default);
+    user.id = Some(synthetic_id.to_string());
+    let user_ext = user.ext.get_or_insert_with(UserExt::default);
+    user_ext.synthetic_fresh = Some(fresh_id.to_string());
 
     if req.get_header("Sec-GPC").is_some() {
-        if !request["regs"].is_object() {
-            request["regs"] = json!({});
-        }
-        if !request["regs"]["ext"].is_object() {
-            request["regs"]["ext"] = json!({});
-        }
-        request["regs"]["ext"]["us_privacy"] = json!("1YYN");
+        let regs = request.regs.get_or_insert_with(Regs::default);
+        let regs_ext = regs.ext.get_or_insert_with(RegsExt::default);
+        regs_ext.us_privacy = Some("1YYN".to_string());
     }
 
     if let Some(geo_info) = GeoInfo::from_request(req) {
-        let geo_obj = json!({
-            "type": 2,
-            "country": geo_info.country,
-            "city": geo_info.city,
-            "region": geo_info.region,
-        });
-
-        if !request["device"].is_object() {
-            request["device"] = json!({});
-        }
-        request["device"]["geo"] = geo_obj;
+        let device = request.device.get_or_insert_with(Device::default);
+        let geo = device.geo.get_or_insert_with(Geo::default);
+        geo.geo_type = Some(2);
+        geo.country = Some(geo_info.country);
+        geo.city = Some(geo_info.city);
+        geo.region = geo_info.region;
     }
 
-    if !request["site"].is_object() {
-        request["site"] = json!({
-            "domain": settings.publisher.domain,
-            "page": format!("https://{}", settings.publisher.domain),
+    if request.site.is_none() {
+        request.site = Some(Site {
+            domain: Some(settings.publisher.domain.clone()),
+            page: Some(format!("https://{}", settings.publisher.domain)),
+            extra: HashMap::new(),
         });
     }
 
     if let Some(request_signing_config) = &settings.request_signing {
-        if request_signing_config.enabled && request["id"].is_string() {
-            if !request["ext"].is_object() {
-                request["ext"] = json!({});
-            }
-
-            let id = request["id"]
-                .as_str()
-                .expect("should have string id when is_string checked");
+        if request_signing_config.enabled {
             let signer = RequestSigner::from_config()?;
-            let signature = signer.sign(id.as_bytes())?;
-            request["ext"]["trusted_server"] = json!({
-                "signature": signature,
-                "kid": signer.kid
-            });
+            let signature = signer.sign(request.id.as_bytes())?;
+            let ext = request.ext.get_or_insert_with(RequestExt::default);
+            let trusted = ext
+                .trusted_server
+                .get_or_insert_with(TrustedServerExt::default);
+            trusted.signature = Some(signature);
+            trusted.kid = Some(signer.kid);
         }
     }
 
     Ok(())
+}
+
+/// Override bidders in the OpenRTB request with the server-configured bidder list.
+///
+/// This replaces any client-provided bidder configuration with the bidders specified
+/// in `[integrations.prebid].bidders` from trusted-server.toml. This ensures that:
+///
+/// 1. Only approved bidders are used (security/compliance control)
+/// 2. Bidder params are managed server-side, not exposed to clients
+/// 3. The publisher's Prebid.js config doesn't need bidder-specific setup
+///
+/// Note: Client-provided bidder params (e.g., `appnexus: { placementId: '123' }`)
+/// are intentionally stripped. Bidder params should be configured in Prebid Server
+/// or through trusted-server's bidder configuration.
+fn override_prebid_bidders(request: &mut OpenRtbRequest, bidders: &[String]) {
+    let bidder_map = bidders
+        .iter()
+        .map(|bidder| (bidder.clone(), JsonValue::Object(serde_json::Map::new())))
+        .collect::<HashMap<_, _>>();
+
+    log::debug!(
+        "Overriding OpenRTB bidders from settings: count={}",
+        bidder_map.len()
+    );
+
+    for imp in &mut request.imp {
+        let ext = imp.ext.get_or_insert_with(|| ImpExt {
+            prebid: None,
+            extra: HashMap::new(),
+        });
+        let prebid = ext.prebid.get_or_insert_with(PrebidImpExt::default);
+        prebid.bidder = bidder_map.clone();
+    }
 }
 
 fn transform_prebid_response(
-    response: &mut Json,
+    response: &mut OpenRtbResponse,
+    settings: &Settings,
     request_host: &str,
     request_scheme: &str,
 ) -> Result<(), Report<TrustedServerError>> {
-    if let Some(seatbids) = response["seatbid"].as_array_mut() {
-        for seatbid in seatbids {
-            if let Some(bids) = seatbid["bid"].as_array_mut() {
-                for bid in bids {
-                    if let Some(adm) = bid["adm"].as_str() {
-                        bid["adm"] = json!(rewrite_ad_markup(adm, request_host, request_scheme));
-                    }
+    let Some(seatbids) = response.seatbid.as_mut() else {
+        return Ok(());
+    };
 
-                    if let Some(nurl) = bid["nurl"].as_str() {
-                        bid["nurl"] = json!(make_first_party_proxy_url(
-                            nurl,
-                            request_host,
-                            request_scheme,
-                            "track"
-                        ));
-                    }
+    for seatbid in seatbids {
+        let Some(bids) = seatbid.bid.as_mut() else {
+            continue;
+        };
 
-                    if let Some(burl) = bid["burl"].as_str() {
-                        bid["burl"] = json!(make_first_party_proxy_url(
-                            burl,
-                            request_host,
-                            request_scheme,
-                            "track"
-                        ));
-                    }
+        for bid in bids {
+            if let Some(adm) = bid.adm.as_deref() {
+                if looks_like_html(adm) {
+                    bid.adm = Some(creative::rewrite_creative_html(adm, settings));
                 }
+            }
+
+            if let Some(nurl) = bid.nurl.as_deref() {
+                bid.nurl = Some(first_party_proxy_url(
+                    settings,
+                    request_host,
+                    request_scheme,
+                    nurl,
+                ));
+            }
+
+            if let Some(burl) = bid.burl.as_deref() {
+                bid.burl = Some(first_party_proxy_url(
+                    settings,
+                    request_host,
+                    request_scheme,
+                    burl,
+                ));
             }
         }
     }
@@ -731,48 +792,136 @@ fn transform_prebid_response(
     Ok(())
 }
 
-fn rewrite_ad_markup(markup: &str, request_host: &str, request_scheme: &str) -> String {
-    let mut content = markup.to_string();
-    let cdn_patterns = vec![
-        ("https://cdn.adsrvr.org", "adsrvr"),
-        ("https://ib.adnxs.com", "adnxs"),
-        ("https://rtb.openx.net", "openx"),
-        ("https://as.casalemedia.com", "casale"),
-        ("https://eus.rubiconproject.com", "rubicon"),
-    ];
-
-    for (cdn_url, cdn_name) in cdn_patterns {
-        if content.contains(cdn_url) {
-            let proxy_base = format!(
-                "{}://{}/ad-proxy/{}",
-                request_scheme, request_host, cdn_name
-            );
-            content = content.replace(cdn_url, &proxy_base);
-        }
-    }
-
-    content = content.replace(
-        "//cdn.adsrvr.org",
-        &format!("//{}/ad-proxy/adsrvr", request_host),
-    );
-    content = content.replace(
-        "//ib.adnxs.com",
-        &format!("//{}/ad-proxy/adnxs", request_host),
-    );
-    content
-}
-
-fn make_first_party_proxy_url(
-    third_party_url: &str,
+fn first_party_proxy_url(
+    settings: &Settings,
     request_host: &str,
     request_scheme: &str,
-    proxy_type: &str,
+    clear_url: &str,
 ) -> String {
-    let encoded = BASE64.encode(third_party_url.as_bytes());
-    format!(
-        "{}://{}/ad-proxy/{}/{}",
-        request_scheme, request_host, proxy_type, encoded
-    )
+    let trimmed = clear_url.trim();
+    let Some(abs) = normalize_absolute_url(trimmed, request_scheme) else {
+        return clear_url.to_string();
+    };
+    if is_excluded_by_domain(settings, &abs) {
+        return clear_url.to_string();
+    }
+    let signed = creative::build_proxy_url(settings, &abs);
+    let proxy_path = if signed == abs {
+        build_proxy_path_for_raw_url(settings, &abs)
+    } else {
+        signed
+    };
+    absolutize_proxy_path(settings, request_host, request_scheme, proxy_path)
+}
+
+fn absolutize_proxy_path(
+    settings: &Settings,
+    request_host: &str,
+    request_scheme: &str,
+    proxy_path: String,
+) -> String {
+    if proxy_path.starts_with('/') {
+        let host = if request_host.is_empty() {
+            settings.publisher.domain.as_str()
+        } else {
+            request_host
+        };
+        if host.is_empty() {
+            return proxy_path;
+        }
+        return format!("{request_scheme}://{host}{proxy_path}");
+    }
+    proxy_path
+}
+
+fn looks_like_html(markup: &str) -> bool {
+    let trimmed = markup.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with('<') {
+        return false;
+    }
+    if lower.starts_with("<?xml") || lower.starts_with("<vast") {
+        return false;
+    }
+    [
+        "<!doctype html",
+        "<html",
+        "<body",
+        "<div",
+        "<span",
+        "<img",
+        "<script",
+        "<iframe",
+        "<a",
+        "<link",
+        "<style",
+        "<video",
+        "<audio",
+        "<source",
+        "<object",
+        "<embed",
+        "<input",
+        "<svg",
+        "<table",
+        "<p",
+        "<canvas",
+        "<meta",
+        "<form",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
+fn normalize_absolute_url(url: &str, request_scheme: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(url.to_string());
+    }
+    if url.starts_with("//") {
+        return Some(format!("{}:{}", request_scheme, url));
+    }
+    None
+}
+
+fn is_excluded_by_domain(settings: &Settings, abs_url: &str) -> bool {
+    if settings.rewrite.exclude_domains.is_empty() {
+        return false;
+    }
+    if let Ok(parsed) = Url::parse(abs_url) {
+        return settings.rewrite.is_excluded(parsed.as_str());
+    }
+    let Some(host) = extract_host(abs_url) else {
+        return false;
+    };
+    let check = format!("https://{}", host);
+    settings.rewrite.is_excluded(&check)
+}
+
+fn extract_host(abs_url: &str) -> Option<&str> {
+    let lower = abs_url.to_ascii_lowercase();
+    let rest = if lower.starts_with("https://") {
+        &abs_url["https://".len()..]
+    } else if lower.starts_with("http://") {
+        &abs_url["http://".len()..]
+    } else {
+        return None;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(host)
+}
+
+fn build_proxy_path_for_raw_url(settings: &Settings, clear_url: &str) -> String {
+    let token = compute_encrypted_sha256_token(settings, clear_url);
+    let mut qs = form_urlencoded::Serializer::new(String::new());
+    qs.append_pair("tsurl", clear_url);
+    qs.append_pair("tstoken", &token);
+    format!("/first-party/proxy?{}", qs.finish())
 }
 
 fn copy_request_headers(from: &Request, to: &mut Request) {
@@ -790,8 +939,6 @@ fn copy_request_headers(from: &Request, to: &mut Request) {
         }
     }
 }
-
-// Request host/scheme extraction is now centralized in http_util::RequestInfo
 
 #[cfg(test)]
 mod tests {
@@ -977,40 +1124,101 @@ mod tests {
     #[test]
     fn enhance_openrtb_request_adds_ids_and_regs() {
         let settings = make_settings();
-        let mut request_json = json!({
-            "id": "openrtb-request-id"
-        });
+        let mut request = OpenRtbRequest {
+            id: "openrtb-request-id".to_string(),
+            imp: Vec::new(),
+            site: None,
+            user: None,
+            regs: None,
+            device: None,
+            ext: None,
+            extra: HashMap::new(),
+        };
 
         let synthetic_id = "synthetic-123";
         let fresh_id = "fresh-456";
         let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
+        enhance_openrtb_request(&mut request, synthetic_id, fresh_id, &settings, &req)
             .expect("should enhance request");
 
-        assert_eq!(request_json["user"]["id"], synthetic_id);
-        assert_eq!(request_json["user"]["ext"]["synthetic_fresh"], fresh_id);
+        let user = request.user.as_ref().expect("should have user");
+        assert_eq!(user.id.as_deref(), Some(synthetic_id), "should set user id");
+        let user_ext = user.ext.as_ref().expect("should have user ext");
         assert_eq!(
-            request_json["regs"]["ext"]["us_privacy"], "1YYN",
-            "GPC header should map to US privacy flag"
+            user_ext.synthetic_fresh.as_deref(),
+            Some(fresh_id),
+            "should set synthetic fresh id"
         );
+        let regs = request.regs.as_ref().expect("should have regs");
+        let regs_ext = regs.ext.as_ref().expect("should have regs ext");
         assert_eq!(
-            request_json["site"]["domain"], settings.publisher.domain,
-            "site domain should match publisher domain"
+            regs_ext.us_privacy.as_deref(),
+            Some("1YYN"),
+            "should map GPC header to US privacy flag"
         );
-        assert!(
-            request_json["site"]["page"]
-                .as_str()
-                .unwrap()
-                .starts_with("https://"),
-            "site page should be populated"
+        let site = request.site.as_ref().expect("should have site");
+        assert_eq!(
+            site.domain.as_deref(),
+            Some(settings.publisher.domain.as_str()),
+            "should set site domain"
+        );
+        let page = site.page.as_ref().expect("should have site page");
+        assert!(page.starts_with("https://"), "should set site page");
+    }
+
+    #[test]
+    fn override_prebid_bidders_replaces_request_values() {
+        let mut request: OpenRtbRequest = serde_json::from_value(json!({
+            "id": "openrtb-request-id",
+            "imp": [
+                {
+                    "id": "slot-a",
+                    "ext": {
+                        "prebid": {
+                            "bidder": { "legacy": {} }
+                        }
+                    }
+                },
+                { "id": "slot-b" }
+            ]
+        }))
+        .expect("should parse openrtb request");
+        let bidders = vec!["appnexus".to_string(), "rubicon".to_string()];
+
+        override_prebid_bidders(&mut request, &bidders);
+
+        let expected = bidders
+            .iter()
+            .map(|bidder| (bidder.clone(), JsonValue::Object(serde_json::Map::new())))
+            .collect::<std::collections::HashMap<_, _>>();
+        let first = request.imp.first().expect("should have first imp");
+        let first_prebid = first
+            .ext
+            .as_ref()
+            .and_then(|ext| ext.prebid.as_ref())
+            .expect("should have prebid ext for first imp");
+        assert_eq!(
+            first_prebid.bidder, expected,
+            "should replace bidders in first imp"
+        );
+        let second = request.imp.get(1).expect("should have second imp");
+        let second_prebid = second
+            .ext
+            .as_ref()
+            .and_then(|ext| ext.prebid.as_ref())
+            .expect("should have prebid ext for second imp");
+        assert_eq!(
+            second_prebid.bidder, expected,
+            "should replace bidders in second imp"
         );
     }
 
     #[test]
     fn transform_prebid_response_rewrites_creatives_and_tracking() {
-        let mut response = json!({
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut response: OpenRtbResponse = serde_json::from_value(json!({
             "seatbid": [{
                 "bid": [{
                     "adm": r#"<img src="https://cdn.adsrvr.org/pixel.png">"#,
@@ -1018,28 +1226,67 @@ mod tests {
                     "burl": "https://notify.example/bill"
                 }]
             }]
-        });
+        }))
+        .expect("should parse openrtb response");
 
-        transform_prebid_response(&mut response, "pub.example", "https")
+        transform_prebid_response(&mut response, &settings, "pub.example", "https")
             .expect("should rewrite response");
 
-        let rewritten_adm = response["seatbid"][0]["bid"][0]["adm"]
-            .as_str()
+        let rewritten_adm = response
+            .seatbid
+            .as_ref()
+            .and_then(|seatbids| seatbids.first())
+            .and_then(|seatbid| seatbid.bid.as_ref())
+            .and_then(|bids| bids.first())
+            .and_then(|bid| bid.adm.as_deref())
             .expect("adm should be string");
         assert!(
-            rewritten_adm.contains("/ad-proxy/adsrvr"),
-            "creative markup should proxy CDN urls"
+            rewritten_adm.contains("/first-party/proxy?tsurl="),
+            "creative markup should proxy asset urls"
         );
 
-        for url_field in ["nurl", "burl"] {
-            let value = response["seatbid"][0]["bid"][0][url_field]
-                .as_str()
-                .unwrap();
+        let bid = response
+            .seatbid
+            .as_ref()
+            .and_then(|seatbids| seatbids.first())
+            .and_then(|seatbid| seatbid.bid.as_ref())
+            .and_then(|bids| bids.first())
+            .expect("should have bid");
+        for value in [bid.nurl.as_deref(), bid.burl.as_deref()] {
+            let value = value.expect("should have tracking url");
             assert!(
-                value.contains("/ad-proxy/track/"),
+                value.starts_with("https://pub.example/first-party/proxy?tsurl="),
                 "tracking URLs should be proxied"
             );
         }
+    }
+
+    #[test]
+    fn transform_prebid_response_preserves_non_html_adm() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let adm = r#"<VAST version="4.0"></VAST>"#;
+        let mut response: OpenRtbResponse = serde_json::from_value(json!({
+            "seatbid": [{
+                "bid": [{
+                    "adm": adm,
+                    "nurl": "https://notify.example/win"
+                }]
+            }]
+        }))
+        .expect("should parse openrtb response");
+
+        transform_prebid_response(&mut response, &settings, "pub.example", "https")
+            .expect("should rewrite response");
+
+        let rewritten_adm = response
+            .seatbid
+            .as_ref()
+            .and_then(|seatbids| seatbids.first())
+            .and_then(|seatbid| seatbid.bid.as_ref())
+            .and_then(|bids| bids.first())
+            .and_then(|bid| bid.adm.as_deref())
+            .expect("adm should be string");
+        assert_eq!(rewritten_adm, adm, "non-html adm should remain unchanged");
     }
 
     #[test]
@@ -1065,19 +1312,50 @@ mod tests {
     }
 
     #[test]
-    fn make_first_party_proxy_url_base64_encodes_target() {
+    fn first_party_proxy_url_signs_target() {
+        let settings = crate::test_support::tests::create_test_settings();
         let url = "https://cdn.example/path?x=1";
-        let rewritten = make_first_party_proxy_url(url, "pub.example", "https", "track");
+        let rewritten = first_party_proxy_url(&settings, "pub.example", "https", url);
         assert!(
-            rewritten.starts_with("https://pub.example/ad-proxy/track/"),
+            rewritten.starts_with("https://pub.example/first-party/proxy?tsurl="),
             "proxy prefix should be applied"
         );
+        assert!(
+            rewritten.contains("tstoken="),
+            "proxy url should include a signature"
+        );
+    }
 
-        let encoded = rewritten.split("/ad-proxy/track/").nth(1).unwrap();
-        let decoded = BASE64
-            .decode(encoded.as_bytes())
-            .expect("should decode base64 proxy payload");
-        assert_eq!(String::from_utf8(decoded).unwrap(), url);
+    #[test]
+    fn first_party_proxy_url_handles_macros() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let url = "https://notify.example/win?price=${AUCTION_PRICE}&id=123";
+        let rewritten = first_party_proxy_url(&settings, "pub.example", "https", url);
+        assert!(
+            rewritten.starts_with("https://pub.example/first-party/proxy?tsurl="),
+            "proxy prefix should be applied"
+        );
+        assert!(
+            rewritten.contains("tstoken="),
+            "proxy url should include a signature"
+        );
+        assert!(
+            rewritten.contains("notify.example"),
+            "proxy url should include target host"
+        );
+        assert!(
+            rewritten.contains("AUCTION_PRICE"),
+            "proxy url should preserve macro tokens"
+        );
+    }
+
+    #[test]
+    fn first_party_proxy_url_respects_exclude_domains() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.exclude_domains = vec!["notify.example".to_string()];
+        let url = "https://notify.example/win";
+        let rewritten = first_party_proxy_url(&settings, "pub.example", "https", url);
+        assert_eq!(rewritten, url, "excluded domains should not be proxied");
     }
 
     #[test]
@@ -1162,7 +1440,10 @@ server_url = "https://prebid.example"
         assert!(cache_control.contains("immutable"));
 
         let body = response.into_body_str();
-        assert!(body.contains("// Script overridden by Trusted Server"));
+        assert!(
+            body.contains("tsjs-unified"),
+            "should contain comment about replacement"
+        );
     }
 
     #[test]
@@ -1187,26 +1468,31 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn config_script_tag_generates_render_mode() {
-        let tag = config_script_tag(Mode::Render);
+    fn tsjs_config_script_tag_generates_render_mode() {
+        let tag = tsjs_config_script_tag(Mode::Render);
         assert!(tag.starts_with("<script>"));
         assert!(tag.ends_with("</script>"));
         assert!(tag.contains(r#"mode:"render""#));
         assert!(tag.contains("tsjs.setConfig"));
-        assert!(tag.contains("tsjs.que.push"));
+        // Should have guard for tsjs existence
+        assert!(tag.contains("window.tsjs&&"));
     }
 
     #[test]
-    fn config_script_tag_generates_auction_mode() {
-        let tag = config_script_tag(Mode::Auction);
+    fn tsjs_config_script_tag_generates_auction_mode() {
+        let tag = tsjs_config_script_tag(Mode::Auction);
         assert!(tag.starts_with("<script>"));
         assert!(tag.ends_with("</script>"));
         assert!(tag.contains(r#"mode:"auction""#));
         assert!(tag.contains("tsjs.setConfig"));
+        // Should have guard for tsjs existence
+        assert!(tag.contains("window.tsjs&&"));
     }
 
     #[test]
-    fn head_injector_returns_empty_when_mode_not_set() {
+    fn head_injector_returns_empty_when_no_mode() {
+        // When no mode is set, no head inserts needed
+        // (s2sConfig is built into the Prebid bundle served via script interception)
         let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationHtmlContext {
             request_host: "pub.example",
@@ -1215,14 +1501,11 @@ server_url = "https://prebid.example"
             document_state: &Default::default(),
         };
         let inserts = integration.head_inserts(&ctx);
-        assert!(
-            inserts.is_empty(),
-            "should not inject config when mode is None"
-        );
+        assert!(inserts.is_empty(), "no head inserts when mode not set");
     }
 
     #[test]
-    fn head_injector_returns_config_script_when_mode_set() {
+    fn head_injector_injects_mode_config_when_mode_set() {
         let mut config = base_config();
         config.mode = Some(Mode::Auction);
         let integration = PrebidIntegration::new(config);
@@ -1233,7 +1516,28 @@ server_url = "https://prebid.example"
             document_state: &Default::default(),
         };
         let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 1);
-        assert!(inserts[0].contains(r#"mode:"auction""#));
+        assert_eq!(inserts.len(), 1, "should inject mode config");
+        assert!(
+            inserts[0].contains(r#"mode:"auction""#),
+            "should contain mode config"
+        );
+    }
+
+    #[test]
+    fn script_handler_serves_empty_js_stub() {
+        let integration = PrebidIntegration::new(base_config());
+
+        let response = integration
+            .handle_script_handler()
+            .expect("should return response");
+
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let body = response.into_body_str();
+        // Should be a small stub comment, not the full bundle
+        assert!(
+            body.len() < 100,
+            "should serve empty JS stub, not full bundle"
+        );
+        assert!(body.starts_with("/*"), "should be a JS comment");
     }
 }

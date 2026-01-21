@@ -46,23 +46,34 @@ curl "https://edge.example.com/ad/render?slot=header-banner&w=728&h=90"
 
 ### POST /ad/auction
 
-Client-side auction endpoint for TSJS library.
+OpenRTB auction endpoint for client-side integrations (for example, Prebid.js S2S).
 
 **Request Body:**
 ```json
 {
-  "adUnits": [
+  "id": "auction-1",
+  "imp": [
     {
-      "code": "header-banner",
-      "mediaTypes": {
-        "banner": {
-          "sizes": [[728, 90], [970, 250]]
+      "id": "header-banner",
+      "banner": {
+        "format": [
+          { "w": 728, "h": 90 },
+          { "w": 970, "h": 250 }
+        ]
+      },
+      "ext": {
+        "prebid": {
+          "bidder": {
+            "appnexus": {},
+            "rubicon": {}
+          }
         }
       }
     }
   ],
-  "config": {
-    "debug": false
+  "site": {
+    "domain": "example.com",
+    "page": "https://example.com"
   }
 }
 ```
@@ -90,7 +101,15 @@ Client-side auction endpoint for TSJS library.
 ```bash
 curl -X POST https://edge.example.com/ad/auction \
   -H "Content-Type: application/json" \
-  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
+  -d '{
+    "id": "auction-1",
+    "imp": [{
+      "id": "banner",
+      "banner": { "format": [{ "w": 300, "h": 250 }] },
+      "ext": { "prebid": { "bidder": { "appnexus": {} } } }
+    }],
+    "site": { "domain": "example.com", "page": "https://example.com" }
+  }'
 ```
 
 ---

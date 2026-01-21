@@ -38,7 +38,7 @@ debug = false
 
 **Endpoints:**
 - `GET /ad/render` - Server-side ad rendering
-- `POST /ad/auction` - Client-side auction endpoint
+- `POST /ad/auction` - OpenRTB auction endpoint (Prebid.js S2S)
 - `GET /prebid.js` - Empty script override (plus any configured patterns)
 
 **When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.

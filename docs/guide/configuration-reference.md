@@ -598,7 +598,7 @@ All integrations support:
 | `timeout_ms` | Integer | `1000` | Request timeout in milliseconds |
 | `bidders` | Array[String] | `[]` | List of enabled bidders |
 | `debug` | Boolean | `false` | Enable debug logging |
-| `mode` | String | None | Default TSJS request mode when Prebid is enabled (`render` or `auction`) |
+| `mode` | String | None | Default TSJS request mode when Prebid is enabled (`render` or `auction`); `auction` expects OpenRTB clients (for example, Prebid.js) calling `/ad/auction` |
 | `script_patterns` | Array[String] | See below | Patterns for removing Prebid script tags and intercepting requests |
 
 **Default `script_patterns`**:
@@ -616,7 +616,7 @@ server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 debug = false
-mode = "auction"
+mode = "auction" # OpenRTB clients (for example, Prebid.js)
 # script_patterns = ["/static/prebid/*"]  # Optional: restrict to specific path
 ```
 

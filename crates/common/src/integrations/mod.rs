@@ -3,6 +3,7 @@
 use crate::settings::Settings;
 
 pub mod didomi;
+pub mod gam;
 pub mod lockr;
 pub mod nextjs;
 pub mod permutive;
@@ -28,5 +29,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         permutive::register,
         lockr::register,
         didomi::register,
+        gam::register,
     ]
 }

@@ -1,5 +1,4 @@
 // Cross-runtime helpers for resolving windows/globals in creatives and pbjs shims.
-import type { TsjsApi } from '../core/types';
 
 export interface TsCreativeApi {
   installGuards(): void;
@@ -34,7 +33,8 @@ export function resolveWindow(): Window | undefined {
   return maybeWindow;
 }
 
-export type PrebidWindow = Window & { tsjs?: TsjsApi; pbjs?: TsjsApi };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type PrebidWindow = Window & { tsjs?: any; pbjs?: any };
 
 // Always hand back an object so shims can safely assign tsjs/pbjs globals.
 export function resolvePrebidWindow(): PrebidWindow {

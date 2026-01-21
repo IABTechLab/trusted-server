@@ -84,7 +84,7 @@ impl FastlyApiClient {
     }
 
     pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
-        ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
+        ensure_backend_from_url("https://api.fastly.com", true).map_err(|e| {
             TrustedServerError::Configuration {
                 message: format!("Failed to ensure API backend: {}", e),
             }

@@ -201,10 +201,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
+                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
+                    snippet.push_str(&tsjs::unified_script_tag());
+                    // Then add any integration-specific head inserts (e.g., mode config)
+                    // These run after the bundle so tsjs API is available
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    snippet.push_str(&tsjs::unified_script_tag());
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -467,7 +470,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::prebid::{config_script_tag, Mode as PrebidMode};
+    use crate::integrations::prebid::{tsjs_config_script_tag, Mode as PrebidMode};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         IntegrationHeadInjector,
@@ -607,7 +610,7 @@ mod tests {
             }
 
             fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![config_script_tag(PrebidMode::Auction)]
+                vec![tsjs_config_script_tag(PrebidMode::Auction)]
             }
         }
 
@@ -643,9 +646,10 @@ mod tests {
             script_pos.is_some(),
             "should inject unified tsjs script when processing HTML"
         );
+        // Config must come AFTER the bundle so tsjs.setConfig is defined when called
         assert!(
-            config_pos.unwrap() < script_pos.unwrap(),
-            "should place tsjs config before the unified bundle"
+            config_pos.unwrap() > script_pos.unwrap(),
+            "should place tsjs config after the unified bundle (so tsjs.setConfig is available)"
         );
     }
 

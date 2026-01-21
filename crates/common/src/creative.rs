@@ -155,9 +155,10 @@ fn build_signed_url_for(
         pairs.extend(extra.iter().cloned());
     }
 
+    // Build tsurl from parsed URL without query/fragment (preserves port)
     u.set_query(None);
     u.set_fragment(None);
-    let tsurl = u.as_str().to_string();
+    let tsurl = u.to_string();
 
     let full_for_token = if pairs.is_empty() {
         tsurl.clone()
@@ -323,7 +324,9 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // Image src + data-src
                 element!("img", |el| {
                     if let Some(src) = el.get_attribute("src") {
+                        log::debug!("creative rewrite: img src input = {}", src);
                         if let Some(p) = proxy_if_abs(settings, &src) {
+                            log::debug!("creative rewrite: img src output = {}", p);
                             let _ = el.set_attribute("src", &p);
                         }
                     }
@@ -537,6 +540,43 @@ mod tests {
         assert_eq!(to_abs("data:image/png;base64,abcd", &settings), None);
         assert_eq!(to_abs("javascript:alert(1)", &settings), None);
         assert_eq!(to_abs("mailto:test@example.com", &settings), None);
+    }
+
+    #[test]
+    fn to_abs_preserves_port_in_protocol_relative() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Protocol-relative URL with explicit port should preserve the port
+        assert_eq!(
+            to_abs("//cdn.example.com:8080/asset.js", &settings),
+            Some("https://cdn.example.com:8080/asset.js".to_string())
+        );
+        assert_eq!(
+            to_abs("//cdn.example.com:9443/img.png", &settings),
+            Some("https://cdn.example.com:9443/img.png".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_creative_preserves_non_standard_port() {
+        // Verify creative rewriting preserves non-standard ports in URLs
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<!DOCTYPE html>
+<html>
+  <body>
+    <a href="//cdn.example.com:9443/click">
+      <img src="//cdn.example.com:9443/img/300x250.svg" />
+    </a>
+    <img src="//cdn.example.com:9443/pixel?pid=test" width="1" height="1" />
+  </body>
+</html>"#;
+        let out = rewrite_creative_html(html, &settings);
+
+        // Port 9443 should be preserved (URL-encoded as %3A9443)
+        assert!(
+            out.contains("cdn.example.com%3A9443"),
+            "Port 9443 should be preserved in rewritten URLs: {}",
+            out
+        );
     }
 
     #[test]

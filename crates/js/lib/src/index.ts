@@ -35,7 +35,7 @@ for (const [moduleName, moduleExports] of Object.entries(modules)) {
 }
 
 // Re-export core types for convenience
-export type { AdUnit, TsjsApi } from './core/types';
+export type { TsjsApi } from './core/types';
 
 // Export the modules object for advanced use cases
 export { modules };

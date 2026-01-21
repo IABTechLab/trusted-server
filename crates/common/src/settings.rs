@@ -259,6 +259,28 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
+/// Proxy settings for `/first-party/proxy` endpoint
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Proxy {
+    /// Enable TLS certificate verification when proxying to HTTPS origins.
+    /// Defaults to true for secure production use.
+    /// Set to false for local development with self-signed certificates.
+    #[serde(default = "default_certificate_check")]
+    pub certificate_check: bool,
+}
+
+fn default_certificate_check() -> bool {
+    true
+}
+
+impl Default for Proxy {
+    fn default() -> Self {
+        Self {
+            certificate_check: default_certificate_check(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -277,6 +299,8 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub rewrite: Rewrite,
+    #[serde(default)]
+    pub proxy: Proxy,
 }
 
 #[allow(unused)]

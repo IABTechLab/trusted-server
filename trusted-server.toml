@@ -74,6 +74,13 @@ sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 
+# GAM (Google Ad Manager) Interceptor
+# Forces Prebid creatives to render when GAM doesn't have matching line items
+[integrations.gam]
+enabled = false
+bidders = []  # Only intercept these bidders (empty = all bidders)
+force_render = false  # Force render even if GAM has a line item
+
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
 # Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")

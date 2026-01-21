@@ -258,11 +258,11 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/ad/render` & `/ad/auction`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
+**Purpose**: Production Prebid Server bridge that owns `/ad/render` & `/ad/auction`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the Prebid.js bundle already ships in the unified TSJS build.
 
 **Key files**:
 - `crates/common/src/integrations/prebid.rs` - Rust implementation  
-- `crates/js/lib/src/ext/prebidjs.ts` - TypeScript shim
+- `crates/js/lib/src/integrations/prebid/index.ts` - Prebid.js bundle integration
 
 #### Prebid Integration Details
 
@@ -285,7 +285,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **2. Routes Owned by the Integration**
 
-`IntegrationProxy::routes` declares the `/ad/render` (GET) and `/ad/auction` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. These routes are intentionally un-namespaced to match the TSJS client.
+`IntegrationProxy::routes` declares the `/ad/render` (GET) and `/ad/auction` (POST) endpoints. `/ad/render` builds OpenRTB from slot parameters, while `/ad/auction` accepts OpenRTB directly from the client. Both paths inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. These routes are intentionally un-namespaced to match client integrations.
 
 **3. HTML Rewrites Through the Registry**
 
@@ -293,7 +293,7 @@ When the integration is enabled, the `IntegrationAttributeRewriter` removes any 
 
 **4. TSJS Assets & Testing**
 
-The shim implementation lives in `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the shim.
+The Prebid.js bundle integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the bundle.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 
