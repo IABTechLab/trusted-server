@@ -23,7 +23,7 @@ use crate::settings::IntegrationConfig;
 /// APS TAM bid request format based on /e/dtb/bid endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApsBidRequest {
-    /// Publisher ID (e.g., "5128")
+    /// Publisher ID
     #[serde(rename = "pubId")]
     pub_id: String,
 
