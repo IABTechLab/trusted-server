@@ -40,6 +40,7 @@ timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 auto_configure = false
 debug = false
+# debug_query_params = ""
 # script_handler = "/prebid.js"
 
 [integrations.nextjs]
@@ -85,19 +86,20 @@ rewrite_sdk = true
 
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # will use mediator when set
+providers = ["prebid"]
+# mediator = "adserver_mock"  # will use mediator when set
 timeout_ms = 2000
 
 [integrations.aps]
-enabled = true
+enabled = false
 pub_id = "your-aps-publisher-id"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
 timeout_ms = 1000
 
 [integrations.adserver_mock]
-enabled = true
+enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
+
 
 
