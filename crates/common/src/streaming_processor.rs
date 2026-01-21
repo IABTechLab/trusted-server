@@ -185,7 +185,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to decompress gzip".to_string(),
             })?;
 
-        log::info!("[Gzip] Decompressed size: {} bytes", decompressed.len());
+        log::info!("Decompressed size: {} bytes", decompressed.len());
 
         // Process the decompressed content
         let processed = self
@@ -195,7 +195,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Gzip] Processed size: {} bytes", processed.len());
+        log::info!("Processed size: {} bytes", processed.len());
 
         // Recompress the output
         let mut encoder = GzEncoder::new(output, Compression::default());
@@ -228,10 +228,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to decompress gzip".to_string(),
             })?;
 
-        log::info!(
-            "[Gzip->None] Decompressed size: {} bytes",
-            decompressed.len()
-        );
+        log::info!("Gzip->None decompressed size: {} bytes", decompressed.len());
 
         // Process the decompressed content
         let processed = self
@@ -241,7 +238,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Gzip->None] Processed size: {} bytes", processed.len());
+        log::info!("Gzip->None processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -287,7 +284,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         log::info!(
-            "[Deflate->None] Decompressed size: {} bytes",
+            "Deflate->None decompressed size: {} bytes",
             decompressed.len()
         );
 
@@ -299,7 +296,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Deflate->None] Processed size: {} bytes", processed.len());
+        log::info!("Deflate->None processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -350,7 +347,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         log::info!(
-            "[Brotli->None] Decompressed size: {} bytes",
+            "Brotli->None decompressed size: {} bytes",
             decompressed.len()
         );
 
@@ -362,7 +359,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Brotli->None] Processed size: {} bytes", processed.len());
+        log::info!("Brotli->None processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -462,7 +459,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
         if !chunk.is_empty() {
             log::debug!(
-                "[HtmlRewriter] Buffering chunk: {} bytes, total buffered: {} bytes",
+                "Buffering chunk: {} bytes, total buffered: {} bytes",
                 chunk.len(),
                 self.accumulated_input.len()
             );
@@ -471,7 +468,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
         // Only process when we have all the input
         if is_last {
             log::info!(
-                "[HtmlRewriter] Processing complete document: {} bytes",
+                "Processing complete document: {} bytes",
                 self.accumulated_input.len()
             );
 
@@ -488,17 +485,17 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
             // Process the entire document
             rewriter.write(&self.accumulated_input).map_err(|e| {
-                log::error!("[HtmlRewriter] Failed to process HTML: {}", e);
+                log::error!("Failed to process HTML: {}", e);
                 io::Error::other(format!("HTML processing failed: {}", e))
             })?;
 
             // Finalize the rewriter
             rewriter.end().map_err(|e| {
-                log::error!("[HtmlRewriter] Failed to finalize: {}", e);
+                log::error!("Failed to finalize: {}", e);
                 io::Error::other(format!("HTML finalization failed: {}", e))
             })?;
 
-            log::debug!("[HtmlRewriter] Output size: {} bytes", output.len());
+            log::debug!("Output size: {} bytes", output.len());
             self.accumulated_input.clear();
             Ok(output)
         } else {

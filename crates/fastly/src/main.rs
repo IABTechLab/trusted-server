@@ -131,9 +131,14 @@ fn init_logger() {
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "{}  {} {}",
+                "{} {} [{}] {}",
                 chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 record.level(),
+                record
+                    .target()
+                    .split("::")
+                    .last()
+                    .unwrap_or(record.target()),
                 message
             ))
         })
