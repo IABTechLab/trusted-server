@@ -634,7 +634,7 @@ Use this checklist to track your onboarding progress:
 ### Documentation & Contribution
 
 - [ ] Read `CONTRIBUTING.md` for PR guidelines
-- [ ] Browse the [documentation site guides](guide/index.md)
+- [ ] Browse the [documentation site guides](guide/getting-started.md)
 - [ ] Make a small contribution (fix a typo, add a test, etc.)
 
 ---
