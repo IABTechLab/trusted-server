@@ -135,7 +135,12 @@ function renderCreativeInline(
     // Write creative HTML directly into iframe using srcdoc
     iframe.srcdoc = buildCreativeDocument(creativeHtml);
 
-    log.info('renderCreativeInline: rendered', { slotId, width, height, htmlLength: creativeHtml.length });
+    log.info('renderCreativeInline: rendered', {
+      slotId,
+      width,
+      height,
+      htmlLength: creativeHtml.length,
+    });
   } catch (err) {
     log.warn('renderCreativeInline: failed', { slotId, err });
   }
