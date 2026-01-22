@@ -527,6 +527,10 @@ async fn proxy_with_redirects(
 /// - If the response is an image or the request `Accept` indicates images, ensures a
 ///   generic `image/*` content type if origin omitted it, and logs likely 1×1 pixels
 ///   using simple size/URL heuristics. No special response (still proxied).
+///
+/// # Errors
+///
+/// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_proxy(
     settings: &Settings,
     req: Request,
@@ -556,6 +560,10 @@ pub async fn handle_first_party_proxy(
 /// content, it validates the URL and issues a 302 redirect to the reconstructed
 /// target URL. This avoids parsing/downloading the content and lets the browser
 /// navigate directly to the destination under first-party control.
+///
+/// # Errors
+///
+/// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_click(
     settings: &Settings,
     req: Request,
@@ -644,6 +652,10 @@ pub async fn handle_first_party_click(
 /// in the signature so the signed URL cannot be replayed indefinitely. Returns JSON
 /// `{ href, base }` where `href` is the signed `/first-party/proxy?...` path and `base`
 /// is the normalized clear URL.
+///
+/// # Errors
+///
+/// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     mut req: Request,
@@ -747,6 +759,10 @@ struct ProxyRebuildResp {
 /// Body: { tsclick: "/first-party/click?tsurl=...&a=1", add: {"b":"2"}, del: ["c"] }
 /// - Only allows adding new parameters or removing existing ones.
 /// - Base tsurl cannot change.
+///
+/// # Errors
+///
+/// Returns an error if JSON parsing fails, the URL is invalid, or the request body cannot be read.
 pub async fn handle_first_party_proxy_rebuild(
     settings: &Settings,
     mut req: Request,

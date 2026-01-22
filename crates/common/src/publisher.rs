@@ -76,6 +76,12 @@ fn detect_request_scheme(req: &Request) -> String {
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
+///
+/// Returns 404 for invalid paths or missing bundle files; otherwise serves the requested bundle.
+///
+/// # Errors
+///
+/// This function never returns an error; the Result type is for API consistency.
 pub fn handle_tsjs_dynamic(
     _settings: &Settings,
     req: Request,

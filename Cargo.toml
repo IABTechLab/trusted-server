@@ -24,8 +24,8 @@ must_use_candidate = "warn"
 
 # Pedantic (selective)
 doc_markdown = "warn"
-# missing_errors_doc = "warn"
-# missing_panics_doc = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
 
 # Restriction (selective)
 print_stdout = "warn"

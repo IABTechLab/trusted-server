@@ -44,6 +44,10 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
 
 /// Encrypts a URL using XChaCha20-Poly1305 with a key derived from the publisher `proxy_secret`.
 /// Returns a Base64 URL-safe (no padding) token: b"x1" || nonce(24) || ciphertext+tag.
+///
+/// # Panics
+///
+/// Panics if encryption fails (which should not happen under normal circumstances).
 #[must_use]
 pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     // Derive a 32-byte key via SHA-256(secret)

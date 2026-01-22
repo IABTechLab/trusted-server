@@ -53,6 +53,11 @@ impl Keypair {
     }
 }
 
+/// Retrieves active JSON Web Keys from the config store.
+///
+/// # Errors
+///
+/// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
 pub fn get_active_jwks() -> Result<String, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
     let active_kids_str = store.get("active-kids")?;

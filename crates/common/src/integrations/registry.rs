@@ -117,6 +117,11 @@ impl std::fmt::Debug for IntegrationDocumentState {
 
 impl IntegrationDocumentState {
     #[must_use]
+    /// Retrieves a value stored for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -131,6 +136,11 @@ impl IntegrationDocumentState {
         })
     }
 
+    /// Retrieves or initializes a value for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get_or_insert_with<T>(
         &self,
         integration_id: &'static str,
@@ -158,6 +168,11 @@ impl IntegrationDocumentState {
         value
     }
 
+    /// Clears all stored values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn clear(&self) {
         let mut guard = self
             .inner
@@ -488,6 +503,10 @@ pub struct IntegrationRegistry {
 
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an integration route registration fails due to duplicate routes or invalid paths.
     #[must_use]
     #[allow(clippy::panic, clippy::unwrap_used)]
     pub fn new(settings: &Settings) -> Self {
@@ -684,6 +703,11 @@ impl IntegrationRegistry {
 
     #[cfg(test)]
     #[must_use]
+    /// Test helper to create a registry from routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if route registration fails due to duplicate or invalid paths.
     pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();

@@ -21,6 +21,10 @@ pub trait StreamProcessor {
     ///
     /// # Returns
     /// Processed data or error
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing fails (e.g., I/O errors, encoding issues).
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error>;
 
     /// Reset the processor state (useful for reuse)
@@ -77,11 +81,19 @@ pub struct StreamingPipeline<P: StreamProcessor> {
 
 impl<P: StreamProcessor> StreamingPipeline<P> {
     /// Create a new streaming pipeline
+    ///
+    /// # Errors
+    ///
+    /// No errors are returned by this constructor.
     pub fn new(config: PipelineConfig, processor: P) -> Self {
         Self { config, processor }
     }
 
     /// Process a stream from input to output
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression transformation is unsupported or if reading/writing fails.
     pub fn process<R: Read, W: Write>(
         &mut self,
         input: R,

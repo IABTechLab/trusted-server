@@ -78,6 +78,11 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 }
 
 impl IntegrationSettings {
+    /// Inserts a configuration value for an integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration cannot be serialized to JSON.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert_config<T>(
         &mut self,
@@ -116,6 +121,11 @@ impl IntegrationSettings {
         }
     }
 
+    /// Retrieves and validates a typed configuration for an integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration cannot be parsed from JSON or fails validation.
     pub fn get_typed<T>(
         &self,
         integration_id: &str,
@@ -180,6 +190,11 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
+    /// Validates that the secret key is not the placeholder value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the secret key is `"secret_key"` (the placeholder).
     pub fn validate_secret_key(secret_key: &str) -> Result<(), ValidationError> {
         match secret_key {
             "secret_key" => Err(ValidationError::new("Secret key is not valid")),
@@ -349,6 +364,11 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
+    /// Retrieves the integration configuration of a specific type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the integration configuration exists but cannot be deserialized as the requested type.
     pub fn integration_config<T>(
         &self,
         integration_id: &str,

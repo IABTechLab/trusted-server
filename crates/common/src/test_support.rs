@@ -37,6 +37,11 @@ pub mod tests {
     }
 
     #[must_use]
+    /// Creates test settings from embedded TOML configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML configuration is invalid.
     pub fn create_test_settings() -> Settings {
         let toml_str = crate_test_settings_str();
         Settings::from_toml(&toml_str).expect("Invalid config")

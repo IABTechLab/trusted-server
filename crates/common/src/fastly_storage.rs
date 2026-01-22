@@ -17,6 +17,11 @@ impl FastlyConfigStore {
         }
     }
 
+    /// Retrieves a configuration value from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not found in the config store.
     pub fn get(&self, key: &str) -> Result<String, TrustedServerError> {
         // TODO use try_open and return the error
         let store = ConfigStore::open(&self.store_name);
@@ -42,6 +47,12 @@ impl FastlySecretStore {
         }
     }
 
+    /// Retrieves a secret value from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret store cannot be opened, the key is not found,
+    /// or the secret plaintext cannot be retrieved.
     pub fn get(&self, key: &str) -> Result<Vec<u8>, TrustedServerError> {
         let store =
             SecretStore::open(&self.store_name).map_err(|_| TrustedServerError::Configuration {
@@ -65,6 +76,11 @@ impl FastlySecretStore {
             .map(|bytes| bytes.into_iter().collect())
     }
 
+    /// Retrieves a secret value from the store and decodes it as a UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret cannot be retrieved or is not valid UTF-8.
     pub fn get_string(&self, key: &str) -> Result<String, TrustedServerError> {
         let bytes = self.get(key)?;
         String::from_utf8(bytes).map_err(|e| TrustedServerError::Configuration {
@@ -79,10 +95,20 @@ pub struct FastlyApiClient {
 }
 
 impl FastlyApiClient {
+    /// Creates a new Fastly API client using the default secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret store cannot be opened or the API key cannot be retrieved.
     pub fn new() -> Result<Self, TrustedServerError> {
         Self::from_secret_store("api-keys", "api_key")
     }
 
+    /// Creates a new Fastly API client from a specified secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API backend cannot be ensured or the API key cannot be retrieved.
     pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
         ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
             TrustedServerError::Configuration {
@@ -139,6 +165,11 @@ impl FastlyApiClient {
         })
     }
 
+    /// Updates a configuration item in a Fastly config store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK status.
     pub fn update_config_item(
         &self,
         store_id: &str,
@@ -176,6 +207,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Creates a secret in a Fastly secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK status.
     pub fn create_secret(
         &self,
         store_id: &str,
@@ -213,6 +249,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Deletes a configuration item from a Fastly config store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK/NO_CONTENT status.
     pub fn delete_config_item(&self, store_id: &str, key: &str) -> Result<(), TrustedServerError> {
         let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
 
@@ -241,6 +282,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Deletes a secret from a Fastly secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK/NO_CONTENT status.
     pub fn delete_secret(
         &self,
         store_id: &str,
