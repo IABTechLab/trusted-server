@@ -4,5 +4,6 @@ test_details = ["test", "--target", "aarch64-apple-darwin"]
 [build]
 target = "wasm32-wasip1"
 
+# Viceroy runs from crate directory, use wrapper to cd to repo root first
 [target.'cfg(all(target_arch = "wasm32"))']
-runner = "viceroy run -C ../../fastly.toml -- "
+runner = ["sh", "-c", "cd ../.. && viceroy run -C fastly.toml -- \"$1\"", "--"]

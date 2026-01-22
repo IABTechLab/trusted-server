@@ -40,8 +40,17 @@ jobs:
       - name: Setup Viceroy (from main since 0.14.3 is broken)
         run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
-      - name: Run tests
+      - name: Build CLI
+        run: cargo build -p cli --target x86_64-unknown-linux-gnu
+
+      - name: Generate local config store
+        run: ./target/x86_64-unknown-linux-gnu/debug/tscli config local -f trusted-server.toml
+
+      - name: Run tests (wasm - default crates)
         run: cargo test
+
+      - name: Run tests (native - cli)
+        run: cargo test -p cli --target x86_64-unknown-linux-gnu
 
   test-typescript:
     name: vitest

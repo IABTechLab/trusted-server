@@ -347,15 +347,62 @@ Configuration is validated at application startup:
 
 **Failure Behavior**: Application exits with error message.
 
-### Manual Validation
+### Manual Validation with CLI
 
-Validate before deployment:
+Use `tscli` to validate configuration before deployment:
 
 ```bash
-# Test TOML syntax
-fastly compute validate
+# Validate configuration file
+tscli config validate -f trusted-server.toml
 
-# Test with local server
+# Validate with verbose output (shows sections and integrations)
+tscli config validate -f trusted-server.toml -v
+
+# Compute configuration hash
+tscli config hash -f trusted-server.toml
+```
+
+`tscli` applies `TRUSTED_SERVER__` environment overrides for validation, hashing, and push operations. Use `tscli config hash --raw` to hash the file without applying environment overrides.
+
+### Generate Local Config Store
+
+For local development with `fastly compute serve`:
+
+```bash
+# Generate config store JSON (outputs to target/trusted-server-config.json)
+tscli config local -f trusted-server.toml
+
+# Generate to custom path
+tscli config local -f trusted-server.toml -o custom-path.json
+```
+
+### Push to Fastly Config Store
+
+Deploy configuration to Fastly:
+
+```bash
+export FASTLY_API_TOKEN=your-token
+
+# Push configuration
+tscli config push -f trusted-server.toml --store-id <store-id>
+
+# Dry run (preview without uploading)
+tscli config push -f trusted-server.toml --store-id <store-id> --dry-run
+
+# Pull current deployed config
+tscli config pull --store-id <store-id> -o pulled-config.toml
+
+# Compare local vs deployed
+tscli config diff -f trusted-server.toml --store-id <store-id>
+```
+
+### Test with Local Server
+
+```bash
+# Generate local config first
+tscli config local -f trusted-server.toml
+
+# Then run local server
 fastly compute serve
 ```
 
