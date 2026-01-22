@@ -1,0 +1,12 @@
+# Clippy configuration for trusted-server
+# See: https://doc.rust-lang.org/clippy/configuration.html
+
+# Cognitive complexity threshold for functions
+cognitive-complexity-threshold = 30
+
+# Maximum number of lines in a function
+too-many-lines-threshold = 200
+
+# Allow module name repetitions in reexports
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 #[path = "src/error.rs"]
 mod error;
 

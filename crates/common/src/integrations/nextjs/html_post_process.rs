@@ -333,6 +333,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
     since = "0.1.0",
     note = "Use NextJsHtmlPostProcessor for production RSC rewriting. This function re-parses HTML."
 )]
+#[must_use]
 pub fn post_process_rsc_html(
     html: &str,
     origin_host: &str,

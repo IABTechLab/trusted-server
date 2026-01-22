@@ -163,12 +163,14 @@ impl KeyRotationManager {
     }
 }
 
+#[must_use]
 pub fn generate_date_based_kid() -> String {
     use chrono::Utc;
     format!("ts-{}", Utc::now().format("%Y-%m-%d"))
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use crate::request_signing::Keypair;
 

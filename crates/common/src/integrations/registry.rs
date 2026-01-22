@@ -116,6 +116,7 @@ impl std::fmt::Debug for IntegrationDocumentState {
 }
 
 impl IntegrationDocumentState {
+    #[must_use]
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -487,6 +488,8 @@ pub struct IntegrationRegistry {
 
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
+    #[must_use]
+    #[allow(clippy::panic, clippy::unwrap_used)]
     pub fn new(settings: &Settings) -> Self {
         let mut inner = IntegrationRegistryInner::default();
 
@@ -561,11 +564,13 @@ impl IntegrationRegistry {
     }
 
     /// Return true when any proxy is registered for the provided route.
+    #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
@@ -581,6 +586,7 @@ impl IntegrationRegistry {
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
+    #[must_use]
     pub fn rewrite_attribute(
         &self,
         attr_name: &str,
@@ -613,16 +619,19 @@ impl IntegrationRegistry {
     }
 
     /// Expose registered script/text rewriters for HTML processing.
+    #[must_use]
     pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
         self.inner.script_rewriters.clone()
     }
 
     /// Expose registered HTML post-processors.
+    #[must_use]
     pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
         self.inner.html_post_processors.clone()
     }
 
     /// Provide a snapshot of registered integrations and their hooks.
+    #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
@@ -653,6 +662,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -673,6 +683,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();

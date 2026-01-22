@@ -19,6 +19,7 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    #[must_use]
     pub fn generate() -> Self {
         let mut csprng = OsRng;
 
@@ -31,6 +32,7 @@ impl Keypair {
         }
     }
 
+    #[must_use]
     pub fn get_jwk(&self, kid: String) -> Jwk {
         let public_key_bytes = self.verifying_key.as_bytes();
 
@@ -72,6 +74,7 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, Verifier};

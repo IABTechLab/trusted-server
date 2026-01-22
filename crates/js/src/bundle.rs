@@ -31,10 +31,12 @@ const ALL_BUNDLES: [TsjsBundle; TSJS_BUNDLE_COUNT] = [TsjsBundle::Unified];
 impl TsjsBundle {
     pub const COUNT: usize = TSJS_BUNDLE_COUNT;
 
+    #[must_use]
     pub const fn filename(self) -> &'static str {
         METAS[self as usize].filename
     }
 
+    #[must_use]
     pub fn minified_filename(self) -> String {
         let base = self.filename();
         match base.strip_suffix(".js") {
@@ -60,19 +62,23 @@ impl TsjsBundle {
         })
     }
 
+    #[must_use]
     pub fn from_filename(name: &str) -> Option<Self> {
         Self::filename_map().get(name).copied()
     }
 }
 
+#[must_use]
 pub fn bundle_hash(bundle: TsjsBundle) -> String {
     hash_bundle(bundle.bundle())
 }
 
+#[must_use]
 pub fn bundle_for_filename(name: &str) -> Option<&'static str> {
     TsjsBundle::from_filename(name).map(|bundle| bundle.bundle())
 }
 
+#[must_use]
 pub fn bundle_hash_for_filename(name: &str) -> Option<String> {
     TsjsBundle::from_filename(name).map(|bundle| hash_bundle(bundle.bundle()))
 }

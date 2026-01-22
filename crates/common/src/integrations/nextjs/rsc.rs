@@ -3,7 +3,7 @@ use regex::Regex;
 
 use super::shared::RscUrlRewriter;
 
-/// T-chunk header pattern: hex_id:Thex_length,
+/// T-chunk header pattern: `hex_id:Thex_length`,
 static TCHUNK_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
 
@@ -13,8 +13,8 @@ pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";
 /// Default maximum combined payload size for cross-script processing (10 MB).
 pub(crate) const DEFAULT_MAX_COMBINED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
-/// Maximum reasonable T-chunk length to prevent DoS from malformed input (100 MB).
-/// A T-chunk larger than this is almost certainly malformed and would cause excessive
+/// Maximum reasonable T-chunk length to prevent `DoS` from malformed input (100 MB).
+/// A `T-chunk` larger than this is almost certainly malformed and would cause excessive
 /// memory allocation or iteration.
 const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
 
@@ -328,6 +328,7 @@ fn calculate_unescaped_byte_length_skip_markers(s: &str) -> usize {
 }
 
 /// Process multiple RSC script payloads together, handling cross-script T-chunks.
+#[must_use]
 pub fn rewrite_rsc_scripts_combined(
     payloads: &[&str],
     origin_host: &str,
@@ -479,6 +480,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
 

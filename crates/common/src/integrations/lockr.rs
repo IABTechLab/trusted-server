@@ -44,12 +44,12 @@ pub struct LockrConfig {
     #[validate(length(min = 1))]
     pub app_id: String,
 
-    /// Base URL for Lockr API (default: https://identity.lockr.kr)
+    /// Base URL for Lockr API (default: <https://identity.lockr.kr>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
 
-    /// SDK URL (default: https://aim.loc.kr/identity-lockr-v1.0.js)
+    /// SDK URL (default: <https://aim.loc.kr/identity-lockr-v1.0.js>)
     #[serde(default = "default_sdk_url")]
     #[validate(url)]
     pub sdk_url: String,
@@ -299,6 +299,7 @@ fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
 }
 
 /// Register the Lockr integration.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(
@@ -396,6 +397,7 @@ fn default_rewrite_sdk_host() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

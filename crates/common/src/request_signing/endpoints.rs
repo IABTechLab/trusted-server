@@ -319,6 +319,12 @@ pub fn handle_deactivate_key(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use fastly::http::{Method, StatusCode};

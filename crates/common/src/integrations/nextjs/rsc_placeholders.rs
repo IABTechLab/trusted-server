@@ -102,6 +102,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::integrations::IntegrationDocumentState;

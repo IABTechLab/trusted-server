@@ -27,7 +27,7 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Extracts the host (including port if present) from the origin_url.
+    /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
     ///
@@ -42,6 +42,7 @@ impl Publisher {
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
     #[allow(dead_code)]
+    #[must_use]
     pub fn origin_host(&self) -> String {
         Url::parse(&self.origin_url)
             .ok()
@@ -198,6 +199,7 @@ pub struct Rewrite {
 impl Rewrite {
     /// Checks if a URL should be excluded from rewriting based on domain matching
     #[allow(dead_code)]
+    #[must_use]
     pub fn is_excluded(&self, url: &str) -> bool {
         // Parse URL to extract host
         let Ok(parsed) = url::Url::parse(url) else {
@@ -425,6 +427,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stderr, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use regex::Regex;

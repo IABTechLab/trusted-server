@@ -167,6 +167,7 @@ fn build(settings: &Settings) -> Option<Arc<DidomiIntegration>> {
 }
 
 /// Register the Didomi consent notice integration when enabled.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(

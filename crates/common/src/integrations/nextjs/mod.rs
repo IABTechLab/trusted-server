@@ -56,6 +56,7 @@ fn default_max_combined_payload_bytes() -> usize {
     10 * 1024 * 1024
 }
 
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let config = match build(settings) {
         Some(config) => {

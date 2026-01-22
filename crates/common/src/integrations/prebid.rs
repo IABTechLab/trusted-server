@@ -252,6 +252,7 @@ fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
     Some(PrebidIntegration::new(config))
 }
 
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(

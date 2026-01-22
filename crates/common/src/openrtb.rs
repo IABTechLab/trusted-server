@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-/// Minimal subset of OpenRTB 2.x bid request used by Trusted Server.
+/// Minimal subset of `OpenRTB` 2.x bid request used by Trusted Server.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub struct OpenRtbRequest {

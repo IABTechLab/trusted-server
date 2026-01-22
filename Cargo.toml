@@ -12,6 +12,26 @@ default-members = [
     "crates/fastly",
 ]
 
+[workspace.lints.clippy]
+# Correctness
+unwrap_used = "warn"
+expect_used = "allow"
+panic = "warn"
+
+# Style
+module_name_repetitions = "allow"
+must_use_candidate = "warn"
+
+# Pedantic (selective)
+doc_markdown = "warn"
+# missing_errors_doc = "warn"
+# missing_panics_doc = "warn"
+
+# Restriction (selective)
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+
 [profile.release]
 debug = 1
 

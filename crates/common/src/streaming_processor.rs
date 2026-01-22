@@ -38,6 +38,7 @@ pub enum Compression {
 
 impl Compression {
     /// Detect compression from content-encoding header
+    #[must_use]
     pub fn from_content_encoding(encoding: &str) -> Self {
         match encoding.to_lowercase().as_str() {
             "gzip" => Self::Gzip,
@@ -436,10 +437,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 }
 
-/// Adapter to use lol_html HtmlRewriter as a StreamProcessor
-/// Important: Due to lol_html's ownership model, we must accumulate input
+/// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`
+/// Important: Due to `lol_html`'s ownership model, we must accumulate input
 /// and process it all at once when the stream ends. This is a limitation
-/// of the lol_html library's API design.
+/// of the `lol_html` library's API design.
 pub struct HtmlRewriterAdapter {
     settings: lol_html::Settings<'static, 'static>,
     accumulated_input: Vec<u8>,
@@ -447,6 +448,7 @@ pub struct HtmlRewriterAdapter {
 
 impl HtmlRewriterAdapter {
     /// Create a new HTML rewriter adapter
+    #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
         Self {
             settings,
@@ -513,7 +515,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
     }
 }
 
-/// Adapter to use our existing StreamingReplacer as a StreamProcessor
+/// Adapter to use our existing `StreamingReplacer` as a `StreamProcessor`
 use crate::streaming_replacer::StreamingReplacer;
 
 impl StreamProcessor for StreamingReplacer {
