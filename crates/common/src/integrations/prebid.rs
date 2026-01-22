@@ -929,6 +929,10 @@ impl AuctionProvider for PrebidAuctionProvider {
     fn is_enabled(&self) -> bool {
         self.config.enabled
     }
+
+    fn backend_name(&self) -> Option<String> {
+        ensure_backend_from_url(&self.config.server_url).ok()
+    }
 }
 
 // ============================================================================

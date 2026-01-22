@@ -1,6 +1,7 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
 use error_stack::{Report, ResultExt};
+use fastly::http::request::{select, PendingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -182,13 +183,14 @@ impl AuctionOrchestrator {
     }
 
     /// Run all providers in parallel and collect responses.
+    ///
+    /// Uses `fastly::http::request::select()` to process responses as they
+    /// become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<Vec<AuctionResponse>, Report<TrustedServerError>> {
-        use std::time::Instant;
-
         let provider_names = self.config.provider_names();
 
         if provider_names.is_empty() {
@@ -198,12 +200,15 @@ impl AuctionOrchestrator {
         }
 
         log::info!(
-            "Running {} providers in parallel using send_async",
+            "Running {} providers in parallel using select",
             provider_names.len()
         );
 
-        // Phase 1: Launch all requests concurrently
-        let mut pending_requests = Vec::new();
+        // Phase 1: Launch all requests concurrently and build mapping
+        // Maps backend_name -> (provider_name, start_time, provider)
+        let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
+            HashMap::new();
+        let mut pending_requests: Vec<PendingRequest> = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -222,17 +227,32 @@ impl AuctionOrchestrator {
                 continue;
             }
 
-            log::info!("Launching bid request to: {}", provider.provider_name());
+            // Get the backend name for this provider to map responses back
+            let backend_name = match provider.backend_name() {
+                Some(name) => name,
+                None => {
+                    log::warn!(
+                        "Provider '{}' has no backend_name, skipping",
+                        provider.provider_name()
+                    );
+                    continue;
+                }
+            };
+
+            log::info!(
+                "Launching bid request to: {} (backend: {})",
+                provider.provider_name(),
+                backend_name
+            );
 
             let start_time = Instant::now();
             match provider.request_bids(request, context) {
                 Ok(pending) => {
-                    pending_requests.push((
-                        provider.provider_name(),
-                        pending,
-                        start_time,
-                        provider.as_ref(),
-                    ));
+                    backend_to_provider.insert(
+                        backend_name,
+                        (provider.provider_name(), start_time, provider.as_ref()),
+                    );
+                    pending_requests.push(pending);
                     log::debug!(
                         "Request to '{}' launched successfully",
                         provider.provider_name()
@@ -249,43 +269,63 @@ impl AuctionOrchestrator {
         }
 
         log::info!(
-            "Launched {} concurrent requests, waiting for responses...",
+            "Launched {} concurrent requests, waiting for responses using select...",
             pending_requests.len()
         );
 
-        // Phase 2: Wait for all responses
+        // Phase 2: Wait for responses using select() to process as they become ready
         let mut responses = Vec::new();
+        let mut remaining = pending_requests;
 
-        for (provider_name, pending, start_time, provider) in pending_requests {
-            match pending.wait() {
+        while !remaining.is_empty() {
+            let (result, rest) = select(remaining);
+            remaining = rest;
+
+            match result {
                 Ok(response) => {
-                    let response_time_ms = start_time.elapsed().as_millis() as u64;
+                    // Identify the provider from the backend name
+                    let backend_name = response
+                        .get_backend_name()
+                        .unwrap_or_default()
+                        .to_string();
 
-                    match provider.parse_response(response, response_time_ms) {
-                        Ok(auction_response) => {
-                            log::info!(
-                                "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
-                                auction_response.provider,
-                                auction_response.bids.len(),
-                                auction_response.status,
-                                auction_response.response_time_ms
-                            );
-                            responses.push(auction_response);
+                    if let Some((provider_name, start_time, provider)) =
+                        backend_to_provider.remove(&backend_name)
+                    {
+                        let response_time_ms = start_time.elapsed().as_millis() as u64;
+
+                        match provider.parse_response(response, response_time_ms) {
+                            Ok(auction_response) => {
+                                log::info!(
+                                    "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
+                                    auction_response.provider,
+                                    auction_response.bids.len(),
+                                    auction_response.status,
+                                    auction_response.response_time_ms
+                                );
+                                responses.push(auction_response);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Provider '{}' failed to parse response: {:?}",
+                                    provider_name,
+                                    e
+                                );
+                                responses
+                                    .push(AuctionResponse::error(provider_name, response_time_ms));
+                            }
                         }
-                        Err(e) => {
-                            log::warn!(
-                                "Provider '{}' failed to parse response: {:?}",
-                                provider_name,
-                                e
-                            );
-                            responses.push(AuctionResponse::error(provider_name, response_time_ms));
-                        }
+                    } else {
+                        log::warn!(
+                            "Received response from unknown backend '{}', ignoring",
+                            backend_name
+                        );
                     }
                 }
                 Err(e) => {
-                    let response_time_ms = start_time.elapsed().as_millis() as u64;
-                    log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
-                    responses.push(AuctionResponse::error(provider_name, response_time_ms));
+                    // When select() returns an error, we can't easily identify which
+                    // provider failed since the PendingRequest is consumed
+                    log::warn!("A provider request failed: {:?}", e);
                 }
             }
         }

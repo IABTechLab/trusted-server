@@ -48,4 +48,14 @@ pub trait AuctionProvider: Send + Sync {
     fn is_enabled(&self) -> bool {
         true
     }
+
+    /// Return the backend name used by this provider for request routing.
+    ///
+    /// This is used by the orchestrator to correlate responses with providers
+    /// when using `select()` to wait for multiple concurrent requests.
+    /// The backend name should match what `ensure_backend_from_url()` returns
+    /// for this provider's endpoint.
+    fn backend_name(&self) -> Option<String> {
+        None
+    }
 }

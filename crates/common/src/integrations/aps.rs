@@ -358,7 +358,7 @@ impl ApsAuctionProvider {
             price: None, // Encoded price in metadata, decoded by mediation
             currency: "USD".to_string(),
             creative: None,
-            adomain: Some(vec!["amazon.com".to_string()]),
+            adomain: None, // APS doesn't provide adomain in response
             bidder: "amazon-aps".to_string(),
             width,
             height,
@@ -514,6 +514,10 @@ impl AuctionProvider for ApsAuctionProvider {
 
     fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    fn backend_name(&self) -> Option<String> {
+        ensure_backend_from_url(&self.config.endpoint).ok()
     }
 }
 
@@ -716,7 +720,7 @@ mod tests {
         assert_eq!(bid1.height, 90);
         assert_eq!(bid1.currency, "USD");
         assert_eq!(bid1.bidder, "amazon-aps");
-        assert_eq!(bid1.adomain, Some(vec!["amazon.com".to_string()]));
+        assert_eq!(bid1.adomain, None);
         assert!(bid1.metadata.contains_key("amzniid"));
         assert!(bid1.metadata.contains_key("amznbid")); // Encoded price stored here
 
@@ -833,7 +837,7 @@ mod tests {
         assert_eq!(bid.height, 90);
         assert_eq!(bid.currency, "USD");
         assert_eq!(bid.bidder, "amazon-aps");
-        assert_eq!(bid.adomain, Some(vec!["amazon.com".to_string()]));
+        assert_eq!(bid.adomain, None);
         assert_eq!(bid.nurl, None); // Real APS uses client-side tracking
         assert_eq!(bid.burl, None);
         assert!(bid.metadata.contains_key("amzniid"));
