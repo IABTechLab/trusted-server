@@ -22,16 +22,16 @@
 //!   `blob:`, `about:`.
 //!
 //! Notable helpers:
-//! - `to_abs(&str) -> Option<String>`: Normalizes a string to an absolute URL if
+//! - `to_abs(&Settings, &str) -> Option<String>`: Normalizes a string to an absolute URL if
 //!   it is already absolute or protocol-relative; returns `None` otherwise or for
 //!   non-network schemes.
-//! - `rewrite_srcset(&str, &Settings) -> String`: Rewrites `srcset`/`imagesrcset`
+//! - `rewrite_srcset(&Settings, &str) -> String`: Rewrites `srcset`/`imagesrcset`
 //!   values, proxying absolute candidates and preserving descriptors (`1x`,
 //!   `1.5x`, `100w`).
 //! - `split_srcset_candidates(&str) -> Vec<&str>`: Robust splitting that supports
 //!   commas with or without spaces and avoids splitting the mediatype/data comma
 //!   in a leading `data:` URL.
-//! - `rewrite_css_body(&str, &Settings) -> String`: Rewrites url(...) occurrences
+//! - `rewrite_css_body(&Settings, &str) -> String`: Rewrites url(...) occurrences
 //!   inside CSS bodies.
 //!
 //! See the tests in this module for comprehensive cases, including irregular
@@ -44,7 +44,7 @@ use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings 
 
 // Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
 // Checks against the rewrite blacklist to exclude configured domains/patterns from proxying.
-pub(super) fn to_abs(u: &str, settings: &Settings) -> Option<String> {
+pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
     let t = u.trim();
     if t.is_empty() {
         return None;
@@ -77,7 +77,7 @@ pub(super) fn to_abs(u: &str, settings: &Settings) -> Option<String> {
 }
 
 // Helper: rewrite url(...) occurrences inside a CSS style string to first-party proxy.
-pub(super) fn rewrite_style_urls(style: &str, settings: &Settings) -> String {
+pub(super) fn rewrite_style_urls(settings: &Settings, style: &str) -> String {
     // naive url(...) rewrite for absolute/protocol-relative URLs
     let lower = style.to_ascii_lowercase();
     let mut out = String::with_capacity(style.len() + 16);
@@ -114,7 +114,7 @@ pub(super) fn rewrite_style_urls(style: &str, settings: &Settings) -> String {
             (s, e)
         };
         let url_val = &style[qs..qe];
-        let new_val = if let Some(abs) = to_abs(url_val, settings) {
+        let new_val = if let Some(abs) = to_abs(settings, url_val) {
             build_proxy_url(settings, &abs)
         } else {
             url_val.to_string()
@@ -204,7 +204,7 @@ pub(super) fn build_click_url(settings: &Settings, clear_url: &str) -> String {
 
 #[inline]
 pub(super) fn proxy_if_abs(settings: &Settings, val: &str) -> Option<String> {
-    to_abs(val, settings).map(|abs| build_proxy_url(settings, &abs))
+    to_abs(settings, val).map(|abs| build_proxy_url(settings, &abs))
 }
 
 /// Split a srcset/imagesrcset attribute into candidate strings.
@@ -257,7 +257,7 @@ pub(super) fn split_srcset_candidates(s: &str) -> Vec<&str> {
 /// - Proxies absolute or protocol-relative candidates via first-party endpoint
 /// - Preserves descriptors (e.g., `1x`, `1.5x`, `100w`)
 /// - Leaves relative candidates unchanged
-pub(super) fn rewrite_srcset(srcset: &str, settings: &Settings) -> String {
+pub(super) fn rewrite_srcset(settings: &Settings, srcset: &str) -> String {
     let mut out_items: Vec<String> = Vec::new();
     for item in split_srcset_candidates(srcset) {
         let it = item.trim();
@@ -267,7 +267,7 @@ pub(super) fn rewrite_srcset(srcset: &str, settings: &Settings) -> String {
         let mut parts = it.split_whitespace();
         let url = parts.next().unwrap_or("");
         let descriptor = parts.collect::<Vec<_>>().join(" ");
-        let rewritten = if let Some(abs) = to_abs(url, settings) {
+        let rewritten = if let Some(abs) = to_abs(settings, url) {
             build_proxy_url(settings, &abs)
         } else {
             url.to_string()
@@ -291,8 +291,8 @@ pub(super) fn proxied_attr_value(settings: &Settings, attr_val: Option<String>) 
 
 /// Rewrite a full CSS stylesheet body by normalizing url(...) references to the
 /// unified first-party proxy. Relative URLs are left unchanged.
-pub fn rewrite_css_body(css: &str, settings: &Settings) -> String {
-    rewrite_style_urls(css, settings)
+pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
+    rewrite_style_urls(settings, css)
 }
 
 /// Rewrite ad creative HTML to first-party endpoints.
@@ -301,7 +301,7 @@ pub fn rewrite_css_body(css: &str, settings: &Settings) -> String {
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
 ///   (served from `/static/tsjs=tsjs-creative.min.js`).
-pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
+pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);
     let injected_ts_creative = std::cell::Cell::new(false);
@@ -355,7 +355,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                             let _ = el.set_attribute("href", &p);
                         }
                         if let Some(srcset) = el.get_attribute("imagesrcset") {
-                            let rewritten = rewrite_srcset(&srcset, settings);
+                            let rewritten = rewrite_srcset(settings, &srcset);
                             if rewritten != srcset {
                                 let _ = el.set_attribute("imagesrcset", &rewritten);
                             }
@@ -412,7 +412,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // Click-through links
                 element!("a[href], area[href]", |el| {
                     if let Some(href) = el.get_attribute("href") {
-                        if let Some(abs) = to_abs(&href, settings) {
+                        if let Some(abs) = to_abs(settings, &href) {
                             let click = build_click_url(settings, &abs);
                             let _ = el.set_attribute("href", &click);
                             let _ = el.set_attribute("data-tsclick", &click);
@@ -423,7 +423,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // Inline style url(...)
                 element!("[style]", |el| {
                     if let Some(st) = el.get_attribute("style") {
-                        let rewritten = rewrite_style_urls(&st, settings);
+                        let rewritten = rewrite_style_urls(settings, &st);
                         if rewritten != st {
                             let _ = el.set_attribute("style", &rewritten);
                         }
@@ -433,7 +433,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // <style> blocks
                 text!("style", |t| {
                     let s = t.as_str();
-                    let rewritten = rewrite_style_urls(s, settings);
+                    let rewritten = rewrite_style_urls(settings, s);
                     if rewritten != s {
                         t.replace(&rewritten, ContentType::Text);
                     }
@@ -451,7 +451,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 // srcset + imagesrcset
                 element!("[srcset]", |el| {
                     if let Some(srcset) = el.get_attribute("srcset") {
-                        let rewritten = rewrite_srcset(&srcset, settings);
+                        let rewritten = rewrite_srcset(settings, &srcset);
                         if rewritten != srcset {
                             let _ = el.set_attribute("srcset", &rewritten);
                         }
@@ -460,7 +460,7 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
                 }),
                 element!("[imagesrcset]", |el| {
                     if let Some(srcset) = el.get_attribute("imagesrcset") {
-                        let rewritten = rewrite_srcset(&srcset, settings);
+                        let rewritten = rewrite_srcset(settings, &srcset);
                         if rewritten != srcset {
                             let _ = el.set_attribute("imagesrcset", &rewritten);
                         }
@@ -487,7 +487,7 @@ mod tests {
         use crate::http_util::encode_url;
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<div><img width="1" height="1" src="https://t.example/p.gif"></div>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let _expected = encode_url(&settings, "https://t.example/p.gif");
         assert!(out.contains("/first-party/proxy?tsurl="), "{}", out);
     }
@@ -496,7 +496,7 @@ mod tests {
     fn injects_tsjs_creative_when_body_present() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<html><body><p>hello</p></body></html>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(
             out.contains("/static/tsjs=tsjs-unified.min.js"),
             "expected unified tsjs injection: {}",
@@ -510,7 +510,7 @@ mod tests {
     fn injects_tsjs_unified_once_with_multiple_bodies() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<html><body>one</body><body>two</body></html>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
     }
 
@@ -518,32 +518,32 @@ mod tests {
     fn to_abs_conversions() {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
-            to_abs("//cdn.example/x", &settings),
+            to_abs(&settings, "//cdn.example/x"),
             Some("https://cdn.example/x".to_string())
         );
         assert_eq!(
-            to_abs("HTTPS://cdn.example/x", &settings),
+            to_abs(&settings, "HTTPS://cdn.example/x"),
             Some("HTTPS://cdn.example/x".to_string())
         );
         assert_eq!(
-            to_abs("http://cdn.example/x", &settings),
+            to_abs(&settings, "http://cdn.example/x"),
             Some("http://cdn.example/x".to_string())
         );
-        assert_eq!(to_abs("/local/x", &settings), None);
+        assert_eq!(to_abs(&settings, "/local/x"), None);
         assert_eq!(
-            to_abs("   //cdn.example/y  ", &settings),
+            to_abs(&settings, "   //cdn.example/y  "),
             Some("https://cdn.example/y".to_string())
         );
-        assert_eq!(to_abs("data:image/png;base64,abcd", &settings), None);
-        assert_eq!(to_abs("javascript:alert(1)", &settings), None);
-        assert_eq!(to_abs("mailto:test@example.com", &settings), None);
+        assert_eq!(to_abs(&settings, "data:image/png;base64,abcd"), None);
+        assert_eq!(to_abs(&settings, "javascript:alert(1)"), None);
+        assert_eq!(to_abs(&settings, "mailto:test@example.com"), None);
     }
 
     #[test]
     fn rewrite_style_urls_handles_absolute_and_relative() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = "background:url(https://cdn.example/a.png) no-repeat; mask: url('//cdn.example/m.svg') 0 0 / cover; border-image: url(/local/border.png) 30";
-        let out = rewrite_style_urls(css, &settings);
+        let out = rewrite_style_urls(&settings, css);
         // Absolute and protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -559,7 +559,7 @@ mod tests {
         use crate::http_util::encode_url;
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<img style="width:1px; height:1px" src="https://t.example/a.png">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let _expected = encode_url(&settings, "https://t.example/a.png");
         assert!(out.contains("/first-party/proxy?tsurl="));
     }
@@ -570,7 +570,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let html =
             r#"<img style="  HEIGHT : 1 ;   width: 1  ; display:block" src="//cdn.example/p">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let _expected = encode_url(&settings, "https://cdn.example/p");
         assert!(out.contains("/first-party/proxy?tsurl="));
     }
@@ -582,7 +582,7 @@ mod tests {
           <img width="300" height="250" src="https://t.example/a.gif">
           <img width="300" height="250" src="/local/pixel.gif">
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Absolute image should be rewritten through first-party unified proxy
         assert!(out.contains("/first-party/proxy?tsurl="));
         // Original absolute URL may be transformed; ensure first-party path present
@@ -595,16 +595,16 @@ mod tests {
         use crate::http_util::encode_url;
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<iframe src="https://cdn.example/ad.html"></iframe>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let _expected = encode_url(&settings, "https://cdn.example/ad.html");
         assert!(out.contains("/first-party/proxy?tsurl="));
 
         let html2 = r#"<iframe src="//cdn.example/ad.html"></iframe>"#;
-        let out2 = rewrite_creative_html(html2, &settings);
+        let out2 = rewrite_creative_html(&settings, html2);
         assert!(out2.contains("/first-party/proxy?tsurl="));
 
         let html3 = r#"<iframe src="/local/ad.html"></iframe>"#;
-        let out3 = rewrite_creative_html(html3, &settings);
+        let out3 = rewrite_creative_html(&settings, html3);
         assert!(out3.contains("<iframe src=\"/local/ad.html\""));
         assert!(!out3.contains("/first-party/proxy?tsurl="));
     }
@@ -614,7 +614,7 @@ mod tests {
         // Absolute + protocol-relative get rewritten to /first-party/proxy?tsurl=..., relative remains
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<img srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
 
         // Should have at least two proxied candidates
         let cnt = out.matches("/first-party/proxy?tsurl=").count();
@@ -642,7 +642,7 @@ mod tests {
             <img src="/fallback.jpg" alt="">
           </picture>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Two rewritten absolute candidates expected
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -659,7 +659,7 @@ mod tests {
     fn rewrites_srcset_no_space_commas_preserves_descriptors() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<img srcset="https://cdn.example/img-1x.png 1x,//cdn.example/img-1_5x.png 1.5x,/local/img.png 2x">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Absolute and protocol-relative candidates rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -679,7 +679,7 @@ mod tests {
         // Relative candidate (no leading slash) in the middle, no space after commas
         let html =
             r#"<img srcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Two absolute/protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -694,7 +694,7 @@ mod tests {
     fn rewrites_srcset_with_extra_spaces() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<img srcset="  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  ">"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Two absolute/protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -715,7 +715,7 @@ mod tests {
           <script src="https://cdn.example/lib.js"></script>
           <script src="/local/app.js"></script>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(out.contains("/first-party/proxy?tsurl="));
         assert!(out.contains("<script src=\"/local/app.js\""));
     }
@@ -728,7 +728,7 @@ mod tests {
           <link rel="preload" as="script" href="//cdn.example/app.js">
           <link rel="prefetch" href="https://cdn.example/next.css">
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let cnt = out.matches("/first-party/proxy?tsurl=").count();
         assert!(cnt >= 3, "expected 3 rewritten links: {}", out);
     }
@@ -741,7 +741,7 @@ mod tests {
           <audio src="//cdn.example/a.mp3"></audio>
           <video><source src="https://cdn.example/trailer.mp4"></video>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 3);
     }
 
@@ -750,7 +750,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         // Use a valid quoted attribute; the previous string had malformed escapes
         let html = r#"<div imagesrcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x"></div>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         let cnt = out.matches("/first-party/proxy?tsurl=").count();
         assert!(
             cnt >= 1,
@@ -764,7 +764,7 @@ mod tests {
     fn rewrites_imagesrcset_no_space_commas() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<div imagesrcset="https://cdn.example/a.png 1x,//cdn.example/b.png 2x,/local/c.png 1x"></div>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // At least two rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -779,7 +779,7 @@ mod tests {
     fn rewrites_imagesrcset_relative_no_space_middle() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<div imagesrcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x"></div>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Two absolute/protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -794,7 +794,7 @@ mod tests {
     fn rewrites_imagesrcset_with_extra_spaces() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"<div imagesrcset="  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  "></div>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // Two absolute/protocol-relative rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -816,7 +816,7 @@ mod tests {
           <embed src="//cdn.example/b.swf"></embed>
           <input type="image" src="https://cdn.example/btn.png">
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 3);
     }
 
@@ -831,7 +831,7 @@ mod tests {
             <use xlink:href="//cdn.example/sprite2.svg#icon" />
           </svg>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 4,
             "svg hrefs not rewritten: {}",
@@ -847,7 +847,7 @@ mod tests {
           <div style="background:url('//cdn.example/bg2.jpg') no-repeat"></div>
           <div style='mask-image: url( //cdn.example/mask.svg )'></div>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 3,
             "style url() not rewritten: {}",
@@ -865,7 +865,7 @@ mod tests {
             .b{background-image:url('//cdn.example/s2.jpg')}
           </style>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
             "style block url() not rewritten: {}",
@@ -877,7 +877,7 @@ mod tests {
     fn rewrite_srcset_w_and_x_descriptors() {
         let settings = crate::test_support::tests::create_test_settings();
         let srcset = "https://cdn.example/a.png 100w, //cdn.example/b.png 2x, /local/c.png 1x";
-        let out = rewrite_srcset(srcset, &settings);
+        let out = rewrite_srcset(&settings, srcset);
         assert!(out.contains(" 100w"));
         assert!(out.contains(" 2x"));
         assert!(out.contains("/local/c.png 1x"));
@@ -892,7 +892,7 @@ mod tests {
     fn rewrite_srcset_ignores_non_network_schemes() {
         let settings = crate::test_support::tests::create_test_settings();
         let srcset = "data:image/png;base64,AAAA 1x, https://cdn.example/a.png 2x";
-        let out = rewrite_srcset(srcset, &settings);
+        let out = rewrite_srcset(&settings, srcset);
         assert!(out.contains("data:image/png;base64,AAAA 1x"), "{}", out);
         assert!(out.contains("/first-party/proxy?tsurl="), "{}", out);
     }
@@ -922,7 +922,7 @@ mod tests {
         let html = r#"
           <link REL='StyleSheet preload' href='https://cdn.example/s.css' imagesrcset='https://cdn.example/a.png 1x, /local.png 1x'>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         // href + one imagesrcset candidate should be rewritten
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
@@ -938,7 +938,7 @@ mod tests {
         let html = r#"
           <div style="background-image:url(https://cdn.example/a.png); mask: url(../rel.svg) center no-repeat; border-image:url('//cdn.example/b.png') 30 fill"></div>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
             "{}",
@@ -955,7 +955,7 @@ mod tests {
           <iframe src="about:blank"></iframe>
           <script src="javascript:alert(1)"></script>
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(!out.contains("/first-party/proxy?tsurl="));
         assert!(out.contains("data:image/png;base64,AAAA"));
         assert!(out.contains("<iframe src=\"about:blank\""));
@@ -966,7 +966,7 @@ mod tests {
     fn rewrite_css_body_direct_smoke() {
         let settings = crate::test_support::tests::create_test_settings();
         let css = ".x{background:url(https://cdn.example/a.png)} .y{mask:url('//cdn.example/b.svg')} .z{background:url(/local.png)}";
-        let out = super::rewrite_css_body(css, &settings);
+        let out = super::rewrite_css_body(&settings, css);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
             "{}",
@@ -980,7 +980,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let html =
             r#"<a href="https://ads.example.com/click?c=123">Buy</a> <a href="/local">Local</a>"#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(out.contains("/first-party/click?tsurl="), "{}", out);
         assert!(out.contains("tstoken="), "{}", out);
         assert!(out.contains("<a href=\"/local\""));
@@ -992,12 +992,12 @@ mod tests {
     fn to_abs_additional_cases() {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
-            to_abs("   https://cdn.example/a   ", &settings),
+            to_abs(&settings, "   https://cdn.example/a   "),
             Some("https://cdn.example/a".to_string())
         );
-        assert_eq!(to_abs("blob:xyz", &settings), None);
-        assert_eq!(to_abs("tel:+123", &settings), None);
-        assert_eq!(to_abs("about:blank", &settings), None);
+        assert_eq!(to_abs(&settings, "blob:xyz"), None);
+        assert_eq!(to_abs(&settings, "tel:+123"), None);
+        assert_eq!(to_abs(&settings, "about:blank"), None);
     }
 
     #[test]
@@ -1007,7 +1007,7 @@ mod tests {
           <img data-src="https://cdn.example/lazy.png">
           <img data-srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">
         "#;
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
         assert!(out.contains("data-src=\"/first-party/proxy?tsurl="));
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
@@ -1021,13 +1021,13 @@ mod tests {
 
         // Excluded domain should return None (not proxied)
         assert_eq!(
-            to_abs("https://trusted-cdn.example.com/lib.js", &settings),
+            to_abs(&settings, "https://trusted-cdn.example.com/lib.js"),
             None
         );
 
         // Non-excluded domain should return Some
         assert_eq!(
-            to_abs("https://other-cdn.example.com/lib.js", &settings),
+            to_abs(&settings, "https://other-cdn.example.com/lib.js"),
             Some("https://other-cdn.example.com/lib.js".to_string())
         );
     }
@@ -1038,17 +1038,17 @@ mod tests {
         settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_string()];
 
         // Should exclude base domain
-        assert_eq!(to_abs("https://cloudflare.com/cdn.js", &settings), None);
+        assert_eq!(to_abs(&settings, "https://cloudflare.com/cdn.js"), None);
 
         // Should exclude subdomain
         assert_eq!(
-            to_abs("https://cdnjs.cloudflare.com/lib.js", &settings),
+            to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
             None
         );
 
         // Should not exclude different domain
         assert_eq!(
-            to_abs("https://notcloudflare.com/lib.js", &settings),
+            to_abs(&settings, "https://notcloudflare.com/lib.js"),
             Some("https://notcloudflare.com/lib.js".to_string())
         );
     }
@@ -1063,7 +1063,7 @@ mod tests {
             <img src="https://other-cdn.example.com/banner.jpg">
         "#;
 
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
 
         // Excluded domain should NOT be rewritten
         assert!(out.contains(r#"src="https://trusted-cdn.example.com/logo.png"#));
@@ -1082,7 +1082,7 @@ mod tests {
             <img srcset="https://trusted.example.com/img-1x.png 1x, https://cdn.example.com/img-2x.png 2x">
         "#;
 
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
 
         // Excluded domain should remain as-is
         assert!(out.contains("https://trusted.example.com/img-1x.png 1x"));
@@ -1109,7 +1109,7 @@ mod tests {
             </style>
         "#;
 
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
 
         // Excluded domain should remain unchanged
         assert!(out.contains("url(https://fonts.googleapis.com/font.woff2)"));
@@ -1129,7 +1129,7 @@ mod tests {
             <a href="https://advertiser.example.com/landing">Ad Link</a>
         "#;
 
-        let out = rewrite_creative_html(html, &settings);
+        let out = rewrite_creative_html(&settings, html);
 
         // Excluded domain should NOT be rewritten to first-party click
         assert!(out.contains(r#"href="https://trusted-landing.example.com/page"#));

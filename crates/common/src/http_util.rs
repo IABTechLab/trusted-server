@@ -8,7 +8,12 @@ use crate::settings::Settings;
 
 /// Build a static text response with strong ETag and standard caching headers.
 /// Handles If-None-Match to return 304 when appropriate.
-pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> Response {
+pub fn serve_static_with_etag(
+    _settings: &Settings,
+    body: &str,
+    req: &Request,
+    content_type: &str,
+) -> Response {
     // Compute ETag for conditional caching
     let hash = Sha256::digest(body.as_bytes());
     let etag = format!("\"sha256-{}\"", hex::encode(hash));

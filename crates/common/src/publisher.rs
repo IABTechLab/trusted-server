@@ -77,7 +77,7 @@ fn detect_request_scheme(req: &Request) -> String {
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
 pub fn handle_tsjs_dynamic(
-    _settings: &Settings,
+    settings: &Settings,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
@@ -93,7 +93,12 @@ pub fn handle_tsjs_dynamic(
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     };
 
-    let mut resp = serve_static_with_etag(body, &req, "application/javascript; charset=utf-8");
+    let mut resp = serve_static_with_etag(
+        settings,
+        body,
+        &req,
+        "application/javascript; charset=utf-8",
+    );
     resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
