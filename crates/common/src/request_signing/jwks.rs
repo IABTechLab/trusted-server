@@ -4,6 +4,7 @@
 //! Ed25519 keypairs in JWK format for request signing.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use error_stack::{Report, ResultExt};
 use jose_jwk::{
     jose_jwa::{Algorithm, Signing},
     Jwk, Key, Okp, OkpCurves, Parameters,
@@ -51,9 +52,14 @@ impl Keypair {
     }
 }
 
-pub fn get_active_jwks() -> Result<String, TrustedServerError> {
+pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new("jwks_store");
-    let active_kids_str = store.get("active-kids")?;
+    let active_kids_str =
+        store
+            .get("active-kids")
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to get active-kids".into(),
+            })?;
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
@@ -63,7 +69,11 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 
     let mut jwks = Vec::new();
     for kid in active_kids {
-        let jwk = store.get(kid)?;
+        let jwk = store
+            .get(kid)
+            .change_context(TrustedServerError::Configuration {
+                message: format!("Failed to get JWK for kid: {}", kid),
+            })?;
         jwks.push(jwk);
     }
 

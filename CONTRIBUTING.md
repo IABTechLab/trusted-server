@@ -118,6 +118,22 @@ Consistency is the most important. Following the existing Rust style, formatting
 
 Style and format will be enforced with a linter when the PR is created.
 
+## :warning: Error Handling
+
+We use [error-stack](https://docs.rs/error-stack/latest/error_stack/) for error handling to provide rich context and traceability.
+
+### Guidelines
+
+1. **Use `Report<E>`**: Public functions should generally return `Result<T, Report<TrustedServerError>>`.
+2. **Context**: Use `.change_context(TrustedServerError::Variant)` to wrap errors and provide semantic meaning.
+   ```rust
+   // Good
+   file.read_to_string(&mut content)
+       .change_context(TrustedServerError::Configuration { message: "Failed to read config".into() })?;
+   ```
+3. **Attachments**: Use `.attach_printable("additional info")` to add debugging context without changing the error variant.
+4. **Consistency**: Avoid returning bare `TrustedServerError` unless absolutely necessary (e.g. implementing traits). Wrap them in `Report::new()`.
+
 ## :pray: Credits
 
 - https://github.com/jessesquires/.github/blob/main/CONTRIBUTING.md

@@ -1,5 +1,6 @@
 use std::io::Read;
 
+use error_stack::{Report, ResultExt};
 use fastly::{ConfigStore, Request, Response, SecretStore};
 use http::StatusCode;
 
@@ -17,17 +18,17 @@ impl FastlyConfigStore {
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<String, TrustedServerError> {
+    pub fn get(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         // TODO use try_open and return the error
         let store = ConfigStore::open(&self.store_name);
-        store
-            .get(key)
-            .ok_or_else(|| TrustedServerError::Configuration {
+        store.get(key).ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Key '{}' not found in config store '{}'",
                     key, self.store_name
                 ),
             })
+        })
     }
 }
 
@@ -42,33 +43,36 @@ impl FastlySecretStore {
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<Vec<u8>, TrustedServerError> {
-        let store =
-            SecretStore::open(&self.store_name).map_err(|_| TrustedServerError::Configuration {
+    pub fn get(&self, key: &str) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        let store = SecretStore::open(&self.store_name).map_err(|_| {
+            Report::new(TrustedServerError::Configuration {
                 message: format!("Failed to open SecretStore '{}'", self.store_name),
-            })?;
+            })
+        })?;
 
-        let secret = store
-            .get(key)
-            .ok_or_else(|| TrustedServerError::Configuration {
+        let secret = store.get(key).ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Secret '{}' not found in secret store '{}'",
                     key, self.store_name
                 ),
-            })?;
+            })
+        })?;
 
         secret
             .try_plaintext()
-            .map_err(|_| TrustedServerError::Configuration {
-                message: "Failed to get secret plaintext".into(),
+            .map_err(|_| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "Failed to get secret plaintext".into(),
+                })
             })
             .map(|bytes| bytes.into_iter().collect())
     }
 
-    pub fn get_string(&self, key: &str) -> Result<String, TrustedServerError> {
+    pub fn get_string(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         let bytes = self.get(key)?;
-        String::from_utf8(bytes).map_err(|e| TrustedServerError::Configuration {
-            message: format!("Failed to decode secret as UTF-8: {}", e),
+        String::from_utf8(bytes).change_context(TrustedServerError::Configuration {
+            message: format!("Failed to decode secret as UTF-8: {}", key),
         })
     }
 }
@@ -79,16 +83,19 @@ pub struct FastlyApiClient {
 }
 
 impl FastlyApiClient {
-    pub fn new() -> Result<Self, TrustedServerError> {
+    pub fn new() -> Result<Self, Report<TrustedServerError>> {
         Self::from_secret_store("api-keys", "api_key")
     }
 
-    pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
-        ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
+    pub fn from_secret_store(
+        store_name: &str,
+        key_name: &str,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        ensure_backend_from_url("https://api.fastly.com").change_context(
             TrustedServerError::Configuration {
-                message: format!("Failed to ensure API backend: {}", e),
-            }
-        })?;
+                message: "Failed to ensure API backend".to_string(),
+            },
+        )?;
 
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;
@@ -105,7 +112,7 @@ impl FastlyApiClient {
         path: &str,
         body: Option<String>,
         content_type: &str,
-    ) -> Result<Response, TrustedServerError> {
+    ) -> Result<Response, Report<TrustedServerError>> {
         let url = format!("{}{}", self.base_url, path);
 
         let api_key_str = String::from_utf8_lossy(&self.api_key).to_string();
@@ -116,9 +123,9 @@ impl FastlyApiClient {
             "PUT" => Request::put(&url),
             "DELETE" => Request::delete(&url),
             _ => {
-                return Err(TrustedServerError::Configuration {
+                return Err(Report::new(TrustedServerError::Configuration {
                     message: format!("Unsupported HTTP method: {}", method),
-                })
+                }))
             }
         };
 
@@ -133,9 +140,9 @@ impl FastlyApiClient {
         }
 
         request.send("backend_https_api_fastly_com").map_err(|e| {
-            TrustedServerError::Configuration {
+            Report::new(TrustedServerError::Configuration {
                 message: format!("Failed to send API request: {}", e),
-            }
+            })
         })
     }
 
@@ -144,7 +151,7 @@ impl FastlyApiClient {
         store_id: &str,
         key: &str,
         value: &str,
-    ) -> Result<(), TrustedServerError> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
         let payload = format!("item_value={}", value);
 
@@ -159,20 +166,22 @@ impl FastlyApiClient {
         response
             .get_body_mut()
             .read_to_string(&mut buf)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to read API response: {}", e),
+            .map_err(|e| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Failed to read API response: {}", e),
+                })
             })?;
 
         if response.get_status() == StatusCode::OK {
             Ok(())
         } else {
-            Err(TrustedServerError::Configuration {
+            Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Failed to update config item: HTTP {} - {}",
                     response.get_status(),
                     buf
                 ),
-            })
+            }))
         }
     }
 
@@ -181,7 +190,7 @@ impl FastlyApiClient {
         store_id: &str,
         secret_name: &str,
         secret_value: &str,
-    ) -> Result<(), TrustedServerError> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let path = format!("/resources/stores/secret/{}/secrets", store_id);
 
         let payload = serde_json::json!({
@@ -196,24 +205,30 @@ impl FastlyApiClient {
         response
             .get_body_mut()
             .read_to_string(&mut buf)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to read API response: {}", e),
+            .map_err(|e| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Failed to read API response: {}", e),
+                })
             })?;
 
         if response.get_status() == StatusCode::OK {
             Ok(())
         } else {
-            Err(TrustedServerError::Configuration {
+            Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Failed to create secret: HTTP {} - {}",
                     response.get_status(),
                     buf
                 ),
-            })
+            }))
         }
     }
 
-    pub fn delete_config_item(&self, store_id: &str, key: &str) -> Result<(), TrustedServerError> {
+    pub fn delete_config_item(
+        &self,
+        store_id: &str,
+        key: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
         let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
 
         let mut response = self.make_request("DELETE", &path, None, "application/json")?;
@@ -222,8 +237,10 @@ impl FastlyApiClient {
         response
             .get_body_mut()
             .read_to_string(&mut buf)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to read API response: {}", e),
+            .map_err(|e| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Failed to read API response: {}", e),
+                })
             })?;
 
         if response.get_status() == StatusCode::OK
@@ -231,13 +248,13 @@ impl FastlyApiClient {
         {
             Ok(())
         } else {
-            Err(TrustedServerError::Configuration {
+            Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Failed to delete config item: HTTP {} - {}",
                     response.get_status(),
                     buf
                 ),
-            })
+            }))
         }
     }
 
@@ -245,7 +262,7 @@ impl FastlyApiClient {
         &self,
         store_id: &str,
         secret_name: &str,
-    ) -> Result<(), TrustedServerError> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let path = format!(
             "/resources/stores/secret/{}/secrets/{}",
             store_id, secret_name
@@ -257,8 +274,10 @@ impl FastlyApiClient {
         response
             .get_body_mut()
             .read_to_string(&mut buf)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to read API response: {}", e),
+            .map_err(|e| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Failed to read API response: {}", e),
+                })
             })?;
 
         if response.get_status() == StatusCode::OK
@@ -266,13 +285,13 @@ impl FastlyApiClient {
         {
             Ok(())
         } else {
-            Err(TrustedServerError::Configuration {
+            Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Failed to delete secret: HTTP {} - {}",
                     response.get_status(),
                     buf
                 ),
-            })
+            }))
         }
     }
 }
@@ -329,6 +348,7 @@ mod tests {
         }
     }
 
+    // Other tests logic is preserved, prints error which is now a Report
     #[test]
     fn test_update_config_item() {
         let result = FastlyApiClient::new();
