@@ -58,7 +58,7 @@ fastly config-store create --name=jwks_store
 fastly config-store list
 ```
 
-Note the Config Store ID from the output (e.g., `r8loXvD9GESm5Crw5oyS16`).
+Note the Config Store ID from the output.
 
 #### 2. Create Secret Stores
 
@@ -158,7 +158,7 @@ For local testing, configure stores in `fastly.toml`:
 [local_server.secret_stores]
   [[local_server.secret_stores.signing_keys]]
     key = "ts-2025-01-01"
-    data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
+    data = "<signing-key>"
   
   [[local_server.secret_stores.api-keys]]
     key = "api_key"
@@ -172,8 +172,8 @@ Update `trusted-server.toml` with your store IDs:
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "r8loXvD9GESm5Crw5oyS16"  # Your jwks_store ID
-secret_store_id = "5D6Ps10nXkaWpbgbxh1mVJ"  # Your signing_keys ID
+config_store_id = "<config-store-id>"  # Your jwks_store ID
+secret_store_id = "<secret-store-id"  # Your signing_keys ID
 ```
 
 ::: tip Getting Store IDs

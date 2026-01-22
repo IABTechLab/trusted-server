@@ -6,6 +6,8 @@ use http::StatusCode;
 use crate::backend::ensure_backend_from_url;
 use crate::error::TrustedServerError;
 
+const FASTLY_API_HOST: &'static str = "https://api.fastly.com";
+
 pub struct FastlyConfigStore {
     store_name: String,
 }
@@ -75,7 +77,7 @@ impl FastlySecretStore {
 
 pub struct FastlyApiClient {
     api_key: Vec<u8>,
-    base_url: String,
+    base_url: &'static str,
     backend_name: String,
 }
 
@@ -85,7 +87,7 @@ impl FastlyApiClient {
     }
 
     pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
-        let backend_name = ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
+        let backend_name = ensure_backend_from_url(FASTLY_API_HOST).map_err(|e| {
             TrustedServerError::Configuration {
                 message: format!("Failed to ensure API backend: {}", e),
             }
@@ -98,7 +100,7 @@ impl FastlyApiClient {
 
         Ok(Self {
             api_key,
-            base_url: "https://api.fastly.com".to_string(),
+            base_url: FASTLY_API_HOST,
             backend_name,
         })
     }
