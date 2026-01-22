@@ -12,8 +12,11 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
-use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::synthetic::get_synthetic_id;
+
+/// Chunk size used for streaming content through the rewrite pipeline.
+const STREAMING_CHUNK_SIZE: usize = 8192;
 
 #[derive(Deserialize)]
 struct ProxySignReq {
@@ -131,6 +134,40 @@ fn rebuild_response_with_body(
     resp
 }
 
+/// Process a response body through a streaming pipeline with the given processor.
+///
+/// Handles decompression, content processing, and re-compression while preserving
+/// the response status and headers.
+fn process_response_with_pipeline<P: StreamProcessor>(
+    mut beresp: Response,
+    processor: P,
+    compression: Compression,
+    content_type: &'static str,
+    error_context: &'static str,
+) -> Result<Response, Report<TrustedServerError>> {
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: STREAMING_CHUNK_SIZE,
+    };
+
+    let body = beresp.take_body();
+    let mut output = Vec::new();
+    let mut pipeline = StreamingPipeline::new(config, processor);
+    pipeline
+        .process(body, &mut output)
+        .change_context(TrustedServerError::Proxy {
+            message: error_context.to_string(),
+        })?;
+
+    Ok(rebuild_response_with_body(
+        beresp,
+        content_type,
+        output,
+        compression != Compression::None,
+    ))
+}
+
 fn finalize_proxied_response(
     settings: &Settings,
     req: &Request,
@@ -178,55 +215,25 @@ fn finalize_proxied_response(
     let compression = Compression::from_content_encoding(&content_encoding);
 
     if ct.contains("text/html") {
-        // HTML: use streaming pipeline to decompress, rewrite, and re-compress
         let processor = CreativeHtmlProcessor::new(settings);
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression, // Preserve compression
-            chunk_size: 8192,
-        };
-
-        let body = beresp.take_body();
-        let mut output = Vec::new();
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline
-            .process(body, &mut output)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process HTML response".to_string(),
-            })?;
-
-        return Ok(rebuild_response_with_body(
+        return process_response_with_pipeline(
             beresp,
+            processor,
+            compression,
             "text/html; charset=utf-8",
-            output,
-            compression != Compression::None, // preserve encoding if compressed
-        ));
+            "Failed to process HTML response",
+        );
     }
 
     if ct.contains("text/css") {
-        // CSS: use streaming pipeline to decompress, rewrite url(...), and re-compress
         let processor = CreativeCssProcessor::new(settings);
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression, // Preserve compression
-            chunk_size: 8192,
-        };
-
-        let body = beresp.take_body();
-        let mut output = Vec::new();
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline
-            .process(body, &mut output)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process CSS response".to_string(),
-            })?;
-
-        return Ok(rebuild_response_with_body(
+        return process_response_with_pipeline(
             beresp,
+            processor,
+            compression,
             "text/css; charset=utf-8",
-            output,
-            compression != Compression::None, // preserve encoding if compressed
-        ));
+            "Failed to process CSS response",
+        );
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics

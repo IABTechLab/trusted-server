@@ -44,6 +44,10 @@ use crate::tsjs;
 use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings as HtmlSettings};
 use std::io;
 
+/// Maximum size of response body that can be buffered for rewriting.
+/// Responses larger than this will be rejected to prevent memory exhaustion.
+const MAX_REWRITABLE_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
 // Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
 // Checks against the rewrite blacklist to exclude configured domains/patterns from proxying.
 pub(super) fn to_abs(u: &str, settings: &Settings) -> Option<String> {
@@ -484,30 +488,36 @@ pub fn rewrite_creative_html(markup: &str, settings: &Settings) -> String {
 ///
 /// This processor buffers input chunks and processes the complete HTML document
 /// when the stream ends, using `rewrite_creative_html` internally.
-pub struct CreativeHtmlProcessor {
-    settings: Settings,
+pub struct CreativeHtmlProcessor<'a> {
+    settings: &'a Settings,
     buffer: Vec<u8>,
 }
 
-impl CreativeHtmlProcessor {
+impl<'a> CreativeHtmlProcessor<'a> {
     /// Create a new HTML processor with the given settings.
-    pub fn new(settings: &Settings) -> Self {
+    pub fn new(settings: &'a Settings) -> Self {
         Self {
-            settings: settings.clone(),
+            settings,
             buffer: Vec::new(),
         }
     }
 }
 
-impl StreamProcessor for CreativeHtmlProcessor {
+impl StreamProcessor for CreativeHtmlProcessor<'_> {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        if self.buffer.len() + chunk.len() > MAX_REWRITABLE_BODY_SIZE {
+            return Err(io::Error::other(format!(
+                "HTML response body exceeds maximum rewritable size of {} bytes",
+                MAX_REWRITABLE_BODY_SIZE
+            )));
+        }
         self.buffer.extend_from_slice(chunk);
 
         if is_last {
             let markup = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {}", e)))?;
 
-            let rewritten = rewrite_creative_html(&markup, &self.settings);
+            let rewritten = rewrite_creative_html(&markup, self.settings);
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())
@@ -523,30 +533,36 @@ impl StreamProcessor for CreativeHtmlProcessor {
 ///
 /// This processor buffers input chunks and processes the complete CSS
 /// when the stream ends, using `rewrite_css_body` internally.
-pub struct CreativeCssProcessor {
-    settings: Settings,
+pub struct CreativeCssProcessor<'a> {
+    settings: &'a Settings,
     buffer: Vec<u8>,
 }
 
-impl CreativeCssProcessor {
+impl<'a> CreativeCssProcessor<'a> {
     /// Create a new CSS processor with the given settings.
-    pub fn new(settings: &Settings) -> Self {
+    pub fn new(settings: &'a Settings) -> Self {
         Self {
-            settings: settings.clone(),
+            settings,
             buffer: Vec::new(),
         }
     }
 }
 
-impl StreamProcessor for CreativeCssProcessor {
+impl StreamProcessor for CreativeCssProcessor<'_> {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        if self.buffer.len() + chunk.len() > MAX_REWRITABLE_BODY_SIZE {
+            return Err(io::Error::other(format!(
+                "CSS response body exceeds maximum rewritable size of {} bytes",
+                MAX_REWRITABLE_BODY_SIZE
+            )));
+        }
         self.buffer.extend_from_slice(chunk);
 
         if is_last {
             let css = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {}", e)))?;
 
-            let rewritten = rewrite_css_body(&css, &self.settings);
+            let rewritten = rewrite_css_body(&css, self.settings);
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())
