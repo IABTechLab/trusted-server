@@ -29,7 +29,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
@@ -68,7 +68,7 @@ pub struct LockrConfig {
     pub rewrite_sdk_host: bool,
 }
 
-impl IntegrationConfigTrait for LockrConfig {
+impl IntegrationConfig for LockrConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
