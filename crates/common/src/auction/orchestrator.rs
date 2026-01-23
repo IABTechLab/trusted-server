@@ -99,16 +99,17 @@ impl AuctionOrchestrator {
                 mediator.provider_name()
             );
 
-            // Create a modified request with all bids attached
-            let mut mediation_request = request.clone();
-            mediation_request.context.insert(
-                "provider_responses".to_string(),
-                serde_json::json!(&provider_responses),
-            );
+            // Create a context with provider responses for the mediator
+            let mediator_context = AuctionContext {
+                settings: context.settings,
+                request: context.request,
+                timeout_ms: context.timeout_ms,
+                provider_responses: Some(&provider_responses),
+            };
 
             let start_time = Instant::now();
             let pending = mediator
-                .request_bids(&mediation_request, context)
+                .request_bids(request, &mediator_context)
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
@@ -284,10 +285,7 @@ impl AuctionOrchestrator {
             match result {
                 Ok(response) => {
                     // Identify the provider from the backend name
-                    let backend_name = response
-                        .get_backend_name()
-                        .unwrap_or_default()
-                        .to_string();
+                    let backend_name = response.get_backend_name().unwrap_or_default().to_string();
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
@@ -558,6 +556,7 @@ mod tests {
             settings,
             request: req,
             timeout_ms: 2000,
+            provider_responses: None,
         }
     }
 

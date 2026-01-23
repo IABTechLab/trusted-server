@@ -94,6 +94,9 @@ pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request,
     pub timeout_ms: u32,
+    /// Provider responses from the bidding phase, used by mediators.
+    /// This is `None` for regular bidders and `Some` when calling a mediator.
+    pub provider_responses: Option<&'a [AuctionResponse]>,
 }
 
 /// Response from a single auction provider.

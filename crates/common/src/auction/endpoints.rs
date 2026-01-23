@@ -41,6 +41,7 @@ pub async fn handle_auction(
         settings,
         request: &req,
         timeout_ms: settings.auction.timeout_ms,
+        provider_responses: None,
     };
 
     // Run the auction

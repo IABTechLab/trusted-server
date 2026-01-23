@@ -84,15 +84,6 @@ impl AdServerMockProvider {
         Self { config }
     }
 
-    /// Extract bidder responses from auction request context.
-    fn extract_bidder_responses(&self, request: &AuctionRequest) -> Vec<AuctionResponse> {
-        request
-            .context
-            .get("provider_responses")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default()
-    }
-
     /// Build mediation request from auction request and bidder responses.
     ///
     /// Handles both:
@@ -244,10 +235,10 @@ impl AuctionProvider for AdServerMockProvider {
     fn request_bids(
         &self,
         request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
+        context: &AuctionContext<'_>,
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
-        // Extract bidder responses from request context
-        let bidder_responses = self.extract_bidder_responses(request);
+        // Get bidder responses from context (passed by orchestrator for mediation)
+        let bidder_responses = context.provider_responses.unwrap_or(&[]);
 
         log::info!(
             "AdServer Mock: mediating {} slots with {} bidder responses",
@@ -257,7 +248,7 @@ impl AuctionProvider for AdServerMockProvider {
 
         // Build mediation request
         let mediation_req = self
-            .build_mediation_request(request, &bidder_responses)
+            .build_mediation_request(request, bidder_responses)
             .change_context(TrustedServerError::Auction {
                 message: "Failed to build mediation request".to_string(),
             })?;
