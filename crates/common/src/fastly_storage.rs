@@ -6,7 +6,7 @@ use http::StatusCode;
 use crate::backend::ensure_backend_from_url;
 use crate::error::TrustedServerError;
 
-const FASTLY_API_HOST: &'static str = "https://api.fastly.com";
+const FASTLY_API_HOST: &str = "https://api.fastly.com";
 
 pub struct FastlyConfigStore {
     store_name: String,
