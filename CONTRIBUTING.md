@@ -14,9 +14,9 @@ We **love** pull requests! Before [forking the repo](https://help.github.com/en/
 
 For most contributions, after your first pull request is accepted and merged, you will be [invited to the project](https://help.github.com/en/github/setting-up-and-managing-your-github-user-account/inviting-collaborators-to-a-personal-repository) and given **push access**. :tada:
 
-*Note: All contributions will be licensed under the project's license.*
+_Note: All contributions will be licensed under the project's license._
 
-- **Smaller is better.** Submit **one** pull request per bug fix or feature. A pull request should contain isolated changes pertaining to a single bug fix or feature implementation. **Do not** refactor or reformat code that is unrelated to your change. It is better to **submit many small pull requests** rather than a single large one. Enormous pull requests will take enormous amounts of time to review, or may be rejected altogether. 
+- **Smaller is better.** Submit **one** pull request per bug fix or feature. A pull request should contain isolated changes pertaining to a single bug fix or feature implementation. **Do not** refactor or reformat code that is unrelated to your change. It is better to **submit many small pull requests** rather than a single large one. Enormous pull requests will take enormous amounts of time to review, or may be rejected altogether.
 
 - **Coordinate bigger changes.** For large and non-trivial changes, open an issue to discuss a strategy with the maintainers. Otherwise, you risk doing a lot of work for nothing!
 
@@ -30,9 +30,9 @@ For most contributions, after your first pull request is accepted and merged, yo
 
 - **[Resolve any merge conflicts](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/resolving-a-merge-conflict-on-github)** that occur.
 
-- **Keep PR in Draft** until ready for review. When PR ready for review assign PR to ourself and assing at least one reviewer
+- **Keep PR in Draft** until ready for review. When it is ready, assign the PR to yourself and request at least one reviewer.
 
-- **Promptly address any CI failures**. If your pull request fails to build or pass tests, please push another commit to fix it. 
+- **Promptly address any CI failures**. If your pull request fails to build or pass tests, please push another commit to fix it.
 
 - When writing comments, use properly constructed sentences, including punctuation.
 
@@ -44,32 +44,32 @@ Please [write a great commit message](https://chris.beams.io/posts/git-commit/).
 
 1. Separate subject from body with a blank line
 1. Limit the subject line to 50 characters
-1. Capitalize the subject line
-1. Add [Draft] prefix for PR not ready for review
+1. Use sentence case (capitalize the first word)
 1. Do not end the subject line with a period
 1. Use the imperative mood in the subject line (example: "Fix networking issue")
 1. Wrap the body at about 72 characters
-1. Use the body to explain **why**, *not what and how* (the code shows that!)
-1. If applicable, prefix the title with the relevant component name. (examples: "[Docs] Fix typo", "[Profile] Fix missing avatar")
+1. Use the body to explain **why**, _not what and how_ (the code shows that!)
+1. Do not use semantic prefixes or tags (examples: `fix:`, `feat:`, `[Docs]`)
+1. Keep PR state out of commit messages; use GitHub Draft PRs instead
 
 ```
-[TAG] Short summary of changes in 50 chars or less
+Short summary of changes in 50 chars or less
 
-Add a more detailed explanation here, if necessary. Possibly give 
-some background about the issue being fixed, etc. The body of the 
-commit message can be several paragraphs. Further paragraphs come 
+Add a more detailed explanation here, if necessary. Possibly give
+some background about the issue being fixed, etc. The body of the
+commit message can be several paragraphs. Further paragraphs come
 after blank lines and please do proper word-wrap.
 
-Wrap it to about 72 characters or so. In some contexts, 
-the first line is treated as the subject of the commit and the 
-rest of the text as the body. The blank line separating the summary 
-from the body is critical (unless you omit the body entirely); 
-various tools like `log`, `shortlog` and `rebase` can get confused 
+Wrap it to about 72 characters or so. In some contexts,
+the first line is treated as the subject of the commit and the
+rest of the text as the body. The blank line separating the summary
+from the body is critical (unless you omit the body entirely);
+various tools like `log`, `shortlog` and `rebase` can get confused
 if you run the two together.
 
 Explain the problem that this commit is solving. Focus on why you
-are making this change as opposed to how or what. The code explains 
-how or what. Reviewers and your future self can read the patch, 
+are making this change as opposed to how or what. The code explains
+how or what. Reviewers and your future self can read the patch,
 but might not understand why a particular solution was implemented.
 Are there side effects or other unintuitive consequences of this
 change? Here's the place to explain them.
@@ -93,31 +93,30 @@ See also: #456, #789
 
 - **Always do your best.** No one writes bugs on purpose. Do your best, and learn from your mistakes.
 
-- Kindly note any violations to the guidelines specified in this document. 
+- Kindly note any violations to the guidelines specified in this document.
 
-- **Use CREG (Code Review Emoji Guide)**  to give the reviewee added context and clarity to follow up on code review. 
+- **Use CREG (Code Review Emoji Guide)** to give the reviewee added context and clarity to follow up on code review.
 
 ### Emoji Legend
 
-|     |   `:code:`   | Meaning                                                                                                                                                                             |
-| :-: | :----------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 😃👍💯  |  `:smiley:` `:+1:` `:100:`  | I like this... <br /><br /> ...and I want the author to know it! This is a way to highlight positive parts of a code review.                                                        |
-| 🔧  |  `:wrench:`  | I think this needs to be changed. <br /><br />This is a concern or suggested change/refactor that I feel is worth addressing.                                                       |
-| ❓  | `:question:` | I have a question. <br /><br /> This should be a fully formed question with sufficient information and context that requires a response.                                            |
-| 🤔💭 | `:thinking:` `:thought_balloon:` | Let me think out loud here for a minute. <br /><br /> I might express concern, suggest an alternative solution, or walk through the code in my own words to make sure I understand. |
-| 🌱  | `:seedling:` | Planting a seed for future. <br /><br /> An observation or suggestion that is not a change request, but may have larger implications. Generally something to keep in mind for the future. |
-| 📝  |   `:memo:`   | This is an explanatory note, fun fact, or relevant commentary that does not require any action.                                                                                     |
-|  ⛏  |   `:pick:`   | This is a nitpick. <br /><br /> This does not require any changes and is often better left unsaid. This may include stylistic, formatting, or organization suggestions and should likely be prevented/enforced by linting if they really matter |
-|  ♻️  | `:recycle:`  | Suggestion for refactoring. <br /><br /> Should include enough context to be actionable and not be considered a nitpick. |
-|  🏕  | `:camping:`  | Here is an opportunity, not directly related to your changes, for us to leave the campground [code] cleaner than we found it.                                                       |
-| 📌  | `:pushpin:`  | This is a concern that is _out of scope_ and should be staged appropriately for follow up.                                                                                          |
-
+|        |             `:code:`             | Meaning                                                                                                                                                                                                                                         |
+| :----: | :------------------------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 😃👍💯 |    `:smiley:` `:+1:` `:100:`     | I like this... <br /><br /> ...and I want the author to know it! This is a way to highlight positive parts of a code review.                                                                                                                    |
+|   🔧   |            `:wrench:`            | I think this needs to be changed. <br /><br />This is a concern or suggested change/refactor that I feel is worth addressing.                                                                                                                   |
+|   ❓   |           `:question:`           | I have a question. <br /><br /> This should be a fully formed question with sufficient information and context that requires a response.                                                                                                        |
+|  🤔💭  | `:thinking:` `:thought_balloon:` | Let me think out loud here for a minute. <br /><br /> I might express concern, suggest an alternative solution, or walk through the code in my own words to make sure I understand.                                                             |
+|   🌱   |           `:seedling:`           | Planting a seed for future. <br /><br /> An observation or suggestion that is not a change request, but may have larger implications. Generally something to keep in mind for the future.                                                       |
+|   📝   |             `:memo:`             | This is an explanatory note, fun fact, or relevant commentary that does not require any action.                                                                                                                                                 |
+|   ⛏    |             `:pick:`             | This is a nitpick. <br /><br /> This does not require any changes and is often better left unsaid. This may include stylistic, formatting, or organization suggestions and should likely be prevented/enforced by linting if they really matter |
+|   ♻️   |           `:recycle:`            | Suggestion for refactoring. <br /><br /> Should include enough context to be actionable and not be considered a nitpick.                                                                                                                        |
+|   🏕   |           `:camping:`            | Here is an opportunity, not directly related to your changes, for us to leave the campground [code] cleaner than we found it.                                                                                                                   |
+|   📌   |           `:pushpin:`            | This is a concern that is _out of scope_ and should be staged appropriately for follow up.                                                                                                                                                      |
 
 ## :nail_care: Coding Style
 
 Consistency is the most important. Following the existing Rust style, formatting, and naming conventions of the file you are modifying and of the overall project. Failure to do so will result in a prolonged review process that has to focus on updating the superficial aspects of your code, rather than improving its functionality and performance.
 
-Style and format will be enforced with a linter when PR is crated.
+Style and format will be enforced with a linter when the PR is created.
 
 ## :pray: Credits
 
