@@ -22,7 +22,10 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
+use crate::openrtb::{
+    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
+    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+};
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -279,6 +282,10 @@ fn build_openrtb_from_ts(
             domain: Some(settings.publisher.domain.clone()),
             page: Some(format!("https://{}", &settings.publisher.domain)),
         }),
+        user: None,
+        device: None,
+        regs: None,
+        ext: None,
     }
 }
 
@@ -422,24 +429,18 @@ fn enhance_openrtb_request(
 
         // Append debug query params if configured
         if let Some(ref params) = config.debug_query_params {
-            page_url = format!("{}?{}", page_url, params);
+            page_url = append_query_params(&page_url, params);
         }
 
         request["site"] = json!({
             "domain": settings.publisher.domain,
             "page": page_url,
         });
-    } else if config.debug_query_params.is_some() {
+    } else if let Some(ref params) = config.debug_query_params {
         // If site already exists, append debug params to existing page URL
         if let Some(page_url) = request["site"]["page"].as_str() {
-            let params = config.debug_query_params.as_ref().unwrap();
-            // Only append if params aren't already present
-            if !page_url.contains(params.as_str()) {
-                let updated_url = if page_url.contains('?') {
-                    format!("{}&{}", page_url, params)
-                } else {
-                    format!("{}?{}", page_url, params)
-                };
+            let updated_url = append_query_params(page_url, params);
+            if updated_url != page_url {
                 request["site"]["page"] = json!(updated_url);
             }
         }
@@ -595,6 +596,19 @@ fn get_request_scheme(req: &Request) -> String {
     "https".to_string()
 }
 
+/// Appends query parameters to a URL, handling both URLs with and without existing query strings.
+/// Returns the original URL unchanged if params are empty or already present.
+fn append_query_params(url: &str, params: &str) -> String {
+    if params.is_empty() || url.contains(params) {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{}&{}", url, params)
+    } else {
+        format!("{}?{}", url, params)
+    }
+}
+
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
@@ -610,8 +624,13 @@ impl PrebidAuctionProvider {
         Self { config }
     }
 
-    /// Convert auction request to OpenRTB format.
-    fn to_openrtb(&self, request: &AuctionRequest) -> OpenRtbRequest {
+    /// Convert auction request to OpenRTB format with all enrichments.
+    fn to_openrtb(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        signer: Option<(&RequestSigner, String)>,
+    ) -> OpenRtbRequest {
         let imps: Vec<Imp> = request
             .slots
             .iter()
@@ -627,11 +646,18 @@ impl PrebidAuctionProvider {
                     .collect();
 
                 // Use bidder params from the slot (passed through from the request)
-                let bidder: std::collections::HashMap<String, Json> = slot
+                let mut bidder: HashMap<String, Json> = slot
                     .bidders
                     .iter()
                     .map(|(name, params)| (name.clone(), params.clone()))
                     .collect();
+
+                // Fallback to config bidders if none provided
+                if bidder.is_empty() {
+                    for b in &self.config.bidders {
+                        bidder.insert(b.clone(), Json::Object(serde_json::Map::new()));
+                    }
+                }
 
                 Imp {
                     id: slot.id.clone(),
@@ -643,13 +669,79 @@ impl PrebidAuctionProvider {
             })
             .collect();
 
+        // Build page URL with debug query params if configured
+        let page_url = request.publisher.page_url.as_ref().map(|url| {
+            if let Some(ref params) = self.config.debug_query_params {
+                append_query_params(url, params)
+            } else {
+                url.clone()
+            }
+        });
+
+        // Build user object
+        let user = Some(User {
+            id: Some(request.user.id.clone()),
+            ext: Some(UserExt {
+                synthetic_fresh: Some(request.user.fresh_id.clone()),
+            }),
+        });
+
+        // Build device object with geo if available
+        let device = request.device.as_ref().and_then(|d| {
+            d.geo.as_ref().map(|geo| Device {
+                geo: Some(Geo {
+                    geo_type: 2, // IP address per OpenRTB spec
+                    country: Some(geo.country.clone()),
+                    city: Some(geo.city.clone()),
+                    region: geo.region.clone(),
+                }),
+            })
+        });
+
+        // Build regs object if Sec-GPC header is present
+        let regs = if context.request.get_header("Sec-GPC").is_some() {
+            Some(Regs {
+                ext: Some(RegsExt {
+                    us_privacy: Some("1YYN".to_string()),
+                }),
+            })
+        } else {
+            None
+        };
+
+        // Build ext object
+        let request_host = get_request_host(context.request);
+        let request_scheme = get_request_scheme(context.request);
+
+        let (signature, kid) = signer
+            .map(|(s, sig)| (Some(sig), Some(s.kid.clone())))
+            .unwrap_or((None, None));
+
+        let ext = Some(RequestExt {
+            prebid: if self.config.debug {
+                Some(PrebidExt { debug: Some(true) })
+            } else {
+                None
+            },
+            trusted_server: Some(TrustedServerExt {
+                signature,
+                kid,
+                request_host: Some(request_host),
+                request_scheme: Some(request_scheme),
+            }),
+        });
+
         OpenRtbRequest {
             id: request.id.clone(),
             imp: imps,
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
-                page: request.publisher.page_url.clone(),
+                page: page_url,
             }),
+            user,
+            device,
+            regs,
+            ext,
         }
     }
 
@@ -746,102 +838,28 @@ impl AuctionProvider for PrebidAuctionProvider {
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
-        // Convert to OpenRTB
-        let openrtb = self.to_openrtb(request);
-        let mut openrtb_json =
-            serde_json::to_value(&openrtb).change_context(TrustedServerError::Prebid {
-                message: "Failed to serialize OpenRTB request".to_string(),
-            })?;
-
-        // Enhance with user info
-        if !openrtb_json["user"].is_object() {
-            openrtb_json["user"] = json!({});
-        }
-        openrtb_json["user"]["id"] = json!(&request.user.id);
-        if !openrtb_json["user"]["ext"].is_object() {
-            openrtb_json["user"]["ext"] = json!({});
-        }
-        openrtb_json["user"]["ext"]["synthetic_fresh"] = json!(&request.user.fresh_id);
-
-        // Add device info if available
-        if let Some(device) = &request.device {
-            if let Some(geo) = &device.geo {
-                let geo_obj = json!({
-                    "type": 2,
-                    "country": geo.country,
-                    "city": geo.city,
-                    "region": geo.region,
-                });
-                if !openrtb_json["device"].is_object() {
-                    openrtb_json["device"] = json!({});
+        // Create signer and compute signature if request signing is enabled
+        let signer_with_signature =
+            if let Some(request_signing_config) = &context.settings.request_signing {
+                if request_signing_config.enabled {
+                    let signer = RequestSigner::from_config()?;
+                    let signature = signer.sign(request.id.as_bytes())?;
+                    Some((signer, signature))
+                } else {
+                    None
                 }
-                openrtb_json["device"]["geo"] = geo_obj;
-            }
-        }
+            } else {
+                None
+            };
 
-        // Add privacy regulations based on Sec-GPC header
-        if context.request.get_header("Sec-GPC").is_some() {
-            if !openrtb_json["regs"].is_object() {
-                openrtb_json["regs"] = json!({});
-            }
-            if !openrtb_json["regs"]["ext"].is_object() {
-                openrtb_json["regs"]["ext"] = json!({});
-            }
-            openrtb_json["regs"]["ext"]["us_privacy"] = json!("1YYN");
-        }
-
-        if !openrtb_json["ext"].is_object() {
-            openrtb_json["ext"] = json!({});
-        }
-        if !openrtb_json["ext"]["trusted_server"].is_object() {
-            openrtb_json["ext"]["trusted_server"] = json!({});
-        }
-
-        let request_host = get_request_host(context.request);
-        let request_scheme = get_request_scheme(context.request);
-        openrtb_json["ext"]["trusted_server"]["request_host"] = json!(request_host);
-        openrtb_json["ext"]["trusted_server"]["request_scheme"] = json!(request_scheme);
-
-        // Add request signing if enabled
-        if let Some(request_signing_config) = &context.settings.request_signing {
-            if request_signing_config.enabled && openrtb_json["id"].is_string() {
-                let id = openrtb_json["id"]
-                    .as_str()
-                    .expect("should have string id when is_string checked");
-                let signer = RequestSigner::from_config()?;
-                let signature = signer.sign(id.as_bytes())?;
-
-                openrtb_json["ext"]["trusted_server"]["signature"] = json!(signature);
-                openrtb_json["ext"]["trusted_server"]["kid"] = json!(signer.kid);
-            }
-        }
-
-        // Add debug flag if enabled
-        if self.config.debug {
-            if !openrtb_json["ext"]["prebid"].is_object() {
-                openrtb_json["ext"]["prebid"] = json!({});
-            }
-            openrtb_json["ext"]["prebid"]["debug"] = json!(true);
-        }
-
-        // Append debug query params to page URL if configured
-        if let Some(ref params) = self.config.debug_query_params {
-            if !params.is_empty() {
-                if let Some(page_url) = openrtb_json["site"]["page"].as_str() {
-                    // Only append if params aren't already present
-                    if !page_url.contains(params.as_str()) {
-                        let updated_url = if page_url.contains('?') {
-                            format!("{}&{}", page_url, params)
-                        } else {
-                            format!("{}?{}", page_url, params)
-                        };
-                        openrtb_json["site"]["page"] = json!(updated_url);
-                    }
-                }
-            }
-        }
-
-        log::info!("Prebid OpenRTB request: {:#?}", openrtb_json);
+        // Convert to OpenRTB with all enrichments
+        let openrtb = self.to_openrtb(
+            request,
+            context,
+            signer_with_signature
+                .as_ref()
+                .map(|(s, sig)| (s, sig.clone())),
+        );
 
         // Create HTTP request
         let mut pbs_req = Request::new(
@@ -851,7 +869,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         copy_request_headers(context.request, &mut pbs_req);
 
         pbs_req
-            .set_body_json(&openrtb_json)
+            .set_body_json(&openrtb)
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to set request body".to_string(),
             })?;
@@ -883,7 +901,6 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         let body_bytes = response.take_body_bytes();
-        log::info!("Prebid OpenRTB response: {}", String::from_utf8_lossy(&body_bytes));
 
         let mut response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
