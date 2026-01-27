@@ -265,6 +265,7 @@ impl LockrIntegration {
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
             header::COOKIE,
+            header::ORIGIN,
         ];
 
         for header_name in &headers_to_copy {
