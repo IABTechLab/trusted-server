@@ -1,5 +1,7 @@
 import { log } from '../../core/log';
 
+import { installPermutiveGuard } from './script_guard';
+
 declare const permutive: {
   config: {
     advertiserApiVersion: string;
@@ -96,5 +98,7 @@ function waitForPermutiveSDK(callback: () => void, maxAttempts = 50) {
 }
 
 if (typeof window !== 'undefined') {
+  installPermutiveGuard();
+
   waitForPermutiveSDK(() => installPermutiveShim());
 }
