@@ -39,7 +39,9 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
         {
-            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !guard.payloads.is_empty() {
                 return true;
             }
@@ -56,7 +58,9 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
             .map(|state| {
-                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.take_payloads()
             })
             .unwrap_or_default();
@@ -488,7 +492,13 @@ fn post_process_rsc_html_in_place_with_limit(
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // Tests use deprecated post_process_rsc_html for legacy API coverage
+#[allow(
+    deprecated, // Tests use deprecated post_process_rsc_html for legacy API coverage
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 

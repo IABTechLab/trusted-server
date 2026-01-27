@@ -476,7 +476,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     let remaining = &combined[last_end..];
     result.push_str(rewriter.rewrite(remaining).as_ref());
 
-    result.split(RSC_MARKER).map(|s| s.to_string()).collect()
+    result.split(RSC_MARKER).map(String::from).collect()
 }
 
 #[cfg(test)]

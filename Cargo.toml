@@ -13,10 +13,10 @@ default-members = [
 ]
 
 [workspace.lints.clippy]
-# Correctness
-unwrap_used = "warn"
-expect_used = "allow"
-panic = "warn"
+# Correctness - Force explicit error handling in production code
+unwrap_used = "deny"
+expect_used = "allow"  # Allow expect with context message
+panic = "deny"
 
 # Style
 module_name_repetitions = "allow"
@@ -26,6 +26,8 @@ must_use_candidate = "warn"
 doc_markdown = "warn"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
+needless_pass_by_value = "warn"  # Encourage borrowing over ownership
+redundant_closure_for_method_calls = "warn"
 
 # Restriction (selective)
 print_stdout = "warn"

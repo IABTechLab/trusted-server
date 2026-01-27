@@ -504,12 +504,15 @@ pub struct IntegrationRegistry {
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    ///
     /// # Panics
     ///
-    /// Panics if an integration route registration fails due to duplicate routes or invalid paths.
-    #[must_use]
-    #[allow(clippy::panic, clippy::unwrap_used)]
-    pub fn new(settings: &Settings) -> Self {
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    #[allow(clippy::unwrap_used)]
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
@@ -520,7 +523,13 @@ impl IntegrationRegistry {
 
                         // Convert /* wildcard to matchit's {*rest} syntax
                         let matchit_path = if route.path.ends_with("/*") {
-                            format!("{}/{{*rest}}", route.path.strip_suffix("/*").unwrap())
+                            format!(
+                                "{}/{{*rest}}",
+                                route
+                                    .path
+                                    .strip_suffix("/*")
+                                    .expect("path should end with '/*'")
+                            )
                         } else {
                             route.path.to_string()
                         };
@@ -543,10 +552,12 @@ impl IntegrationRegistry {
                         };
 
                         if let Err(e) = router.insert(&matchit_path, value) {
-                            panic!(
-                                "Integration route registration failed for {} {}: {:?}",
-                                route.method, route.path, e
-                            );
+                            return Err(Report::new(TrustedServerError::Configuration {
+                                message: format!(
+                                    "Integration route registration failed for {} {}: {:?}",
+                                    route.method, route.path, e
+                                ),
+                            }));
                         }
 
                         inner.routes.push((route, registration.integration_id));
@@ -564,9 +575,9 @@ impl IntegrationRegistry {
             }
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
-        }
+        })
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -718,7 +729,10 @@ impl IntegrationRegistry {
         for (method, path, value) in routes {
             // Convert /* wildcard to matchit's {*rest} syntax
             let matchit_path = if path.ends_with("/*") {
-                format!("{}/{{*rest}}", path.strip_suffix("/*").unwrap())
+                format!(
+                    "{}/{{*rest}}",
+                    path.strip_suffix("/*").expect("path should end with '/*'")
+                )
             } else {
                 path.to_string()
             };
@@ -732,7 +746,9 @@ impl IntegrationRegistry {
                 _ => continue,
             };
 
-            router.insert(&matchit_path, value).unwrap();
+            router
+                .insert(&matchit_path, value)
+                .expect("route registration should succeed");
         }
 
         Self {

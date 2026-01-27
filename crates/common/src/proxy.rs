@@ -95,7 +95,7 @@ fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
 
 // Transform the backend response into the final response sent to the client.
 // Handles HTML and CSS rewrites and image content-type normalization.
-fn rebuild_text_response(beresp: Response, content_type: &'static str, body: String) -> Response {
+fn rebuild_text_response(beresp: &Response, content_type: &'static str, body: String) -> Response {
     let status = beresp.get_status();
     let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
         .get_headers()
@@ -151,14 +151,14 @@ fn finalize_proxied_response(
         // HTML: rewrite and serve as HTML (safe to read as string)
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_creative_html(&body, settings);
-        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
+        return rebuild_text_response(&beresp, "text/html; charset=utf-8", rewritten);
     }
 
     if ct.contains("text/css") {
         // CSS: rewrite url(...) references in stylesheets (safe to read as string)
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_css_body(&body, settings);
-        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
+        return rebuild_text_response(&beresp, "text/css; charset=utf-8", rewritten);
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics

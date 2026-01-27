@@ -64,7 +64,7 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 

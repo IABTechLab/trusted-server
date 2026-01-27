@@ -75,7 +75,7 @@ pub fn bundle_hash(bundle: TsjsBundle) -> String {
 
 #[must_use]
 pub fn bundle_for_filename(name: &str) -> Option<&'static str> {
-    TsjsBundle::from_filename(name).map(|bundle| bundle.bundle())
+    TsjsBundle::from_filename(name).map(TsjsBundle::bundle)
 }
 
 #[must_use]

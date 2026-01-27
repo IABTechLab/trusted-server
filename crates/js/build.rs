@@ -45,7 +45,11 @@ fn main() {
                     .arg("install")
                     .current_dir(&ts_dir)
                     .status();
-                if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
+                if !status
+                    .as_ref()
+                    .map(std::process::ExitStatus::success)
+                    .unwrap_or(false)
+                {
                     println!(
                         "cargo:warning=tsjs: npm install failed; using existing dist if available"
                     );
@@ -73,7 +77,11 @@ fn main() {
                 .args(["run", "build:custom"])
                 .current_dir(&ts_dir)
                 .status();
-            if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
+            if !status
+                .as_ref()
+                .map(std::process::ExitStatus::success)
+                .unwrap_or(false)
+            {
                 panic!("tsjs: npm run build:custom failed - refusing to use stale bundle");
             }
         }

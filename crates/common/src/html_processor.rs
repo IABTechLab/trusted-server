@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             &registry,
@@ -677,7 +677,7 @@ mod tests {
             )
             .expect("should insert testlight config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let mut config = create_test_config();
         config.integrations = registry;
 

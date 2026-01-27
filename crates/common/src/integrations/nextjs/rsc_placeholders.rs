@@ -87,7 +87,9 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             .get_or_insert_with(NEXTJS_INTEGRATION_ID, || {
                 Mutex::new(NextJsRscPostProcessState::default())
             });
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let placeholder_index = guard.payloads.len();
         let placeholder = rsc_payload_placeholder(placeholder_index);

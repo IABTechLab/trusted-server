@@ -29,11 +29,17 @@ fn main(req: Request) -> Result<Response, Error> {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
-            return Ok(to_error_response(e));
+            return Ok(to_error_response(&e));
         }
     };
     log::info!("Settings {settings:?}");
-    let integration_registry = IntegrationRegistry::new(&settings);
+    let integration_registry = match IntegrationRegistry::new(&settings) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Failed to create integration registry: {:?}", e);
+            return Ok(to_error_response(&e));
+        }
+    };
 
     futures::executor::block_on(route_request(settings, integration_registry, req))
 }
@@ -60,7 +66,7 @@ async fn route_request(
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&settings, req)
+            handle_tsjs_dynamic(&settings, &req)
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
@@ -111,7 +117,7 @@ async fn route_request(
     };
 
     // Convert any errors to HTTP error responses
-    let mut response = result.unwrap_or_else(to_error_response);
+    let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);

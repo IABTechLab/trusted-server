@@ -423,7 +423,7 @@ where
             } else {
                 let parts = if txt.contains(',') {
                     txt.split(',')
-                        .map(|p| p.trim())
+                        .map(str::trim)
                         .filter(|p| !p.is_empty())
                         .collect::<Vec<_>>()
                 } else {

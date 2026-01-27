@@ -1,12 +1,38 @@
 # Clippy configuration for trusted-server
 # See: https://doc.rust-lang.org/clippy/configuration.html
 
-# Cognitive complexity threshold for functions
+# =============================================================================
+# Complexity Thresholds
+# =============================================================================
+
+# Cognitive complexity threshold for functions (default: 25)
+# Set to 30 to accommodate existing complex HTML/RSC processing functions
+# like `create_html_processor` and `rewrite_rsc_scripts_combined`.
+# Consider refactoring functions that exceed this threshold.
 cognitive-complexity-threshold = 30
 
-# Maximum number of lines in a function
+# Maximum number of lines in a function (default: 100)
+# Set to 200 to allow larger handler functions that process HTTP requests
+# with multiple validation steps. Prefer extracting helpers when possible.
 too-many-lines-threshold = 200
 
-# Allow module name repetitions in reexports
+# =============================================================================
+# Test Allowances
+# =============================================================================
+
+# Allow expect() in tests for clearer failure messages than unwrap()
 allow-expect-in-tests = true
+
+# Allow unwrap() in tests where panicking on failure is acceptable
 allow-unwrap-in-tests = true
+
+# =============================================================================
+# Future Considerations
+# =============================================================================
+#
+# As the codebase matures, consider tightening these thresholds:
+# - cognitive-complexity-threshold = 25 (default)
+# - too-many-lines-threshold = 100 (default)
+#
+# Additional lints to consider enabling in Cargo.toml:
+# - missing_const_for_fn = "warn"

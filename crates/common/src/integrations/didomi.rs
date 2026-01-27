@@ -273,7 +273,7 @@ mod tests {
             .insert_config(DIDOMI_INTEGRATION_ID, &config(true))
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
