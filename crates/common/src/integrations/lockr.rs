@@ -66,6 +66,13 @@ pub struct LockrConfig {
     /// Whether to rewrite the host variable in the Lockr SDK JavaScript
     #[serde(default = "default_rewrite_sdk_host")]
     pub rewrite_sdk_host: bool,
+
+    /// Override the Origin header sent to Lockr API.
+    /// Use this when running locally or from a domain not registered with Lockr.
+    /// Example: "https://www.example.com"
+    #[serde(default)]
+    #[validate(url)]
+    pub origin_override: Option<String>,
 }
 
 impl IntegrationConfigTrait for LockrConfig {
@@ -265,13 +272,19 @@ impl LockrIntegration {
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
             header::COOKIE,
-            header::ORIGIN,
         ];
 
         for header_name in &headers_to_copy {
             if let Some(value) = from.get_header(header_name) {
                 to.set_header(header_name, value);
             }
+        }
+
+        // Handle Origin header - use override if configured, otherwise forward original
+        if let Some(ref origin_override) = self.config.origin_override {
+            to.set_header(header::ORIGIN, origin_override.as_str());
+        } else if let Some(value) = from.get_header(header::ORIGIN) {
+            to.set_header(header::ORIGIN, value);
         }
 
         // Copy any X-* custom headers
@@ -410,6 +423,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -431,6 +445,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -462,6 +477,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: false, // Disabled
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -520,6 +536,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -550,6 +567,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -590,6 +608,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -632,6 +651,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: false, // Disabled
+            origin_override: None,
         };
 
         // When rewrite_sdk_host is false, the handle_sdk_serving function
@@ -649,6 +669,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
