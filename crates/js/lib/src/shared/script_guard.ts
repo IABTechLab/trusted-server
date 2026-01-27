@@ -45,7 +45,7 @@ function rewriteToFirstParty(proxyPath: string): string {
  */
 function shouldRewriteElement(
   node: Node,
-  isTargetUrl: (url: string) => boolean,
+  isTargetUrl: (url: string) => boolean
 ): node is HTMLScriptElement | HTMLLinkElement {
   if (!node || !(node instanceof HTMLElement)) {
     return false;
@@ -53,8 +53,7 @@ function shouldRewriteElement(
 
   // Script elements
   if (node.tagName === 'SCRIPT') {
-    const src =
-      (node as HTMLScriptElement).src || node.getAttribute('src');
+    const src = (node as HTMLScriptElement).src || node.getAttribute('src');
     return !!src && isTargetUrl(src);
   }
 
@@ -76,7 +75,7 @@ function shouldRewriteElement(
  */
 function rewriteElement(
   element: HTMLScriptElement | HTMLLinkElement,
-  config: ScriptGuardConfig,
+  config: ScriptGuardConfig
 ): void {
   const prefix = `${config.name} guard`;
 
@@ -147,7 +146,7 @@ export function createScriptGuard(config: ScriptGuardConfig): ScriptGuard {
     Element.prototype.insertBefore = function <T extends Node>(
       this: Element,
       node: T,
-      reference: Node | null,
+      reference: Node | null
     ): T {
       if (shouldRewriteElement(node, config.isTargetUrl)) {
         rewriteElement(node as HTMLScriptElement | HTMLLinkElement, config);
