@@ -79,7 +79,6 @@ pub fn get_active_jwks() -> Result<String, TrustedServerError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, Verifier};

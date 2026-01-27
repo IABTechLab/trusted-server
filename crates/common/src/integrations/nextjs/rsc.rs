@@ -480,7 +480,6 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
 }
 
 #[cfg(test)]
-#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
 

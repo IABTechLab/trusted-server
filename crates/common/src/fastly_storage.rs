@@ -324,7 +324,6 @@ impl FastlyApiClient {
 }
 
 #[cfg(test)]
-#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
 

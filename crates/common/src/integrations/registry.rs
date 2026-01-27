@@ -511,7 +511,6 @@ impl IntegrationRegistry {
     /// # Panics
     ///
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
-    #[allow(clippy::unwrap_used)]
     pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 

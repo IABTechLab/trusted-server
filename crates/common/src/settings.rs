@@ -447,7 +447,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::print_stderr, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use regex::Regex;

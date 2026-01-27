@@ -195,7 +195,6 @@ pub fn generate_date_based_kid() -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use crate::request_signing::Keypair;
 

@@ -492,13 +492,7 @@ fn post_process_rsc_html_in_place_with_limit(
 }
 
 #[cfg(test)]
-#[allow(
-    deprecated, // Tests use deprecated post_process_rsc_html for legacy API coverage
-    clippy::print_stdout,
-    clippy::print_stderr,
-    clippy::panic,
-    clippy::unwrap_used
-)]
+#[allow(deprecated)] // Tests use deprecated post_process_rsc_html for legacy API coverage
 mod tests {
     use super::*;
 

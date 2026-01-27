@@ -137,7 +137,6 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

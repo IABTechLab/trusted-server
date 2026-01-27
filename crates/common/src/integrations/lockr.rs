@@ -397,7 +397,6 @@ fn default_rewrite_sdk_host() -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
