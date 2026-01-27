@@ -281,10 +281,13 @@ impl LockrIntegration {
         }
 
         // Handle Origin header - use override if configured, otherwise forward original
-        if let Some(ref origin_override) = self.config.origin_override {
-            to.set_header(header::ORIGIN, origin_override.as_str());
-        } else if let Some(value) = from.get_header(header::ORIGIN) {
-            to.set_header(header::ORIGIN, value);
+        let origin = self
+            .config
+            .origin_override
+            .as_deref()
+            .or_else(|| from.get_header_str(header::ORIGIN));
+        if let Some(origin) = origin {
+            to.set_header(header::ORIGIN, origin);
         }
 
         // Copy any X-* custom headers
