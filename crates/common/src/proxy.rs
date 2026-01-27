@@ -231,7 +231,7 @@ fn finalize_proxied_response_streaming(
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
     log::info!(
-        "stream: origin response status={} ct={} cl={} accept={} url={}",
+        "origin response status={} ct={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
         cl_raw,

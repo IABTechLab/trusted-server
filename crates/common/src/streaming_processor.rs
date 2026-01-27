@@ -228,7 +228,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to decompress gzip".to_string(),
             })?;
 
-        log::info!("Gzip->None decompressed size: {} bytes", decompressed.len());
+        log::info!("Decompressed size: {} bytes", decompressed.len());
 
         // Process the decompressed content
         let processed = self
@@ -238,7 +238,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("Gzip->None processed size: {} bytes", processed.len());
+        log::info!("Processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
