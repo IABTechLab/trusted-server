@@ -51,12 +51,9 @@ impl RequestSigner {
                 })?;
 
         let secret_store = FastlySecretStore::new("signing_keys");
-        let key_bytes =
-            secret_store
-                .get(&key_id)
-                .change_context(TrustedServerError::Configuration {
-                    message: format!("Failed to get signing key for kid: {}", key_id),
-                })?;
+        let key_bytes = secret_store
+            .get(&key_id)
+            .attach(format!("Failed to get signing key for kid: {}", key_id))?;
         let signing_key = parse_ed25519_signing_key(key_bytes)?;
 
         Ok(Self {
@@ -142,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_request_signer_sign() {
-        // We propagate errors in tests too, or unwrap.
+        // Report unwraps print full error chain on test failure
         // Note: unwrapping a Report prints it nicely if test fails.
         let signer = RequestSigner::from_config().unwrap();
         let signature = signer

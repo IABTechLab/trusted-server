@@ -54,12 +54,9 @@ impl Keypair {
 
 pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new("jwks_store");
-    let active_kids_str =
-        store
-            .get("active-kids")
-            .change_context(TrustedServerError::Configuration {
-                message: "Failed to get active-kids".into(),
-            })?;
+    let active_kids_str = store
+        .get("active-kids")
+        .attach("while fetching active kids list")?;
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
@@ -71,9 +68,7 @@ pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
     for kid in active_kids {
         let jwk = store
             .get(kid)
-            .change_context(TrustedServerError::Configuration {
-                message: format!("Failed to get JWK for kid: {}", kid),
-            })?;
+            .attach(format!("Failed to get JWK for kid: {}", kid))?;
         jwks.push(jwk);
     }
 

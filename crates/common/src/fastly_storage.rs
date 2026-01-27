@@ -72,7 +72,7 @@ impl FastlySecretStore {
     pub fn get_string(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         let bytes = self.get(key)?;
         String::from_utf8(bytes).change_context(TrustedServerError::Configuration {
-            message: format!("Failed to decode secret as UTF-8: {}", key),
+            message: "Failed to decode secret as UTF-8".to_string(),
         })
     }
 }
@@ -91,11 +91,7 @@ impl FastlyApiClient {
         store_name: &str,
         key_name: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        ensure_backend_from_url("https://api.fastly.com").change_context(
-            TrustedServerError::Configuration {
-                message: "Failed to ensure API backend".to_string(),
-            },
-        )?;
+        ensure_backend_from_url("https://api.fastly.com")?;
 
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;

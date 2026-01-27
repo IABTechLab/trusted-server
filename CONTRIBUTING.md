@@ -116,7 +116,7 @@ See also: #456, #789
 
 Consistency is the most important. Following the existing Rust style, formatting, and naming conventions of the file you are modifying and of the overall project. Failure to do so will result in a prolonged review process that has to focus on updating the superficial aspects of your code, rather than improving its functionality and performance.
 
-Style and format will be enforced with a linter when the PR is created.
+Style and format will be enforced with a linter when PR is created.
 
 ## :warning: Error Handling
 
