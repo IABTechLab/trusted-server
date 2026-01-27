@@ -201,14 +201,19 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
 # Bidders (comma-separated)
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
 
-# Auto-remove Prebid.js scripts
-TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
-
 # Enable debug logging
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 
-# Optional: Script handler path
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_HANDLER="/prebid.js"
+# Default tsjs mode when Prebid integration is enabled (optional)
+# "auction" expects OpenRTB clients (for example, Prebid.js) calling /ad/auction
+TRUSTED_SERVER__INTEGRATIONS__PREBID__MODE="auction" # or "render"
+
+# Script patterns to remove Prebid tags and serve empty JS (indexed format)
+# Default patterns match common Prebid filenames at exact paths
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__0="/prebid.js"
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__1="/prebid.min.js"
+# For versioned paths, use wildcards:
+# TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS__0="/static/prebid/{*rest}"
 ```
 
 **TOML Equivalent:**
@@ -218,10 +223,47 @@ enabled = true
 server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon", "openx"]
-auto_configure = true
 debug = false
-script_handler = "/prebid.js"
+mode = "auction" # OpenRTB clients (for example, Prebid.js)
+script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 ```
+
+---
+
+## GAM Integration
+
+The GAM (Google Ad Manager) interceptor forces Prebid creatives to render when GAM
+doesn't have matching line items configured. This is useful for testing and development.
+
+```bash
+# Enable GAM interceptor
+TRUSTED_SERVER__INTEGRATIONS__GAM__ENABLED=true
+
+# Only intercept specific bidders (comma-separated, empty = all bidders)
+TRUSTED_SERVER__INTEGRATIONS__GAM__BIDDERS="mocktioneer,appnexus"
+
+# Force render even if GAM returned a line item (default: false)
+TRUSTED_SERVER__INTEGRATIONS__GAM__FORCE_RENDER=false
+```
+
+**TOML Equivalent:**
+```toml
+[integrations.gam]
+enabled = true
+bidders = ["mocktioneer"]
+force_render = false
+```
+
+**How it works:**
+1. When a GPT slot renders, the interceptor checks if there's a Prebid bid (`hb_adid` targeting)
+2. If `bidders` is set, only those bidders' creatives are intercepted
+3. If `force_render` is false (default), only renders when GAM has no matching line item
+4. If `force_render` is true, always renders Prebid creative regardless of GAM
+
+**Use cases:**
+- **Development/Testing**: Render mocktioneer test ads without GAM line items
+- **A/B Testing**: Force Prebid creatives for specific bidders
+- **Fallback**: Use Prebid as fallback when GAM has no matching ads
 
 ---
 
@@ -642,7 +684,11 @@ export TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://prebid-server.com"
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000
 export TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
-export TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
+
+# Optional: GAM Interceptor (forces Prebid creatives when GAM has no line items)
+export TRUSTED_SERVER__INTEGRATIONS__GAM__ENABLED=true
+export TRUSTED_SERVER__INTEGRATIONS__GAM__BIDDERS="mocktioneer"
+export TRUSTED_SERVER__INTEGRATIONS__GAM__FORCE_RENDER=false
 
 # Optional: Security Headers
 export TRUSTED_SERVER__RESPONSE_HEADERS__STRICT_TRANSPORT_SECURITY="max-age=31536000"

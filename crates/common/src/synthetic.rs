@@ -14,6 +14,7 @@ use sha2::Sha256;
 use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
+use crate::http_util::RequestInfo;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -41,9 +42,13 @@ pub fn generate_synthetic_id(
     let auth_user_id = req
         .get_header(HEADER_SYNTHETIC_PUB_USER_ID)
         .map(|h| h.to_str().unwrap_or("anonymous"));
-    let publisher_domain = req
-        .get_header(header::HOST)
-        .map(|h| h.to_str().unwrap_or("unknown"));
+    // Use RequestInfo for consistent host extraction (respects X-Forwarded-Host)
+    let request_info = RequestInfo::from_request(req);
+    let publisher_domain = if request_info.host.is_empty() {
+        None
+    } else {
+        Some(request_info.host.as_str())
+    };
     let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
     let accept_language = req
         .get_header(header::ACCEPT_LANGUAGE)

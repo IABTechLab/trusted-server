@@ -84,8 +84,6 @@ export type ModuleName = ${finalModules.map((m) => `'${m}'`).join(' | ')};
 
 export default defineConfig(() => {
   const distDir = path.resolve(__dirname, '../dist');
-  const buildTimestamp = new Date().toISOString();
-  const banner = `// build: ${buildTimestamp}\n`;
 
   return {
     build: {
@@ -93,11 +91,11 @@ export default defineConfig(() => {
       outDir: distDir,
       assetsDir: '.',
       sourcemap: false,
-      minify: 'esbuild',
+      minify: 'esbuild' as const,
       rollupOptions: {
         input: path.resolve(__dirname, 'src/index.ts'),
         output: {
-          format: 'iife',
+          format: 'iife' as const,
           dir: distDir,
           entryFileNames: 'tsjs-unified.js',
           inlineDynamicImports: true,

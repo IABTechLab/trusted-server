@@ -6,7 +6,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 | Integration | Type | Endpoints | HTML Rewriting | Primary Use Case | Status |
 |-------------|------|-----------|----------------|------------------|--------|
-| **Prebid** | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts | Server-side header bidding | Production |
+| **Prebid** | Proxy + Rewriter | 2+ routes | Removes Prebid.js scripts | Server-side header bidding | Production |
 | **Next.js** | Script Rewriter | None | Rewrites Next.js data | First-party Next.js routing | Production |
 | **Permutive** | Proxy + Rewriter | 6 routes | Rewrites SDK URLs | First-party audience data | Production |
 | **Testlight** | Proxy + Rewriter | 1 route | Rewrites integration scripts | Testing/development | Development |
@@ -32,14 +32,14 @@ enabled = true
 server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon"]
-auto_configure = true
 debug = false
+# script_patterns = ["/static/prebid/*"]
 ```
 
 **Endpoints:**
-- `GET /first-party/ad` - Server-side ad rendering
-- `POST /third-party/ad` - Client-side auction endpoint
-- `GET /prebid.js` - Optional empty script override
+- `GET /ad/render` - Server-side ad rendering
+- `POST /ad/auction` - OpenRTB auction endpoint (Prebid.js S2S)
+- `GET /prebid.js` - Empty script override (plus any configured patterns)
 
 **When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.
 
@@ -243,7 +243,7 @@ Minimal impact. HTML rewriting happens during streaming (Next.js), and proxy end
 No. Integration configuration is read at startup. You must redeploy to change integration settings.
 
 ### Are integrations required?
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and first-party proxying.
+No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and proxying.
 
 ### How do I add a new integration?
 See the [Integration Guide](./integration-guide.md) for a complete tutorial on building custom integrations.

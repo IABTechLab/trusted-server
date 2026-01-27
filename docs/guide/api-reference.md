@@ -11,9 +11,9 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ---
 
-## First-Party Endpoints
+## Ad and Proxy Endpoints
 
-### GET /first-party/ad
+### GET /ad/render
 
 Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
 
@@ -26,11 +26,11 @@ Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
 
 **Response:**
 - **Content-Type:** `text/html; charset=utf-8`
-- **Body:** Complete HTML creative with first-party proxying applied
+- **Body:** Complete HTML creative with proxy rewrites applied
 
 **Example:**
 ```bash
-curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
+curl "https://edge.example.com/ad/render?slot=header-banner&w=728&h=90"
 ```
 
 **Response Headers:**
@@ -44,25 +44,36 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 ---
 
-### POST /third-party/ad
+### POST /ad/auction
 
-Client-side auction endpoint for TSJS library.
+OpenRTB auction endpoint for client-side integrations (for example, Prebid.js S2S).
 
 **Request Body:**
 ```json
 {
-  "adUnits": [
+  "id": "auction-1",
+  "imp": [
     {
-      "code": "header-banner",
-      "mediaTypes": {
-        "banner": {
-          "sizes": [[728, 90], [970, 250]]
+      "id": "header-banner",
+      "banner": {
+        "format": [
+          { "w": 728, "h": 90 },
+          { "w": 970, "h": 250 }
+        ]
+      },
+      "ext": {
+        "prebid": {
+          "bidder": {
+            "appnexus": {},
+            "rubicon": {}
+          }
         }
       }
     }
   ],
-  "config": {
-    "debug": false
+  "site": {
+    "domain": "example.com",
+    "page": "https://example.com"
   }
 }
 ```
@@ -88,9 +99,17 @@ Client-side auction endpoint for TSJS library.
 
 **Example:**
 ```bash
-curl -X POST https://edge.example.com/third-party/ad \
+curl -X POST https://edge.example.com/ad/auction \
   -H "Content-Type: application/json" \
-  -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
+  -d '{
+    "id": "auction-1",
+    "imp": [{
+      "id": "banner",
+      "banner": { "format": [{ "w": 300, "h": 250 }] },
+      "ext": { "prebid": { "bidder": { "appnexus": {} } } }
+    }],
+    "site": { "domain": "example.com", "page": "https://example.com" }
+  }'
 ```
 
 ---
@@ -164,7 +183,7 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 ### GET/POST /first-party/sign
 
-URL signing endpoint. Returns signed first-party proxy URL for a given target URL.
+URL signing endpoint. Returns signed proxy URL for a given target URL.
 
 **Request Methods:** GET or POST
 
@@ -415,24 +434,28 @@ See [Configuration](./configuration.md) for TSJS build options.
 
 ### Prebid Integration
 
-#### GET /first-party/ad
-See [First-Party Endpoints](#get-first-party-ad) above.
+#### GET /ad/render
+See [Ad and Proxy Endpoints](#get-ad-render) above.
 
-#### POST /third-party/ad
-See [First-Party Endpoints](#post-third-party-ad) above.
+#### POST /ad/auction
+See [Ad and Proxy Endpoints](#post-ad-auction) above.
 
-#### GET /prebid.js (Optional)
-Returns empty JavaScript to override Prebid.js when `script_handler` is configured.
+#### GET /prebid.js, /prebid.min.js, etc. (Script Override)
+Returns empty JavaScript to override Prebid.js scripts when the Prebid integration is enabled. By default, exact requests to `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, or `/prebidjs.min.js` will be intercepted and served an empty script.
 
 **Configuration:**
 ```toml
 [integrations.prebid]
-script_handler = "/prebid.js"
+# Default patterns (exact paths)
+script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+
+# Use wildcard patterns to match paths under a prefix
+# script_patterns = ["/static/prebid/*"]
 ```
 
 **Response:**
 - **Content-Type:** `application/javascript; charset=utf-8`
-- **Body:** `// Prebid.js override by Trusted Server`
+- **Body:** `// Script overridden by Trusted Server`
 - **Cache:** `immutable, max-age=31536000`
 
 ---

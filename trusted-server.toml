@@ -38,9 +38,9 @@ enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = false
 debug = false
-# script_handler = "/prebid.js"
+# mode = "auction" # optional default for tsjs when prebid is enabled
+# script_patterns = ["/prebid.min.js", "/prebidjs.min.js"]  # defaults to common prebid filenames
 
 [integrations.nextjs]
 enabled = false
@@ -73,6 +73,13 @@ api_endpoint = "https://identity.loc.kr"
 sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
+
+# GAM (Google Ad Manager) Interceptor
+# Forces Prebid creatives to render when GAM doesn't have matching line items
+[integrations.gam]
+enabled = false
+bidders = []  # Only intercept these bidders (empty = all bidders)
+force_render = false  # Force render even if GAM has a line item
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]

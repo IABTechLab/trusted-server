@@ -3,6 +3,7 @@
 use crate::settings::Settings;
 
 pub mod didomi;
+pub mod gam;
 pub mod lockr;
 pub mod nextjs;
 pub mod permutive;
@@ -13,9 +14,9 @@ pub mod testlight;
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationDocumentState, IntegrationEndpoint,
-    IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy,
-    IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationHtmlPostProcessor,
+    IntegrationMetadata, IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder,
+    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
 type IntegrationBuilder = fn(&Settings) -> Option<IntegrationRegistration>;
@@ -28,5 +29,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         permutive::register,
         lockr::register,
         didomi::register,
+        gam::register,
     ]
 }

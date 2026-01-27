@@ -43,7 +43,8 @@ impl TsjsBundle {
         }
     }
 
-    pub(crate) const fn bundle(self) -> &'static str {
+    /// Returns the JavaScript bundle content.
+    pub const fn bundle(self) -> &'static str {
         METAS[self as usize].bundle
     }
 

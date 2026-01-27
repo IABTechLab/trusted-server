@@ -210,6 +210,8 @@ impl IntegrationScriptRewriter for MyIntegration {
 
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
+If you need to inject HTML into `<head>` (for example to enqueue `tsjs.setConfig(...)`), implement `IntegrationHeadInjector` and register it with `.with_head_injector(...)`. Snippets are inserted before the unified TSJS bundle.
+
 ::: warning Removing Elements
 Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js` because the unified TSJS bundle is injected automatically at the start of `<head>`.
 :::
@@ -256,11 +258,11 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
+**Purpose**: Production Prebid Server bridge that owns `/ad/render` & `/ad/auction`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the Prebid.js bundle already ships in the unified TSJS build.
 
 **Key files**:
 - `crates/common/src/integrations/prebid.rs` - Rust implementation  
-- `crates/js/lib/src/ext/prebidjs.ts` - TypeScript shim
+- `crates/js/lib/src/integrations/prebid/index.ts` - Prebid.js bundle integration
 
 #### Prebid Integration Details
 
@@ -276,22 +278,22 @@ enabled = true
 server_url = "https://prebid.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["equativ", "sampleBidder"]
-auto_configure = true
+# script_patterns = ["/static/prebid/*"]
 ```
 
 Tests or scaffolding can inject configs by calling `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that other integrations use.
 
 **2. Routes Owned by the Integration**
 
-`IntegrationProxy::routes` declares the `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. All routes are properly namespaced under `/integrations/prebid/` to follow the integration routing pattern.
+`IntegrationProxy::routes` declares the `/ad/render` (GET) and `/ad/auction` (POST) endpoints. `/ad/render` builds OpenRTB from slot parameters, while `/ad/auction` accepts OpenRTB directly from the client. Both paths inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. These routes are intentionally un-namespaced to match client integrations.
 
 **3. HTML Rewrites Through the Registry**
 
-When `auto_configure` is enabled, the integration's `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references outright. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
 
 **4. TSJS Assets & Testing**
 
-The shim implementation lives in `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the shim.
+The Prebid.js bundle integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the bundle.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 
