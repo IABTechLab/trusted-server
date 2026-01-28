@@ -1177,10 +1177,7 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(
-            crate::constants::HEADER_SYNTHETIC_TRUSTED_SERVER,
-            "synthetic-123",
-        );
+        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, "synthetic-123");
 
         let resp = handle_first_party_click(&settings, req)
             .await

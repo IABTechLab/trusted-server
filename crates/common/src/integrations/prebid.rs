@@ -12,7 +12,7 @@ use url::Url;
 use validator::Validate;
 
 use crate::backend::ensure_backend_from_url;
-use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
+use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -497,9 +497,7 @@ async fn handle_prebid_auction(
 
                 Ok(Response::from_status(StatusCode::OK)
                     .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header("X-Synthetic-ID", &synthetic_id)
-                    .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id)
-                    .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id)
+                    .with_header(HEADER_X_SYNTHETIC_ID, &synthetic_id)
                     .with_body(transformed_body))
             }
             Err(_) => Ok(Response::from_status(pbs_response.get_status())
