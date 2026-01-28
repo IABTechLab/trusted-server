@@ -145,6 +145,7 @@ impl PrebidIntegration {
             .with_body(body))
     }
 
+    #[allow(dead_code)]
     async fn handle_first_party_ad(
         &self,
         settings: &Settings,
@@ -682,6 +683,7 @@ fn append_query_params(url: &str, params: &str) -> String {
 ///
 /// Searches through the OpenRTB seatbid/bid structure for a bid whose `impid`
 /// matches `slot` and returns its `adm` (ad markup) value.
+#[allow(dead_code)]
 fn extract_adm_for_slot(response: &Json, slot: &str) -> Option<String> {
     let seatbids = response.get("seatbid")?.as_array()?;
     for seatbid in seatbids {
