@@ -217,14 +217,14 @@ trusted-server/
 
 ### Key Files to Understand First
 
-| File                                                                                        | Purpose                                   |
-| ------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| [crates/fastly/src/main.rs](../crates/fastly/src/main.rs)                                   | Request routing entry point - start here! |
-| [crates/common/src/publisher.rs](../crates/common/src/publisher.rs)                         | Publisher origin handling                 |
-| [crates/common/src/proxy.rs](../crates/common/src/proxy.rs)                                 | First-party proxy implementation          |
-| [crates/common/src/synthetic.rs](../crates/common/src/synthetic.rs)                         | Synthetic ID generation                   |
-| [crates/common/src/integrations/registry.rs](../crates/common/src/integrations/registry.rs) | Integration module pattern                |
-| [trusted-server.toml](../trusted-server.toml)                                               | Application configuration                 |
+| File                                       | Purpose                                   |
+| ------------------------------------------ | ----------------------------------------- |
+| `crates/fastly/src/main.rs`                | Request routing entry point - start here! |
+| `crates/common/src/publisher.rs`           | Publisher origin handling                 |
+| `crates/common/src/proxy.rs`               | First-party proxy implementation          |
+| `crates/common/src/synthetic.rs`           | Synthetic ID generation                   |
+| `crates/common/src/integrations/registry.rs` | Integration module pattern                |
+| `trusted-server.toml`                      | Application configuration                 |
 
 ---
 
@@ -357,12 +357,12 @@ cargo test
 1. Create a feature branch from `main`
 2. Make your changes
 3. Run `cargo fmt`, `cargo clippy`, and `cargo test`
-4. Commit using the guidelines in [CONTRIBUTING.md](../CONTRIBUTING.md#memo-writing-commit-messages)
+4. Commit using the guidelines in [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md)
 5. Open a Pull Request
 
 ### Commit Message Format
 
-Follow the guidelines in [CONTRIBUTING.md](../CONTRIBUTING.md#memo-writing-commit-messages). In short:
+Follow the guidelines in [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md). In short:
 
 - Use sentence case and imperative mood
 - Do not use semantic prefixes or bracketed tags (examples: `fix:`, `[Docs]`)
@@ -438,11 +438,11 @@ fastly compute serve
 4. Add configuration in `trusted-server.toml`
 5. Write tests
 
-See [testlight.rs](../crates/common/src/integrations/testlight.rs) for an example.
+See `crates/common/src/integrations/testlight.rs` for an example.
 
 ### Modifying Request Routing
 
-Edit [crates/fastly/src/main.rs](../crates/fastly/src/main.rs) to add new routes or modify existing ones.
+Edit `crates/fastly/src/main.rs` to add new routes or modify existing ones.
 
 ### Updating Configuration
 
@@ -511,7 +511,7 @@ The project follows IAB Tech Lab's open-source governance model:
 | Project Lead | Overall project vision and direction |
 | Developer    | Contributes code/docs                |
 
-See [ProjectGovernance.md](../ProjectGovernance.md) for full details.
+See [ProjectGovernance.md](https://github.com/IABTechLab/trusted-server/blob/main/ProjectGovernance.md) for full details.
 
 ### Key Contacts
 
@@ -538,13 +538,13 @@ Ask your manager or onboarding buddy for calendar invites to relevant meetings.
 
 ### Documentation
 
-| Resource                              | Description                                   |
-| ------------------------------------- | --------------------------------------------- |
-| [README.md](../README.md)             | Project overview and setup                    |
-| [CONTRIBUTING.md](../CONTRIBUTING.md) | Contribution guidelines                       |
-| [AGENTS.md](../AGENTS.md)             | AI assistant guidance / architecture overview |
-| [SEQUENCE.md](../SEQUENCE.md)         | Request flow diagrams                         |
-| [FAQ_POC.md](../FAQ_POC.md)           | Frequently asked questions                    |
+| Resource                                                                                    | Description                                   |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| [README.md](https://github.com/IABTechLab/trusted-server/blob/main/README.md)               | Project overview and setup                    |
+| [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md)   | Contribution guidelines                       |
+| [AGENTS.md](https://github.com/IABTechLab/trusted-server/blob/main/AGENTS.md)               | AI assistant guidance / architecture overview |
+| [SEQUENCE.md](https://github.com/IABTechLab/trusted-server/blob/main/SEQUENCE.md)           | Request flow diagrams                         |
+| [FAQ_POC.md](https://github.com/IABTechLab/trusted-server/blob/main/FAQ_POC.md)             | Frequently asked questions                    |
 
 ### VitePress Documentation Site
 
