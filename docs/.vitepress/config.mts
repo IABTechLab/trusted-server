@@ -58,6 +58,8 @@ export default defineConfig({
     nav: [
       { text: 'Home', link: '/' },
       { text: 'Guide', link: '/guide/getting-started' },
+      { text: 'Business Value', link: '/business-use-cases' },
+      { text: 'Roadmap', link: '/roadmap' },
     ],
 
     sidebar: [
@@ -69,7 +71,7 @@ export default defineConfig({
             link: '/guide/what-is-trusted-server',
           },
           { text: 'Getting Started', link: '/guide/getting-started' },
-          { text: 'Fastly Setup', link: '/guide/fastly' },
+          { text: 'Onboarding Guide', link: '/guide/onboarding' },
         ],
       },
       {
@@ -119,6 +121,44 @@ export default defineConfig({
             link: '/guide/environment-variables',
           },
           { text: 'Error Reference', link: '/guide/error-reference' },
+        ],
+      },
+      {
+        text: 'Partner Integrations',
+        items: [
+          {
+            text: 'Identity',
+            items: [{ text: 'Lockr', link: '/guide/integrations/lockr' }],
+          },
+          {
+            text: 'CMP',
+            items: [{ text: 'Didomi', link: '/guide/integrations/didomi' }],
+          },
+          {
+            text: 'Data',
+            items: [
+              { text: 'Permutive', link: '/guide/integrations/permutive' },
+            ],
+          },
+          {
+            text: 'Ad Serving',
+            items: [{ text: 'GAM', link: '/guide/integrations/gam' }],
+          },
+          {
+            text: 'Demand Wrapper',
+            items: [
+              { text: 'Prebid', link: '/guide/integrations/prebid' },
+              { text: 'APS', link: '/guide/integrations/aps' },
+            ],
+          },
+          {
+            text: 'SSP',
+            items: [{ text: 'Kargo', link: '/guide/integrations/kargo' }],
+          },
+          {
+            text: 'Framework Support',
+            items: [{ text: 'Next.js', link: '/guide/integrations/nextjs' }],
+          },
         ],
       },
     ],

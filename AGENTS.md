@@ -114,4 +114,4 @@ cargo check
 - Relies on Fastly KV stores for persistence.
 - Uses Handlebars templates for dynamic responses.
 - Emits detailed logs for edge debugging.
-- Follow conventional commit format (see `CONTRIBUTING.md`).
+- Follow the commit message format in `CONTRIBUTING.md`.

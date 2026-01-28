@@ -15,6 +15,7 @@ Commit messages should:
 2. Use sentence case (capitalize first word)
 3. Describe the change in an imperative, present-tense style
 4. Not use semantic prefixes (like "fix:", "feat:", "chore:")
+5. Not use bracketed tags (like "[Docs]" or "[Fix]")
 
 ## Examples
 
@@ -27,7 +28,7 @@ Fix PostgreSQL integration type reference issues
 Improve error handling in token validation
 ```
 
-### Avoid semantic prefixes:
+### Avoid semantic prefixes and tags:
 
 ```text
 // Don't use these formats
@@ -35,4 +36,6 @@ fix: add feature flags to tests
 feat: implement new logging system
 chore: update dependencies
 docs: update README
+[Docs] Update README
+[Fix] Handle empty payload
 ```
