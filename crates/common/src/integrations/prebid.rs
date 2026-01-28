@@ -23,7 +23,7 @@ use crate::integrations::{
 use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
+use crate::synthetic::get_or_generate_synthetic_id;
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const ROUTE_FIRST_PARTY_AD: &str = "/first-party/ad";
@@ -445,21 +445,10 @@ async fn handle_prebid_auction(
     )?;
 
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
-    let fresh_id = generate_synthetic_id(settings, &req)?;
 
-    log::info!(
-        "Using synthetic ID: {}, fresh ID: {}",
-        synthetic_id,
-        fresh_id
-    );
+    log::info!("Using synthetic_id: {}", synthetic_id);
 
-    enhance_openrtb_request(
-        &mut openrtb_request,
-        &synthetic_id,
-        &fresh_id,
-        settings,
-        &req,
-    )?;
+    enhance_openrtb_request(&mut openrtb_request, &synthetic_id, settings, &req)?;
 
     let mut pbs_req = Request::new(
         Method::POST,
@@ -512,7 +501,6 @@ async fn handle_prebid_auction(
 fn enhance_openrtb_request(
     request: &mut Json,
     synthetic_id: &str,
-    fresh_id: &str,
     settings: &Settings,
     req: &Request,
 ) -> Result<(), Report<TrustedServerError>> {
@@ -524,7 +512,6 @@ fn enhance_openrtb_request(
     if !request["user"]["ext"].is_object() {
         request["user"]["ext"] = json!({});
     }
-    request["user"]["ext"]["synthetic_fresh"] = json!(fresh_id);
 
     if req.get_header("Sec-GPC").is_some() {
         if !request["regs"].is_object() {
@@ -882,15 +869,13 @@ mod tests {
         });
 
         let synthetic_id = "synthetic-123";
-        let fresh_id = "fresh-456";
         let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
         req.set_header("Sec-GPC", "1");
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
+        enhance_openrtb_request(&mut request_json, synthetic_id, &settings, &req)
             .expect("should enhance request");
 
         assert_eq!(request_json["user"]["id"], synthetic_id);
-        assert_eq!(request_json["user"]["ext"]["synthetic_fresh"], fresh_id);
         assert_eq!(
             request_json["regs"]["ext"]["us_privacy"], "1YYN",
             "GPC header should map to US privacy flag"

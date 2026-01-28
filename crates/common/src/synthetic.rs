@@ -57,8 +57,8 @@ fn generate_random_suffix(length: usize) -> String {
 
 /// Generates a fresh synthetic ID based on request parameters.
 ///
-/// Creates a deterministic ID using HMAC-SHA256 with the configured secret key
-/// and various request attributes including IP, user agent, cookies, and headers.
+/// Creates an HMAC-SHA256-based ID using the configured secret key and request
+/// attributes, then appends a random suffix for additional uniqueness.
 ///
 /// # Errors
 ///
@@ -107,17 +107,17 @@ pub fn generate_synthetic_id(
 
     // Append random 6-character alphanumeric suffix for additional uniqueness
     let random_suffix = generate_random_suffix(6);
-    let fresh_id = format!("{}.{}", hmac_hash, random_suffix);
+    let synthetic_id = format!("{}.{}", hmac_hash, random_suffix);
 
-    log::info!("Generated fresh ID: {}", fresh_id);
+    log::info!("Generated fresh ID: {}", synthetic_id);
 
-    Ok(fresh_id)
+    Ok(synthetic_id)
 }
 
 /// Gets or creates a synthetic ID from the request.
 ///
 /// Attempts to retrieve an existing synthetic ID from:
-/// 1. The `x-psid-ts` header
+/// 1. The `x-synthetic-id` header
 /// 2. The `synthetic_id` cookie
 ///
 /// If neither exists, generates a new synthetic ID.
@@ -161,12 +161,9 @@ pub fn get_or_generate_synthetic_id(
     }
 
     // If no existing Synthetic ID found, generate a fresh one
-    let fresh_id = generate_synthetic_id(settings, req)?;
-    log::info!(
-        "No existing Synthetic ID found, using fresh ID: {}",
-        fresh_id
-    );
-    Ok(fresh_id)
+    let synthetic_id = generate_synthetic_id(settings, req)?;
+    log::info!("No existing synthetic_id, generated: {}", synthetic_id);
+    Ok(synthetic_id)
 }
 
 #[cfg(test)]
@@ -219,6 +216,31 @@ mod tests {
         req
     }
 
+    fn is_synthetic_id_format(value: &str) -> bool {
+        let mut parts = value.split('.');
+        let hmac_part = match parts.next() {
+            Some(part) => part,
+            None => return false,
+        };
+        let suffix_part = match parts.next() {
+            Some(part) => part,
+            None => return false,
+        };
+        if parts.next().is_some() {
+            return false;
+        }
+        if hmac_part.len() != 64 || suffix_part.len() != 6 {
+            return false;
+        }
+        if !hmac_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        if !suffix_part.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+        true
+    }
+
     #[test]
     fn test_generate_synthetic_id() {
         let settings: Settings = create_test_settings();
@@ -231,14 +253,46 @@ mod tests {
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
         log::info!("Generated synthetic ID: {}", synthetic_id);
-        // ID format: 64 hex chars (HMAC) + "." + 6 alphanumeric chars (random suffix) = 71 chars
-        assert_eq!(synthetic_id.len(), 71);
-        let parts: Vec<&str> = synthetic_id.split('.').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].len(), 64);
-        assert!(parts[0].chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(parts[1].len(), 6);
-        assert!(parts[1].chars().all(|c| c.is_alphanumeric()));
+        assert!(
+            is_synthetic_id_format(&synthetic_id),
+            "should match synthetic ID format"
+        );
+    }
+
+    #[test]
+    fn test_is_synthetic_id_format_accepts_valid_value() {
+        let value = format!("{}.{}", "a".repeat(64), "Ab12z9");
+        assert!(
+            is_synthetic_id_format(&value),
+            "should accept a valid synthetic ID format"
+        );
+    }
+
+    #[test]
+    fn test_is_synthetic_id_format_rejects_invalid_values() {
+        let missing_suffix = "a".repeat(64);
+        assert!(
+            !is_synthetic_id_format(&missing_suffix),
+            "should reject missing suffix"
+        );
+
+        let invalid_hex = format!("{}.{}", "a".repeat(63) + "g", "Ab12z9");
+        assert!(
+            !is_synthetic_id_format(&invalid_hex),
+            "should reject non-hex HMAC content"
+        );
+
+        let invalid_suffix = format!("{}.{}", "a".repeat(64), "ab-129");
+        assert!(
+            !is_synthetic_id_format(&invalid_suffix),
+            "should reject non-alphanumeric suffix"
+        );
+
+        let extra_segment = format!("{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
+        assert!(
+            !is_synthetic_id_format(&extra_segment),
+            "should reject extra segments"
+        );
     }
 
     #[test]
