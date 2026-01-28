@@ -291,6 +291,7 @@ pub(super) fn proxied_attr_value(settings: &Settings, attr_val: Option<String>) 
 
 /// Rewrite a full CSS stylesheet body by normalizing url(...) references to the
 /// unified first-party proxy. Relative URLs are left unchanged.
+#[must_use]
 pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
     rewrite_style_urls(settings, css)
 }
@@ -301,6 +302,7 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
 ///   (served from `/static/tsjs=tsjs-creative.min.js`).
+#[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);

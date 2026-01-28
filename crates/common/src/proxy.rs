@@ -151,14 +151,14 @@ fn finalize_proxied_response(
         // HTML: rewrite and serve as HTML (safe to read as string)
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_creative_html(settings, &body);
-        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
+        return rebuild_text_response(&beresp, "text/html; charset=utf-8", rewritten);
     }
 
     if ct.contains("text/css") {
         // CSS: rewrite url(...) references in stylesheets (safe to read as string)
         let body = beresp.take_body_str();
         let rewritten = crate::creative::rewrite_css_body(settings, &body);
-        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
+        return rebuild_text_response(&beresp, "text/css; charset=utf-8", rewritten);
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics
