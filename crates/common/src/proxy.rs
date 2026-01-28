@@ -137,7 +137,7 @@ fn finalize_proxied_response(
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
     log::info!(
-        "proxy: origin response status={} ct={} cl={} accept={} url={}",
+        "origin response status={} ct={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
         cl_raw,
@@ -199,11 +199,7 @@ fn finalize_proxied_response(
         }
 
         if is_pixel {
-            log::info!(
-                "proxy: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
+            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
         }
 
         return beresp;
@@ -235,7 +231,7 @@ fn finalize_proxied_response_streaming(
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
     log::info!(
-        "proxy(stream): origin response status={} ct={} cl={} accept={} url={}",
+        "origin response status={} ct={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
         cl_raw,
@@ -280,7 +276,7 @@ fn finalize_proxied_response_streaming(
 
         if is_pixel {
             log::info!(
-                "proxy(stream): likely pixel image fetched: {} ct={}",
+                "stream: likely pixel image fetched: {} ct={}",
                 target_url,
                 ct
             );
@@ -340,10 +336,7 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
     let synthetic_id_param = match get_synthetic_id(req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!(
-                "proxy: failed to extract synthetic ID for forwarding: {:?}",
-                e
-            );
+            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
             None
         }
     };
@@ -368,11 +361,11 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
         }
 
         log::debug!(
-            "proxy: forwarding synthetic_id to origin url {}",
+            "forwarding synthetic_id to origin url {}",
             target_url_parsed.as_str()
         );
     } else {
-        log::debug!("proxy: no synthetic_id to forward to origin");
+        log::debug!("no synthetic_id to forward to origin");
     }
 }
 
@@ -469,7 +462,7 @@ async fn proxy_with_redirects(
 
         if redirect_attempt == MAX_REDIRECTS {
             log::warn!(
-                "proxy: redirect limit reached for {}; returning redirect response",
+                "redirect limit reached for {}; returning redirect response",
                 current_url
             );
             return Ok(finalize_proxied_response(
@@ -498,7 +491,7 @@ async fn proxy_with_redirects(
         }
 
         log::info!(
-            "proxy: following redirect {} => {} (status {})",
+            "following redirect {} => {} (status {})",
             current_url,
             next_url,
             status.as_u16()
@@ -577,10 +570,7 @@ pub async fn handle_first_party_click(
     let synthetic_id = match get_synthetic_id(&req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!(
-                "click: failed to extract synthetic ID for forwarding: {:?}",
-                e
-            );
+            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
             None
         }
     };
@@ -607,15 +597,12 @@ pub async fn handle_first_party_click(
                 }
 
                 let final_target = url.to_string();
-                log::debug!(
-                    "click: forwarding synthetic_id to target url {}",
-                    final_target
-                );
+                log::debug!("forwarding synthetic_id to target url {}", final_target);
                 redirect_target = final_target;
             }
             Err(e) => {
                 log::warn!(
-                    "click: failed to parse target url for synthetic forwarding: {:?}",
+                    "failed to parse target url for synthetic forwarding: {:?}",
                     e
                 );
             }
@@ -632,7 +619,7 @@ pub async fn handle_first_party_click(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
-        "click: redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
+        "redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
         tsurl,
         had_params,
         redirect_target,

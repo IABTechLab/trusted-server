@@ -19,8 +19,6 @@ build = """
 
 [local_server]
     address = "127.0.0.1:7676"
-    tls_cert_path = "./localhost+2.pem"
-    tls_key_path = "./localhost+2-key.pem"
     
     [local_server.backends]
 
