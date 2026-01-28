@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
+use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -16,7 +16,7 @@ use crate::integrations::{
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
+use crate::synthetic::get_or_generate_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -142,8 +142,6 @@ impl IntegrationProxy for TestlightIntegration {
 
         let synthetic_id = get_or_generate_synthetic_id(settings, &req)
             .change_context(Self::error("Failed to fetch or mint synthetic ID"))?;
-        let fresh_id = generate_synthetic_id(settings, &req)
-            .change_context(Self::error("Failed to mint fresh synthetic ID"))?;
 
         payload.user.id = Some(synthetic_id.clone());
 
@@ -177,8 +175,7 @@ impl IntegrationProxy for TestlightIntegration {
             }
         }
 
-        response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id);
-        response.set_header(HEADER_SYNTHETIC_FRESH, &fresh_id);
+        response.set_header(HEADER_X_SYNTHETIC_ID, &synthetic_id);
         Ok(response)
     }
 }
@@ -221,7 +218,7 @@ fn default_shim_src() -> String {
 }
 
 fn default_enabled() -> bool {
-    true
+    false
 }
 
 impl Default for TestlightRequestBody {
