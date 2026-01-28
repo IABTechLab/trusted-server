@@ -229,7 +229,7 @@ impl PrebidIntegration {
             Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
         };
 
-        let rewritten = creative::rewrite_creative_html(&html, settings);
+        let rewritten = creative::rewrite_creative_html(settings, &html);
 
         Ok(Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")

@@ -76,10 +76,7 @@ fn detect_request_scheme(req: &Request) -> String {
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
-pub fn handle_tsjs_dynamic(
-    _settings: &Settings,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+pub fn handle_tsjs_dynamic(req: Request) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
