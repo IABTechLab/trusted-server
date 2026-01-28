@@ -11,6 +11,7 @@ The Kargo integration provides direct access to Kargo's supply-side platform for
 ## What is Kargo?
 
 Kargo is a mobile-first SSP specializing in high-impact, brand-safe advertising with:
+
 - Premium brand demand
 - Advanced creative formats
 - Viewability optimization

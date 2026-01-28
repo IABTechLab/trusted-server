@@ -8,7 +8,7 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 
 - **Privacy Protection** - No direct third-party cookies or tracking
 - **Synthetic ID Forwarding** - Controlled identity propagation
-- **Creative Rewrites** - Automatic HTML/CSS URL transformation  
+- **Creative Rewrites** - Automatic HTML/CSS URL transformation
 - **Click Tracking** - First-party click redirects
 - **Content Security** - Validated, signed URLs prevent tampering
 
@@ -43,6 +43,7 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 Proxies third-party assets with automatic HTML/CSS rewriting.
 
 **Request**:
+
 ```
 GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 ```
@@ -53,7 +54,7 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 | `tsurl` | Yes | Base URL of the resource (without query params) |
 | `tstoken` | Yes | HMAC-SHA256 signature of the full URL |
 | `tsexp` | No | Unix timestamp expiration (30s default from signing) |
-| *(others)* | No | Original query parameters from target URL |
+| _(others)_ | No | Original query parameters from target URL |
 
 **Behavior**:
 
@@ -75,11 +76,13 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 **Example**:
 
 Original URL:
+
 ```
 https://tracker.com/pixel.gif?campaign=123&uid=abc
 ```
 
 Signed proxy URL:
+
 ```
 /first-party/proxy?
   tsurl=https://tracker.com/pixel.gif&
@@ -89,6 +92,7 @@ Signed proxy URL:
 ```
 
 Final proxied request:
+
 ```
 https://tracker.com/pixel.gif?campaign=123&uid=abc&synthetic_id=xyz
 ```
@@ -98,6 +102,7 @@ https://tracker.com/pixel.gif?campaign=123&uid=abc&synthetic_id=xyz
 Handles click tracking with first-party redirects.
 
 **Request**:
+
 ```
 GET /first-party/click?tsurl=https://advertiser.com/landing&tstoken=signature
 ```
@@ -119,16 +124,20 @@ GET /first-party/click?tsurl=https://advertiser.com/landing&tstoken=signature
 **Example**:
 
 Click URL in creative:
+
 ```html
-<a href="/first-party/click?
+<a
+  href="/first-party/click?
   tsurl=https://advertiser.com/buy&
   product=widget&
-  tstoken=signature">
+  tstoken=signature"
+>
   Buy Now
 </a>
 ```
 
 User clicks → Server responds:
+
 ```
 HTTP/1.1 302 Found
 Location: https://advertiser.com/buy?product=widget&synthetic_id=xyz
@@ -143,11 +152,13 @@ Use `/first-party/click` for navigational links (anchors) since it avoids downlo
 Generates signed proxy URLs for dynamic use cases.
 
 **Request (GET)**:
+
 ```
 GET /first-party/sign?url=https://example.com/resource.jpg
 ```
 
 **Request (POST)**:
+
 ```json
 POST /first-party/sign
 {
@@ -156,6 +167,7 @@ POST /first-party/sign
 ```
 
 **Response**:
+
 ```json
 {
   "href": "/first-party/proxy?tsurl=https://example.com/resource.jpg&param=value&tstoken=signature&tsexp=1234567890",
@@ -170,6 +182,7 @@ POST /first-party/sign
 | `base` | Original base URL (without query parameters) |
 
 **Expiration**:
+
 - Default: 30 seconds from signing
 - `tsexp` parameter included in signed URL
 - Validation fails after expiration
@@ -179,10 +192,10 @@ POST /first-party/sign
 ```javascript
 // Client-side JavaScript dynamically signing URLs
 fetch('/first-party/sign?url=' + encodeURIComponent(imageUrl))
-  .then(r => r.json())
-  .then(data => {
-    img.src = data.href; // Use signed URL
-  });
+  .then((r) => r.json())
+  .then((data) => {
+    img.src = data.href // Use signed URL
+  })
 ```
 
 ### `/first-party/proxy-rebuild` - URL Modification
@@ -190,6 +203,7 @@ fetch('/first-party/sign?url=' + encodeURIComponent(imageUrl))
 Modifies existing signed URLs by adding or removing parameters.
 
 **Request**:
+
 ```
 POST /first-party/proxy-rebuild?tsclick=encoded_click_url&add=key:value&del=key
 ```
@@ -213,11 +227,13 @@ POST /first-party/proxy-rebuild?tsclick=encoded_click_url&add=key:value&del=key
 **Example**:
 
 Original click URL:
+
 ```
 /first-party/click?tsurl=https://example.com&product=A&tstoken=sig1
 ```
 
 Modify URL (add `variant=red`, remove `product`):
+
 ```
 POST /first-party/proxy-rebuild?
   tsclick=L2ZpcnN0LXBhcnR5L2NsaWNrP3RzdXJsPWh0dHBzOi8vZXhhbXBsZS5jb20mcHJvZHVjdD1BJnRzdG9rZW49c2lnMQ==&
@@ -226,6 +242,7 @@ POST /first-party/proxy-rebuild?
 ```
 
 Response:
+
 ```json
 {
   "href": "/first-party/click?tsurl=https://example.com&variant=red&tstoken=sig2"
@@ -251,6 +268,7 @@ Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
 ```
 
 **Configuration**:
+
 ```toml
 [publisher]
 proxy_secret = "your-secret-key-here"  # Must be secure random string
@@ -270,11 +288,12 @@ On incoming requests:
 ```
 
 ::: danger Security
+
 - Keep `proxy_secret` confidential and secure
 - Rotate secrets periodically
 - Never expose in client-side code
 - Use strong random values (32+ bytes)
-:::
+  :::
 
 ## Content Type Handling
 
@@ -283,6 +302,7 @@ On incoming requests:
 **Triggers**: Response `Content-Type: text/html`
 
 **Process**:
+
 1. Parse HTML with streaming processor
 2. Rewrite absolute URLs to `/first-party/proxy` or `/first-party/click`
 3. Preserve relative URLs unchanged
@@ -296,27 +316,35 @@ On incoming requests:
 **Triggers**: Response `Content-Type: text/css`
 
 **Process**:
+
 1. Parse CSS for `url(...)` values
 2. Rewrite absolute URLs to `/first-party/proxy`
 3. Sign URLs with `tstoken`
 4. Return as `text/css; charset=utf-8`
 
 **Example**:
+
 ```css
 /* Original */
-.banner { background: url(https://cdn.com/bg.jpg); }
+.banner {
+  background: url(https://cdn.com/bg.jpg);
+}
 
 /* Rewritten */
-.banner { background: url(/first-party/proxy?tsurl=https://cdn.com/bg.jpg&tstoken=sig); }
+.banner {
+  background: url(/first-party/proxy?tsurl=https://cdn.com/bg.jpg&tstoken=sig);
+}
 ```
 
 ### Image Handling
 
-**Triggers**: 
+**Triggers**:
+
 - Response `Content-Type: image/*`, OR
 - Request `Accept` header contains `image/`
 
 **Process**:
+
 1. Set `Content-Type: image/*` if missing
 2. Detect likely pixels with heuristics:
    - `Content-Length` ≤ 256 bytes
@@ -325,6 +353,7 @@ On incoming requests:
 4. Passthrough image data
 
 **Logging**:
+
 ```
 proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
 ```
@@ -334,6 +363,7 @@ proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
 **Triggers**: Any other `Content-Type`
 
 **Process**:
+
 - Forward response without modification
 - Preserve original `Content-Type`
 - No HTML/CSS/URL rewriting
@@ -344,6 +374,7 @@ proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
 The proxy automatically follows HTTP redirects:
 
 **Supported Status Codes**:
+
 - `301` - Moved Permanently
 - `302` - Found
 - `303` - See Other (switches to GET)
@@ -351,6 +382,7 @@ The proxy automatically follows HTTP redirects:
 - `308` - Permanent Redirect
 
 **Behavior**:
+
 1. Follow up to **4 redirect hops**
 2. Re-apply `synthetic_id` on each hop
 3. Switch to `GET` after `303` response
@@ -358,6 +390,7 @@ The proxy automatically follows HTTP redirects:
 5. Preserve request headers across hops
 
 **Example Flow**:
+
 ```
 Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
   → 302 to https://cdn.com/ad.html
@@ -372,11 +405,13 @@ Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
 When proxying, Trusted Server automatically appends the `synthetic_id` parameter:
 
 **Source Priority**:
+
 1. `x-psid-ts` request header
 2. `synthetic_id` cookie
 3. Generate new ID if missing
 
 **Example**:
+
 ```
 Original request to proxy:
   /first-party/proxy?tsurl=https://tracker.com/pixel.gif&tstoken=sig
@@ -407,10 +442,11 @@ This ensures downstream trackers receive consistent IDs even through redirect ch
 Click redirects also forward synthetic IDs:
 
 ```html
-<a href="/first-party/click?tsurl=https://advertiser.com&tstoken=sig">
+<a href="/first-party/click?tsurl=https://advertiser.com&tstoken=sig"></a>
 ```
 
 User clicks → redirect includes ID:
+
 ```
 302 Found
 Location: https://advertiser.com?synthetic_id=user123
@@ -418,10 +454,11 @@ Location: https://advertiser.com?synthetic_id=user123
 
 ::: tip Privacy Control
 Synthetic IDs are only forwarded when:
+
 1. User has given GDPR consent (if required)
 2. ID exists in request (header/cookie)
 3. Integration hasn't disabled forwarding (`forward_synthetic_id: false`)
-:::
+   :::
 
 ## Configuration
 
@@ -462,15 +499,17 @@ ProxyRequestConfig::new(url)
 ```
 
 **Streaming** (buffered rewrites disabled):
+
 - Preserves origin compression (gzip/brotli)
 - Lower memory usage
 - No HTML/CSS URL rewriting
 - Best for: large files, images, videos
 
 **Buffered** (default):
+
 - Enables HTML/CSS rewriting
 - Decompresses response
-- Higher memory usage  
+- Higher memory usage
 - Best for: ad creatives, landing pages
 
 ## Performance Optimization
@@ -478,11 +517,13 @@ ProxyRequestConfig::new(url)
 ### Compression
 
 **Buffered Mode**:
+
 - Decompresses origin response
 - Processes content
 - Returns uncompressed (Fastly can re-compress)
 
 **Streaming Mode**:
+
 - Preserves origin `Content-Encoding`
 - No decompression/recompression overhead
 - Passes through gzip/brotli/deflate
@@ -490,12 +531,14 @@ ProxyRequestConfig::new(url)
 ### Caching
 
 Proxy responses respect origin cache headers:
+
 - `Cache-Control`
 - `Expires`
 - `ETag`
 - `Last-Modified`
 
 **Best Practices**:
+
 ```http
 Cache-Control: public, max-age=3600
 Vary: Accept-Encoding
@@ -506,6 +549,7 @@ Vary: Accept-Encoding
 Only essential headers are forwarded to reduce overhead:
 
 **Forwarded Headers**:
+
 - `User-Agent` - Client identification
 - `Accept` - Content negotiation
 - `Accept-Language` - Language preferences
@@ -514,6 +558,7 @@ Only essential headers are forwarded to reduce overhead:
 - `X-Forwarded-For` - Client IP chain
 
 **Not Forwarded**:
+
 - Authentication headers (unless explicitly added)
 - Cookies (except synthetic ID appended as query param)
 - Custom headers (unless added via `ProxyRequestConfig`)
@@ -523,34 +568,40 @@ Only essential headers are forwarded to reduce overhead:
 ### Common Errors
 
 **Invalid Signature**:
+
 ```
 HTTP 403 Forbidden
 tstoken validation failed: signature mismatch
 ```
 
 **Solutions**:
+
 - Verify `proxy_secret` matches signing configuration
 - Check URL reconstruction includes all parameters in correct order
 - Ensure no URL encoding issues
 
 **Expired URL**:
+
 ```
 HTTP 403 Forbidden
 tstoken expired
 ```
 
 **Solutions**:
+
 - URLs signed with `/first-party/sign` expire in 30s
 - Re-sign URL if needed
 - Check client/server clock sync
 
 **Missing Parameters**:
+
 ```
 HTTP 400 Bad Request
 Missing required parameter: tsurl
 ```
 
 **Solutions**:
+
 - Ensure `tsurl` parameter is present
 - Include `tstoken` in request
 - Verify URL encoding is correct
@@ -566,6 +617,7 @@ Log: proxy: redirect limit reached for url=https://...
 Response: Returns last redirect response (302/307/308) without following.
 
 **Solutions**:
+
 - Contact origin to reduce redirect chain
 - Increase limit in code (modify `MAX_REDIRECTS` constant)
 
@@ -577,13 +629,13 @@ Response: Returns last redirect response (302/307/308) without following.
 ✅ Use cryptographically strong `proxy_secret` (32+ bytes random)  
 ✅ Rotate secrets periodically  
 ✅ Validate expiration on all requests  
-✅ Use constant-time comparison for signatures  
+✅ Use constant-time comparison for signatures
 
 **Don't**:
 ❌ Expose `proxy_secret` in client-side code  
 ❌ Reuse secrets across environments  
 ❌ Accept unsigned URLs  
-❌ Skip validation for "trusted" domains  
+❌ Skip validation for "trusted" domains
 
 ### URL Injection Prevention
 
@@ -602,11 +654,13 @@ Trusted Server:
 ### Content Security
 
 **Automatic Protection**:
+
 - HTML/CSS rewriting removes malicious URLs
 - Data URIs are skipped (`data:`, `javascript:`, `blob:`)
 - Protocol validation (only `http://` and `https://`)
 
 **Considerations**:
+
 - Origin content is still served (validate trusted sources)
 - Streaming mode bypasses HTML inspection
 - Enable CSP headers for additional protection
@@ -636,6 +690,7 @@ X-TS-Version = "1.0"
 ### Metrics to Track
 
 **Key Metrics**:
+
 - Proxy request count (total)
 - Signature validation failures (rate)
 - Redirect hops (average/max)

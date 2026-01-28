@@ -34,14 +34,15 @@ Trusted Server supports multiple consent frameworks:
 ```javascript
 // Placeholder example
 const hasConsent = await trustedServer.checkConsent({
-    purposes: ['storage', 'personalization'],
-    vendors: [vendor_id]
-});
+  purposes: ['storage', 'personalization'],
+  vendors: [vendor_id],
+})
 ```
 
 ### Consent Storage
 
 Consent signals are:
+
 - Validated on every request
 - Not persisted without explicit consent
 - Respected across all operations
@@ -60,6 +61,7 @@ Trusted Server supports:
 ### Data Minimization
 
 Only essential data is collected:
+
 - Synthetic IDs (with consent)
 - Minimal request metadata
 - No PII storage

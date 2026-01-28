@@ -11,6 +11,7 @@ The Amazon Publisher Services (APS) integration will enable direct integration w
 ## What is APS?
 
 Amazon Publisher Services provides publishers with access to Amazon's advertising demand through:
+
 - **Transparent Ad Marketplace (TAM)**: Server-to-server header bidding
 - **A9 Bidding**: Amazon's proprietary bidding algorithm
 - **Unified Ad Marketplace (UAM)**: Client-side header bidding wrapper
@@ -57,12 +58,12 @@ This integration is in the planning phase. Development will begin in Q2 2026.
 
 ## Comparison: APS vs Prebid
 
-| Feature | APS | Prebid |
-|---------|-----|--------|
-| Demand Source | Amazon exclusive | 300+ bidders |
-| Integration | Proprietary | Open-source |
-| Data Advantage | Amazon shopping data | Neutral |
-| Setup Complexity | Medium | Low |
+| Feature          | APS                  | Prebid       |
+| ---------------- | -------------------- | ------------ |
+| Demand Source    | Amazon exclusive     | 300+ bidders |
+| Integration      | Proprietary          | Open-source  |
+| Data Advantage   | Amazon shopping data | Neutral      |
+| Setup Complexity | Medium               | Low          |
 
 ## Get Involved
 

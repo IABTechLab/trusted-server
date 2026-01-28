@@ -2,16 +2,16 @@
 layout: home
 
 hero:
-  name: "Trusted Server"
-  text: "The New Execution Layer for the Open-Web"
-  tagline: "Returning control of: content monetization, proprietary data, security, and overall user-experience back to publishers."
+  name: 'Trusted Server'
+  text: 'The New Execution Layer for the Open-Web'
+  tagline: 'Returning control of: content monetization, proprietary data, security, and overall user-experience back to publishers.'
   actions:
     - theme: brand
       text: Get Started
       link: /guide/getting-started
     - theme: alt
       text: View on GitHub
-      link: https://github.com/IABTechLab/trusted-server 
+      link: https://github.com/IABTechLab/trusted-server
 features:
   - title: Synthetic ID Generation
     details: HMAC-based synthetic IDs that preserve privacy while enabling tracking with user consent

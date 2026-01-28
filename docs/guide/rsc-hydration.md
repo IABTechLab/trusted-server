@@ -8,13 +8,13 @@ Next.js App Router uses React Server Components with a streaming "flight" protoc
 
 ```html
 <script>
-  self.__next_f.push([0]);
+  self.__next_f.push([0])
 </script>
 <script>
-  self.__next_f.push([1, "0:[[...RSC content...]"]);
+  self.__next_f.push([1, '0:[[...RSC content...]'])
 </script>
 <script>
-  self.__next_f.push([1, '1a:T29,{"url":"https://origin.example.com"}']);
+  self.__next_f.push([1, '1a:T29,{"url":"https://origin.example.com"}'])
 </script>
 ```
 
@@ -81,12 +81,12 @@ A critical aspect of RSC handling is that T-chunk content can span multiple `sel
 ```html
 <!-- Script 10: T-chunk HEADER only -->
 <script>
-  self.__next_f.push([1, "11:null\n1a:T928,"]);
+  self.__next_f.push([1, '11:null\n1a:T928,'])
 </script>
 
 <!-- Script 11: T-chunk CONTENT (the 2344 unescaped bytes) -->
 <script>
-  self.__next_f.push([1, "...2344 bytes of actual content..."]);
+  self.__next_f.push([1, '...2344 bytes of actual content...'])
 </script>
 ```
 
@@ -102,12 +102,12 @@ In production Next.js sites, T-chunks commonly span scripts like this:
   self.__next_f.push([
     1,
     '435:null\n436:T68f,{"children":["article",{"href":"https://origin.example.com/news',
-  ]);
+  ])
 </script>
 
 <!-- Script 60: Contains the rest of the T-chunk content -->
 <script>
-  self.__next_f.push([1, '/tech"},"Read more"]}\n437:{"className":"footer"}']);
+  self.__next_f.push([1, '/tech"},"Read more"]}\n437:{"className":"footer"}'])
 </script>
 ```
 

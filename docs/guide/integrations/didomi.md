@@ -13,6 +13,7 @@ The Didomi integration enables first-party serving of Didomi's consent managemen
 Didomi is a Consent Management Platform that helps publishers comply with GDPR, CCPA, and other privacy regulations by managing user consent for data collection and processing.
 
 **Key Capabilities**:
+
 - TCF 2.2 (Transparency & Consent Framework) compliance
 - Custom consent notices and preferences
 - Vendor management
@@ -36,6 +37,7 @@ Didomi is a Consent Management Platform that helps publishers comply with GDPR, 
 ```
 
 **Benefits**:
+
 - Didomi SDK loads from your domain (not `privacy-center.org`)
 - First-party cookies for consent storage
 - Improved tracking prevention compatibility
@@ -54,11 +56,11 @@ api_origin = "https://api.privacy-center.org"
 
 ### Configuration Options
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `enabled` | boolean | No | `false` | Enable/disable integration |
-| `sdk_origin` | string | Yes | `https://sdk.privacy-center.org` | Didomi SDK backend URL |
-| `api_origin` | string | Yes | `https://api.privacy-center.org` | Didomi API backend URL |
+| Field        | Type    | Required | Default                          | Description                |
+| ------------ | ------- | -------- | -------------------------------- | -------------------------- |
+| `enabled`    | boolean | No       | `false`                          | Enable/disable integration |
+| `sdk_origin` | string  | Yes      | `https://sdk.privacy-center.org` | Didomi SDK backend URL     |
+| `api_origin` | string  | Yes      | `https://api.privacy-center.org` | Didomi API backend URL     |
 
 ### Environment Variables
 
@@ -77,12 +79,14 @@ TRUSTED_SERVER__INTEGRATIONS__DIDOMI__API_ORIGIN=https://api.privacy-center.org
 Proxies Didomi SDK resources through first-party domain.
 
 **Example**:
+
 ```
 Original: https://sdk.privacy-center.org/24cd1234/loader.js
 Proxied:  https://your-domain.com/integrations/didomi/consent/24cd1234/loader.js
 ```
 
 **Headers Forwarded**:
+
 - `User-Agent`
 - `Accept`
 - `Accept-Language`
@@ -92,11 +96,13 @@ Proxied:  https://your-domain.com/integrations/didomi/consent/24cd1234/loader.js
 - `Authorization`
 
 **Geo Headers** (SDK only):
+
 - `X-Geo-Country` ← `FastlyGeo-CountryCode`
 - `X-Geo-Region` ← `FastlyGeo-Region`
 - `CloudFront-Viewer-Country` ← `FastlyGeo-CountryCode`
 
 **CORS Headers** (added to SDK responses):
+
 ```http
 Access-Control-Allow-Origin: *
 Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With
@@ -110,6 +116,7 @@ Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
 Proxies Didomi API requests (consent events, user preferences, etc.).
 
 **Example**:
+
 ```
 Original: https://api.privacy-center.org/v1/events
 Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
@@ -124,6 +131,7 @@ Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
 ### Consent Validation
 
 Didomi consent status is checked before:
+
 - Generating synthetic IDs
 - Syncing with identity partners (Lockr)
 - Activating tracking pixels
@@ -139,6 +147,7 @@ if !has_didomi_consent(&request, Purpose::Tracking) {
 ### TCF 2.2 Support
 
 Didomi integration supports IAB's Transparency & Consent Framework 2.2:
+
 - TCF consent strings (TC strings)
 - Vendor consent validation
 - Purpose consent enforcement
@@ -177,6 +186,7 @@ The Didomi integration is implemented in [crates/common/src/integrations/didomi.
 ### Key Components
 
 **Backend Selection** (line 74-80):
+
 ```rust
 fn backend_for_path(&self, consent_path: &str) -> DidomiBackend {
     if consent_path.starts_with("/api/") {
@@ -188,11 +198,13 @@ fn backend_for_path(&self, consent_path: &str) -> DidomiBackend {
 ```
 
 **Header Forwarding** (line 100-127):
+
 - Forwards standard HTTP headers
 - Adds geo headers for SDK requests
 - Preserves client IP via `X-Forwarded-For`
 
 **CORS Management** (line 143-153):
+
 - Adds CORS headers to SDK responses
 - Skips CORS for API requests (Didomi API handles it)
 
@@ -216,20 +228,19 @@ Use Didomi's standard JavaScript API:
 
 ```javascript
 // Wait for Didomi to load
-window.didomiOnReady = window.didomiOnReady || [];
+window.didomiOnReady = window.didomiOnReady || []
 window.didomiOnReady.push(function (Didomi) {
-
   // Check consent for specific purpose
   if (Didomi.getUserStatus().purposes.consent.enabled.includes('cookies')) {
     // User consented to cookies
-    initializeAnalytics();
+    initializeAnalytics()
   }
 
   // Listen for consent changes
-  Didomi.on('consent.changed', function() {
-    console.log('Consent status changed');
-  });
-});
+  Didomi.on('consent.changed', function () {
+    console.log('Consent status changed')
+  })
+})
 ```
 
 ## Best Practices
@@ -247,8 +258,8 @@ Ensure your Didomi organization ID is in the SDK path:
 Add DNS preconnect for faster loading:
 
 ```html
-<link rel="preconnect" href="https://your-domain.com">
-<link rel="dns-prefetch" href="https://your-domain.com">
+<link rel="preconnect" href="https://your-domain.com" />
+<link rel="dns-prefetch" href="https://your-domain.com" />
 ```
 
 ### 3. Cache SDK Responses
@@ -262,6 +273,7 @@ Cache-Control: public, max-age=3600
 ### 4. Monitor Consent Rate
 
 Track consent acceptance/rejection rates:
+
 - Low acceptance → Review consent notice clarity
 - Regional variations → Adjust messaging
 - Trend analysis → Optimize user experience
@@ -271,10 +283,12 @@ Track consent acceptance/rejection rates:
 ### Didomi SDK Not Loading
 
 **Symptoms**:
+
 - Consent notice doesn't appear
 - Console errors about missing Didomi
 
 **Solutions**:
+
 - Verify `/integrations/didomi/consent/` path is correct
 - Check `sdk_origin` configuration
 - Ensure Didomi ID in script path is valid
@@ -283,10 +297,12 @@ Track consent acceptance/rejection rates:
 ### CORS Errors
 
 **Symptoms**:
+
 - Browser console shows CORS errors
 - SDK requests blocked
 
 **Solutions**:
+
 - Verify integration adds CORS headers for SDK requests
 - Check `Access-Control-Allow-Origin` is present
 - Ensure requests go through proxy (not directly to Didomi)
@@ -294,10 +310,12 @@ Track consent acceptance/rejection rates:
 ### API Requests Failing
 
 **Symptoms**:
+
 - Consent events not recording
 - Preference updates failing
 
 **Solutions**:
+
 - Check `/integrations/didomi/consent/api/*` routing
 - Verify `api_origin` configuration
 - Review Authorization headers are forwarded

@@ -62,7 +62,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: crates/js/lib/package.json
 
       - name: Install dependencies

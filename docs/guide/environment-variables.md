@@ -5,10 +5,12 @@ Complete guide to configuring Trusted Server using environment variables.
 ## Overview
 
 Trusted Server can be configured using:
+
 1. **TOML file** (`trusted-server.toml`) - Default configuration
 2. **Environment variables** - Override TOML settings at runtime
 
 Environment variables are useful for:
+
 - Secrets management (never commit passwords/keys to git)
 - Environment-specific settings (dev/staging/prod)
 - CI/CD pipelines
@@ -26,12 +28,14 @@ TRUSTED_SERVER__{SECTION}__{SUBSECTION}__{FIELD}
 ```
 
 **Rules:**
+
 - Double underscores (`__`) separate levels
 - All uppercase
 - Hyphens in TOML keys become underscores
 - Array indices use double underscores with numbers
 
 **Example:**
+
 ```toml
 # TOML: trusted-server.toml
 [publisher]
@@ -62,6 +66,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="change-me-to-random-string-min-32-chars
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [publisher]
 domain = "publisher.com"
@@ -87,6 +92,7 @@ TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}:{{ first_p
 ```
 
 **Template Variables:**
+
 - `client_ip` - Client IP address
 - `user_agent` - User agent string
 - `first_party_id` - Publisher's first-party cookie
@@ -95,6 +101,7 @@ TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}:{{ first_p
 - `accept_language` - Accept-Language header
 
 **TOML Equivalent:**
+
 ```toml
 [synthetic]
 counter_store = "counter_store"
@@ -119,6 +126,7 @@ TRUSTED_SERVER__REQUEST_SIGNING__SECRET_STORE_ID="your-secret-store-id"
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [request_signing]
 enabled = true
@@ -143,6 +151,7 @@ TRUSTED_SERVER__RESPONSE_HEADERS__STRICT_TRANSPORT_SECURITY="max-age=31536000"
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [response_headers]
 X-Custom-Header = "custom value"
@@ -172,6 +181,7 @@ TRUSTED_SERVER__HANDLERS__1__PASSWORD="another-password"
 **Pattern:** Use `__0__`, `__1__`, etc. for array indices.
 
 **TOML Equivalent:**
+
 ```toml
 [[handlers]]
 path = "^/admin"
@@ -212,6 +222,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_HANDLER="/prebid.js"
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [integrations.prebid]
 enabled = true
@@ -236,6 +247,7 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES="href,link,url,src"
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [integrations.nextjs]
 enabled = true
@@ -271,6 +283,7 @@ TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__REWRITE_SDK=true
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [integrations.permutive]
 enabled = true
@@ -305,6 +318,7 @@ TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__REWRITE_SCRIPTS=false
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [integrations.testlight]
 enabled = true
@@ -326,6 +340,7 @@ TRUSTED_SERVER__REWRITE__EXCLUDE_DOMAINS="*.edgecompute.app,localhost:*,*.intern
 ```
 
 **TOML Equivalent:**
+
 ```toml
 [rewrite]
 exclude_domains = [
@@ -336,6 +351,7 @@ exclude_domains = [
 ```
 
 **Patterns:**
+
 - Exact match: `example.com`
 - Wildcard subdomain: `*.example.com`
 - Wildcard port: `localhost:*`
@@ -346,6 +362,7 @@ exclude_domains = [
 ## Data Type Formats
 
 ### Strings
+
 ```bash
 # Simple string
 TRUSTED_SERVER__PUBLISHER__DOMAIN="example.com"
@@ -355,6 +372,7 @@ TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM="value with spaces"
 ```
 
 ### Booleans
+
 ```bash
 # Accepted values: true, false (lowercase)
 TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
@@ -362,6 +380,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 ```
 
 ### Numbers
+
 ```bash
 # Integers (no quotes)
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
@@ -369,6 +388,7 @@ TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__CACHE_TTL_SECONDS=3600
 ```
 
 ### Arrays (Comma-Separated)
+
 ```bash
 # Comma-separated values (no spaces)
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon,openx"
@@ -378,6 +398,7 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES="href,link,url"
 ```
 
 ### Arrays (Indexed)
+
 ```bash
 # Use indices for complex arrays
 TRUSTED_SERVER__HANDLERS__0__PATH="^/admin"
@@ -387,6 +408,7 @@ TRUSTED_SERVER__HANDLERS__1__USERNAME="user"
 ```
 
 ### Nested Objects
+
 ```bash
 # Use double underscores for nesting
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://server.com"
@@ -398,6 +420,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://server.com"
 ## Common Patterns
 
 ### Development Environment
+
 ```bash
 # .env.development
 TRUSTED_SERVER__PUBLISHER__DOMAIN="localhost:7676"
@@ -408,6 +431,7 @@ TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=false
 ```
 
 ### Production Environment
+
 ```bash
 # .env.production
 TRUSTED_SERVER__PUBLISHER__DOMAIN="publisher.com"
@@ -421,6 +445,7 @@ TRUSTED_SERVER__REQUEST_SIGNING__SECRET_STORE_ID="${SECRET_STORE_ID}"
 ```
 
 ### CI/CD Pipeline
+
 ```bash
 # GitHub Actions example
 env:
@@ -435,6 +460,7 @@ env:
 ## Secrets Management
 
 ### Never Commit Secrets
+
 ```bash
 # ❌ WRONG - Don't commit to git
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="my-secret-key"
@@ -444,6 +470,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="${PROXY_SECRET}"
 ```
 
 ### Use Secrets Managers
+
 ```bash
 # AWS Secrets Manager
 export PROXY_SECRET=$(aws secretsmanager get-secret-value --secret-id trusted-server/proxy-secret --query SecretString --output text)
@@ -458,6 +485,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="${PROXY_SECRET}"
 ```
 
 ### Rotate Secrets Regularly
+
 ```bash
 # Generate strong secrets
 openssl rand -base64 32  # 32-byte random string
@@ -472,6 +500,7 @@ openssl rand -base64 32  # 32-byte random string
 ### Local Development
 
 **Using .env file:**
+
 ```bash
 # Create .env file
 cat > .env <<EOF
@@ -485,6 +514,7 @@ fastly compute serve
 ```
 
 **Using shell script:**
+
 ```bash
 #!/bin/bash
 export TRUSTED_SERVER__PUBLISHER__DOMAIN="localhost:7676"
@@ -557,6 +587,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true fastly compute serve
 **Cause:** Environment variable set after build
 
 **Solution:** Set before building:
+
 ```bash
 export TRUSTED_SERVER__PUBLISHER__DOMAIN="example.com"
 cargo build
