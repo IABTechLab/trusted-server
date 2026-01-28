@@ -18,7 +18,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
@@ -61,7 +61,7 @@ pub struct PermutiveConfig {
     pub rewrite_sdk: bool,
 }
 
-impl IntegrationConfigTrait for PermutiveConfig {
+impl IntegrationConfig for PermutiveConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
