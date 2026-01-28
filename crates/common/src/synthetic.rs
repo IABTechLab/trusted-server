@@ -10,8 +10,9 @@ use handlebars::Handlebars;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
+use uuid::Uuid;
 
-use crate::constants::{HEADER_SYNTHETIC_PUB_USER_ID, HEADER_SYNTHETIC_TRUSTED_SERVER};
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -31,33 +32,26 @@ pub fn generate_synthetic_id(
     settings: &Settings,
     req: &Request,
 ) -> Result<String, Report<TrustedServerError>> {
+    let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
-    let first_party_id = handle_request_cookies(req).ok().flatten().and_then(|jar| {
-        jar.get("pub_userid")
-            .map(|cookie| cookie.value().to_string())
-    });
-    let auth_user_id = req
-        .get_header(HEADER_SYNTHETIC_PUB_USER_ID)
-        .map(|h| h.to_str().unwrap_or("anonymous"));
-    let publisher_domain = req
-        .get_header(header::HOST)
-        .map(|h| h.to_str().unwrap_or("unknown"));
-    let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
     let accept_language = req
         .get_header(header::ACCEPT_LANGUAGE)
         .and_then(|h| h.to_str().ok())
         .map(|lang| lang.split(',').next().unwrap_or("unknown"));
+    let accept_encoding = req
+        .get_header(header::ACCEPT_ENCODING)
+        .and_then(|h| h.to_str().ok());
+    let random_uuid = Uuid::new_v4().to_string();
 
     let handlebars = Handlebars::new();
     let data = &json!({
         "client_ip": client_ip.unwrap_or("unknown".to_string()),
         "user_agent": user_agent.unwrap_or("unknown"),
-        "first_party_id": first_party_id.unwrap_or("anonymous".to_string()),
-        "auth_user_id": auth_user_id.unwrap_or("anonymous"),
-        "publisher_domain": publisher_domain.unwrap_or("unknown.com"),
-        "accept_language": accept_language.unwrap_or("unknown")
+        "accept_language": accept_language.unwrap_or("unknown"),
+        "accept_encoding": accept_encoding.unwrap_or("unknown"),
+        "random_uuid": random_uuid
     });
 
     let input_string = handlebars
@@ -94,7 +88,7 @@ pub fn generate_synthetic_id(
 /// - [`TrustedServerError::SyntheticId`] if ID generation fails
 pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(synthetic_id) = req
-        .get_header(HEADER_SYNTHETIC_TRUSTED_SERVER)
+        .get_header(HEADER_X_SYNTHETIC_ID)
         .and_then(|h| h.to_str().ok())
     {
         let id = synthetic_id.to_string();
@@ -104,7 +98,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 
     match handle_request_cookies(req)? {
         Some(jar) => {
-            if let Some(cookie) = jar.get("synthetic_id") {
+            if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
                 let id = cookie.value().to_string();
                 log::info!("Using existing Trusted Server ID from cookie: {}", id);
                 return Ok(Some(id));
@@ -140,7 +134,6 @@ mod tests {
     use super::*;
     use fastly::http::{HeaderName, HeaderValue};
 
-    use crate::constants::HEADER_X_PUB_USER_ID;
     use crate::test_support::tests::create_test_settings;
 
     fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
@@ -160,28 +153,22 @@ mod tests {
         let settings: Settings = create_test_settings();
         let req = create_test_request(vec![
             (header::USER_AGENT, "Mozilla/5.0"),
-            (header::COOKIE, "pub_userid=12345"),
-            (HEADER_X_PUB_USER_ID, "67890"),
-            (header::HOST, settings.publisher.domain.as_str()),
             (header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
+            (header::ACCEPT_ENCODING, "gzip, deflate, br"),
         ]);
 
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
         log::info!("Generated synthetic ID: {}", synthetic_id);
-        assert_eq!(
-            synthetic_id,
-            "a1748067b3908f2c9e0f6ea30a341328ba4b84de45448b13d1007030df14a98e"
-        )
+        // ID is non-deterministic due to random_uuid being available, but the hash should be 64 hex chars
+        assert_eq!(synthetic_id.len(), 64);
+        assert!(synthetic_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_get_synthetic_id_with_header() {
         let settings = create_test_settings();
-        let req = create_test_request(vec![(
-            HEADER_SYNTHETIC_TRUSTED_SERVER,
-            "existing_synthetic_id",
-        )]);
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "existing_synthetic_id")]);
 
         let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
         assert_eq!(synthetic_id, Some("existing_synthetic_id".to_string()));
@@ -194,7 +181,10 @@ mod tests {
     #[test]
     fn test_get_synthetic_id_with_cookie() {
         let settings = create_test_settings();
-        let req = create_test_request(vec![(header::COOKIE, "synthetic_id=existing_cookie_id")]);
+        let req = create_test_request(vec![(
+            header::COOKIE,
+            &format!("{}=existing_cookie_id", COOKIE_SYNTHETIC_ID),
+        )]);
 
         let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
         assert_eq!(synthetic_id, Some("existing_cookie_id".to_string()));
