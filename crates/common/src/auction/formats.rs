@@ -39,6 +39,16 @@ pub struct AdRequest {
 pub struct AdUnit {
     pub code: String,
     pub media_types: Option<MediaTypes>,
+    pub bids: Option<Vec<BidConfig>>,
+}
+
+/// Bidder configuration from the request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BidConfig {
+    pub bidder: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,11 +101,20 @@ pub fn convert_tsjs_to_auction_request(
                     });
                 }
 
+                // Extract bidder params from the bids array
+                let mut bidders = std::collections::HashMap::new();
+                if let Some(bids) = &unit.bids {
+                    for bid in bids {
+                        bidders.insert(bid.bidder.clone(), bid.params.clone());
+                    }
+                }
+
                 slots.push(AdSlot {
                     id: unit.code.clone(),
                     formats,
                     floor_price: None,
                     targeting: std::collections::HashMap::new(),
+                    bidders,
                 });
             }
         }

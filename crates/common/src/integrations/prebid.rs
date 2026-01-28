@@ -22,7 +22,10 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::openrtb::{Banner, Format, Imp, ImpExt, OpenRtbRequest, PrebidImpExt, Site};
+use crate::openrtb::{
+    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
+    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+};
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -47,6 +50,8 @@ pub struct PrebidIntegrationConfig {
     pub debug: bool,
     #[serde(default)]
     pub script_handler: Option<String>,
+    #[serde(default)]
+    pub debug_query_params: Option<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -338,8 +343,12 @@ fn build_openrtb_from_ts(
         imp: imps,
         site: Some(Site {
             domain: Some(settings.publisher.domain.clone()),
-            page: Some(format!("https://{}", settings.publisher.domain)),
+            page: Some(format!("https://{}", &settings.publisher.domain)),
         }),
+        user: None,
+        device: None,
+        regs: None,
+        ext: None,
     }
 }
 
@@ -381,6 +390,7 @@ async fn handle_prebid_auction(
         &fresh_id,
         settings,
         &req,
+        config,
     )?;
 
     let mut pbs_req = Request::new(
@@ -395,6 +405,7 @@ async fn handle_prebid_auction(
         })?;
 
     log::info!("Sending request to Prebid Server");
+
     let backend_name = ensure_backend_from_url(&config.server_url)?;
     let mut pbs_response =
         pbs_req
@@ -440,6 +451,7 @@ fn enhance_openrtb_request(
     fresh_id: &str,
     settings: &Settings,
     req: &Request,
+    config: &PrebidIntegrationConfig,
 ) -> Result<(), Report<TrustedServerError>> {
     if !request["user"].is_object() {
         request["user"] = json!({});
@@ -476,10 +488,25 @@ fn enhance_openrtb_request(
     }
 
     if !request["site"].is_object() {
+        let mut page_url = format!("https://{}", settings.publisher.domain);
+
+        // Append debug query params if configured
+        if let Some(ref params) = config.debug_query_params {
+            page_url = append_query_params(&page_url, params);
+        }
+
         request["site"] = json!({
             "domain": settings.publisher.domain,
-            "page": format!("https://{}", settings.publisher.domain),
+            "page": page_url,
         });
+    } else if let Some(ref params) = config.debug_query_params {
+        // If site already exists, append debug params to existing page URL
+        if let Some(page_url) = request["site"]["page"].as_str() {
+            let updated_url = append_query_params(page_url, params);
+            if updated_url != page_url {
+                request["site"]["page"] = json!(updated_url);
+            }
+        }
     }
 
     if let Some(request_signing_config) = &settings.request_signing {
@@ -498,6 +525,16 @@ fn enhance_openrtb_request(
                 "kid": signer.kid
             });
         }
+    }
+
+    if config.debug {
+        if !request["ext"].is_object() {
+            request["ext"] = json!({});
+        }
+        if !request["ext"]["prebid"].is_object() {
+            request["ext"]["prebid"] = json!({});
+        }
+        request["ext"]["prebid"]["debug"] = json!(true);
     }
 
     Ok(())
@@ -622,6 +659,19 @@ fn get_request_scheme(req: &Request) -> String {
     "https".to_string()
 }
 
+/// Appends query parameters to a URL, handling both URLs with and without existing query strings.
+/// Returns the original URL unchanged if params are empty or already present.
+fn append_query_params(url: &str, params: &str) -> String {
+    if params.is_empty() || url.contains(params) {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{}&{}", url, params)
+    } else {
+        format!("{}?{}", url, params)
+    }
+}
+
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
@@ -637,8 +687,13 @@ impl PrebidAuctionProvider {
         Self { config }
     }
 
-    /// Convert auction request to OpenRTB format.
-    fn to_openrtb(&self, request: &AuctionRequest) -> OpenRtbRequest {
+    /// Convert auction request to OpenRTB format with all enrichments.
+    fn to_openrtb(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        signer: Option<(&RequestSigner, String)>,
+    ) -> OpenRtbRequest {
         let imps: Vec<Imp> = request
             .slots
             .iter()
@@ -653,9 +708,18 @@ impl PrebidAuctionProvider {
                     })
                     .collect();
 
-                let mut bidder = std::collections::HashMap::new();
-                for bidder_name in &self.config.bidders {
-                    bidder.insert(bidder_name.clone(), Json::Object(serde_json::Map::new()));
+                // Use bidder params from the slot (passed through from the request)
+                let mut bidder: HashMap<String, Json> = slot
+                    .bidders
+                    .iter()
+                    .map(|(name, params)| (name.clone(), params.clone()))
+                    .collect();
+
+                // Fallback to config bidders if none provided
+                if bidder.is_empty() {
+                    for b in &self.config.bidders {
+                        bidder.insert(b.clone(), Json::Object(serde_json::Map::new()));
+                    }
                 }
 
                 Imp {
@@ -668,13 +732,79 @@ impl PrebidAuctionProvider {
             })
             .collect();
 
+        // Build page URL with debug query params if configured
+        let page_url = request.publisher.page_url.as_ref().map(|url| {
+            if let Some(ref params) = self.config.debug_query_params {
+                append_query_params(url, params)
+            } else {
+                url.clone()
+            }
+        });
+
+        // Build user object
+        let user = Some(User {
+            id: Some(request.user.id.clone()),
+            ext: Some(UserExt {
+                synthetic_fresh: Some(request.user.fresh_id.clone()),
+            }),
+        });
+
+        // Build device object with geo if available
+        let device = request.device.as_ref().and_then(|d| {
+            d.geo.as_ref().map(|geo| Device {
+                geo: Some(Geo {
+                    geo_type: 2, // IP address per OpenRTB spec
+                    country: Some(geo.country.clone()),
+                    city: Some(geo.city.clone()),
+                    region: geo.region.clone(),
+                }),
+            })
+        });
+
+        // Build regs object if Sec-GPC header is present
+        let regs = if context.request.get_header("Sec-GPC").is_some() {
+            Some(Regs {
+                ext: Some(RegsExt {
+                    us_privacy: Some("1YYN".to_string()),
+                }),
+            })
+        } else {
+            None
+        };
+
+        // Build ext object
+        let request_host = get_request_host(context.request);
+        let request_scheme = get_request_scheme(context.request);
+
+        let (signature, kid) = signer
+            .map(|(s, sig)| (Some(sig), Some(s.kid.clone())))
+            .unwrap_or((None, None));
+
+        let ext = Some(RequestExt {
+            prebid: if self.config.debug {
+                Some(PrebidExt { debug: Some(true) })
+            } else {
+                None
+            },
+            trusted_server: Some(TrustedServerExt {
+                signature,
+                kid,
+                request_host: Some(request_host),
+                request_scheme: Some(request_scheme),
+            }),
+        });
+
         OpenRtbRequest {
             id: request.id.clone(),
             imp: imps,
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
-                page: request.publisher.page_url.clone(),
+                page: page_url,
             }),
+            user,
+            device,
+            regs,
+            ext,
         }
     }
 
@@ -771,75 +901,28 @@ impl AuctionProvider for PrebidAuctionProvider {
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
-        // Convert to OpenRTB
-        let openrtb = self.to_openrtb(request);
-        let mut openrtb_json =
-            serde_json::to_value(&openrtb).change_context(TrustedServerError::Prebid {
-                message: "Failed to serialize OpenRTB request".to_string(),
-            })?;
-
-        // Enhance with user info
-        if !openrtb_json["user"].is_object() {
-            openrtb_json["user"] = json!({});
-        }
-        openrtb_json["user"]["id"] = json!(&request.user.id);
-        if !openrtb_json["user"]["ext"].is_object() {
-            openrtb_json["user"]["ext"] = json!({});
-        }
-        openrtb_json["user"]["ext"]["synthetic_fresh"] = json!(&request.user.fresh_id);
-
-        // Add device info if available
-        if let Some(device) = &request.device {
-            if let Some(geo) = &device.geo {
-                let geo_obj = json!({
-                    "type": 2,
-                    "country": geo.country,
-                    "city": geo.city,
-                    "region": geo.region,
-                });
-                if !openrtb_json["device"].is_object() {
-                    openrtb_json["device"] = json!({});
+        // Create signer and compute signature if request signing is enabled
+        let signer_with_signature =
+            if let Some(request_signing_config) = &context.settings.request_signing {
+                if request_signing_config.enabled {
+                    let signer = RequestSigner::from_config()?;
+                    let signature = signer.sign(request.id.as_bytes())?;
+                    Some((signer, signature))
+                } else {
+                    None
                 }
-                openrtb_json["device"]["geo"] = geo_obj;
-            }
-        }
+            } else {
+                None
+            };
 
-        // Add privacy regulations based on Sec-GPC header
-        if context.request.get_header("Sec-GPC").is_some() {
-            if !openrtb_json["regs"].is_object() {
-                openrtb_json["regs"] = json!({});
-            }
-            if !openrtb_json["regs"]["ext"].is_object() {
-                openrtb_json["regs"]["ext"] = json!({});
-            }
-            openrtb_json["regs"]["ext"]["us_privacy"] = json!("1YYN");
-        }
-
-        if !openrtb_json["ext"].is_object() {
-            openrtb_json["ext"] = json!({});
-        }
-        if !openrtb_json["ext"]["trusted_server"].is_object() {
-            openrtb_json["ext"]["trusted_server"] = json!({});
-        }
-
-        let request_host = get_request_host(context.request);
-        let request_scheme = get_request_scheme(context.request);
-        openrtb_json["ext"]["trusted_server"]["request_host"] = json!(request_host);
-        openrtb_json["ext"]["trusted_server"]["request_scheme"] = json!(request_scheme);
-
-        // Add request signing if enabled
-        if let Some(request_signing_config) = &context.settings.request_signing {
-            if request_signing_config.enabled && openrtb_json["id"].is_string() {
-                let id = openrtb_json["id"]
-                    .as_str()
-                    .expect("should have string id when is_string checked");
-                let signer = RequestSigner::from_config()?;
-                let signature = signer.sign(id.as_bytes())?;
-
-                openrtb_json["ext"]["trusted_server"]["signature"] = json!(signature);
-                openrtb_json["ext"]["trusted_server"]["kid"] = json!(signer.kid);
-            }
-        }
+        // Convert to OpenRTB with all enrichments
+        let openrtb = self.to_openrtb(
+            request,
+            context,
+            signer_with_signature
+                .as_ref()
+                .map(|(s, sig)| (s, sig.clone())),
+        );
 
         // Create HTTP request
         let mut pbs_req = Request::new(
@@ -849,7 +932,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         copy_request_headers(context.request, &mut pbs_req);
 
         pbs_req
-            .set_body_json(&openrtb_json)
+            .set_body_json(&openrtb)
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to set request body".to_string(),
             })?;
@@ -881,6 +964,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         let body_bytes = response.take_body_bytes();
+
         let mut response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
                 message: "Failed to parse Prebid response".to_string(),
@@ -980,6 +1064,7 @@ mod tests {
             auto_configure: true,
             debug: false,
             script_handler: None,
+            debug_query_params: None,
         }
     }
 
@@ -1144,8 +1229,17 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, fresh_id, &settings, &req)
-            .expect("should enhance request");
+        let config = base_config();
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         assert_eq!(request_json["user"]["id"], synthetic_id);
         assert_eq!(request_json["user"]["ext"]["synthetic_fresh"], fresh_id);
@@ -1163,6 +1257,66 @@ mod tests {
                 .unwrap()
                 .starts_with("https://"),
             "site page should be populated"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_adds_debug_flag_when_enabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/auction");
+
+        let mut config = base_config();
+        config.debug = true;
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        assert_eq!(
+            request_json["ext"]["prebid"]["debug"], true,
+            "debug flag should be set to true when config.debug is enabled"
+        );
+    }
+
+    #[test]
+    fn enhance_openrtb_request_does_not_add_debug_flag_when_disabled() {
+        let settings = make_settings();
+        let mut request_json = json!({
+            "id": "openrtb-request-id"
+        });
+
+        let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
+        let req = Request::new(Method::POST, "https://edge.example/auction");
+
+        let mut config = base_config();
+        config.debug = false;
+
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        assert!(
+            request_json["ext"]["prebid"]["debug"].is_null(),
+            "debug flag should not be set when config.debug is disabled"
         );
     }
 
@@ -1294,6 +1448,7 @@ server_url = "https://prebid.example"
             auto_configure: false,
             debug: false,
             script_handler: Some("/prebid.js".to_string()),
+            debug_query_params: None,
         };
         let integration = PrebidIntegration::new(config);
 
@@ -1328,6 +1483,7 @@ server_url = "https://prebid.example"
             auto_configure: false,
             debug: false,
             script_handler: Some("/prebid.js".to_string()),
+            debug_query_params: None,
         };
         let integration = PrebidIntegration::new(config);
 
@@ -1351,5 +1507,111 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script handler configured
         assert_eq!(routes.len(), 0);
+    }
+
+    #[test]
+    fn debug_query_params_appended_to_existing_site_page_in_enhance() {
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with existing site.page
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        assert_eq!(page, "https://example.com/page?kargo_debug=true");
+    }
+
+    #[test]
+    fn debug_query_params_appended_to_url_with_existing_query() {
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with existing query params in site.page
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page?existing=param"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        assert_eq!(
+            page,
+            "https://example.com/page?existing=param&kargo_debug=true"
+        );
+    }
+
+    #[test]
+    fn debug_query_params_not_duplicated() {
+        // Verify that if params are already in the URL, they aren't added again
+        let settings = make_settings();
+        let mut config = base_config();
+        config.debug_query_params = Some("kargo_debug=true".to_string());
+
+        let req = Request::new(Method::GET, "https://example.com/test");
+        let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
+
+        // Test with URL that already has the debug params
+        let mut request = json!({
+            "id": "test-id",
+            "site": {
+                "domain": "example.com",
+                "page": "https://example.com/page?kargo_debug=true"
+            }
+        });
+
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+
+        let page = request["site"]["page"].as_str().unwrap();
+        // Should still only have params once
+        assert_eq!(page, "https://example.com/page?kargo_debug=true");
+        // Verify params appear exactly once
+        assert_eq!(page.matches("kargo_debug=true").count(), 1);
     }
 }

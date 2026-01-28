@@ -37,6 +37,8 @@ pub struct AdSlot {
     pub floor_price: Option<f64>,
     /// Slot-specific targeting
     pub targeting: HashMap<String, serde_json::Value>,
+    /// Bidder configurations (bidder name -> params)
+    pub bidders: HashMap<String, serde_json::Value>,
 }
 
 /// Ad format specification.

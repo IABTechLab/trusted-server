@@ -516,6 +516,7 @@ mod tests {
                     }],
                     floor_price: Some(1.50),
                     targeting: HashMap::new(),
+                    bidders: HashMap::new(),
                 },
                 AdSlot {
                     id: "sidebar".to_string(),
@@ -526,6 +527,7 @@ mod tests {
                     }],
                     floor_price: Some(1.00),
                     targeting: HashMap::new(),
+                    bidders: HashMap::new(),
                 },
             ],
             publisher: PublisherInfo {
