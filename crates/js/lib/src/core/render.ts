@@ -174,3 +174,8 @@ function buildIframeDocument(creativeHtml: string): string {
     creativeHtml
   );
 }
+
+// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
+export function buildCreativeDocument(creativeHtml: string): string {
+  return buildIframeDocument(creativeHtml);
+}
