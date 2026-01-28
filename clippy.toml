@@ -29,10 +29,12 @@ allow-unwrap-in-tests = true
 # =============================================================================
 # Future Considerations
 # =============================================================================
-#
+# 
 # As the codebase matures, consider tightening these thresholds:
 # - cognitive-complexity-threshold = 25 (default)
 # - too-many-lines-threshold = 100 (default)
 #
 # Additional lints to consider enabling in Cargo.toml:
+# - needless_pass_by_value = "warn"
+# - redundant_closure_for_method_calls = "warn"
 # - missing_const_for_fn = "warn"
