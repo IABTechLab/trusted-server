@@ -396,6 +396,7 @@ mod tests {
                 }],
                 floor_price: Some(1.50),
                 targeting: HashMap::new(),
+                bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
                 domain: "test.com".to_string(),
@@ -568,6 +569,7 @@ mod tests {
                 }],
                 floor_price: None,
                 targeting: HashMap::new(),
+                bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
                 domain: "test.com".to_string(),
