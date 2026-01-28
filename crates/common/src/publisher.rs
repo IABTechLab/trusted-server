@@ -82,10 +82,7 @@ fn detect_request_scheme(req: &Request) -> String {
 /// # Errors
 ///
 /// This function never returns an error; the Result type is for API consistency.
-pub fn handle_tsjs_dynamic(
-    _settings: &Settings,
-    req: &Request,
-) -> Result<Response, Report<TrustedServerError>> {
+pub fn handle_tsjs_dynamic(req: Request) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     let path = req.get_path();
     if !path.starts_with(PREFIX) {

@@ -150,15 +150,15 @@ fn finalize_proxied_response(
     if ct.contains("text/html") {
         // HTML: rewrite and serve as HTML (safe to read as string)
         let body = beresp.take_body_str();
-        let rewritten = crate::creative::rewrite_creative_html(&body, settings);
-        return rebuild_text_response(&beresp, "text/html; charset=utf-8", rewritten);
+        let rewritten = crate::creative::rewrite_creative_html(settings, &body);
+        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
     }
 
     if ct.contains("text/css") {
         // CSS: rewrite url(...) references in stylesheets (safe to read as string)
         let body = beresp.take_body_str();
-        let rewritten = crate::creative::rewrite_css_body(&body, settings);
-        return rebuild_text_response(&beresp, "text/css; charset=utf-8", rewritten);
+        let rewritten = crate::creative::rewrite_css_body(settings, &body);
+        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics
@@ -680,7 +680,7 @@ pub async fn handle_first_party_proxy_sign(
             .unwrap_or_else(|| "https".to_string());
         format!("{}:{}", default_scheme, trimmed)
     } else {
-        crate::creative::to_abs(trimmed, settings).ok_or_else(|| {
+        crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
                 message: "unsupported url".to_string(),
             })
@@ -1426,7 +1426,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
-        let direct = creative::rewrite_creative_html(html, &settings);
+        let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp);
