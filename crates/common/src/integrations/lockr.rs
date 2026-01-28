@@ -69,7 +69,7 @@ pub struct LockrConfig {
 
     /// Override the Origin header sent to Lockr API.
     /// Use this when running locally or from a domain not registered with Lockr.
-    /// Example: "https://www.example.com"
+    /// Example: "<https://www.example.com>"
     #[serde(default)]
     #[validate(url)]
     pub origin_override: Option<String>,
