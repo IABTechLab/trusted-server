@@ -3,11 +3,14 @@
 //! This module provides functionality for generating privacy-preserving synthetic IDs
 //! based on various request parameters and a secret key.
 
+use std::net::IpAddr;
+
 use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 use handlebars::Handlebars;
 use hmac::{Hmac, Mac};
+use rand::Rng;
 use serde_json::json;
 use sha2::Sha256;
 use uuid::Uuid;
@@ -18,6 +21,39 @@ use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const ALPHANUMERIC_CHARSET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// Normalizes an IP address for stable synthetic ID generation.
+///
+/// For IPv6 addresses, masks to /64 prefix to handle Privacy Extensions
+/// where devices rotate their interface identifier (lower 64 bits).
+/// IPv4 addresses are returned unchanged.
+fn normalize_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ipv4) => ipv4.to_string(),
+        IpAddr::V6(ipv6) => {
+            let segments = ipv6.segments();
+            // Keep only the first 4 segments (64 bits) for /64 prefix
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::",
+                segments[0], segments[1], segments[2], segments[3]
+            )
+        }
+    }
+}
+
+/// Generates a random alphanumeric string of the specified length.
+fn generate_random_suffix(length: usize) -> String {
+    let mut rng = rand::thread_rng();
+    (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..ALPHANUMERIC_CHARSET.len());
+            ALPHANUMERIC_CHARSET[idx] as char
+        })
+        .collect()
+}
 
 /// Generates a fresh synthetic ID based on request parameters.
 ///
@@ -32,7 +68,7 @@ pub fn generate_synthetic_id(
     settings: &Settings,
     req: &Request,
 ) -> Result<String, Report<TrustedServerError>> {
-    let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
+    let client_ip = req.get_client_ip_addr().map(normalize_ip);
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
@@ -67,7 +103,11 @@ pub fn generate_synthetic_id(
             message: "Failed to create HMAC instance".to_string(),
         })?;
     mac.update(input_string.as_bytes());
-    let fresh_id = hex::encode(mac.finalize().into_bytes());
+    let hmac_hash = hex::encode(mac.finalize().into_bytes());
+
+    // Append random 6-character alphanumeric suffix for additional uniqueness
+    let random_suffix = generate_random_suffix(6);
+    let fresh_id = format!("{}.{}", hmac_hash, random_suffix);
 
     log::info!("Generated fresh ID: {}", fresh_id);
 
@@ -133,8 +173,39 @@ pub fn get_or_generate_synthetic_id(
 mod tests {
     use super::*;
     use fastly::http::{HeaderName, HeaderValue};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn test_normalize_ip_ipv4_unchanged() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(normalize_ip(ipv4), "192.168.1.100");
+    }
+
+    #[test]
+    fn test_normalize_ip_ipv6_masks_to_64() {
+        // Full IPv6 address with interface identifier
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0db8, 0x85a3, 0x0000, 0x8a2e, 0x0370, 0x7334, 0x1234,
+        ));
+        assert_eq!(normalize_ip(ipv6), "2001:db8:85a3:0::");
+    }
+
+    #[test]
+    fn test_normalize_ip_ipv6_different_suffix_same_prefix() {
+        // Two IPv6 addresses with same /64 prefix but different interface identifiers
+        // (simulating Privacy Extensions rotation)
+        let ipv6_a = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0db8, 0xabcd, 0x0001, 0x1111, 0x2222, 0x3333, 0x4444,
+        ));
+        let ipv6_b = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0db8, 0xabcd, 0x0001, 0xaaaa, 0xbbbb, 0xcccc, 0xdddd,
+        ));
+        // Both should normalize to the same /64 prefix
+        assert_eq!(normalize_ip(ipv6_a), normalize_ip(ipv6_b));
+        assert_eq!(normalize_ip(ipv6_a), "2001:db8:abcd:1::");
+    }
 
     fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
         let mut req = Request::new("GET", "http://example.com");
@@ -160,9 +231,14 @@ mod tests {
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
         log::info!("Generated synthetic ID: {}", synthetic_id);
-        // ID is non-deterministic due to random_uuid being available, but the hash should be 64 hex chars
-        assert_eq!(synthetic_id.len(), 64);
-        assert!(synthetic_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // ID format: 64 hex chars (HMAC) + "." + 6 alphanumeric chars (random suffix) = 71 chars
+        assert_eq!(synthetic_id.len(), 71);
+        let parts: Vec<&str> = synthetic_id.split('.').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 64);
+        assert!(parts[0].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(parts[1].len(), 6);
+        assert!(parts[1].chars().all(|c| c.is_alphanumeric()));
     }
 
     #[test]
