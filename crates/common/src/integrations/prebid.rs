@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method, StatusCode};
+use fastly::http::{header, Method, StatusCode, Url};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json, Value as JsonValue};
@@ -16,6 +16,7 @@ use crate::auction::types::{
 };
 use crate::backend::ensure_backend_from_url;
 use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
+use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::integrations::{
@@ -191,13 +192,18 @@ impl PrebidIntegration {
                 message: "Failed to set OpenRTB body".to_string(),
             })?;
 
-        let mut pbs_resp = pbs_auction_for_get(settings, req, &self.config).await?;
+        let backend_name = ensure_backend_from_url(&self.config.server_url)?;
+        let mut pbs_resp = req
+            .send(backend_name)
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to send first-party ad request to Prebid Server".to_string(),
+            })?;
 
         let body_bytes = pbs_resp.take_body_bytes();
         let html = match serde_json::from_slice::<Json>(&body_bytes) {
             Ok(json) => extract_adm_for_slot(&json, &slot)
                 .unwrap_or_else(|| "<!-- no creative -->".to_string()),
-            Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| "".to_string()),
+            Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| String::new()),
         };
 
         let rewritten = creative::rewrite_creative_html(settings, &html);
@@ -670,6 +676,23 @@ fn append_query_params(url: &str, params: &str) -> String {
     } else {
         format!("{}?{}", url, params)
     }
+}
+
+/// Extracts the `adm` field from the first bid matching the given slot (by `impid`).
+///
+/// Searches through the OpenRTB seatbid/bid structure for a bid whose `impid`
+/// matches `slot` and returns its `adm` (ad markup) value.
+fn extract_adm_for_slot(response: &Json, slot: &str) -> Option<String> {
+    let seatbids = response.get("seatbid")?.as_array()?;
+    for seatbid in seatbids {
+        let bids = seatbid.get("bid")?.as_array()?;
+        for bid in bids {
+            if bid.get("impid").and_then(|v| v.as_str()) == Some(slot) {
+                return bid.get("adm").and_then(|v| v.as_str()).map(String::from);
+            }
+        }
+    }
+    None
 }
 
 // ============================================================================

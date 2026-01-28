@@ -517,7 +517,7 @@ impl StreamProcessor for CreativeHtmlProcessor<'_> {
             let markup = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {}", e)))?;
 
-            let rewritten = rewrite_creative_html(&markup, self.settings);
+            let rewritten = rewrite_creative_html(self.settings, &markup);
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())
@@ -562,7 +562,7 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
             let css = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {}", e)))?;
 
-            let rewritten = rewrite_css_body(&css, self.settings);
+            let rewritten = rewrite_css_body(self.settings, &css);
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())

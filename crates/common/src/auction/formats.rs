@@ -172,7 +172,7 @@ pub fn convert_to_openrtb_response(
         // Process creative HTML if present - rewrite URLs and return inline
         let creative_html = if let Some(ref raw_creative) = bid.creative {
             // Rewrite creative HTML with proxy URLs for first-party delivery
-            let rewritten = creative::rewrite_creative_html(raw_creative, settings);
+            let rewritten = creative::rewrite_creative_html(settings, raw_creative);
 
             log::debug!(
                 "Rewritten creative for auction {} slot {} ({} bytes)",
