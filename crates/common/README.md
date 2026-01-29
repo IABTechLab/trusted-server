@@ -33,9 +33,9 @@ Additional behavior:
 
 Helpers:
 
-- `rewrite_creative_html(markup, settings) -> String` — rewrite an HTML fragment
-- `rewrite_css_body(css, settings) -> String` — rewrite a CSS body (`url(...)` entries)
-- `rewrite_srcset(srcset, settings) -> String` — proxy absolute candidates; preserve descriptors (`1x`, `1.5x`, `100w`)
+- `rewrite_creative_html(settings, markup) -> String` — rewrite an HTML fragment
+- `rewrite_css_body(settings, css) -> String` — rewrite a CSS body (`url(...)` entries)
+- `rewrite_srcset(settings, srcset) -> String` — proxy absolute candidates; preserve descriptors (`1x`, `1.5x`, `100w`)
 - `split_srcset_candidates(srcset) -> Vec<&str>` — robust splitting for commas with/without spaces; avoids splitting the first `data:` mediatype comma
 
 Static bundles (served by publisher module):

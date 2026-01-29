@@ -6,6 +6,8 @@ use http::StatusCode;
 use crate::backend::ensure_backend_from_url;
 use crate::error::TrustedServerError;
 
+const FASTLY_API_HOST: &str = "https://api.fastly.com";
+
 pub struct FastlyConfigStore {
     store_name: String,
 }
@@ -75,7 +77,8 @@ impl FastlySecretStore {
 
 pub struct FastlyApiClient {
     api_key: Vec<u8>,
-    base_url: String,
+    base_url: &'static str,
+    backend_name: String,
 }
 
 impl FastlyApiClient {
@@ -84,7 +87,7 @@ impl FastlyApiClient {
     }
 
     pub fn from_secret_store(store_name: &str, key_name: &str) -> Result<Self, TrustedServerError> {
-        ensure_backend_from_url("https://api.fastly.com").map_err(|e| {
+        let backend_name = ensure_backend_from_url(FASTLY_API_HOST).map_err(|e| {
             TrustedServerError::Configuration {
                 message: format!("Failed to ensure API backend: {}", e),
             }
@@ -93,9 +96,12 @@ impl FastlyApiClient {
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;
 
+        log::debug!("FastlyApiClient initialized with backend: {}", backend_name);
+
         Ok(Self {
             api_key,
-            base_url: "https://api.fastly.com".to_string(),
+            base_url: FASTLY_API_HOST,
+            backend_name,
         })
     }
 
@@ -132,11 +138,11 @@ impl FastlyApiClient {
                 .with_body(body_content);
         }
 
-        request.send("backend_https_api_fastly_com").map_err(|e| {
-            TrustedServerError::Configuration {
+        request
+            .send(&self.backend_name)
+            .map_err(|e| TrustedServerError::Configuration {
                 message: format!("Failed to send API request: {}", e),
-            }
-        })
+            })
     }
 
     pub fn update_config_item(

@@ -295,10 +295,10 @@ time.
 
 Two built-in integrations demonstrate how the framework pieces fit together:
 
-| Integration | Purpose                                                                                                                                                                                                                                               | Key files                                                                                    |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                                                                                | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
-| `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
+| Integration | Purpose                                                                                                                                                                                  | Key files                                                                                    |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `testlight` | Sample partner stub showing request proxying, attribute rewrites, and asset injection.                                                                                                   | `crates/common/src/integrations/testlight.rs`, `crates/js/lib/src/integrations/testlight.ts` |
+| `prebid`    | Production Prebid Server bridge that owns `/first-party/ad` & `/auction`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build. | `crates/common/src/integrations/prebid.rs`, `crates/js/lib/src/ext/prebidjs.ts`              |
 
 ### Example: Prebid integration
 
@@ -323,11 +323,11 @@ Prebid applies the same steps outlined above with a few notable patterns:
    other integrations use.
 
 2. **Routes owned by the integration** – `IntegrationProxy::routes` declares the
-   `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST)
+   `/integrations/prebid/first-party/ad` (GET) and `/auction` (POST)
    endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs +
    geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML
-   creative rewrites before responding. All routes are properly namespaced under
-   `/integrations/prebid/` to follow the integration routing pattern.
+   creative rewrites before responding. The `/auction` route is mounted at the top level,
+   while other integration-specific routes follow the `/integrations/prebid/` namespacing pattern.
 
 3. **HTML rewrites through the registry** – When the integration is enabled, the
    `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>`

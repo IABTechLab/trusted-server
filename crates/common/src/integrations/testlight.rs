@@ -15,7 +15,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 use crate::tsjs;
 
@@ -37,7 +37,7 @@ pub struct TestlightConfig {
     pub rewrite_scripts: bool,
 }
 
-impl IntegrationConfigTrait for TestlightConfig {
+impl IntegrationConfig for TestlightConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
