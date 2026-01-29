@@ -5,6 +5,7 @@
 
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::SigningKey;
+use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
 use crate::error::TrustedServerError;
@@ -36,7 +37,7 @@ impl KeyRotationManager {
     pub fn new(
         config_store_id: impl Into<String>,
         secret_store_id: impl Into<String>,
-    ) -> Result<Self, TrustedServerError> {
+    ) -> Result<Self, Report<TrustedServerError>> {
         let config_store_id = config_store_id.into();
         let secret_store_id = secret_store_id.into();
 
@@ -56,7 +57,10 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if key storage or update operations fail.
-    pub fn rotate_key(&self, kid: Option<String>) -> Result<KeyRotationResult, TrustedServerError> {
+    pub fn rotate_key(
+        &self,
+        kid: Option<String>,
+    ) -> Result<KeyRotationResult, Report<TrustedServerError>> {
         let new_kid = kid.unwrap_or_else(generate_date_based_kid);
 
         let keypair = Keypair::generate();
@@ -86,45 +90,46 @@ impl KeyRotationManager {
         &self,
         kid: &str,
         signing_key: &SigningKey,
-    ) -> Result<(), TrustedServerError> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let key_bytes = signing_key.as_bytes();
         let key_b64 = general_purpose::STANDARD.encode(key_bytes);
 
         self.api_client
             .create_secret(&self.secret_store_id, kid, &key_b64)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to store private key '{}': {}", kid, e),
+            .change_context(TrustedServerError::Configuration {
+                message: format!("Failed to store private key '{}'", kid),
             })
     }
 
-    fn store_public_jwk(&self, kid: &str, jwk: &Jwk) -> Result<(), TrustedServerError> {
-        let jwk_json =
-            serde_json::to_string(jwk).map_err(|e| TrustedServerError::Configuration {
+    fn store_public_jwk(&self, kid: &str, jwk: &Jwk) -> Result<(), Report<TrustedServerError>> {
+        let jwk_json = serde_json::to_string(jwk).map_err(|e| {
+            Report::new(TrustedServerError::Configuration {
                 message: format!("Failed to serialize JWK: {}", e),
-            })?;
+            })
+        })?;
 
         self.api_client
             .update_config_item(&self.config_store_id, kid, &jwk_json)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to store public JWK '{}': {}", kid, e),
+            .change_context(TrustedServerError::Configuration {
+                message: format!("Failed to store public JWK '{}'", kid),
             })
     }
 
-    fn update_current_kid(&self, kid: &str) -> Result<(), TrustedServerError> {
+    fn update_current_kid(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
         self.api_client
             .update_config_item(&self.config_store_id, "current-kid", kid)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to update current-kid: {}", e),
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to update current-kid".into(),
             })
     }
 
-    fn update_active_kids(&self, active_kids: &[String]) -> Result<(), TrustedServerError> {
+    fn update_active_kids(&self, active_kids: &[String]) -> Result<(), Report<TrustedServerError>> {
         let active_kids_str = active_kids.join(",");
 
         self.api_client
             .update_config_item(&self.config_store_id, "active-kids", &active_kids_str)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to update active-kids: {}", e),
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to update active-kids".into(),
             })
     }
 
@@ -133,7 +138,7 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if the active keys cannot be retrieved from the config store.
-    pub fn list_active_keys(&self) -> Result<Vec<String>, TrustedServerError> {
+    pub fn list_active_keys(&self) -> Result<Vec<String>, Report<TrustedServerError>> {
         let active_kids_str = self.config_store.get("active-kids")?;
 
         let active_kids: Vec<String> = active_kids_str
@@ -150,15 +155,15 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if this would deactivate the last active key, or if the update fails.
-    pub fn deactivate_key(&self, kid: &str) -> Result<(), TrustedServerError> {
+    pub fn deactivate_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
         let mut active_kids = self.list_active_keys()?;
 
         active_kids.retain(|k| k != kid);
 
         if active_kids.is_empty() {
-            return Err(TrustedServerError::Configuration {
+            return Err(Report::new(TrustedServerError::Configuration {
                 message: "Cannot deactivate the last active key".into(),
-            });
+            }));
         }
 
         self.update_active_kids(&active_kids)
@@ -169,19 +174,19 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if deactivation fails or if the key cannot be deleted from storage.
-    pub fn delete_key(&self, kid: &str) -> Result<(), TrustedServerError> {
+    pub fn delete_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
         self.deactivate_key(kid)?;
 
         self.api_client
             .delete_config_item(&self.config_store_id, kid)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to delete JWK from ConfigStore: {}", e),
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to delete JWK from ConfigStore".into(),
             })?;
 
         self.api_client
             .delete_secret(&self.secret_store_id, kid)
-            .map_err(|e| TrustedServerError::Configuration {
-                message: format!("Failed to delete secret from SecretStore: {}", e),
+            .change_context(TrustedServerError::Configuration {
+                message: "Failed to delete secret from SecretStore".into(),
             })?;
 
         Ok(())
@@ -203,15 +208,11 @@ mod tests {
     #[test]
     fn test_generate_date_based_kid() {
         let kid = generate_date_based_kid();
-        println!("Generated KID: {}", kid);
-
         // Verify format: ts-YYYY-MM-DD
         assert!(kid.starts_with("ts-"));
-        assert!(kid.len() >= 13); // "ts-" + "YYYY-MM-DD" = 13 chars minimum
-
-        // Verify it contains only valid characters
+        assert!(kid.len() >= 13);
         let parts: Vec<&str> = kid.split('-').collect();
-        assert_eq!(parts.len(), 4); // ["ts", "YYYY", "MM", "DD"]
+        assert_eq!(parts.len(), 4);
         assert_eq!(parts[0], "ts");
     }
 
@@ -222,7 +223,6 @@ mod tests {
             Ok(manager) => {
                 assert_eq!(manager.config_store_id, "jwks_store");
                 assert_eq!(manager.secret_store_id, "signing_keys");
-                println!("✓ KeyRotationManager created successfully");
             }
             Err(e) => {
                 println!("Expected error in test environment: {}", e);
@@ -236,7 +236,6 @@ mod tests {
         if let Ok(manager) = result {
             match manager.list_active_keys() {
                 Ok(keys) => {
-                    println!("Active keys: {:?}", keys);
                     assert!(!keys.is_empty(), "Should have at least one active key");
                 }
                 Err(e) => println!("Expected error in test environment: {}", e),
