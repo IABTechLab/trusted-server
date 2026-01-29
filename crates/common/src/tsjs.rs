@@ -22,11 +22,13 @@ fn script_tag_for(bundle: TsjsBundle, attrs: &str) -> String {
 }
 
 /// `/static` URL for the unified bundle with cache-busting hash.
+#[must_use]
 pub fn unified_script_src() -> String {
     script_src_for(TsjsBundle::Unified)
 }
 
 /// `<script>` tag for injecting the unified bundle.
+#[must_use]
 pub fn unified_script_tag() -> String {
     script_tag_for(TsjsBundle::Unified, "id=\"trustedserver-js\"")
 }

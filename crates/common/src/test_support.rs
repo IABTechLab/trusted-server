@@ -2,6 +2,7 @@
 pub mod tests {
     use crate::settings::Settings;
 
+    #[must_use]
     pub fn crate_test_settings_str() -> String {
         r#"
             [[handlers]]
@@ -35,6 +36,12 @@ pub mod tests {
             "#.to_string()
     }
 
+    #[must_use]
+    /// Creates test settings from embedded TOML configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML configuration is invalid.
     pub fn create_test_settings() -> Settings {
         let toml_str = crate_test_settings_str();
         Settings::from_toml(&toml_str).expect("Invalid config")

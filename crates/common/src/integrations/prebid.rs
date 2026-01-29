@@ -230,6 +230,7 @@ fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
     Some(PrebidIntegration::new(config))
 }
 
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(
@@ -681,7 +682,7 @@ fn append_query_params(url: &str, params: &str) -> String {
 
 /// Extracts the `adm` field from the first bid matching the given slot (by `impid`).
 ///
-/// Searches through the OpenRTB seatbid/bid structure for a bid whose `impid`
+/// Searches through the `OpenRTB` seatbid/bid structure for a bid whose `impid`
 /// matches `slot` and returns its `adm` (ad markup) value.
 #[allow(dead_code)]
 fn extract_adm_for_slot(response: &Json, slot: &str) -> Option<String> {
@@ -708,11 +709,12 @@ pub struct PrebidAuctionProvider {
 
 impl PrebidAuctionProvider {
     /// Create a new Prebid auction provider.
+    #[must_use]
     pub fn new(config: PrebidIntegrationConfig) -> Self {
         Self { config }
     }
 
-    /// Convert auction request to OpenRTB format with all enrichments.
+    /// Convert auction request to `OpenRTB` format with all enrichments.
     fn to_openrtb(
         &self,
         request: &AuctionRequest,
@@ -833,7 +835,7 @@ impl PrebidAuctionProvider {
         }
     }
 
-    /// Parse OpenRTB response into auction response.
+    /// Parse `OpenRTB` response into auction response.
     fn parse_openrtb_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
         let mut bids = Vec::new();
 
@@ -861,7 +863,7 @@ impl PrebidAuctionProvider {
         }
     }
 
-    /// Parse a single bid from OpenRTB response.
+    /// Parse a single bid from `OpenRTB` response.
     fn parse_bid(&self, bid_obj: &Json, seat: &str) -> Result<AuctionBid, ()> {
         let slot_id = bid_obj
             .get("impid")
@@ -869,32 +871,41 @@ impl PrebidAuctionProvider {
             .ok_or(())?
             .to_string();
 
-        let price = bid_obj.get("price").and_then(|v| v.as_f64()).ok_or(())?;
+        let price = bid_obj
+            .get("price")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or(())?;
 
         let creative = bid_obj
             .get("adm")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
-        let width = bid_obj.get("w").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
-        let height = bid_obj.get("h").and_then(|v| v.as_u64()).unwrap_or(250) as u32;
+        let width = bid_obj
+            .get("w")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(300) as u32;
+        let height = bid_obj
+            .get("h")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(250) as u32;
 
         let nurl = bid_obj
             .get("nurl")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let burl = bid_obj
             .get("burl")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let adomain = bid_obj
             .get("adomain")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect()
             });
 
@@ -1052,6 +1063,7 @@ impl AuctionProvider for PrebidAuctionProvider {
 ///
 /// This function checks the settings for Prebid configuration and returns
 /// the provider if enabled.
+#[must_use]
 pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
@@ -1164,7 +1176,7 @@ mod tests {
                 }),
             )
             .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1214,7 +1226,7 @@ mod tests {
                 }),
             )
             .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {

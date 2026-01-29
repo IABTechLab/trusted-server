@@ -19,6 +19,7 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    #[must_use]
     pub fn generate() -> Self {
         let mut csprng = OsRng;
 
@@ -31,6 +32,7 @@ impl Keypair {
         }
     }
 
+    #[must_use]
     pub fn get_jwk(&self, kid: String) -> Jwk {
         let public_key_bytes = self.verifying_key.as_bytes();
 
@@ -51,13 +53,18 @@ impl Keypair {
     }
 }
 
+/// Retrieves active JSON Web Keys from the config store.
+///
+/// # Errors
+///
+/// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
 pub fn get_active_jwks() -> Result<String, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
     let active_kids_str = store.get("active-kids")?;
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 

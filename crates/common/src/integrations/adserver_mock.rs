@@ -80,6 +80,7 @@ pub struct AdServerMockProvider {
 
 impl AdServerMockProvider {
     /// Create a new mock ad server provider.
+    #[must_use]
     pub fn new(config: AdServerMockConfig) -> Self {
         Self { config }
     }
@@ -183,7 +184,7 @@ impl AdServerMockProvider {
         }))
     }
 
-    /// Parse OpenRTB response from mediation endpoint.
+    /// Parse `OpenRTB` response from mediation endpoint.
     /// Mediation returns decoded prices for all bids (including APS bids that were encoded).
     fn parse_mediation_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
         // Parse OpenRTB response
@@ -348,6 +349,7 @@ impl AuctionProvider for AdServerMockProvider {
 // ============================================================================
 
 /// Auto-register ad server mock provider based on settings configuration.
+#[must_use]
 pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 

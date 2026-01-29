@@ -15,7 +15,15 @@ use super::AuctionOrchestrator;
 ///
 /// This is the main entry point for running header bidding auctions.
 /// It orchestrates bids from multiple providers (Prebid, APS, GAM, etc.) and returns
-/// the winning bids in OpenRTB format with creative HTML inline in the `adm` field.
+/// the winning bids in `OpenRTB` format with creative HTML inline in the `adm` field.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The request body cannot be parsed
+/// - The auction request conversion fails (e.g., invalid ad units)
+/// - The auction execution fails
+/// - The response cannot be serialized
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,

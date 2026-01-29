@@ -3,6 +3,9 @@ name = "trusted-server-fastly"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 chrono = { workspace = true }
 error-stack = { workspace = true }
