@@ -47,6 +47,7 @@ fn provider_builders() -> &'static [ProviderBuilder] {
 ///
 /// # Arguments
 /// * `settings` - Application settings used to configure the orchestrator and providers
+#[must_use]
 pub fn build_orchestrator(settings: &Settings) -> AuctionOrchestrator {
     log::info!("Building auction orchestrator");
 

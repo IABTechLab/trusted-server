@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::auction::types::OrchestratorExt;
 
-/// Minimal subset of OpenRTB 2.x bid request used by Trusted Server.
+/// Minimal subset of `OpenRTB` 2.x bid request used by Trusted Server.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub struct OpenRtbRequest {
@@ -72,7 +72,7 @@ pub struct Device {
 
 #[derive(Debug, Serialize)]
 pub struct Geo {
-    /// Location type per OpenRTB spec (1=GPS, 2=IP address, 3=user provided)
+    /// Location type per `OpenRTB` spec (1=GPS, 2=IP address, 3=user provided)
     #[serde(rename = "type")]
     pub geo_type: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,7 +131,7 @@ pub struct PrebidImpExt {
     pub bidder: std::collections::HashMap<String, Value>,
 }
 
-/// Minimal subset of OpenRTB 2.x bid response used by Trusted Server.
+/// Minimal subset of `OpenRTB` 2.x bid response used by Trusted Server.
 #[derive(Debug, Serialize)]
 pub struct OpenRtbResponse {
     pub id: String,

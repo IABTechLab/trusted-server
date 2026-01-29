@@ -116,6 +116,12 @@ impl std::fmt::Debug for IntegrationDocumentState {
 }
 
 impl IntegrationDocumentState {
+    #[must_use]
+    /// Retrieves a value stored for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -130,6 +136,11 @@ impl IntegrationDocumentState {
         })
     }
 
+    /// Retrieves or initializes a value for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get_or_insert_with<T>(
         &self,
         integration_id: &'static str,
@@ -157,6 +168,11 @@ impl IntegrationDocumentState {
         value
     }
 
+    /// Clears all stored values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn clear(&self) {
         let mut guard = self
             .inner
@@ -490,7 +506,15 @@ pub struct IntegrationRegistry {
 
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
-    pub fn new(settings: &Settings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
@@ -501,7 +525,13 @@ impl IntegrationRegistry {
 
                         // Convert /* wildcard to matchit's {*rest} syntax
                         let matchit_path = if route.path.ends_with("/*") {
-                            format!("{}/{{*rest}}", route.path.strip_suffix("/*").unwrap())
+                            format!(
+                                "{}/{{*rest}}",
+                                route
+                                    .path
+                                    .strip_suffix("/*")
+                                    .expect("path should end with '/*'")
+                            )
                         } else {
                             route.path.clone()
                         };
@@ -524,10 +554,12 @@ impl IntegrationRegistry {
                         };
 
                         if let Err(e) = router.insert(&matchit_path, value) {
-                            panic!(
-                                "Integration route registration failed for {} {}: {:?}",
-                                route.method, route.path, e
-                            );
+                            return Err(Report::new(TrustedServerError::Configuration {
+                                message: format!(
+                                    "Integration route registration failed for {} {}: {:?}",
+                                    route.method, route.path, e
+                                ),
+                            }));
                         }
 
                         inner.routes.push((route, registration.integration_id));
@@ -545,9 +577,9 @@ impl IntegrationRegistry {
             }
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
-        }
+        })
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -564,11 +596,13 @@ impl IntegrationRegistry {
     }
 
     /// Return true when any proxy is registered for the provided route.
+    #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
@@ -584,6 +618,7 @@ impl IntegrationRegistry {
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
+    #[must_use]
     pub fn rewrite_attribute(
         &self,
         attr_name: &str,
@@ -616,16 +651,19 @@ impl IntegrationRegistry {
     }
 
     /// Expose registered script/text rewriters for HTML processing.
+    #[must_use]
     pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
         self.inner.script_rewriters.clone()
     }
 
     /// Expose registered HTML post-processors.
+    #[must_use]
     pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
         self.inner.html_post_processors.clone()
     }
 
     /// Provide a snapshot of registered integrations and their hooks.
+    #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
@@ -657,6 +695,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -677,6 +716,12 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
+    /// Test helper to create a registry from routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if route registration fails due to duplicate or invalid paths.
     pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();
@@ -687,7 +732,10 @@ impl IntegrationRegistry {
         for (method, path, value) in routes {
             // Convert /* wildcard to matchit's {*rest} syntax
             let matchit_path = if path.ends_with("/*") {
-                format!("{}/{{*rest}}", path.strip_suffix("/*").unwrap())
+                format!(
+                    "{}/{{*rest}}",
+                    path.strip_suffix("/*").expect("path should end with '/*'")
+                )
             } else {
                 path.to_string()
             };
@@ -701,7 +749,9 @@ impl IntegrationRegistry {
                 _ => continue,
             };
 
-            router.insert(&matchit_path, value).unwrap();
+            router
+                .insert(&matchit_path, value)
+                .expect("route registration should succeed");
         }
 
         Self {

@@ -11,6 +11,10 @@ use crate::error::TrustedServerError;
 /// The backend name is derived from the scheme and `host[:port]` to avoid collisions across
 /// http/https or different ports. If a backend with the derived name already exists,
 /// this function logs and reuses it.
+///
+/// # Errors
+///
+/// Returns an error if the host is empty or if backend creation fails (except for `NameInUse` which reuses the existing backend).
 pub fn ensure_origin_backend(
     scheme: &str,
     host: &str,
@@ -75,6 +79,13 @@ pub fn ensure_origin_backend(
     }
 }
 
+/// Ensures a dynamic backend exists for the given origin URL.
+///
+/// Parses the URL and delegates to `ensure_origin_backend` to create or reuse a backend.
+///
+/// # Errors
+///
+/// Returns an error if the URL cannot be parsed or lacks a host, or if backend creation fails.
 pub fn ensure_backend_from_url(origin_url: &str) -> Result<String, Report<TrustedServerError>> {
     let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
         message: format!("Invalid origin_url: {}", origin_url),

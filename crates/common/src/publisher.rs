@@ -76,7 +76,13 @@ fn detect_request_scheme(req: &Request) -> String {
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
-pub fn handle_tsjs_dynamic(req: Request) -> Result<Response, Report<TrustedServerError>> {
+///
+/// Returns 404 for invalid paths or missing bundle files; otherwise serves the requested bundle.
+///
+/// # Errors
+///
+/// This function never returns an error; the Result type is for API consistency.
+pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
@@ -90,7 +96,7 @@ pub fn handle_tsjs_dynamic(req: Request) -> Result<Response, Report<TrustedServe
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     };
 
-    let mut resp = serve_static_with_etag(body, &req, "application/javascript; charset=utf-8");
+    let mut resp = serve_static_with_etag(body, req, "application/javascript; charset=utf-8");
     resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
@@ -110,7 +116,7 @@ struct ProcessResponseParams<'a> {
 /// Process response body in streaming fashion with compression preservation
 fn process_response_streaming(
     body: Body,
-    params: ProcessResponseParams,
+    params: &ProcessResponseParams,
 ) -> Result<Body, Report<TrustedServerError>> {
     // Check if this is HTML content
     let is_html = params.content_type.contains("text/html");
@@ -337,7 +343,7 @@ pub fn handle_publisher_request(
             content_type: &content_type,
             integration_registry,
         };
-        match process_response_streaming(body, params) {
+        match process_response_streaming(body, &params) {
             Ok(processed_body) => {
                 // Set the processed body back
                 response.set_body(processed_body);

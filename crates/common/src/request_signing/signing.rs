@@ -9,6 +9,11 @@ use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, Ve
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 
+/// Retrieves the current active key ID from the config store.
+///
+/// # Errors
+///
+/// Returns an error if the config store cannot be accessed or the current-kid key is not found.
 pub fn get_current_key_id() -> Result<String, TrustedServerError> {
     let store = FastlyConfigStore::new("jwks_store");
     store.get("current-kid")
@@ -40,6 +45,11 @@ pub struct RequestSigner {
 }
 
 impl RequestSigner {
+    /// Creates a `RequestSigner` from the current key ID stored in config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
     pub fn from_config() -> Result<Self, TrustedServerError> {
         let config_store = FastlyConfigStore::new("jwks_store");
         let key_id = config_store.get("current-kid")?;
@@ -54,6 +64,11 @@ impl RequestSigner {
         })
     }
 
+    /// Signs a payload using the Ed25519 signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing fails.
     pub fn sign(&self, payload: &[u8]) -> Result<String, TrustedServerError> {
         let signature_bytes = self.key.sign(payload).to_bytes();
 
@@ -61,6 +76,11 @@ impl RequestSigner {
     }
 }
 
+/// Verifies a signature using the public key associated with the given key ID.
+///
+/// # Errors
+///
+/// Returns an error if the JWK cannot be retrieved, parsed, or if signature verification fails.
 pub fn verify_signature(
     payload: &[u8],
     signature_b64: &str,

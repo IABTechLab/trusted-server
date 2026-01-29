@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::Settings;
 
-/// Build a static text response with strong ETag and standard caching headers.
+/// Build a static text response with strong `ETag` and standard caching headers.
 /// Handles If-None-Match to return 304 when appropriate.
 pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> Response {
     // Compute ETag for conditional caching
@@ -44,6 +44,11 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
 
 /// Encrypts a URL using XChaCha20-Poly1305 with a key derived from the publisher `proxy_secret`.
 /// Returns a Base64 URL-safe (no padding) token: b"x1" || nonce(24) || ciphertext+tag.
+///
+/// # Panics
+///
+/// Panics if encryption fails (which should not happen under normal circumstances).
+#[must_use]
 pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     // Derive a 32-byte key via SHA-256(secret)
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
@@ -71,6 +76,7 @@ pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
 }
 
 /// Decrypts and verifies a token produced by `encode_url`. Returns None if invalid.
+#[must_use]
 pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
     let data = URL_SAFE_NO_PAD.decode(token.as_bytes()).ok()?;
     if data.len() < 2 + 24 + 16 {
@@ -92,11 +98,12 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
 }
 
 /// Compute a deterministic signature token (tstoken) for a clear-text URL using the
-/// publisher's proxy_secret. This enables proxy URLs to retain the original URL in
+/// publisher's `proxy_secret`. This enables proxy URLs to retain the original URL in
 /// clear text while still providing integrity/authenticity via a keyed digest.
 ///
 /// Token format: Base64 URL-safe (no padding) of SHA-256("ts-proxy-v2" || secret || url)
 /// - Not intended as a general HMAC; sufficient for validating unmodified URLs under a secret.
+#[must_use]
 pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ts-proxy-v2");
@@ -107,6 +114,7 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 }
 
 /// Verify a `tstoken` for the given clear-text URL.
+#[must_use]
 pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
     sign_clear_url(settings, clear_url) == token
 }
@@ -118,6 +126,7 @@ pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &
 /// 2) Base64-decode the `x1||nonce||ciphertext+tag` bytes
 /// 3) Compute SHA-256 over those bytes
 /// 4) Return Base64 URL-safe (no padding) digest as `tstoken`
+#[must_use]
 pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> String {
     // Encrypt deterministically using existing helper
     let enc = encode_url(settings, full_url);

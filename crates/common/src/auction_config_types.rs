@@ -39,11 +39,13 @@ fn default_creative_store() -> String {
 #[allow(dead_code)] // Methods used in runtime but not in build script
 impl AuctionConfig {
     /// Get all provider names.
+    #[must_use]
     pub fn provider_names(&self) -> &[String] {
         &self.providers
     }
 
     /// Check if this config has a mediator configured.
+    #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
     }

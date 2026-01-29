@@ -20,6 +20,7 @@ pub struct AuctionOrchestrator {
 
 impl AuctionOrchestrator {
     /// Create a new orchestrator with the given configuration.
+    #[must_use]
     pub fn new(config: AuctionConfig) -> Self {
         Self {
             config,
@@ -35,6 +36,7 @@ impl AuctionOrchestrator {
     }
 
     /// Get the number of registered providers.
+    #[must_use]
     pub fn provider_count(&self) -> usize {
         self.providers.len()
     }
@@ -44,6 +46,11 @@ impl AuctionOrchestrator {
     /// Strategy is determined by mediator configuration:
     /// - If mediator is configured: runs parallel mediation (bidders → mediator decides)
     /// - If no mediator: runs parallel only (bidders → highest CPM wins)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the auction execution fails due to provider errors or
+    /// mediation errors.
     pub async fn run_auction(
         &self,
         request: &AuctionRequest,
@@ -89,8 +96,7 @@ impl AuctionOrchestrator {
         let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
-        let (mediator_response, winning_bids) = if self.config.has_mediator() {
-            let mediator_name = self.config.mediator.as_ref().unwrap();
+        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
             let mediator = self.get_provider(mediator_name)?;
 
             log::info!(
@@ -450,6 +456,7 @@ impl AuctionOrchestrator {
     }
 
     /// Check if orchestrator is enabled.
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
@@ -472,11 +479,13 @@ pub struct OrchestrationResult {
 
 impl OrchestrationResult {
     /// Get the winning bid for a specific slot.
+    #[must_use]
     pub fn get_winning_bid(&self, slot_id: &str) -> Option<&Bid> {
         self.winning_bids.get(slot_id)
     }
 
     /// Get all bids from all providers for a specific slot.
+    #[must_use]
     pub fn get_all_bids_for_slot(&self, slot_id: &str) -> Vec<&Bid> {
         self.provider_responses
             .iter()
@@ -486,6 +495,7 @@ impl OrchestrationResult {
     }
 
     /// Get the total number of bids received.
+    #[must_use]
     pub fn total_bids(&self) -> usize {
         self.provider_responses.iter().map(|r| r.bids.len()).sum()
     }

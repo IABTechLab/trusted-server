@@ -146,7 +146,7 @@ pub struct Bid {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
-/// OpenRTB response metadata for the orchestrator.
+/// `OpenRTB` response metadata for the orchestrator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorExt {
     pub strategy: String,

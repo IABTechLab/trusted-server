@@ -18,6 +18,10 @@ use crate::settings::Settings;
 /// This endpoint provides a standardized discovery mechanism following the IAB
 /// Data Subject Rights framework pattern. It returns JWKS keys and API endpoints
 /// in a single discoverable location.
+///
+/// # Errors
+///
+/// Returns an error if JWKS cannot be retrieved, parsed, or serialized.
 pub fn handle_trusted_server_discovery(
     _settings: &Settings,
     _req: Request,
@@ -65,6 +69,10 @@ pub struct VerifySignatureResponse {
 
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures
+///
+/// # Errors
+///
+/// Returns an error if the request body cannot be parsed as JSON or if verification fails.
 pub fn handle_verify_signature(
     _settings: &Settings,
     mut req: Request,
@@ -132,6 +140,10 @@ pub struct RotateKeyResponse {
 }
 
 /// Rotates the current active kid by generating and saving a new one
+///
+/// # Errors
+///
+/// Returns an error if the request signing settings are missing, JSON parsing fails, or key rotation fails.
 pub fn handle_rotate_key(
     settings: &Settings,
     mut req: Request,
@@ -232,6 +244,10 @@ pub struct DeactivateKeyResponse {
 }
 
 /// Deactivates an active key
+///
+/// # Errors
+///
+/// Returns an error if the request signing settings are missing, JSON parsing fails, or key deactivation fails.
 pub fn handle_deactivate_key(
     settings: &Settings,
     mut req: Request,

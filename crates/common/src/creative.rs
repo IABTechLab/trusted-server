@@ -297,6 +297,7 @@ pub(super) fn proxied_attr_value(settings: &Settings, attr_val: Option<String>) 
 
 /// Rewrite a full CSS stylesheet body by normalizing url(...) references to the
 /// unified first-party proxy. Relative URLs are left unchanged.
+#[must_use]
 pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
     rewrite_style_urls(settings, css)
 }
@@ -307,6 +308,7 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
 ///   (served from `/static/tsjs=tsjs-creative.min.js`).
+#[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);
@@ -495,6 +497,7 @@ pub struct CreativeHtmlProcessor<'a> {
 
 impl<'a> CreativeHtmlProcessor<'a> {
     /// Create a new HTML processor with the given settings.
+    #[must_use]
     pub fn new(settings: &'a Settings) -> Self {
         Self {
             settings,
@@ -529,7 +532,7 @@ impl StreamProcessor for CreativeHtmlProcessor<'_> {
     }
 }
 
-/// Stream processor for CSS that rewrites url() references to first-party proxy.
+/// Stream processor for CSS that rewrites `url()` references to first-party proxy.
 ///
 /// This processor buffers input chunks and processes the complete CSS
 /// when the stream ends, using `rewrite_css_body` internally.
@@ -540,6 +543,7 @@ pub struct CreativeCssProcessor<'a> {
 
 impl<'a> CreativeCssProcessor<'a> {
     /// Create a new CSS processor with the given settings.
+    #[must_use]
     pub fn new(settings: &'a Settings) -> Self {
         Self {
             settings,

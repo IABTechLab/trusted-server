@@ -62,6 +62,7 @@ pub fn handle_request_cookies(
 ///
 /// Generates a properly formatted cookie with security attributes
 /// for storing the synthetic ID.
+#[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
     format!(
         "synthetic_id={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",

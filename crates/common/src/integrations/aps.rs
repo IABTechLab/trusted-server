@@ -144,7 +144,7 @@ struct ApsSlotResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     amznp: Option<String>,
 
-    /// Amazon size in WxH format (e.g., "300x250")
+    /// Amazon size in `WxH` format (e.g., "300x250")
     #[serde(skip_serializing_if = "Option::is_none")]
     amznsz: Option<String>,
 
@@ -177,7 +177,7 @@ pub struct ApsConfig {
     pub timeout_ms: u32,
 }
 
-/// Custom deserializer for pub_id that accepts both string and integer
+/// Custom deserializer for `pub_id` that accepts both string and integer
 fn deserialize_pub_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -262,11 +262,12 @@ pub struct ApsAuctionProvider {
 
 impl ApsAuctionProvider {
     /// Create a new APS auction provider.
+    #[must_use]
     pub fn new(config: ApsConfig) -> Self {
         Self { config }
     }
 
-    /// Convert unified AuctionRequest to APS TAM bid request format.
+    /// Convert unified `AuctionRequest` to APS TAM bid request format.
     fn to_aps_request(&self, request: &AuctionRequest) -> ApsBidRequest {
         let slots: Vec<ApsSlot> = request
             .slots
@@ -313,7 +314,7 @@ impl ApsAuctionProvider {
     /// Note: Price is NOT decoded here. The encoded price is stored in metadata
     /// and will be decoded by the mediation layer (mocktioneer). This simulates
     /// real-world APS where only Amazon/GAM can decode the proprietary price encoding.
-    fn parse_aps_slot(&self, slot: ApsSlotResponse) -> Result<Bid, ()> {
+    fn parse_aps_slot(&self, slot: &ApsSlotResponse) -> Result<Bid, ()> {
         // Only process filled slots (fif == "1")
         if slot.fif.as_deref() != Some("1") {
             return Err(());
@@ -368,7 +369,7 @@ impl ApsAuctionProvider {
         })
     }
 
-    /// Parse APS TAM response into unified AuctionResponse.
+    /// Parse APS TAM response into unified `AuctionResponse`.
     fn parse_aps_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
         let mut bids = Vec::new();
 
@@ -380,7 +381,7 @@ impl ApsAuctionProvider {
             );
 
             for slot in aps_response.contextual.slots {
-                match self.parse_aps_slot(slot) {
+                match self.parse_aps_slot(&slot) {
                     Ok(bid) => {
                         let encoded_price = bid
                             .metadata
@@ -531,6 +532,7 @@ use std::sync::Arc;
 /// Auto-register APS provider based on settings configuration.
 ///
 /// Returns the APS provider if enabled in settings.
+#[must_use]
 pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
@@ -830,7 +832,7 @@ mod tests {
         };
 
         let bid = provider
-            .parse_aps_slot(aps_slot)
+            .parse_aps_slot(&aps_slot)
             .expect("should parse slot");
 
         assert_eq!(bid.slot_id, "test-slot");
@@ -889,7 +891,7 @@ mod tests {
             amznactt: Some("OPEN".to_string()),
         };
 
-        let bid = provider.parse_aps_slot(aps_slot).expect("should parse");
+        let bid = provider.parse_aps_slot(&aps_slot).expect("should parse");
 
         // Key assertions:
         // 1. creative should be None for APS bids

@@ -1,6 +1,6 @@
 //! Simplified HTML processor that combines URL replacement and Prebid injection
 //!
-//! This module provides a StreamProcessor implementation for HTML content.
+//! This module provides a `StreamProcessor` implementation for HTML content.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
@@ -94,6 +94,7 @@ pub struct HtmlProcessorConfig {
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
+    #[must_use]
     pub fn from_settings(
         _settings: &Settings,
         integrations: &IntegrationRegistry,
@@ -111,6 +112,7 @@ impl HtmlProcessorConfig {
 }
 
 /// Create an HTML processor with URL replacement and optional Prebid injection
+#[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
@@ -568,7 +570,7 @@ mod tests {
     #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             &registry,
@@ -674,7 +676,7 @@ mod tests {
             )
             .expect("should insert testlight config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let mut config = create_test_config();
         config.integrations = registry;
 

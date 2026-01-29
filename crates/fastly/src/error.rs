@@ -7,7 +7,7 @@ use fastly::Response;
 use trusted_server_common::error::{IntoHttpResponse, TrustedServerError};
 
 /// Converts a [`TrustedServerError`] into an HTTP error response.
-pub fn to_error_response(report: Report<TrustedServerError>) -> Response {
+pub fn to_error_response(report: &Report<TrustedServerError>) -> Response {
     // Get the root error for status code and message
     let root_error = report.current_context();
 
