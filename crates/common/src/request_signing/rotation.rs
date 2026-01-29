@@ -29,6 +29,11 @@ pub struct KeyRotationManager {
 }
 
 impl KeyRotationManager {
+    /// Creates a new key rotation manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API client cannot be initialized.
     pub fn new(
         config_store_id: impl Into<String>,
         secret_store_id: impl Into<String>,
@@ -47,6 +52,11 @@ impl KeyRotationManager {
         })
     }
 
+    /// Rotates the signing key by generating a new keypair and storing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key storage or update operations fail.
     pub fn rotate_key(
         &self,
         kid: Option<String>,
@@ -123,6 +133,11 @@ impl KeyRotationManager {
             })
     }
 
+    /// Lists all active key IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the active keys cannot be retrieved from the config store.
     pub fn list_active_keys(&self) -> Result<Vec<String>, Report<TrustedServerError>> {
         let active_kids_str = self.config_store.get("active-kids")?;
 
@@ -135,6 +150,11 @@ impl KeyRotationManager {
         Ok(active_kids)
     }
 
+    /// Deactivates a key by removing it from the active keys list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this would deactivate the last active key, or if the update fails.
     pub fn deactivate_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
         let mut active_kids = self.list_active_keys()?;
 
@@ -149,6 +169,11 @@ impl KeyRotationManager {
         self.update_active_kids(&active_kids)
     }
 
+    /// Deletes a key by deactivating it and removing it from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deactivation fails or if the key cannot be deleted from storage.
     pub fn delete_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
         self.deactivate_key(kid)?;
 
@@ -168,6 +193,7 @@ impl KeyRotationManager {
     }
 }
 
+#[must_use]
 pub fn generate_date_based_kid() -> String {
     use chrono::Utc;
     format!("ts-{}", Utc::now().format("%Y-%m-%d"))

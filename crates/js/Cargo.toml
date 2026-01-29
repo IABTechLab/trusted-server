@@ -6,6 +6,9 @@ description = "Trusted Server tsjs — TypeScript-built JS embedded in a Rust cr
 license = "Apache-2.0"
 build = "build.rs"
 
+[lints]
+workspace = true
+
 [lib]
 name = "trusted_server_js"
 path = "src/lib.rs"

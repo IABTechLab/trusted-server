@@ -10,31 +10,23 @@ describe('request.requestAds', () => {
     renderMock.mockReset();
   });
 
-  it('sends fetch and renders creatives from response', async () => {
-    // mock render module to capture calls
-    vi.mock('../../src/core/render', async () => {
-      const actual = await vi.importActual<any>('../../src/core/render');
-      return {
-        ...actual,
-        renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
-      };
-    });
-
-    // mock fetch
+  it('sends fetch and renders creatives via iframe from response', async () => {
+    // mock fetch - returns creative HTML inline in adm field
+    const creativeHtml = '<div>Test Creative</div>';
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
-      json: async () => ({ seatbid: [{ bid: [{ impid: 'slot1', adm: '<div>ad</div>' }] }] }),
+      json: async () => ({
+        seatbid: [{ bid: [{ impid: 'slot1', adm: creativeHtml }] }],
+      }),
     });
 
     const { addAdUnits } = await import('../../src/core/registry');
-    const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
     document.body.innerHTML = '<div id="slot1"></div>';
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
 
     requestAds();
     // wait microtasks
@@ -42,7 +34,11 @@ describe('request.requestAds', () => {
     await Promise.resolve();
 
     expect((globalThis as any).fetch).toHaveBeenCalled();
-    expect(renderMock).toHaveBeenCalledWith('slot1', '<div>ad</div>');
+
+    // Verify iframe was created with creative HTML in srcdoc
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
+    expect(iframe).toBeTruthy();
+    expect(iframe!.srcdoc).toContain(creativeHtml);
   });
 
   it('handles unexpected third-party response without rendering', async () => {
@@ -102,9 +98,19 @@ describe('request.requestAds', () => {
     expect(renderMock).not.toHaveBeenCalled();
   });
 
-  it('inserts an iframe per ad unit with correct src (firstParty)', async () => {
+  it('inserts an iframe with creative HTML from unified auction', async () => {
+    // mock fetch for unified auction endpoint - returns inline HTML
+    const creativeHtml = '<img src="/first-party/proxy?tsurl=...">Ad</img>';
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [{ bid: [{ impid: 'slot1', adm: creativeHtml }] }],
+      }),
+    });
+
     const { addAdUnits } = await import('../../src/core/registry');
-    const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
     // Prepare slot in DOM
@@ -112,32 +118,44 @@ describe('request.requestAds', () => {
     div.id = 'slot1';
     document.body.appendChild(div);
 
-    // Configure first-party mode explicitly
-    setConfig({ mode: 'firstParty' } as any);
-
     // Add an ad unit and request
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
     requestAds();
 
-    // Verify iframe was inserted with expected src
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Verify iframe was inserted with creative HTML in srcdoc
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
     expect(iframe).toBeTruthy();
-    expect(iframe!.getAttribute('src')).toContain('/first-party/ad?');
-    expect(iframe!.getAttribute('src')).toContain('slot=slot1');
-    expect(iframe!.getAttribute('src')).toContain('w=300');
-    expect(iframe!.getAttribute('src')).toContain('h=250');
+    expect(iframe!.srcdoc).toContain(creativeHtml);
   });
 
-  it('skips iframe insertion when slot is missing (firstParty)', async () => {
+  it('skips iframe insertion when slot is missing', async () => {
+    // mock fetch for unified auction endpoint - returns inline HTML
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            bid: [{ impid: 'missing-slot', adm: '<div>Creative for missing slot</div>' }],
+          },
+        ],
+      }),
+    });
+
     const { addAdUnits } = await import('../../src/core/registry');
-    const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
-    setConfig({ mode: 'firstParty' } as any);
     addAdUnits({ code: 'missing-slot', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
     requestAds();
 
-    // No iframe should be inserted because the slot isn't present
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No iframe should be inserted because the slot isn't present in DOM
     const iframe = document.querySelector('iframe');
     expect(iframe).toBeNull();
   });

@@ -21,6 +21,10 @@ pub trait StreamProcessor {
     ///
     /// # Returns
     /// Processed data or error
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing fails (e.g., I/O errors, encoding issues).
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error>;
 
     /// Reset the processor state (useful for reuse)
@@ -38,6 +42,7 @@ pub enum Compression {
 
 impl Compression {
     /// Detect compression from content-encoding header
+    #[must_use]
     pub fn from_content_encoding(encoding: &str) -> Self {
         match encoding.to_lowercase().as_str() {
             "gzip" => Self::Gzip,
@@ -76,11 +81,19 @@ pub struct StreamingPipeline<P: StreamProcessor> {
 
 impl<P: StreamProcessor> StreamingPipeline<P> {
     /// Create a new streaming pipeline
+    ///
+    /// # Errors
+    ///
+    /// No errors are returned by this constructor.
     pub fn new(config: PipelineConfig, processor: P) -> Self {
         Self { config, processor }
     }
 
     /// Process a stream from input to output
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression transformation is unsupported or if reading/writing fails.
     pub fn process<R: Read, W: Write>(
         &mut self,
         input: R,
@@ -433,10 +446,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 }
 
-/// Adapter to use lol_html HtmlRewriter as a StreamProcessor
-/// Important: Due to lol_html's ownership model, we must accumulate input
+/// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`
+/// Important: Due to `lol_html`'s ownership model, we must accumulate input
 /// and process it all at once when the stream ends. This is a limitation
-/// of the lol_html library's API design.
+/// of the `lol_html` library's API design.
 pub struct HtmlRewriterAdapter {
     settings: lol_html::Settings<'static, 'static>,
     accumulated_input: Vec<u8>,
@@ -444,6 +457,7 @@ pub struct HtmlRewriterAdapter {
 
 impl HtmlRewriterAdapter {
     /// Create a new HTML rewriter adapter
+    #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
         Self {
             settings,
@@ -510,7 +524,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
     }
 }
 
-/// Adapter to use our existing StreamingReplacer as a StreamProcessor
+/// Adapter to use our existing `StreamingReplacer` as a `StreamProcessor`
 use crate::streaming_replacer::StreamingReplacer;
 
 impl StreamProcessor for StreamingReplacer {

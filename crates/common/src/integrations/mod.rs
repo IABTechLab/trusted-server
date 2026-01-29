@@ -2,6 +2,8 @@
 
 use crate::settings::Settings;
 
+pub mod adserver_mock;
+pub mod aps;
 pub mod didomi;
 pub mod lockr;
 pub mod nextjs;

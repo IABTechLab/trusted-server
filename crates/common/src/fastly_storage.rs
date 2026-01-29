@@ -7,6 +7,8 @@ use http::StatusCode;
 use crate::backend::ensure_backend_from_url;
 use crate::error::TrustedServerError;
 
+const FASTLY_API_HOST: &str = "https://api.fastly.com";
+
 pub struct FastlyConfigStore {
     store_name: String,
 }
@@ -18,6 +20,11 @@ impl FastlyConfigStore {
         }
     }
 
+    /// Retrieves a configuration value from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not found in the config store.
     pub fn get(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         // TODO use try_open and return the error
         let store = ConfigStore::open(&self.store_name);
@@ -43,6 +50,12 @@ impl FastlySecretStore {
         }
     }
 
+    /// Retrieves a secret value from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret store cannot be opened, the key is not found,
+    /// or the secret plaintext cannot be retrieved.
     pub fn get(&self, key: &str) -> Result<Vec<u8>, Report<TrustedServerError>> {
         let store = SecretStore::open(&self.store_name).map_err(|_| {
             Report::new(TrustedServerError::Configuration {
@@ -69,6 +82,11 @@ impl FastlySecretStore {
             .map(|bytes| bytes.into_iter().collect())
     }
 
+    /// Retrieves a secret value from the store and decodes it as a UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret cannot be retrieved or is not valid UTF-8.
     pub fn get_string(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         let bytes = self.get(key)?;
         String::from_utf8(bytes).change_context(TrustedServerError::Configuration {
@@ -79,26 +97,40 @@ impl FastlySecretStore {
 
 pub struct FastlyApiClient {
     api_key: Vec<u8>,
-    base_url: String,
+    base_url: &'static str,
+    backend_name: String,
 }
 
 impl FastlyApiClient {
+    /// Creates a new Fastly API client using the default secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret store cannot be opened or the API key cannot be retrieved.
     pub fn new() -> Result<Self, Report<TrustedServerError>> {
         Self::from_secret_store("api-keys", "api_key")
     }
 
+    /// Creates a new Fastly API client from a specified secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API backend cannot be ensured or the API key cannot be retrieved.
     pub fn from_secret_store(
         store_name: &str,
         key_name: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        ensure_backend_from_url("https://api.fastly.com")?;
+        let backend_name = ensure_backend_from_url("https://api.fastly.com")?;
 
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;
 
+        log::debug!("FastlyApiClient initialized with backend: {}", backend_name);
+
         Ok(Self {
             api_key,
-            base_url: "https://api.fastly.com".to_string(),
+            base_url: FASTLY_API_HOST,
+            backend_name,
         })
     }
 
@@ -135,13 +167,18 @@ impl FastlyApiClient {
                 .with_body(body_content);
         }
 
-        request.send("backend_https_api_fastly_com").map_err(|e| {
+        request.send(&self.backend_name).map_err(|e| {
             Report::new(TrustedServerError::Configuration {
                 message: format!("Failed to send API request: {}", e),
             })
         })
     }
 
+    /// Updates a configuration item in a Fastly config store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK status.
     pub fn update_config_item(
         &self,
         store_id: &str,
@@ -181,6 +218,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Creates a secret in a Fastly secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK status.
     pub fn create_secret(
         &self,
         store_id: &str,
@@ -220,6 +262,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Deletes a configuration item from a Fastly config store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK/NO_CONTENT status.
     pub fn delete_config_item(
         &self,
         store_id: &str,
@@ -254,6 +301,11 @@ impl FastlyApiClient {
         }
     }
 
+    /// Deletes a secret from a Fastly secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns a non-OK/NO_CONTENT status.
     pub fn delete_secret(
         &self,
         store_id: &str,
