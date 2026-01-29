@@ -11,12 +11,13 @@ use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::auction_config_types::AuctionConfig;
 use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
@@ -67,7 +68,7 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
@@ -179,7 +180,7 @@ impl DerefMut for IntegrationSettings {
 }
 
 #[allow(unused)]
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
@@ -203,7 +204,7 @@ impl Synthetic {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
     /// URLs from these domains will not be proxied through first-party endpoints.
@@ -239,7 +240,7 @@ impl Rewrite {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -264,7 +265,7 @@ impl Handler {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
@@ -276,7 +277,7 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -294,6 +295,8 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub rewrite: Rewrite,
+    #[serde(default)]
+    pub auction: AuctionConfig,
 }
 
 #[allow(unused)]

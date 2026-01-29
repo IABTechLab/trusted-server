@@ -186,52 +186,55 @@ impl IntegrationDocumentState {
 #[derive(Clone, Debug)]
 pub struct IntegrationEndpoint {
     pub method: Method,
-    pub path: &'static str,
+    pub path: String,
 }
 
 impl IntegrationEndpoint {
     #[must_use]
-    pub fn new(method: Method, path: &'static str) -> Self {
-        Self { method, path }
+    pub fn new(method: Method, path: impl Into<String>) -> Self {
+        Self {
+            method,
+            path: path.into(),
+        }
     }
 
     #[must_use]
-    pub fn get(path: &'static str) -> Self {
+    pub fn get(path: impl Into<String>) -> Self {
         Self {
             method: Method::GET,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn post(path: &'static str) -> Self {
+    pub fn post(path: impl Into<String>) -> Self {
         Self {
             method: Method::POST,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn put(path: &'static str) -> Self {
+    pub fn put(path: impl Into<String>) -> Self {
         Self {
             method: Method::PUT,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn delete(path: &'static str) -> Self {
+    pub fn delete(path: impl Into<String>) -> Self {
         Self {
             method: Method::DELETE,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn patch(path: &'static str) -> Self {
+    pub fn patch(path: impl Into<String>) -> Self {
         Self {
             method: Method::PATCH,
-            path,
+            path: path.into(),
         }
     }
 }
@@ -264,7 +267,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn get(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::get(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
@@ -276,7 +279,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn post(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::post(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
@@ -288,7 +291,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn put(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::put(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
@@ -296,11 +299,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.delete("/users")  // becomes /integrations/my_integration/users
+    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
     /// ```
     fn delete(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::delete(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
@@ -308,11 +311,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.patch("/users")  // becomes /integrations/my_integration/users
+    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
     /// ```
     fn patch(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::patch(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::patch(full_path)
     }
 }
 
@@ -530,7 +533,7 @@ impl IntegrationRegistry {
                                     .expect("path should end with '/*'")
                             )
                         } else {
-                            route.path.to_string()
+                            route.path.clone()
                         };
 
                         // Select appropriate router and insert
@@ -668,9 +671,10 @@ impl IntegrationRegistry {
             let entry = map
                 .entry(*integration_id)
                 .or_insert_with(|| IntegrationMetadata::new(integration_id));
-            entry
-                .routes
-                .push(IntegrationEndpoint::new(route.method.clone(), route.path));
+            entry.routes.push(IntegrationEndpoint::new(
+                route.method.clone(),
+                route.path.clone(),
+            ));
         }
 
         for rewriter in &self.inner.html_rewriters {

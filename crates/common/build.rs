@@ -3,6 +3,9 @@
 #[path = "src/error.rs"]
 mod error;
 
+#[path = "src/auction_config_types.rs"]
+mod auction_config_types;
+
 #[path = "src/settings.rs"]
 mod settings;
 

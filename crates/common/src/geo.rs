@@ -15,7 +15,7 @@ use crate::constants::{
 ///
 /// Contains all available geographic data from Fastly's geolocation service,
 /// including city, country, continent, coordinates, and DMA/metro code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeoInfo {
     /// City name
     pub city: String,
