@@ -9,9 +9,14 @@ use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
+use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::synthetic::get_synthetic_id;
+
+/// Chunk size used for streaming content through the rewrite pipeline.
+const STREAMING_CHUNK_SIZE: usize = 8192;
 
 #[derive(Deserialize)]
 struct ProxySignReq {
@@ -77,13 +82,16 @@ impl<'a> ProxyRequestConfig<'a> {
     }
 }
 
+/// Encodings we support decompressing in `finalize_proxied_response`.
+/// We override the client's Accept-Encoding to only advertise these.
+const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
+
 /// Copy a curated set of request headers to a proxied request.
 fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
     for header_name in [
         HEADER_USER_AGENT,
         HEADER_ACCEPT,
         HEADER_ACCEPT_LANGUAGE,
-        HEADER_ACCEPT_ENCODING,
         HEADER_REFERER,
         HEADER_X_FORWARDED_FOR,
     ] {
@@ -91,11 +99,19 @@ fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
             dst.set_header(&header_name, v);
         }
     }
+    // Only advertise encodings we can decompress (excludes zstd, etc.)
+    dst.set_header(HEADER_ACCEPT_ENCODING, SUPPORTED_ENCODINGS);
 }
 
-// Transform the backend response into the final response sent to the client.
-// Handles HTML and CSS rewrites and image content-type normalization.
-fn rebuild_text_response(beresp: Response, content_type: &'static str, body: String) -> Response {
+/// Rebuild a response with a new body, preserving headers except Content-Length.
+/// If `preserve_encoding` is true, the Content-Encoding header is kept (for compressed responses).
+/// If false, Content-Encoding is stripped (for decompressed responses).
+fn rebuild_response_with_body(
+    beresp: &Response,
+    content_type: &'static str,
+    body: Vec<u8>,
+    preserve_encoding: bool,
+) -> Response {
     let status = beresp.get_status();
     let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
         .get_headers()
@@ -103,7 +119,12 @@ fn rebuild_text_response(beresp: Response, content_type: &'static str, body: Str
         .collect();
     let mut resp = Response::from_status(status);
     for (name, value) in headers {
+        // Always skip Content-Length (size changed) and Content-Type (we set it)
         if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
+            continue;
+        }
+        // Skip Content-Encoding only if we're not preserving it
+        if name == header::CONTENT_ENCODING && !preserve_encoding {
             continue;
         }
         resp.set_header(name, value);
@@ -113,16 +134,55 @@ fn rebuild_text_response(beresp: Response, content_type: &'static str, body: Str
     resp
 }
 
+/// Process a response body through a streaming pipeline with the given processor.
+///
+/// Handles decompression, content processing, and re-compression while preserving
+/// the response status and headers.
+fn process_response_with_pipeline<P: StreamProcessor>(
+    mut beresp: Response,
+    processor: P,
+    compression: Compression,
+    content_type: &'static str,
+    error_context: &'static str,
+) -> Result<Response, Report<TrustedServerError>> {
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: STREAMING_CHUNK_SIZE,
+    };
+
+    let body = beresp.take_body();
+    let mut output = Vec::new();
+    let mut pipeline = StreamingPipeline::new(config, processor);
+    pipeline
+        .process(body, &mut output)
+        .change_context(TrustedServerError::Proxy {
+            message: error_context.to_string(),
+        })?;
+
+    Ok(rebuild_response_with_body(
+        &beresp,
+        content_type,
+        output,
+        compression != Compression::None,
+    ))
+}
+
 fn finalize_proxied_response(
     settings: &Settings,
     req: &Request,
     target_url: &str,
     mut beresp: Response,
-) -> Response {
-    // Determine content-type from response headers
+) -> Result<Response, Report<TrustedServerError>> {
+    // Determine content-type and content-encoding from response headers
     let status_code = beresp.get_status().as_u16();
     let ct_raw = beresp
         .get_header(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_encoding = beresp
+        .get_header(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
@@ -136,29 +196,44 @@ fn finalize_proxied_response(
         .unwrap_or("-");
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
+    let ce_for_log: &str = if content_encoding.is_empty() {
+        "-"
+    } else {
+        &content_encoding
+    };
     log::info!(
-        "proxy: origin response status={} ct={} cl={} accept={} url={}",
+        "origin response status={} ct={} ce={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
+        ce_for_log,
         cl_raw,
         accept_raw,
         target_url
     );
 
     let ct = ct_raw.to_ascii_lowercase();
+    let compression = Compression::from_content_encoding(&content_encoding);
 
     if ct.contains("text/html") {
-        // HTML: rewrite and serve as HTML (safe to read as string)
-        let body = beresp.take_body_str();
-        let rewritten = crate::creative::rewrite_creative_html(&body, settings);
-        return rebuild_text_response(beresp, "text/html; charset=utf-8", rewritten);
+        let processor = CreativeHtmlProcessor::new(settings);
+        return process_response_with_pipeline(
+            beresp,
+            processor,
+            compression,
+            "text/html; charset=utf-8",
+            "Failed to process HTML response",
+        );
     }
 
     if ct.contains("text/css") {
-        // CSS: rewrite url(...) references in stylesheets (safe to read as string)
-        let body = beresp.take_body_str();
-        let rewritten = crate::creative::rewrite_css_body(&body, settings);
-        return rebuild_text_response(beresp, "text/css; charset=utf-8", rewritten);
+        let processor = CreativeCssProcessor::new(settings);
+        return process_response_with_pipeline(
+            beresp,
+            processor,
+            compression,
+            "text/css; charset=utf-8",
+            "Failed to process CSS response",
+        );
     }
 
     // Image handling: set generic content-type if missing and log pixel heuristics
@@ -199,18 +274,14 @@ fn finalize_proxied_response(
         }
 
         if is_pixel {
-            log::info!(
-                "proxy: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
+            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
         }
 
-        return beresp;
+        return Ok(beresp);
     }
 
     // Passthrough for non-text, non-image responses
-    beresp
+    Ok(beresp)
 }
 
 fn finalize_proxied_response_streaming(
@@ -235,7 +306,7 @@ fn finalize_proxied_response_streaming(
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
     log::info!(
-        "proxy(stream): origin response status={} ct={} cl={} accept={} url={}",
+        "origin response status={} ct={} cl={} accept={} url={}",
         status_code,
         ct_for_log,
         cl_raw,
@@ -280,7 +351,7 @@ fn finalize_proxied_response_streaming(
 
         if is_pixel {
             log::info!(
-                "proxy(stream): likely pixel image fetched: {} ct={}",
+                "stream: likely pixel image fetched: {} ct={}",
                 target_url,
                 ct
             );
@@ -340,10 +411,7 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
     let synthetic_id_param = match get_synthetic_id(req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!(
-                "proxy: failed to extract synthetic ID for forwarding: {:?}",
-                e
-            );
+            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
             None
         }
     };
@@ -368,11 +436,11 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
         }
 
         log::debug!(
-            "proxy: forwarding synthetic_id to origin url {}",
+            "forwarding synthetic_id to origin url {}",
             target_url_parsed.as_str()
         );
     } else {
-        log::debug!("proxy: no synthetic_id to forward to origin");
+        log::debug!("no synthetic_id to forward to origin");
     }
 }
 
@@ -430,11 +498,15 @@ async fn proxy_with_redirects(
             })?;
 
         if !follow_redirects {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(
+                    req,
+                    &current_url,
+                    beresp,
+                ))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         let status = beresp.get_status();
@@ -448,11 +520,15 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(
+                    req,
+                    &current_url,
+                    beresp,
+                ))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         let Some(location) = beresp
@@ -460,24 +536,23 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(
+                    req,
+                    &current_url,
+                    beresp,
+                ))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         };
 
         if redirect_attempt == MAX_REDIRECTS {
             log::warn!(
-                "proxy: redirect limit reached for {}; returning redirect response",
+                "redirect limit reached for {}; returning redirect response",
                 current_url
             );
-            return Ok(finalize_proxied_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-            ));
+            return finalize_proxied_response(settings, req, &current_url, beresp);
         }
 
         let next_url = url::Url::parse(location)
@@ -490,15 +565,19 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            return Ok(if stream_passthrough {
-                finalize_proxied_response_streaming(req, &current_url, beresp)
+            return if stream_passthrough {
+                Ok(finalize_proxied_response_streaming(
+                    req,
+                    &current_url,
+                    beresp,
+                ))
             } else {
                 finalize_proxied_response(settings, req, &current_url, beresp)
-            });
+            };
         }
 
         log::info!(
-            "proxy: following redirect {} => {} (status {})",
+            "following redirect {} => {} (status {})",
             current_url,
             next_url,
             status.as_u16()
@@ -527,6 +606,10 @@ async fn proxy_with_redirects(
 /// - If the response is an image or the request `Accept` indicates images, ensures a
 ///   generic `image/*` content type if origin omitted it, and logs likely 1×1 pixels
 ///   using simple size/URL heuristics. No special response (still proxied).
+///
+/// # Errors
+///
+/// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_proxy(
     settings: &Settings,
     req: Request,
@@ -556,6 +639,10 @@ pub async fn handle_first_party_proxy(
 /// content, it validates the URL and issues a 302 redirect to the reconstructed
 /// target URL. This avoids parsing/downloading the content and lets the browser
 /// navigate directly to the destination under first-party control.
+///
+/// # Errors
+///
+/// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_click(
     settings: &Settings,
     req: Request,
@@ -569,10 +656,7 @@ pub async fn handle_first_party_click(
     let synthetic_id = match get_synthetic_id(&req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!(
-                "click: failed to extract synthetic ID for forwarding: {:?}",
-                e
-            );
+            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
             None
         }
     };
@@ -599,15 +683,12 @@ pub async fn handle_first_party_click(
                 }
 
                 let final_target = url.to_string();
-                log::debug!(
-                    "click: forwarding synthetic_id to target url {}",
-                    final_target
-                );
+                log::debug!("forwarding synthetic_id to target url {}", final_target);
                 redirect_target = final_target;
             }
             Err(e) => {
                 log::warn!(
-                    "click: failed to parse target url for synthetic forwarding: {:?}",
+                    "failed to parse target url for synthetic forwarding: {:?}",
                     e
                 );
             }
@@ -624,7 +705,7 @@ pub async fn handle_first_party_click(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
-        "click: redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
+        "redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
         tsurl,
         had_params,
         redirect_target,
@@ -644,6 +725,10 @@ pub async fn handle_first_party_click(
 /// in the signature so the signed URL cannot be replayed indefinitely. Returns JSON
 /// `{ href, base }` where `href` is the signed `/first-party/proxy?...` path and `base`
 /// is the normalized clear URL.
+///
+/// # Errors
+///
+/// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     mut req: Request,
@@ -681,7 +766,7 @@ pub async fn handle_first_party_proxy_sign(
             .unwrap_or_else(|| "https".to_string());
         format!("{}:{}", default_scheme, trimmed)
     } else {
-        crate::creative::to_abs(trimmed, settings).ok_or_else(|| {
+        crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
                 message: "unsupported url".to_string(),
             })
@@ -747,6 +832,10 @@ struct ProxyRebuildResp {
 /// Body: { tsclick: "/first-party/click?tsurl=...&a=1", add: {"b":"2"}, del: ["c"] }
 /// - Only allows adding new parameters or removing existing ones.
 /// - Base tsurl cannot change.
+///
+/// # Errors
+///
+/// Returns an error if JSON parsing fails, the URL is invalid, or the request body cannot be read.
 pub async fn handle_first_party_proxy_rebuild(
     settings: &Settings,
     mut req: Request,
@@ -1011,7 +1100,7 @@ mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        reconstruct_and_validate_signed_target, ProxyRequestConfig,
+        reconstruct_and_validate_signed_target, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -1363,12 +1452,13 @@ mod tests {
                 .unwrap(),
             "en-US"
         );
+        // Accept-Encoding is overridden to only include supported encodings
         assert_eq!(
             dst.get_header(HEADER_ACCEPT_ENCODING)
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "gzip"
+            SUPPORTED_ENCODINGS
         );
         assert_eq!(
             dst.get_header(HEADER_REFERER).unwrap().to_str().unwrap(),
@@ -1423,10 +1513,11 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
-        let direct = creative::rewrite_creative_html(html, &settings);
+        let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp);
+        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+            .expect("finalize should succeed");
         let ct = out
             .get_header(header::CONTENT_TYPE)
             .unwrap()
@@ -1453,7 +1544,8 @@ mod tests {
             .with_header(header::CONTENT_TYPE, "text/css")
             .with_body(css);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp);
+        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+            .expect("finalize should succeed");
         let body = out.take_body_str();
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         let ct = out
@@ -1470,7 +1562,8 @@ mod tests {
         let beresp = Response::from_status(StatusCode::OK).with_body("PNG");
         let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
         req.set_header(HEADER_ACCEPT, "image/*");
-        let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp);
+        let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
+            .expect("finalize should succeed");
         // Since CT was missing and Accept indicates image, it should set generic image/*
         let ct = out
             .get_header(header::CONTENT_TYPE)
@@ -1487,7 +1580,8 @@ mod tests {
             .with_header(header::CONTENT_TYPE, "application/json")
             .with_body("{\"ok\":true}");
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp);
+        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp)
+            .expect("finalize should succeed");
         // Should not rewrite, preserve status and content-type
         assert_eq!(out.get_status(), StatusCode::ACCEPTED);
         let ct = out
@@ -1498,5 +1592,148 @@ mod tests {
         assert_eq!(ct, "application/json");
         let body = out.take_body_str();
         assert_eq!(body, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn html_gzip_response_is_processed_with_compression_preserved() {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::{Read, Write};
+
+        let settings = create_test_settings();
+        let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
+
+        // Gzip compress the HTML
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(html.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_header(header::CONTENT_ENCODING, "gzip")
+            .with_body(compressed);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+            .expect("finalize should process and succeed");
+
+        // Content-Encoding should be preserved (gzip in -> gzip out)
+        let ce = out
+            .get_header(header::CONTENT_ENCODING)
+            .expect("Content-Encoding should be preserved")
+            .to_str()
+            .unwrap();
+        assert_eq!(ce, "gzip");
+
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+
+        // Decompress output to verify content was rewritten
+        let compressed_output = out.into_body().into_bytes();
+        let mut decoder = GzDecoder::new(&compressed_output[..]);
+        let mut decompressed = String::new();
+        decoder
+            .read_to_string(&mut decompressed)
+            .expect("should decompress output");
+
+        assert!(
+            decompressed.contains("/first-party/proxy?tsurl="),
+            "HTML should be rewritten: {}",
+            decompressed
+        );
+    }
+
+    #[test]
+    fn css_brotli_response_is_processed_with_compression_preserved() {
+        use brotli::enc::writer::CompressorWriter;
+        use brotli::Decompressor;
+        use std::io::{Read, Write};
+
+        let settings = create_test_settings();
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+
+        // Brotli compress the CSS
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = CompressorWriter::new(&mut compressed, 4096, 4, 22);
+            encoder.write_all(css.as_bytes()).unwrap();
+        }
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/css")
+            .with_header(header::CONTENT_ENCODING, "br")
+            .with_body(compressed);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+            .expect("finalize should process brotli and succeed");
+
+        // Content-Encoding should be preserved (br in -> br out)
+        let ce = out
+            .get_header(header::CONTENT_ENCODING)
+            .expect("Content-Encoding should be preserved")
+            .to_str()
+            .unwrap();
+        assert_eq!(ce, "br");
+
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/css; charset=utf-8");
+
+        // Decompress output to verify content was rewritten
+        let compressed_output = out.into_body().into_bytes();
+        let mut decoder = Decompressor::new(&compressed_output[..], 4096);
+        let mut decompressed = String::new();
+        decoder
+            .read_to_string(&mut decompressed)
+            .expect("should decompress brotli output");
+
+        assert!(
+            decompressed.contains("/first-party/proxy?tsurl="),
+            "CSS should be rewritten: {}",
+            decompressed
+        );
+    }
+
+    #[test]
+    fn html_uncompressed_response_is_processed_without_encoding() {
+        let settings = create_test_settings();
+        let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_body(html);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let mut out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+            .expect("finalize should succeed");
+
+        // No Content-Encoding since input was uncompressed
+        assert!(
+            out.get_header(header::CONTENT_ENCODING).is_none(),
+            "Content-Encoding should not be set for uncompressed input"
+        );
+
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+
+        let body = out.take_body_str();
+        assert!(
+            body.contains("/first-party/proxy?tsurl="),
+            "HTML should be rewritten: {}",
+            body
+        );
     }
 }

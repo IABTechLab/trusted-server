@@ -118,6 +118,17 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
     Ok(None)
 }
 
+/// Gets or creates a synthetic ID from the request.
+///
+/// Attempts to retrieve an existing synthetic ID from:
+/// 1. The `x-psid-ts` header
+/// 2. The `synthetic_id` cookie
+///
+/// If neither exists, generates a new synthetic ID.
+///
+/// # Errors
+///
+/// Returns an error if template rendering fails during generation or if ID generation fails.
 pub fn get_or_generate_synthetic_id(
     settings: &Settings,
     req: &Request,

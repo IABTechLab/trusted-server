@@ -15,7 +15,7 @@ use crate::constants::{
 ///
 /// Contains all available geographic data from Fastly's geolocation service,
 /// including city, country, continent, coordinates, and DMA/metro code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeoInfo {
     /// City name
     pub city: String,
@@ -71,11 +71,13 @@ impl GeoInfo {
     }
 
     /// Returns coordinates as a formatted string "latitude,longitude"
+    #[must_use]
     pub fn coordinates_string(&self) -> String {
         format!("{},{}", self.latitude, self.longitude)
     }
 
     /// Checks if a valid metro code is available (non-zero)
+    #[must_use]
     pub fn has_metro_code(&self) -> bool {
         self.metro_code > 0
     }

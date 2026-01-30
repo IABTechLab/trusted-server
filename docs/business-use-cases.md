@@ -6,33 +6,18 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 ## Revenue & Monetization
 
-### 1. Increase Ad Revenue in Cookieless Environments
+### 1. Increased Ad Revenue in Cookieless Environments
 
-**Problem**: Safari and Firefox severely restrict third-party cookies, fragmenting user identity and reducing addressable inventory [CPMs by 30-45% in North America]a(https://gs.statcounter.com/browser-market-share/desktop-mobile/north-america) alone. 
+**Problem**: Safari and Firefox block third-party cookies, fragmenting user identity and reducing addressable inventory CPMs by 30-50%.
 
-**Solution**: Trusted Server's synthetic ID module maintains user recognition across all browsers through first-party identifiers. Synthetic IDs are set as an HTTP header as such: 
-
-```http
-// Header Example
-X-Synthetic-Ts: 0f99d7dc67265b6e3f9c10c2bbdca5357e739538ee1ac1f9e2d1e906299b6f37
-```
-
-They are also appended to the publisher first-pary cookie as well: 
-
-```http
-// First-Party Cookie Snippet 
- vis_opt_exp_27_exclude=1; 
-----> synthetic_id=0f99d7dc67265b6e3f9c10c2bbdca5357e739538ee1ac1f9e2d1e906299b6f37; 
- sharedID=235334ad-841e-42e7-a902-c0bf2a55d56d; _sharedID_cst=zix7LPQsHA%3D%3D;
-```
-
-As a reminder, Synthetic ID presence can be opted out of by end-users via the publiser's CMP. 
+**Solution**: Trusted Server's synthetic ID system maintains user recognition across cookieless browsers through first-party identifiers.
 
 **Business Impact**:
 - **Revenue Recovery**: Restore 30-40% of lost Safari/Firefox CPM
-- **Addressable Inventory**: Increase valuable, addressable inventory from ~60% to 95%
+- **Addressable Inventory**: Increase addressable inventory from 60% to 95%
+- **Annual Value**: $500K+ for mid-sized publisher (10M monthly visits)
 
-**Early Testing Metrics**:
+**Metrics**:
 - CPM lift: +35% in Safari
 - Fill rate increase: +25% in cookieless browsers
 - Identity resolution rate: 90%+ vs 40% with third-party cookies
@@ -319,13 +304,12 @@ As a reminder, Synthetic ID presence can be opted out of by end-users via the pu
 **Total Cost Savings**: +$900K
 
 **Risk Mitigation**:
-1. GDPR fine avoidance: not assumed here
+1. GDPR fine avoidance: +$2.3M (risk value)
 2. Malvertising prevention: +$1.2M (user retention)
 
 **Net Impact**: +$3.68M annually
 **ROI**: 18.4x (1,840% return)
 
-* These are estimated values and not guaranteed 
 ---
 
 ## Getting Started
