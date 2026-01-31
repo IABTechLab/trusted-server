@@ -11,12 +11,13 @@ use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::auction_config_types::AuctionConfig;
 use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
@@ -27,7 +28,7 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Extracts the host (including port if present) from the origin_url.
+    /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
     ///
@@ -42,6 +43,7 @@ impl Publisher {
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
     #[allow(dead_code)]
+    #[must_use]
     pub fn origin_host(&self) -> String {
         Url::parse(&self.origin_url)
             .ok()
@@ -66,7 +68,7 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
@@ -77,6 +79,11 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 }
 
 impl IntegrationSettings {
+    /// Inserts a configuration value for an integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration cannot be serialized to JSON.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert_config<T>(
         &mut self,
@@ -115,6 +122,11 @@ impl IntegrationSettings {
         }
     }
 
+    /// Retrieves and validates a typed configuration for an integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration cannot be parsed from JSON or fails validation.
     pub fn get_typed<T>(
         &self,
         integration_id: &str,
@@ -168,7 +180,7 @@ impl DerefMut for IntegrationSettings {
 }
 
 #[allow(unused)]
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
@@ -179,6 +191,11 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
+    /// Validates that the secret key is not the placeholder value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the secret key is `"secret_key"` (the placeholder).
     pub fn validate_secret_key(secret_key: &str) -> Result<(), ValidationError> {
         match secret_key {
             "secret_key" => Err(ValidationError::new("Secret key is not valid")),
@@ -187,7 +204,7 @@ impl Synthetic {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
     /// URLs from these domains will not be proxied through first-party endpoints.
@@ -198,6 +215,7 @@ pub struct Rewrite {
 impl Rewrite {
     /// Checks if a URL should be excluded from rewriting based on domain matching
     #[allow(dead_code)]
+    #[must_use]
     pub fn is_excluded(&self, url: &str) -> bool {
         // Parse URL to extract host
         let Ok(parsed) = url::Url::parse(url) else {
@@ -222,7 +240,7 @@ impl Rewrite {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -247,7 +265,7 @@ impl Handler {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
@@ -259,7 +277,7 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -277,6 +295,8 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub rewrite: Rewrite,
+    #[serde(default)]
+    pub auction: AuctionConfig,
 }
 
 #[allow(unused)]
@@ -347,6 +367,11 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
+    /// Retrieves the integration configuration of a specific type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the integration configuration exists but cannot be deserialized as the requested type.
     pub fn integration_config<T>(
         &self,
         integration_id: &str,
@@ -401,7 +426,7 @@ where
             } else {
                 let parts = if txt.contains(',') {
                     txt.split(',')
-                        .map(|p| p.trim())
+                        .map(str::trim)
                         .filter(|p| !p.is_empty())
                         .collect::<Vec<_>>()
                 } else {

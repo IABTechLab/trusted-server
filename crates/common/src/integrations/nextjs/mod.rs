@@ -56,6 +56,7 @@ fn default_max_combined_payload_bytes() -> usize {
     10 * 1024 * 1024
 }
 
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let config = match build(settings) {
         Some(config) => {
@@ -142,7 +143,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -205,7 +206,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -253,7 +254,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -304,7 +305,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -370,7 +371,7 @@ mod tests {
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -442,7 +443,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         // Use small chunk size to force fragmentation

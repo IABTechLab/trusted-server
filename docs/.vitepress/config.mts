@@ -1,7 +1,8 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid(defineConfig({
   title: "Trusted Server",
   description: "Privacy-preserving edge computing for ad serving and synthetic ID generation",
   base: "/trusted-server",
@@ -53,7 +54,8 @@ export default defineConfig({
       {
         text: 'Advanced',
         items: [
-          { text: 'RSC Hydration', link: '/guide/rsc-hydration' }
+          { text: 'RSC Hydration', link: '/guide/rsc-hydration' },
+          { text: 'Collective Sync', link: '/guide/collective-sync' }
         ]
       },
       {
@@ -101,5 +103,12 @@ export default defineConfig({
       message: 'Released under the Apache License 2.0.',
       copyright: 'Copyright © 2018-present IAB Technology Laboratory'
     }
+  },
+  // Mermaid configuration
+  mermaid: {
+    // https://mermaid.js.org/config/setup/modules/mermaidAPI.html#mermaidapi-configuration-defaults
+  },
+  mermaidPlugin: {
+    class: 'mermaid'
   }
-})
+}))

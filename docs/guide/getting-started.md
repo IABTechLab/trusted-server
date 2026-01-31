@@ -8,7 +8,7 @@ Before you begin, ensure you have:
 
 - Rust 1.91.1 or later
 - Fastly CLI installed
-- A Fastly account
+- A Fastly account and API Key
 - Basic familiarity with WebAssembly
 
 ## Installation
@@ -27,6 +27,16 @@ cd trusted-server
 brew install fastly/tap/fastly
 
 # Or download from fastly.com/cli
+```
+
+### Set Up Fastly CLI
+
+```bash
+# Generate API Token in Faslty Web Portal
+fastly profile create
+# Follow interactive Prompts
+# This will store your API token credential in a configuration file and remember it for subsequent commands.
+# Set a FASTLY_API_TOKEN environment variable
 ```
 
 ### Install Viceroy (Test Runtime)

@@ -1,16 +1,12 @@
-// Request orchestration for tsjs: fires first-party iframe loads or third-party fetches.
-import { delay } from '../shared/async';
-
+// Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
-import { renderCreativeIntoSlot, renderAllAdUnits, createAdIframe, findSlot } from './render';
-import { getConfig } from './config';
-import { RequestMode } from './types';
+import { createAdIframe, findSlot, buildCreativeDocument } from './render';
 import type { RequestAdsCallback, RequestAdsOptions } from './types';
 
 // getHighestCpmBids is provided by the Prebid extension (shim) to mirror Prebid's API
 
-// Entry point matching Prebid's requestBids signature; decides first/third-party mode.
+// Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
   maybeOpts?: RequestAdsOptions
@@ -25,81 +21,38 @@ export function requestAds(
     callback = opts?.bidsBackHandler;
   }
 
-  const mode: RequestMode = (getConfig().mode as RequestMode | undefined) ?? RequestMode.FirstParty;
-  log.info('requestAds: called', { hasCallback: typeof callback === 'function', mode });
+  log.info('requestAds: called', { hasCallback: typeof callback === 'function' });
   try {
     const adUnits = getAllUnits();
     const payload = { adUnits, config: {} };
     log.debug('requestAds: payload', { units: adUnits.length });
-    if (mode === RequestMode.FirstParty) void requestAdsFirstParty(adUnits);
-    else requestAdsThirdParty(payload);
+
+    // Use unified auction endpoint
+    void requestAdsUnified(payload);
+
     // Synchronously invoke callback to match test expectations
     try {
       if (callback) callback();
     } catch {
       /* ignore callback errors */
     }
-    // network handled in requestAdsThirdParty; no-op here
   } catch {
     log.warn('requestAds: failed to initiate');
   }
 }
 
-// Create per-slot first-party iframe requests served directly from the edge.
-async function requestAdsFirstParty(adUnits: ReadonlyArray<{ code: string }>) {
-  for (const unit of adUnits) {
-    const size = (firstSize(unit) ?? [300, 250]) as readonly [number, number];
-    const slotId = unit.code;
-
-    const attemptInsert = async (attemptsRemaining: number): Promise<void> => {
-      const container = findSlot(slotId) as HTMLElement | null;
-      if (container) {
-        const iframe = createAdIframe(container, {
-          name: `tsjs_iframe_${slotId}`,
-          title: 'Ad content',
-          width: size[0],
-          height: size[1],
-        });
-        iframe.src = `/first-party/ad?slot=${encodeURIComponent(slotId)}&w=${encodeURIComponent(String(size[0]))}&h=${encodeURIComponent(String(size[1]))}`;
-        return;
-      }
-
-      if (attemptsRemaining <= 0) {
-        log.warn('requestAds(firstParty): slot not found; skipping iframe', { slotId });
-        return;
-      }
-
-      if (typeof document !== 'undefined' && document.readyState === 'loading') {
-        document.addEventListener(
-          'DOMContentLoaded',
-          () => {
-            void attemptInsert(attemptsRemaining - 1);
-          },
-          { once: true }
-        );
-        return;
-      }
-
-      await delay(50);
-      await attemptInsert(attemptsRemaining - 1);
-    };
-
-    void attemptInsert(10);
-  }
-}
-
-// Fire a JSON POST to the third-party ad endpoint and render returned creatives.
-function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) {
-  // Render simple placeholders immediately so pages have content
-  renderAllAdUnits();
+// Fire a JSON POST to the unified /auction endpoint and render creatives via iframes.
+function requestAdsUnified(payload: { adUnits: unknown[]; config: unknown }) {
   if (typeof fetch !== 'function') {
     log.warn('requestAds: fetch not available; nothing to render');
     return;
   }
-  log.info('requestAds: sending request to /third-party/ad', {
+
+  log.info('requestAds: sending request to /auction', {
     units: (payload.adUnits || []).length,
   });
-  void fetch('/third-party/ad', {
+
+  void fetch('/auction', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
@@ -107,14 +60,22 @@ function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) 
     keepalive: true,
   })
     .then(async (res) => {
-      log.debug('requestAds: sent');
+      log.debug('requestAds: received response');
       try {
         const ct = res.headers.get('content-type') || '';
         if (res.ok && ct.includes('application/json')) {
           const data: unknown = await res.json();
-          for (const bid of parseSeatBids(data)) {
-            if (bid.impid && bid.adm) renderCreativeIntoSlot(String(bid.impid), bid.adm);
+          const bids = parseSeatBids(data);
+
+          log.info('requestAds: got bids', { count: bids.length });
+
+          for (const bid of bids) {
+            if (bid.impid && bid.adm) {
+              // adm contains the creative HTML directly (already rewritten with proxy URLs)
+              renderCreativeInline(String(bid.impid), String(bid.adm), bid.w, bid.h);
+            }
           }
+
           log.info('requestAds: rendered creatives from response');
           return;
         }
@@ -128,8 +89,65 @@ function requestAdsThirdParty(payload: { adUnits: unknown[]; config: unknown }) 
     });
 }
 
+// Render a creative by writing HTML directly into a sandboxed iframe.
+function renderCreativeInline(
+  slotId: string,
+  creativeHtml: string,
+  creativeWidth?: number,
+  creativeHeight?: number
+): void {
+  const container = findSlot(slotId) as HTMLElement | null;
+  if (!container) {
+    log.warn('renderCreativeInline: slot not found; skipping render', { slotId });
+    return;
+  }
+
+  try {
+    // Clear previous content
+    container.innerHTML = '';
+
+    // Determine size with fallback chain: creative size → ad unit size → 300x250
+    let width: number;
+    let height: number;
+
+    if (creativeWidth && creativeHeight && creativeWidth > 0 && creativeHeight > 0) {
+      // Use actual creative dimensions from bid response
+      width = creativeWidth;
+      height = creativeHeight;
+      log.debug('renderCreativeInline: using creative dimensions', { width, height });
+    } else {
+      // Fallback to ad unit's first size, then to 300x250
+      const unit = getAllUnits().find((u) => u.code === slotId);
+      const size = (unit && firstSize(unit)) || [300, 250];
+      width = size[0];
+      height = size[1];
+      log.debug('renderCreativeInline: using ad unit dimensions', { width, height });
+    }
+
+    // Create iframe sized for the ad
+    const iframe = createAdIframe(container, {
+      name: `tsjs_iframe_${slotId}`,
+      title: 'Ad content',
+      width,
+      height,
+    });
+
+    // Write creative HTML directly into iframe using srcdoc
+    iframe.srcdoc = buildCreativeDocument(creativeHtml);
+
+    log.info('renderCreativeInline: rendered', {
+      slotId,
+      width,
+      height,
+      htmlLength: creativeHtml.length,
+    });
+  } catch (err) {
+    log.warn('renderCreativeInline: failed', { slotId, err });
+  }
+}
+
 // Local minimal OpenRTB typing to keep core decoupled from Prebid extension types
-type RtBid = { impid?: string; adm?: string };
+type RtBid = { impid?: string; adm?: string; w?: number; h?: number };
 type RtSeatBid = { bid?: RtBid[] | null };
 type RtResponse = { seatbid?: RtSeatBid[] | null };
 
@@ -149,7 +167,9 @@ function parseSeatBids(data: unknown): RtBid[] {
     for (const b of bids) {
       const impid = typeof b?.impid === 'string' ? b!.impid : undefined;
       const adm = typeof b?.adm === 'string' ? b!.adm : undefined;
-      out.push({ impid, adm });
+      const w = typeof b?.w === 'number' ? b!.w : undefined;
+      const h = typeof b?.h === 'number' ? b!.h : undefined;
+      out.push({ impid, adm, w, h });
     }
   }
   return out;
