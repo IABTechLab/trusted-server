@@ -808,7 +808,7 @@ log::debug!("creative: skipped non-network scheme {}", url);
 
 ```rust
 let original = "<img src=\"https://tracker.com/pixel.gif\">";
-let rewritten = rewrite_creative_html(original, &settings);
+let rewritten = rewrite_creative_html(&settings, original);
 assert!(rewritten.contains("/first-party/proxy"));
 ```
 
@@ -818,7 +818,7 @@ assert!(rewritten.contains("/first-party/proxy"));
 #[test]
 fn test_image_src_rewrite() {
     let html = r#"<img src="https://cdn.example.com/banner.jpg">"#;
-    let result = rewrite_creative_html(html, &test_settings());
+    let result = rewrite_creative_html(&test_settings(), html);
     assert!(result.contains("/first-party/proxy?tsurl="));
     assert!(result.contains("&tstoken="));
 }

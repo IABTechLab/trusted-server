@@ -31,6 +31,7 @@ impl StreamingReplacer {
     /// # Arguments
     ///
     /// * `replacements` - List of string replacements to perform
+    #[must_use]
     pub fn new(replacements: Vec<Replacement>) -> Self {
         // Calculate the maximum pattern length we need to buffer
         let max_pattern_length = replacements.iter().map(|r| r.find.len()).max().unwrap_or(0);
@@ -48,6 +49,7 @@ impl StreamingReplacer {
     ///
     /// * `find` - The string to find
     /// * `replace_with` - The string to replace it with
+    #[must_use]
     pub fn new_single(find: &str, replace_with: &str) -> Self {
         Self::new(vec![Replacement {
             find: find.to_string(),
@@ -146,10 +148,11 @@ impl StreamingReplacer {
 }
 
 // Note: The stream_process function has been removed in favor of using
-// StreamingPipeline from the streaming_processor module, which provides
+// `StreamingPipeline` from the `streaming_processor` module, which provides
 // a more comprehensive solution with compression support.
 
-/// Helper function to create a StreamingReplacer for URL replacements
+/// Helper function to create a `StreamingReplacer` for URL replacements
+#[must_use]
 pub fn create_url_replacer(
     origin_host: &str,
     origin_url: &str,

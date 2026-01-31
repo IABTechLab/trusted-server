@@ -21,6 +21,10 @@ pub trait StreamProcessor {
     ///
     /// # Returns
     /// Processed data or error
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing fails (e.g., I/O errors, encoding issues).
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error>;
 
     /// Reset the processor state (useful for reuse)
@@ -38,6 +42,7 @@ pub enum Compression {
 
 impl Compression {
     /// Detect compression from content-encoding header
+    #[must_use]
     pub fn from_content_encoding(encoding: &str) -> Self {
         match encoding.to_lowercase().as_str() {
             "gzip" => Self::Gzip,
@@ -76,11 +81,19 @@ pub struct StreamingPipeline<P: StreamProcessor> {
 
 impl<P: StreamProcessor> StreamingPipeline<P> {
     /// Create a new streaming pipeline
+    ///
+    /// # Errors
+    ///
+    /// No errors are returned by this constructor.
     pub fn new(config: PipelineConfig, processor: P) -> Self {
         Self { config, processor }
     }
 
     /// Process a stream from input to output
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression transformation is unsupported or if reading/writing fails.
     pub fn process<R: Read, W: Write>(
         &mut self,
         input: R,
@@ -185,7 +198,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to decompress gzip".to_string(),
             })?;
 
-        log::info!("[Gzip] Decompressed size: {} bytes", decompressed.len());
+        log::info!("Decompressed size: {} bytes", decompressed.len());
 
         // Process the decompressed content
         let processed = self
@@ -195,7 +208,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Gzip] Processed size: {} bytes", processed.len());
+        log::info!("Processed size: {} bytes", processed.len());
 
         // Recompress the output
         let mut encoder = GzEncoder::new(output, Compression::default());
@@ -228,10 +241,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to decompress gzip".to_string(),
             })?;
 
-        log::info!(
-            "[Gzip->None] Decompressed size: {} bytes",
-            decompressed.len()
-        );
+        log::info!("Decompressed size: {} bytes", decompressed.len());
 
         // Process the decompressed content
         let processed = self
@@ -241,7 +251,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Gzip->None] Processed size: {} bytes", processed.len());
+        log::info!("Processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -287,7 +297,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         log::info!(
-            "[Deflate->None] Decompressed size: {} bytes",
+            "Deflate->None decompressed size: {} bytes",
             decompressed.len()
         );
 
@@ -299,7 +309,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Deflate->None] Processed size: {} bytes", processed.len());
+        log::info!("Deflate->None processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -350,7 +360,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         log::info!(
-            "[Brotli->None] Decompressed size: {} bytes",
+            "Brotli->None decompressed size: {} bytes",
             decompressed.len()
         );
 
@@ -362,7 +372,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("[Brotli->None] Processed size: {} bytes", processed.len());
+        log::info!("Brotli->None processed size: {} bytes", processed.len());
 
         // Write uncompressed output
         output
@@ -436,10 +446,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 }
 
-/// Adapter to use lol_html HtmlRewriter as a StreamProcessor
-/// Important: Due to lol_html's ownership model, we must accumulate input
+/// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`
+/// Important: Due to `lol_html`'s ownership model, we must accumulate input
 /// and process it all at once when the stream ends. This is a limitation
-/// of the lol_html library's API design.
+/// of the `lol_html` library's API design.
 pub struct HtmlRewriterAdapter {
     settings: lol_html::Settings<'static, 'static>,
     accumulated_input: Vec<u8>,
@@ -447,6 +457,7 @@ pub struct HtmlRewriterAdapter {
 
 impl HtmlRewriterAdapter {
     /// Create a new HTML rewriter adapter
+    #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
         Self {
             settings,
@@ -462,7 +473,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
         if !chunk.is_empty() {
             log::debug!(
-                "[HtmlRewriter] Buffering chunk: {} bytes, total buffered: {} bytes",
+                "Buffering chunk: {} bytes, total buffered: {} bytes",
                 chunk.len(),
                 self.accumulated_input.len()
             );
@@ -471,7 +482,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
         // Only process when we have all the input
         if is_last {
             log::info!(
-                "[HtmlRewriter] Processing complete document: {} bytes",
+                "Processing complete document: {} bytes",
                 self.accumulated_input.len()
             );
 
@@ -488,17 +499,17 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
             // Process the entire document
             rewriter.write(&self.accumulated_input).map_err(|e| {
-                log::error!("[HtmlRewriter] Failed to process HTML: {}", e);
+                log::error!("Failed to process HTML: {}", e);
                 io::Error::other(format!("HTML processing failed: {}", e))
             })?;
 
             // Finalize the rewriter
             rewriter.end().map_err(|e| {
-                log::error!("[HtmlRewriter] Failed to finalize: {}", e);
+                log::error!("Failed to finalize: {}", e);
                 io::Error::other(format!("HTML finalization failed: {}", e))
             })?;
 
-            log::debug!("[HtmlRewriter] Output size: {} bytes", output.len());
+            log::debug!("Output size: {} bytes", output.len());
             self.accumulated_input.clear();
             Ok(output)
         } else {
@@ -513,7 +524,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
     }
 }
 
-/// Adapter to use our existing StreamingReplacer as a StreamProcessor
+/// Adapter to use our existing `StreamingReplacer` as a `StreamProcessor`
 use crate::streaming_replacer::StreamingReplacer;
 
 impl StreamProcessor for StreamingReplacer {

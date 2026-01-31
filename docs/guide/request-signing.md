@@ -63,7 +63,7 @@ use trusted_server_common::request_signing::RequestSigner;
 let signer = RequestSigner::from_config()?;
 
 // Sign a payload
-let payload = b"request data to sign";
+let payload = "request data to sign";
 let signature = signer.sign(payload)?;
 
 // Signature is base64url-encoded

@@ -5,18 +5,18 @@ use validator::Validate;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
+pub use crate::auction_config_types::AuctionConfig;
+
 const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.toml");
 
 /// Creates a new [`Settings`] instance from the embedded configuration file.
-// /
-// / Loads the configuration from the embedded `trusted-server.toml` file
-// / and applies any environment variable overrides.
-// /
-// / # Errors
-// /
-// / - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
-// / - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
-// / - [`TrustedServerError::InsecureSecretKey`] if the secret key is set to the default value
+/// Loads the configuration from the embedded `trusted-server.toml` file
+/// and applies any environment variable overrides.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
+/// - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
 pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
     let toml_bytes = SETTINGS_DATA;
     let toml_str = str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {

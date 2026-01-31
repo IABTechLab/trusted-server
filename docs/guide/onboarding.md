@@ -1,17 +1,36 @@
-# Onboarding Guide
+# New Engineer Onboarding Guide
 
-Get up to speed with the Trusted Server project and start contributing effectively.
+Welcome to the Trusted Server project! This guide will help you get up to speed quickly and start contributing effectively.
 
-## Overview
+## Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Architecture at a Glance](#architecture-at-a-glance)
+3. [Development Environment Setup](#development-environment-setup)
+4. [Codebase Structure](#codebase-structure)
+5. [Key Concepts](#key-concepts)
+6. [Development Workflow](#development-workflow)
+7. [Testing](#testing)
+8. [Common Tasks](#common-tasks)
+9. [Debugging & Troubleshooting](#debugging--troubleshooting)
+10. [Team & Governance](#team--governance)
+11. [Resources & Getting Help](#resources--getting-help)
+12. [Onboarding Checklist](#onboarding-checklist)
+
+---
+
+## Project Overview
+
+### What is Trusted Server?
 
 Trusted Server is an **open-source, edge computing framework** developed by IAB Tech Lab that moves advertising operations from third-party JavaScript in browsers to secure WebAssembly (WASM) binaries running on edge platforms (currently Fastly Compute).
 
 ### The Problem It Solves
 
-- **Privacy restrictions**: Browser privacy initiatives (3rd-party cookie deprecation, tracking prevention) limit traditional advertising
-- **Third-party dependency**: Publishers have little control over third-party scripts on their pages
+- **Privacy restrictions**: Browser privacy initiatives (3rd-party cookie deprecation, tracking prevention) are limiting traditional advertising
+- **Third-party dependency**: Publishers have little control over third-party scripts running on their pages
 - **Performance**: Multiple third-party scripts slow down page load times
-- **Data control**: Publishers need better control over data sharing
+- **Data control**: Publishers need better control over how and with whom they share data
 
 ### Key Benefits
 
@@ -20,9 +39,11 @@ Trusted Server is an **open-source, edge computing framework** developed by IAB 
 - **Better performance**: Server-side processing reduces client-side JavaScript
 - **Data control**: Publishers control data sharing and user identification
 
-::: warning
-This is a **proof of concept (POC)** - not production-ready. The goal is to demonstrate technical feasibility and invite industry collaboration.
-:::
+### Current Status
+
+This is a **proof of concept (POC)** - not production-ready. The goal is to demonstrate technical feasibility and invite industry collaboration to build toward an MVP.
+
+---
 
 ## Architecture at a Glance
 
@@ -74,20 +95,22 @@ This is a **proof of concept (POC)** - not production-ready. The goal is to demo
 
 | Layer          | Technology                  |
 | -------------- | --------------------------- |
-| Language       | Rust ({{RUST_VERSION}})     |
+| Language       | Rust (1.91.1)               |
 | Runtime        | WebAssembly (wasm32-wasip1) |
 | Edge Platform  | Fastly Compute              |
 | Client Library | TypeScript (TSJS)           |
 | Build Tools    | Cargo, Vite                 |
 
+---
+
 ## Development Environment Setup
 
 ### Prerequisites
 
-Install the following tools using [asdf](https://asdf-vm.com/) for version management:
+Install the following tools (we recommend using `asdf` for version management):
 
 ```bash
-# Install asdf (macOS)
+# Install asdf (if not already installed)
 brew install asdf
 
 # Add plugins
@@ -96,9 +119,9 @@ asdf plugin add nodejs
 asdf plugin add fastly
 
 # Install required versions (from .tool-versions)
-asdf install rust {{RUST_VERSION}}
-asdf install nodejs {{NODEJS_VERSION}}
-asdf install fastly {{FASTLY_VERSION}}
+asdf install rust 1.91.1
+asdf install nodejs 24.10.0
+asdf install fastly 13.1.0
 
 # Reshim to ensure binaries are available
 asdf reshim
@@ -107,13 +130,21 @@ asdf reshim
 rustup target add wasm32-wasip1
 ```
 
-Add to your shell profile (`~/.zshrc` or `~/.bash_profile`):
+**Configure your shell PATH** (required for asdf to work):
+
+For **Bash** (`~/.bash_profile`):
 
 ```bash
 export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
 ```
 
-Then restart your terminal or run `source ~/.zshrc`.
+For **Zsh** (`~/.zshrc`):
+
+```bash
+export PATH="${ASDF_DATA_DIR:-$HOME/.asdf}/shims:$PATH"
+```
+
+Then restart your terminal or run `source ~/.zshrc` (or `~/.bash_profile`).
 
 ### Clone and Build
 
@@ -125,13 +156,13 @@ cd trusted-server
 # Build the Rust project
 cargo build
 
-# Install viceroy (Fastly local simulator)
+# Install viceroy (Fastly local simulator) for testing
 cargo install viceroy
 
-# Run tests to verify setup
+# Run Rust tests to verify setup
 cargo test
 
-# Build the TypeScript client library
+# Build the TypeScript client library (TSJS)
 cd crates/js/lib
 npm install
 npm run build
@@ -147,6 +178,8 @@ We recommend **VS Code** with these extensions:
 - Even Better TOML (TOML file support)
 - CodeLLDB (debugging)
 
+---
+
 ## Codebase Structure
 
 ```
@@ -160,8 +193,8 @@ trusted-server/
 │   │       ├── synthetic.rs     # Synthetic ID generation
 │   │       ├── settings.rs      # Configuration management
 │   │       ├── integrations/    # Partner integrations
-│   │       │   ├── prebid.rs
-│   │       │   ├── lockr.rs
+│   │       │   ├── prebid.rs    # Prebid Server RTB
+│   │       │   ├── lockr.rs     # Lockr ID solution
 │   │       │   └── ...
 │   │       └── request_signing/ # Ed25519 signing
 │   │
@@ -182,7 +215,7 @@ trusted-server/
 └── .tool-versions               # Tool versions (asdf)
 ```
 
-### Key Files to Start With
+### Key Files to Understand First
 
 | File                                         | Purpose                                   |
 | -------------------------------------------- | ----------------------------------------- |
@@ -193,11 +226,13 @@ trusted-server/
 | `crates/common/src/integrations/registry.rs` | Integration module pattern                |
 | `trusted-server.toml`                        | Application configuration                 |
 
+---
+
 ## Key Concepts
 
-### First-Party Proxying
+### 1. First-Party Proxying
 
-Instead of loading ad creatives from third-party domains, Trusted Server proxies them through first-party endpoints:
+Instead of loading ad creatives directly from third-party domains, Trusted Server proxies them through first-party endpoints:
 
 ```
 Before:  Browser → ad-server.com/creative.html
@@ -206,7 +241,7 @@ After:   Browser → publisher.com/first-party/proxy?tsurl=ad-server.com/creativ
 
 This keeps all requests under the publisher's domain, avoiding third-party cookie restrictions.
 
-### Synthetic ID Generation
+### 2. Synthetic ID Generation
 
 Privacy-preserving user identification using HMAC-SHA256:
 
@@ -224,11 +259,12 @@ The ID is:
 - Non-reversible (can't extract original signals)
 - Publisher-controlled (configurable template)
 
-### Integration Modules
+### 3. Integration Modules
 
-Extensible pattern for adding new partners:
+Extensible pattern for adding new partners (ad servers, ID solutions, consent providers):
 
 ```rust
+// Each integration implements standard traits
 pub struct PrebidIntegration { ... }
 
 impl Integration for PrebidIntegration {
@@ -236,13 +272,15 @@ impl Integration for PrebidIntegration {
 }
 ```
 
-### Request Signing
+### 4. Request Signing
 
 Ed25519 cryptographic signing for authenticated API requests:
 
 - Public keys published at `/.well-known/trusted-server.json`
 - Key rotation supported with graceful transitions
 - Used for OpenRTB bid requests
+
+---
 
 ## Development Workflow
 
@@ -273,12 +311,12 @@ fastly compute serve
 # Server runs at http://127.0.0.1:7676
 ```
 
-### Local Origin Stub
+### Local Origin Stub and Smoke Test
 
-For a fully local origin instead of `origin.getpurpose.ai`:
+If you want a fully local origin instead of `origin.getpurpose.ai`, set the origin URL to `http://localhost:9090` and use this stub to validate a first-party proxy flow end-to-end.
 
 ```bash
-# Terminal 1: start a simple origin server
+# Terminal 1: start a simple origin server on port 9090
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://localhost:9090
 mkdir -p /tmp/ts-origin
 printf 'hello from origin\n' > /tmp/ts-origin/hello.txt
@@ -286,7 +324,7 @@ python3 -m http.server 9090 --directory /tmp/ts-origin
 ```
 
 ```bash
-# Terminal 2: sign and proxy an asset
+# Terminal 2: with `fastly compute serve` running, sign and proxy the asset
 signed_path=$(
   curl -s "http://127.0.0.1:7676/first-party/sign?url=http://localhost:9090/hello.txt" \
   | python3 - <<'PY'
@@ -319,12 +357,16 @@ cargo test
 1. Create a feature branch from `main`
 2. Make your changes
 3. Run `cargo fmt`, `cargo clippy`, and `cargo test`
-4. Commit following the guidelines in [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md)
+4. Commit using the guidelines in [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md)
 5. Open a Pull Request
 
 ### Commit Message Format
 
-Use sentence case and imperative mood. Do not use semantic prefixes (like `fix:` or `feat:`):
+Follow the guidelines in [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md). In short:
+
+- Use sentence case and imperative mood
+- Do not use semantic prefixes or bracketed tags (examples: `fix:`, `[Docs]`)
+- Keep PR state out of commit messages; use GitHub Draft PRs instead
 
 ```
 Short summary in 50 chars or less
@@ -335,6 +377,8 @@ not the "what" (the code shows that).
 Resolves: #123
 ```
 
+---
+
 ## Testing
 
 ### Running Tests
@@ -343,16 +387,12 @@ Resolves: #123
 # Run all Rust tests
 cargo test
 
-# Run with more details
+# Run with more details (useful when tests fail)
 cargo test -- --nocapture
 
 # Run TypeScript tests
 cd crates/js/lib && npm test
 ```
-
-::: warning
-If a test fails, viceroy won't display the line number. Use `cargo test -- --nocapture` to see detailed output.
-:::
 
 ### Writing Tests
 
@@ -379,12 +419,14 @@ mod tests {
 
 ### Local Integration Testing
 
-Use the Fastly local simulator to test full request flows:
+Use the Fastly local simulator (viceroy) to test full request flows:
 
 ```bash
 fastly compute serve
 # Then make requests to http://127.0.0.1:7676
 ```
+
+---
 
 ## Common Tasks
 
@@ -419,11 +461,13 @@ cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
 fastly compute publish --package pkg/trusted-server-fastly.tar.gz
 ```
 
+---
+
 ## Debugging & Troubleshooting
 
-### Viewing Logs
+### Viewing Logs Locally
 
-When running with `fastly compute serve`, logs print to stdout:
+When running with `fastly compute serve`, logs are printed to stdout. Use the `log` macros in Rust:
 
 ```rust
 use log::{debug, error, info, warn};
@@ -432,26 +476,46 @@ info!("Processing request for path: {}", path);
 debug!("Request headers: {:?}", headers);
 ```
 
-Use `RUST_LOG=debug fastly compute serve` for verbose logging.
-
 ### Common Issues
 
-| Issue                                 | Solution                                                |
-| ------------------------------------- | ------------------------------------------------------- |
-| `cargo test` fails with viceroy error | Run `cargo install viceroy`                             |
-| `asdf` commands not found             | Ensure PATH is configured (see Prerequisites)           |
-| `fastly compute serve` fails          | Check `.env.dev` exists and `fastly.toml` is configured |
-| TypeScript build fails                | Run `npm install` in `crates/js/lib` first              |
-| Tests pass locally but fail in CI     | Ensure `cargo fmt` and `cargo clippy` pass              |
+| Issue                                 | Solution                                                       |
+| ------------------------------------- | -------------------------------------------------------------- |
+| `cargo test` fails with viceroy error | Run `cargo install viceroy` to install/update the test runtime |
+| `asdf` commands not found             | Ensure PATH is configured (see Prerequisites section)          |
+| `fastly compute serve` fails          | Check that `.env.dev` exists and `fastly.toml` is configured   |
+| TypeScript build fails                | Run `npm install` in `crates/js/lib` first                     |
+| Tests pass locally but fail in CI     | Ensure `cargo fmt` and `cargo clippy` pass without warnings    |
+
+### Debugging Tips
+
+- Use `cargo test -- --nocapture` to see println/log output during tests
+- For failed tests, viceroy doesn't show line numbers - check test output carefully
+- Use `RUST_LOG=debug fastly compute serve` for verbose logging locally
+- Check `.env.dev` for environment variable overrides
+
+---
 
 ## Team & Governance
+
+### Project Structure
 
 The project follows IAB Tech Lab's open-source governance model:
 
 - **Trusted Server Task Force**: Defines requirements and roadmap (meets biweekly)
 - **Development Team**: Handles engineering implementation and releases
 
+### Team Roles
+
+| Role         | Responsibility                       |
+| ------------ | ------------------------------------ |
+| Project Lead | Overall project vision and direction |
+| Developer    | Contributes code/docs                |
+
+See [ProjectGovernance.md](https://github.com/IABTechLab/trusted-server/blob/main/ProjectGovernance.md) for full details.
+
 ### Key Contacts
+
+<!-- TODO: Update with current team members -->
 
 | Role         | GitHub Handle                                                |
 | ------------ | ------------------------------------------------------------ |
@@ -459,23 +523,34 @@ The project follows IAB Tech Lab's open-source governance model:
 | Developer    | [@aram356](https://github.com/aram356)                       |
 | Developer    | [@ChristianPavilonis](https://github.com/ChristianPavilonis) |
 
-See [ProjectGovernance.md](https://github.com/IABTechLab/trusted-server/blob/main/ProjectGovernance.md) for full details.
+### Meetings
+
+<!-- TODO: Add actual meeting links and times -->
+
+- **Task Force Meeting**: Biweekly (check calendar for schedule)
+- **Development Team Standup**: Weekly (check calendar for schedule)
+
+Ask your manager or onboarding buddy for calendar invites to relevant meetings.
+
+---
 
 ## Resources & Getting Help
 
 ### Documentation
 
-| Resource                                                                                  | Description             |
-| ----------------------------------------------------------------------------------------- | ----------------------- |
-| [README.md](https://github.com/IABTechLab/trusted-server/blob/main/README.md)             | Project overview        |
-| [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md) | Contribution guidelines |
-| [AGENTS.md](https://github.com/IABTechLab/trusted-server/blob/main/AGENTS.md)             | AI assistant guidance   |
-| [SEQUENCE.md](https://github.com/IABTechLab/trusted-server/blob/main/SEQUENCE.md)         | Request flow diagrams   |
-| [FAQ_POC.md](https://github.com/IABTechLab/trusted-server/blob/main/FAQ_POC.md)           | FAQs                    |
+| Resource                                                                                  | Description                                   |
+| ----------------------------------------------------------------------------------------- | --------------------------------------------- |
+| [README.md](https://github.com/IABTechLab/trusted-server/blob/main/README.md)             | Project overview and setup                    |
+| [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md) | Contribution guidelines                       |
+| [AGENTS.md](https://github.com/IABTechLab/trusted-server/blob/main/AGENTS.md)             | AI assistant guidance / architecture overview |
+| [SEQUENCE.md](https://github.com/IABTechLab/trusted-server/blob/main/SEQUENCE.md)         | Request flow diagrams                         |
+| [FAQ_POC.md](https://github.com/IABTechLab/trusted-server/blob/main/FAQ_POC.md)           | Frequently asked questions                    |
 
-### VitePress Documentation
+### VitePress Documentation Site
 
-Run the docs site locally:
+The `docs/` folder contains a full documentation site with detailed guides:
+
+To run the docs site locally:
 
 ```bash
 cd docs
@@ -483,14 +558,44 @@ npm install
 npm run dev
 ```
 
+See [docs/README.md](../README.md) for deployment details.
+
+| Guide                                       | Description                      |
+| ------------------------------------------- | -------------------------------- |
+| [Getting Started](./getting-started.md)     | Quick start guide                |
+| [Architecture](./architecture.md)           | System architecture overview     |
+| [Configuration](./configuration.md)         | Configuration options            |
+| [Synthetic IDs](./synthetic-ids.md)         | Privacy-preserving ID generation |
+| [First-Party Proxy](./first-party-proxy.md) | Proxy endpoint documentation     |
+| [Request Signing](./request-signing.md)     | Ed25519 signing setup            |
+| [GDPR Compliance](./gdpr-compliance.md)     | Privacy and consent handling     |
+
+### Integration Guides
+
+| Integration                              | Description                   |
+| ---------------------------------------- | ----------------------------- |
+| [Prebid](./integrations/prebid.md)       | Prebid Server RTB integration |
+| [Lockr](./integrations/lockr.md)         | Lockr ID solution             |
+| [Didomi](./integrations/didomi.md)       | Didomi consent management     |
+| [Permutive](./integrations/permutive.md) | Permutive audience segments   |
+| [Next.js](./integrations/nextjs.md)      | Next.js RSC integration       |
+| [GAM](./integrations/gam.md)             | Google Ad Manager             |
+| [APS](./integrations/aps.md)             | Amazon Publisher Services     |
+
 ### Coding Standards
 
-Review the standards in `.agents/rules/`:
+Review the coding standards in `.agents/rules/`:
 
 - `rust-coding-style.mdc` - Naming, organization, patterns
 - `rust-error-handling.mdc` - Error handling patterns
 - `rust-testing-strategy.mdc` - Testing approach
 - `git-commit-conventions.mdc` - Commit message format
+
+### Getting Help
+
+- **GitHub Issues**: For bugs, feature requests, and questions
+- **Task Force Meetings**: Biweekly meetings for roadmap discussions
+- **Code Review**: Submit PRs for feedback from maintainers
 
 ### External Resources
 
@@ -499,7 +604,11 @@ Review the standards in `.agents/rules/`:
 - [WebAssembly Overview](https://webassembly.org/)
 - [OpenRTB Specification](https://iabtechlab.com/standards/openrtb/)
 
+---
+
 ## Onboarding Checklist
+
+Use this checklist to track your onboarding progress:
 
 ### Access & Accounts
 
@@ -525,13 +634,9 @@ Review the standards in `.agents/rules/`:
 ### Documentation & Contribution
 
 - [ ] Read `CONTRIBUTING.md` for PR guidelines
-- [ ] Browse the documentation site guides
+- [ ] Browse the [documentation site guides](./getting-started.md)
 - [ ] Make a small contribution (fix a typo, add a test, etc.)
 
-## Next Steps
+---
 
-- [What is Trusted Server?](/guide/what-is-trusted-server) - Understand the project vision
-- [Architecture](/guide/architecture) - Deep dive into system design
-- [Configuration](/guide/configuration) - Configure for your environment
-- [Synthetic IDs](/guide/synthetic-ids) - Learn about privacy-preserving IDs
-- [Integrations Overview](/guide/integrations-overview) - Explore partner integrations
+Welcome aboard! Don't hesitate to ask questions - we're here to help you succeed.

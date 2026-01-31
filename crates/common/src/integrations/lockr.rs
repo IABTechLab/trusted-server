@@ -29,7 +29,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
@@ -44,12 +44,12 @@ pub struct LockrConfig {
     #[validate(length(min = 1))]
     pub app_id: String,
 
-    /// Base URL for Lockr API (default: https://identity.lockr.kr)
+    /// Base URL for Lockr API (default: <https://identity.lockr.kr>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
 
-    /// SDK URL (default: https://aim.loc.kr/identity-lockr-v1.0.js)
+    /// SDK URL (default: <https://aim.loc.kr/identity-lockr-v1.0.js>)
     #[serde(default = "default_sdk_url")]
     #[validate(url)]
     pub sdk_url: String,
@@ -69,13 +69,13 @@ pub struct LockrConfig {
 
     /// Override the Origin header sent to Lockr API.
     /// Use this when running locally or from a domain not registered with Lockr.
-    /// Example: "https://www.example.com"
+    /// Example: "<https://www.example.com>"
     #[serde(default)]
     #[validate(url)]
     pub origin_override: Option<String>,
 }
 
-impl IntegrationConfigTrait for LockrConfig {
+impl IntegrationConfig for LockrConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -316,6 +316,7 @@ fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
 }
 
 /// Register the Lockr integration.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(

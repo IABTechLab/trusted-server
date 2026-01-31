@@ -12,7 +12,7 @@ export default [
     languageOptions: {
       parserOptions: {
         projectService: {
-          allowDefaultProject: ['.vitepress/*.mts'],
+          tsconfigPath: './tsconfig.json',
         },
       },
     },

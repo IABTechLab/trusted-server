@@ -4,6 +4,7 @@
 //! Ed25519 keypairs in JWK format for request signing.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use error_stack::{Report, ResultExt};
 use jose_jwk::{
     jose_jwa::{Algorithm, Signing},
     Jwk, Key, Okp, OkpCurves, Parameters,
@@ -19,6 +20,7 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    #[must_use]
     pub fn generate() -> Self {
         let mut csprng = OsRng;
 
@@ -31,6 +33,7 @@ impl Keypair {
         }
     }
 
+    #[must_use]
     pub fn get_jwk(&self, kid: String) -> Jwk {
         let public_key_bytes = self.verifying_key.as_bytes();
 
@@ -51,19 +54,28 @@ impl Keypair {
     }
 }
 
-pub fn get_active_jwks() -> Result<String, TrustedServerError> {
+/// Retrieves active JSON Web Keys from the config store.
+///
+/// # Errors
+///
+/// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
+pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new("jwks_store");
-    let active_kids_str = store.get("active-kids")?;
+    let active_kids_str = store
+        .get("active-kids")
+        .attach("while fetching active kids list")?;
 
     let active_kids: Vec<&str> = active_kids_str
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 
     let mut jwks = Vec::new();
     for kid in active_kids {
-        let jwk = store.get(kid)?;
+        let jwk = store
+            .get(kid)
+            .attach(format!("Failed to get JWK for kid: {}", kid))?;
         jwks.push(jwk);
     }
 

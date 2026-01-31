@@ -39,7 +39,9 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
         {
-            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !guard.payloads.is_empty() {
                 return true;
             }
@@ -56,7 +58,9 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             .document_state
             .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
             .map(|state| {
-                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.take_payloads()
             })
             .unwrap_or_default();
@@ -333,6 +337,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
     since = "0.1.0",
     note = "Use NextJsHtmlPostProcessor for production RSC rewriting. This function re-parses HTML."
 )]
+#[must_use]
 pub fn post_process_rsc_html(
     html: &str,
     origin_host: &str,

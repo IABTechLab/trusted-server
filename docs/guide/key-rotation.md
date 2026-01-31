@@ -26,6 +26,175 @@ Key rotation is the process of generating new signing keys and transitioning fro
 - **Incident-based**: Immediately if compromise suspected
 - **Before major releases**: Ensure fresh keys for new deployments
 
+## Prerequisites
+
+Before you can rotate keys, you need to set up the required Fastly stores and API credentials.
+
+### Required Stores
+
+Key rotation requires three Fastly stores:
+
+1. **Config Store** (`jwks_store`) - Stores public JWKs and metadata
+   - `current-kid` - The active key identifier
+   - `active-kids` - Comma-separated list of valid key IDs
+   - Individual JWKs keyed by their `kid`
+
+2. **Secret Store** (`signing_keys`) - Stores private signing keys
+   - Each key stored with its `kid` as the key name
+   - Values are base64-encoded Ed25519 private keys
+
+3. **Secret Store** (`api-keys`) - Stores Fastly API credentials
+   - `api_key` - Fastly API token for managing stores
+
+### Creating Stores
+
+#### 1. Create Config Store
+
+```bash
+# Create the config store
+fastly config-store create --name=jwks_store
+
+# Get the store ID (you'll need this for configuration)
+fastly config-store list
+```
+
+Note the Config Store ID from the output.
+
+#### 2. Create Secret Stores
+
+```bash
+# Create secret store for signing keys
+fastly secret-store create --name=signing_keys
+
+# Create secret store for API credentials
+fastly secret-store create --name=api-keys
+
+# Get the store IDs
+fastly secret-store list
+```
+
+Note both Secret Store IDs from the output.
+
+::: tip Dashboard Alternative
+You can also create stores via the Fastly dashboard, but CLI commands are recommended for automation and reproducibility.
+:::
+
+### Creating Fastly API Key
+
+Key rotation uses the Fastly API to manage store contents. You need to create an API token:
+
+#### Step 1: Generate API Token
+
+1. Log in to the [Fastly Dashboard](https://manage.fastly.com)
+2. Navigate to **Account → API Tokens → Personal Tokens**
+3. Click **Create Token**
+4. Configure the token:
+   - **Name**: `trusted-server-key-rotation`
+   - **Scope**: `global:read`, `global:write` (or scope to your specific service)
+   - **Expiration**: Set according to your security policy
+
+#### Step 2: Store API Token
+
+Store the API token in the `api-keys` secret store:
+
+```bash
+# Store the API key
+fastly secret-store-entry create \
+  --store-id=<your-api-keys-store-id> \
+  --name=api_key \
+  --secret=<your-fastly-api-token>
+```
+
+::: warning Keep Your API Token Secure
+
+- Never commit API tokens to version control
+- Store them only in Fastly Secret Store
+- Rotate API tokens according to your security policy
+- Use minimal required permissions
+  :::
+
+### Linking Stores to Service
+
+Stores must be linked to your Compute service to be accessible at runtime.
+
+#### Production (CLI)
+
+```bash
+# Link config store
+fastly service-version compute config-store create \
+  --version=<version> \
+  --config-store-id=<jwks-store-id> \
+  --name=jwks_store
+
+# Link signing keys secret store
+fastly service-version compute secret-store create \
+  --version=<version> \
+  --secret-store-id=<signing-keys-store-id> \
+  --name=signing_keys
+
+# Link API keys secret store
+fastly service-version compute secret-store create \
+  --version=<version> \
+  --secret-store-id=<api-keys-store-id> \
+  --name=api-keys
+```
+
+::: tip Dashboard Linking
+You can also link stores via the Fastly dashboard under your service's **Resources** section.
+:::
+
+#### Local Development
+
+For local testing, configure stores in `fastly.toml`:
+
+```toml
+[local_server.config_stores]
+  [local_server.config_stores.jwks_store]
+    format = "inline-toml"
+    [local_server.config_stores.jwks_store.contents]
+      ts-2025-01-01 = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-01-01\",\"use\":\"sig\",\"x\":\"...\"}"
+      current-kid = "ts-2025-01-01"
+      active-kids = "ts-2025-01-01"
+
+[local_server.secret_stores]
+  [[local_server.secret_stores.signing_keys]]
+    key = "ts-2025-01-01"
+    data = "<signing-key>"
+
+  [[local_server.secret_stores.api-keys]]
+    key = "api_key"
+    env = "FASTLY_KEY"  # Load from environment variable
+```
+
+### Configuration in trusted-server.toml
+
+Update `trusted-server.toml` with your store IDs:
+
+```toml
+[request_signing]
+enabled = true
+config_store_id = "<config-store-id>"  # Your jwks_store ID
+secret_store_id = "<secret-store-id"  # Your signing_keys ID
+```
+
+::: tip Getting Store IDs
+Use `fastly config-store list` and `fastly secret-store list` to retrieve your store IDs.
+:::
+
+### Verification
+
+Verify your setup is correct:
+
+```bash
+# Test local development
+fastly compute serve
+
+# Check that stores are accessible
+curl http://localhost:7676/.well-known/trusted-server.json
+```
+
+You should see a JWKS response with your public keys.
+
 ## Key Rotation Process
 
 ### Architecture
@@ -428,9 +597,11 @@ Test rotation in staging first:
 
 **Solutions**:
 
-- Check Fastly API token is configured
-- Verify config_store_id and secret_store_id settings
-- Ensure stores exist in Fastly dashboard
+- Verify all required stores are created (see [Prerequisites](#prerequisites))
+- Check Fastly API token is stored in `api-keys` secret store as `api_key`
+- Verify `config_store_id` and `secret_store_id` in `trusted-server.toml` match your actual store IDs
+- Ensure stores are linked to your Compute service
+- Confirm API token has `global:read` and `global:write` permissions
 
 ### Cannot Deactivate Key
 
@@ -508,6 +679,8 @@ Restrict rotation endpoints:
 
 ## Next Steps
 
+- Complete the [Prerequisites](#prerequisites) setup if you haven't already
 - Learn about [Request Signing](/guide/request-signing) for using keys
-- Review [Configuration](/guide/configuration) for store setup
+- Review [Configuration](/guide/configuration) for additional store setup
 - Set up [Testing](/guide/testing) for rotation procedures
+- Read about [GDPR Compliance](/guide/gdpr-compliance) for privacy considerations
