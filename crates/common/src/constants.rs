@@ -1,9 +1,9 @@
 use http::header::HeaderName;
 
-pub const HEADER_SYNTHETIC_FRESH: HeaderName = HeaderName::from_static("x-synthetic-fresh");
-pub const HEADER_SYNTHETIC_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
+pub const COOKIE_SYNTHETIC_ID: &str = "synthetic_id";
+
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
-pub const HEADER_SYNTHETIC_TRUSTED_SERVER: HeaderName = HeaderName::from_static("x-psid-ts");
+pub const HEADER_X_SYNTHETIC_ID: HeaderName = HeaderName::from_static("x-synthetic-id");
 pub const HEADER_X_CONSENT_ADVERTISING: HeaderName =
     HeaderName::from_static("x-consent-advertising");
 pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");

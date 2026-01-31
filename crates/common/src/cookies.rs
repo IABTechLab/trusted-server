@@ -8,6 +8,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 
+use crate::constants::COOKIE_SYNTHETIC_ID;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -65,8 +66,8 @@ pub fn handle_request_cookies(
 #[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
     format!(
-        "synthetic_id={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
     )
 }
 
@@ -158,8 +159,8 @@ mod tests {
         assert_eq!(
             result,
             format!(
-                "synthetic_id=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-                settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+                "{}=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
             )
         );
     }

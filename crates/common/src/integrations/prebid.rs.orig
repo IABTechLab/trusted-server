@@ -385,9 +385,20 @@ async fn handle_prebid_auction(
 
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
-    log::info!("Using synthetic_id: {}", synthetic_id,);
+    log::info!("Using synthetic_id: {}", synthetic_id);
 
-    enhance_openrtb_request(&mut openrtb_request, &synthetic_id, settings, &req, config)?;
+<<<<<<< HEAD
+    enhance_openrtb_request(&mut openrtb_request, &synthetic_id, settings, &req)?;
+=======
+    enhance_openrtb_request(
+        &mut openrtb_request,
+        &synthetic_id,
+        &fresh_id,
+        settings,
+        &req,
+        config,
+    )?;
+>>>>>>> main
 
     let mut pbs_req = Request::new(
         Method::POST,
@@ -1246,13 +1257,29 @@ mod tests {
         });
 
         let synthetic_id = "synthetic-123";
+<<<<<<< HEAD
+        let mut req = Request::new(Method::POST, "https://edge.example/third-party/ad");
+        req.set_header("Sec-GPC", "1");
+
+        enhance_openrtb_request(&mut request_json, synthetic_id, &settings, &req)
+            .expect("should enhance request");
+=======
+        let fresh_id = "fresh-456";
         let mut req = Request::new(Method::POST, "https://edge.example/auction");
         req.set_header("Sec-GPC", "1");
 
         let config = base_config();
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
+>>>>>>> main
 
         assert_eq!(request_json["user"]["id"], synthetic_id);
         assert_eq!(
@@ -1280,13 +1307,21 @@ mod tests {
         });
 
         let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
         let req = Request::new(Method::POST, "https://edge.example/auction");
 
         let mut config = base_config();
         config.debug = true;
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         assert_eq!(
             request_json["ext"]["prebid"]["debug"], true,
@@ -1302,13 +1337,21 @@ mod tests {
         });
 
         let synthetic_id = "synthetic-123";
+        let fresh_id = "fresh-456";
         let req = Request::new(Method::POST, "https://edge.example/auction");
 
         let mut config = base_config();
         config.debug = false;
 
-        enhance_openrtb_request(&mut request_json, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request_json,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         assert!(
             request_json["ext"]["prebid"]["debug"].is_null(),
@@ -1513,6 +1556,7 @@ server_url = "https://prebid.example"
 
         let req = Request::new(Method::GET, "https://example.com/test");
         let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
 
         // Test with existing site.page
         let mut request = json!({
@@ -1523,8 +1567,15 @@ server_url = "https://prebid.example"
             }
         });
 
-        enhance_openrtb_request(&mut request, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         let page = request["site"]["page"].as_str().unwrap();
         assert_eq!(page, "https://example.com/page?kargo_debug=true");
@@ -1538,6 +1589,7 @@ server_url = "https://prebid.example"
 
         let req = Request::new(Method::GET, "https://example.com/test");
         let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
 
         // Test with existing query params in site.page
         let mut request = json!({
@@ -1548,8 +1600,15 @@ server_url = "https://prebid.example"
             }
         });
 
-        enhance_openrtb_request(&mut request, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         let page = request["site"]["page"].as_str().unwrap();
         assert_eq!(
@@ -1567,6 +1626,7 @@ server_url = "https://prebid.example"
 
         let req = Request::new(Method::GET, "https://example.com/test");
         let synthetic_id = "test-synthetic-id";
+        let fresh_id = "test-fresh-id";
 
         // Test with URL that already has the debug params
         let mut request = json!({
@@ -1577,8 +1637,15 @@ server_url = "https://prebid.example"
             }
         });
 
-        enhance_openrtb_request(&mut request, synthetic_id, &settings, &req, &config)
-            .expect("should enhance request");
+        enhance_openrtb_request(
+            &mut request,
+            synthetic_id,
+            fresh_id,
+            &settings,
+            &req,
+            &config,
+        )
+        .expect("should enhance request");
 
         let page = request["site"]["page"].as_str().unwrap();
         // Should still only have params once
