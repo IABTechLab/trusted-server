@@ -29,6 +29,7 @@ debug = false
 ### Server-Side Header Bidding
 
 Move header bidding to the server for:
+
 - Faster page loads (reduce browser JavaScript)
 - Better mobile performance
 - Reduced client-side latency
@@ -37,6 +38,7 @@ Move header bidding to the server for:
 ### OpenRTB 2.x Support
 
 Full OpenRTB protocol conversion:
+
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
 - Adds synthetic ID for privacy-safe tracking
@@ -57,6 +59,7 @@ Optional Ed25519 request signing for bid request authentication and fraud preven
 Server-side ad rendering for single ad slot.
 
 **Query Parameters**:
+
 - `slot` - Ad unit code
 - `w` - Width in pixels
 - `h` - Height in pixels
@@ -95,6 +98,7 @@ See [crates/common/src/integrations/prebid.rs](https://github.com/IABTechLab/tru
 ### OpenRTB Request Construction
 
 Located in `build_openrtb_from_ts()` function (line 335):
+
 - Converts ad units to impressions
 - Adds site metadata
 - Injects bidder parameters

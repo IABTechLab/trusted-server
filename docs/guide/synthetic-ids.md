@@ -1,54 +1,26 @@
 # Synthetic IDs
 
-Trusted Server's Synthetic ID module maintains user recognition across all browsers through first-party identifiers. 
+Trusted Server's Synthetic ID module maintains user recognition across all browsers through first-party identifiers.
 
 ## What are Synthetic IDs?
 
-Synthetic IDs are deterministic, mostly unique, privacy-safe identifiers, generated on a first site visit using HMAC-based templates that allow tracking with user consent while protecting user privacy. They are passed in requests on subsequent visits and activity. Synthetic IDs are represented in an HTTP header as such: 
+Synthetic IDs are privacy-safe identifiers generated on a first site visit using HMAC-based templates that allow tracking with user consent while protecting user privacy. Trusted Server derives a deterministic HMAC base from the template inputs and appends a short random suffix to reduce collision risk. They are passed in requests on subsequent visits and activity.
 
-```http
-// Header Example
-X-Synthetic-Ts: 0f99d7dc67265b6e3f9c10c2bbdca5357e739538ee1ac1f9e2d1e906299b6f37
-```
-
-They are also appended to the publisher first-pary cookie as well: 
-
-```http
-// First-Party Cookie Snippet 
- vis_opt_exp_27_exclude=1; 
-----> synthetic_id=0f99d7dc67265b6e3f9c10c2bbdca5357e739538ee1ac1f9e2d1e906299b6f37; 
- sharedID=235334ad-841e-42e7-a902-c0bf2a55d56d; _sharedID_cst=zix7LPQsHA%3D%3D;
-```
+Trusted Server surfaces the current synthetic ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
 ## How They Work
 
 ### HMAC-Based Generation
 
-Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate deterministic but privacy-safe identifiers.
+Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate a deterministic base from a configurable template, then append a short random suffix.
 
-```rust
-// Example placeholder
-synthetic_id = hmac_sha256(secret_key, template_data)
-```
+**Format**: `64-hex-hmac`.`6-alphanumeric-suffix`
 
-### Template System
-
-Templates define how synthetic IDs are constructed from various input sources:
-
-- User consent signals
-- Domain information
-- Temporal data
-- Custom parameters
+**IP normalization**: IPv6 addresses are normalized to a /64 prefix before templating.
 
 ## Configuration
 
-Configure synthetic ID templates in `trusted-server.toml`:
-
-```toml
-[synthetic_ids]
-template = "{{domain}}-{{timestamp}}-{{consent_hash}}"
-secret_key = "your-secret-key"
-```
+Configure synthetic ID templates and secrets in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `synthetic` section and environment variable overrides.
 
 ## Privacy Considerations
 
@@ -56,16 +28,6 @@ secret_key = "your-secret-key"
 - No personally identifiable information (PII) is included
 - Templates are configurable per-deployment
 - IDs can be rotated on schedule
-
-## Usage Example
-
-```javascript
-// Placeholder example
-const syntheticId = await trustedServer.generateSyntheticId({
-  domain: 'example.com',
-  consent: true
-});
-```
 
 ## Best Practices
 
@@ -78,27 +40,4 @@ const syntheticId = await trustedServer.generateSyntheticId({
 
 - Learn about [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)
-
-```sequenceDiagram
-    participant Browser
-    participant TS as Trusted Server (Edge)
-    participant KV as KV Store
-    participant Obj as Object Store (S3)
-    participant Partner as Partner TS Instance
-
-    Browser->>TS: Page request
-    TS->>KV: Lookup synthetic_id
-    alt Cache hit
-        KV-->>TS: Return user data
-    else Cache miss
-        TS->>Obj: Fetch from source of truth
-        Obj-->>TS: Return user data
-        TS->>KV: Populate cache
-    end
-    TS-->>Browser: Response with personalization
-
-    Note over TS,Obj: Async sync process
-    TS->>Obj: Write new/updated records
-    Partner->>Obj: Poll for updates
-    Partner->>KV: Update local cache
-    ```
+- Learn about [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams
