@@ -264,4 +264,4 @@ curl https://edge.example.com/
 - Learn about [Synthetic IDs](/guide/synthetic-ids) for identity generation
 - Review [GDPR Compliance](/guide/gdpr-compliance) for consent management
 - Explore [Didomi Integration](/guide/integrations/didomi) for CMP integration
-- Check [Configuration Reference](/guide/configuration-reference) for advanced options
+- Check [Configuration Reference](/guide/configuration) for advanced options

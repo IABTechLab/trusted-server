@@ -123,7 +123,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon"
 ```
 
-See [Environment Variables Reference](./environment-variables.md) for complete patterns.
+See [Configuration Reference](./configuration.md) for complete patterns.
 
 ---
 
@@ -464,7 +464,7 @@ echo -n "Hello World" | base64
 
 ```bash
 # Check current key ID
-curl https://edge.example.com/.well-known/ts.jwks.json | jq '.keys[].kid'
+curl https://edge.example.com/.well-known/trusted-server.json | jq '.jwks.keys[].kid'
 ```
 
 **Signature from wrong key:**
@@ -724,7 +724,7 @@ If you encounter an error not listed here:
 
 ## Next Steps
 
-- Review [Configuration Reference](./configuration-reference.md)
-- Check [Environment Variables](./environment-variables.md)
+- Review [Configuration Reference](./configuration.md)
+- Check [Configuration Reference](./configuration.md)
 - Explore [API Reference](./api-reference.md)
 - Learn about [Testing](./testing.md)

@@ -37,8 +37,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 **Response Headers:**
 
-- `X-Synthetic-Trusted-Server` - Stable synthetic ID
-- `X-Synthetic-Fresh` - One-time fresh ID
+- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
 
 **Use Cases:**
 
@@ -248,30 +247,34 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 
 ## Request Signing Endpoints
 
-### GET /.well-known/ts.jwks.json
+### GET /.well-known/trusted-server.json
 
-Returns active public keys in JWKS (JSON Web Key Set) format for signature verification.
+Returns the Trusted Server discovery document, which includes active public keys in JWKS
+format for signature verification.
 
 **Response:**
 
 ```json
 {
-  "keys": [
-    {
-      "kty": "OKP",
-      "crv": "Ed25519",
-      "kid": "ts-2025-01-A",
-      "use": "sig",
-      "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw"
-    }
-  ]
+  "version": "1.0",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "ts-2025-01-A",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw"
+      }
+    ]
+  }
 }
 ```
 
 **Example:**
 
 ```bash
-curl https://edge.example.com/.well-known/ts.jwks.json
+curl https://edge.example.com/.well-known/trusted-server.json
 ```
 
 **Use Cases:**
@@ -550,8 +553,7 @@ Proxies to configured endpoint with `user.id` populated with synthetic ID.
 
 **Response Headers:**
 
-- `X-Synthetic-Trusted-Server` - Stable synthetic ID
-- `X-Synthetic-Fresh` - One-time fresh ID
+- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
 
 ---
 
@@ -641,4 +643,4 @@ Access-Control-Allow-Headers = "Content-Type, Authorization"
 - Explore [Integrations Overview](./integrations-overview.md)
 - Learn about [Configuration](./configuration.md)
 - Review [Error Reference](./error-reference.md)
-- Understand [Environment Variables](./environment-variables.md)
+- Understand [Configuration Reference](./configuration.md)

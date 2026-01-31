@@ -14,26 +14,13 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 
 ## How It Works
 
-```
-┌──────────────────────────────────────────────────┐
-│  Ad Creative (Original)                          │
-│  <img src="https://tracker.com/pixel.gif">      │
-└──────────────────────────────────────────────────┘
-                     ↓ Rewrite
-┌──────────────────────────────────────────────────┐
-│  Ad Creative (Rewritten)                         │
-│  <img src="/first-party/proxy?                   │
-│    tsurl=https://tracker.com/pixel.gif&          │
-│    tstoken=abc123...">                           │
-└──────────────────────────────────────────────────┘
-                     ↓ Browser Request
-┌──────────────────────────────────────────────────┐
-│  Trusted Server                                  │
-│  1. Validate tstoken signature                   │
-│  2. Append synthetic_id parameter                │
-│  3. Proxy to tracker.com                         │
-│  4. Return response                              │
-└──────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  original["`Creative (Original) &lt;img src='tracker.com/pixel.gif' /&gt;`"]
+  rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
+  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append synthetic_id<br/>3. Proxy to tracker.com<br/>4. Return response"]
+
+  original -->|Rewrite| rewritten -->|Browser Request| server
 ```
 
 ## Core Endpoints
@@ -255,45 +242,9 @@ This endpoint is designed for advanced scenarios like A/B testing where you need
 
 ## URL Signing & Validation
 
-### Signature Generation
+Trusted Server signs proxy and click URLs using the publisher `proxy_secret`. Signed URLs include a `tstoken` and may include `tsexp` for expiration.
 
-Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
-
-```
-1. Reconstruct full URL: tsurl + query params (sorted)
-2. Encrypt with XChaCha20-Poly1305 (deterministic nonce)
-3. Hash encrypted bytes with SHA-256
-4. Base64 URL-safe encode (no padding)
-5. Result = tstoken
-```
-
-**Configuration**:
-
-```toml
-[publisher]
-proxy_secret = "your-secret-key-here"  # Must be secure random string
-```
-
-### Signature Validation
-
-On incoming requests:
-
-```
-1. Extract tsurl and all query params (except tstoken, tsexp)
-2. Reconstruct full URL in same order
-3. Compute expected tstoken using proxy_secret
-4. Compare with provided tstoken (constant-time)
-5. Check tsexp hasn't passed (if present)
-6. Reject if mismatch or expired
-```
-
-::: danger Security
-
-- Keep `proxy_secret` confidential and secure
-- Rotate secrets periodically
-- Never expose in client-side code
-- Use strong random values (32+ bytes)
-  :::
+For the detailed signing algorithm, validation steps, and security notes, see [Proxy Signing](/guide/proxy-signing).
 
 ## Content Type Handling
 
@@ -406,7 +357,7 @@ When proxying, Trusted Server automatically appends the `synthetic_id` parameter
 
 **Source Priority**:
 
-1. `x-psid-ts` request header
+1. `x-synthetic-id` request header
 2. `synthetic_id` cookie
 3. Generate new ID if missing
 

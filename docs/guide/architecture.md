@@ -6,28 +6,21 @@ Understanding the architecture of Trusted Server.
 
 Trusted Server is built as a Rust-based edge computing application that runs on Fastly Compute platform.
 
-```
-┌─────────────┐
-│   Browser   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────┐
-│  Trusted Server     │
-│  (Fastly Edge)      │
-│  ┌───────────────┐  │
-│  │ GDPR Check    │  │
-│  │ Synthetic IDs │  │
-│  │ Ad Serving    │  │
-│  └───────────────┘  │
-└──────┬──────────────┘
-       │
-       ▼
-┌─────────────────────┐
-│   Ad Servers        │
-│   KV Stores         │
-│   External APIs     │
-└─────────────────────┘
+```mermaid
+flowchart TD
+  browser["Browser"]
+  backends["Ad Servers / KV Stores / External APIs"]
+
+  subgraph edge["Trusted Server"]
+    direction TB
+    gdpr["GDPR Check"]
+    ids["Synthetic IDs"]
+    ads["Ad Serving"]
+    gdpr --> ids --> ads
+  end
+
+  browser --> edge
+  edge --> backends
 ```
 
 ## Core Components

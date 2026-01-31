@@ -115,7 +115,7 @@ if !is_valid {
 
 Trusted Server provides a built-in endpoint for testing signatures:
 
-**Endpoint**: `POST /admin/verify-signature`
+**Endpoint**: `POST /verify-signature`
 
 **Request**:
 
@@ -196,7 +196,7 @@ const publicKey = jwks.keys.find((k) => k.kid === signatureKid)
 
 - 32 bytes
 - Stored as JWK in Config Store
-- Published in JWKS endpoint
+- Published in discovery endpoint (`/.well-known/trusted-server.json`)
 
 ### JWK Format
 
@@ -333,7 +333,7 @@ Use the verification endpoint:
 SIGNATURE=$(sign-payload "test message")
 
 # Verify via API
-curl -X POST https://your-domain/admin/verify-signature \
+curl -X POST https://your-domain/verify-signature \
   -H "Content-Type: application/json" \
   -d '{
     "payload": "test message",

@@ -100,10 +100,6 @@ export default withMermaid(
           items: [
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Configuration', link: '/guide/configuration' },
-            {
-              text: 'Configuration Reference',
-              link: '/guide/configuration-reference',
-            },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },
           ],
@@ -112,6 +108,10 @@ export default withMermaid(
           text: 'Advanced',
           items: [
             { text: 'RSC Hydration', link: '/guide/rsc-hydration' },
+            {
+              text: 'Proxy Signing',
+              link: '/guide/proxy-signing',
+            },
             { text: 'Collective Sync', link: '/guide/collective-sync' },
           ],
         },
@@ -119,10 +119,6 @@ export default withMermaid(
           text: 'Reference',
           items: [
             { text: 'API Reference', link: '/guide/api-reference' },
-            {
-              text: 'Environment Variables',
-              link: '/guide/environment-variables',
-            },
             { text: 'Error Reference', link: '/guide/error-reference' },
           ],
         },
@@ -180,6 +176,9 @@ export default withMermaid(
     },
     // Mermaid configuration
     mermaid: {
+      flowchart: {
+        useMaxWidth: true,
+      },
       // https://mermaid.js.org/config/setup/modules/mermaidAPI.html#mermaidapi-configuration-defaults
     },
     mermaidPlugin: {

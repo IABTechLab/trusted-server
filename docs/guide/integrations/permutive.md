@@ -64,5 +64,5 @@ See [crates/common/src/integrations/permutive.rs](https://github.com/IABTechLab/
 ## Next Steps
 
 - Review [Integrations Overview](/guide/integrations-overview) for comparison
-- Check [Configuration Reference](/guide/configuration-reference) for options
+- Check [Configuration Reference](/guide/configuration) for options
 - Learn about [First-Party Proxy](/guide/first-party-proxy) architecture

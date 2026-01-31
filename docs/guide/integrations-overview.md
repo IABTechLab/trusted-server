@@ -233,7 +233,7 @@ TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__WORKSPACE_ID="workspace-123"
 TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__ENDPOINT="https://test.example.com"
 ```
 
-See [Environment Variables Reference](./environment-variables.md) for complete details.
+See [Configuration Reference](./configuration.md) for complete details.
 
 ## Custom Integrations
 

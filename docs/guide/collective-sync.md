@@ -74,12 +74,12 @@ Each synthetic ID maps to a compact JSON record optimized for fast reads:
 }
 ```
 
-| Field | Type     | Description                      |
-| ----- | -------- | -------------------------------- |
-| `sid` | string   | Full synthetic ID (HMAC.random)  |
-| `seg` | string[] | Audience segments                |
-| `lst` | integer  | Last seen timestamp (Unix epoch) |
-| `src` | string[] | Contributing publisher domains   |
+| Field | Type     | Description                        |
+| ----- | -------- | ---------------------------------- |
+| `sid` | string   | Full synthetic ID (`64hex.6alnum`) |
+| `seg` | string[] | Audience segments                  |
+| `lst` | integer  | Last seen timestamp (Unix epoch)   |
+| `src` | string[] | Contributing publisher domains     |
 
 ### Object Store Record (Source of Truth)
 
@@ -209,5 +209,5 @@ The sync endpoint handles:
 ## Next Steps
 
 - [Synthetic IDs](/guide/synthetic-ids) - Understand ID generation
-- [Configuration Reference](/guide/configuration-reference) - Full config options
+- [Configuration Reference](/guide/configuration) - Full config options
 - [GDPR Compliance](/guide/gdpr-compliance) - Privacy requirements
