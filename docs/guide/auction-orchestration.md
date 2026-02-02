@@ -66,7 +66,7 @@ sequenceDiagram
     activate TS
     Client->>TS: POST /auction<br/>AdRequest with adUnits[]
     Note right of Client: { "adUnits": [{ "code": "header-banner",<br/>  "mediaTypes": { "banner": { "sizes": [[728,90]] } } }] }
-    
+
     TS->>TS: Parse AdRequest<br/>Transform to AuctionRequest<br/>Generate user IDs<br/>Build context
     deactivate Client
     deactivate TS
@@ -80,7 +80,7 @@ sequenceDiagram
     TS->>Orch: orchestrator.run_auction()
     Orch->>Orch: Detect strategy<br/>mediator? parallel_mediation : parallel_only
     deactivate TS
-    
+
     Note over Orch: Strategy determined by config:<br/>[auction]<br/>mediator = "adserver_mock" → parallel_mediation<br/>No mediator → parallel_only
   end
 
@@ -90,27 +90,27 @@ sequenceDiagram
     activate APS
     activate Prebid
     activate Mock
-    
+
     par Parallel Provider Calls
       Orch->>APS: POST /e/dtb/bid<br/>APS TAM format
       Note right of Orch: { "pubId": "5128",<br/>  "slots": [{ "slotID": "header-banner",<br/>    "sizes": [[728,90]] }] }
-      
+
       APS->>Mock: APS TAM request
       Mock-->>APS: APS bid response<br/>(encoded prices, no creative)
       Note right of Mock: { "contextual": { "slots": [{<br/>  "slotID": "header-banner",<br/>  "amznbid": "Mi41MA==", // "2.50"<br/>  "fif": "1" }] } }
-      
+
       APS-->>Orch: AuctionResponse<br/>(APS bids)
     and
       Orch->>Prebid: POST /openrtb2/auction<br/>OpenRTB 2.x format
       Note right of Orch: { "id": "request",<br/>  "imp": [{ "id": "header-banner",<br/>    "banner": { "w": 728, "h": 90 } }] }
-      
+
       Prebid->>Mock: OpenRTB request
       Mock-->>Prebid: OpenRTB response<br/>(clear prices, with creative)
       Note right of Mock: { "seatbid": [{ "seat": "prebid",<br/>  "bid": [{ "price": 2.00, "adm": "<html>..." }] }] }
-      
+
       Prebid-->>Orch: AuctionResponse<br/>(Prebid bids)
     end
-    
+
     Note over Orch: Collected bids from all providers<br/>APS: encoded prices, no creative<br/>Prebid: clear prices, with creative
     deactivate Mock
     deactivate APS
@@ -124,10 +124,10 @@ sequenceDiagram
       activate Med
       Orch->>Med: POST /adserver/mediate<br/>All bids for final selection
       Note right of Orch: { "id": "auction-123",<br/>  "imp": [...],<br/>  "ext": { "bidder_responses": [<br/>    { "bidder": "amazon-aps",<br/>      "bids": [{ "encoded_price": "Mi41MA==" }] },<br/>    { "bidder": "prebid",<br/>      "bids": [{ "price": 2.00 }] }] } }
-      
+
       Med->>Med: Decode APS encoded prices<br/>Apply floor prices<br/>Select highest CPM per slot
       Note right of Med: Base64 decode: "Mi41MA==" → "2.50"<br/>Winner: APS at $2.50 vs Prebid at $2.00
-      
+
       Med-->>Orch: OpenRTB response with winners
       Note right of Med: { "seatbid": [{ "seat": "amazon-aps",<br/>  "bid": [{ "price": 2.50, "impid": "header-banner" }] }] }
       deactivate Med
@@ -137,7 +137,7 @@ sequenceDiagram
       Note over Client,Mock: Direct Winner Selection
       Orch->>Orch: Compare clear prices only<br/>Skip APS (encoded prices)<br/>Select highest CPM
       Note right of Orch: APS bids skipped (encoded prices)<br/>Winner: Prebid at $2.00 (only clear price)
-      
+
       Note over Orch: Results: Limited winner selection<br/>Cannot compare encoded APS prices<br/>Prebid wins by default
     end
   end
@@ -148,10 +148,10 @@ sequenceDiagram
     activate TS
     activate Client
     Orch->>Orch: Transform to OpenRTB response<br/>Generate iframe creatives<br/>Rewrite creative URLs<br/>Add orchestrator metadata
-    
+
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
-    
+
     TS-->>Client: 200 OpenRTB response<br/>with winning creative
     deactivate Orch
     deactivate TS
@@ -202,14 +202,14 @@ Convert OrchestrationResult → OpenRTB 2.x Response
 
 The orchestrator is composed of several modules:
 
-| Module | Path | Purpose |
-|--------|------|---------|
-| `orchestrator.rs` | `crates/common/src/auction/` | Core parallel execution and bid selection |
-| `provider.rs` | `crates/common/src/auction/` | `AuctionProvider` trait definition |
-| `types.rs` | `crates/common/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
-| `formats.rs` | `crates/common/src/auction/` | Format conversions (TSJS ↔ OpenRTB) |
-| `endpoints.rs` | `crates/common/src/auction/` | HTTP handler for `POST /auction` |
-| `config.rs` | `crates/common/src/auction/` | Auction configuration types |
+| Module            | Path                         | Purpose                                     |
+| ----------------- | ---------------------------- | ------------------------------------------- |
+| `orchestrator.rs` | `crates/common/src/auction/` | Core parallel execution and bid selection   |
+| `provider.rs`     | `crates/common/src/auction/` | `AuctionProvider` trait definition          |
+| `types.rs`        | `crates/common/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
+| `formats.rs`      | `crates/common/src/auction/` | Format conversions (TSJS ↔ OpenRTB)         |
+| `endpoints.rs`    | `crates/common/src/auction/` | HTTP handler for `POST /auction`            |
+| `config.rs`       | `crates/common/src/auction/` | Auction configuration types                 |
 
 ### Provider Auto-Discovery
 
@@ -385,7 +385,9 @@ An external mediation service that receives all bidder responses and performs un
 ```json
 {
   "id": "auction-123",
-  "imp": [{ "id": "header-banner", "banner": { "format": [{ "w": 728, "h": 90 }] } }],
+  "imp": [
+    { "id": "header-banner", "banner": { "format": [{ "w": 728, "h": 90 }] } }
+  ],
   "ext": {
     "bidder_responses": [
       {
@@ -394,10 +396,12 @@ An external mediation service that receives all bidder responses and performs un
       },
       {
         "bidder": "prebid",
-        "bids": [{ "imp_id": "header-banner", "price": 2.00, "adm": "<html>..." }]
+        "bids": [
+          { "imp_id": "header-banner", "price": 2.0, "adm": "<html>..." }
+        ]
       }
     ],
-    "config": { "price_floor": 0.50 }
+    "config": { "price_floor": 0.5 }
   }
 }
 ```
@@ -493,7 +497,10 @@ The `POST /auction` endpoint accepts a Prebid.js-compatible `AdRequest`:
       "code": "header-banner",
       "mediaTypes": {
         "banner": {
-          "sizes": [[728, 90], [970, 250]]
+          "sizes": [
+            [728, 90],
+            [970, 250]
+          ]
         }
       },
       "bids": [
@@ -521,7 +528,7 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
         {
           "id": "bid-1",
           "impid": "header-banner",
-          "price": 2.50,
+          "price": 2.5,
           "adm": "<iframe src=\"/first-party/proxy?tsurl=...&tstoken=sig\">...</iframe>",
           "w": 728,
           "h": 90
@@ -552,16 +559,16 @@ Winning creatives are processed through a streaming HTML rewriter (`lol_html`) b
 
 **Elements rewritten:**
 
-| Element | Attributes | Target |
-|---------|-----------|--------|
-| `<img>` | `src`, `data-src`, `srcset` | `/first-party/proxy?tsurl=...` |
-| `<script>` | `src` | `/first-party/proxy?tsurl=...` |
-| `<link>` | `href`, `imagesrcset` | `/first-party/proxy?tsurl=...` |
-| `<iframe>` | `src` | `/first-party/proxy?tsurl=...` |
-| `<video>`, `<audio>`, `<source>` | `src` | `/first-party/proxy?tsurl=...` |
-| `<a>`, `<area>` | `href` | `/first-party/click?tsurl=...` |
-| `<style>`, `[style]` | `url()` references | `/first-party/proxy?tsurl=...` |
-| SVG `<image>`, `<use>` | `href`, `xlink:href` | `/first-party/proxy?tsurl=...` |
+| Element                          | Attributes                  | Target                         |
+| -------------------------------- | --------------------------- | ------------------------------ |
+| `<img>`                          | `src`, `data-src`, `srcset` | `/first-party/proxy?tsurl=...` |
+| `<script>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
+| `<link>`                         | `href`, `imagesrcset`       | `/first-party/proxy?tsurl=...` |
+| `<iframe>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
+| `<video>`, `<audio>`, `<source>` | `src`                       | `/first-party/proxy?tsurl=...` |
+| `<a>`, `<area>`                  | `href`                      | `/first-party/click?tsurl=...` |
+| `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
+| SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
 
 URLs that are relative, or use `data:`, `javascript:`, `blob:`, or `mailto:` schemes are left unchanged. Domains in the `rewrite.exclude_domains` config list (supports wildcards like `*.cloudflare.com`) are also skipped.
 
@@ -603,41 +610,41 @@ price_floor = 0.50
 
 #### `[auction]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable the auction system |
-| `providers` | string[] | `[]` | Ordered list of provider names to call |
-| `mediator` | string? | `null` | Provider name to use as mediator (enables `parallel_mediation`) |
-| `timeout_ms` | u32 | `2000` | Overall auction timeout in milliseconds |
+| Field        | Type     | Default | Description                                                     |
+| ------------ | -------- | ------- | --------------------------------------------------------------- |
+| `enabled`    | bool     | `false` | Enable the auction system                                       |
+| `providers`  | string[] | `[]`    | Ordered list of provider names to call                          |
+| `mediator`   | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
+| `timeout_ms` | u32      | `2000`  | Overall auction timeout in milliseconds                         |
 
 #### `[integrations.prebid]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable Prebid provider |
-| `server_url` | string | — | Prebid Server URL (required) |
-| `timeout_ms` | u32 | `1000` | Request timeout |
-| `bidders` | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot |
-| `auto_configure` | bool | `true` | Auto-remove client-side prebid.js scripts |
-| `debug` | bool | `false` | Enable Prebid debug mode |
+| Field            | Type     | Default           | Description                                 |
+| ---------------- | -------- | ----------------- | ------------------------------------------- |
+| `enabled`        | bool     | `true`            | Enable Prebid provider                      |
+| `server_url`     | string   | —                 | Prebid Server URL (required)                |
+| `timeout_ms`     | u32      | `1000`            | Request timeout                             |
+| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot |
+| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts   |
+| `debug`          | bool     | `false`           | Enable Prebid debug mode                    |
 
 #### `[integrations.aps]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable APS provider |
-| `pub_id` | string | — | APS publisher ID (required) |
-| `endpoint` | string | `https://aax.amazon-adsystem.com/e/dtb/bid` | APS TAM endpoint |
-| `timeout_ms` | u32 | `800` | Request timeout |
+| Field        | Type   | Default                                     | Description                 |
+| ------------ | ------ | ------------------------------------------- | --------------------------- |
+| `enabled`    | bool   | `false`                                     | Enable APS provider         |
+| `pub_id`     | string | —                                           | APS publisher ID (required) |
+| `endpoint`   | string | `https://aax.amazon-adsystem.com/e/dtb/bid` | APS TAM endpoint            |
+| `timeout_ms` | u32    | `800`                                       | Request timeout             |
 
 #### `[integrations.adserver_mock]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable mediator |
-| `endpoint` | string | `http://localhost:6767/adserver/mediate` | Mediator service endpoint |
-| `timeout_ms` | u32 | `500` | Request timeout |
-| `price_floor` | f64? | `null` | Global price floor CPM |
+| Field         | Type   | Default                                  | Description               |
+| ------------- | ------ | ---------------------------------------- | ------------------------- |
+| `enabled`     | bool   | `false`                                  | Enable mediator           |
+| `endpoint`    | string | `http://localhost:6767/adserver/mediate` | Mediator service endpoint |
+| `timeout_ms`  | u32    | `500`                                    | Request timeout           |
+| `price_floor` | f64?   | `null`                                   | Global price floor CPM    |
 
 ### Timeout Tuning
 
@@ -694,11 +701,11 @@ The orchestrator is designed to be resilient:
 
 The auction system logs at multiple levels throughout execution:
 
-| Level | Examples |
-|-------|---------|
-| `info` | Auction request received, provider launch, bid counts, winner selection, total timing |
-| `debug` | Skipped bids (encoded prices), creative rewrite sizes |
-| `warn` | Provider launch failures, parse failures, mediator bids without decoded prices |
+| Level   | Examples                                                                              |
+| ------- | ------------------------------------------------------------------------------------- |
+| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing |
+| `debug` | Skipped bids (encoded prices), creative rewrite sizes                                 |
+| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices        |
 
 ### Response Metadata
 
@@ -712,4 +719,3 @@ Every auction response includes structured metadata in `ext.orchestrator`:
   "time_ms": 145
 }
 ```
-
