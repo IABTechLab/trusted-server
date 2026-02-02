@@ -45,6 +45,45 @@ pub struct RequestSigner {
     pub kid: String,
 }
 
+/// Current version of the signing protocol
+pub const SIGNING_VERSION: &str = "1.1";
+
+/// Parameters for enhanced request signing
+#[derive(Debug, Clone)]
+pub struct SigningParams {
+    pub request_id: String,
+    pub request_host: String,
+    pub request_scheme: String,
+    pub timestamp: u64,
+}
+
+impl SigningParams {
+    /// Creates a new `SigningParams` with the current timestamp
+    #[must_use]
+    pub fn new(request_id: String, request_host: String, request_scheme: String) -> Self {
+        Self {
+            request_id,
+            request_host,
+            request_scheme,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Builds the canonical payload string for signing.
+    ///
+    /// Format: `kid:request_host:request_scheme:id:ts`
+    #[must_use]
+    pub fn build_payload(&self, kid: &str) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            kid, self.request_host, self.request_scheme, self.request_id, self.timestamp
+        )
+    }
+}
+
 impl RequestSigner {
     /// Creates a `RequestSigner` from the current key ID stored in config.
     ///
@@ -81,6 +120,21 @@ impl RequestSigner {
         let signature_bytes = self.key.sign(payload).to_bytes();
 
         Ok(general_purpose::URL_SAFE_NO_PAD.encode(signature_bytes))
+    }
+
+    /// Signs a request using the enhanced v1.1 signing protocol.
+    ///
+    /// The signed payload format is: `kid:request_host:request_scheme:id:ts`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing fails.
+    pub fn sign_request(
+        &self,
+        params: &SigningParams,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let payload = params.build_payload(&self.kid);
+        self.sign(payload.as_bytes())
     }
 }
 
@@ -233,5 +287,85 @@ mod tests {
 
         let result = verify_signature(payload, malformed_signature, &signer.kid);
         assert!(result.is_err(), "Should error for malformed signature");
+    }
+
+    #[test]
+    fn test_signing_params_build_payload() {
+        let params = SigningParams {
+            request_id: "req-123".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let payload = params.build_payload("kid-abc");
+        assert_eq!(payload, "kid-abc:example.com:https:req-123:1706900000");
+    }
+
+    #[test]
+    fn test_signing_params_new_creates_timestamp() {
+        let params = SigningParams::new(
+            "req-123".to_string(),
+            "example.com".to_string(),
+            "https".to_string(),
+        );
+
+        assert_eq!(params.request_id, "req-123");
+        assert_eq!(params.request_host, "example.com");
+        assert_eq!(params.request_scheme, "https");
+        // Timestamp should be recent (within last minute)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(params.timestamp <= now);
+        assert!(params.timestamp >= now - 60);
+    }
+
+    #[test]
+    fn test_sign_request_enhanced() {
+        let signer = RequestSigner::from_config().unwrap();
+        let params = SigningParams::new(
+            "auction-123".to_string(),
+            "publisher.com".to_string(),
+            "https".to_string(),
+        );
+
+        let signature = signer.sign_request(&params).unwrap();
+        assert!(!signature.is_empty());
+
+        // Verify the signature is valid by reconstructing the payload
+        let payload = params.build_payload(&signer.kid);
+        let result = verify_signature(payload.as_bytes(), &signature, &signer.kid).unwrap();
+        assert!(result, "Enhanced signature should be valid");
+    }
+
+    #[test]
+    fn test_sign_request_different_params_different_signature() {
+        let signer = RequestSigner::from_config().unwrap();
+
+        let params1 = SigningParams {
+            request_id: "req-1".to_string(),
+            request_host: "host1.com".to_string(),
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let params2 = SigningParams {
+            request_id: "req-1".to_string(),
+            request_host: "host2.com".to_string(), // Different host
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let sig1 = signer.sign_request(&params1).unwrap();
+        let sig2 = signer.sign_request(&params2).unwrap();
+
+        assert_ne!(sig1, sig2, "Different hosts should produce different signatures");
+    }
+
+    #[test]
+    fn test_signing_version_constant() {
+        assert_eq!(SIGNING_VERSION, "1.1");
     }
 }

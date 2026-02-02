@@ -113,6 +113,9 @@ pub struct PrebidExt {
 
 #[derive(Debug, Serialize, Default)]
 pub struct TrustedServerExt {
+    /// Version of the signing protocol (e.g., "1.1")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +124,9 @@ pub struct TrustedServerExt {
     pub request_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_scheme: Option<String>,
+    /// Unix timestamp for replay protection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
