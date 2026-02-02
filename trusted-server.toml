@@ -75,6 +75,19 @@ sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 
+# DataDome bot protection integration
+# Proxies tags.js and signal collection API through first-party context
+# Endpoints:
+#   GET  /integrations/datadome/tags.js  - Proxied SDK script
+#   ANY  /integrations/datadome/js/*     - Signal collection API
+[integrations.datadome]
+enabled = true
+# js_key = "YOUR_DATADOME_JS_KEY"  # Optional: for auto-injecting DataDome config
+sdk_origin = "https://js.datadome.co"        # SDK script origin (tags.js)
+api_origin = "https://api-js.datadome.co"    # Signal collection API origin (/js/*)
+cache_ttl_seconds = 3600
+rewrite_sdk = true  # Rewrite <script src="js.datadome.co/..."> to first-party paths in HTML
+
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
 # Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")
