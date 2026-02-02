@@ -158,6 +158,10 @@ export default withMermaid(
               text: 'Framework Support',
               items: [{ text: 'Next.js', link: '/guide/integrations/nextjs' }],
             },
+            {
+              text: 'Security',
+              items: [{ text: 'DataDome', link: '/guide/integrations/datadome' }],
+            },
           ],
         },
       ],
