@@ -81,12 +81,12 @@ rewrite_sdk = true
 #   GET  /integrations/datadome/tags.js  - Proxied SDK script
 #   ANY  /integrations/datadome/js/*     - Signal collection API
 [integrations.datadome]
-enabled = true
+enabled = false
 # js_key = "YOUR_DATADOME_JS_KEY"  # Optional: for auto-injecting DataDome config
-sdk_origin = "https://js.datadome.co"        # SDK script origin (tags.js)
-api_origin = "https://api-js.datadome.co"    # Signal collection API origin (/js/*)
+sdk_origin = "https://js.datadome.co"
+api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
-rewrite_sdk = true  # Rewrite <script src="js.datadome.co/..."> to first-party paths in HTML
+rewrite_sdk = true 
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]

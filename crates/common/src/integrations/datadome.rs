@@ -42,11 +42,6 @@ pub struct DataDomeConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// `DataDome` JavaScript key (client-side key from `DataDome` dashboard)
-    /// If provided, Trusted Server can inject the config script automatically
-    #[serde(default)]
-    pub js_key: Option<String>,
-
     /// Base URL for `DataDome` SDK script (default: <https://js.datadome.co>)
     /// Used for fetching and serving tags.js
     #[serde(default = "default_sdk_origin")]
@@ -93,7 +88,6 @@ impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            js_key: None,
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
             cache_ttl_seconds: default_cache_ttl(),
@@ -472,7 +466,6 @@ mod tests {
     fn test_config() -> DataDomeConfig {
         DataDomeConfig {
             enabled: true,
-            js_key: Some("test-key".to_string()),
             sdk_origin: "https://js.datadome.co".to_string(),
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
