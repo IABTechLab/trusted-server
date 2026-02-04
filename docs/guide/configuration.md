@@ -723,16 +723,15 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                | Type          | Default           | Description                     |
-| -------------------- | ------------- | ----------------- | ------------------------------- |
-| `enabled`            | Boolean       | `true`            | Enable Prebid integration       |
-| `server_url`         | String        | Required          | Prebid Server endpoint URL      |
-| `timeout_ms`         | Integer       | `1000`            | Request timeout in milliseconds |
-| `bidders`            | Array[String] | `["mocktioneer"]` | List of enabled bidders         |
-| `auto_configure`     | Boolean       | `true`            | Auto-inject Prebid.js shim      |
-| `debug`              | Boolean       | `false`           | Enable debug logging            |
-| `script_handler`     | String        | `None`            | Custom script endpoint path     |
-| `debug_query_params` | String        | `None`            | Extra query params for debug    |
+| Field                | Type          | Default                                                                | Description                                 |
+| -------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
+| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                   |
+| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                  |
+| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds             |
+| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                     |
+| `debug`              | Boolean       | `false`                                                                | Enable debug logging                        |
+| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging   |
+| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception |
 
 **Example**:
 
@@ -742,8 +741,10 @@ enabled = true
 server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = true
 debug = false
+
+# Customize script interception (optional)
+script_patterns = ["/prebid.js", "/prebid.min.js"]
 ```
 
 **Environment Override**:
@@ -753,10 +754,20 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
-TRUSTED_SERVER__INTEGRATIONS__PREBID__AUTO_CONFIGURE=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG_QUERY_PARAMS=debug=1
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS='["/prebid.js","/prebid.min.js"]'
 ```
+
+**Script Pattern Matching**:
+
+The `script_patterns` configuration determines which Prebid scripts are intercepted and replaced with empty JavaScript responses. This prevents client-side Prebid.js from loading when using server-side bidding.
+
+- **Suffix matching**: `/prebid.min.js` matches any URL ending with that path
+- **Wildcard patterns**: `/static/prebid/*` matches paths under that prefix
+- **Disable interception**: Set `script_patterns = []` to keep client-side Prebid
+
+See [Prebid Integration](/guide/integrations/prebid) for full details.
 
 ### Next.js Integration
 
