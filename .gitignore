@@ -4,7 +4,7 @@
 /target
 
 # env
-.env
+.env*
 
 # backup
 **/*.rs.bk
@@ -14,10 +14,7 @@ src/*.html
 # OS
 .DS_Store
 
-# IDE - VSCode
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
+# IDE
+.claude
 .specstory
+.vscode
