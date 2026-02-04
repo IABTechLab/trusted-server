@@ -848,7 +848,7 @@ mod tests {
                 }),
             )
             .expect("should update prebid config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
