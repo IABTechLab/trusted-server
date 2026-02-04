@@ -5,7 +5,7 @@ use fastly::{Body, Request, Response};
 use crate::backend::ensure_backend_from_url;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -202,9 +202,11 @@ pub fn handle_publisher_request(
         .get_header(header::COOKIE)
         .and_then(|h| h.to_str().ok())
         .map(|cookies| {
-            cookies
-                .split(';')
-                .any(|cookie| cookie.trim_start().starts_with("synthetic_id="))
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim_start()
+                    .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            })
         })
         .unwrap_or(false);
 
@@ -305,7 +307,7 @@ pub fn handle_publisher_request(
         );
     }
 
-    response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, synthetic_id.as_str());
+    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     if !has_synthetic_cookie {
         response.set_header(
             header::SET_COOKIE,
