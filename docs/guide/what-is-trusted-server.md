@@ -12,20 +12,22 @@ Trusted Server provides publishers benefits such as:
 - Increased ad inventory revenue within cookie restricted (Safari Webkit) or other JS-challenged environments
 - Ability to serve ALL assets under 1st party context with on-the-fly URL detection and rewriting via HTML/CSS stream inspection
 - Cryptographically sign bid requests for downstream partners to verify requests originated from specific publisher's Trusted Server instance, preventing fraud and spoofing
-- Creates deterministic, cryptographically Synthetic identifiers (Publisher Owned Synthetic IDs) without relying on third-party cookies
-- Native integration with Prebid-Server and other third-party monetization and ID vendors 
+- Creates privacy-safe synthetic identifiers (HMAC base + short random suffix) without relying on third-party cookies
+- Native integration with Prebid-Server and other third-party monetization and ID vendors
 - Native support for parsing RSC (React Server Components) for Next.JS front-end origins
 - Dynamic backend support for ease of integrating existing publisher environments
 - Support for existing 3rd party JS workflows
 
-
 ### Privacy-Preserving
+
 All tracking and data collection requires explicit user consent through GDPR compliance checks.
 
 ### Edge Computing
+
 Currently runs on Fastly Compute platform, providing global low-latency performance. Initiatives for Cloudflare Worker support and Akamai's Fermyon SPIN support.
 
 ### Real-Time Bidding
+
 Integrates with Prebid for seamless RTB workflows.
 
 ## Use Cases

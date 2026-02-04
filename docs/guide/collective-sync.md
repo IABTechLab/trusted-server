@@ -31,11 +31,11 @@ sequenceDiagram
 
 ## Architecture Principles
 
-| Component | Role | Characteristics |
-|-----------|------|-----------------|
-| **KV Store** | Hot cache | Fast reads (~1ms), edge-local, eventually consistent |
-| **Object Store** | Source of truth | Durable, supports range queries, sync endpoint |
-| **Secret Key** | Shared salt | Distributed out-of-band, enables collective membership |
+| Component        | Role            | Characteristics                                        |
+| ---------------- | --------------- | ------------------------------------------------------ |
+| **KV Store**     | Hot cache       | Fast reads (~1ms), edge-local, eventually consistent   |
+| **Object Store** | Source of truth | Durable, supports range queries, sync endpoint         |
+| **Secret Key**   | Shared salt     | Distributed out-of-band, enables collective membership |
 
 ## Configuration
 
@@ -74,12 +74,12 @@ Each synthetic ID maps to a compact JSON record optimized for fast reads:
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `sid` | string | Full synthetic ID (HMAC.random) |
-| `seg` | string[] | Audience segments |
-| `lst` | integer | Last seen timestamp (Unix epoch) |
-| `src` | string[] | Contributing publisher domains |
+| Field | Type     | Description                        |
+| ----- | -------- | ---------------------------------- |
+| `sid` | string   | Full synthetic ID (`64hex.6alnum`) |
+| `seg` | string[] | Audience segments                  |
+| `lst` | integer  | Last seen timestamp (Unix epoch)   |
+| `src` | string[] | Contributing publisher domains     |
 
 ### Object Store Record (Source of Truth)
 
@@ -94,8 +94,8 @@ The Object Store maintains a richer record with full history:
   "last_seen": "2024-01-28T15:00:00Z",
   "first_seen": "2024-01-15T10:30:00Z",
   "sources": [
-    {"domain": "pub-a.com", "last_seen": "2024-01-28T15:00:00Z"},
-    {"domain": "pub-b.com", "last_seen": "2024-01-27T12:00:00Z"}
+    { "domain": "pub-a.com", "last_seen": "2024-01-28T15:00:00Z" },
+    { "domain": "pub-b.com", "last_seen": "2024-01-27T12:00:00Z" }
   ],
   "version": 3
 }
@@ -161,6 +161,7 @@ Content-Type: application/json
 ```
 
 The sync endpoint handles:
+
 - Deduplication by synthetic_id
 - Segment merging (union of all observed segments)
 - Source tracking (which publishers contributed data)
@@ -197,16 +198,16 @@ The sync endpoint handles:
 
 ## Implementation Status
 
-| Feature | Status |
-|---------|--------|
-| KV Store integration | ✅ Available |
-| Object Store writes | 🚧 In development |
-| Sync endpoint | 🚧 In development |
-| Incremental sync | 📋 Planned |
-| Segment merging | 📋 Planned |
+| Feature              | Status            |
+| -------------------- | ----------------- |
+| KV Store integration | ✅ Available      |
+| Object Store writes  | 🚧 In development |
+| Sync endpoint        | 🚧 In development |
+| Incremental sync     | 📋 Planned        |
+| Segment merging      | 📋 Planned        |
 
 ## Next Steps
 
 - [Synthetic IDs](/guide/synthetic-ids) - Understand ID generation
-- [Configuration Reference](/guide/configuration-reference) - Full config options
+- [Configuration Reference](/guide/configuration) - Full config options
 - [GDPR Compliance](/guide/gdpr-compliance) - Privacy requirements

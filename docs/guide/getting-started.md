@@ -6,9 +6,9 @@ Get up and running with Trusted Server quickly.
 
 Before you begin, ensure you have:
 
-- Rust 1.91.1 or later
+- Rust 1.91.1 (see `.tool-versions`)
 - Fastly CLI installed
-- A Fastly account and API Key
+- A Fastly account and API key
 - Basic familiarity with WebAssembly
 
 ## Installation
@@ -16,28 +16,13 @@ Before you begin, ensure you have:
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/trusted-server.git
+git clone https://github.com/IABTechLab/trusted-server.git
 cd trusted-server
 ```
 
-### Install Fastly CLI
+### Fastly CLI Setup
 
-```bash
-# macOS
-brew install fastly/tap/fastly
-
-# Or download from fastly.com/cli
-```
-
-### Set Up Fastly CLI
-
-```bash
-# Generate API Token in Faslty Web Portal
-fastly profile create
-# Follow interactive Prompts
-# This will store your API token credential in a configuration file and remember it for subsequent commands.
-# Set a FASTLY_API_TOKEN environment variable
-```
+Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly).
 
 ### Install Viceroy (Test Runtime)
 

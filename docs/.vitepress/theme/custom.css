@@ -13,10 +13,13 @@
 
   /* Home hero name gradient - solid red to match brand */
   --vp-home-hero-name-color: #dd3333;
-  --vp-home-hero-name-background: linear-gradient(135deg, #dd3333 0%, #ab2828 100%);
+  --vp-home-hero-name-background: linear-gradient(
+    135deg,
+    #dd3333 0%,
+    #ab2828 100%
+  );
   -webkit-background-clip: text;
   background-clip: text;
-
 }
 
 /* Dark mode adjustments */
@@ -31,7 +34,11 @@
   --vp-button-brand-active-bg: #c42e2e;
 
   --vp-home-hero-name-color: #e64545;
-  --vp-home-hero-name-background: linear-gradient(135deg, #e64545 0%, #dd3333 100%);
+  --vp-home-hero-name-background: linear-gradient(
+    135deg,
+    #e64545 0%,
+    #dd3333 100%
+  );
 }
 
 /* Hero title size */

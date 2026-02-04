@@ -22,12 +22,14 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 **So that** I can analyze bidding behavior and revenue patterns
 
 #### Acceptance Criteria
+
 - [ ] Capture bid events with: timestamp, exchange, ad-slot, bid price, currency, creative URL, timeout status
 - [ ] Tag winning bid vs losing bids per auction
 - [ ] Emit structured JSON log events via Fastly Real-time Logging
 - [ ] Support high-cardinality dimensions without performance degradation
 
 #### Technical Tasks
+
 - [ ] Define `BidEvent` struct in Rust with all required fields
 - [ ] Instrument Prebid response parsing to extract bid data
 - [ ] Configure Fastly log endpoint (BigQuery, S3, or Datadog)
@@ -35,6 +37,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] Benchmark logging overhead (<1ms per request)
 
 #### Data Schema
+
 ```json
 {
   "event_type": "prebid_bid",
@@ -60,12 +63,14 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 **So that** I can audit vendor activity and detect unauthorized calls
 
 #### Acceptance Criteria
+
 - [ ] Track all outbound requests proxied through Trusted Server
 - [ ] Capture: domain, full URL path, request type, initiator (script/pixel/etc)
 - [ ] Aggregate call counts per page load (session/page correlation)
 - [ ] Flag domains not on approved allowlist
 
 #### Technical Tasks
+
 - [ ] Instrument proxy request handlers to emit domain call events
 - [ ] Add session/page_id correlation (via synthetic ID or request header)
 - [ ] Create domain allowlist configuration in settings.toml
@@ -73,6 +78,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] Track request timing (DNS, connect, TTFB, total)
 
 #### Data Schema
+
 ```json
 {
   "event_type": "domain_call",
@@ -97,18 +103,21 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 **So that** I can understand vendor behavior and script activity
 
 #### Acceptance Criteria
+
 - [ ] Track JS file requests and API endpoints called by ad SDKs
 - [ ] Identify which SDK initiated each call (Prebid, GAM, identity partners)
 - [ ] Capture endpoint patterns (e.g., `/v1/auction`, `/sync`, `/pixel`)
 - [ ] Count calls per SDK per page load
 
 #### Technical Tasks
+
 - [ ] Parse request paths to categorize endpoint types
 - [ ] Build SDK fingerprinting logic (match known SDK URL patterns)
 - [ ] Emit `sdk_call` events with SDK attribution
 - [ ] Create SDK registry configuration for known vendors
 
 #### Data Schema
+
 ```json
 {
   "event_type": "sdk_call",
@@ -132,12 +141,14 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 **So that** I can ensure GDPR/CCPA compliance and avoid regulatory risk
 
 #### Acceptance Criteria
+
 - [ ] Log consent state (TCF string, USP string) per request
 - [ ] Flag calls made to tracking domains when consent not granted
 - [ ] Track consent rate by geography
 - [ ] Alert on potential violations (call to tracking domain without consent)
 
 #### Technical Tasks
+
 - [ ] Parse TCF/GPP consent strings in request flow
 - [ ] Build tracking domain classification (analytics, advertising, functional)
 - [ ] Cross-reference consent state with domain calls
@@ -145,6 +156,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] Add geo detection for consent rate reporting
 
 #### Data Schema
+
 ```json
 {
   "event_type": "compliance_check",
@@ -168,6 +180,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 **So that** events can be aggregated and visualized
 
 #### Acceptance Criteria
+
 - [ ] Support multiple log destinations (BigQuery, S3, Datadog, Kafka)
 - [ ] Configure via settings.toml or environment variables
 - [ ] Structured JSON output with consistent schema
@@ -175,6 +188,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] <5 second latency from event to availability
 
 #### Technical Tasks
+
 - [ ] Implement Fastly Real-time Log Streaming configuration
 - [ ] Add log destination settings to configuration schema
 - [ ] Create log formatter for consistent JSON output
@@ -182,6 +196,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] Document setup for each supported destination
 
 #### Configuration Example
+
 ```toml
 [observability.logging]
 enabled = true
@@ -204,6 +219,7 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 **So that** I can monitor revenue and operations at a glance
 
 #### Acceptance Criteria
+
 - [ ] Real-time bid activity panel (bids/min by exchange)
 - [ ] Win rate by exchange (pie/bar chart)
 - [ ] Top domains called (table with counts)
@@ -212,6 +228,7 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 - [ ] Filterable by time range, ad-slot, exchange
 
 #### Technical Tasks
+
 - [ ] Set up Grafana instance (or use Grafana Cloud)
 - [ ] Configure Prometheus/BigQuery as data source
 - [ ] Build dashboard JSON template
@@ -219,6 +236,7 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 - [ ] Document dashboard import process
 
 #### Dashboard Panels
+
 1. **Bid Activity** - Time series of bids/minute by exchange
 2. **Revenue Metrics** - Avg bid price, win rate, timeout rate
 3. **Domain Calls** - Top 20 domains, authorized vs unauthorized
@@ -235,6 +253,7 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 **So that** I can respond quickly to issues
 
 #### Acceptance Criteria
+
 - [ ] Alert when exchange win rate drops >20% from baseline
 - [ ] Alert on compliance violation detected
 - [ ] Alert when unauthorized domain called
@@ -242,6 +261,7 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 - [ ] Configurable notification channels (Slack, email, PagerDuty)
 
 #### Technical Tasks
+
 - [ ] Define alerting rules in Prometheus/Grafana
 - [ ] Configure notification channels
 - [ ] Set baseline thresholds (configurable per publisher)
@@ -297,12 +317,12 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 
 ## Success Metrics
 
-| Metric | Target |
-|--------|--------|
-| Event capture latency | <5 seconds from request to dashboard |
-| Log completeness | >99.9% of events captured |
-| Dashboard query latency | <2 seconds for common queries |
-| Alert delivery time | <1 minute from trigger |
+| Metric                  | Target                               |
+| ----------------------- | ------------------------------------ |
+| Event capture latency   | <5 seconds from request to dashboard |
+| Log completeness        | >99.9% of events captured            |
+| Dashboard query latency | <2 seconds for common queries        |
+| Alert delivery time     | <1 minute from trigger               |
 
 ---
 
@@ -326,12 +346,12 @@ service_account_key_secret = "BIGQUERY_SA_KEY"
 
 ## Timeline Estimate
 
-| Phase | Stories | Estimate |
-|-------|---------|----------|
-| Phase 1: Instrumentation | Stories 1-4 | 3-4 weeks |
-| Phase 2: Infrastructure | Story 5 | 1-2 weeks |
-| Phase 3: Visualization | Stories 6-7 | 2-3 weeks |
-| **Total** | | **6-9 weeks** |
+| Phase                    | Stories     | Estimate      |
+| ------------------------ | ----------- | ------------- |
+| Phase 1: Instrumentation | Stories 1-4 | 3-4 weeks     |
+| Phase 2: Infrastructure  | Story 5     | 1-2 weeks     |
+| Phase 3: Visualization   | Stories 6-7 | 2-3 weeks     |
+| **Total**                |             | **6-9 weeks** |
 
 ---
 
