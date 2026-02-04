@@ -5,31 +5,37 @@
 
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
+use error_stack::{Report, ResultExt};
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 
-pub fn get_current_key_id() -> Result<String, TrustedServerError> {
+/// Retrieves the current active key ID from the config store.
+///
+/// # Errors
+///
+/// Returns an error if the config store cannot be accessed or the current-kid key is not found.
+pub fn get_current_key_id() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new("jwks_store");
     store.get("current-kid")
 }
 
-fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, TrustedServerError> {
+fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, Report<TrustedServerError>> {
     let bytes = if key_bytes.len() > 32 {
         general_purpose::STANDARD.decode(&key_bytes).map_err(|_| {
-            TrustedServerError::Configuration {
+            Report::new(TrustedServerError::Configuration {
                 message: "Failed to decode base64 key".into(),
-            }
+            })
         })?
     } else {
         key_bytes
     };
 
-    let key_array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| TrustedServerError::Configuration {
+    let key_array: [u8; 32] = bytes.try_into().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
             message: "Invalid key length (expected 32 bytes for Ed25519)".into(),
-        })?;
+        })
+    })?;
 
     Ok(SigningKey::from_bytes(&key_array))
 }
@@ -40,12 +46,24 @@ pub struct RequestSigner {
 }
 
 impl RequestSigner {
-    pub fn from_config() -> Result<Self, TrustedServerError> {
+    /// Creates a `RequestSigner` from the current key ID stored in config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
+    pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
         let config_store = FastlyConfigStore::new("jwks_store");
-        let key_id = config_store.get("current-kid")?;
+        let key_id =
+            config_store
+                .get("current-kid")
+                .change_context(TrustedServerError::Configuration {
+                    message: "Failed to get current-kid".into(),
+                })?;
 
         let secret_store = FastlySecretStore::new("signing_keys");
-        let key_bytes = secret_store.get(&key_id)?;
+        let key_bytes = secret_store
+            .get(&key_id)
+            .attach(format!("Failed to get signing key for kid: {}", key_id))?;
         let signing_key = parse_ed25519_signing_key(key_bytes)?;
 
         Ok(Self {
@@ -54,65 +72,81 @@ impl RequestSigner {
         })
     }
 
-    pub fn sign(&self, payload: &[u8]) -> Result<String, TrustedServerError> {
+    /// Signs a payload using the Ed25519 signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing fails.
+    pub fn sign(&self, payload: &[u8]) -> Result<String, Report<TrustedServerError>> {
         let signature_bytes = self.key.sign(payload).to_bytes();
 
         Ok(general_purpose::URL_SAFE_NO_PAD.encode(signature_bytes))
     }
 }
 
+/// Verifies a signature using the public key associated with the given key ID.
+///
+/// # Errors
+///
+/// Returns an error if the JWK cannot be retrieved, parsed, or if signature verification fails.
 pub fn verify_signature(
     payload: &[u8],
     signature_b64: &str,
     kid: &str,
-) -> Result<bool, TrustedServerError> {
+) -> Result<bool, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new("jwks_store");
-    let jwk_json = store.get(kid)?;
-
-    let jwk: serde_json::Value =
-        serde_json::from_str(&jwk_json).map_err(|e| TrustedServerError::Configuration {
-            message: format!("Failed to parse JWK: {}", e),
+    let jwk_json = store
+        .get(kid)
+        .change_context(TrustedServerError::Configuration {
+            message: format!("Failed to get JWK for kid: {}", kid),
         })?;
 
-    let x_b64 =
-        jwk.get("x")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| TrustedServerError::Configuration {
-                message: "JWK missing 'x' parameter".into(),
-            })?;
+    let jwk: serde_json::Value = serde_json::from_str(&jwk_json).map_err(|e| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("Failed to parse JWK: {}", e),
+        })
+    })?;
+
+    let x_b64 = jwk.get("x").and_then(|v| v.as_str()).ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "JWK missing 'x' parameter".into(),
+        })
+    })?;
 
     let public_key_bytes = general_purpose::URL_SAFE_NO_PAD
         .decode(x_b64)
-        .map_err(|e| TrustedServerError::Configuration {
-            message: format!("Failed to decode public key: {}", e),
+        .map_err(|e| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Failed to decode public key: {}", e),
+            })
         })?;
 
-    let verifying_key_bytes: [u8; 32] =
-        public_key_bytes
-            .try_into()
-            .map_err(|_| TrustedServerError::Configuration {
-                message: "Public key must be 32 bytes".into(),
-            })?;
+    let verifying_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Public key must be 32 bytes".into(),
+        })
+    })?;
 
     let verifying_key = VerifyingKey::from_bytes(&verifying_key_bytes).map_err(|e| {
-        TrustedServerError::Configuration {
+        Report::new(TrustedServerError::Configuration {
             message: format!("Failed to create verifying key: {}", e),
-        }
+        })
     })?;
 
     let signature_bytes = general_purpose::URL_SAFE_NO_PAD
         .decode(signature_b64)
         .or_else(|_| general_purpose::STANDARD.decode(signature_b64))
-        .map_err(|e| TrustedServerError::Configuration {
-            message: format!("Failed to decode signature: {}", e),
+        .map_err(|e| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Failed to decode signature: {}", e),
+            })
         })?;
 
-    let signature_array: [u8; 64] =
-        signature_bytes
-            .try_into()
-            .map_err(|_| TrustedServerError::Configuration {
-                message: "Signature must be 64 bytes".into(),
-            })?;
+    let signature_array: [u8; 64] = signature_bytes.try_into().map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Signature must be 64 bytes".into(),
+        })
+    })?;
 
     let signature = Signature::from_bytes(&signature_array);
 
@@ -125,18 +159,19 @@ mod tests {
 
     #[test]
     fn test_request_signer_sign() {
+        // Report unwraps print full error chain on test failure
+        // Note: unwrapping a Report prints it nicely if test fails.
         let signer = RequestSigner::from_config().unwrap();
         let signature = signer
             .sign(b"these pretzels are making me thirsty")
             .unwrap();
         assert!(!signature.is_empty());
-        assert!(signature.len() > 32); // Ed25519 signatures are 64 bytes, base64 encoded should be longer
+        assert!(signature.len() > 32);
     }
 
     #[test]
     fn test_request_signer_from_config() {
         let signer = RequestSigner::from_config().unwrap();
-        // Verify that we can successfully load the signing key from Fastly config
         assert!(!signer.kid.is_empty());
     }
 
@@ -146,7 +181,6 @@ mod tests {
         let signer = RequestSigner::from_config().unwrap();
         let signature = signer.sign(payload).unwrap();
 
-        // Verify the signature
         let result = verify_signature(payload, &signature, &signer.kid).unwrap();
         assert!(result, "Signature should be valid");
     }
@@ -156,10 +190,8 @@ mod tests {
         let payload = b"test payload";
         let signer = RequestSigner::from_config().unwrap();
 
-        // Create a valid Ed25519 signature (64 bytes) but for a different payload
         let wrong_signature = signer.sign(b"different payload").unwrap();
 
-        // Should return false for signature of different payload
         let result = verify_signature(payload, &wrong_signature, &signer.kid).unwrap();
         assert!(!result, "Invalid signature should not verify");
     }
@@ -170,7 +202,6 @@ mod tests {
         let signer = RequestSigner::from_config().unwrap();
         let signature = signer.sign(original_payload).unwrap();
 
-        // Try to verify with different payload
         let wrong_payload = b"wrong payload";
         let result = verify_signature(wrong_payload, &signature, &signer.kid).unwrap();
         assert!(!result, "Signature should not verify with wrong payload");
@@ -183,7 +214,6 @@ mod tests {
         let signature = signer.sign(payload).unwrap();
         let nonexistent_kid = "nonexistent-key-id";
 
-        // Should return an error for missing key
         let result = verify_signature(payload, &signature, nonexistent_kid);
         assert!(result.is_err(), "Should error for missing key");
     }
@@ -194,7 +224,6 @@ mod tests {
         let signer = RequestSigner::from_config().unwrap();
         let malformed_signature = "not-valid-base64!!!";
 
-        // Should return an error for malformed base64
         let result = verify_signature(payload, malformed_signature, &signer.kid);
         assert!(result.is_err(), "Should error for malformed signature");
     }

@@ -15,20 +15,29 @@ pub trait AuctionProvider: Send + Sync {
     /// Submit a bid request to this provider and return a pending request.
     ///
     /// Implementations should:
-    /// - Transform AuctionRequest to provider-specific format
-    /// - Make HTTP call to provider endpoint using send_async()
-    /// - Return PendingRequest for orchestrator to await
+    /// - Transform `AuctionRequest` to provider-specific format
+    /// - Make HTTP call to provider endpoint using `send_async()`
+    /// - Return `PendingRequest` for orchestrator to await
     ///
     /// The orchestrator will handle waiting for responses and parsing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be created or if the provider endpoint
+    /// cannot be reached (though usually network errors happen during `PendingRequest` await).
     fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<PendingRequest, Report<TrustedServerError>>;
 
-    /// Parse the response from the provider into an AuctionResponse.
+    /// Parse the response from the provider into an `AuctionResponse`.
     ///
-    /// Called by the orchestrator after the PendingRequest completes.
+    /// Called by the orchestrator after the `PendingRequest` completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response cannot be parsed into a valid `AuctionResponse`.
     fn parse_response(
         &self,
         response: fastly::Response,

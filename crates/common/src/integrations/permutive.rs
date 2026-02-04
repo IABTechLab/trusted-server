@@ -41,12 +41,12 @@ pub struct PermutiveConfig {
     #[serde(default)]
     pub project_id: String,
 
-    /// Base URL for Permutive API (default: https://api.permutive.com)
+    /// Base URL for Permutive API (default: <https://api.permutive.com>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
 
-    /// Base URL for Permutive Secure Signals (default: https://secure-signals.permutive.app)
+    /// Base URL for Permutive Secure Signals (default: <https://secure-signals.permutive.app>)
     #[serde(default = "default_secure_signals_endpoint")]
     #[validate(url)]
     pub secure_signals_endpoint: String,
@@ -85,7 +85,7 @@ impl PermutiveIntegration {
     }
 
     /// Build the Permutive SDK URL from configuration.
-    /// Returns URL like: https://myorg.edge.permutive.app/workspace-12345-web.js
+    /// Returns URL like: <https://myorg.edge.permutive.app/workspace-12345-web.js>
     fn sdk_url(&self) -> String {
         format!(
             "https://{}.edge.permutive.app/{}-web.js",
@@ -521,6 +521,7 @@ fn build(settings: &Settings) -> Option<Arc<PermutiveIntegration>> {
 }
 
 /// Register the Permutive integration.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(

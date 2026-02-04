@@ -25,19 +25,22 @@ Server-side ad rendering endpoint. Returns complete HTML for a single ad slot.
 | `h` | integer | Yes | Ad height in pixels |
 
 **Response:**
+
 - **Content-Type:** `text/html; charset=utf-8`
 - **Body:** Complete HTML creative with first-party proxying applied
 
 **Example:**
+
 ```bash
 curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 ```
 
 **Response Headers:**
-- `X-Synthetic-Trusted-Server` - Stable synthetic ID
-- `X-Synthetic-Fresh` - One-time fresh ID
+
+- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
 
 **Use Cases:**
+
 - Server-side ad rendering
 - Direct iframe embedding
 - First-party ad delivery
@@ -49,6 +52,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 Client-side auction endpoint for TSJS library.
 
 **Request Body:**
+
 ```json
 {
   "adUnits": [
@@ -56,7 +60,10 @@ Client-side auction endpoint for TSJS library.
       "code": "header-banner",
       "mediaTypes": {
         "banner": {
-          "sizes": [[728, 90], [970, 250]]
+          "sizes": [
+            [728, 90],
+            [970, 250]
+          ]
         }
       }
     }
@@ -68,6 +75,7 @@ Client-side auction endpoint for TSJS library.
 ```
 
 **Response:**
+
 ```json
 {
   "seatbid": [
@@ -76,7 +84,7 @@ Client-side auction endpoint for TSJS library.
         {
           "impid": "header-banner",
           "adm": "<html>...</html>",
-          "price": 1.50,
+          "price": 1.5,
           "w": 728,
           "h": 90
         }
@@ -87,6 +95,7 @@ Client-side auction endpoint for TSJS library.
 ```
 
 **Example:**
+
 ```bash
 curl -X POST https://edge.example.com/third-party/ad \
   -H "Content-Type: application/json" \
@@ -107,6 +116,7 @@ Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.)
 | `*` | any | No | Original target URL query parameters (preserved as-is) |
 
 **Response:**
+
 - **Content-Type:** Mirrors upstream or inferred from content
 - **Body:** Proxied resource content
   - HTML responses: Rewritten with creative processor
@@ -114,12 +124,14 @@ Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.)
   - Other: Passed through
 
 **Behavior:**
+
 - Validates `tstoken` against reconstructed URL
 - Follows redirects (301/302/303/307/308, max 4 hops)
 - Injects synthetic ID as `synthetic_id` query parameter
 - Logs 1×1 pixel impressions
 
 **Example:**
+
 ```bash
 # Original URL: https://ad.doubleclick.net/pixel?id=123&type=view
 # Signed proxy URL:
@@ -127,6 +139,7 @@ curl "https://edge.example.com/first-party/proxy?tsurl=https://ad.doubleclick.ne
 ```
 
 **Error Responses:**
+
 - `400 Bad Request` - Missing or invalid `tstoken`
 - `403 Forbidden` - Token validation failed
 - `500 Internal Server Error` - Upstream fetch failed
@@ -145,16 +158,19 @@ Click tracking redirect endpoint.
 | `*` | any | No | Original target URL query parameters |
 
 **Response:**
+
 - **Status:** `302 Found`
 - **Location:** Reconstructed target URL with synthetic ID injected
 
 **Behavior:**
+
 - Validates `tstoken` against reconstructed URL
 - Injects `synthetic_id` query parameter
 - Logs click metadata (tsurl, referer, user agent)
 - Does not proxy content (redirect only)
 
 **Example:**
+
 ```bash
 curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com/landing&campaign=123&tstoken=xyz..."
 # → 302 Location: https://advertiser.com/landing?campaign=123&synthetic_id=abc123
@@ -169,11 +185,13 @@ URL signing endpoint. Returns signed first-party proxy URL for a given target UR
 **Request Methods:** GET or POST
 
 **GET Request:**
+
 ```bash
 curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
 ```
 
 **POST Request:**
+
 ```bash
 curl -X POST https://edge.example.com/first-party/sign \
   -H "Content-Type: application/json" \
@@ -181,6 +199,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 ```
 
 **Response:**
+
 ```json
 {
   "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.com/pixel.gif&tstoken=abc123..."
@@ -188,6 +207,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 ```
 
 **Use Cases:**
+
 - TSJS creative runtime (image/iframe proxying)
 - Dynamic URL signing in client-side code
 - Testing proxy URL generation
@@ -199,6 +219,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScript modifies query parameters.
 
 **Request Body:**
+
 ```json
 {
   "tsclick": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&tstoken=original...",
@@ -210,6 +231,7 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 ```
 
 **Response:**
+
 ```json
 {
   "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new..."
@@ -217,6 +239,7 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 ```
 
 **Use Cases:**
+
 - TSJS click guard (automatic URL repair)
 - Handling creative JavaScript that modifies tracking URLs
 
@@ -224,31 +247,38 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 
 ## Request Signing Endpoints
 
-### GET /.well-known/ts.jwks.json
+### GET /.well-known/trusted-server.json
 
-Returns active public keys in JWKS (JSON Web Key Set) format for signature verification.
+Returns the Trusted Server discovery document, which includes active public keys in JWKS
+format for signature verification.
 
 **Response:**
+
 ```json
 {
-  "keys": [
-    {
-      "kty": "OKP",
-      "crv": "Ed25519",
-      "kid": "ts-2025-01-A",
-      "use": "sig",
-      "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw"
-    }
-  ]
+  "version": "1.0",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "ts-2025-01-A",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw"
+      }
+    ]
+  }
 }
 ```
 
 **Example:**
+
 ```bash
-curl https://edge.example.com/.well-known/ts.jwks.json
+curl https://edge.example.com/.well-known/trusted-server.json
 ```
 
 **Use Cases:**
+
 - Signature verification by downstream systems
 - Key rotation validation
 - Integration testing
@@ -260,6 +290,7 @@ curl https://edge.example.com/.well-known/ts.jwks.json
 Verifies a signature against a payload and key ID.
 
 **Request Body:**
+
 ```json
 {
   "payload": "base64-encoded-data",
@@ -269,6 +300,7 @@ Verifies a signature against a payload and key ID.
 ```
 
 **Response (Success):**
+
 ```json
 {
   "verified": true,
@@ -278,6 +310,7 @@ Verifies a signature against a payload and key ID.
 ```
 
 **Response (Failure):**
+
 ```json
 {
   "verified": false,
@@ -287,6 +320,7 @@ Verifies a signature against a payload and key ID.
 ```
 
 **Example:**
+
 ```bash
 curl -X POST https://edge.example.com/verify-signature \
   -H "Content-Type: application/json" \
@@ -302,6 +336,7 @@ Generates and activates a new signing key.
 **Authentication:** Requires basic auth (configured via `handlers` in `trusted-server.toml`)
 
 **Request Body (Optional):**
+
 ```json
 {
   "kid": "custom-key-id"
@@ -311,6 +346,7 @@ Generates and activates a new signing key.
 If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
 
 **Response:**
+
 ```json
 {
   "new_kid": "ts-2025-01-15-A",
@@ -321,6 +357,7 @@ If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
 ```
 
 **Example:**
+
 ```bash
 curl -X POST https://edge.example.com/admin/keys/rotate \
   -u admin:password \
@@ -328,6 +365,7 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 ```
 
 **Behavior:**
+
 - Keeps both new and previous key active
 - Updates `current-kid` to new key
 - Preserves old key for graceful transition
@@ -343,6 +381,7 @@ Deactivates or deletes a signing key.
 **Authentication:** Requires basic auth
 
 **Request Body:**
+
 ```json
 {
   "kid": "ts-2025-01-14-A",
@@ -350,12 +389,13 @@ Deactivates or deletes a signing key.
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `kid` | string | Yes | Key ID to deactivate |
-| `delete` | boolean | No | If true, permanently removes key (default: false) |
+| Field    | Type    | Required | Description                                       |
+| -------- | ------- | -------- | ------------------------------------------------- |
+| `kid`    | string  | Yes      | Key ID to deactivate                              |
+| `delete` | boolean | No       | If true, permanently removes key (default: false) |
 
 **Response:**
+
 ```json
 {
   "kid": "ts-2025-01-14-A",
@@ -365,6 +405,7 @@ Deactivates or deletes a signing key.
 ```
 
 **Example:**
+
 ```bash
 curl -X POST https://edge.example.com/admin/keys/deactivate \
   -u admin:password \
@@ -383,6 +424,7 @@ Serves the TSJS (Trusted Server JavaScript) library.
 **Path Pattern:** `/static/tsjs=<filename>?v=<hash>`
 
 **Supported Filenames:**
+
 - `tsjs-unified.js`
 - `tsjs-unified.min.js`
 
@@ -392,17 +434,23 @@ Serves the TSJS (Trusted Server JavaScript) library.
 | `v` | string | No | Cache-busting hash (SHA256 of bundle contents) |
 
 **Response:**
+
 - **Content-Type:** `application/javascript; charset=utf-8`
 - **Body:** TSJS bundle (IIFE format)
 - **Headers:** ETag for caching
 
 **Example:**
+
 ```html
-<script src="/static/tsjs=tsjs-unified.min.js?v=a1b2c3d4..." id="trustedserver-js"></script>
+<script
+  src="/static/tsjs=tsjs-unified.min.js?v=a1b2c3d4..."
+  id="trustedserver-js"
+></script>
 ```
 
 **Module Selection:**
 Controlled at build time via `TSJS_MODULES` environment variable:
+
 ```bash
 TSJS_MODULES=creative,ext,permutive cargo build
 ```
@@ -416,27 +464,28 @@ See [Configuration](./configuration.md) for TSJS build options.
 ### Prebid Integration
 
 #### GET /first-party/ad
+
 See [First-Party Endpoints](#get-first-party-ad) above.
 
 #### POST /third-party/ad
+
 See [First-Party Endpoints](#post-third-party-ad) above.
 
-#### GET /prebid.js, /prebid.min.js, etc. (Script Override)
-Returns empty JavaScript to override Prebid.js scripts when the Prebid integration is enabled. By default, exact requests to `/prebid.js`, `/prebid.min.js`, `/prebidjs.js`, or `/prebidjs.min.js` will be intercepted and served an empty script.
+#### GET /prebid.js (Optional)
+
+Returns empty JavaScript to override Prebid.js when `script_handler` is configured.
 
 **Configuration:**
+
 ```toml
 [integrations.prebid]
-# Default patterns (exact paths)
-script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
-
-# Use wildcard patterns to match paths under a prefix
-# script_patterns = ["/static/prebid/*"]
+script_handler = "/prebid.js"
 ```
 
 **Response:**
+
 - **Content-Type:** `application/javascript; charset=utf-8`
-- **Body:** `// Script overridden by Trusted Server`
+- **Body:** `// Prebid.js override by Trusted Server`
 - **Cache:** `immutable, max-age=31536000`
 
 ---
@@ -444,32 +493,40 @@ script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.mi
 ### Permutive Integration
 
 #### GET /integrations/permutive/sdk
+
 Serves Permutive SDK from first-party domain.
 
 **Response:**
+
 - **Content-Type:** `application/javascript; charset=utf-8`
 - **Body:** Permutive SDK fetched from `{organization_id}.edge.permutive.app/{workspace_id}-web.js`
 - **Cache:** 1 hour (configurable via `cache_ttl_seconds`)
 
-#### GET/POST /integrations/permutive/api/*
+#### GET/POST /integrations/permutive/api/\*
+
 Proxies to `api.permutive.com`.
 
 **Example:**
+
 ```bash
 curl https://edge.example.com/integrations/permutive/api/settings
 # → Proxies to https://api.permutive.com/settings
 ```
 
-#### GET/POST /integrations/permutive/secure-signal/*
+#### GET/POST /integrations/permutive/secure-signal/\*
+
 Proxies to `secure-signals.permutive.app`.
 
-#### GET/POST /integrations/permutive/events/*
+#### GET/POST /integrations/permutive/events/\*
+
 Proxies to `events.permutive.app` for event tracking.
 
-#### GET/POST /integrations/permutive/sync/*
+#### GET/POST /integrations/permutive/sync/\*
+
 Proxies to `sync.permutive.com` for ID synchronization.
 
-#### GET /integrations/permutive/cdn/*
+#### GET /integrations/permutive/cdn/\*
+
 Proxies to `cdn.permutive.com` for static assets.
 
 ---
@@ -477,17 +534,17 @@ Proxies to `cdn.permutive.com` for static assets.
 ### Testlight Integration
 
 #### POST /integrations/testlight/auction
+
 Testing auction endpoint with synthetic ID injection.
 
 **Request Body:**
+
 ```json
 {
   "user": {
     "id": null
   },
-  "imp": [
-    { "id": "slot-1" }
-  ]
+  "imp": [{ "id": "slot-1" }]
 }
 ```
 
@@ -495,8 +552,8 @@ Testing auction endpoint with synthetic ID injection.
 Proxies to configured endpoint with `user.id` populated with synthetic ID.
 
 **Response Headers:**
-- `X-Synthetic-Trusted-Server` - Stable synthetic ID
-- `X-Synthetic-Fresh` - One-time fresh ID
+
+- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
 
 ---
 
@@ -534,6 +591,7 @@ All endpoints use consistent error response format:
 Endpoints under protected paths require HTTP Basic Authentication:
 
 **Configuration:**
+
 ```toml
 [[handlers]]
 path = "^/admin"
@@ -542,11 +600,13 @@ password = "secure-password"
 ```
 
 **Usage:**
+
 ```bash
 curl -u admin:secure-password https://edge.example.com/admin/keys/rotate
 ```
 
 **Protected Endpoints:**
+
 - `/admin/keys/rotate`
 - `/admin/keys/deactivate`
 - Any paths matching configured `handlers` patterns
@@ -558,6 +618,7 @@ curl -u admin:secure-password https://edge.example.com/admin/keys/rotate
 Trusted Server relies on Fastly's built-in rate limiting. Configure in Fastly dashboard:
 
 **Recommended Limits:**
+
 - Public endpoints: 1000 req/min per IP
 - Admin endpoints: 10 req/min per IP
 - TSJS serving: 10000 req/min (highly cacheable)
@@ -582,4 +643,4 @@ Access-Control-Allow-Headers = "Content-Type, Authorization"
 - Explore [Integrations Overview](./integrations-overview.md)
 - Learn about [Configuration](./configuration.md)
 - Review [Error Reference](./error-reference.md)
-- Understand [Environment Variables](./environment-variables.md)
+- Understand [Configuration Reference](./configuration.md)

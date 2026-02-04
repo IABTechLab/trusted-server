@@ -2,7 +2,7 @@
 //!
 //! This module handles:
 //! - Parsing incoming tsjs/Prebid.js format requests
-//! - Converting internal auction results to OpenRTB 2.x responses
+//! - Converting internal auction results to `OpenRTB` 2.x responses
 
 use error_stack::{ensure, Report, ResultExt};
 use fastly::http::{header, StatusCode};
@@ -63,7 +63,13 @@ pub struct BannerUnit {
     pub sizes: Vec<Vec<u32>>,
 }
 
-/// Convert tsjs/Prebid.js request format to internal AuctionRequest.
+/// Convert tsjs/Prebid.js request format to internal `AuctionRequest`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Synthetic ID generation fails
+/// - Request contains invalid banner sizes (must be [width, height])
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
@@ -122,7 +128,9 @@ pub fn convert_tsjs_to_auction_request(
 
     // Get geo info if available
     let device = GeoInfo::from_request(req).map(|geo| DeviceInfo {
-        user_agent: req.get_header_str("user-agent").map(|s| s.to_string()),
+        user_agent: req
+            .get_header_str("user-agent")
+            .map(std::string::ToString::to_string),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
         geo: Some(geo),
     });
@@ -148,9 +156,15 @@ pub fn convert_tsjs_to_auction_request(
     })
 }
 
-/// Convert OrchestrationResult to OpenRTB response format.
+/// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
 /// Returns rewritten creative HTML directly in the `adm` field for inline delivery.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - A winning bid is missing a price
+/// - The response serialization fails
 pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,

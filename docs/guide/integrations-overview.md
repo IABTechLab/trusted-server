@@ -4,12 +4,12 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 ## Quick Comparison
 
-| Integration | Type | Endpoints | HTML Rewriting | Primary Use Case | Status |
-|-------------|------|-----------|----------------|------------------|--------|
-| **Prebid** | Proxy + Rewriter | 2+ routes | Removes Prebid.js scripts | Server-side header bidding | Production |
-| **Next.js** | Script Rewriter | None | Rewrites Next.js data | First-party Next.js routing | Production |
-| **Permutive** | Proxy + Rewriter | 6 routes | Rewrites SDK URLs | First-party audience data | Production |
-| **Testlight** | Proxy + Rewriter | 1 route | Rewrites integration scripts | Testing/development | Development |
+| Integration   | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
+| ------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
+| **Prebid**    | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
+| **Next.js**   | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
+| **Permutive** | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
+| **Testlight** | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
 
@@ -18,6 +18,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 **What it does:** Enables server-side header bidding through Prebid Server while maintaining first-party context.
 
 **Key Features:**
+
 - OpenRTB 2.x protocol conversion
 - Synthetic ID injection for privacy
 - First-party creative resource proxying
@@ -26,20 +27,22 @@ Trusted Server provides built-in integrations with popular third-party services,
 - Request signing for authentication
 
 **Configuration:**
+
 ```toml
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon"]
+auto_configure = true
 debug = false
-# script_patterns = ["/static/prebid/*"]
 ```
 
 **Endpoints:**
+
 - `GET /first-party/ad` - Server-side ad rendering
 - `POST /third-party/ad` - Client-side auction endpoint
-- `GET /prebid.js` - Empty script override (plus any configured patterns)
+- `GET /prebid.js` - Optional empty script override
 
 **When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.
 
@@ -52,6 +55,7 @@ debug = false
 **What it does:** Rewrites Next.js application data to route traffic through Trusted Server's first-party proxy.
 
 **Key Features:**
+
 - Next.js 13+ App Router support (RSC streaming)
 - Pages Router support (static data payload)
 - Configurable attribute rewriting
@@ -59,6 +63,7 @@ debug = false
 - Preserves JSON structure
 
 **Configuration:**
+
 ```toml
 [integrations.nextjs]
 enabled = false
@@ -78,6 +83,7 @@ rewrite_attributes = ["href", "link", "url"]
 **What it does:** Provides first-party data collection and audience segmentation by proxying Permutive's SDK and API endpoints.
 
 **Key Features:**
+
 - Complete first-party SDK serving
 - Multi-endpoint proxying (API, Events, Sync, Secure Signals, CDN)
 - SDK caching for performance
@@ -85,6 +91,7 @@ rewrite_attributes = ["href", "link", "url"]
 - Header forwarding for authentication
 
 **Configuration:**
+
 ```toml
 [integrations.permutive]
 enabled = true
@@ -98,6 +105,7 @@ rewrite_sdk = true
 ```
 
 **Endpoints:**
+
 - `GET /integrations/permutive/sdk` - SDK serving
 - `GET/POST /integrations/permutive/api/*` - API proxy
 - `GET/POST /integrations/permutive/secure-signal/*` - Secure Signals
@@ -116,6 +124,7 @@ rewrite_sdk = true
 **What it does:** Testing/development integration for validating the integration system with OpenRTB-like auctions.
 
 **Key Features:**
+
 - Synthetic ID injection demonstration
 - Flexible JSON schema (preserves unknown fields)
 - Stream passthrough mode
@@ -123,6 +132,7 @@ rewrite_sdk = true
 - Validation with serde + validator
 
 **Configuration:**
+
 ```toml
 [integrations.testlight]
 enabled = true
@@ -133,6 +143,7 @@ rewrite_scripts = false
 ```
 
 **Endpoints:**
+
 - `POST /integrations/testlight/auction` - Auction endpoint with ID injection
 
 **When to use:** You're developing or testing integration functionality and need a simple endpoint to validate synthetic ID injection.
@@ -146,13 +157,16 @@ rewrite_scripts = false
 All integrations use a consistent architecture:
 
 ### Route Namespacing
+
 - Pattern: `/integrations/{integration_name}/{endpoint}`
 - Examples:
   - `/integrations/permutive/api/settings`
   - `/integrations/testlight/auction`
 
 ### Configuration Pattern
+
 All integrations support:
+
 - TOML configuration in `trusted-server.toml`
 - Environment variable overrides
 - Enable/disable flags
@@ -190,12 +204,12 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration | Performance Impact | Caching Strategy | Notes |
-|-------------|-------------------|------------------|-------|
-| **Prebid** | Medium | Response caching possible | Timeout configurable (default 1s) |
-| **Next.js** | Low | N/A (streaming rewrite) | Minimal overhead, runs during HTML streaming |
-| **Permutive** | Low | SDK cached (1 hour default) | API calls proxied in real-time |
-| **Testlight** | Low | No caching | Development use only |
+| Integration   | Performance Impact | Caching Strategy            | Notes                                        |
+| ------------- | ------------------ | --------------------------- | -------------------------------------------- |
+| **Prebid**    | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
+| **Next.js**   | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
+| **Permutive** | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
+| **Testlight** | Low                | No caching                  | Development use only                         |
 
 ## Environment Variables
 
@@ -219,7 +233,7 @@ TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__WORKSPACE_ID="workspace-123"
 TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__ENDPOINT="https://test.example.com"
 ```
 
-See [Environment Variables Reference](./environment-variables.md) for complete details.
+See [Configuration Reference](./configuration.md) for complete details.
 
 ## Custom Integrations
 
@@ -234,18 +248,23 @@ See the [Integration Guide](./integration-guide.md) for details on building cust
 ## Common Questions
 
 ### Can I enable multiple integrations?
+
 Yes! All integrations can run simultaneously. They operate independently and don't conflict.
 
 ### Do integrations affect page load time?
+
 Minimal impact. HTML rewriting happens during streaming (Next.js), and proxy endpoints only execute when called. Prebid timeout is configurable.
 
 ### Can I disable integrations at runtime?
+
 No. Integration configuration is read at startup. You must redeploy to change integration settings.
 
 ### Are integrations required?
+
 No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and first-party proxying.
 
 ### How do I add a new integration?
+
 See the [Integration Guide](./integration-guide.md) for a complete tutorial on building custom integrations.
 
 ## Next Steps

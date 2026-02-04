@@ -16,11 +16,10 @@ secret_key = "trusted-server"
 # Possible values
 #   - "client_ip"
 #   - "user_agent"
-#   - "first_party_id"
-#   - "auth_user_id"
-#   - "publisher_domain"
 #   - "accept_language"
-template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_id }}:{{ publisher_domain }}:{{ accept_language }}"
+#   - "accept_encoding"
+#   - "random_uuid"
+template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 # Custom headers to be included in every response
 [response_headers]
@@ -38,9 +37,10 @@ enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
+auto_configure = false
 debug = false
 # debug_query_params = ""
-# script_patterns = ["/prebid.min.js", "/prebidjs.min.js"]  # defaults to common prebid filenames
+# script_handler = "/prebid.js"
 
 [integrations.nextjs]
 enabled = false
@@ -82,6 +82,7 @@ rewrite_sdk = true
 #     "*.edgecompute.app",
 # ]
 
+
 [auction]
 enabled = true
 providers = ["prebid"]
@@ -98,3 +99,5 @@ timeout_ms = 1000
 enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
+
+
