@@ -1,9 +1,8 @@
 // Global configuration storage for the tsjs runtime (mode, logging, etc.).
 import { log, LogLevel } from './log';
 import type { Config, GamConfig } from './types';
-import { RequestMode } from './types';
 
-let CONFIG: Config = { mode: RequestMode.FirstParty };
+let CONFIG: Config = { mode: 'render' };
 
 // Lazy import to avoid circular dependencies - GAM integration may not be present
 let setGamConfigFn: ((cfg: GamConfig) => void) | null | undefined = undefined;
