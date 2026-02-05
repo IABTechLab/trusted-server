@@ -82,7 +82,6 @@ rewrite_sdk = true
 #   ANY  /integrations/datadome/js/*     - Signal collection API
 [integrations.datadome]
 enabled = false
-# js_key = "YOUR_DATADOME_JS_KEY"  # Optional: for auto-injecting DataDome config
 sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600

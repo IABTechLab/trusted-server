@@ -27,7 +27,6 @@ Add the following to your `trusted-server.toml`:
 ```toml
 [integrations.datadome]
 enabled = true
-# js_key = "YOUR_DATADOME_JS_KEY"  # Optional: for reference
 sdk_origin = "https://js.datadome.co"        # SDK script origin (tags.js)
 api_origin = "https://api-js.datadome.co"    # Signal collection API origin (/js/*)
 cache_ttl_seconds = 3600
@@ -36,14 +35,13 @@ rewrite_sdk = true
 
 ### Configuration Options
 
-| Option              | Type    | Default                      | Description                                                |
-| ------------------- | ------- | ---------------------------- | ---------------------------------------------------------- |
-| `enabled`           | boolean | `false`                      | Enable the DataDome integration                            |
-| `js_key`            | string  | -                            | Your DataDome JavaScript key (optional, for documentation) |
-| `sdk_origin`        | string  | `https://js.datadome.co`     | DataDome SDK origin URL (for tags.js)                      |
-| `api_origin`        | string  | `https://api-js.datadome.co` | DataDome signal collection API origin URL (for /js/\*)     |
-| `cache_ttl_seconds` | integer | `3600`                       | Cache TTL for tags.js (1 hour default)                     |
-| `rewrite_sdk`       | boolean | `true`                       | Rewrite DataDome script URLs in HTML to first-party paths  |
+| Option              | Type    | Default                      | Description                                               |
+| ------------------- | ------- | ---------------------------- | --------------------------------------------------------- |
+| `enabled`           | boolean | `false`                      | Enable the DataDome integration                           |
+| `sdk_origin`        | string  | `https://js.datadome.co`     | DataDome SDK origin URL (for tags.js)                     |
+| `api_origin`        | string  | `https://api-js.datadome.co` | DataDome signal collection API origin URL (for /js/\*)    |
+| `cache_ttl_seconds` | integer | `3600`                       | Cache TTL for tags.js (1 hour default)                    |
+| `rewrite_sdk`       | boolean | `true`                       | Rewrite DataDome script URLs in HTML to first-party paths |
 
 ## Usage
 
