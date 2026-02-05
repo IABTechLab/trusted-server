@@ -555,4 +555,4 @@ assert!(result.total_time_ms < 2000);
 
 ## Questions?
 
-See the main project [README](../../../../README.md) or [integration guide](../../../../docs/integration_guide.md).
+See the main project [README](../../../../README.md) or [integration guide](../../../../docs/guide/integration-guide.md).

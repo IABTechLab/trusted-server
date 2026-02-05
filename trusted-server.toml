@@ -16,15 +16,15 @@ secret_key = "trusted-server"
 # Possible values
 #   - "client_ip"
 #   - "user_agent"
-#   - "first_party_id"
-#   - "auth_user_id"
-#   - "publisher_domain"
 #   - "accept_language"
-template = "{{ client_ip }}:{{ user_agent }}:{{ first_party_id }}:{{ auth_user_id }}:{{ publisher_domain }}:{{ accept_language }}"
+#   - "accept_encoding"
+#   - "random_uuid"
+template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 # Custom headers to be included in every response
-[response_headers]
-X-Custom-Header = "custom header value"
+# Allows publishers to include tags such as X-Robots-Tag: noindex
+# [response_headers]
+# X-Custom-Header = "custom header value"
 
 # Request Signing Configuration
 # Enable signing of OpenRTB requests and other API calls
@@ -100,6 +100,5 @@ timeout_ms = 1000
 enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
-
 
 

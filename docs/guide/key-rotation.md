@@ -106,11 +106,12 @@ fastly secret-store-entry create \
 ```
 
 ::: warning Keep Your API Token Secure
+
 - Never commit API tokens to version control
 - Store them only in Fastly Secret Store
 - Rotate API tokens according to your security policy
 - Use minimal required permissions
-:::
+  :::
 
 ### Linking Stores to Service
 
@@ -159,7 +160,7 @@ For local testing, configure stores in `fastly.toml`:
   [[local_server.secret_stores.signing_keys]]
     key = "ts-2025-01-01"
     data = "<signing-key>"
-  
+
   [[local_server.secret_stores.api-keys]]
     key = "api_key"
     env = "FASTLY_KEY"  # Load from environment variable
@@ -221,14 +222,17 @@ You should see a JWKS response with your public keys.
 ### State During Rotation
 
 **Before Rotation**:
+
 - Current key: `ts-2024-01-15`
 - Active keys: `["ts-2024-01-15"]`
 
 **After Rotation**:
+
 - Current key: `ts-2024-02-15` (new)
 - Active keys: `["ts-2024-01-15", "ts-2024-02-15"]`
 
 **After Grace Period**:
+
 - Current key: `ts-2024-02-15`
 - Active keys: `["ts-2024-02-15"]`
 
@@ -249,6 +253,7 @@ curl -X POST https://your-domain/admin/keys/rotate \
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -277,6 +282,7 @@ curl -X POST https://your-domain/admin/keys/rotate \
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -312,6 +318,7 @@ let custom_result = manager.rotate_key(Some("my-custom-key".to_string()))?;
 ### Listing Active Keys
 
 **Rust API**:
+
 ```rust
 let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
 let active_keys = manager.list_active_keys()?;
@@ -323,6 +330,7 @@ for kid in active_keys {
 
 **Config Store**:
 Keys are stored as comma-separated values in the `active-kids` config item:
+
 ```
 ts-2024-01-15,ts-2024-02-15,ts-2024-03-15
 ```
@@ -330,6 +338,7 @@ ts-2024-01-15,ts-2024-02-15,ts-2024-03-15
 ### Multiple Active Keys
 
 You can have multiple active keys for:
+
 - **Gradual rollout**: Different services adopt new key at different times
 - **Geographic distribution**: Different regions rotate independently
 - **A/B testing**: Test new keys with subset of traffic
@@ -339,6 +348,7 @@ You can have multiple active keys for:
 ### When to Deactivate
 
 Deactivate old keys after:
+
 1. All services have adopted the new key
 2. Grace period has elapsed (recommended: 7-30 days)
 3. No more requests using the old key
@@ -362,6 +372,7 @@ curl -X POST https://your-domain/admin/keys/deactivate \
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -386,6 +397,7 @@ curl -X POST https://your-domain/admin/keys/deactivate \
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -411,6 +423,7 @@ manager.delete_key("ts-2024-01-15")?;
 ### Safety Checks
 
 The system prevents:
+
 - **Deleting the last active key** - At least one key must remain active
 - **Invalid key IDs** - Returns error for non-existent keys
 
@@ -421,11 +434,13 @@ The system prevents:
 Format: `ts-YYYY-MM-DD`
 
 Examples:
+
 - `ts-2024-01-15`
 - `ts-2024-02-15`
 - `ts-2024-12-31`
 
 **Advantages**:
+
 - Easy to identify key age
 - Automatic chronological sorting
 - Clear rotation history
@@ -440,6 +455,7 @@ Use descriptive names for specific purposes:
 - `service-a-v1` - Service-specific keys
 
 **Advantages**:
+
 - Meaningful identifiers
 - Environment separation
 - Service isolation
@@ -456,6 +472,7 @@ Regular rotation on a fixed schedule:
 ```
 
 **rotate-keys.sh**:
+
 ```bash
 #!/bin/bash
 # Rotate signing keys
@@ -527,11 +544,13 @@ let verified = verify_signature(payload, signature, kid)?;
 ### 1. Grace Period
 
 Always maintain a grace period:
+
 - **Minimum**: 7 days
 - **Recommended**: 30 days
 - **Conservative**: 90 days
 
 This allows:
+
 - Partner systems to update cached keys
 - In-flight requests to complete
 - Troubleshooting signature issues
@@ -539,6 +558,7 @@ This allows:
 ### 2. Communication
 
 Before rotation, notify partners:
+
 - Send advance notice (7-14 days)
 - Publish new key in JWKS endpoint
 - Document rotation schedule
@@ -546,6 +566,7 @@ Before rotation, notify partners:
 ### 3. Rollback Plan
 
 Always have a rollback strategy:
+
 - Keep previous key active initially
 - Test new key before deactivating old key
 - Document reactivation procedure
@@ -553,6 +574,7 @@ Always have a rollback strategy:
 ### 4. Documentation
 
 Document your rotation:
+
 - Record rotation dates
 - Track key identifiers
 - Note any issues or rollbacks
@@ -561,6 +583,7 @@ Document your rotation:
 ### 5. Testing
 
 Test rotation in staging first:
+
 - Verify new key generation
 - Test signature verification
 - Validate JWKS endpoint
@@ -573,6 +596,7 @@ Test rotation in staging first:
 **Error**: `Failed to create KeyRotationManager`
 
 **Solutions**:
+
 - Verify all required stores are created (see [Prerequisites](#prerequisites))
 - Check Fastly API token is stored in `api-keys` secret store as `api_key`
 - Verify `config_store_id` and `secret_store_id` in `trusted-server.toml` match your actual store IDs
@@ -584,17 +608,20 @@ Test rotation in staging first:
 **Error**: `Cannot deactivate the last active key`
 
 **Solutions**:
+
 - Rotate to generate a new key first
 - Verify multiple keys are active
 - Check active-kids list
 
 ### Signature Verification Fails After Rotation
 
-**Symptoms**: 
+**Symptoms**:
+
 - Old signatures fail to verify
 - `Key not found` errors
 
 **Solutions**:
+
 - Verify old key is still in active-kids
 - Check JWKS endpoint includes old key
 - Wait for partner caches to update
@@ -602,9 +629,11 @@ Test rotation in staging first:
 ### Key Not in JWKS
 
 **Symptoms**:
+
 - New key missing from `.well-known/trusted-server.json`
 
 **Solutions**:
+
 - Check active-kids includes new key
 - Verify JWK stored in Config Store
 - Check Config Store cache expiration
@@ -616,11 +645,13 @@ Test rotation in staging first:
 If a key is compromised:
 
 1. **Immediate**: Rotate to new key
+
 ```bash
 curl -X POST /admin/keys/rotate
 ```
 
 2. **Urgent**: Deactivate compromised key
+
 ```bash
 curl -X POST /admin/keys/deactivate \
   -d '{"kid": "compromised-key", "delete": false}'
@@ -631,6 +662,7 @@ curl -X POST /admin/keys/deactivate \
 4. **Communication**: Notify partners of compromise
 
 5. **Cleanup**: Delete compromised key after investigation
+
 ```bash
 curl -X POST /admin/keys/deactivate \
   -d '{"kid": "compromised-key", "delete": true}'
@@ -639,6 +671,7 @@ curl -X POST /admin/keys/deactivate \
 ### Access Control
 
 Restrict rotation endpoints:
+
 - Require authentication/authorization
 - Use admin-only API keys
 - Implement rate limiting

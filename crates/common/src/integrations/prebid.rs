@@ -7,7 +7,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode, Url};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json, Value as JsonValue};
+use serde_json::{json, Value as Json};
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -15,10 +15,8 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::backend::ensure_backend_from_url;
-use crate::constants::{HEADER_SYNTHETIC_FRESH, HEADER_SYNTHETIC_TRUSTED_SERVER};
-use crate::creative;
 use crate::error::TrustedServerError;
-use crate::geo::GeoInfo;
+use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -29,7 +27,6 @@ use crate::openrtb::{
 };
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 
@@ -45,14 +42,18 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub bidders: Vec<String>,
-    #[serde(default = "default_auto_configure")]
-    pub auto_configure: bool,
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
-    pub script_handler: Option<String>,
-    #[serde(default)]
     pub debug_query_params: Option<String>,
+    /// Patterns to match Prebid script URLs for serving empty JS.
+    /// Supports suffix matching (e.g., "/prebid.min.js" matches any path ending with that)
+    /// and wildcard patterns (e.g., "/static/prebid/*" matches paths under that prefix).
+    #[serde(
+        default = "default_script_patterns",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub script_patterns: Vec<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -69,52 +70,23 @@ fn default_bidders() -> Vec<String> {
     vec!["mocktioneer".to_string()]
 }
 
-fn default_auto_configure() -> bool {
-    true
-}
-
 fn default_enabled() -> bool {
     true
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BannerUnit {
-    sizes: Vec<Vec<u32>>,
-}
+/// Default suffixes that identify Prebid scripts
+const PREBID_SCRIPT_SUFFIXES: &[&str] = &[
+    "/prebid.js",
+    "/prebid.min.js",
+    "/prebidjs.js",
+    "/prebidjs.min.js",
+];
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaTypes {
-    banner: Option<BannerUnit>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AdUnit {
-    code: String,
-    media_types: Option<MediaTypes>,
-    #[serde(default)]
-    bids: Option<Vec<Bid>>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AdRequest {
-    ad_units: Vec<AdUnit>,
-    config: Option<JsonValue>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct Bid {
-    bidder: String,
-    #[serde(default)]
-    params: JsonValue,
+fn default_script_patterns() -> Vec<String> {
+    PREBID_SCRIPT_SUFFIXES
+        .iter()
+        .map(|&s| s.to_owned())
+        .collect()
 }
 
 pub struct PrebidIntegration {
@@ -126,11 +98,70 @@ impl PrebidIntegration {
         Arc::new(Self { config })
     }
 
-    fn error(message: impl Into<String>) -> TrustedServerError {
-        TrustedServerError::Integration {
-            integration: PREBID_INTEGRATION_ID.to_string(),
-            message: message.into(),
+    fn matches_script_url(&self, attr_value: &str) -> bool {
+        let trimmed = attr_value.trim();
+        let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+
+        if self.matches_script_pattern(without_query) {
+            return true;
         }
+
+        if !without_query.starts_with('/')
+            && !without_query.starts_with("//")
+            && !without_query.contains("://")
+        {
+            let with_slash = format!("/{without_query}");
+            if self.matches_script_pattern(&with_slash) {
+                return true;
+            }
+        }
+
+        let parsed = if without_query.starts_with("//") {
+            Url::parse(&format!("https:{without_query}"))
+        } else {
+            Url::parse(without_query)
+        };
+
+        parsed
+            .ok()
+            .is_some_and(|url| self.matches_script_pattern(url.path()))
+    }
+
+    fn matches_script_pattern(&self, path: &str) -> bool {
+        // Normalize path to lowercase for case-insensitive matching
+        let path_lower = path.to_ascii_lowercase();
+
+        // Check if path matches any configured pattern
+        for pattern in &self.config.script_patterns {
+            let pattern_lower = pattern.to_ascii_lowercase();
+
+            // Check for wildcard patterns: /* or {*name}
+            if pattern_lower.ends_with("/*") || pattern_lower.contains("{*") {
+                // Extract prefix before the wildcard
+                let prefix = if pattern_lower.ends_with("/*") {
+                    &pattern_lower[..pattern_lower.len() - 1] // Remove trailing *
+                } else {
+                    // Find {* and extract prefix before it
+                    pattern_lower.split("{*").next().unwrap_or("")
+                };
+
+                if path_lower.starts_with(prefix) {
+                    // Check if it ends with a known Prebid script suffix
+                    if PREBID_SCRIPT_SUFFIXES
+                        .iter()
+                        .any(|suffix| path_lower.ends_with(suffix))
+                    {
+                        return true;
+                    }
+                }
+            } else {
+                // Exact match or suffix match
+                if path_lower.ends_with(&pattern_lower) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
@@ -143,75 +174,6 @@ impl PrebidIntegration {
             )
             .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .with_body(body))
-    }
-
-    #[allow(dead_code)]
-    async fn handle_first_party_ad(
-        &self,
-        settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let url = req.get_url_str();
-        let parsed = Url::parse(url).change_context(TrustedServerError::Prebid {
-            message: "Invalid first-party serve-ad URL".to_string(),
-        })?;
-        let qp = parsed
-            .query_pairs()
-            .into_owned()
-            .collect::<std::collections::HashMap<_, _>>();
-        let slot = qp.get("slot").cloned().unwrap_or_default();
-        let w = qp
-            .get("w")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(300);
-        let h = qp
-            .get("h")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(250);
-        if slot.is_empty() {
-            return Err(Report::new(TrustedServerError::BadRequest {
-                message: "missing slot".to_string(),
-            }));
-        }
-
-        let ad_req = AdRequest {
-            ad_units: vec![AdUnit {
-                code: slot.clone(),
-                media_types: Some(MediaTypes {
-                    banner: Some(BannerUnit {
-                        sizes: vec![vec![w, h]],
-                    }),
-                }),
-                bids: None,
-            }],
-            config: None,
-        };
-
-        let ortb = build_openrtb_from_ts(&ad_req, settings, &self.config);
-        req.set_body_json(&ortb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set OpenRTB body".to_string(),
-            })?;
-
-        let backend_name = ensure_backend_from_url(&self.config.server_url)?;
-        let mut pbs_resp = req
-            .send(backend_name)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to send first-party ad request to Prebid Server".to_string(),
-            })?;
-
-        let body_bytes = pbs_resp.take_body_bytes();
-        let html = match serde_json::from_slice::<Json>(&body_bytes) {
-            Ok(json) => extract_adm_for_slot(&json, &slot)
-                .unwrap_or_else(|| "<!-- no creative -->".to_string()),
-            Err(_) => String::from_utf8(body_bytes).unwrap_or_else(|_| String::new()),
-        };
-
-        let rewritten = creative::rewrite_creative_html(settings, &html);
-
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(rewritten))
     }
 }
 
@@ -250,8 +212,12 @@ impl IntegrationProxy for PrebidIntegration {
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         let mut routes = vec![];
 
-        if let Some(script_path) = &self.config.script_handler {
-            routes.push(IntegrationEndpoint::get(script_path.clone()));
+        // Register routes for script removal patterns
+        // Patterns can be exact paths (e.g., "/prebid.min.js") or use matchit wildcards
+        // (e.g., "/static/prebid/{*rest}")
+        for pattern in &self.config.script_patterns {
+            let static_path: &'static str = Box::leak(pattern.clone().into_boxed_str());
+            routes.push(IntegrationEndpoint::get(static_path));
         }
 
         routes
@@ -266,12 +232,9 @@ impl IntegrationProxy for PrebidIntegration {
         let method = req.get_method().clone();
 
         match method {
-            Method::GET if self.config.script_handler.as_ref() == Some(&path) => {
-                self.handle_script_handler()
-            }
-            _ => Err(Report::new(Self::error(format!(
-                "Unsupported Prebid route: {path}"
-            )))),
+            // Serve empty JS for matching script patterns
+            Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
+            _ => Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found")),
         }
     }
 }
@@ -282,7 +245,7 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 
     fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.auto_configure && matches!(attribute, "src" | "href")
+        matches!(attribute, "src" | "href")
     }
 
     fn rewrite(
@@ -291,261 +254,12 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
         attr_value: &str,
         _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if self.config.auto_configure && is_prebid_script_url(attr_value) {
+        if self.matches_script_url(attr_value) {
             AttributeRewriteAction::remove_element()
         } else {
             AttributeRewriteAction::keep()
         }
     }
-}
-
-#[allow(dead_code)]
-fn build_openrtb_from_ts(
-    req: &AdRequest,
-    settings: &Settings,
-    prebid: &PrebidIntegrationConfig,
-) -> OpenRtbRequest {
-    use uuid::Uuid;
-
-    let imps: Vec<Imp> = req
-        .ad_units
-        .iter()
-        .map(|unit| {
-            let formats: Vec<Format> = unit
-                .media_types
-                .as_ref()
-                .and_then(|mt| mt.banner.as_ref())
-                .map(|b| {
-                    b.sizes
-                        .iter()
-                        .filter(|s| s.len() >= 2)
-                        .map(|s| Format { w: s[0], h: s[1] })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec![Format { w: 300, h: 250 }]);
-
-            let mut bidder: HashMap<String, JsonValue> = HashMap::new();
-            if let Some(bids) = &unit.bids {
-                for bid in bids {
-                    bidder.insert(bid.bidder.clone(), bid.params.clone());
-                }
-            }
-            if bidder.is_empty() {
-                for b in &prebid.bidders {
-                    bidder.insert(b.clone(), JsonValue::Object(serde_json::Map::new()));
-                }
-            }
-
-            Imp {
-                id: unit.code.clone(),
-                banner: Some(Banner { format: formats }),
-                ext: Some(ImpExt {
-                    prebid: PrebidImpExt { bidder },
-                }),
-            }
-        })
-        .collect();
-
-    OpenRtbRequest {
-        id: Uuid::new_v4().to_string(),
-        imp: imps,
-        site: Some(Site {
-            domain: Some(settings.publisher.domain.clone()),
-            page: Some(format!("https://{}", &settings.publisher.domain)),
-        }),
-        user: None,
-        device: None,
-        regs: None,
-        ext: None,
-    }
-}
-
-fn is_prebid_script_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    let without_query = lower.split('?').next().unwrap_or("");
-    let filename = without_query.rsplit('/').next().unwrap_or("");
-    matches!(
-        filename,
-        "prebid.js" | "prebid.min.js" | "prebidjs.js" | "prebidjs.min.js"
-    )
-}
-
-#[allow(dead_code)]
-async fn handle_prebid_auction(
-    settings: &Settings,
-    mut req: Request,
-    config: &PrebidIntegrationConfig,
-) -> Result<Response, Report<TrustedServerError>> {
-    log::info!("Handling Prebid auction request");
-    let mut openrtb_request: Json = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Prebid {
-            message: "Failed to parse OpenRTB request".to_string(),
-        },
-    )?;
-
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
-    let fresh_id = generate_synthetic_id(settings, &req)?;
-
-    log::info!(
-        "Using synthetic ID: {}, fresh ID: {}",
-        synthetic_id,
-        fresh_id
-    );
-
-    enhance_openrtb_request(
-        &mut openrtb_request,
-        &synthetic_id,
-        &fresh_id,
-        settings,
-        &req,
-        config,
-    )?;
-
-    let mut pbs_req = Request::new(
-        Method::POST,
-        format!("{}/openrtb2/auction", config.server_url),
-    );
-    copy_request_headers(&req, &mut pbs_req);
-    pbs_req
-        .set_body_json(&openrtb_request)
-        .change_context(TrustedServerError::Prebid {
-            message: "Failed to set request body".to_string(),
-        })?;
-
-    log::info!("Sending request to Prebid Server");
-
-    let backend_name = ensure_backend_from_url(&config.server_url)?;
-    let mut pbs_response =
-        pbs_req
-            .send(backend_name)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to send request to Prebid Server".to_string(),
-            })?;
-
-    if pbs_response.get_status().is_success() {
-        let response_body = pbs_response.take_body_bytes();
-        match serde_json::from_slice::<Json>(&response_body) {
-            Ok(mut response_json) => {
-                let request_host = get_request_host(&req);
-                let request_scheme = get_request_scheme(&req);
-                transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
-
-                let transformed_body = serde_json::to_vec(&response_json).change_context(
-                    TrustedServerError::Prebid {
-                        message: "Failed to serialize transformed response".to_string(),
-                    },
-                )?;
-
-                Ok(Response::from_status(StatusCode::OK)
-                    .with_header(header::CONTENT_TYPE, "application/json")
-                    .with_header("X-Synthetic-ID", &synthetic_id)
-                    .with_header(HEADER_SYNTHETIC_FRESH, &fresh_id)
-                    .with_header(HEADER_SYNTHETIC_TRUSTED_SERVER, &synthetic_id)
-                    .with_body(transformed_body))
-            }
-            Err(_) => Ok(Response::from_status(pbs_response.get_status())
-                .with_header(header::CONTENT_TYPE, "application/json")
-                .with_body(response_body)),
-        }
-    } else {
-        Ok(pbs_response)
-    }
-}
-
-#[allow(dead_code)]
-fn enhance_openrtb_request(
-    request: &mut Json,
-    synthetic_id: &str,
-    fresh_id: &str,
-    settings: &Settings,
-    req: &Request,
-    config: &PrebidIntegrationConfig,
-) -> Result<(), Report<TrustedServerError>> {
-    if !request["user"].is_object() {
-        request["user"] = json!({});
-    }
-    request["user"]["id"] = json!(synthetic_id);
-
-    if !request["user"]["ext"].is_object() {
-        request["user"]["ext"] = json!({});
-    }
-    request["user"]["ext"]["synthetic_fresh"] = json!(fresh_id);
-
-    if req.get_header("Sec-GPC").is_some() {
-        if !request["regs"].is_object() {
-            request["regs"] = json!({});
-        }
-        if !request["regs"]["ext"].is_object() {
-            request["regs"]["ext"] = json!({});
-        }
-        request["regs"]["ext"]["us_privacy"] = json!("1YYN");
-    }
-
-    if let Some(geo_info) = GeoInfo::from_request(req) {
-        let geo_obj = json!({
-            "type": 2,
-            "country": geo_info.country,
-            "city": geo_info.city,
-            "region": geo_info.region,
-        });
-
-        if !request["device"].is_object() {
-            request["device"] = json!({});
-        }
-        request["device"]["geo"] = geo_obj;
-    }
-
-    if !request["site"].is_object() {
-        let mut page_url = format!("https://{}", settings.publisher.domain);
-
-        // Append debug query params if configured
-        if let Some(ref params) = config.debug_query_params {
-            page_url = append_query_params(&page_url, params);
-        }
-
-        request["site"] = json!({
-            "domain": settings.publisher.domain,
-            "page": page_url,
-        });
-    } else if let Some(ref params) = config.debug_query_params {
-        // If site already exists, append debug params to existing page URL
-        if let Some(page_url) = request["site"]["page"].as_str() {
-            let updated_url = append_query_params(page_url, params);
-            if updated_url != page_url {
-                request["site"]["page"] = json!(updated_url);
-            }
-        }
-    }
-
-    if let Some(request_signing_config) = &settings.request_signing {
-        if request_signing_config.enabled && request["id"].is_string() {
-            if !request["ext"].is_object() {
-                request["ext"] = json!({});
-            }
-
-            let id = request["id"]
-                .as_str()
-                .expect("should have string id when is_string checked");
-            let signer = RequestSigner::from_config()?;
-            let signature = signer.sign(id.as_bytes())?;
-            request["ext"]["trusted_server"] = json!({
-                "signature": signature,
-                "kid": signer.kid
-            });
-        }
-    }
-
-    if config.debug {
-        if !request["ext"].is_object() {
-            request["ext"] = json!({});
-        }
-        if !request["ext"]["prebid"].is_object() {
-            request["ext"]["prebid"] = json!({});
-        }
-        request["ext"]["prebid"]["debug"] = json!(true);
-    }
-
-    Ok(())
 }
 
 fn transform_prebid_response(
@@ -646,27 +360,6 @@ fn copy_request_headers(from: &Request, to: &mut Request) {
     }
 }
 
-fn get_request_host(req: &Request) -> String {
-    req.get_header(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn get_request_scheme(req: &Request) -> String {
-    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
-        return "https".to_string();
-    }
-
-    if let Some(proto) = req.get_header("X-Forwarded-Proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            return proto_str.to_lowercase();
-        }
-    }
-
-    "https".to_string()
-}
-
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
 /// Returns the original URL unchanged if params are empty or already present.
 fn append_query_params(url: &str, params: &str) -> String {
@@ -678,24 +371,6 @@ fn append_query_params(url: &str, params: &str) -> String {
     } else {
         format!("{}?{}", url, params)
     }
-}
-
-/// Extracts the `adm` field from the first bid matching the given slot (by `impid`).
-///
-/// Searches through the `OpenRTB` seatbid/bid structure for a bid whose `impid`
-/// matches `slot` and returns its `adm` (ad markup) value.
-#[allow(dead_code)]
-fn extract_adm_for_slot(response: &Json, slot: &str) -> Option<String> {
-    let seatbids = response.get("seatbid")?.as_array()?;
-    for seatbid in seatbids {
-        let bids = seatbid.get("bid")?.as_array()?;
-        for bid in bids {
-            if bid.get("impid").and_then(|v| v.as_str()) == Some(slot) {
-                return bid.get("adm").and_then(|v| v.as_str()).map(String::from);
-            }
-        }
-    }
-    None
 }
 
 // ============================================================================
@@ -800,9 +475,7 @@ impl PrebidAuctionProvider {
         };
 
         // Build ext object
-        let request_host = get_request_host(context.request);
-        let request_scheme = get_request_scheme(context.request);
-
+        let request_info = RequestInfo::from_request(context.request);
         let (signature, kid) = signer
             .map(|(s, sig)| (Some(sig), Some(s.kid.clone())))
             .unwrap_or((None, None));
@@ -816,8 +489,8 @@ impl PrebidAuctionProvider {
             trusted_server: Some(TrustedServerExt {
                 signature,
                 kid,
-                request_host: Some(request_host),
-                request_scheme: Some(request_scheme),
+                request_host: Some(request_info.host),
+                request_scheme: Some(request_info.scheme),
             }),
         });
 
@@ -1098,10 +771,9 @@ mod tests {
             server_url: "https://prebid.example".to_string(),
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
-            auto_configure: true,
             debug: false,
-            script_handler: None,
             debug_query_params: None,
+            script_patterns: default_script_patterns(),
         }
     }
 
@@ -1155,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn html_processor_keeps_prebid_scripts_when_auto_config_disabled() {
+    fn html_processor_keeps_prebid_scripts_when_no_patterns() {
         let html = r#"<html><head>
             <script src="https://cdn.prebid.org/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
@@ -1171,7 +843,7 @@ mod tests {
                     "server_url": "https://test-prebid.com/openrtb2/auction",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
-                    "auto_configure": false,
+                    "script_patterns": [],
                     "debug": false
                 }),
             )
@@ -1196,16 +868,16 @@ mod tests {
         );
         assert!(
             processed.contains("prebid.min.js"),
-            "Prebid script should remain when auto-config is disabled"
+            "Prebid script should remain when no script patterns configured"
         );
         assert!(
             processed.contains("cdn.prebid.org/prebid.js"),
-            "Prebid preload should remain when auto-config is disabled"
+            "Prebid preload should remain when no script patterns configured"
         );
     }
 
     #[test]
-    fn html_processor_removes_prebid_scripts_when_auto_config_enabled() {
+    fn html_processor_removes_prebid_scripts_when_patterns_match() {
         let html = r#"<html><head>
             <script src="https://cdn.prebid.org/prebid.min.js"></script>
             <link rel="preload" as="script" href="https://cdn.prebid.org/prebid.js" />
@@ -1221,7 +893,7 @@ mod tests {
                     "server_url": "https://test-prebid.com/openrtb2/auction",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
-                    "auto_configure": true,
+                    "script_patterns": ["/prebid.js", "/prebid.min.js"],
                     "debug": false
                 }),
             )
@@ -1414,16 +1086,15 @@ mod tests {
     }
 
     #[test]
-    fn is_prebid_script_url_matches_common_variants() {
-        assert!(is_prebid_script_url("https://cdn.com/prebid.js"));
-        assert!(is_prebid_script_url(
-            "https://cdn.com/prebid.min.js?version=1"
-        ));
-        assert!(!is_prebid_script_url("https://cdn.com/app.js"));
+    fn matches_script_url_matches_common_variants() {
+        let integration = PrebidIntegration::new(base_config());
+        assert!(integration.matches_script_url("https://cdn.com/prebid.js"));
+        assert!(integration.matches_script_url("https://cdn.com/prebid.min.js?version=1"));
+        assert!(!integration.matches_script_url("https://cdn.com/app.js"));
     }
 
     #[test]
-    fn test_script_handler_config_parsing() {
+    fn test_script_patterns_config_parsing() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1440,7 +1111,7 @@ template = "{{client_ip}}:{{user_agent}}"
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid.example"
-script_handler = "/prebid.js"
+script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
 "#;
 
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
@@ -1449,11 +1120,15 @@ script_handler = "/prebid.js"
             .expect("should get config")
             .expect("should be enabled");
 
-        assert_eq!(config.script_handler, Some("/prebid.js".to_string()));
+        assert_eq!(config.script_patterns.len(), 2);
+        assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
+        assert!(config
+            .script_patterns
+            .contains(&"/custom/prebid.min.js".to_string()));
     }
 
     #[test]
-    fn test_script_handler_none_by_default() {
+    fn test_script_patterns_defaults() {
         let toml_str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1478,22 +1153,17 @@ server_url = "https://prebid.example"
             .expect("should get config")
             .expect("should be enabled");
 
-        assert_eq!(config.script_handler, None);
+        // Should have default script patterns
+        assert!(!config.script_patterns.is_empty());
+        assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
+        assert!(config
+            .script_patterns
+            .contains(&"/prebid.min.js".to_string()));
     }
 
     #[test]
     fn test_script_handler_returns_empty_js() {
-        let config = PrebidIntegrationConfig {
-            enabled: true,
-            server_url: "https://prebid.example".to_string(),
-            timeout_ms: 1000,
-            bidders: vec![],
-            auto_configure: false,
-            debug: false,
-            script_handler: Some("/prebid.js".to_string()),
-            debug_query_params: None,
-        };
-        let integration = PrebidIntegration::new(config);
+        let integration = PrebidIntegration::new(base_config());
 
         let response = integration
             .handle_script_handler()
@@ -1517,29 +1187,18 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn test_routes_includes_script_handler() {
-        let config = PrebidIntegrationConfig {
-            enabled: true,
-            server_url: "https://prebid.example".to_string(),
-            timeout_ms: 1000,
-            bidders: vec![],
-            auto_configure: false,
-            debug: false,
-            script_handler: Some("/prebid.js".to_string()),
-            debug_query_params: None,
-        };
-        let integration = PrebidIntegration::new(config);
+    fn test_routes_includes_script_patterns() {
+        let integration = PrebidIntegration::new(base_config());
 
         let routes = integration.routes();
 
-        // Should have 1 route: script handler
-        assert_eq!(routes.len(), 1);
+        // Should have routes for default script patterns
+        assert!(!routes.is_empty());
 
-        let has_script_route = routes
+        let has_prebid_js_route = routes
             .iter()
             .any(|r| r.path == "/prebid.js" && r.method == Method::GET);
-        assert!(has_script_route, "should register script handler route");
-    }
+        assert!(has_prebid_js_route, "should register /prebid.js route");
 
     #[test]
     fn test_routes_without_script_handler() {
@@ -1622,38 +1281,22 @@ server_url = "https://prebid.example"
         assert_eq!(
             page,
             "https://example.com/page?existing=param&kargo_debug=true"
+        let has_prebid_min_js_route = routes
+            .iter()
+            .any(|r| r.path == "/prebid.min.js" && r.method == Method::GET);
+        assert!(
+            has_prebid_min_js_route,
+            "should register /prebid.min.js route"
         );
     }
 
     #[test]
-    fn debug_query_params_not_duplicated() {
-        // Verify that if params are already in the URL, they aren't added again
-        let settings = make_settings();
+    fn test_routes_with_empty_script_patterns() {
         let mut config = base_config();
-        config.debug_query_params = Some("kargo_debug=true".to_string());
+        config.script_patterns = vec![];
+        let integration = PrebidIntegration::new(config);
 
-        let req = Request::new(Method::GET, "https://example.com/test");
-        let synthetic_id = "test-synthetic-id";
-        let fresh_id = "test-fresh-id";
-
-        // Test with URL that already has the debug params
-        let mut request = json!({
-            "id": "test-id",
-            "site": {
-                "domain": "example.com",
-                "page": "https://example.com/page?kargo_debug=true"
-            }
-        });
-
-        enhance_openrtb_request(
-            &mut request,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
+        let routes = integration.routes();
 
         let page = request["site"]["page"]
             .as_str()
@@ -1662,5 +1305,7 @@ server_url = "https://prebid.example"
         assert_eq!(page, "https://example.com/page?kargo_debug=true");
         // Verify params appear exactly once
         assert_eq!(page.matches("kargo_debug=true").count(), 1);
+        // Should have 0 routes when no script patterns configured
+        assert_eq!(routes.len(), 0);
     }
 }

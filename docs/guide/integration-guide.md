@@ -4,12 +4,12 @@ This document explains how to integrate a new integration module with the Truste
 
 ## Architecture Overview
 
-| Component | Purpose |
-| --- | --- |
-| `crates/common/src/integrations/registry.rs` | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, and `IntegrationScriptRewriter` traits and hosts the `IntegrationRegistry`, which drives proxy routing and HTML/text rewrites. |
+| Component                                                  | Purpose                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/common/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, and `IntegrationScriptRewriter` traits and hosts the `IntegrationRegistry`, which drives proxy routing and HTML/text rewrites.                                                               |
 | `Settings::integrations` (`crates/common/src/settings.rs`) | Free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
-| Fastly entrypoint (`crates/fastly/src/main.rs`) | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware. |
-| `html_processor.rs` | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs). |
+| Fastly entrypoint (`crates/fastly/src/main.rs`)            | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
+| `html_processor.rs`                                        | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
 
 ## Step-by-Step Integration
 
@@ -251,6 +251,7 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 **Purpose**: Sample partner stub showing request proxying, attribute rewrites, and asset injection.
 
 **Key files**:
+
 - `crates/common/src/integrations/testlight.rs` - Rust implementation
 - `crates/js/lib/src/integrations/testlight.ts` - TypeScript shim
 
@@ -259,7 +260,8 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 **Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
 
 **Key files**:
-- `crates/common/src/integrations/prebid.rs` - Rust implementation  
+
+- `crates/common/src/integrations/prebid.rs` - Rust implementation
 - `crates/js/lib/src/ext/prebidjs.ts` - TypeScript shim
 
 #### Prebid Integration Details
@@ -276,7 +278,7 @@ enabled = true
 server_url = "https://prebid.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["equativ", "sampleBidder"]
-auto_configure = true
+# script_patterns = ["/static/prebid/*"]
 ```
 
 Tests or scaffolding can inject configs by calling `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that other integrations use.
@@ -287,7 +289,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When `auto_configure` is enabled, the integration's `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references outright. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
 
 **4. TSJS Assets & Testing**
 
