@@ -42,3 +42,13 @@ export interface TsjsApi {
     debug(...args: unknown[]): void;
   };
 }
+
+/** GAM interceptor configuration. */
+export interface GamConfig {
+  /** Enable the GAM interceptor. Defaults to false. */
+  enabled?: boolean;
+  /** Only intercept bids from these bidders. Empty array = all bidders. */
+  bidders?: string[];
+  /** Force render Prebid creative even if GAM returned a line item. Defaults to false. */
+  forceRender?: boolean;
+}
