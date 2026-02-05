@@ -249,10 +249,7 @@ impl DataDomeIntegration {
     }
 
     /// Handle the /tags.js endpoint - fetch and rewrite the `DataDome` SDK.
-    async fn handle_tags_js(
-        &self,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
+    async fn handle_tags_js(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
         let target_url = self.build_sdk_url("/tags.js", req.get_query_str());
 
         log::info!("[datadome] Fetching tags.js from {}", target_url);
@@ -309,10 +306,7 @@ impl DataDomeIntegration {
     }
 
     /// Handle the /js/* signal collection endpoint - proxy pass-through to api-js.datadome.co.
-    async fn handle_js_api(
-        &self,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
+    async fn handle_js_api(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
         let original_path = req.get_path();
 
         // Strip our prefix to get the DataDome path
