@@ -4,22 +4,45 @@ import { log } from '../core/log';
  * Shared Script Guard Factory
  *
  * Creates a DOM interception guard that patches appendChild and insertBefore
- * to intercept dynamically inserted script (and preload link) elements whose
- * URLs match an integration's SDK. The matched URLs are rewritten to a
+ * to intercept dynamically inserted script (and preload/prefetch link) elements
+ * whose URLs match an integration's SDK. The matched URLs are rewritten to a
  * first-party proxy endpoint before the element is inserted into the DOM.
  *
  * Each call to createScriptGuard() produces an independent guard with its own
  * installation state, so multiple integrations can coexist without interference.
  */
 
-export interface ScriptGuardConfig {
+/**
+ * Base configuration shared by all guard types.
+ */
+interface ScriptGuardConfigBase {
   /** Integration name used in log messages (e.g. "Lockr", "Permutive"). */
   name: string;
   /** Return true if the URL belongs to this integration's SDK. */
   isTargetUrl: (url: string) => boolean;
+}
+
+/**
+ * Config using a fixed proxy path (original behavior).
+ * The entire URL is replaced with `{origin}{proxyPath}`.
+ */
+interface ScriptGuardConfigWithProxyPath extends ScriptGuardConfigBase {
   /** First-party proxy path to rewrite to (e.g. "/integrations/lockr/sdk"). */
   proxyPath: string;
+  rewriteUrl?: never;
 }
+
+/**
+ * Config using a custom URL rewriter function.
+ * Allows integrations like DataDome to preserve the original path.
+ */
+interface ScriptGuardConfigWithRewriter extends ScriptGuardConfigBase {
+  proxyPath?: never;
+  /** Custom function to rewrite the original URL to a first-party URL. */
+  rewriteUrl: (originalUrl: string) => string;
+}
+
+export type ScriptGuardConfig = ScriptGuardConfigWithProxyPath | ScriptGuardConfigWithRewriter;
 
 export interface ScriptGuard {
   /** Patch appendChild/insertBefore to intercept matching scripts. */
@@ -34,20 +57,18 @@ export interface ScriptGuard {
  * Build a first-party URL from the current page origin and the configured proxy path.
  */
 function rewriteToFirstParty(proxyPath: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
-  const host = window.location.host;
-  return `${protocol}://${host}${proxyPath}`;
+  return `${window.location.origin}${proxyPath}`;
 }
 
 /**
- * Determine whether a DOM node is a script or preload-link element whose URL
- * matches the guard's target pattern.
+ * Determine whether a DOM node is a script or preload/prefetch link element
+ * whose URL matches the guard's target pattern.
  */
 function shouldRewriteElement(
   node: Node,
   isTargetUrl: (url: string) => boolean
 ): node is HTMLScriptElement | HTMLLinkElement {
-  if (!node || !(node instanceof HTMLElement)) {
+  if (!(node instanceof HTMLElement)) {
     return false;
   }
 
@@ -57,10 +78,11 @@ function shouldRewriteElement(
     return !!src && isTargetUrl(src);
   }
 
-  // Link preload elements
+  // Link preload/prefetch elements
   if (node.tagName === 'LINK') {
     const link = node as HTMLLinkElement;
-    if (link.getAttribute('rel') !== 'preload' || link.getAttribute('as') !== 'script') {
+    const rel = link.getAttribute('rel');
+    if ((rel !== 'preload' && rel !== 'prefetch') || link.getAttribute('as') !== 'script') {
       return false;
     }
     const href = link.href || link.getAttribute('href');
@@ -68,6 +90,16 @@ function shouldRewriteElement(
   }
 
   return false;
+}
+
+/**
+ * Get the rewritten URL using either the custom rewriter or the proxy path.
+ */
+function getRewrittenUrl(originalUrl: string, config: ScriptGuardConfig): string {
+  if (config.rewriteUrl) {
+    return config.rewriteUrl(originalUrl);
+  }
+  return rewriteToFirstParty(config.proxyPath);
 }
 
 /**
@@ -84,7 +116,7 @@ function rewriteElement(
     const originalSrc = script.src || script.getAttribute('src');
     if (!originalSrc) return;
 
-    const rewritten = rewriteToFirstParty(config.proxyPath);
+    const rewritten = getRewrittenUrl(originalSrc, config);
 
     log.info(`${prefix}: rewriting dynamically inserted SDK script`, {
       original: originalSrc,
@@ -99,9 +131,9 @@ function rewriteElement(
     const originalHref = link.href || link.getAttribute('href');
     if (!originalHref) return;
 
-    const rewritten = rewriteToFirstParty(config.proxyPath);
+    const rewritten = getRewrittenUrl(originalHref, config);
 
-    log.info(`${prefix}: rewriting SDK preload link`, {
+    log.info(`${prefix}: rewriting SDK ${link.getAttribute('rel')} link`, {
       original: originalHref,
       rewritten,
       rel: link.getAttribute('rel'),

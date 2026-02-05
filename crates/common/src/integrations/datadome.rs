@@ -4,16 +4,56 @@
 //! collection API, enabling first-party bot protection while maintaining the permissionless
 //! Trusted Server approach (no DNS/CNAME changes required).
 //!
-//! ## Endpoints
+//! # Overview
 //!
-//! - `GET /integrations/datadome/tags.js` - Proxies the `DataDome` SDK script
-//! - `ANY /integrations/datadome/js/*` - Proxies signal collection API calls
+//! `DataDome` provides real-time bot protection and fraud prevention. This integration enables
+//! first-party delivery of `DataDome`'s JavaScript SDK and signal collection through Trusted
+//! Server, eliminating the need for DNS/CNAME configuration while improving protection against
+//! ad blockers that may interfere with third-party scripts.
 //!
-//! ## Script Rewriting
+//! # Benefits
 //!
-//! The integration rewrites the `tags.js` script to replace hardcoded `DataDome` API
-//! endpoints with first-party paths through Trusted Server. This ensures all browser
-//! requests go through the publisher's domain rather than directly to `DataDome`.
+//! - **No DNS changes required**: Works immediately without CNAME setup
+//! - **First-party context**: All traffic flows through the publisher's domain
+//! - **Ad blocker resistance**: First-party scripts are less likely to be blocked
+//! - **Automatic URL rewriting**: SDK scripts are transparently rewritten to use first-party paths
+//!
+//! # Configuration
+//!
+//! Add to `trusted-server.toml`:
+//!
+//! ```toml
+//! [integrations.datadome]
+//! enabled = true
+//! sdk_origin = "https://js.datadome.co"        # SDK script origin
+//! api_origin = "https://api-js.datadome.co"    # Signal collection API origin
+//! cache_ttl_seconds = 3600                     # Cache TTL for tags.js (1 hour)
+//! rewrite_sdk = true                           # Rewrite DataDome URLs in HTML
+//! ```
+//!
+//! # Endpoints
+//!
+//! | Method | Path | Description |
+//! |--------|------|-------------|
+//! | `GET` | `/integrations/datadome/tags.js` | Proxies the `DataDome` SDK script |
+//! | `GET/POST` | `/integrations/datadome/js/*` | Proxies signal collection API calls |
+//!
+//! # Request Flow
+//!
+//! 1. **SDK Loading**: Browser requests `/integrations/datadome/tags.js`
+//! 2. **Proxy & Rewrite**: Trusted Server fetches from `js.datadome.co`, rewrites internal
+//!    URLs to first-party paths using [`DATADOME_URL_PATTERN`]
+//! 3. **Signal Collection**: SDK sends signals to `/integrations/datadome/js/`
+//! 4. **Transparent Proxy**: Trusted Server forwards to `api-js.datadome.co`, returns response
+//!
+//! # HTML Attribute Rewriting
+//!
+//! When `rewrite_sdk = true`, the integration implements [`IntegrationAttributeRewriter`] to
+//! automatically rewrite `DataDome` script URLs in HTML responses:
+//!
+//! - `<script src="https://js.datadome.co/tags.js">` becomes
+//!   `<script src="https://publisher.com/integrations/datadome/tags.js">`
+//! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
 use std::sync::Arc;
 
@@ -21,6 +61,7 @@ use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
@@ -34,6 +75,28 @@ use crate::integrations::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
+
+/// Regex pattern for matching and rewriting `DataDome` URLs in script content.
+///
+/// Pattern breakdown:
+/// - `(['"])` - Capture group 1: opening quote (single or double)
+/// - `(https?:)?` - Capture group 2: optional protocol (http: or https:)
+/// - `(//)?` - Capture group 3: optional protocol-relative slashes
+/// - `(api-)?` - Capture group 4: optional "api-" prefix for api-js.datadome.co
+/// - `js\.datadome\.co` - Literal domain we're rewriting
+/// - `(/[^'"]*)?` - Capture group 5: optional path (everything until closing quote)
+/// - `(['"])` - Capture group 6: closing quote
+///
+/// This handles URLs like:
+/// - `"https://js.datadome.co/tags.js"`
+/// - `"https://api-js.datadome.co/js/check"`
+/// - `'//js.datadome.co/js/check'`
+/// - `"api-js.datadome.co/js/check"`
+/// - `"js.datadome.co"`
+static DATADOME_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
+        .expect("DataDome URL rewrite regex should compile")
+});
 
 /// Configuration for `DataDome` integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -130,31 +193,13 @@ impl DataDomeIntegration {
     /// flows through Trusted Server. Root-relative paths work correctly regardless of the
     /// current page path.
     ///
-    /// Uses regex to handle all URL variants:
+    /// Uses the static [`DATADOME_URL_PATTERN`] regex to handle all URL variants:
     /// - Absolute URLs: `https://js.datadome.co/path` or `https://api-js.datadome.co/path`
     /// - Protocol-relative: `//js.datadome.co/path` or `//api-js.datadome.co/path`
     /// - Bare domain: `js.datadome.co/path` or `api-js.datadome.co/path`
     /// - All quote styles: `"..."` and `'...'`
     fn rewrite_script_content(&self, content: &str) -> String {
-        // Pattern breakdown:
-        // (['"])                    - Capture group 1: opening quote (single or double)
-        // (https?:)?                - Capture group 2: optional protocol (http: or https:)
-        // (//)?                     - Capture group 3: optional protocol-relative slashes
-        // (api-)?                   - Capture group 4: optional "api-" prefix for api-js.datadome.co
-        // js\.datadome\.co          - Literal domain we're rewriting
-        // (/[^'"]*)?                - Capture group 5: optional path (everything until closing quote)
-        // (['"])                    - Capture group 6: closing quote
-        //
-        // This handles:
-        // - "https://js.datadome.co/tags.js"
-        // - "https://api-js.datadome.co/js/check"
-        // - '//js.datadome.co/js/check'
-        // - "api-js.datadome.co/js/check"
-        // - "js.datadome.co"
-        let pattern = Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
-            .expect("DataDome URL rewrite regex should compile");
-
-        pattern
+        DATADOME_URL_PATTERN
             .replace_all(content, |caps: &regex::Captures| {
                 let open_quote = &caps[1];
                 let path = caps.get(5).map_or("", |m| m.as_str());
@@ -206,7 +251,6 @@ impl DataDomeIntegration {
     /// Handle the /tags.js endpoint - fetch and rewrite the `DataDome` SDK.
     async fn handle_tags_js(
         &self,
-        _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let target_url = self.build_sdk_url("/tags.js", req.get_query_str());
@@ -267,7 +311,6 @@ impl DataDomeIntegration {
     /// Handle the /js/* signal collection endpoint - proxy pass-through to api-js.datadome.co.
     async fn handle_js_api(
         &self,
-        _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let original_path = req.get_path();
@@ -367,15 +410,15 @@ impl IntegrationProxy for DataDomeIntegration {
 
     async fn handle(
         &self,
-        settings: &Settings,
+        _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
 
         if path == "/integrations/datadome/tags.js" {
-            self.handle_tags_js(settings, req).await
+            self.handle_tags_js(req).await
         } else if path.starts_with("/integrations/datadome/js/") {
-            self.handle_js_api(settings, req).await
+            self.handle_js_api(req).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown DataDome route: {}",
