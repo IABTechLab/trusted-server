@@ -52,6 +52,38 @@ Keys are stored in two separate Fastly stores:
 └─────────────────────┘
 ```
 
+### Signing Flow (Prebid)
+
+The following diagram shows how request signing works for Prebid auction requests, from the Trusted Server through to DSP verification:
+
+```mermaid
+sequenceDiagram
+    participant TS as Trusted Server<br/>(Publisher Domain)
+    participant PBS as Prebid Server
+    participant DSP as DSP
+
+    Note over TS: Signs request using<br/>Ed25519 private key
+
+    TS->>PBS: POST /openrtb2/auction
+    Note right of TS: OpenRTB body includes<br/>ext.trusted_server {<br/>  signature,<br/>  kid,<br/>  request_host,<br/>  request_scheme<br/>}
+
+    PBS->>DSP: POST /openrtb2/auction
+    Note right of PBS: Forwards full OpenRTB body<br/>including ext.trusted_server
+
+    Note over DSP: Extracts signature, kid,<br/>and site.domain from request
+
+    opt JWKS not cached (10 min TTL)
+        DSP->>TS: GET /.well-known/trusted-server.json
+        TS-->>DSP: JWKS response
+        Note left of DSP: {keys: [{<br/>  kid,<br/>  kty: "OKP",<br/>  crv: "Ed25519",<br/>  x: "public_key"<br/>}]}
+    end
+
+    Note over DSP: Looks up public key by kid<br/>Verifies Ed25519 signature<br/>over request
+
+    DSP-->>PBS: Bid Response
+    PBS-->>TS: Bid Response
+```
+
 ## Signing Requests
 
 ### Basic Usage
