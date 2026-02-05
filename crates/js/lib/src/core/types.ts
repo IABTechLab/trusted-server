@@ -47,11 +47,23 @@ export enum RequestMode {
   ThirdParty = 'thirdParty',
 }
 
+/** GAM interceptor configuration. */
+export interface GamConfig {
+  /** Enable the GAM interceptor. Defaults to false. */
+  enabled?: boolean;
+  /** Only intercept bids from these bidders. Empty array = all bidders. */
+  bidders?: string[];
+  /** Force render Prebid creative even if GAM returned a line item. Defaults to false. */
+  forceRender?: boolean;
+}
+
 export interface Config {
   debug?: boolean;
   logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
   /** Select ad serving mode. Default is RequestMode.FirstParty. */
   mode?: RequestMode;
+  /** GAM interceptor configuration. */
+  gam?: GamConfig;
   // Extendable for future fields
   [key: string]: unknown;
 }
