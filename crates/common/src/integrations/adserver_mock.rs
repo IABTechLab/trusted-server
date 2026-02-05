@@ -277,7 +277,7 @@ impl AuctionProvider for AdServerMockProvider {
             })?;
 
         // Send async
-        let backend_name = ensure_backend_from_url(&self.config.endpoint).change_context(
+        let backend_name = ensure_backend_from_url(&self.config.endpoint, true).change_context(
             TrustedServerError::Auction {
                 message: format!(
                     "Failed to resolve backend for mediation endpoint: {}",
@@ -340,7 +340,7 @@ impl AuctionProvider for AdServerMockProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.endpoint).ok()
+        ensure_backend_from_url(&self.config.endpoint, true).ok()
     }
 }
 

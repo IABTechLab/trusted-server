@@ -1,4 +1,4 @@
-//! Simplified HTML processor that combines URL replacement and Prebid injection
+//! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
 use std::cell::Cell;
@@ -191,10 +191,26 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Inject unified tsjs bundle once at the start of <head>
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
+            let integrations = integration_registry.clone();
+            let patterns = patterns.clone();
+            let document_state = document_state.clone();
             move |el| {
                 if !injected_tsjs.get() {
-                    let loader = tsjs::unified_script_tag();
-                    el.prepend(&loader, ContentType::Html);
+                    let mut snippet = String::new();
+                    let ctx = IntegrationHtmlContext {
+                        request_host: &patterns.request_host,
+                        request_scheme: &patterns.request_scheme,
+                        origin_host: &patterns.origin_host,
+                        document_state: &document_state,
+                    };
+                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
+                    snippet.push_str(&tsjs::unified_script_tag());
+                    // Then add any integration-specific head inserts (e.g., mode config)
+                    // These run after the bundle so tsjs API is available
+                    for insert in integrations.head_inserts(&ctx) {
+                        snippet.push_str(&insert);
+                    }
+                    el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
                 Ok(())

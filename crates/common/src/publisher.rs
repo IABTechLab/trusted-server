@@ -216,7 +216,10 @@ pub fn handle_publisher_request(
         has_synthetic_cookie
     );
 
-    let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
+    let backend_name = ensure_backend_from_url(
+        &settings.publisher.origin_url,
+        settings.proxy.certificate_check,
+    )?;
     let origin_host = settings.publisher.origin_host();
 
     log::debug!(

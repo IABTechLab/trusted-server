@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use build_print::{error, info, warn};
+
 const UNIFIED_BUNDLE: &str = "tsjs-unified.js";
 
 fn main() {
@@ -34,7 +36,7 @@ fn main() {
     // If Node/npm is absent, keep going if dist exists
     let npm = which::which("npm").ok();
     if npm.is_none() {
-        println!("cargo:warning=tsjs: npm not found; will use existing dist if available");
+        warn!("tsjs: npm not found; will use existing dist if available");
     }
 
     // Install deps if node_modules missing
@@ -50,9 +52,7 @@ fn main() {
                     .map(std::process::ExitStatus::success)
                     .unwrap_or(false)
                 {
-                    println!(
-                        "cargo:warning=tsjs: npm install failed; using existing dist if available"
-                    );
+                    error!("tsjs: npm install failed; using existing dist if available");
                 }
             }
         }
@@ -69,12 +69,12 @@ fn main() {
     // Build unified bundle
     if !skip {
         if let Some(npm_path) = npm.clone() {
-            println!("cargo:warning=tsjs: Building unified bundle");
+            info!("tsjs: Building unified bundle");
             let js_modules = env::var("TSJS_MODULES").unwrap_or("".to_string());
 
             let status = Command::new(&npm_path)
                 .env("TSJS_MODULES", js_modules)
-                .args(["run", "build:custom"])
+                .args(["run", "build"])
                 .current_dir(&ts_dir)
                 .status();
             if !status
@@ -82,12 +82,12 @@ fn main() {
                 .map(std::process::ExitStatus::success)
                 .unwrap_or(false)
             {
-                panic!("tsjs: npm run build:custom failed - refusing to use stale bundle");
+                panic!("tsjs: npm run build failed - refusing to use stale bundle");
             }
         }
     }
 
-    // Copy unified bundle into OUT_DIR for include_str!
+    // Copy bundle into OUT_DIR for include_str!
     copy_bundle(UNIFIED_BUNDLE, true, &crate_dir, &dist_dir, &out_dir);
 }
 
