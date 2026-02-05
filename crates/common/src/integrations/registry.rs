@@ -684,7 +684,7 @@ impl IntegrationRegistry {
     }
 
     /// Collect HTML snippets for insertion at the start of `<head>`.
-    #[must_use] 
+    #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = Vec::new();
         for injector in &self.inner.head_injectors {
