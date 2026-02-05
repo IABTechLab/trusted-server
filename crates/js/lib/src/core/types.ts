@@ -1,6 +1,8 @@
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
+export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
+
 export interface Banner {
   sizes: ReadonlyArray<Size>;
 }
@@ -22,29 +24,16 @@ export interface AdUnit {
 
 export interface TsjsApi {
   version: string;
-  que: Array<() => void>;
-  addAdUnits(units: AdUnit | AdUnit[]): void;
-  renderAdUnit(codeOrUnit: string | AdUnit): void;
-  renderAllAdUnits(): void;
-  setConfig?(cfg: Config): void;
-  getConfig?(): Config;
-  // Core API: requestAds; accepts same signatures as Prebid's requestBids
-  requestAds?(opts?: RequestAdsOptions): void;
-  requestAds?(callback: RequestAdsCallback, opts?: RequestAdsOptions): void;
-  getHighestCpmBids?(adUnitCodes?: string | string[]): ReadonlyArray<HighestCpmBid>;
-  log?: {
-    setLevel(l: 'silent' | 'error' | 'warn' | 'info' | 'debug'): void;
-    getLevel(): 'silent' | 'error' | 'warn' | 'info' | 'debug';
+  setConfig(cfg: Config): void;
+  getConfig(): Config;
+  log: {
+    setLevel(l: LogLevel): void;
+    getLevel(): LogLevel;
     info(...args: unknown[]): void;
     warn(...args: unknown[]): void;
     error(...args: unknown[]): void;
     debug(...args: unknown[]): void;
   };
-}
-
-export enum RequestMode {
-  FirstParty = 'firstParty',
-  ThirdParty = 'thirdParty',
 }
 
 /** GAM interceptor configuration. */
@@ -59,9 +48,9 @@ export interface GamConfig {
 
 export interface Config {
   debug?: boolean;
-  logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
-  /** Select ad serving mode. Default is RequestMode.FirstParty. */
-  mode?: RequestMode;
+  logLevel?: LogLevel;
+  /** Select ad serving mode: 'render' or 'auction'. */
+  mode?: 'render' | 'auction';
   /** GAM interceptor configuration. */
   gam?: GamConfig;
   // Extendable for future fields
