@@ -453,7 +453,7 @@ impl AuctionProvider for ApsAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.endpoint).change_context(
+        let backend_name = ensure_backend_from_url(&self.config.endpoint, true).change_context(
             TrustedServerError::Auction {
                 message: format!(
                     "Failed to resolve backend for APS endpoint: {}",
@@ -518,7 +518,7 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.endpoint).ok()
+        ensure_backend_from_url(&self.config.endpoint, true).ok()
     }
 }
 

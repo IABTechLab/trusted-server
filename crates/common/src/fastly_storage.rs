@@ -120,7 +120,7 @@ impl FastlyApiClient {
         store_name: &str,
         key_name: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let backend_name = ensure_backend_from_url("https://api.fastly.com")?;
+        let backend_name = ensure_backend_from_url("https://api.fastly.com", true)?;
 
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;
