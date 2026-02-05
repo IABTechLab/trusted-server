@@ -36,7 +36,6 @@ export interface TsjsApi {
   };
 }
 
-
 export interface Config {
   debug?: boolean;
   logLevel?: LogLevel;
