@@ -659,7 +659,7 @@ fastly log-tail
 fastly compute serve
 
 # Test endpoint
-curl http://localhost:7676/first-party/ad?slot=test&w=300&h=250
+curl http://localhost:7676/ad/render?slot=test&w=300&h=250
 ```
 
 ---
