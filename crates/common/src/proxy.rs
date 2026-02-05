@@ -1183,7 +1183,6 @@ mod tests {
     #[tokio::test]
     async fn proxy_sign_preserves_non_standard_port() {
         let settings = create_test_settings();
-        // Test with non-standard port (e.g., 9443)
         let body = serde_json::json!({
             "url": "https://cdn.example.com:9443/img/300x250.svg",
         });
@@ -1191,8 +1190,12 @@ mod tests {
         req.set_body(body.to_string());
         let mut resp = handle_first_party_proxy_sign(&settings, req)
             .await
-            .expect("sign ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
+            .expect("should sign URL with non-standard port");
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::OK,
+            "should return 200 for valid sign request"
+        );
         let json = resp.take_body_str();
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
@@ -1607,7 +1610,7 @@ mod tests {
             "https://cdn.example.com:9443/creatives/300x250.html",
             beresp,
         )
-        .expect("finalize should succeed");
+        .expect("should finalize HTML response with non-standard port URL");
 
         let body = out.take_body_str();
 

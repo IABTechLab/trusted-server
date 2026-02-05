@@ -348,6 +348,10 @@ impl Settings {
             return Err(Report::new(TrustedServerError::InsecureSecretKey));
         }
 
+        if !settings.proxy.certificate_check {
+            log::warn!("INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified");
+        }
+
         Ok(settings)
     }
 
