@@ -1,6 +1,6 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
-//! This module provides a StreamProcessor implementation for HTML content.
+//! This module provides a `StreamProcessor` implementation for HTML content.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
@@ -94,6 +94,7 @@ pub struct HtmlProcessorConfig {
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
+    #[must_use]
     pub fn from_settings(
         _settings: &Settings,
         integrations: &IntegrationRegistry,
@@ -111,6 +112,7 @@ impl HtmlProcessorConfig {
 }
 
 /// Create an HTML processor with URL replacement and optional Prebid injection
+#[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
@@ -470,10 +472,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::prebid::{tsjs_config_script_tag, Mode as PrebidMode};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             &registry,
@@ -598,59 +598,6 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
-    }
-
-    #[test]
-    fn injects_tsjs_config_when_mode_set() {
-        struct ModeInjector;
-
-        impl IntegrationHeadInjector for ModeInjector {
-            fn integration_id(&self) -> &'static str {
-                "mode-injector"
-            }
-
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![tsjs_config_script_tag(PrebidMode::Auction)]
-            }
-        }
-
-        let mut config = create_test_config();
-        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![Arc::new(ModeInjector)],
-        );
-        let processor = create_html_processor(config);
-
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let html = "<html><head></head><body></body></html>";
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let result = String::from_utf8(output).unwrap();
-
-        let config_pos = result.find("setConfig({mode:\"auction\"})");
-        let script_pos = result.find("trustedserver-js");
-        assert!(
-            config_pos.is_some(),
-            "should inject tsjs mode config when configured"
-        );
-        assert!(
-            script_pos.is_some(),
-            "should inject unified tsjs script when processing HTML"
-        );
-        // Config must come AFTER the bundle so tsjs.setConfig is defined when called
-        assert!(
-            config_pos.unwrap() > script_pos.unwrap(),
-            "should place tsjs config after the unified bundle (so tsjs.setConfig is available)"
-        );
     }
 
     #[test]
@@ -745,7 +692,7 @@ mod tests {
             )
             .expect("should insert testlight config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let mut config = create_test_config();
         config.integrations = registry;
 

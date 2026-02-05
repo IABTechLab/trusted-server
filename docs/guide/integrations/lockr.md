@@ -13,6 +13,7 @@ The Lockr integration enables first-party identity resolution and privacy-compli
 Lockr is an identity resolution and privacy platform that helps publishers manage user identities across fragmented environments (cookieless browsers, multiple devices, etc.) while respecting user privacy and consent.
 
 **Key Capabilities**:
+
 - Privacy-preserving identity graphs
 - Consent-based data sharing
 - Secure identity vault
@@ -49,12 +50,12 @@ project_id = "your-project-id"
 
 ### Configuration Options
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `enabled` | boolean | No | Enable/disable integration (default: `false`) |
-| `api_endpoint` | string | Yes | Lockr API endpoint URL |
-| `organization_id` | string | Yes | Your Lockr organization ID |
-| `project_id` | string | Yes | Your Lockr project ID |
+| Field             | Type    | Required | Description                                   |
+| ----------------- | ------- | -------- | --------------------------------------------- |
+| `enabled`         | boolean | No       | Enable/disable integration (default: `false`) |
+| `api_endpoint`    | string  | Yes      | Lockr API endpoint URL                        |
+| `organization_id` | string  | Yes      | Your Lockr organization ID                    |
+| `project_id`      | string  | Yes      | Your Lockr project ID                         |
 
 ### Environment Variables
 
@@ -79,6 +80,7 @@ Lockr integration automatically syncs Trusted Server synthetic IDs with Lockr's 
 ### Privacy Vault
 
 User data is stored securely in Lockr's privacy vault:
+
 - Encrypted at rest
 - Consent-based access
 - User right to erasure
@@ -141,16 +143,19 @@ The Lockr integration is implemented in [crates/common/src/integrations/lockr.rs
 ### Key Components
 
 **Identity Sync Endpoint**:
+
 - Route: `/integrations/lockr/sync`
 - Method: POST
 - Purpose: Synchronize synthetic ID with Lockr vault
 
 **ID Mapping**:
+
 - Maps Trusted Server synthetic ID → Lockr unified ID
 - Cached for performance
 - Respects consent status
 
 **Consent Validation**:
+
 - Checks GDPR consent before syncing
 - Integrates with CMP (e.g., Didomi)
 - Respects user withdrawal of consent
@@ -160,6 +165,7 @@ The Lockr integration is implemented in [crates/common/src/integrations/lockr.rs
 ### 1. Consent First
 
 Always validate consent before initiating Lockr sync:
+
 ```rust
 if !has_gdpr_consent() {
     return; // Skip Lockr sync
@@ -169,6 +175,7 @@ if !has_gdpr_consent() {
 ### 2. Cache Lockr IDs
 
 Cache Lockr identity mappings to reduce API calls:
+
 - TTL: 24 hours recommended
 - Invalidate on consent withdrawal
 - Use KV store for persistence
@@ -176,6 +183,7 @@ Cache Lockr identity mappings to reduce API calls:
 ### 3. Monitor Sync Rate
 
 Track Lockr sync success/failure rates:
+
 - Alert on elevated failures
 - Monitor API latency
 - Track consent decline impact
@@ -183,6 +191,7 @@ Track Lockr sync success/failure rates:
 ### 4. Test Identity Flow
 
 Validate end-to-end identity flow:
+
 ```bash
 # 1. Generate synthetic ID
 curl https://edge.example.com/
@@ -196,10 +205,12 @@ curl https://edge.example.com/
 ### Lockr Sync Fails
 
 **Symptoms**:
+
 - No Lockr ID in bid requests
 - Sync endpoint returns errors
 
 **Solutions**:
+
 - Verify `organization_id` and `project_id` are correct
 - Check Lockr API endpoint is reachable
 - Ensure GDPR consent is granted
@@ -208,9 +219,11 @@ curl https://edge.example.com/
 ### Missing EID in Bid Requests
 
 **Symptoms**:
+
 - Lockr sync succeeds but EID missing from OpenRTB
 
 **Solutions**:
+
 - Verify OpenRTB request builder includes `user.ext.eids`
 - Check integration is registered in IntegrationRegistry
 - Ensure `contribute_eids()` method is implemented
@@ -251,4 +264,4 @@ curl https://edge.example.com/
 - Learn about [Synthetic IDs](/guide/synthetic-ids) for identity generation
 - Review [GDPR Compliance](/guide/gdpr-compliance) for consent management
 - Explore [Didomi Integration](/guide/integrations/didomi) for CMP integration
-- Check [Configuration Reference](/guide/configuration-reference) for advanced options
+- Check [Configuration Reference](/guide/configuration) for advanced options

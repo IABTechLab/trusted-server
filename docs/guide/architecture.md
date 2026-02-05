@@ -6,28 +6,21 @@ Understanding the architecture of Trusted Server.
 
 Trusted Server is built as a Rust-based edge computing application that runs on Fastly Compute platform.
 
-```
-┌─────────────┐
-│   Browser   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────┐
-│  Trusted Server     │
-│  (Fastly Edge)      │
-│  ┌───────────────┐  │
-│  │ GDPR Check    │  │
-│  │ Synthetic IDs │  │
-│  │ Ad Serving    │  │
-│  └───────────────┘  │
-└──────┬──────────────┘
-       │
-       ▼
-┌─────────────────────┐
-│   Ad Servers        │
-│   KV Stores         │
-│   External APIs     │
-└─────────────────────┘
+```mermaid
+flowchart TD
+  browser["Browser"]
+  backends["Ad Servers / KV Stores / External APIs"]
+
+  subgraph edge["Trusted Server"]
+    direction TB
+    gdpr["GDPR Check"]
+    ids["Synthetic IDs"]
+    ads["Ad Serving"]
+    gdpr --> ids --> ads
+  end
+
+  browser --> edge
+  edge --> backends
 ```
 
 ## Core Components
@@ -35,6 +28,7 @@ Trusted Server is built as a Rust-based edge computing application that runs on 
 ### trusted-server-common
 
 Core library containing shared functionality:
+
 - Synthetic ID generation
 - Cookie handling
 - HTTP abstractions
@@ -44,6 +38,7 @@ Core library containing shared functionality:
 ### trusted-server-fastly
 
 Fastly-specific implementation:
+
 - Main application entry point
 - Fastly SDK integration
 - Request/response handling
@@ -86,6 +81,7 @@ All tracking operations require explicit GDPR consent checks before execution.
 ### Fastly KV Store
 
 Used for:
+
 - Counter storage
 - Domain mappings
 - Configuration cache
@@ -112,6 +108,7 @@ User data is not persisted in storage - only processed in-flight at the edge.
 ## WebAssembly Target
 
 Compiled to `wasm32-wasip1` for Fastly Compute:
+
 - Sandboxed execution
 - Fast cold starts
 - Efficient resource usage

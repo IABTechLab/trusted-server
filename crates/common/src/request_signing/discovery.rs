@@ -18,6 +18,7 @@ pub struct TrustedServerDiscovery {
 
 impl TrustedServerDiscovery {
     /// Creates a new discovery document with the given JWKS
+    #[must_use]
     pub fn new(jwks_value: serde_json::Value) -> Self {
         Self {
             version: "1.0".to_string(),

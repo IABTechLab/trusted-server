@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,7 +47,11 @@ fn main() {
                     .arg("install")
                     .current_dir(&ts_dir)
                     .status();
-                if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
+                if !status
+                    .as_ref()
+                    .map(std::process::ExitStatus::success)
+                    .unwrap_or(false)
+                {
                     error!("tsjs: npm install failed; using existing dist if available");
                 }
             }
@@ -60,7 +66,7 @@ fn main() {
             .status();
     }
 
-    // Build unified bundle (includes Prebid.js)
+    // Build unified bundle
     if !skip {
         if let Some(npm_path) = npm.clone() {
             info!("tsjs: Building unified bundle");
@@ -71,7 +77,11 @@ fn main() {
                 .args(["run", "build"])
                 .current_dir(&ts_dir)
                 .status();
-            if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
+            if !status
+                .as_ref()
+                .map(std::process::ExitStatus::success)
+                .unwrap_or(false)
+            {
                 panic!("tsjs: npm run build failed - refusing to use stale bundle");
             }
         }

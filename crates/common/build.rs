@@ -1,5 +1,10 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 #[path = "src/error.rs"]
 mod error;
+
+#[path = "src/auction_config_types.rs"]
+mod auction_config_types;
 
 #[path = "src/settings.rs"]
 mod settings;
@@ -26,7 +31,7 @@ fn rerun_if_changed() {
     let settings_json = serde_json::to_value(&default_settings).unwrap();
 
     let mut env_vars = HashSet::new();
-    collect_env_vars(&settings_json, &mut env_vars, vec![]);
+    collect_env_vars(&settings_json, &mut env_vars, &[]);
 
     // Print rerun-if-env-changed for each variable
     let mut sorted_vars: Vec<_> = env_vars.into_iter().collect();
@@ -57,10 +62,10 @@ fn merge_toml() {
     fs::write(dest_path, merged_toml).unwrap_or_else(|_| panic!("Failed to write {:?}", dest_path));
 }
 
-fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: Vec<String>) {
+fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: &[String]) {
     if let Value::Object(map) = value {
         for (key, val) in map {
-            let mut new_path = path.clone();
+            let mut new_path = path.to_owned();
             new_path.push(key.to_uppercase());
 
             match val {
@@ -76,7 +81,7 @@ fn collect_env_vars(value: &Value, env_vars: &mut HashSet<String>, path: Vec<Str
                 }
                 Value::Object(_) => {
                     // Recurse into nested objects
-                    collect_env_vars(val, env_vars, new_path);
+                    collect_env_vars(val, env_vars, &new_path);
                 }
                 _ => {}
             }

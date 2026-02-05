@@ -12,6 +12,28 @@ default-members = [
     "crates/fastly",
 ]
 
+[workspace.lints.clippy]
+# Correctness - Force explicit error handling in production code
+unwrap_used = "deny"
+expect_used = "allow"  # Allow expect with context message
+panic = "deny"
+
+# Style
+module_name_repetitions = "allow"
+must_use_candidate = "warn"
+
+# Pedantic (selective)
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+needless_pass_by_value = "warn"  # Encourage borrowing over ownership
+redundant_closure_for_method_calls = "warn"
+
+# Restriction (selective)
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+
 [profile.release]
 debug = 1
 

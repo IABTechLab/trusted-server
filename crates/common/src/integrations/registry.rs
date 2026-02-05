@@ -116,6 +116,12 @@ impl std::fmt::Debug for IntegrationDocumentState {
 }
 
 impl IntegrationDocumentState {
+    #[must_use]
+    /// Retrieves a value stored for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -130,6 +136,11 @@ impl IntegrationDocumentState {
         })
     }
 
+    /// Retrieves or initializes a value for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get_or_insert_with<T>(
         &self,
         integration_id: &'static str,
@@ -157,6 +168,11 @@ impl IntegrationDocumentState {
         value
     }
 
+    /// Clears all stored values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn clear(&self) {
         let mut guard = self
             .inner
@@ -170,52 +186,55 @@ impl IntegrationDocumentState {
 #[derive(Clone, Debug)]
 pub struct IntegrationEndpoint {
     pub method: Method,
-    pub path: &'static str,
+    pub path: String,
 }
 
 impl IntegrationEndpoint {
     #[must_use]
-    pub fn new(method: Method, path: &'static str) -> Self {
-        Self { method, path }
+    pub fn new(method: Method, path: impl Into<String>) -> Self {
+        Self {
+            method,
+            path: path.into(),
+        }
     }
 
     #[must_use]
-    pub fn get(path: &'static str) -> Self {
+    pub fn get(path: impl Into<String>) -> Self {
         Self {
             method: Method::GET,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn post(path: &'static str) -> Self {
+    pub fn post(path: impl Into<String>) -> Self {
         Self {
             method: Method::POST,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn put(path: &'static str) -> Self {
+    pub fn put(path: impl Into<String>) -> Self {
         Self {
             method: Method::PUT,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn delete(path: &'static str) -> Self {
+    pub fn delete(path: impl Into<String>) -> Self {
         Self {
             method: Method::DELETE,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn patch(path: &'static str) -> Self {
+    pub fn patch(path: impl Into<String>) -> Self {
         Self {
             method: Method::PATCH,
-            path,
+            path: path.into(),
         }
     }
 }
@@ -248,7 +267,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn get(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::get(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
@@ -260,7 +279,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn post(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::post(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
@@ -272,7 +291,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn put(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::put(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
@@ -280,11 +299,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.delete("/users")  // becomes /integrations/my_integration/users
+    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
     /// ```
     fn delete(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::delete(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
@@ -292,11 +311,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.patch("/users")  // becomes /integrations/my_integration/users
+    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
     /// ```
     fn patch(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::patch(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::patch(full_path)
     }
 }
 
@@ -505,7 +524,15 @@ pub struct IntegrationRegistry {
 
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
-    pub fn new(settings: &Settings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
@@ -516,9 +543,15 @@ impl IntegrationRegistry {
 
                         // Convert /* wildcard to matchit's {*rest} syntax
                         let matchit_path = if route.path.ends_with("/*") {
-                            format!("{}/{{*rest}}", route.path.strip_suffix("/*").unwrap())
+                            format!(
+                                "{}/{{*rest}}",
+                                route
+                                    .path
+                                    .strip_suffix("/*")
+                                    .expect("path should end with '/*'")
+                            )
                         } else {
-                            route.path.to_string()
+                            route.path.clone()
                         };
 
                         // Select appropriate router and insert
@@ -539,10 +572,12 @@ impl IntegrationRegistry {
                         };
 
                         if let Err(e) = router.insert(&matchit_path, value) {
-                            panic!(
-                                "Integration route registration failed for {} {}: {:?}",
-                                route.method, route.path, e
-                            );
+                            return Err(Report::new(TrustedServerError::Configuration {
+                                message: format!(
+                                    "Integration route registration failed for {} {}: {:?}",
+                                    route.method, route.path, e
+                                ),
+                            }));
                         }
 
                         inner.routes.push((route, registration.integration_id));
@@ -563,9 +598,9 @@ impl IntegrationRegistry {
             }
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
-        }
+        })
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -582,11 +617,13 @@ impl IntegrationRegistry {
     }
 
     /// Return true when any proxy is registered for the provided route.
+    #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
@@ -602,6 +639,7 @@ impl IntegrationRegistry {
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
+    #[must_use]
     pub fn rewrite_attribute(
         &self,
         attr_name: &str,
@@ -634,16 +672,19 @@ impl IntegrationRegistry {
     }
 
     /// Expose registered script/text rewriters for HTML processing.
+    #[must_use]
     pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
         self.inner.script_rewriters.clone()
     }
 
     /// Expose registered HTML post-processors.
+    #[must_use]
     pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
         self.inner.html_post_processors.clone()
     }
 
     /// Collect HTML snippets for insertion at the start of `<head>`.
+    #[must_use] 
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = Vec::new();
         for injector in &self.inner.head_injectors {
@@ -656,6 +697,7 @@ impl IntegrationRegistry {
     }
 
     /// Provide a snapshot of registered integrations and their hooks.
+    #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
@@ -663,9 +705,10 @@ impl IntegrationRegistry {
             let entry = map
                 .entry(*integration_id)
                 .or_insert_with(|| IntegrationMetadata::new(integration_id));
-            entry
-                .routes
-                .push(IntegrationEndpoint::new(route.method.clone(), route.path));
+            entry.routes.push(IntegrationEndpoint::new(
+                route.method.clone(),
+                route.path.clone(),
+            ));
         }
 
         for rewriter in &self.inner.html_rewriters {
@@ -686,6 +729,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -729,6 +773,12 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use]
+    /// Test helper to create a registry from routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if route registration fails due to duplicate or invalid paths.
     pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();
@@ -739,7 +789,10 @@ impl IntegrationRegistry {
         for (method, path, value) in routes {
             // Convert /* wildcard to matchit's {*rest} syntax
             let matchit_path = if path.ends_with("/*") {
-                format!("{}/{{*rest}}", path.strip_suffix("/*").unwrap())
+                format!(
+                    "{}/{{*rest}}",
+                    path.strip_suffix("/*").expect("path should end with '/*'")
+                )
             } else {
                 path.to_string()
             };
@@ -753,7 +806,9 @@ impl IntegrationRegistry {
                 _ => continue,
             };
 
-            router.insert(&matchit_path, value).unwrap();
+            router
+                .insert(&matchit_path, value)
+                .expect("route registration should succeed");
         }
 
         Self {

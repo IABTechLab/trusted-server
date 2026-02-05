@@ -33,10 +33,10 @@ rewrite_attributes = ["href", "link", "url"]
 
 ### Configuration Options
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | boolean | `false` | Enable Next.js integration |
-| `rewrite_attributes` | array | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
+| Field                | Type    | Default                   | Description                           |
+| -------------------- | ------- | ------------------------- | ------------------------------------- |
+| `enabled`            | boolean | `false`                   | Enable Next.js integration            |
+| `rewrite_attributes` | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
 
 ## How It Works
 
@@ -66,24 +66,24 @@ Next.js Pages Router embeds data in `__NEXT_DATA__` script:
 ```html
 <!-- Original -->
 <script id="__NEXT_DATA__">
-{
-  "props": {
-    "pageProps": {
-      "imageUrl": "https://cdn.example.com/image.png"
+  {
+    "props": {
+      "pageProps": {
+        "imageUrl": "https://cdn.example.com/image.png"
+      }
     }
   }
-}
 </script>
 
 <!-- After Next.js Integration -->
 <script id="__NEXT_DATA__">
-{
-  "props": {
-    "pageProps": {
-      "imageUrl": "/first-party/proxy?tsurl=https://cdn.example.com/image.png&tstoken=..."
+  {
+    "props": {
+      "pageProps": {
+        "imageUrl": "/first-party/proxy?tsurl=https://cdn.example.com/image.png&tstoken=..."
+      }
     }
   }
-}
 </script>
 ```
 
@@ -102,11 +102,13 @@ The Next.js integration is implemented across multiple files:
 Targets the Next.js data script for rewriting.
 
 **Attribute Rewriting**:
+
 - `href` - Link URLs
 - `link` - Preload/prefetch URLs
 - `url` - Image and asset URLs
 
 **RSC Stream Processing**:
+
 - Parses React Server Component streaming format
 - Rewrites URLs in streaming chunks
 - Preserves component structure
@@ -116,6 +118,7 @@ Targets the Next.js data script for rewriting.
 ### Next.js + Trusted Server
 
 Run your Next.js application behind Trusted Server for:
+
 - First-party asset loading
 - Synthetic ID injection
 - Privacy-compliant tracking
@@ -161,6 +164,7 @@ Verify React Server Components hydrate correctly:
 ### 4. Monitor Performance
 
 Next.js integration adds minimal overhead (<10ms), but monitor:
+
 - Time to First Byte (TTFB)
 - First Contentful Paint (FCP)
 - Largest Contentful Paint (LCP)
@@ -172,6 +176,7 @@ Next.js integration adds minimal overhead (<10ms), but monitor:
 **Symptoms**: React hydration errors in browser console
 
 **Solutions**:
+
 - Ensure rewrite attributes match your Next.js data structure
 - Check URLs are properly signed
 - Verify origin URLs are accessible
@@ -181,6 +186,7 @@ Next.js integration adds minimal overhead (<10ms), but monitor:
 **Symptoms**: Next.js `<Image>` components show broken images
 
 **Solutions**:
+
 - Verify `_next/image` URLs are proxied
 - Check image domains are allowed
 - Ensure proxy signatures are valid
@@ -190,6 +196,7 @@ Next.js integration adds minimal overhead (<10ms), but monitor:
 **Symptoms**: Next.js API routes return 404/500
 
 **Solutions**:
+
 - Check `/api/*` routes are not being over-proxied
 - Verify Next.js origin URL is correct
 - Review proxy exclusion rules

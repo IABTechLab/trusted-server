@@ -5,7 +5,7 @@ use fastly::{Body, Request, Response};
 use crate::backend::ensure_backend_from_url;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{HEADER_SYNTHETIC_TRUSTED_SERVER, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -17,10 +17,13 @@ use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 /// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
-pub fn handle_tsjs_dynamic(
-    _settings: &Settings,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+///
+/// Returns 404 for invalid paths or missing bundle files; otherwise serves the requested bundle.
+///
+/// # Errors
+///
+/// This function never returns an error; the Result type is for API consistency.
+pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
@@ -34,7 +37,7 @@ pub fn handle_tsjs_dynamic(
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     };
 
-    let mut resp = serve_static_with_etag(body, &req, "application/javascript; charset=utf-8");
+    let mut resp = serve_static_with_etag(body, req, "application/javascript; charset=utf-8");
     resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
@@ -54,7 +57,7 @@ struct ProcessResponseParams<'a> {
 /// Process response body in streaming fashion with compression preservation
 fn process_response_streaming(
     body: Body,
-    params: ProcessResponseParams,
+    params: &ProcessResponseParams,
 ) -> Result<Body, Report<TrustedServerError>> {
     // Check if this is HTML content
     let is_html = params.content_type.contains("text/html");
@@ -199,9 +202,11 @@ pub fn handle_publisher_request(
         .get_header(header::COOKIE)
         .and_then(|h| h.to_str().ok())
         .map(|cookies| {
-            cookies
-                .split(';')
-                .any(|cookie| cookie.trim_start().starts_with("synthetic_id="))
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim_start()
+                    .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            })
         })
         .unwrap_or(false);
 
@@ -275,7 +280,7 @@ pub fn handle_publisher_request(
             content_type: &content_type,
             integration_registry,
         };
-        match process_response_streaming(body, params) {
+        match process_response_streaming(body, &params) {
             Ok(processed_body) => {
                 // Set the processed body back
                 response.set_body(processed_body);
@@ -305,7 +310,7 @@ pub fn handle_publisher_request(
         );
     }
 
-    response.set_header(HEADER_SYNTHETIC_TRUSTED_SERVER, synthetic_id.as_str());
+    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     if !has_synthetic_cookie {
         response.set_header(
             header::SET_COOKIE,

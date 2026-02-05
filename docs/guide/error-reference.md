@@ -17,6 +17,7 @@ Common errors, their causes, and solutions when working with Trusted Server.
 ### Failed to load settings
 
 **Error Message:**
+
 ```
 Failed to load settings: ParseError
 ```
@@ -24,12 +25,14 @@ Failed to load settings: ParseError
 **Cause:** Invalid TOML syntax in `trusted-server.toml`
 
 **Solution:**
+
 1. Validate TOML syntax using an online validator
 2. Check for missing quotes around strings
 3. Ensure array syntax uses square brackets: `["item1", "item2"]`
 4. Verify section headers use brackets: `[section]`
 
 **Example Fix:**
+
 ```toml
 # ❌ Wrong
 [publisher]
@@ -45,6 +48,7 @@ domain = "test-publisher.com"
 ### Missing required configuration
 
 **Error Message:**
+
 ```
 Missing required field: publisher.domain
 ```
@@ -61,6 +65,7 @@ proxy_secret = "change-me-to-random-string"
 ```
 
 **Required Fields:**
+
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
@@ -71,6 +76,7 @@ proxy_secret = "change-me-to-random-string"
 ### Invalid URL format
 
 **Error Message:**
+
 ```
 Invalid URL in integrations.prebid.server_url
 ```
@@ -94,6 +100,7 @@ server_url = "https://prebid-server.example.com"
 ### Environment variable override failed
 
 **Error Message:**
+
 ```
 Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 ```
@@ -116,7 +123,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon"
 ```
 
-See [Environment Variables Reference](./environment-variables.md) for complete patterns.
+See [Configuration Reference](./configuration.md) for complete patterns.
 
 ---
 
@@ -125,6 +132,7 @@ See [Environment Variables Reference](./environment-variables.md) for complete p
 ### Synthetic ID generation failed
 
 **Error Message:**
+
 ```
 Failed to generate synthetic ID: KV store not available
 ```
@@ -132,6 +140,7 @@ Failed to generate synthetic ID: KV store not available
 **Cause:** KV store (counter_store or opid_store) not configured in Fastly
 
 **Solution:**
+
 1. Create KV stores in Fastly dashboard
 2. Link them to your Compute service
 3. Update `trusted-server.toml`:
@@ -156,6 +165,7 @@ opid_store = "opid_store"
 ### Backend not found
 
 **Error Message:**
+
 ```
 Backend not found: prebid-server
 ```
@@ -165,11 +175,13 @@ Backend not found: prebid-server
 **Solution:**
 
 For integrations using dynamic backends (Prebid, Testlight):
+
 - Ensure the integration is enabled
 - Verify the URL is accessible from Fastly edge
 - Check Fastly service limits (backend count)
 
 For static backends, configure in Fastly dashboard:
+
 1. Go to Origins → Hosts
 2. Add backend with name matching configuration
 3. Redeploy service
@@ -179,6 +191,7 @@ For static backends, configure in Fastly dashboard:
 ### Token validation failed
 
 **Error Message:**
+
 ```
 Invalid tstoken signature
 ```
@@ -186,12 +199,14 @@ Invalid tstoken signature
 **Cause:** URL was modified after signing, or proxy_secret mismatch
 
 **Solution:**
+
 1. Verify `publisher.proxy_secret` matches across environments
 2. Don't manually modify signed URLs
 3. Use `/first-party/sign` endpoint to generate new signatures
 4. Check for URL encoding issues
 
 **Debug:**
+
 ```bash
 # Test URL signing
 curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
@@ -202,6 +217,7 @@ curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.g
 ### Request timeout
 
 **Error Message:**
+
 ```
 Upstream request timeout after 1000ms
 ```
@@ -209,6 +225,7 @@ Upstream request timeout after 1000ms
 **Cause:** Upstream service (Prebid Server, Permutive, etc.) didn't respond in time
 
 **Solution:**
+
 1. Increase timeout in configuration:
 
 ```toml
@@ -217,6 +234,7 @@ timeout_ms = 2000  # Increase from default 1000ms
 ```
 
 2. Verify upstream service is responsive:
+
 ```bash
 curl -w "%{time_total}\n" https://upstream-service.example.com
 ```
@@ -228,6 +246,7 @@ curl -w "%{time_total}\n" https://upstream-service.example.com
 ### Cookie domain mismatch
 
 **Error Message:**
+
 ```
 Warning: Cookie not set due to domain mismatch
 ```
@@ -235,6 +254,7 @@ Warning: Cookie not set due to domain mismatch
 **Cause:** `publisher.cookie_domain` doesn't match request domain
 
 **Solution:**
+
 ```toml
 [publisher]
 domain = "example.com"
@@ -242,6 +262,7 @@ cookie_domain = ".example.com"  # Leading dot for subdomains
 ```
 
 **Rules:**
+
 - Use leading dot (`.example.com`) to cover subdomains
 - Cookie domain must be parent of request domain
 - Don't include protocol or port
@@ -253,6 +274,7 @@ cookie_domain = ".example.com"  # Leading dot for subdomains
 ### Prebid Server error
 
 **Error Message:**
+
 ```
 Prebid Server returned 400: Invalid OpenRTB request
 ```
@@ -260,7 +282,9 @@ Prebid Server returned 400: Invalid OpenRTB request
 **Cause:** OpenRTB transformation produced invalid request
 
 **Solution:**
+
 1. Enable debug mode:
+
 ```toml
 [integrations.prebid]
 debug = true
@@ -286,6 +310,7 @@ debug = true
 ### Next.js rewriting not working
 
 **Error Message:**
+
 ```
 Next.js links still pointing to origin domain
 ```
@@ -293,6 +318,7 @@ Next.js links still pointing to origin domain
 **Cause:** Rewrite attributes don't match JSON keys in Next.js data
 
 **Solution:**
+
 1. Inspect Next.js data payload in `<script id="__NEXT_DATA__">`
 2. Update `rewrite_attributes` to match actual keys:
 
@@ -309,6 +335,7 @@ rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
 ### Permutive SDK not loading
 
 **Error Message:**
+
 ```
 Failed to fetch Permutive SDK: 404 Not Found
 ```
@@ -316,12 +343,14 @@ Failed to fetch Permutive SDK: 404 Not Found
 **Cause:** Incorrect organization_id or workspace_id
 
 **Solution:**
+
 1. Verify IDs in your Permutive dashboard URL:
    - `https://myorg.edge.permutive.app/workspace-123-web.js`
    - org: `myorg`
    - workspace: `workspace-123`
 
 2. Update configuration:
+
 ```toml
 [integrations.permutive]
 organization_id = "myorg"
@@ -329,6 +358,7 @@ workspace_id = "workspace-123"
 ```
 
 3. Test SDK URL directly:
+
 ```bash
 curl https://myorg.edge.permutive.app/workspace-123-web.js
 ```
@@ -338,6 +368,7 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 ### Integration not proxying requests
 
 **Error Message:**
+
 ```
 No route matched for /integrations/custom/endpoint
 ```
@@ -345,7 +376,9 @@ No route matched for /integrations/custom/endpoint
 **Cause:** Integration not enabled or route not registered
 
 **Solution:**
+
 1. Enable integration:
+
 ```toml
 [integrations.custom]
 enabled = true
@@ -361,6 +394,7 @@ enabled = true
 ### Key not found
 
 **Error Message:**
+
 ```
 Signing key not found: ts-2025-01-A
 ```
@@ -368,6 +402,7 @@ Signing key not found: ts-2025-01-A
 **Cause:** Key ID referenced but not present in Secret Store
 
 **Solution:**
+
 1. Check Config Store `current-kid` value
 2. Verify corresponding key exists in Secret Store
 3. Run key rotation to generate new key:
@@ -382,6 +417,7 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 ### JWKS endpoint empty
 
 **Error Message:**
+
 ```
 {
   "keys": []
@@ -391,7 +427,9 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 **Cause:** No active keys in system
 
 **Solution:**
+
 1. Initialize keys using rotation endpoint:
+
 ```bash
 curl -X POST https://edge.example.com/admin/keys/rotate \
   -u admin:password
@@ -405,6 +443,7 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 ### Signature verification failed
 
 **Error Message:**
+
 ```
 {
   "verified": false,
@@ -415,18 +454,21 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 **Causes & Solutions:**
 
 **Wrong payload encoding:**
+
 ```bash
 # Ensure base64 encoding (not base64url)
 echo -n "Hello World" | base64
 ```
 
 **Wrong key ID:**
+
 ```bash
 # Check current key ID
-curl https://edge.example.com/.well-known/ts.jwks.json | jq '.keys[].kid'
+curl https://edge.example.com/.well-known/trusted-server.json | jq '.jwks.keys[].kid'
 ```
 
 **Signature from wrong key:**
+
 - Verify you're using the current signing key
 - Check key hasn't been rotated/deactivated
 
@@ -435,6 +477,7 @@ curl https://edge.example.com/.well-known/ts.jwks.json | jq '.keys[].kid'
 ### Config/Secret Store not found
 
 **Error Message:**
+
 ```
 Config store not found: jwks_store
 ```
@@ -442,6 +485,7 @@ Config store not found: jwks_store
 **Cause:** Store not created or not linked to Compute service
 
 **Solution:**
+
 1. Create stores in Fastly dashboard:
    - Settings → Config Stores → Create
    - Settings → Secret Stores → Create
@@ -451,6 +495,7 @@ Config store not found: jwks_store
    - Add store with exact name from configuration
 
 3. Update `trusted-server.toml`:
+
 ```toml
 [request_signing]
 enabled = true
@@ -465,6 +510,7 @@ secret_store_id = "your-secret-store-id"
 ### WASM compilation failed
 
 **Error Message:**
+
 ```
 error: could not compile `trusted-server-fastly`
 ```
@@ -472,17 +518,21 @@ error: could not compile `trusted-server-fastly`
 **Cause:** Rust compilation error or missing dependencies
 
 **Solution:**
+
 1. Update Rust toolchain:
+
 ```bash
 rustup update
 ```
 
 2. Install wasm32-wasip1 target:
+
 ```bash
 rustup target add wasm32-wasip1
 ```
 
 3. Clean and rebuild:
+
 ```bash
 cargo clean
 cargo build --target wasm32-wasip1 --release
@@ -493,6 +543,7 @@ cargo build --target wasm32-wasip1 --release
 ### Fastly CLI deployment failed
 
 **Error Message:**
+
 ```
 Error: Service version activation failed
 ```
@@ -500,12 +551,14 @@ Error: Service version activation failed
 **Causes & Solutions:**
 
 **Missing service ID:**
+
 ```toml
 # Add to fastly.toml
 service_id = "YOUR_SERVICE_ID"  # From Fastly dashboard
 ```
 
 **Missing API token:**
+
 ```bash
 # Authenticate Fastly CLI
 fastly profile create
@@ -513,6 +566,7 @@ fastly profile create
 ```
 
 **Service validation errors:**
+
 - Check Fastly dashboard for validation messages
 - Verify all required backends are configured
 - Ensure KV/Config/Secret stores are linked
@@ -522,6 +576,7 @@ fastly profile create
 ### TSJS build failed
 
 **Error Message:**
+
 ```
 ERROR: npm run build:custom failed
 ```
@@ -529,23 +584,28 @@ ERROR: npm run build:custom failed
 **Cause:** Node.js dependency or build issue
 
 **Solution:**
+
 1. Install Node.js dependencies:
+
 ```bash
 cd crates/js/lib
 npm install
 ```
 
 2. Test build manually:
+
 ```bash
 npm run build
 ```
 
 3. Check for TypeScript errors:
+
 ```bash
 npm run type-check
 ```
 
 4. Skip TSJS build temporarily:
+
 ```bash
 TSJS_SKIP_BUILD=1 cargo build
 ```
@@ -555,6 +615,7 @@ TSJS_SKIP_BUILD=1 cargo build
 ### Version mismatch error
 
 **Error Message:**
+
 ```
 Warning: viceroy version mismatch
 ```
@@ -562,6 +623,7 @@ Warning: viceroy version mismatch
 **Cause:** Local test runtime (viceroy) out of date
 
 **Solution:**
+
 ```bash
 cargo install viceroy --force
 ```
@@ -573,6 +635,7 @@ cargo install viceroy --force
 ### Enable Debug Logging
 
 **In configuration:**
+
 ```toml
 [integrations.prebid]
 debug = true
@@ -582,6 +645,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true
 ```
 
 **Check Fastly logs:**
+
 ```bash
 fastly log-tail
 ```
@@ -635,6 +699,7 @@ If you encounter an error not listed here:
 5. **Open an issue** - Provide error message, configuration, and steps to reproduce
 
 **Useful Information to Include:**
+
 - Complete error message
 - Relevant configuration (redact secrets)
 - Rust version (`cargo --version`)
@@ -645,21 +710,21 @@ If you encounter an error not listed here:
 
 ## Common HTTP Status Codes
 
-| Code | Meaning | Common Causes | Quick Fix |
-|------|---------|---------------|-----------|
-| **400** | Bad Request | Missing parameters, invalid JSON | Check request format |
-| **401** | Unauthorized | Missing/invalid auth | Check credentials |
-| **403** | Forbidden | Invalid token, disabled feature | Verify token/config |
-| **404** | Not Found | Unknown endpoint | Check URL path |
-| **500** | Internal Error | Configuration error, bug | Check logs |
-| **502** | Bad Gateway | Backend unavailable | Verify backend |
-| **504** | Gateway Timeout | Backend slow | Increase timeout |
+| Code    | Meaning         | Common Causes                    | Quick Fix            |
+| ------- | --------------- | -------------------------------- | -------------------- |
+| **400** | Bad Request     | Missing parameters, invalid JSON | Check request format |
+| **401** | Unauthorized    | Missing/invalid auth             | Check credentials    |
+| **403** | Forbidden       | Invalid token, disabled feature  | Verify token/config  |
+| **404** | Not Found       | Unknown endpoint                 | Check URL path       |
+| **500** | Internal Error  | Configuration error, bug         | Check logs           |
+| **502** | Bad Gateway     | Backend unavailable              | Verify backend       |
+| **504** | Gateway Timeout | Backend slow                     | Increase timeout     |
 
 ---
 
 ## Next Steps
 
-- Review [Configuration Reference](./configuration-reference.md)
-- Check [Environment Variables](./environment-variables.md)
+- Review [Configuration Reference](./configuration.md)
+- Check [Configuration Reference](./configuration.md)
 - Explore [API Reference](./api-reference.md)
 - Learn about [Testing](./testing.md)

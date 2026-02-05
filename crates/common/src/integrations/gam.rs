@@ -54,6 +54,7 @@ impl IntegrationConfig for GamIntegrationConfig {
 
 /// Generate the JavaScript config script tag for GAM integration.
 /// Sets window.tsGamConfig which is picked up by the GAM integration on init.
+#[must_use] 
 pub fn gam_config_script_tag(config: &GamIntegrationConfig) -> String {
     let bidders_json = if config.bidders.is_empty() {
         "[]".to_string()
@@ -80,6 +81,7 @@ pub struct GamIntegration {
 }
 
 impl GamIntegration {
+    #[must_use] 
     pub fn new(config: GamIntegrationConfig) -> Self {
         Self { config }
     }
@@ -96,6 +98,7 @@ impl IntegrationHeadInjector for GamIntegration {
 }
 
 /// Register the GAM integration if enabled.
+#[must_use] 
 pub fn register(settings: &crate::settings::Settings) -> Option<IntegrationRegistration> {
     use std::sync::Arc;
 
