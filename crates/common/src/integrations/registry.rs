@@ -376,6 +376,14 @@ pub trait IntegrationHtmlPostProcessor: Send + Sync {
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
 }
 
+/// Trait for integration-provided HTML head injections.
+pub trait IntegrationHeadInjector: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+    /// Return HTML snippets to insert at the start of `<head>`.
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
@@ -383,6 +391,7 @@ pub struct IntegrationRegistration {
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
 }
 
 impl IntegrationRegistration {
@@ -405,6 +414,7 @@ impl IntegrationRegistrationBuilder {
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
             },
         }
     }
@@ -440,6 +450,12 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
+    pub fn with_head_injector(mut self, injector: Arc<dyn IntegrationHeadInjector>) -> Self {
+        self.registration.head_injectors.push(injector);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
@@ -460,6 +476,7 @@ struct IntegrationRegistryInner {
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -474,6 +491,7 @@ impl Default for IntegrationRegistryInner {
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
+            head_injectors: Vec::new(),
         }
     }
 }
@@ -574,6 +592,9 @@ impl IntegrationRegistry {
                 inner
                     .html_post_processors
                     .extend(registration.html_post_processors.into_iter());
+                inner
+                    .head_injectors
+                    .extend(registration.head_injectors.into_iter());
             }
         }
 
@@ -662,6 +683,19 @@ impl IntegrationRegistry {
         self.inner.html_post_processors.clone()
     }
 
+    /// Collect HTML snippets for insertion at the start of `<head>`.
+    #[must_use]
+    pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        let mut inserts = Vec::new();
+        for injector in &self.inner.head_injectors {
+            let mut next = injector.head_inserts(ctx);
+            if !next.is_empty() {
+                inserts.append(&mut next);
+            }
+        }
+        inserts
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
@@ -711,6 +745,29 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_rewriters_with_head_injectors(
+        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
+        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+        head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
+                routes: Vec::new(),
+                html_rewriters: attribute_rewriters,
+                script_rewriters,
+                html_post_processors: Vec::new(),
+                head_injectors,
             }),
         }
     }
@@ -765,6 +822,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
             }),
         }
     }
