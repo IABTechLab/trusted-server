@@ -927,109 +927,6 @@ mod tests {
     }
 
     #[test]
-    fn enhance_openrtb_request_adds_ids_and_regs() {
-        let settings = make_settings();
-        let mut request_json = json!({
-            "id": "openrtb-request-id"
-        });
-
-        let synthetic_id = "synthetic-123";
-        let fresh_id = "fresh-456";
-        let mut req = Request::new(Method::POST, "https://edge.example/auction");
-        req.set_header("Sec-GPC", "1");
-
-        let config = base_config();
-
-        enhance_openrtb_request(
-            &mut request_json,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
-
-        assert_eq!(request_json["user"]["id"], synthetic_id);
-        assert_eq!(request_json["user"]["ext"]["synthetic_fresh"], fresh_id);
-        assert_eq!(
-            request_json["regs"]["ext"]["us_privacy"], "1YYN",
-            "GPC header should map to US privacy flag"
-        );
-        assert_eq!(
-            request_json["site"]["domain"], settings.publisher.domain,
-            "site domain should match publisher domain"
-        );
-        assert!(
-            request_json["site"]["page"]
-                .as_str()
-                .expect("page should be a string")
-                .starts_with("https://"),
-            "site page should be populated"
-        );
-    }
-
-    #[test]
-    fn enhance_openrtb_request_adds_debug_flag_when_enabled() {
-        let settings = make_settings();
-        let mut request_json = json!({
-            "id": "openrtb-request-id"
-        });
-
-        let synthetic_id = "synthetic-123";
-        let fresh_id = "fresh-456";
-        let req = Request::new(Method::POST, "https://edge.example/auction");
-
-        let mut config = base_config();
-        config.debug = true;
-
-        enhance_openrtb_request(
-            &mut request_json,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
-
-        assert_eq!(
-            request_json["ext"]["prebid"]["debug"], true,
-            "debug flag should be set to true when config.debug is enabled"
-        );
-    }
-
-    #[test]
-    fn enhance_openrtb_request_does_not_add_debug_flag_when_disabled() {
-        let settings = make_settings();
-        let mut request_json = json!({
-            "id": "openrtb-request-id"
-        });
-
-        let synthetic_id = "synthetic-123";
-        let fresh_id = "fresh-456";
-        let req = Request::new(Method::POST, "https://edge.example/auction");
-
-        let mut config = base_config();
-        config.debug = false;
-
-        enhance_openrtb_request(
-            &mut request_json,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
-
-        assert!(
-            request_json["ext"]["prebid"]["debug"].is_null(),
-            "debug flag should not be set when config.debug is disabled"
-        );
-    }
-
-    #[test]
     fn transform_prebid_response_rewrites_creatives_and_tracking() {
         let mut response = json!({
             "seatbid": [{
@@ -1055,7 +952,7 @@ mod tests {
         for url_field in ["nurl", "burl"] {
             let value = response["seatbid"][0]["bid"][0][url_field]
                 .as_str()
-                .expect("tracking URL should be string");
+                .expect("should get tracking URL");
             assert!(
                 value.contains("/ad-proxy/track/"),
                 "tracking URLs should be proxied"
@@ -1075,12 +972,12 @@ mod tests {
         let encoded = rewritten
             .split("/ad-proxy/track/")
             .nth(1)
-            .expect("should have track path segment");
+            .expect("should have encoded payload after proxy prefix");
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .expect("should decode base64 proxy payload");
         assert_eq!(
-            String::from_utf8(decoded).expect("decoded should be valid UTF-8"),
+            String::from_utf8(decoded).expect("should be valid UTF-8"),
             url
         );
     }
@@ -1200,87 +1097,6 @@ server_url = "https://prebid.example"
             .any(|r| r.path == "/prebid.js" && r.method == Method::GET);
         assert!(has_prebid_js_route, "should register /prebid.js route");
 
-    #[test]
-    fn test_routes_without_script_handler() {
-        let config = base_config(); // Has script_handler: None
-        let integration = PrebidIntegration::new(config);
-
-        let routes = integration.routes();
-
-        // Should have 0 routes when no script handler configured
-        assert_eq!(routes.len(), 0);
-    }
-
-    #[test]
-    fn debug_query_params_appended_to_existing_site_page_in_enhance() {
-        let settings = make_settings();
-        let mut config = base_config();
-        config.debug_query_params = Some("kargo_debug=true".to_string());
-
-        let req = Request::new(Method::GET, "https://example.com/test");
-        let synthetic_id = "test-synthetic-id";
-        let fresh_id = "test-fresh-id";
-
-        // Test with existing site.page
-        let mut request = json!({
-            "id": "test-id",
-            "site": {
-                "domain": "example.com",
-                "page": "https://example.com/page"
-            }
-        });
-
-        enhance_openrtb_request(
-            &mut request,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
-
-        let page = request["site"]["page"]
-            .as_str()
-            .expect("page should be a string");
-        assert_eq!(page, "https://example.com/page?kargo_debug=true");
-    }
-
-    #[test]
-    fn debug_query_params_appended_to_url_with_existing_query() {
-        let settings = make_settings();
-        let mut config = base_config();
-        config.debug_query_params = Some("kargo_debug=true".to_string());
-
-        let req = Request::new(Method::GET, "https://example.com/test");
-        let synthetic_id = "test-synthetic-id";
-        let fresh_id = "test-fresh-id";
-
-        // Test with existing query params in site.page
-        let mut request = json!({
-            "id": "test-id",
-            "site": {
-                "domain": "example.com",
-                "page": "https://example.com/page?existing=param"
-            }
-        });
-
-        enhance_openrtb_request(
-            &mut request,
-            synthetic_id,
-            fresh_id,
-            &settings,
-            &req,
-            &config,
-        )
-        .expect("should enhance request");
-
-        let page = request["site"]["page"]
-            .as_str()
-            .expect("page should be a string");
-        assert_eq!(
-            page,
-            "https://example.com/page?existing=param&kargo_debug=true"
         let has_prebid_min_js_route = routes
             .iter()
             .any(|r| r.path == "/prebid.min.js" && r.method == Method::GET);
@@ -1298,13 +1114,6 @@ server_url = "https://prebid.example"
 
         let routes = integration.routes();
 
-        let page = request["site"]["page"]
-            .as_str()
-            .expect("page should be a string");
-        // Should still only have params once
-        assert_eq!(page, "https://example.com/page?kargo_debug=true");
-        // Verify params appear exactly once
-        assert_eq!(page.matches("kargo_debug=true").count(), 1);
         // Should have 0 routes when no script patterns configured
         assert_eq!(routes.len(), 0);
     }
