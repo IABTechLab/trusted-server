@@ -261,7 +261,7 @@ mod tests {
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let url = integration
             .build_target_url("https://sdk.privacy-center.org", "/loader.js", Some("v=1"))
-            .unwrap();
+            .expect("should build target URL");
         assert_eq!(url, "https://sdk.privacy-center.org/loader.js?v=1");
     }
 

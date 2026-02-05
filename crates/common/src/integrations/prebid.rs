@@ -1291,7 +1291,7 @@ mod tests {
         assert!(
             request_json["site"]["page"]
                 .as_str()
-                .unwrap()
+                .expect("page should be a string")
                 .starts_with("https://"),
             "site page should be populated"
         );
@@ -1383,7 +1383,7 @@ mod tests {
         for url_field in ["nurl", "burl"] {
             let value = response["seatbid"][0]["bid"][0][url_field]
                 .as_str()
-                .unwrap();
+                .expect("tracking URL should be string");
             assert!(
                 value.contains("/ad-proxy/track/"),
                 "tracking URLs should be proxied"
@@ -1400,11 +1400,17 @@ mod tests {
             "proxy prefix should be applied"
         );
 
-        let encoded = rewritten.split("/ad-proxy/track/").nth(1).unwrap();
+        let encoded = rewritten
+            .split("/ad-proxy/track/")
+            .nth(1)
+            .expect("should have track path segment");
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .expect("should decode base64 proxy payload");
-        assert_eq!(String::from_utf8(decoded).unwrap(), url);
+        assert_eq!(
+            String::from_utf8(decoded).expect("decoded should be valid UTF-8"),
+            url
+        );
     }
 
     #[test]
@@ -1575,7 +1581,9 @@ server_url = "https://prebid.example"
         )
         .expect("should enhance request");
 
-        let page = request["site"]["page"].as_str().unwrap();
+        let page = request["site"]["page"]
+            .as_str()
+            .expect("page should be a string");
         assert_eq!(page, "https://example.com/page?kargo_debug=true");
     }
 
@@ -1608,7 +1616,9 @@ server_url = "https://prebid.example"
         )
         .expect("should enhance request");
 
-        let page = request["site"]["page"].as_str().unwrap();
+        let page = request["site"]["page"]
+            .as_str()
+            .expect("page should be a string");
         assert_eq!(
             page,
             "https://example.com/page?existing=param&kargo_debug=true"
@@ -1645,7 +1655,9 @@ server_url = "https://prebid.example"
         )
         .expect("should enhance request");
 
-        let page = request["site"]["page"].as_str().unwrap();
+        let page = request["site"]["page"]
+            .as_str()
+            .expect("page should be a string");
         // Should still only have params once
         assert_eq!(page, "https://example.com/page?kargo_debug=true");
         // Verify params appear exactly once
