@@ -4,12 +4,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use error_stack::Report;
-use fastly::http::Method;
+use fastly::http::{header, Method};
 use fastly::{Request, Response};
 use matchit::Router;
 
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_SYNTHETIC_ID};
+use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,6 +605,9 @@ impl IntegrationRegistry {
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    ///
+    /// This method automatically sets the `x-synthetic-id` header and
+    /// `synthetic_id` cookie on successful responses.
     #[must_use]
     pub async fn handle_proxy(
         &self,
@@ -611,7 +617,35 @@ impl IntegrationRegistry {
         req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
-            Some(proxy.handle(settings, req).await)
+            // Generate synthetic ID before consuming request
+            let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
+            let has_synthetic_cookie = req
+                .get_header(header::COOKIE)
+                .and_then(|h| h.to_str().ok())
+                .map(|cookies| {
+                    cookies.split(';').any(|cookie| {
+                        cookie
+                            .trim_start()
+                            .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+                    })
+                })
+                .unwrap_or(false);
+
+            let mut result = proxy.handle(settings, req).await;
+
+            // Set synthetic ID header on successful responses
+            if let Ok(ref mut response) = result {
+                if let Ok(ref synthetic_id) = synthetic_id_result {
+                    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                    if !has_synthetic_cookie {
+                        response.set_header(
+                            header::SET_COOKIE,
+                            create_synthetic_cookie(settings, synthetic_id.as_str()),
+                        );
+                    }
+                }
+            }
+            Some(result)
         } else {
             None
         }
@@ -1041,5 +1075,213 @@ mod tests {
         // Should not match other methods on same path
         assert!(!registry.has_route(&Method::GET, "/integrations/test/users"));
         assert!(!registry.has_route(&Method::POST, "/integrations/test/users"));
+    }
+
+    // Tests for synthetic ID header on proxy responses
+
+    #[test]
+    fn cookie_detection_finds_synthetic_id() {
+        let cookies = "other=value; synthetic_id=abc123; more=stuff";
+        let has_cookie = cookies.split(';').any(|cookie| {
+            cookie
+                .trim_start()
+                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+        });
+        assert!(has_cookie, "Should detect synthetic_id cookie");
+    }
+
+    #[test]
+    fn cookie_detection_handles_missing_cookie() {
+        let cookies = "other=value; session=xyz";
+        let has_cookie = cookies.split(';').any(|cookie| {
+            cookie
+                .trim_start()
+                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+        });
+        assert!(!has_cookie, "Should not find synthetic_id when missing");
+    }
+
+    #[test]
+    fn cookie_detection_handles_empty_cookies() {
+        let cookies = "";
+        let has_cookie = cookies.split(';').any(|cookie| {
+            cookie
+                .trim_start()
+                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+        });
+        assert!(!has_cookie, "Should handle empty cookie string");
+    }
+
+    // Async tests for handle_proxy synthetic ID functionality
+
+    use crate::test_support::tests::create_test_settings;
+
+    /// Mock proxy that returns a simple 200 OK response
+    struct SyntheticIdTestProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for SyntheticIdTestProxy {
+        fn integration_name(&self) -> &'static str {
+            "synthetic_id_test"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![
+                IntegrationEndpoint {
+                    method: Method::GET,
+                    path: "/integrations/test/synthetic".to_string(),
+                },
+                IntegrationEndpoint {
+                    method: Method::POST,
+                    path: "/integrations/test/synthetic".to_string(),
+                },
+            ]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _req: Request,
+        ) -> Result<Response, Report<TrustedServerError>> {
+            // Return a simple response without the synthetic ID header.
+            // The registry's handle_proxy should add it.
+            Ok(Response::from_status(fastly::http::StatusCode::OK).with_body("test response"))
+        }
+    }
+
+    #[test]
+    fn handle_proxy_sets_synthetic_id_header_on_response() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Create a request without a synthetic ID cookie
+        let req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+
+        // Call handle_proxy (uses futures executor in test environment)
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ));
+
+        // Should have matched and returned a response
+        assert!(result.is_some(), "Should find route and handle request");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "Handler should succeed");
+
+        let response = response.unwrap();
+
+        // Verify x-synthetic-id header is present
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "Response should have x-synthetic-id header"
+        );
+
+        // Verify Set-Cookie header is present (since no cookie was in request)
+        let set_cookie = response.get_header(header::SET_COOKIE);
+        assert!(
+            set_cookie.is_some(),
+            "Response should have Set-Cookie header for synthetic_id"
+        );
+
+        let cookie_value = set_cookie.unwrap().to_str().unwrap();
+        assert!(
+            cookie_value.contains(COOKIE_SYNTHETIC_ID),
+            "Set-Cookie should contain synthetic_id cookie, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn handle_proxy_skips_cookie_when_already_present() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Create a request WITH an existing synthetic_id cookie
+        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+        req.set_header(header::COOKIE, "synthetic_id=existing_id_12345");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ));
+
+        assert!(result.is_some(), "Should find route");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "Handler should succeed");
+
+        let response = response.unwrap();
+
+        // Should still have x-synthetic-id header
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "Response should still have x-synthetic-id header"
+        );
+
+        // But should NOT set the cookie again (it's already present)
+        let set_cookie = response.get_header(header::SET_COOKIE);
+
+        // Either no Set-Cookie, or if present, not for synthetic_id
+        if let Some(cookie) = set_cookie {
+            let cookie_str = cookie.to_str().unwrap_or("");
+            assert!(
+                !cookie_str.contains(COOKIE_SYNTHETIC_ID),
+                "Should not set duplicate synthetic_id cookie, got: {}",
+                cookie_str
+            );
+        }
+    }
+
+    #[test]
+    fn handle_proxy_works_with_post_method() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::POST,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let req = Request::post("https://test-publisher.com/integrations/test/synthetic")
+            .with_body("test body");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::POST,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ));
+
+        assert!(result.is_some(), "Should find POST route");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "Handler should succeed");
+
+        let response = response.unwrap();
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "POST response should have x-synthetic-id header"
+        );
     }
 }

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -175,7 +174,6 @@ impl IntegrationProxy for TestlightIntegration {
             }
         }
 
-        response.set_header(HEADER_X_SYNTHETIC_ID, &synthetic_id);
         Ok(response)
     }
 }
