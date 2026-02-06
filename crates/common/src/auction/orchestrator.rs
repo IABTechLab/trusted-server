@@ -120,9 +120,12 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
+
             let backend_response = pending.wait().change_context(TrustedServerError::Auction {
                 message: format!("Mediator {} request failed", mediator.provider_name()),
             })?;
+
+            log::info!("response: {:#?}", backend_response);
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
