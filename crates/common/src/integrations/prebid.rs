@@ -640,6 +640,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
         copy_request_headers(context.request, &mut pbs_req);
 
+        log::info!("OPENRTB: {:#?}", openrtb);
+
         pbs_req
             .set_body_json(&openrtb)
             .change_context(TrustedServerError::Prebid {
