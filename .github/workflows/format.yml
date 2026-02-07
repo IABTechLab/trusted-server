@@ -1,4 +1,6 @@
 name: "Run Format"
+permissions:
+  contents: read
 
 on:
   push:
