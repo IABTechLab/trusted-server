@@ -9,7 +9,7 @@ use fastly::{Request, Response};
 use matchit::Router;
 
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::create_synthetic_cookie;
+use crate::cookies::{create_synthetic_cookie, handle_request_cookies};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::synthetic::get_or_generate_synthetic_id;
@@ -619,16 +619,10 @@ impl IntegrationRegistry {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Generate synthetic ID before consuming request
             let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
-            let has_synthetic_cookie = req
-                .get_header(header::COOKIE)
-                .and_then(|h| h.to_str().ok())
-                .map(|cookies| {
-                    cookies.split(';').any(|cookie| {
-                        cookie
-                            .trim_start()
-                            .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-                    })
-                })
+            let has_synthetic_cookie = handle_request_cookies(&req)
+                .ok()
+                .flatten()
+                .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID).map(|_| true))
                 .unwrap_or(false);
 
             let mut result = proxy.handle(settings, req).await;
@@ -1079,42 +1073,38 @@ mod tests {
 
     // Tests for synthetic ID header on proxy responses
 
-    #[test]
-    fn cookie_detection_finds_synthetic_id() {
-        let cookies = "other=value; synthetic_id=abc123; more=stuff";
-        let has_cookie = cookies.split(';').any(|cookie| {
-            cookie
-                .trim_start()
-                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-        });
-        assert!(has_cookie, "Should detect synthetic_id cookie");
-    }
-
-    #[test]
-    fn cookie_detection_handles_missing_cookie() {
-        let cookies = "other=value; session=xyz";
-        let has_cookie = cookies.split(';').any(|cookie| {
-            cookie
-                .trim_start()
-                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-        });
-        assert!(!has_cookie, "Should not find synthetic_id when missing");
-    }
-
-    #[test]
-    fn cookie_detection_handles_empty_cookies() {
-        let cookies = "";
-        let has_cookie = cookies.split(';').any(|cookie| {
-            cookie
-                .trim_start()
-                .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-        });
-        assert!(!has_cookie, "Should handle empty cookie string");
-    }
-
-    // Async tests for handle_proxy synthetic ID functionality
-
+    use crate::cookies::parse_cookies_to_jar;
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn cookie_jar_finds_synthetic_id() {
+        let cookies = "other=value; synthetic_id=abc123; more=stuff";
+        let jar = parse_cookies_to_jar(cookies);
+        assert!(
+            jar.get(COOKIE_SYNTHETIC_ID).is_some(),
+            "Should detect synthetic_id cookie"
+        );
+    }
+
+    #[test]
+    fn cookie_jar_handles_missing_cookie() {
+        let cookies = "other=value; session=xyz";
+        let jar = parse_cookies_to_jar(cookies);
+        assert!(
+            jar.get(COOKIE_SYNTHETIC_ID).is_none(),
+            "Should not find synthetic_id when missing"
+        );
+    }
+
+    #[test]
+    fn cookie_jar_handles_empty_cookies() {
+        let cookies = "";
+        let jar = parse_cookies_to_jar(cookies);
+        assert!(
+            jar.get(COOKIE_SYNTHETIC_ID).is_none(),
+            "Should handle empty cookie string"
+        );
+    }
 
     /// Mock proxy that returns a simple 200 OK response
     struct SyntheticIdTestProxy;
