@@ -647,7 +647,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.server_url)?;
+        let backend_name = ensure_backend_from_url(&self.config.server_url, true)?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -724,7 +724,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.server_url).ok()
+        ensure_backend_from_url(&self.config.server_url, true).ok()
     }
 }
 

@@ -277,6 +277,27 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Proxy {
+    /// Enable TLS certificate verification when proxying to HTTPS origins.
+    /// Defaults to true for secure production use.
+    /// Set to false for local development with self-signed certificates.
+    #[serde(default = "default_certificate_check")]
+    pub certificate_check: bool,
+}
+
+fn default_certificate_check() -> bool {
+    true
+}
+
+impl Default for Proxy {
+    fn default() -> Self {
+        Self {
+            certificate_check: default_certificate_check(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -297,6 +318,8 @@ pub struct Settings {
     pub rewrite: Rewrite,
     #[serde(default)]
     pub auction: AuctionConfig,
+    #[serde(default)]
+    pub proxy: Proxy,
 }
 
 #[allow(unused)]
@@ -323,6 +346,10 @@ impl Settings {
         // Validate that the secret key is not the default
         if settings.synthetic.secret_key == "secret-key" {
             return Err(Report::new(TrustedServerError::InsecureSecretKey));
+        }
+
+        if !settings.proxy.certificate_check {
+            log::warn!("INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified");
         }
 
         Ok(settings)
