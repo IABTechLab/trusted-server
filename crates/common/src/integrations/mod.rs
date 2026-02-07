@@ -4,6 +4,7 @@ use crate::settings::Settings;
 
 pub mod adserver_mock;
 pub mod aps;
+pub mod datadome;
 pub mod didomi;
 pub mod lockr;
 pub mod nextjs;
@@ -30,5 +31,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         permutive::register,
         lockr::register,
         didomi::register,
+        datadome::register,
     ]
 }
