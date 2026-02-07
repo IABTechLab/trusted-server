@@ -161,57 +161,64 @@ mod tests {
     fn test_request_signer_sign() {
         // Report unwraps print full error chain on test failure
         // Note: unwrapping a Report prints it nicely if test fails.
-        let signer = RequestSigner::from_config().unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
         let signature = signer
             .sign(b"these pretzels are making me thirsty")
-            .unwrap();
+            .expect("should sign payload");
         assert!(!signature.is_empty());
         assert!(signature.len() > 32);
     }
 
     #[test]
     fn test_request_signer_from_config() {
-        let signer = RequestSigner::from_config().unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
         assert!(!signer.kid.is_empty());
     }
 
     #[test]
     fn test_sign_and_verify() {
         let payload = b"test payload for verification";
-        let signer = RequestSigner::from_config().unwrap();
-        let signature = signer.sign(payload).unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
+        let signature = signer.sign(payload).expect("should sign payload");
 
-        let result = verify_signature(payload, &signature, &signer.kid).unwrap();
+        let result =
+            verify_signature(payload, &signature, &signer.kid).expect("should verify signature");
         assert!(result, "Signature should be valid");
     }
 
     #[test]
     fn test_verify_invalid_signature() {
         let payload = b"test payload";
-        let signer = RequestSigner::from_config().unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
 
-        let wrong_signature = signer.sign(b"different payload").unwrap();
+        let wrong_signature = signer
+            .sign(b"different payload")
+            .expect("should sign different payload");
 
-        let result = verify_signature(payload, &wrong_signature, &signer.kid).unwrap();
+        let result = verify_signature(payload, &wrong_signature, &signer.kid)
+            .expect("should attempt verification");
         assert!(!result, "Invalid signature should not verify");
     }
 
     #[test]
     fn test_verify_wrong_payload() {
         let original_payload = b"original payload";
-        let signer = RequestSigner::from_config().unwrap();
-        let signature = signer.sign(original_payload).unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
+        let signature = signer
+            .sign(original_payload)
+            .expect("should sign original payload");
 
         let wrong_payload = b"wrong payload";
-        let result = verify_signature(wrong_payload, &signature, &signer.kid).unwrap();
+        let result = verify_signature(wrong_payload, &signature, &signer.kid)
+            .expect("should attempt verification");
         assert!(!result, "Signature should not verify with wrong payload");
     }
 
     #[test]
     fn test_verify_missing_key() {
         let payload = b"test payload";
-        let signer = RequestSigner::from_config().unwrap();
-        let signature = signer.sign(payload).unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
+        let signature = signer.sign(payload).expect("should sign payload");
         let nonexistent_kid = "nonexistent-key-id";
 
         let result = verify_signature(payload, &signature, nonexistent_kid);
@@ -221,7 +228,7 @@ mod tests {
     #[test]
     fn test_verify_malformed_signature() {
         let payload = b"test payload";
-        let signer = RequestSigner::from_config().unwrap();
+        let signer = RequestSigner::from_config().expect("should create signer from config");
         let malformed_signature = "not-valid-base64!!!";
 
         let result = verify_signature(payload, malformed_signature, &signer.kid);

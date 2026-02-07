@@ -108,13 +108,15 @@ mod tests {
 
     #[test]
     fn returns_name_for_https_no_port() {
-        let name = ensure_origin_backend("https", "origin.example.com", None).unwrap();
+        let name = ensure_origin_backend("https", "origin.example.com", None)
+            .expect("should create backend for https without port");
         assert_eq!(name, "backend_https_origin_example_com_443");
     }
 
     #[test]
     fn returns_name_for_http_with_port_and_sanitizes() {
-        let name = ensure_origin_backend("http", "api.test-site.org", Some(8080)).unwrap();
+        let name = ensure_origin_backend("http", "api.test-site.org", Some(8080))
+            .expect("should create backend for http with custom port");
         assert_eq!(name, "backend_http_api_test-site_org_8080");
         // Explicitly check that ':' was replaced with '_'
         assert!(name.ends_with("_8080"));
@@ -122,21 +124,24 @@ mod tests {
 
     #[test]
     fn returns_name_for_http_without_port_defaults_to_80() {
-        let name = ensure_origin_backend("http", "example.org", None).unwrap();
+        let name = ensure_origin_backend("http", "example.org", None)
+            .expect("should create backend for http defaulting to port 80");
         assert_eq!(name, "backend_http_example_org_80");
     }
 
     #[test]
     fn error_on_missing_host() {
-        let err = ensure_origin_backend("https", "", None).err().unwrap();
+        let err = ensure_origin_backend("https", "", None).expect_err("should error on empty host");
         let msg = err.to_string();
         assert!(msg.contains("missing host"));
     }
 
     #[test]
     fn second_call_reuses_existing_backend() {
-        let first = ensure_origin_backend("https", "reuse.example.com", None).unwrap();
-        let second = ensure_origin_backend("https", "reuse.example.com", None).unwrap();
+        let first = ensure_origin_backend("https", "reuse.example.com", None)
+            .expect("should create backend first time");
+        let second = ensure_origin_backend("https", "reuse.example.com", None)
+            .expect("should reuse existing backend");
         assert_eq!(first, second);
     }
 }

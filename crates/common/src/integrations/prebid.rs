@@ -952,7 +952,7 @@ mod tests {
         for url_field in ["nurl", "burl"] {
             let value = response["seatbid"][0]["bid"][0][url_field]
                 .as_str()
-                .unwrap();
+                .expect("should get tracking URL");
             assert!(
                 value.contains("/ad-proxy/track/"),
                 "tracking URLs should be proxied"
@@ -969,11 +969,17 @@ mod tests {
             "proxy prefix should be applied"
         );
 
-        let encoded = rewritten.split("/ad-proxy/track/").nth(1).unwrap();
+        let encoded = rewritten
+            .split("/ad-proxy/track/")
+            .nth(1)
+            .expect("should have encoded payload after proxy prefix");
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .expect("should decode base64 proxy payload");
-        assert_eq!(String::from_utf8(decoded).unwrap(), url);
+        assert_eq!(
+            String::from_utf8(decoded).expect("should be valid UTF-8"),
+            url
+        );
     }
 
     #[test]

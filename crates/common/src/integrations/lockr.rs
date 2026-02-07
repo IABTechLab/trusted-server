@@ -502,7 +502,9 @@ mod tests {
     fn test_api_path_extraction_with_camel_case() {
         // Test that we properly extract paths with correct casing
         let path = "/integrations/lockr/api/publisher/app/v1/identityLockr/settings";
-        let extracted = path.strip_prefix("/integrations/lockr/api").unwrap();
+        let extracted = path
+            .strip_prefix("/integrations/lockr/api")
+            .expect("should strip prefix");
         assert_eq!(extracted, "/publisher/app/v1/identityLockr/settings");
     }
 
@@ -525,7 +527,9 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = input.strip_prefix("/integrations/lockr/api").unwrap();
+            let result = input
+                .strip_prefix("/integrations/lockr/api")
+                .expect("should strip prefix");
             assert_eq!(result, expected, "Failed for input: {}", input);
         }
     }
@@ -589,7 +593,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk_old.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // Verify the host was rewritten to the proxy endpoint
         assert!(rewritten.contains("'host': '/integrations/lockr/api'"));
@@ -630,7 +635,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk_real.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // Verify the host was rewritten to the proxy endpoint
         assert!(rewritten.contains("'host': '/integrations/lockr/api'"));
@@ -688,7 +694,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // When pattern doesn't match, content should be unchanged
         assert!(rewritten.contains("'host': 'https://example.com'"));
