@@ -14,7 +14,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -647,7 +647,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.server_url, true)?;
+        let backend_name = BackendConfig::from_url(&self.config.server_url, true)?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -724,7 +724,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.server_url, true).ok()
+        BackendConfig::from_url(&self.config.server_url, true).ok()
     }
 }
 

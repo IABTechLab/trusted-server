@@ -4,7 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::{ConfigStore, Request, Response, SecretStore};
 use http::StatusCode;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
@@ -120,7 +120,7 @@ impl FastlyApiClient {
         store_name: &str,
         key_name: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let backend_name = ensure_backend_from_url("https://api.fastly.com", true)?;
+        let backend_name = BackendConfig::from_url("https://api.fastly.com", true)?;
 
         let secret_store = FastlySecretStore::new(store_name);
         let api_key = secret_store.get(key_name)?;

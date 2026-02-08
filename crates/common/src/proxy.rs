@@ -479,12 +479,10 @@ async fn proxy_with_redirects(
             }));
         }
 
-        let backend_name = crate::backend::ensure_origin_backend(
-            &scheme,
-            host,
-            parsed_url.port(),
-            settings.proxy.certificate_check,
-        )?;
+        let backend_name = crate::backend::BackendConfig::new(&scheme, host)
+            .port(parsed_url.port())
+            .certificate_check(settings.proxy.certificate_check)
+            .ensure()?;
 
         let mut proxy_req = Request::new(current_method.clone(), &current_url);
         copy_proxy_forward_headers(req, &mut proxy_req);

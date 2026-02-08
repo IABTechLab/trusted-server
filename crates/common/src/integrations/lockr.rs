@@ -23,7 +23,7 @@ use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -148,7 +148,7 @@ impl LockrIntegration {
         lockr_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
         lockr_req.set_header(header::ACCEPT, "application/javascript, */*");
 
-        let backend_name = ensure_backend_from_url(sdk_url, true)
+        let backend_name = BackendConfig::from_url(sdk_url, true)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
         let mut lockr_response =
@@ -242,7 +242,7 @@ impl LockrIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.api_endpoint, true)
+        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
             .change_context(Self::error("Failed to determine backend for API proxy"))?;
 
         let response = match target_req.send(backend_name) {
