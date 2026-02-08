@@ -6,7 +6,6 @@
   "description": "Trusted Server tsjs TypeScript library with queue and simple banner rendering.",
   "scripts": {
     "build": "vite build",
-    "build:custom": "vite build",
     "dev": "vite build --watch",
     "test": "vitest run",
     "test:watch": "vitest",

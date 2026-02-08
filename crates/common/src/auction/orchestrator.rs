@@ -724,7 +724,11 @@ mod tests {
             "Slot-1 should still be present"
         );
         assert!(
-            filtered.get("slot-1").unwrap().price.is_none(),
+            filtered
+                .get("slot-1")
+                .expect("slot-1 should be present")
+                .price
+                .is_none(),
             "Price should still be None (not decoded yet)"
         );
     }

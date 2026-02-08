@@ -87,7 +87,10 @@ pub fn ensure_origin_backend(
     if scheme.eq_ignore_ascii_case("https") {
         builder = builder.enable_ssl().sni_hostname(host);
         if certificate_check {
-            builder = builder.check_certificate(host);
+            builder = builder
+                .enable_ssl()
+                .sni_hostname(host)
+                .check_certificate(host);
         } else {
             log::warn!(
                 "INSECURE: certificate check disabled for backend: {}",

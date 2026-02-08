@@ -41,6 +41,7 @@ debug = 1
 async-trait = "0.1"
 base64 = "0.22"
 brotli = "8.0"
+build-print = "1.0.1"
 bytes = "1.11"
 chacha20poly1305 = "0.10"
 chrono = "0.4.42"

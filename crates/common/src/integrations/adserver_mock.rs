@@ -470,20 +470,26 @@ mod tests {
 
         auction_request.context.insert(
             "provider_responses".to_string(),
-            serde_json::to_value(&bidder_responses).unwrap(),
+            serde_json::to_value(&bidder_responses).expect("should serialize bidder responses"),
         );
 
         let mediation_req = provider
             .build_mediation_request(&auction_request, &bidder_responses)
-            .unwrap();
+            .expect("should build mediation request");
 
         // Verify structure
         assert_eq!(mediation_req["id"], "test-auction-123");
-        assert_eq!(mediation_req["imp"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            mediation_req["imp"]
+                .as_array()
+                .expect("imp should be array")
+                .len(),
+            1
+        );
         assert_eq!(
             mediation_req["ext"]["bidder_responses"]
                 .as_array()
-                .unwrap()
+                .expect("bidder_responses should be array")
                 .len(),
             2
         );

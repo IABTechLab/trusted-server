@@ -61,7 +61,8 @@ mod tests {
             "url": "https://example.com/track/impression"
         });
 
-        let callback: Callback = serde_json::from_value(json_data).unwrap();
+        let callback: Callback =
+            serde_json::from_value(json_data).expect("should deserialize callback");
         assert_eq!(callback.callback_type, "impression");
         assert_eq!(callback.url, "https://example.com/track/impression");
     }
@@ -74,7 +75,8 @@ mod tests {
             "url": "https://example.com/track/click"
         }"#;
 
-        let callback: Callback = serde_json::from_str(json_str).unwrap();
+        let callback: Callback =
+            serde_json::from_str(json_str).expect("should deserialize callback from str");
         assert_eq!(callback.callback_type, "click");
         assert_eq!(callback.url, "https://example.com/track/click");
     }
@@ -107,7 +109,8 @@ mod tests {
             ]
         });
 
-        let ad_response: AdResponse = serde_json::from_value(json_data).unwrap();
+        let ad_response: AdResponse =
+            serde_json::from_value(json_data).expect("should deserialize ad response");
 
         assert_eq!(ad_response.network_id, "12345");
         assert_eq!(ad_response.site_id, "67890");
@@ -147,7 +150,8 @@ mod tests {
             "callbacks": []
         });
 
-        let ad_response: AdResponse = serde_json::from_value(json_data).unwrap();
+        let ad_response: AdResponse = serde_json::from_value(json_data)
+            .expect("should deserialize ad response with empty callbacks");
         assert_eq!(ad_response.callbacks.len(), 0);
     }
 
@@ -187,7 +191,8 @@ mod tests {
             "callbacks": []
         }"#;
 
-        let ad_response: AdResponse = serde_json::from_str(json_str).unwrap();
+        let ad_response: AdResponse =
+            serde_json::from_str(json_str).expect("should deserialize ad response from str");
         assert_eq!(ad_response.network_id, "net123");
         assert_eq!(ad_response.site_id, "site456");
         assert_eq!(ad_response.page_id, "page789");
@@ -215,7 +220,8 @@ mod tests {
             "another": 123
         });
 
-        let callback: Callback = serde_json::from_value(json_data).unwrap();
+        let callback: Callback = serde_json::from_value(json_data)
+            .expect("should deserialize callback with extra fields");
         assert_eq!(callback.callback_type, "conversion");
         assert_eq!(callback.url, "https://example.com/track/conversion");
     }
@@ -281,7 +287,8 @@ mod tests {
                 "url": format!("https://example.com/track/{}", cb_type)
             });
 
-            let callback: Callback = serde_json::from_value(json_data).unwrap();
+            let callback: Callback =
+                serde_json::from_value(json_data).expect("should deserialize callback type");
             assert_eq!(callback.callback_type, cb_type);
             assert_eq!(
                 callback.url,
