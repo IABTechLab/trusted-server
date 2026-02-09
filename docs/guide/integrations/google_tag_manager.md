@@ -40,9 +40,25 @@ container_id = "GTM-XXXXXX"
 
 ## How It Works
 
+```mermaid
+flowchart TD
+  user["User Browser"]
+  server["Trusted Server"]
+  google["Google Servers<br/>(gtm.js, collect)"]
+
+  user -- "1. Request HTML" --> server
+  server -- "2. Rewrite HTML<br/>(src=/integrations/...)" --> user
+  user -- "3. Request Script<br/>(gtm.js w/ ID)" --> server
+  server -- "4. Fetch Script" --> google
+  google -- "5. Return Script" --> server
+  server -- "6. Rewrite Script Content<br/>(replace www.google-analytics.com)" --> user
+  user -- "7. Send Beacon<br/>(/collect w/ data)" --> server
+  server -- "8. Proxy Beacon" --> google
+```
+
 ### 1. Script Rewriting
 
-When Trusted Server processes an HTML response, it automatically rewrites GTM script tags:
+When Trusted Server processes an HTML response, it automatically rewrites GTM script tags to point to the local proxy:
 
 **Before:**
 
@@ -58,38 +74,75 @@ When Trusted Server processes an HTML response, it automatically rewrites GTM sc
 
 ### 2. Script Proxying
 
-When the browser requests `/integrations/google_tag_manager/gtm.js`:
+The proxy intercepts requests for the GTM library and modifies it on-the-fly. This is critical for First-Party context.
 
-1.  Trusted Server fetches the original script from Google.
-2.  It modifies the script content on-the-fly to replace references to `www.google-analytics.com` and `www.googletagmanager.com` with the local proxy path.
-3.  It serves the modified script to the browser.
+1.  **Fetch**: Retrieves the original `gtm.js` from Google.
+2.  **Rewrite**: Replaces hardcoded references to `www.google-analytics.com` and `www.googletagmanager.com` with the local proxy path.
+3.  **Serve**: Returns the modified script with correct caching headers.
 
 ### 3. Beacon Proxying
 
-Analytics data sent by the modified script is directed to:
-`/integrations/google_tag_manager/collect` (or `/g/collect`)
+Analytics data (events, pageviews) normally sent to `google-analytics.com/collect` are now routed to:
 
-Trusted Server forwards these requests to Google's servers, ensuring the data is recorded successfully.
+`https://your-server.com/integrations/google_tag_manager/collect`
+
+Trusted Server acts as a gateway, stripping client IP addresses (privacy) before forwarding the data to Google.
+
+## Core Endpoints
+
+### `GET .../gtm.js` - Script Proxy
+
+Proxies the Google Tag Manager library.
+
+**Request**:
+```
+GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
+```
+
+**Behavior**:
+- Proxies to `https://www.googletagmanager.com/gtm.js`
+- Rewrites internal URLs to use the first-party proxy
+- Strips `Accept-Encoding` during fetch to ensure rewriteable text response
+
+### `GET/POST .../collect` - Analytics Beacon
+
+Proxies analytics events (GA4/UA).
+
+**Request**:
+```
+POST /integrations/google_tag_manager/g/collect?v=2&...
+```
+
+**Behavior**:
+- Proxies to `https://www.google-analytics.com/g/collect`
+- Forwarding: User-Agent, Referer, Payload
+- Privacy: Does NOT forward client IP (Google sees Trusted Server IP)
+
+## Performance & Caching
+
+### Compression
+The integration requires the upstream `gtm.js` to be uncompressed to perform string replacement. Trusted Server fetches it with `Accept-Encoding: identity`. 
+
+*Note: Trusted Server will re-compress the response (gzip/brotli) before sending it to the user if the `compression` feature is enabled.*
+
+### Direct Proxying
+Beacon requests (`/collect`) are proxied directly using streaming, minimizing latency overhead.
 
 ## Manual Verification
 
 You can verify the integration using `curl`:
 
-**Test Script Proxy:**
-
+**Test Script Result**:
 ```bash
-curl -v "http://your-server.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"
+curl -v "http://localhost:8080/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"
 ```
+_Expected_: `200 OK`. Body should contain `/integrations/google_tag_manager` instead of `google-analytics.com`.
 
-_Expected_: 200 OK, and the body content should contain rewritten paths.
-
-**Test Beacon:**
-
+**Test Beacon Result**:
 ```bash
-curl -v -X POST "http://your-server.com/integrations/google_tag_manager/g/collect?v=2&tid=G-XXXXXX..."
+curl -v -X POST "http://localhost:8080/integrations/google_tag_manager/g/collect?v=2&tid=G-TEST"
 ```
-
-_Expected_: 200/204 OK.
+_Expected_: `200 OK` (or 204).
 
 ## Implementation Details
 
