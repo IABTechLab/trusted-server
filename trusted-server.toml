@@ -84,6 +84,12 @@ rewrite_sdk = true
 # ]
 
 
+# Proxy configuration
+# [proxy]
+# Enable TLS certificate verification when proxying to HTTPS origins.
+# Defaults to true. Set to false only for local development with self-signed certificates.
+# certificate_check = true
+
 [auction]
 enabled = true
 providers = ["prebid"]

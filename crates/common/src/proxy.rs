@@ -479,7 +479,10 @@ async fn proxy_with_redirects(
             }));
         }
 
-        let backend_name = crate::backend::ensure_origin_backend(&scheme, host, parsed_url.port())?;
+        let backend_name = crate::backend::BackendConfig::new(&scheme, host)
+            .port(parsed_url.port())
+            .certificate_check(settings.proxy.certificate_check)
+            .ensure()?;
 
         let mut proxy_req = Request::new(current_method.clone(), &current_url);
         copy_proxy_forward_headers(req, &mut proxy_req);
@@ -1175,6 +1178,31 @@ mod tests {
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
+    #[tokio::test]
+    async fn proxy_sign_preserves_non_standard_port() {
+        let settings = create_test_settings();
+        let body = serde_json::json!({
+            "url": "https://cdn.example.com:9443/img/300x250.svg",
+        });
+        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
+        req.set_body(body.to_string());
+        let mut resp = handle_first_party_proxy_sign(&settings, req)
+            .await
+            .expect("should sign URL with non-standard port");
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::OK,
+            "should return 200 for valid sign request"
+        );
+        let json = resp.take_body_str();
+        // Port 9443 should be preserved (URL-encoded as %3A9443)
+        assert!(
+            json.contains("%3A9443"),
+            "Port should be preserved in signed URL: {}",
+            json
+        );
+    }
+
     #[test]
     fn proxy_request_config_supports_streaming_and_headers() {
         let cfg = ProxyRequestConfig::new("https://example.com/asset")
@@ -1560,6 +1588,45 @@ mod tests {
             .to_str()
             .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn html_response_rewrite_preserves_non_standard_port() {
+        // Verify that HTML rewriting preserves non-standard ports in sub-resource URLs.
+        // This is the core test for the port preservation fix.
+        let settings = create_test_settings();
+
+        let html = r#"<!DOCTYPE html>
+<html>
+  <body>
+    <a href="//cdn.example.com:9443/click">
+      <img src="//cdn.example.com:9443/img/300x250.svg" />
+    </a>
+    <img src="//cdn.example.com:9443/pixel?pid=test" width="1" height="1" />
+  </body>
+</html>"#;
+
+        let beresp = Response::from_status(StatusCode::OK)
+            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .with_body(html);
+
+        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let mut out = finalize(
+            &settings,
+            &req,
+            "https://cdn.example.com:9443/creatives/300x250.html",
+            beresp,
+        )
+        .expect("should finalize HTML response with non-standard port URL");
+
+        let body = out.take_body_str();
+
+        // Port 9443 should be preserved (URL-encoded as %3A9443)
+        assert!(
+            body.contains("cdn.example.com%3A9443"),
+            "Port 9443 should be preserved in rewritten URLs. Body:\n{}",
+            body
+        );
     }
 
     #[test]

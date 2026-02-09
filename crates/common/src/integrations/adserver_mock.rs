@@ -17,7 +17,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -277,7 +277,7 @@ impl AuctionProvider for AdServerMockProvider {
             })?;
 
         // Send async
-        let backend_name = ensure_backend_from_url(&self.config.endpoint).change_context(
+        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
             TrustedServerError::Auction {
                 message: format!(
                     "Failed to resolve backend for mediation endpoint: {}",
@@ -340,7 +340,7 @@ impl AuctionProvider for AdServerMockProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.endpoint).ok()
+        BackendConfig::from_url(&self.config.endpoint, true).ok()
     }
 }
 
