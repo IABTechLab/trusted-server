@@ -302,7 +302,7 @@ fn transform_prebid_response(
 
 fn rewrite_ad_markup(markup: &str, request_host: &str, request_scheme: &str) -> String {
     let mut content = markup.to_string();
-    let cdn_patterns = vec![
+    let cdn_patterns = [
         ("https://cdn.adsrvr.org", "adsrvr"),
         ("https://ib.adnxs.com", "adnxs"),
         ("https://rtb.openx.net", "openx"),
@@ -451,16 +451,15 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build device object with geo if available
-        let device = request.device.as_ref().and_then(|d| {
-            d.geo.as_ref().map(|geo| Device {
-                geo: Some(Geo {
-                    geo_type: 2, // IP address per OpenRTB spec
-                    country: Some(geo.country.clone()),
-                    city: Some(geo.city.clone()),
-                    region: geo.region.clone(),
-                }),
-            })
+        // Build device object with user-agent and geo if available
+        let device = request.device.as_ref().map(|d| Device {
+            ua: d.user_agent.clone(),
+            geo: d.geo.as_ref().map(|geo| Geo {
+                geo_type: 2, // IP address per OpenRTB spec
+                country: Some(geo.country.clone()),
+                city: Some(geo.city.clone()),
+                region: geo.region.clone(),
+            }),
         });
 
         // Build regs object if Sec-GPC header is present
