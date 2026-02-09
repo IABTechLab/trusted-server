@@ -66,7 +66,7 @@ use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -254,8 +254,8 @@ impl DataDomeIntegration {
 
         log::info!("[datadome] Fetching tags.js from {}", target_url);
 
-        let backend =
-            ensure_backend_from_url(&target_url).change_context(Self::error("Invalid SDK URL"))?;
+        let backend = BackendConfig::from_url(&target_url, true)
+            .change_context(Self::error("Invalid SDK URL"))?;
 
         let sdk_host = Self::extract_host(&self.config.sdk_origin);
 
@@ -325,8 +325,8 @@ impl DataDomeIntegration {
             api_host
         );
 
-        let backend =
-            ensure_backend_from_url(&target_url).change_context(Self::error("Invalid API URL"))?;
+        let backend = BackendConfig::from_url(&target_url, true)
+            .change_context(Self::error("Invalid API URL"))?;
 
         let mut backend_req = Request::new(req.get_method().clone(), &target_url);
         backend_req.set_header(header::HOST, api_host);
