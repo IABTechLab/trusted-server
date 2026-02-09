@@ -95,8 +95,11 @@ impl AdServerMockProvider {
             if let Some(segments) = segments_val.as_array() {
                 let csv: String = segments
                     .iter()
-                    .filter_map(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-                    .map(|n| n.to_string())
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -764,13 +767,13 @@ mod tests {
         let mut request = create_test_auction_request();
         request.context.insert(
             "permutive_segments".to_string(),
-            json!([10000001, 10000003, 10000008]),
+            json!(["10000001", "10000003", "adv", "bhgp"]),
         );
 
         let url = provider.build_endpoint_url(&request);
         assert_eq!(
             url,
-            "http://localhost:6767/adserver/mediate?permutive=10000001,10000003,10000008"
+            "http://localhost:6767/adserver/mediate?permutive=10000001,10000003,adv,bhgp"
         );
     }
 
@@ -820,12 +823,12 @@ mod tests {
         let mut request = create_test_auction_request();
         request
             .context
-            .insert("permutive_segments".to_string(), json!([123, 456]));
+            .insert("permutive_segments".to_string(), json!(["123", "adv"]));
 
         let url = provider.build_endpoint_url(&request);
         assert_eq!(
             url,
-            "http://localhost:6767/adserver/mediate?debug=true&permutive=123,456"
+            "http://localhost:6767/adserver/mediate?debug=true&permutive=123,adv"
         );
     }
 }

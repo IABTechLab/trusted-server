@@ -1,5 +1,6 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
+import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument } from './render';
 import { buildAdRequest, sendAuction } from './auction';
@@ -10,41 +11,6 @@ export interface RequestAdsOptions {
   timeout?: number;
 }
 
-/**
- * Read Permutive segment IDs from localStorage.
- *
- * Permutive stores event data in the `permutive-app` key. Each event entry in
- * `eventPublication.eventUpload` is a tuple of [eventKey, eventObject]. We
- * iterate in reverse (most recent first) looking for any event whose
- * `properties.segments` is a non-empty array.
- *
- * Returns an array of segment ID numbers, or an empty array if unavailable.
- */
-function getPermutiveSegments(): number[] {
-  try {
-    const raw = localStorage.getItem('permutive-app');
-    if (!raw) return [];
-
-    const data = JSON.parse(raw);
-    const uploads: unknown[] = data?.eventPublication?.eventUpload;
-    if (!Array.isArray(uploads) || uploads.length === 0) return [];
-
-    // Iterate most-recent-first to get the freshest segments
-    for (let i = uploads.length - 1; i >= 0; i--) {
-      const entry = uploads[i];
-      if (!Array.isArray(entry) || entry.length < 2) continue;
-
-      const segments = entry[1]?.event?.properties?.segments;
-      if (Array.isArray(segments) && segments.length > 0) {
-        log.debug('getPermutiveSegments: found segments', { count: segments.length });
-        return segments.filter((s: unknown) => typeof s === 'number') as number[];
-      }
-    }
-  } catch {
-    log.debug('getPermutiveSegments: failed to read from localStorage');
-  }
-  return [];
-}
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
@@ -64,13 +30,9 @@ export function requestAds(
   log.info('requestAds: called', { hasCallback: typeof callback === 'function' });
   try {
     const adUnits = getAllUnits();
-    const permutiveSegments = getPermutiveSegments();
-    const config: Record<string, unknown> = {};
-    if (permutiveSegments.length > 0) {
-      config.permutive_segments = permutiveSegments;
-    }
+    const config = collectContext();
     const payload = { ...buildAdRequest(adUnits), config };
-    log.debug('requestAds: payload', { units: adUnits.length, permutiveSegments: permutiveSegments.length });
+    log.debug('requestAds: payload', { units: adUnits.length, contextKeys: Object.keys(config) });
 
     // Use unified auction endpoint
     void sendAuction('/auction', payload)
