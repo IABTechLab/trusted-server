@@ -30,7 +30,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     pub config: Option<JsonValue>,
 }
 
@@ -135,16 +134,22 @@ pub fn convert_tsjs_to_auction_request(
         geo: GeoInfo::from_request(req),
     });
 
-    // Extract optional Permutive segments from the request config
+    // Forward all config entries from the JS request into the context map.
+    // Each integration's context provider contributes its own keys (e.g.
+    // permutive_segments, lockr_ids, …) — we pass them all through so
+    // auction providers can read whatever they need.
     let mut context = HashMap::new();
     if let Some(ref config) = body.config {
-        if let Some(segments) = config.get("permutive_segments") {
-            if segments.is_array() {
+        if let Some(obj) = config.as_object() {
+            for (key, value) in obj {
+                context.insert(key.clone(), value.clone());
+            }
+            if !context.is_empty() {
                 log::info!(
-                    "Auction request includes {} Permutive segments",
-                    segments.as_array().map_or(0, Vec::len)
+                    "Auction request context: {} entries ({})",
+                    context.len(),
+                    context.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
-                context.insert("permutive_segments".to_string(), segments.clone());
             }
         }
     }
