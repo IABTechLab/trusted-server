@@ -751,6 +751,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
+    #[must_use] 
     pub fn from_rewriters_with_head_injectors(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
