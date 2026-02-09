@@ -116,9 +116,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             // Proxy for the gtag script (if used)
             self.get("/gtag/js"),
             // Analytics beacons (GA4/UA)
-            // Note: In a real "Tag Gateway" implementation, we'd likely need
-            // (e.g., `gtm.js` script tags), it will automatically rewrite the `src` attribute to point to
-            // the first-party proxy endpoint.
+            // The GTM script is rewritten to point these beacons to our proxy.
             self.get("/collect"),
             self.post("/collect"),
             self.get("/g/collect"),
@@ -254,11 +252,16 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationDocumentState, IntegrationScriptContext, IntegrationScriptRewriter,
-        ScriptRewriteAction,
+        IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
+        IntegrationScriptRewriter, ScriptRewriteAction,
     };
+    use crate::settings::Settings;
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::tests::crate_test_settings_str;
+    use std::io::Cursor;
 
     #[test]
     fn test_attribute_rewriter() {
@@ -450,5 +453,123 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         assert!(rewritten.contains("/integrations/google_tag_manager/collect"));
         assert!(rewritten.contains("/integrations/google_tag_manager/gtm.js"));
         assert!(!rewritten.contains("https://www.google-analytics.com"));
+    }
+
+    fn make_settings() -> Settings {
+        Settings::from_toml(&crate_test_settings_str()).expect("should parse settings")
+    }
+
+    fn config_from_settings(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+    ) -> HtmlProcessorConfig {
+        HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
+    }
+
+    #[test]
+    fn test_config_parsing() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.google_tag_manager]
+enabled = true
+container_id = "GTM-PARSED"
+upstream_url = "https://custom.gtm.example"
+"#;
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+            .expect("should get config")
+            .expect("should be enabled");
+
+        assert!(config.enabled);
+        assert_eq!(config.container_id, "GTM-PARSED");
+        assert_eq!(config.upstream_url, "https://custom.gtm.example");
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.google_tag_manager]
+container_id = "GTM-DEFAULT"
+"#;
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+            .expect("should get config")
+            .expect("should be enabled");
+
+        assert!(config.enabled); // Default is true
+        assert_eq!(config.container_id, "GTM-DEFAULT");
+        assert_eq!(config.upstream_url, "https://www.googletagmanager.com"); // Default upstream
+    }
+
+    #[test]
+    fn test_html_processor_pipeline_rewrites_gtm() {
+        let html = r#"<html><head>
+            <script src="https://www.googletagmanager.com/gtm.js?id=GTM-TEST"></script>
+        </head><body></body></html>"#;
+
+        let mut settings = make_settings();
+        // Enable GTM
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-TEST",
+                    "upstream_url": "https://www.googletagmanager.com"
+                }),
+            )
+            .expect("should update gtm config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
+        assert!(result.is_ok());
+
+        let processed = String::from_utf8_lossy(&output);
+
+        // Verify rewrite happened
+        assert!(processed.contains("/integrations/google_tag_manager/gtm.js?id=GTM-TEST"));
+        assert!(!processed.contains("https://www.googletagmanager.com/gtm.js"));
     }
 }
