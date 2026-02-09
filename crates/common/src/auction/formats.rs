@@ -135,6 +135,20 @@ pub fn convert_tsjs_to_auction_request(
         geo: GeoInfo::from_request(req),
     });
 
+    // Extract optional Permutive segments from the request config
+    let mut context = HashMap::new();
+    if let Some(ref config) = body.config {
+        if let Some(segments) = config.get("permutive_segments") {
+            if segments.is_array() {
+                log::info!(
+                    "Auction request includes {} Permutive segments",
+                    segments.as_array().map_or(0, Vec::len)
+                );
+                context.insert("permutive_segments".to_string(), segments.clone());
+            }
+        }
+    }
+
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
         slots,
@@ -152,7 +166,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
-        context: HashMap::new(),
+        context,
     })
 }
 

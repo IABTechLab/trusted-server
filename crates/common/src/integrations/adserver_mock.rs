@@ -85,6 +85,40 @@ impl AdServerMockProvider {
         Self { config }
     }
 
+    /// Build the mediation endpoint URL, appending Permutive segments as a query
+    /// string parameter when present in the auction request context.
+    ///
+    /// For example, if segments `[10000001, 10000003]` are present, the URL
+    /// becomes `https://…/adserver/mediate?permutive=10000001,10000003`.
+    fn build_endpoint_url(&self, request: &AuctionRequest) -> String {
+        if let Some(segments_val) = request.context.get("permutive_segments") {
+            if let Some(segments) = segments_val.as_array() {
+                let csv: String = segments
+                    .iter()
+                    .filter_map(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                if !csv.is_empty() {
+                    // Append as query parameter, respecting existing query strings
+                    let sep = if self.config.endpoint.contains('?') {
+                        "&"
+                    } else {
+                        "?"
+                    };
+                    let url = format!("{}{}permutive={}", self.config.endpoint, sep, csv);
+                    log::info!(
+                        "AdServer Mock: appending {} Permutive segments to mediation URL",
+                        segments.len()
+                    );
+                    return url;
+                }
+            }
+        }
+        self.config.endpoint.clone()
+    }
+
     /// Build mediation request from auction request and bidder responses.
     ///
     /// Handles both:
@@ -256,8 +290,11 @@ impl AuctionProvider for AdServerMockProvider {
 
         log::debug!("AdServer Mock: mediation request: {:?}", mediation_req);
 
+        // Build endpoint URL with optional Permutive segments query string
+        let endpoint_url = self.build_endpoint_url(request);
+
         // Create HTTP POST request
-        let mut req = Request::new(Method::POST, &self.config.endpoint);
+        let mut req = Request::new(Method::POST, &endpoint_url);
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
         if let Ok(url) = url::Url::parse(&self.config.endpoint) {
@@ -711,6 +748,84 @@ mod tests {
         assert_eq!(
             bid2.price, None,
             "Bid without price field should have None price"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_with_permutive_segments() {
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.context.insert(
+            "permutive_segments".to_string(),
+            json!([10000001, 10000003, 10000008]),
+        );
+
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(
+            url,
+            "http://localhost:6767/adserver/mediate?permutive=10000001,10000003,10000008"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_without_segments() {
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let request = create_test_auction_request();
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(url, "http://localhost:6767/adserver/mediate");
+    }
+
+    #[test]
+    fn test_build_endpoint_url_with_empty_segments() {
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request
+            .context
+            .insert("permutive_segments".to_string(), json!([]));
+
+        let url = provider.build_endpoint_url(&request);
+        // Empty segments array should NOT append query param
+        assert!(
+            !url.contains("permutive="),
+            "Empty segments should not add query param"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_preserves_existing_query_params() {
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request
+            .context
+            .insert("permutive_segments".to_string(), json!([123, 456]));
+
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(
+            url,
+            "http://localhost:6767/adserver/mediate?debug=true&permutive=123,456"
         );
     }
 }
