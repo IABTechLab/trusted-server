@@ -14,7 +14,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -647,7 +647,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.server_url, true)?;
+        let backend_name = BackendConfig::from_url(&self.config.server_url, true)?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -724,7 +724,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.server_url, true).ok()
+        BackendConfig::from_url(&self.config.server_url, true).ok()
     }
 }
 
@@ -952,7 +952,7 @@ mod tests {
         for url_field in ["nurl", "burl"] {
             let value = response["seatbid"][0]["bid"][0][url_field]
                 .as_str()
-                .unwrap();
+                .expect("should get tracking URL");
             assert!(
                 value.contains("/ad-proxy/track/"),
                 "tracking URLs should be proxied"
@@ -969,11 +969,17 @@ mod tests {
             "proxy prefix should be applied"
         );
 
-        let encoded = rewritten.split("/ad-proxy/track/").nth(1).unwrap();
+        let encoded = rewritten
+            .split("/ad-proxy/track/")
+            .nth(1)
+            .expect("should have encoded payload after proxy prefix");
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .expect("should decode base64 proxy payload");
-        assert_eq!(String::from_utf8(decoded).unwrap(), url);
+        assert_eq!(
+            String::from_utf8(decoded).expect("should be valid UTF-8"),
+            url
+        );
     }
 
     #[test]

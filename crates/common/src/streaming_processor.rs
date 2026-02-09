@@ -551,9 +551,14 @@ mod tests {
         let input = b"hello world";
         let mut output = Vec::new();
 
-        pipeline.process(&input[..], &mut output).unwrap();
+        pipeline
+            .process(&input[..], &mut output)
+            .expect("pipeline should process uncompressed input");
 
-        assert_eq!(String::from_utf8(output).unwrap(), "hi world");
+        assert_eq!(
+            String::from_utf8(output).expect("output should be valid UTF-8"),
+            "hi world"
+        );
     }
 
     #[test]
@@ -598,22 +603,28 @@ mod tests {
 
         // Test that intermediate chunks return empty
         let chunk1 = b"<html><body>";
-        let result1 = adapter.process_chunk(chunk1, false).unwrap();
+        let result1 = adapter
+            .process_chunk(chunk1, false)
+            .expect("should process chunk1");
         assert_eq!(result1.len(), 0, "Should return empty for non-last chunk");
 
         let chunk2 = b"<p>original</p>";
-        let result2 = adapter.process_chunk(chunk2, false).unwrap();
+        let result2 = adapter
+            .process_chunk(chunk2, false)
+            .expect("should process chunk2");
         assert_eq!(result2.len(), 0, "Should return empty for non-last chunk");
 
         // Test that last chunk processes everything
         let chunk3 = b"</body></html>";
-        let result3 = adapter.process_chunk(chunk3, true).unwrap();
+        let result3 = adapter
+            .process_chunk(chunk3, true)
+            .expect("should process final chunk");
         assert!(
             !result3.is_empty(),
             "Should return processed content for last chunk"
         );
 
-        let output = String::from_utf8(result3).unwrap();
+        let output = String::from_utf8(result3).expect("output should be valid UTF-8");
         assert!(output.contains("replaced"), "Should have replaced content");
         assert!(output.contains("<html>"), "Should have complete HTML");
     }
@@ -639,16 +650,20 @@ mod tests {
         let mut last_chunk = chunks.next().unwrap_or(&[]);
 
         for chunk in chunks {
-            let result = adapter.process_chunk(last_chunk, false).unwrap();
+            let result = adapter
+                .process_chunk(last_chunk, false)
+                .expect("should process intermediate chunk");
             assert_eq!(result.len(), 0, "Intermediate chunks should return empty");
             last_chunk = chunk;
         }
 
         // Process last chunk
-        let result = adapter.process_chunk(last_chunk, true).unwrap();
+        let result = adapter
+            .process_chunk(last_chunk, true)
+            .expect("should process last chunk");
         assert!(!result.is_empty(), "Last chunk should return content");
 
-        let output = String::from_utf8(result).unwrap();
+        let output = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(
             output.contains("Paragraph 999"),
             "Should contain all content"
@@ -663,15 +678,21 @@ mod tests {
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
         // Process some content
-        adapter.process_chunk(b"<html>", false).unwrap();
-        adapter.process_chunk(b"<body>test</body>", false).unwrap();
+        adapter
+            .process_chunk(b"<html>", false)
+            .expect("should process html tag");
+        adapter
+            .process_chunk(b"<body>test</body>", false)
+            .expect("should process body");
 
         // Reset should clear accumulated input
         adapter.reset();
 
         // After reset, adapter should be ready for new input
-        let result = adapter.process_chunk(b"<p>new</p>", true).unwrap();
-        let output = String::from_utf8(result).unwrap();
+        let result = adapter
+            .process_chunk(b"<p>new</p>", true)
+            .expect("should process new content after reset");
+        let output = String::from_utf8(result).expect("output should be valid UTF-8");
         assert_eq!(
             output, "<p>new</p>",
             "Should only contain new input after reset"
@@ -701,9 +722,11 @@ mod tests {
         let input = b"<html><body><a href=\"https://example.com\">Link</a></body></html>";
         let mut output = Vec::new();
 
-        pipeline.process(&input[..], &mut output).unwrap();
+        pipeline
+            .process(&input[..], &mut output)
+            .expect("pipeline should process HTML");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert!(
             result.contains("https://test.com"),
             "Should have replaced URL"

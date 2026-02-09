@@ -348,6 +348,10 @@ impl Settings {
             return Err(Report::new(TrustedServerError::InsecureSecretKey));
         }
 
+        if !settings.proxy.certificate_check {
+            log::warn!("INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified");
+        }
+
         Ok(settings)
     }
 
@@ -488,7 +492,7 @@ mod tests {
         let settings = Settings::new();
         assert!(settings.is_ok(), "Settings should load from embedded TOML");
 
-        let settings = settings.unwrap();
+        let settings = settings.expect("should load settings from embedded TOML");
 
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
@@ -601,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new(r"origin_url = .*").unwrap();
+        let re = Regex::new(r"origin_url = .*").expect("regex should compile");
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -622,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_settings_invalid_toml_syntax() {
-        let re = Regex::new(r"\]").unwrap();
+        let re = Regex::new(r"\]").expect("regex should compile");
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -632,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_settings_partial_config() {
-        let re = Regex::new(r"\[publisher\]").unwrap();
+        let re = Regex::new(r"\[publisher\]").expect("regex should compile");
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -811,7 +815,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().publisher.origin_url,
+                    settings.expect("should load settings").publisher.origin_url,
                     "https://change-publisher.com"
                 );
             },
@@ -835,7 +839,7 @@ mod tests {
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.unwrap().publisher.origin_url,
+                    settings.expect("should load settings").publisher.origin_url,
                     "https://change-publisher.com"
                 );
             },

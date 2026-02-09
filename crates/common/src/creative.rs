@@ -332,9 +332,7 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                 // Image src + data-src
                 element!("img", |el| {
                     if let Some(src) = el.get_attribute("src") {
-                        log::debug!("creative rewrite: img src input = {}", src);
                         if let Some(p) = proxy_if_abs(settings, &src) {
-                            log::debug!("creative rewrite: img src output = {}", p);
                             let _ = el.set_attribute("src", &p);
                         }
                     }
@@ -645,14 +643,15 @@ mod tests {
     #[test]
     fn to_abs_preserves_port_in_protocol_relative() {
         let settings = crate::test_support::tests::create_test_settings();
-        // Protocol-relative URL with explicit port should preserve the port
         assert_eq!(
             to_abs(&settings, "//cdn.example.com:8080/asset.js"),
-            Some("https://cdn.example.com:8080/asset.js".to_string())
+            Some("https://cdn.example.com:8080/asset.js".to_string()),
+            "should preserve port 8080 in protocol-relative URL"
         );
         assert_eq!(
             to_abs(&settings, "//cdn.example.com:9443/img.png"),
-            Some("https://cdn.example.com:9443/img.png".to_string())
+            Some("https://cdn.example.com:9443/img.png".to_string()),
+            "should preserve port 9443 in protocol-relative URL"
         );
     }
 

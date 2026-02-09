@@ -156,7 +156,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let processed = String::from_utf8_lossy(&output);
 
         // Note: URLs may have padding characters for length preservation
@@ -219,7 +219,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -267,7 +267,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -318,7 +318,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -384,7 +384,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let final_html = String::from_utf8_lossy(&output);
 
         // RSC payloads should be rewritten via post-processing
@@ -457,7 +457,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let final_html = String::from_utf8_lossy(&output);
 
         // Non-RSC scripts should be preserved

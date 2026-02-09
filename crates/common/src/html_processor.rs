@@ -537,8 +537,8 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let processed = String::from_utf8(output).unwrap();
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
 
         assert!(processed.contains("keep-me"));
         assert!(!processed.contains("remove-me"));
@@ -570,9 +570,9 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert!(result.contains(r#"href="https://test.example.com/page""#));
         assert!(result.contains(r#"href="//test.example.com/proto""#));
         assert!(result.contains(r#"href="test.example.com/bare""#));
@@ -631,8 +631,8 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let result = String::from_utf8(output).unwrap();
+            .expect("pipeline should process HTML");
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
 
         // Assertions - only URL attribute replacements are expected
         // Check URL replacements (not all occurrences will be replaced since
@@ -733,8 +733,10 @@ mod tests {
 
         // Compress
         let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-        encoder.write_all(html.as_bytes()).unwrap();
-        let compressed_input = encoder.finish().unwrap();
+        encoder
+            .write_all(html.as_bytes())
+            .expect("should write to gzip encoder");
+        let compressed_input = encoder.finish().expect("should finish gzip encoding");
 
         println!("Compressed input size: {} bytes", compressed_input.len());
 
@@ -754,7 +756,7 @@ mod tests {
         let mut compressed_output = Vec::new();
         pipeline
             .process(Cursor::new(&compressed_input), &mut compressed_output)
-            .unwrap();
+            .expect("pipeline should process gzipped HTML");
 
         // Ensure we produced output
         assert!(
@@ -765,7 +767,9 @@ mod tests {
         // Decompress and verify
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).unwrap();
+        decoder
+            .read_to_string(&mut decompressed)
+            .expect("should decompress gzip output");
 
         let remaining_urls = decompressed.matches("www.test-publisher.com").count();
         let replaced_urls = decompressed
