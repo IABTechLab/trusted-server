@@ -1,9 +1,4 @@
 name: "Run Format"
-permissions:
-  contents: read
-
-permissions:
-  contents: read
 
 on:
   push:
