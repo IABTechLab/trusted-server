@@ -95,11 +95,13 @@ Trusted Server acts as a gateway, stripping client IP addresses (privacy) before
 Proxies the Google Tag Manager library.
 
 **Request**:
+
 ```
 GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
 ```
 
 **Behavior**:
+
 - Proxies to `https://www.googletagmanager.com/gtm.js`
 - Rewrites internal URLs to use the first-party proxy
 - Strips `Accept-Encoding` during fetch to ensure rewriteable text response
@@ -109,11 +111,13 @@ GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
 Proxies analytics events (GA4/UA).
 
 **Request**:
+
 ```
 POST /integrations/google_tag_manager/g/collect?v=2&...
 ```
 
 **Behavior**:
+
 - Proxies to `https://www.google-analytics.com/g/collect`
 - Forwarding: User-Agent, Referer, Payload
 - Privacy: Does NOT forward client IP (Google sees Trusted Server IP)
@@ -121,11 +125,13 @@ POST /integrations/google_tag_manager/g/collect?v=2&...
 ## Performance & Caching
 
 ### Compression
-The integration requires the upstream `gtm.js` to be uncompressed to perform string replacement. Trusted Server fetches it with `Accept-Encoding: identity`. 
 
-*Note: Trusted Server will re-compress the response (gzip/brotli) before sending it to the user if the `compression` feature is enabled.*
+The integration requires the upstream `gtm.js` to be uncompressed to perform string replacement. Trusted Server fetches it with `Accept-Encoding: identity`.
+
+_Note: Trusted Server will re-compress the response (gzip/brotli) before sending it to the user if the `compression` feature is enabled._
 
 ### Direct Proxying
+
 Beacon requests (`/collect`) are proxied directly using streaming, minimizing latency overhead.
 
 ## Manual Verification
@@ -133,15 +139,19 @@ Beacon requests (`/collect`) are proxied directly using streaming, minimizing la
 You can verify the integration using `curl`:
 
 **Test Script Result**:
+
 ```bash
 curl -v "http://localhost:8080/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"
 ```
+
 _Expected_: `200 OK`. Body should contain `/integrations/google_tag_manager` instead of `google-analytics.com`.
 
 **Test Beacon Result**:
+
 ```bash
 curl -v -X POST "http://localhost:8080/integrations/google_tag_manager/g/collect?v=2&tid=G-TEST"
 ```
+
 _Expected_: `200 OK` (or 204).
 
 ## Implementation Details
