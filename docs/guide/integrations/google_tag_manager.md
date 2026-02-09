@@ -14,10 +14,10 @@ The Tag Gateway intercepts requests for GTM scripts (`gtm.js`) and Google Analyt
 
 **Benefits**:
 
--   **Bypass Ad Blockers**: Serving scripts from a first-party domain can prevent them from being blocked by some ad blockers and privacy extensions.
--   **Extended Cookie Life**: First-party cookies set by these scripts are more durable in environments like Safari (ITP).
--   **Performance**: Utilize edge caching for scripts.
--   **Privacy Control**: Strips client IP addresses before forwarding data to Google.
+- **Bypass Ad Blockers**: Serving scripts from a first-party domain can prevent them from being blocked by some ad blockers and privacy extensions.
+- **Extended Cookie Life**: First-party cookies set by these scripts are more durable in environments like Safari (ITP).
+- **Performance**: Utilize edge caching for scripts.
+- **Privacy Control**: Strips client IP addresses before forwarding data to Google.
 
 ## Configuration
 
@@ -32,11 +32,11 @@ container_id = "GTM-XXXXXX"
 
 ### Configuration Options
 
-| Field          | Type   | Required | Description                                       |
-| -------------- | ------ | -------- | ------------------------------------------------- |
-| `enabled`      | boolean| No       | Enable/disable integration (default: `false`)     |
-| `container_id` | string | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)        |
-| `upstream_url` | string | No       | Custom upstream URL (advanced usage)              |
+| Field          | Type    | Required | Description                                   |
+| -------------- | ------- | -------- | --------------------------------------------- |
+| `enabled`      | boolean | No       | Enable/disable integration (default: `false`) |
+| `container_id` | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)    |
+| `upstream_url` | string  | No       | Custom upstream URL (advanced usage)          |
 
 ## How It Works
 
@@ -45,11 +45,13 @@ container_id = "GTM-XXXXXX"
 When Trusted Server processes an HTML response, it automatically rewrites GTM script tags:
 
 **Before:**
+
 ```html
 <script src="https://www.googletagmanager.com/gtm.js?id=GTM-XXXXXX"></script>
 ```
 
 **After:**
+
 ```html
 <script src="/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"></script>
 ```
@@ -57,6 +59,7 @@ When Trusted Server processes an HTML response, it automatically rewrites GTM sc
 ### 2. Script Proxying
 
 When the browser requests `/integrations/google_tag_manager/gtm.js`:
+
 1.  Trusted Server fetches the original script from Google.
 2.  It modifies the script content on-the-fly to replace references to `www.google-analytics.com` and `www.googletagmanager.com` with the local proxy path.
 3.  It serves the modified script to the browser.
@@ -73,16 +76,20 @@ Trusted Server forwards these requests to Google's servers, ensuring the data is
 You can verify the integration using `curl`:
 
 **Test Script Proxy:**
+
 ```bash
 curl -v "http://your-server.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"
 ```
-*Expected*: 200 OK, and the body content should contain rewritten paths.
+
+_Expected_: 200 OK, and the body content should contain rewritten paths.
 
 **Test Beacon:**
+
 ```bash
 curl -v -X POST "http://your-server.com/integrations/google_tag_manager/g/collect?v=2&tid=G-XXXXXX..."
 ```
-*Expected*: 200/204 OK.
+
+_Expected_: 200/204 OK.
 
 ## Implementation Details
 

@@ -26,7 +26,7 @@ pub struct GoogleTagManagerConfig {
     /// GTM Container ID (e.g., "GTM-XXXXXX").
     #[validate(length(min = 1))]
     pub container_id: String,
-    /// Upstream URL for GTM (defaults to https://www.googletagmanager.com).
+    /// Upstream URL for GTM (defaults to <https://www.googletagmanager.com>).
     #[serde(default = "default_upstream")]
     pub upstream_url: String,
 }
@@ -77,6 +77,7 @@ impl GoogleTagManagerIntegration {
     }
 }
 
+#[must_use]
 pub fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
     let config = settings
         .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
@@ -116,7 +117,8 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             self.get("/gtag/js"),
             // Analytics beacons (GA4/UA)
             // Note: In a real "Tag Gateway" implementation, we'd likely need
-            // to rewrite the GTM script to point these beacons to our proxy.
+            // (e.g., `gtm.js` script tags), it will automatically rewrite the `src` attribute to point to
+            // the first-party proxy endpoint.
             self.get("/collect"),
             self.post("/collect"),
             self.get("/g/collect"),
