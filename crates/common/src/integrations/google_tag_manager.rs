@@ -607,4 +607,134 @@ container_id = "GTM-DEFAULT"
             }
         }
     }
+
+    #[test]
+    fn test_html_processing_with_fixture() {
+        // 1. Configure Settings with GTM enabled
+        let mut settings = make_settings();
+
+        // Use the ID from the fixture: GTM-522ZT3X6
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-522ZT3X6",
+                    "upstream_url": "https://www.googletagmanager.com"
+                }),
+            )
+            .expect("should update gtm config");
+
+        // 2. Setup Pipeline
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        // 3. Load Fixture
+        // Path is relative to this file: ../html_processor.test.html
+        let html_content = include_str!("../html_processor.test.html");
+
+        // 4. Run Pipeline
+        let mut output = Vec::new();
+        let result = pipeline.process(Cursor::new(html_content.as_bytes()), &mut output);
+        assert!(
+            result.is_ok(),
+            "Pipeline processing failed: {:?}",
+            result.err()
+        );
+
+        let processed = String::from_utf8_lossy(&output);
+        let encoded_id = urlencoding::encode("google_tag_manager");
+
+        // 5. Assertions
+
+        // a. Link Preload Rewrite:
+        // Original: <link rel="preload" href="https://www.googletagmanager.com/gtm.js?id=GTM-522ZT3X6" ...
+        // Expected: href="/integrations/google_tag_manager/gtm.js?id=GTM-522ZT3X6"
+        let expected_link = format!("/integrations/{}/gtm.js?id=GTM-522ZT3X6", encoded_id);
+
+        assert!(
+            processed.contains(&expected_link),
+            "Link preload tag not rewritten correctly"
+        );
+
+        assert!(
+            !processed.contains("href=\"https://www.googletagmanager.com/gtm.js?id=GTM-522ZT3X6\""),
+            "Original link preload tag should not exist"
+        );
+
+        // b. Noscript Iframe Rewrite
+        // Should NOT be rewritten for ns.html
+        assert!(
+            processed.contains("src=\"https://www.googletagmanager.com/ns.html?id=GTM-522ZT3X6\""),
+            "Noscript iframe src should NOT be rewritten (only gtm.js is targeted)"
+        );
+    }
+
+    #[test]
+    fn test_inline_script_rewriting() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-12345",
+                    "upstream_url": "https://www.googletagmanager.com"
+                }),
+            )
+            .expect("should update config");
+
+        // Inlined Pipeline Creation
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        // Synthetic HTML with inline script
+        let html_input = r#"
+            <html>
+            <head>
+                <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+                new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+                j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+                'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+                })(window,document,'script','dataLayer','GTM-12345');</script>
+            </head>
+            <body></body>
+            </html>
+        "#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process");
+        let processed = String::from_utf8_lossy(&output);
+
+        let encoded_id = urlencoding::encode("google_tag_manager");
+        let expected_src = format!("/integrations/{}/gtm.js", encoded_id);
+
+        assert!(
+            processed.contains(&expected_src),
+            "Inline script src not rewritten"
+        );
+
+        assert!(
+            !processed.contains("j.src='https://www.googletagmanager.com/gtm.js"),
+            "Original src should be gone"
+        );
+    }
 }
