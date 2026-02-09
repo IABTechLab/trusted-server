@@ -503,6 +503,7 @@ pub struct IntegrationMetadata {
     pub routes: Vec<IntegrationEndpoint>,
     pub attribute_rewriters: usize,
     pub script_selectors: Vec<&'static str>,
+    pub head_injectors: usize,
 }
 
 impl IntegrationMetadata {
@@ -512,6 +513,7 @@ impl IntegrationMetadata {
             routes: Vec::new(),
             attribute_rewriters: 0,
             script_selectors: Vec::new(),
+            head_injectors: 0,
         }
     }
 }
@@ -725,6 +727,13 @@ impl IntegrationRegistry {
             entry.script_selectors.push(rewriter.selector());
         }
 
+        for injector in &self.inner.head_injectors {
+            let entry = map
+                .entry(injector.integration_id())
+                .or_insert_with(|| IntegrationMetadata::new(injector.integration_id()));
+            entry.head_injectors += 1;
+        }
+
         map.into_values().collect()
     }
 
@@ -751,7 +760,7 @@ impl IntegrationRegistry {
     }
 
     #[cfg(test)]
-    #[must_use] 
+    #[must_use]
     pub fn from_rewriters_with_head_injectors(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,

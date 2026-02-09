@@ -111,7 +111,7 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Create an HTML processor with URL replacement and optional Prebid injection
+/// Create an HTML processor with URL replacement and integration hooks
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
@@ -474,6 +474,7 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+        IntegrationHeadInjector, IntegrationHtmlContext,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -542,6 +543,77 @@ mod tests {
 
         assert!(processed.contains("keep-me"));
         assert!(!processed.contains("remove-me"));
+    }
+
+    #[test]
+    fn integration_head_injector_prepends_after_tsjs_once() {
+        struct TestHeadInjector;
+
+        impl IntegrationHeadInjector for TestHeadInjector {
+            fn integration_id(&self) -> &'static str {
+                "test"
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                vec![r#"<script>window.__testHeadInjector=true;</script>"#.to_string()]
+            }
+        }
+
+        let html = r#"<html><head><title>Test</title></head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
+            Vec::new(),
+            Vec::new(),
+            vec![Arc::new(TestHeadInjector)],
+        );
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
+
+        let tsjs_marker = "id=\"trustedserver-js\"";
+        let head_marker = "window.__testHeadInjector=true";
+
+        assert_eq!(
+            processed.matches(tsjs_marker).count(),
+            1,
+            "should inject unified tsjs tag once"
+        );
+        assert_eq!(
+            processed.matches(head_marker).count(),
+            1,
+            "should inject head snippet once"
+        );
+
+        let tsjs_index = processed
+            .find(tsjs_marker)
+            .expect("should include unified tsjs tag");
+        let head_index = processed
+            .find(head_marker)
+            .expect("should include head snippet");
+        let title_index = processed
+            .find("<title>")
+            .expect("should keep existing head content");
+
+        assert!(
+            tsjs_index < head_index,
+            "should inject head snippet after tsjs tag"
+        );
+        assert!(
+            head_index < title_index,
+            "should prepend head snippet before existing head content"
+        );
     }
 
     #[test]
