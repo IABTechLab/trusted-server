@@ -6,7 +6,7 @@ This document explains how to integrate a new integration module with the Truste
 
 | Component                                                  | Purpose                                                                                                                                                                                                                                                      |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/common/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, and `IntegrationScriptRewriter` traits and hosts the `IntegrationRegistry`, which drives proxy routing and HTML/text rewrites.                                                               |
+| `crates/common/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                   |
 | `Settings::integrations` (`crates/common/src/settings.rs`) | Free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
 | Fastly entrypoint (`crates/fastly/src/main.rs`)            | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
 | `html_processor.rs`                                        | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
@@ -79,14 +79,15 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         IntegrationRegistration::builder("my_integration")
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
-            .with_script_rewriter(integration)
+            .with_script_rewriter(integration.clone())
+            .with_head_injector(integration)
             .with_asset("my_integration")
             .build(),
     )
 }
 ```
 
-Any combination of the three vectors may be populated. Modules that only need HTML rewrites can skip the `proxies` field altogether, and vice versa. The registry automatically iterates over the static builder list in `crates/common/src/integrations/mod.rs`, so adding the new `register` function is enough to make the integration discoverable.
+Any combination of the vectors may be populated. Modules that only need HTML rewrites can skip the `proxies` field altogether, and vice versa. The registry automatically iterates over the static builder list in `crates/common/src/integrations/mod.rs`, so adding the new `register` function is enough to make the integration discoverable.
 
 ### 4. Implement IntegrationProxy for Endpoints
 
@@ -212,6 +213,29 @@ impl IntegrationScriptRewriter for MyIntegration {
 
 ::: warning Removing Elements
 Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js` because the unified TSJS bundle is injected automatically at the start of `<head>`.
+:::
+
+### 5b. Implement Head Injection (Optional)
+
+If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts that run after the unified TSJS bundle), implement `IntegrationHeadInjector`. Snippets returned by this trait are prepended into `<head>` immediately after the TSJS bundle tag, so the `tsjs` API is available.
+
+```rust
+impl IntegrationHeadInjector for MyIntegration {
+    fn integration_id(&self) -> &'static str { "my_integration" }
+
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![format!(
+            r#"<script>tsjs.setConfig({{ mode: "my_integration", host: "{}" }});</script>"#,
+            ctx.request_host
+        )]
+    }
+}
+```
+
+`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated after the unified script tag and prepended together, so ordering between integrations is not guaranteed — keep snippets self-contained.
+
+::: tip When to Use Head Injection
+Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
 :::
 
 ### 6. Register the Module

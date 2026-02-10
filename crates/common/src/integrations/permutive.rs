@@ -12,7 +12,7 @@ use fastly::{Request, Response};
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -118,7 +118,7 @@ impl PermutiveIntegration {
         permutive_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
         permutive_req.set_header(header::ACCEPT, "application/javascript, */*");
 
-        let backend_name = ensure_backend_from_url(&sdk_url)
+        let backend_name = BackendConfig::from_url(&sdk_url, true)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
         let mut permutive_response =
@@ -208,7 +208,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.api_endpoint)
+        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
             .change_context(Self::error("Failed to determine backend for API proxy"))?;
 
         let response = target_req
@@ -277,7 +277,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.secure_signals_endpoint)
+        let backend_name = BackendConfig::from_url(&self.config.secure_signals_endpoint, true)
             .change_context(Self::error(
                 "Failed to determine backend for Secure Signals proxy",
             ))?;
@@ -342,7 +342,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://events.permutive.app")
+        let backend_name = BackendConfig::from_url("https://events.permutive.app", true)
             .change_context(Self::error("Failed to determine backend for Events proxy"))?;
 
         let response = target_req
@@ -405,7 +405,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://sync.permutive.com")
+        let backend_name = BackendConfig::from_url("https://sync.permutive.com", true)
             .change_context(Self::error("Failed to determine backend for Sync proxy"))?;
 
         let response = target_req
@@ -460,7 +460,7 @@ impl PermutiveIntegration {
         self.copy_request_headers(&req, &mut target_req);
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://cdn.permutive.com")
+        let backend_name = BackendConfig::from_url("https://cdn.permutive.com", true)
             .change_context(Self::error("Failed to determine backend for CDN proxy"))?;
 
         let response = target_req
