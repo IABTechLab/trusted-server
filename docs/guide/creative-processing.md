@@ -666,6 +666,32 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 - `replace(content)` - Replace script content
 - `remove_node()` - Delete script element
 
+### Head Injectors
+
+Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
+
+**Example**: An integration injects configuration that runs after the TSJS API is available
+
+```rust
+impl IntegrationHeadInjector for MyIntegration {
+    fn integration_id(&self) -> &'static str { "my_integration" }
+
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![format!(
+            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
+            ctx.request_host
+        )]
+    }
+}
+```
+
+**Behavior**:
+
+- Snippets are prepended into `<head>` after the TSJS bundle tag
+- Called once per HTML response
+- Multiple integrations can each contribute snippets
+- If no snippets are returned, no extra markup is added
+
 See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
 
 ## TSJS Injection
