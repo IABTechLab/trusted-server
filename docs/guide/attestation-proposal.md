@@ -657,7 +657,7 @@ flowchart TB
 | **Config tampering**     | Detectable via hash mismatch                           | Runtime hash computation + attestation             |
 | **Config authenticity**  | Verify signed config payload                           | `settings-signature` checked before parsing config |
 | **Rollback protection**  | Config version + validity window                       | Prevents replay of stale configs                   |
-| **Attestation envelope** | DSSE (Sigstore standard)                              | Avoids canonicalization ambiguity, better tooling  |
+| **Attestation envelope** | DSSE (Sigstore standard)                               | Avoids canonicalization ambiguity, better tooling  |
 | **Request binding**      | Include `attestation_hash` in signed request           | Cryptographically binds runtime claims per request |
 | **Provenance lookup**    | Include Sigstore log index or bundle                   | Enables low-latency verification                   |
 | **Multi-platform**       | Abstract via trait                                     | Same WASM binary logic, platform-specific backends |
@@ -974,7 +974,7 @@ name: Deploy Config
 on:
   push:
     paths:
-      - "trusted-server.toml"
+      - 'trusted-server.toml'
 
 jobs:
   deploy:
@@ -1383,7 +1383,7 @@ The request signing scheme should cover the attestation claims (or at least `att
 | Publisher replays old attestation     | Timestamp + per-request nonce (e.g., OpenRTB request ID) + freshness window + attestation hash bound to request sign |
 | Config store tampering                | Verify `settings-signature` before parsing or using config                                                           |
 | Rollback to stale config              | `config_version` + `published_at` + `valid_until` checks                                                             |
-| Attestation tampering                 | DSSE envelope with verified key id                                                                                  |
+| Attestation tampering                 | DSSE envelope with verified key id                                                                                   |
 | Vendor key compromise                 | Key rotation, transparency log, short-lived signatures                                                               |
 | Schema downgrade                      | Version pinning, schema hash in attestation                                                                          |
 | Side-channel config leaks             | Only expose hashes, not actual values                                                                                |
