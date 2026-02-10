@@ -46,7 +46,7 @@ Even with a perfectly attested, unmodified WASM binary, these configuration chan
 
 | What Binary Attestation Proves         | What It Does NOT Prove                      |
 | -------------------------------------- | ------------------------------------------- |
-| Code was built from a specific commit  | Which Prebid servers are configured         |
+| Code was built from a specific commit  | Which Prebid adapers are configured         |
 | Build environment wasn't tampered with | What timeout values are set                 |
 | No malicious code was injected         | Which bidders are enabled/blocked           |
 | Integration code is authentic          | Whether integration is configured correctly |
