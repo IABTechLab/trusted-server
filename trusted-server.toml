@@ -87,7 +87,13 @@ enabled = false
 sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
-rewrite_sdk = true 
+rewrite_sdk = true
+
+[integrations.gpt]
+enabled = true
+script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = true
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
