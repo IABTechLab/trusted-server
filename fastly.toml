@@ -19,8 +19,6 @@ build = """
 
 [local_server]
     address = "127.0.0.1:7676"
-    tls_cert_path = "./localhost+2.pem"
-    tls_key_path = "./localhost+2-key.pem"
     
     [local_server.backends]
 
@@ -30,6 +28,10 @@ build = """
             data = "placeholder"
 
         [[local_server.kv_stores.opid_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.creative_store]]
             key = "placeholder"
             data = "placeholder"
     [local_server.secret_stores]

@@ -23,13 +23,13 @@ use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
@@ -44,12 +44,12 @@ pub struct LockrConfig {
     #[validate(length(min = 1))]
     pub app_id: String,
 
-    /// Base URL for Lockr API (default: https://identity.lockr.kr)
+    /// Base URL for Lockr API (default: <https://identity.lockr.kr>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
 
-    /// SDK URL (default: https://aim.loc.kr/identity-lockr-v1.0.js)
+    /// SDK URL (default: <https://aim.loc.kr/identity-lockr-v1.0.js>)
     #[serde(default = "default_sdk_url")]
     #[validate(url)]
     pub sdk_url: String,
@@ -66,9 +66,16 @@ pub struct LockrConfig {
     /// Whether to rewrite the host variable in the Lockr SDK JavaScript
     #[serde(default = "default_rewrite_sdk_host")]
     pub rewrite_sdk_host: bool,
+
+    /// Override the Origin header sent to Lockr API.
+    /// Use this when running locally or from a domain not registered with Lockr.
+    /// Example: "<https://www.example.com>"
+    #[serde(default)]
+    #[validate(url)]
+    pub origin_override: Option<String>,
 }
 
-impl IntegrationConfigTrait for LockrConfig {
+impl IntegrationConfig for LockrConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -141,7 +148,7 @@ impl LockrIntegration {
         lockr_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
         lockr_req.set_header(header::ACCEPT, "application/javascript, */*");
 
-        let backend_name = ensure_backend_from_url(sdk_url)
+        let backend_name = BackendConfig::from_url(sdk_url, true)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
         let mut lockr_response =
@@ -235,7 +242,7 @@ impl LockrIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.api_endpoint)
+        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
             .change_context(Self::error("Failed to determine backend for API proxy"))?;
 
         let response = match target_req.send(backend_name) {
@@ -273,6 +280,16 @@ impl LockrIntegration {
             }
         }
 
+        // Handle Origin header - use override if configured, otherwise forward original
+        let origin = self
+            .config
+            .origin_override
+            .as_deref()
+            .or_else(|| from.get_header_str(header::ORIGIN));
+        if let Some(origin) = origin {
+            to.set_header(header::ORIGIN, origin);
+        }
+
         // Copy any X-* custom headers
         for header_name in from.get_header_names() {
             let name_str = header_name.as_str();
@@ -299,6 +316,7 @@ fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
 }
 
 /// Register the Lockr integration.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(
@@ -409,6 +427,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -430,6 +449,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -461,6 +481,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: false, // Disabled
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -481,7 +502,9 @@ mod tests {
     fn test_api_path_extraction_with_camel_case() {
         // Test that we properly extract paths with correct casing
         let path = "/integrations/lockr/api/publisher/app/v1/identityLockr/settings";
-        let extracted = path.strip_prefix("/integrations/lockr/api").unwrap();
+        let extracted = path
+            .strip_prefix("/integrations/lockr/api")
+            .expect("should strip prefix");
         assert_eq!(extracted, "/publisher/app/v1/identityLockr/settings");
     }
 
@@ -504,7 +527,9 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = input.strip_prefix("/integrations/lockr/api").unwrap();
+            let result = input
+                .strip_prefix("/integrations/lockr/api")
+                .expect("should strip prefix");
             assert_eq!(result, expected, "Failed for input: {}", input);
         }
     }
@@ -519,6 +544,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -549,6 +575,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -566,7 +593,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk_old.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // Verify the host was rewritten to the proxy endpoint
         assert!(rewritten.contains("'host': '/integrations/lockr/api'"));
@@ -589,6 +617,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -606,7 +635,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk_real.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // Verify the host was rewritten to the proxy endpoint
         assert!(rewritten.contains("'host': '/integrations/lockr/api'"));
@@ -631,6 +661,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: false, // Disabled
+            origin_override: None,
         };
 
         // When rewrite_sdk_host is false, the handle_sdk_serving function
@@ -648,6 +679,7 @@ const identityLockr = {
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
             rewrite_sdk_host: true,
+            origin_override: None,
         };
         let integration = LockrIntegration::new(config);
 
@@ -662,7 +694,8 @@ const identityLockr = {
         let result = integration.rewrite_sdk_host(mock_sdk.as_bytes().to_vec());
         assert!(result.is_ok());
 
-        let rewritten = String::from_utf8(result.unwrap()).unwrap();
+        let rewritten = String::from_utf8(result.expect("should rewrite SDK host"))
+            .expect("should be valid UTF-8");
 
         // When pattern doesn't match, content should be unchanged
         assert!(rewritten.contains("'host': 'https://example.com'"));

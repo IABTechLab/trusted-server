@@ -1,40 +1,26 @@
 # Synthetic IDs
 
-Learn about privacy-preserving synthetic ID generation in Trusted Server.
+Trusted Server's Synthetic ID module maintains user recognition across all browsers through first-party identifiers.
 
 ## What are Synthetic IDs?
 
-Synthetic IDs are privacy-safe identifiers generated using HMAC-based templates that allow tracking with user consent while protecting user privacy.
+Synthetic IDs are privacy-safe identifiers generated on a first site visit using HMAC-based templates that allow tracking with user consent while protecting user privacy. Trusted Server derives a deterministic HMAC base from the template inputs and appends a short random suffix to reduce collision risk. They are passed in requests on subsequent visits and activity.
+
+Trusted Server surfaces the current synthetic ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
 ## How They Work
 
 ### HMAC-Based Generation
 
-Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate deterministic but privacy-safe identifiers.
+Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate a deterministic base from a configurable template, then append a short random suffix.
 
-```rust
-// Example placeholder
-synthetic_id = hmac_sha256(secret_key, template_data)
-```
+**Format**: `64-hex-hmac`.`6-alphanumeric-suffix`
 
-### Template System
-
-Templates define how synthetic IDs are constructed from various input sources:
-
-- User consent signals
-- Domain information
-- Temporal data
-- Custom parameters
+**IP normalization**: IPv6 addresses are normalized to a /64 prefix before templating.
 
 ## Configuration
 
-Configure synthetic ID templates in `trusted-server.toml`:
-
-```toml
-[synthetic_ids]
-template = "{{domain}}-{{timestamp}}-{{consent_hash}}"
-secret_key = "your-secret-key"
-```
+Configure synthetic ID templates and secrets in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `synthetic` section and environment variable overrides.
 
 ## Privacy Considerations
 
@@ -42,16 +28,6 @@ secret_key = "your-secret-key"
 - No personally identifiable information (PII) is included
 - Templates are configurable per-deployment
 - IDs can be rotated on schedule
-
-## Usage Example
-
-```javascript
-// Placeholder example
-const syntheticId = await trustedServer.generateSyntheticId({
-  domain: 'example.com',
-  consent: true
-});
-```
 
 ## Best Practices
 
@@ -64,3 +40,4 @@ const syntheticId = await trustedServer.generateSyntheticId({
 
 - Learn about [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)
+- Learn about [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams

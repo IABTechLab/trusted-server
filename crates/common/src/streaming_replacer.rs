@@ -31,6 +31,7 @@ impl StreamingReplacer {
     /// # Arguments
     ///
     /// * `replacements` - List of string replacements to perform
+    #[must_use]
     pub fn new(replacements: Vec<Replacement>) -> Self {
         // Calculate the maximum pattern length we need to buffer
         let max_pattern_length = replacements.iter().map(|r| r.find.len()).max().unwrap_or(0);
@@ -48,6 +49,7 @@ impl StreamingReplacer {
     ///
     /// * `find` - The string to find
     /// * `replace_with` - The string to replace it with
+    #[must_use]
     pub fn new_single(find: &str, replace_with: &str) -> Self {
         Self::new(vec![Replacement {
             find: find.to_string(),
@@ -146,10 +148,11 @@ impl StreamingReplacer {
 }
 
 // Note: The stream_process function has been removed in favor of using
-// StreamingPipeline from the streaming_processor module, which provides
+// `StreamingPipeline` from the `streaming_processor` module, which provides
 // a more comprehensive solution with compression support.
 
-/// Helper function to create a StreamingReplacer for URL replacements
+/// Helper function to create a `StreamingReplacer` for URL replacements
+#[must_use]
 pub fn create_url_replacer(
     origin_host: &str,
     origin_url: &str,
@@ -201,7 +204,7 @@ mod tests {
 
         let input = b"Visit https://origin.example.com for more info";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(result, "Visit https://test.example.com for more info");
     }
@@ -221,7 +224,8 @@ mod tests {
         let processed1 = replacer.process_chunk(chunk1, false);
         let processed2 = replacer.process_chunk(chunk2, true);
 
-        let result = String::from_utf8([processed1, processed2].concat()).unwrap();
+        let result = String::from_utf8([processed1, processed2].concat())
+            .expect("output should be valid UTF-8");
         assert_eq!(result, "Visit https://test.example.com for more info");
     }
 
@@ -243,7 +247,7 @@ mod tests {
         let input =
             b"<a href='https://origin.example.com'>Link</a> and //origin.example.com/resource";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert!(result.contains("https://test.example.com"));
         assert!(result.contains("//test.example.com/resource"));
@@ -278,7 +282,7 @@ mod tests {
             result.extend(processed);
         }
 
-        let result_str = String::from_utf8(result).unwrap();
+        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         assert_eq!(result_str, "https://test.example.com");
     }
 
@@ -307,7 +311,7 @@ mod tests {
         "#;
 
         let processed = replacer.process_chunk(content.as_bytes(), true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         // Verify all patterns were replaced
         assert!(result.contains("https://test.example.com/page"));
@@ -332,7 +336,7 @@ mod tests {
         let content =
             b"Visit https://origin.example.com:8080/api or //origin.example.com:8080/resource";
         let processed = replacer.process_chunk(content, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(
             result,
@@ -356,7 +360,7 @@ mod tests {
         "#;
 
         let processed = replacer.process_chunk(content.as_bytes(), true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         // When request is HTTP, all URLs should be replaced with HTTP
         assert!(result.contains("http://test.example.com"));
@@ -381,7 +385,7 @@ mod tests {
             result.extend(replacer.process_chunk(chunk, is_last));
         }
 
-        let result_str = String::from_utf8(result).unwrap();
+        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(result_str.contains("https://test.com/test"));
         assert!(result_str.contains("https://test.com/more"));
         assert!(result_str.contains("思怙ᕏ测试"));
@@ -403,7 +407,7 @@ mod tests {
         result.extend(replacer.process_chunk(chunk1, false));
         result.extend(replacer.process_chunk(chunk2, true));
 
-        let result_str = String::from_utf8(result).unwrap();
+        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(result_str.contains("https://new.com/før/bår/test"));
     }
 
@@ -417,7 +421,7 @@ mod tests {
 
         // Process the entire content at once to verify it works
         let all_at_once = replacer.process_chunk(content, true);
-        let expected = String::from_utf8(all_at_once).unwrap();
+        let expected = String::from_utf8(all_at_once).expect("output should be valid UTF-8");
         assert!(expected.contains("https://test.com/test"));
         assert!(expected.contains("https://test.com/more"));
     }
@@ -441,7 +445,7 @@ mod tests {
             result.extend(replacer.process_chunk(chunk, is_last));
         }
 
-        let result_str = String::from_utf8(result).unwrap();
+        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(result_str.contains("https://test.com/page1"));
         assert!(result_str.contains("https://test.com/page2"));
     }
@@ -463,7 +467,7 @@ mod tests {
             result.extend(replacer.process_chunk(chunk, is_last));
         }
 
-        let result_str = String::from_utf8(result).unwrap();
+        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         // Just verify the content is preserved correctly
         assert!(result_str.contains("思怙ᕏ测试"));
         assert!(result_str.contains("🎉"));
@@ -487,7 +491,7 @@ mod tests {
 
         let input = b"The color is gray, not light gray.";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(result, "The colour is grey, not light grey.");
     }
@@ -510,7 +514,7 @@ mod tests {
 
         let input = b"Say hello world and hello there!";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         // Note: Since we apply replacements in order, "hello world" gets replaced first
         assert_eq!(result, "Say greetings universe and hi there!");
@@ -534,7 +538,7 @@ mod tests {
 
         let input = b"abcdef";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         // "abc" gets replaced first, so "bcd" is no longer found
         assert_eq!(result, "xyzdef");
@@ -547,7 +551,7 @@ mod tests {
 
         let input = b"Keep this REMOVE_ME but not this";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(result, "Keep this  but not this");
     }
@@ -559,7 +563,7 @@ mod tests {
 
         let input = b"Hello world, hello there, HELLO!";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(result, "Hi world, hello there, HELLO!");
     }
@@ -582,7 +586,7 @@ mod tests {
 
         let input = b"The cost: $10.99 [TAG] is final";
         let processed = replacer.process_chunk(input, true);
-        let result = String::from_utf8(processed).unwrap();
+        let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
         assert_eq!(result, "The price: €9.99 <LABEL> is final");
     }
@@ -616,9 +620,9 @@ mod tests {
 
         pipeline
             .process(Cursor::new(input.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process input");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert_eq!(result, "hi world, bar is bar");
     }
 
@@ -644,9 +648,9 @@ mod tests {
 
         pipeline
             .process(Cursor::new(input.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process input");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert_eq!(result, expected);
     }
 
@@ -665,7 +669,9 @@ mod tests {
         };
         let mut pipeline = StreamingPipeline::new(config, replacer);
 
-        pipeline.process(Cursor::new(b""), &mut output).unwrap();
+        pipeline
+            .process(Cursor::new(b""), &mut output)
+            .expect("pipeline should process empty input");
 
         assert!(output.is_empty());
     }
@@ -691,9 +697,9 @@ mod tests {
 
         pipeline
             .process(Cursor::new(input.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process input");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert_eq!(result, "hi world");
     }
 }

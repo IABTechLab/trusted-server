@@ -12,13 +12,13 @@ use fastly::{Request, Response};
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::settings::{IntegrationConfig as IntegrationConfigTrait, Settings};
+use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
@@ -41,12 +41,12 @@ pub struct PermutiveConfig {
     #[serde(default)]
     pub project_id: String,
 
-    /// Base URL for Permutive API (default: https://api.permutive.com)
+    /// Base URL for Permutive API (default: <https://api.permutive.com>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
 
-    /// Base URL for Permutive Secure Signals (default: https://secure-signals.permutive.app)
+    /// Base URL for Permutive Secure Signals (default: <https://secure-signals.permutive.app>)
     #[serde(default = "default_secure_signals_endpoint")]
     #[validate(url)]
     pub secure_signals_endpoint: String,
@@ -61,7 +61,7 @@ pub struct PermutiveConfig {
     pub rewrite_sdk: bool,
 }
 
-impl IntegrationConfigTrait for PermutiveConfig {
+impl IntegrationConfig for PermutiveConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -85,7 +85,7 @@ impl PermutiveIntegration {
     }
 
     /// Build the Permutive SDK URL from configuration.
-    /// Returns URL like: https://myorg.edge.permutive.app/workspace-12345-web.js
+    /// Returns URL like: <https://myorg.edge.permutive.app/workspace-12345-web.js>
     fn sdk_url(&self) -> String {
         format!(
             "https://{}.edge.permutive.app/{}-web.js",
@@ -118,7 +118,7 @@ impl PermutiveIntegration {
         permutive_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
         permutive_req.set_header(header::ACCEPT, "application/javascript, */*");
 
-        let backend_name = ensure_backend_from_url(&sdk_url)
+        let backend_name = BackendConfig::from_url(&sdk_url, true)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
         let mut permutive_response =
@@ -208,7 +208,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.api_endpoint)
+        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
             .change_context(Self::error("Failed to determine backend for API proxy"))?;
 
         let response = target_req
@@ -277,7 +277,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url(&self.config.secure_signals_endpoint)
+        let backend_name = BackendConfig::from_url(&self.config.secure_signals_endpoint, true)
             .change_context(Self::error(
                 "Failed to determine backend for Secure Signals proxy",
             ))?;
@@ -342,7 +342,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://events.permutive.app")
+        let backend_name = BackendConfig::from_url("https://events.permutive.app", true)
             .change_context(Self::error("Failed to determine backend for Events proxy"))?;
 
         let response = target_req
@@ -405,7 +405,7 @@ impl PermutiveIntegration {
         }
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://sync.permutive.com")
+        let backend_name = BackendConfig::from_url("https://sync.permutive.com", true)
             .change_context(Self::error("Failed to determine backend for Sync proxy"))?;
 
         let response = target_req
@@ -460,7 +460,7 @@ impl PermutiveIntegration {
         self.copy_request_headers(&req, &mut target_req);
 
         // Get backend and forward
-        let backend_name = ensure_backend_from_url("https://cdn.permutive.com")
+        let backend_name = BackendConfig::from_url("https://cdn.permutive.com", true)
             .change_context(Self::error("Failed to determine backend for CDN proxy"))?;
 
         let response = target_req
@@ -521,6 +521,7 @@ fn build(settings: &Settings) -> Option<Arc<PermutiveIntegration>> {
 }
 
 /// Register the Permutive integration.
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
     Some(

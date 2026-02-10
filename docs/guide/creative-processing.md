@@ -58,22 +58,32 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 **Elements**: `<img>`, `<input type="image">`
 
 **Attributes**:
+
 - `src` - Primary image source
 - `data-src` - Lazy-loading source
 - `srcset` - Responsive image sources
 - `imagesrcset` - Image set (used in `<link>`)
 
 **Example**:
+
 ```html
 <!-- Original -->
-<img src="https://cdn.example.com/banner.jpg" 
-     srcset="https://cdn.example.com/banner@1x.jpg 1x,
-             https://cdn.example.com/banner@2x.jpg 2x">
+<img
+  src="https://cdn.example.com/banner.jpg"
+  srcset="
+    https://cdn.example.com/banner@1x.jpg 1x,
+    https://cdn.example.com/banner@2x.jpg 2x
+  "
+/>
 
 <!-- Rewritten -->
-<img src="/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
-     srcset="/first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
-             /first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x">
+<img
+  src="/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
+  srcset="
+    /first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
+    /first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x
+  "
+/>
 ```
 
 ### Scripts
@@ -81,9 +91,11 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 **Elements**: `<script>`
 
 **Attributes**:
+
 - `src` - Script source URL
 
 **Example**:
+
 ```html
 <!-- Original -->
 <script src="https://cdn.example.com/tracker.js"></script>
@@ -97,18 +109,23 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 **Elements**: `<video>`, `<audio>`, `<source>`
 
 **Attributes**:
+
 - `src` - Media source URL
 
 **Example**:
+
 ```html
 <!-- Original -->
 <video>
-  <source src="https://cdn.example.com/video.mp4" type="video/mp4">
+  <source src="https://cdn.example.com/video.mp4" type="video/mp4" />
 </video>
 
 <!-- Rewritten -->
 <video>
-  <source src="/first-party/proxy?tsurl=https://cdn.example.com/video.mp4&tstoken=sig" type="video/mp4">
+  <source
+    src="/first-party/proxy?tsurl=https://cdn.example.com/video.mp4&tstoken=sig"
+    type="video/mp4"
+  />
 </video>
 ```
 
@@ -117,18 +134,24 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 **Elements**: `<object>`, `<embed>`
 
 **Attributes**:
+
 - `data` - Object data source (`<object>`)
 - `src` - Embed source (`<embed>`)
 
 **Example**:
+
 ```html
 <!-- Original -->
 <object data="https://example.com/flash.swf"></object>
-<embed src="https://example.com/media.swf">
+<embed src="https://example.com/media.swf" />
 
 <!-- Rewritten -->
-<object data="/first-party/proxy?tsurl=https://example.com/flash.swf&tstoken=sig"></object>
-<embed src="/first-party/proxy?tsurl=https://example.com/media.swf&tstoken=sig">
+<object
+  data="/first-party/proxy?tsurl=https://example.com/flash.swf&tstoken=sig"
+></object>
+<embed
+  src="/first-party/proxy?tsurl=https://example.com/media.swf&tstoken=sig"
+/>
 ```
 
 ### Iframes
@@ -136,15 +159,19 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 **Elements**: `<iframe>`
 
 **Attributes**:
+
 - `src` - Frame source URL
 
 **Example**:
+
 ```html
 <!-- Original -->
 <iframe src="https://advertiser.com/creative.html"></iframe>
 
 <!-- Rewritten -->
-<iframe src="/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"></iframe>
+<iframe
+  src="/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"
+></iframe>
 ```
 
 ::: warning Nested Iframes
@@ -156,23 +183,33 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 **Elements**: `<link>`
 
 **Attributes**:
+
 - `href` - Link target (stylesheets, preload, prefetch)
 - `imagesrcset` - Responsive images in link preload
 
 **Conditions**: Only rewritten when `rel` attribute matches:
+
 - `stylesheet`
 - `preload`
 - `prefetch`
 
 **Example**:
+
 ```html
 <!-- Original -->
-<link rel="stylesheet" href="https://cdn.example.com/styles.css">
-<link rel="preload" href="https://cdn.example.com/font.woff2" as="font">
+<link rel="stylesheet" href="https://cdn.example.com/styles.css" />
+<link rel="preload" href="https://cdn.example.com/font.woff2" as="font" />
 
 <!-- Rewritten -->
-<link rel="stylesheet" href="/first-party/proxy?tsurl=https://cdn.example.com/styles.css&tstoken=sig">
-<link rel="preload" href="/first-party/proxy?tsurl=https://cdn.example.com/font.woff2&tstoken=sig" as="font">
+<link
+  rel="stylesheet"
+  href="/first-party/proxy?tsurl=https://cdn.example.com/styles.css&tstoken=sig"
+/>
+<link
+  rel="preload"
+  href="/first-party/proxy?tsurl=https://cdn.example.com/font.woff2&tstoken=sig"
+  as="font"
+/>
 ```
 
 ### Anchors (Click Tracking)
@@ -180,17 +217,22 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 **Elements**: `<a>`, `<area>`
 
 **Attributes**:
+
 - `href` - Link destination
 
 **Rewrite Mode**: Uses `/first-party/click` for direct redirects
 
 **Example**:
+
 ```html
 <!-- Original -->
 <a href="https://advertiser.com/product?id=123">Buy Now</a>
 
 <!-- Rewritten -->
-<a href="/first-party/click?tsurl=https://advertiser.com/product&id=123&tstoken=sig">Buy Now</a>
+<a
+  href="/first-party/click?tsurl=https://advertiser.com/product&id=123&tstoken=sig"
+  >Buy Now</a
+>
 ```
 
 ::: tip Click vs Proxy
@@ -202,10 +244,12 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 **Elements**: SVG `<image>`, `<use>`
 
 **Attributes**:
+
 - `href` - SVG 2.0 syntax
 - `xlink:href` - SVG 1.1 legacy syntax
 
 **Example**:
+
 ```html
 <!-- Original -->
 <svg>
@@ -215,8 +259,12 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 
 <!-- Rewritten -->
 <svg>
-  <image href="/first-party/proxy?tsurl=https://cdn.example.com/icon.svg&tstoken=sig" />
-  <use xlink:href="/first-party/proxy?tsurl=https://cdn.example.com/sprite.svg&tstoken=sig#icon" />
+  <image
+    href="/first-party/proxy?tsurl=https://cdn.example.com/icon.svg&tstoken=sig"
+  />
+  <use
+    xlink:href="/first-party/proxy?tsurl=https://cdn.example.com/sprite.svg&tstoken=sig#icon"
+  />
 </svg>
 ```
 
@@ -227,12 +275,15 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 **Patterns**: Rewrites `url(...)` values in CSS
 
 **Example**:
+
 ```html
 <!-- Original -->
 <div style="background: url(https://cdn.example.com/bg.png) no-repeat;">
-
-<!-- Rewritten -->
-<div style="background: url(/first-party/proxy?tsurl=https://cdn.example.com/bg.png&tstoken=sig) no-repeat;">
+  <!-- Rewritten -->
+  <div
+    style="background: url(/first-party/proxy?tsurl=https://cdn.example.com/bg.png&tstoken=sig) no-repeat;"
+  ></div>
+</div>
 ```
 
 ### Style Blocks
@@ -242,17 +293,26 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 **Patterns**: Rewrites all `url(...)` occurrences in CSS
 
 **Example**:
+
 ```html
 <!-- Original -->
 <style>
-  .header { background-image: url(https://cdn.example.com/header.jpg); }
-  .logo { background: url('https://cdn.example.com/logo.png'); }
+  .header {
+    background-image: url(https://cdn.example.com/header.jpg);
+  }
+  .logo {
+    background: url('https://cdn.example.com/logo.png');
+  }
 </style>
 
 <!-- Rewritten -->
 <style>
-  .header { background-image: url(/first-party/proxy?tsurl=https://cdn.example.com/header.jpg&tstoken=sig); }
-  .logo { background: url('/first-party/proxy?tsurl=https://cdn.example.com/logo.png&tstoken=sig'); }
+  .header {
+    background-image: url(/first-party/proxy?tsurl=https://cdn.example.com/header.jpg&tstoken=sig);
+  }
+  .logo {
+    background: url('/first-party/proxy?tsurl=https://cdn.example.com/logo.png&tstoken=sig');
+  }
 </style>
 ```
 
@@ -265,6 +325,7 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 **Rewritten**: ✅ Yes
 
 **Examples**:
+
 ```
 ✅ https://cdn.example.com/image.png
 ✅ http://tracker.example.com/pixel.gif
@@ -279,6 +340,7 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 **Rewritten**: ✅ Yes (normalized to `https://`)
 
 **Examples**:
+
 ```
 Original: //cdn.example.com/script.js
 Normalized: https://cdn.example.com/script.js
@@ -288,6 +350,7 @@ Rewritten: /first-party/proxy?tsurl=https://cdn.example.com/script.js&tstoken=si
 ### Relative URLs
 
 **Patterns**:
+
 - Starts with `/` (absolute path)
 - Starts with `./` or `../` (relative path)
 - No scheme prefix (relative)
@@ -295,6 +358,7 @@ Rewritten: /first-party/proxy?tsurl=https://cdn.example.com/script.js&tstoken=si
 **Rewritten**: ❌ No
 
 **Examples**:
+
 ```
 ❌ /assets/image.png
 ❌ ./local.jpg
@@ -309,6 +373,7 @@ Relative URLs already point to your domain (publisher origin). Rewriting them wo
 ### Non-Network Schemes
 
 **Skipped Schemes**:
+
 - `data:` - Data URIs (inline content)
 - `javascript:` - JavaScript execution
 - `mailto:` - Email links
@@ -319,6 +384,7 @@ Relative URLs already point to your domain (publisher origin). Rewriting them wo
 **Rewritten**: ❌ No
 
 **Examples**:
+
 ```
 ❌ data:image/png;base64,iVBORw0KGgo...
 ❌ javascript:void(0)
@@ -337,22 +403,28 @@ Srcset attributes contain comma-separated candidates with optional descriptors:
 **Format**: `url descriptor, url descriptor, ...`
 
 **Descriptors**:
+
 - `1x`, `2x`, `3x` - Pixel density
 - `100w`, `200w` - Width in pixels
 
 ### Parsing Rules
 
 **Robust Comma Handling**:
+
 - Splits on commas with or without spaces
 - Preserves `data:` URIs (doesn't split on internal commas)
 - Handles irregular spacing
 
 **Example**:
+
 ```html
 <!-- Various spacing patterns -->
-srcset="url1.jpg 1x, url2.jpg 2x"  <!-- standard -->
-srcset="url1.jpg 1x,url2.jpg 2x"   <!-- no space after comma -->
-srcset="url1.jpg   1x  ,  url2.jpg  2x"  <!-- extra spaces -->
+srcset="url1.jpg 1x, url2.jpg 2x"
+<!-- standard -->
+srcset="url1.jpg 1x,url2.jpg 2x"
+<!-- no space after comma -->
+srcset="url1.jpg 1x , url2.jpg 2x"
+<!-- extra spaces -->
 ```
 
 ### Descriptor Preservation
@@ -361,18 +433,22 @@ Descriptors are preserved exactly as written:
 
 ```html
 <!-- Original -->
-<img srcset="
-  https://cdn.com/small.jpg 480w,
-  https://cdn.com/medium.jpg 800w,
-  https://cdn.com/large.jpg 1200w
-">
+<img
+  srcset="
+    https://cdn.com/small.jpg   480w,
+    https://cdn.com/medium.jpg  800w,
+    https://cdn.com/large.jpg  1200w
+  "
+/>
 
 <!-- Rewritten -->
-<img srcset="
-  /first-party/proxy?tsurl=https://cdn.com/small.jpg&tstoken=sig1 480w,
-  /first-party/proxy?tsurl=https://cdn.com/medium.jpg&tstoken=sig2 800w,
-  /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig3 1200w
-">
+<img
+  srcset="
+    /first-party/proxy?tsurl=https://cdn.com/small.jpg&tstoken=sig1   480w,
+    /first-party/proxy?tsurl=https://cdn.com/medium.jpg&tstoken=sig2  800w,
+    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig3  1200w
+  "
+/>
 ```
 
 ### Mixed URL Types
@@ -381,16 +457,15 @@ Srcset can mix absolute and relative URLs:
 
 ```html
 <!-- Original -->
-<img srcset="
-  /local/small.jpg 1x,
-  https://cdn.com/large.jpg 2x
-">
+<img srcset="/local/small.jpg 1x, https://cdn.com/large.jpg 2x" />
 
 <!-- Rewritten (only absolute URL) -->
-<img srcset="
-  /local/small.jpg 1x,
-  /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig 2x
-">
+<img
+  srcset="
+    /local/small.jpg                                               1x,
+    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig 2x
+  "
+/>
 ```
 
 ## CSS URL Rewriting
@@ -449,14 +524,14 @@ Properties can have multiple `url()` values:
 ```css
 /* Original */
 .element {
-  background: 
+  background:
     url(https://cdn.com/top.png) top,
     url(https://cdn.com/bottom.png) bottom;
 }
 
 /* Rewritten */
 .element {
-  background: 
+  background:
     url(/first-party/proxy?tsurl=https://cdn.com/top.png&tstoken=sig1) top,
     url(/first-party/proxy?tsurl=https://cdn.com/bottom.png&tstoken=sig2) bottom;
 }
@@ -515,21 +590,27 @@ Matches:
 ### Use Cases
 
 **Trusted Partners**:
+
 ```toml
 exclude_domains = ["*.trusted-cdn.com"]
 ```
+
 Skip rewriting for partners already providing first-party scripts.
 
 **Development**:
+
 ```toml
 exclude_domains = ["localhost", "127.0.0.1"]
 ```
+
 Avoid proxying local development servers.
 
 **Same-Origin Resources**:
+
 ```toml
 exclude_domains = ["assets.publisher.com"]
 ```
+
 Skip resources already on your domain.
 
 ## Integration Hooks
@@ -542,8 +623,8 @@ Integrations can override attribute rewriting:
 
 ```rust
 impl IntegrationAttributeRewriter for NextJsIntegration {
-    fn rewrite(&self, attr_name: &str, attr_value: &str, ctx: &Context) 
-        -> AttributeRewriteAction 
+    fn rewrite(&self, attr_name: &str, attr_value: &str, ctx: &Context)
+        -> AttributeRewriteAction
     {
         if attr_name == "href" && attr_value.contains(&ctx.origin_host) {
             let rewritten = attr_value.replace(&ctx.origin_host, &ctx.request_host);
@@ -555,6 +636,7 @@ impl IntegrationAttributeRewriter for NextJsIntegration {
 ```
 
 **Actions**:
+
 - `keep()` - Leave attribute unchanged
 - `replace(value)` - Change attribute value
 - `remove_element()` - Delete entire element
@@ -570,7 +652,7 @@ impl IntegrationScriptRewriter for NextJsIntegration {
     fn selector(&self) -> &'static str {
         "script#__NEXT_DATA__"
     }
-    
+
     fn rewrite(&self, content: &str, ctx: &Context) -> ScriptRewriteAction {
         let rewritten = rewrite_next_data_urls(content, ctx);
         ScriptRewriteAction::replace(rewritten)
@@ -579,9 +661,36 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 ```
 
 **Actions**:
+
 - `keep()` - Leave script unchanged
 - `replace(content)` - Replace script content
 - `remove_node()` - Delete script element
+
+### Head Injectors
+
+Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
+
+**Example**: An integration injects configuration that runs after the TSJS API is available
+
+```rust
+impl IntegrationHeadInjector for MyIntegration {
+    fn integration_id(&self) -> &'static str { "my_integration" }
+
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![format!(
+            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
+            ctx.request_host
+        )]
+    }
+}
+```
+
+**Behavior**:
+
+- Snippets are prepended into `<head>` after the TSJS bundle tag
+- Called once per HTML response
+- Multiple integrations can each contribute snippets
+- If no snippets are returned, no extra markup is added
 
 See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
 
@@ -594,8 +703,13 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 **Location**: Start of `<head>` element
 
 **Tag**:
+
 ```html
-<script async src="/static/tsjs-core.min.js" data-tsjs-integration="core"></script>
+<script
+  async
+  src="/static/tsjs-core.min.js"
+  data-tsjs-integration="core"
+></script>
 ```
 
 **Timing**: Injected **once per HTML response** before any other scripts.
@@ -611,10 +725,19 @@ IntegrationRegistration::builder("my_integration")
 ```
 
 **Result**:
+
 ```html
 <head>
-  <script async src="/static/tsjs-core.min.js" data-tsjs-integration="core"></script>
-  <script async src="/static/tsjs-my_integration.min.js" data-tsjs-integration="my_integration"></script>
+  <script
+    async
+    src="/static/tsjs-core.min.js"
+    data-tsjs-integration="core"
+  ></script>
+  <script
+    async
+    src="/static/tsjs-my_integration.min.js"
+    data-tsjs-integration="my_integration"
+  ></script>
   <!-- Rest of head content -->
 </head>
 ```
@@ -636,12 +759,14 @@ Available bundles (from `crates/js/lib/src/integrations/`):
 HTML is processed in **chunks** (default 8192 bytes):
 
 **Benefits**:
+
 - Low memory footprint
 - Handles large creatives
 - Incremental output
 - Fast first byte
 
 **Trade-offs**:
+
 - Cannot access full DOM
 - Element-by-element processing
 - No look-ahead
@@ -649,6 +774,7 @@ HTML is processed in **chunks** (default 8192 bytes):
 ### Compression
 
 **Buffered Mode** (with rewriting):
+
 ```
 Origin Response (gzipped)
   ↓ Decompress
@@ -660,6 +786,7 @@ Client
 ```
 
 **Streaming Mode** (no rewriting):
+
 ```
 Origin Response (gzipped)
   ↓ Passthrough
@@ -673,11 +800,13 @@ Use streaming for binary/large files to preserve compression.
 Rewritten creatives can be cached:
 
 **Cache Key Components**:
+
 - Original creative URL
 - Publisher domain
 - Integration configuration
 
 **Headers to Set**:
+
 ```http
 Cache-Control: public, max-age=3600
 Vary: Accept-Encoding
@@ -698,22 +827,24 @@ log::debug!("creative: skipped non-network scheme {}", url);
 ### Testing Rewrites
 
 **Manual Testing**:
+
 1. Save original creative HTML to file
 2. Pass through rewrite function
 3. Compare output
 
 ```rust
 let original = "<img src=\"https://tracker.com/pixel.gif\">";
-let rewritten = rewrite_creative_html(original, &settings);
+let rewritten = rewrite_creative_html(&settings, original);
 assert!(rewritten.contains("/first-party/proxy"));
 ```
 
 **Integration Tests**:
+
 ```rust
 #[test]
 fn test_image_src_rewrite() {
     let html = r#"<img src="https://cdn.example.com/banner.jpg">"#;
-    let result = rewrite_creative_html(html, &test_settings());
+    let result = rewrite_creative_html(&test_settings(), html);
     assert!(result.contains("/first-party/proxy?tsurl="));
     assert!(result.contains("&tstoken="));
 }
@@ -722,14 +853,17 @@ fn test_image_src_rewrite() {
 ### Common Issues
 
 **Relative URLs Not Working**:
+
 - Ensure origin response includes proper `<base>` tag
 - Or convert to absolute URLs before rewriting
 
 **Data URIs Being Rewritten**:
+
 - Should be automatically skipped
 - Check for malformed `data:` scheme
 
 **Srcset Parsing Errors**:
+
 - Verify comma-separated format
 - Check for unclosed quotes
 
@@ -749,7 +883,7 @@ All rewritten URLs are validated:
 Recommended CSP headers for rewritten creatives:
 
 ```http
-Content-Security-Policy: 
+Content-Security-Policy:
   default-src 'self';
   img-src 'self' /first-party/proxy;
   script-src 'self' /static/tsjs;
@@ -760,11 +894,13 @@ Content-Security-Policy:
 ### Injection Prevention
 
 **Automatic Protection**:
+
 - URLs are properly encoded
 - No raw user input in rewrites
 - Signature prevents tampering
 
 **Manual Checks**:
+
 - Validate origin creative sources
 - Sanitize user-generated content
 - Monitor for suspicious patterns
@@ -774,12 +910,14 @@ Content-Security-Policy:
 ### Configuration
 
 ✅ **Do**:
+
 - Use strong `proxy_secret` (32+ bytes random)
 - Exclude trusted first-party domains
 - Set appropriate cache headers
 - Test rewrites before production
 
 ❌ **Don't**:
+
 - Hardcode secrets in source
 - Rewrite same-origin URLs unnecessarily
 - Skip signature validation
@@ -788,12 +926,14 @@ Content-Security-Policy:
 ### Performance
 
 ✅ **Do**:
+
 - Use streaming for large/binary responses
 - Enable compression at edge
 - Cache rewritten creatives
 - Monitor rewrite latency
 
 ❌ **Don't**:
+
 - Buffer entire response unnecessarily
 - Rewrite on every request (cache!)
 - Process non-HTML/CSS with rewriter

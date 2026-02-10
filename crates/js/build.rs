@@ -1,7 +1,11 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use build_print::{info, warn};
 
 const UNIFIED_BUNDLE: &str = "tsjs-unified.js";
 
@@ -32,21 +36,23 @@ fn main() {
     // If Node/npm is absent, keep going if dist exists
     let npm = which::which("npm").ok();
     if npm.is_none() {
-        println!("cargo:warning=tsjs: npm not found; will use existing dist if available");
+        warn!("tsjs: npm not found; will use existing dist if available");
     }
 
     // Install deps if node_modules missing
     if !skip {
-        if let Some(npm_path) = npm.clone() {
+        if let Some(npm_path) = npm.as_deref() {
             if !ts_dir.join("node_modules").exists() {
-                let status = Command::new(npm_path.clone())
+                let status = Command::new(npm_path)
                     .arg("install")
                     .current_dir(&ts_dir)
                     .status();
-                if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
-                    println!(
-                        "cargo:warning=tsjs: npm install failed; using existing dist if available"
-                    );
+                if !status
+                    .as_ref()
+                    .map(std::process::ExitStatus::success)
+                    .unwrap_or(false)
+                {
+                    warn!("tsjs: npm install failed; using existing dist if available");
                 }
             }
         }
@@ -54,7 +60,7 @@ fn main() {
 
     // Run tests if requested
     if !skip && npm.is_some() && env::var("TSJS_TEST").map(|v| v == "1").unwrap_or(false) {
-        let _ = Command::new(npm.clone().unwrap())
+        let _ = Command::new(npm.as_deref().unwrap())
             .args(["run", "test", "--", "--run"]) // ensure non-watch
             .current_dir(&ts_dir)
             .status();
@@ -62,22 +68,26 @@ fn main() {
 
     // Build unified bundle
     if !skip {
-        if let Some(npm_path) = npm.clone() {
-            println!("cargo:warning=tsjs: Building unified bundle");
+        if let Some(npm_path) = npm.as_deref() {
+            info!("tsjs: Building unified bundle");
             let js_modules = env::var("TSJS_MODULES").unwrap_or("".to_string());
 
-            let status = Command::new(&npm_path)
+            let status = Command::new(npm_path)
                 .env("TSJS_MODULES", js_modules)
-                .args(["run", "build:custom"])
+                .args(["run", "build"])
                 .current_dir(&ts_dir)
                 .status();
-            if !status.as_ref().map(|s| s.success()).unwrap_or(false) {
-                panic!("tsjs: npm run build:custom failed - refusing to use stale bundle");
+            if !status
+                .as_ref()
+                .map(std::process::ExitStatus::success)
+                .unwrap_or(false)
+            {
+                panic!("tsjs: npm run build failed - refusing to use stale bundle");
             }
         }
     }
 
-    // Copy unified bundle into OUT_DIR for include_str!
+    // Copy bundle into OUT_DIR for include_str!
     copy_bundle(UNIFIED_BUNDLE, true, &crate_dir, &dist_dir, &out_dir);
 }
 

@@ -56,6 +56,7 @@ fn default_max_combined_payload_bytes() -> usize {
     10 * 1024 * 1024
 }
 
+#[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let config = match build(settings) {
         Some(config) => {
@@ -142,7 +143,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -155,7 +156,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let processed = String::from_utf8_lossy(&output);
 
         // Note: URLs may have padding characters for length preservation
@@ -205,7 +206,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -218,7 +219,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -253,7 +254,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -266,7 +267,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -304,7 +305,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -317,7 +318,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
         let final_html = String::from_utf8_lossy(&output);
 
@@ -370,7 +371,7 @@ mod tests {
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -383,7 +384,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let final_html = String::from_utf8_lossy(&output);
 
         // RSC payloads should be rewritten via post-processing
@@ -442,7 +443,7 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::new(&settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         // Use small chunk size to force fragmentation
@@ -456,7 +457,7 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
         let final_html = String::from_utf8_lossy(&output);
 
         // Non-RSC scripts should be preserved

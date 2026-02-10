@@ -18,6 +18,10 @@ use crate::settings::Settings;
 /// This endpoint provides a standardized discovery mechanism following the IAB
 /// Data Subject Rights framework pattern. It returns JWKS keys and API endpoints
 /// in a single discoverable location.
+///
+/// # Errors
+///
+/// Returns an error if JWKS cannot be retrieved, parsed, or serialized.
 pub fn handle_trusted_server_discovery(
     _settings: &Settings,
     _req: Request,
@@ -65,6 +69,10 @@ pub struct VerifySignatureResponse {
 
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures
+///
+/// # Errors
+///
+/// Returns an error if the request body cannot be parsed as JSON or if verification fails.
 pub fn handle_verify_signature(
     _settings: &Settings,
     mut req: Request,
@@ -132,6 +140,10 @@ pub struct RotateKeyResponse {
 }
 
 /// Rotates the current active kid by generating and saving a new one
+///
+/// # Errors
+///
+/// Returns an error if the request signing settings are missing, JSON parsing fails, or key rotation fails.
 pub fn handle_rotate_key(
     settings: &Settings,
     mut req: Request,
@@ -232,6 +244,10 @@ pub struct DeactivateKeyResponse {
 }
 
 /// Deactivates an active key
+///
+/// # Errors
+///
+/// Returns an error if the request signing settings are missing, JSON parsing fails, or key deactivation fails.
 pub fn handle_deactivate_key(
     settings: &Settings,
     mut req: Request,
@@ -329,8 +345,11 @@ mod tests {
 
         // First, create a valid signature
         let payload = "test message";
-        let signer = crate::request_signing::RequestSigner::from_config().unwrap();
-        let signature = signer.sign(payload.as_bytes()).unwrap();
+        let signer = crate::request_signing::RequestSigner::from_config()
+            .expect("should create signer from config");
+        let signature = signer
+            .sign(payload.as_bytes())
+            .expect("should sign payload");
 
         // Create verification request
         let verify_req = VerifySignatureRequest {
@@ -339,17 +358,19 @@ mod tests {
             kid: signer.kid.clone(),
         };
 
-        let body = serde_json::to_string(&verify_req).unwrap();
+        let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
         let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
         req.set_body(body);
 
         // Handle the request
-        let mut resp = handle_verify_signature(&settings, req).unwrap();
+        let mut resp =
+            handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
 
         // Parse response
         let resp_body = resp.take_body_str();
-        let verify_resp: VerifySignatureResponse = serde_json::from_str(&resp_body).unwrap();
+        let verify_resp: VerifySignatureResponse =
+            serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
         assert!(verify_resp.verified, "Signature should be verified");
         assert_eq!(verify_resp.kid, signer.kid);
@@ -359,10 +380,13 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_invalid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let signer = crate::request_signing::RequestSigner::from_config().unwrap();
+        let signer = crate::request_signing::RequestSigner::from_config()
+            .expect("should create signer from config");
 
         // Create a signature for a different payload
-        let wrong_signature = signer.sign(b"different payload").unwrap();
+        let wrong_signature = signer
+            .sign(b"different payload")
+            .expect("should sign different payload");
 
         // Create request with signature that does not match the payload
         let verify_req = VerifySignatureRequest {
@@ -371,17 +395,19 @@ mod tests {
             kid: signer.kid.clone(),
         };
 
-        let body = serde_json::to_string(&verify_req).unwrap();
+        let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
         let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
         req.set_body(body);
 
         // Handle the request
-        let mut resp = handle_verify_signature(&settings, req).unwrap();
+        let mut resp =
+            handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
 
         // Parse response
         let resp_body = resp.take_body_str();
-        let verify_resp: VerifySignatureResponse = serde_json::from_str(&resp_body).unwrap();
+        let verify_resp: VerifySignatureResponse =
+            serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
         assert!(!verify_resp.verified, "Invalid signature should not verify");
         assert_eq!(verify_resp.kid, signer.kid);
@@ -409,7 +435,8 @@ mod tests {
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
-                let response: RotateKeyResponse = serde_json::from_str(&body).unwrap();
+                let response: RotateKeyResponse =
+                    serde_json::from_str(&body).expect("should deserialize rotate response");
                 println!(
                     "Rotation response: success={}, message={}",
                     response.success, response.message
@@ -427,7 +454,7 @@ mod tests {
             kid: Some("test-custom-key".to_string()),
         };
 
-        let body_json = serde_json::to_string(&req_body).unwrap();
+        let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
         req.set_body(body_json);
 
@@ -435,7 +462,8 @@ mod tests {
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
-                let response: RotateKeyResponse = serde_json::from_str(&body).unwrap();
+                let response: RotateKeyResponse =
+                    serde_json::from_str(&body).expect("should deserialize rotate response");
                 println!(
                     "Custom KID rotation: success={}, new_kid={}",
                     response.success, response.new_kid
@@ -464,7 +492,8 @@ mod tests {
             delete: false,
         };
 
-        let body_json = serde_json::to_string(&req_body).unwrap();
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
@@ -472,7 +501,8 @@ mod tests {
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
-                let response: DeactivateKeyResponse = serde_json::from_str(&body).unwrap();
+                let response: DeactivateKeyResponse =
+                    serde_json::from_str(&body).expect("should deserialize deactivate response");
                 println!(
                     "Deactivate response: success={}, message={}",
                     response.success, response.message
@@ -491,7 +521,8 @@ mod tests {
             delete: true,
         };
 
-        let body_json = serde_json::to_string(&req_body).unwrap();
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
@@ -499,7 +530,8 @@ mod tests {
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
-                let response: DeactivateKeyResponse = serde_json::from_str(&body).unwrap();
+                let response: DeactivateKeyResponse =
+                    serde_json::from_str(&body).expect("should deserialize deactivate response");
                 println!(
                     "Delete response: success={}, deleted={}",
                     response.success, response.deleted
@@ -522,14 +554,16 @@ mod tests {
     #[test]
     fn test_rotate_key_request_deserialization() {
         let json = r#"{"kid":"custom-key"}"#;
-        let req: RotateKeyRequest = serde_json::from_str(json).unwrap();
+        let req: RotateKeyRequest =
+            serde_json::from_str(json).expect("should deserialize rotate key request");
         assert_eq!(req.kid, Some("custom-key".to_string()));
     }
 
     #[test]
     fn test_deactivate_key_request_deserialization() {
         let json = r#"{"kid":"old-key","delete":true}"#;
-        let req: DeactivateKeyRequest = serde_json::from_str(json).unwrap();
+        let req: DeactivateKeyRequest =
+            serde_json::from_str(json).expect("should deserialize deactivate key request");
         assert_eq!(req.kid, "old-key");
         assert!(req.delete);
     }
@@ -549,7 +583,8 @@ mod tests {
                 let body = resp.take_body_str();
 
                 // Parse the discovery document
-                let discovery: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let discovery: serde_json::Value =
+                    serde_json::from_str(&body).expect("should parse discovery document");
 
                 // Verify structure - only version and jwks
                 assert_eq!(discovery["version"], "1.0");

@@ -116,6 +116,12 @@ impl std::fmt::Debug for IntegrationDocumentState {
 }
 
 impl IntegrationDocumentState {
+    #[must_use]
+    /// Retrieves a value stored for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -130,6 +136,11 @@ impl IntegrationDocumentState {
         })
     }
 
+    /// Retrieves or initializes a value for an integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn get_or_insert_with<T>(
         &self,
         integration_id: &'static str,
@@ -157,6 +168,11 @@ impl IntegrationDocumentState {
         value
     }
 
+    /// Clears all stored values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned.
     pub fn clear(&self) {
         let mut guard = self
             .inner
@@ -170,52 +186,55 @@ impl IntegrationDocumentState {
 #[derive(Clone, Debug)]
 pub struct IntegrationEndpoint {
     pub method: Method,
-    pub path: &'static str,
+    pub path: String,
 }
 
 impl IntegrationEndpoint {
     #[must_use]
-    pub fn new(method: Method, path: &'static str) -> Self {
-        Self { method, path }
+    pub fn new(method: Method, path: impl Into<String>) -> Self {
+        Self {
+            method,
+            path: path.into(),
+        }
     }
 
     #[must_use]
-    pub fn get(path: &'static str) -> Self {
+    pub fn get(path: impl Into<String>) -> Self {
         Self {
             method: Method::GET,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn post(path: &'static str) -> Self {
+    pub fn post(path: impl Into<String>) -> Self {
         Self {
             method: Method::POST,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn put(path: &'static str) -> Self {
+    pub fn put(path: impl Into<String>) -> Self {
         Self {
             method: Method::PUT,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn delete(path: &'static str) -> Self {
+    pub fn delete(path: impl Into<String>) -> Self {
         Self {
             method: Method::DELETE,
-            path,
+            path: path.into(),
         }
     }
 
     #[must_use]
-    pub fn patch(path: &'static str) -> Self {
+    pub fn patch(path: impl Into<String>) -> Self {
         Self {
             method: Method::PATCH,
-            path,
+            path: path.into(),
         }
     }
 }
@@ -248,7 +267,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn get(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::get(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
@@ -260,7 +279,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn post(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::post(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
@@ -272,7 +291,7 @@ pub trait IntegrationProxy: Send + Sync {
     /// ```
     fn put(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::put(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
@@ -280,11 +299,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.delete("/users")  // becomes /integrations/my_integration/users
+    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
     /// ```
     fn delete(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::delete(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
@@ -292,11 +311,11 @@ pub trait IntegrationProxy: Send + Sync {
     ///
     /// # Example
     /// ```ignore
-    /// self.patch("/users")  // becomes /integrations/my_integration/users
+    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
     /// ```
     fn patch(&self, path: &str) -> IntegrationEndpoint {
         let full_path = format!("/integrations/{}{}", self.integration_name(), path);
-        IntegrationEndpoint::patch(Box::leak(full_path.into_boxed_str()))
+        IntegrationEndpoint::patch(full_path)
     }
 }
 
@@ -357,6 +376,14 @@ pub trait IntegrationHtmlPostProcessor: Send + Sync {
     fn post_process(&self, html: &mut String, ctx: &IntegrationHtmlContext<'_>) -> bool;
 }
 
+/// Trait for integration-provided HTML head injections.
+pub trait IntegrationHeadInjector: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+    /// Return HTML snippets to insert at the start of `<head>`.
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
@@ -364,6 +391,7 @@ pub struct IntegrationRegistration {
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
 }
 
 impl IntegrationRegistration {
@@ -386,6 +414,7 @@ impl IntegrationRegistrationBuilder {
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
             },
         }
     }
@@ -421,6 +450,12 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
+    pub fn with_head_injector(mut self, injector: Arc<dyn IntegrationHeadInjector>) -> Self {
+        self.registration.head_injectors.push(injector);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
@@ -441,6 +476,7 @@ struct IntegrationRegistryInner {
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -455,6 +491,7 @@ impl Default for IntegrationRegistryInner {
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
+            head_injectors: Vec::new(),
         }
     }
 }
@@ -466,6 +503,7 @@ pub struct IntegrationMetadata {
     pub routes: Vec<IntegrationEndpoint>,
     pub attribute_rewriters: usize,
     pub script_selectors: Vec<&'static str>,
+    pub head_injectors: usize,
 }
 
 impl IntegrationMetadata {
@@ -475,6 +513,7 @@ impl IntegrationMetadata {
             routes: Vec::new(),
             attribute_rewriters: 0,
             script_selectors: Vec::new(),
+            head_injectors: 0,
         }
     }
 }
@@ -487,7 +526,15 @@ pub struct IntegrationRegistry {
 
 impl IntegrationRegistry {
     /// Build a registry from the provided settings.
-    pub fn new(settings: &Settings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
@@ -498,9 +545,15 @@ impl IntegrationRegistry {
 
                         // Convert /* wildcard to matchit's {*rest} syntax
                         let matchit_path = if route.path.ends_with("/*") {
-                            format!("{}/{{*rest}}", route.path.strip_suffix("/*").unwrap())
+                            format!(
+                                "{}/{{*rest}}",
+                                route
+                                    .path
+                                    .strip_suffix("/*")
+                                    .expect("path should end with '/*'")
+                            )
                         } else {
-                            route.path.to_string()
+                            route.path.clone()
                         };
 
                         // Select appropriate router and insert
@@ -521,10 +574,12 @@ impl IntegrationRegistry {
                         };
 
                         if let Err(e) = router.insert(&matchit_path, value) {
-                            panic!(
-                                "Integration route registration failed for {} {}: {:?}",
-                                route.method, route.path, e
-                            );
+                            return Err(Report::new(TrustedServerError::Configuration {
+                                message: format!(
+                                    "Integration route registration failed for {} {}: {:?}",
+                                    route.method, route.path, e
+                                ),
+                            }));
                         }
 
                         inner.routes.push((route, registration.integration_id));
@@ -539,12 +594,15 @@ impl IntegrationRegistry {
                 inner
                     .html_post_processors
                     .extend(registration.html_post_processors.into_iter());
+                inner
+                    .head_injectors
+                    .extend(registration.head_injectors.into_iter());
             }
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
-        }
+        })
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -561,11 +619,13 @@ impl IntegrationRegistry {
     }
 
     /// Return true when any proxy is registered for the provided route.
+    #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
@@ -581,6 +641,7 @@ impl IntegrationRegistry {
     }
 
     /// Give integrations a chance to rewrite HTML attributes.
+    #[must_use]
     pub fn rewrite_attribute(
         &self,
         attr_name: &str,
@@ -613,16 +674,32 @@ impl IntegrationRegistry {
     }
 
     /// Expose registered script/text rewriters for HTML processing.
+    #[must_use]
     pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
         self.inner.script_rewriters.clone()
     }
 
     /// Expose registered HTML post-processors.
+    #[must_use]
     pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
         self.inner.html_post_processors.clone()
     }
 
+    /// Collect HTML snippets for insertion at the start of `<head>`.
+    #[must_use]
+    pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        let mut inserts = Vec::new();
+        for injector in &self.inner.head_injectors {
+            let mut next = injector.head_inserts(ctx);
+            if !next.is_empty() {
+                inserts.append(&mut next);
+            }
+        }
+        inserts
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
+    #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
@@ -630,9 +707,10 @@ impl IntegrationRegistry {
             let entry = map
                 .entry(*integration_id)
                 .or_insert_with(|| IntegrationMetadata::new(integration_id));
-            entry
-                .routes
-                .push(IntegrationEndpoint::new(route.method.clone(), route.path));
+            entry.routes.push(IntegrationEndpoint::new(
+                route.method.clone(),
+                route.path.clone(),
+            ));
         }
 
         for rewriter in &self.inner.html_rewriters {
@@ -649,10 +727,18 @@ impl IntegrationRegistry {
             entry.script_selectors.push(rewriter.selector());
         }
 
+        for injector in &self.inner.head_injectors {
+            let entry = map
+                .entry(injector.integration_id())
+                .or_insert_with(|| IntegrationMetadata::new(injector.integration_id()));
+            entry.head_injectors += 1;
+        }
+
         map.into_values().collect()
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -668,11 +754,41 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
             }),
         }
     }
 
     #[cfg(test)]
+    #[must_use]
+    pub fn from_rewriters_with_head_injectors(
+        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
+        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
+        head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
+                routes: Vec::new(),
+                html_rewriters: attribute_rewriters,
+                script_rewriters,
+                html_post_processors: Vec::new(),
+                head_injectors,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    /// Test helper to create a registry from routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if route registration fails due to duplicate or invalid paths.
     pub fn from_routes(routes: Vec<(Method, &str, RouteValue)>) -> Self {
         let mut get_router = Router::new();
         let mut post_router = Router::new();
@@ -683,7 +799,10 @@ impl IntegrationRegistry {
         for (method, path, value) in routes {
             // Convert /* wildcard to matchit's {*rest} syntax
             let matchit_path = if path.ends_with("/*") {
-                format!("{}/{{*rest}}", path.strip_suffix("/*").unwrap())
+                format!(
+                    "{}/{{*rest}}",
+                    path.strip_suffix("/*").expect("path should end with '/*'")
+                )
             } else {
                 path.to_string()
             };
@@ -697,7 +816,9 @@ impl IntegrationRegistry {
                 _ => continue,
             };
 
-            router.insert(&matchit_path, value).unwrap();
+            router
+                .insert(&matchit_path, value)
+                .expect("route registration should succeed");
         }
 
         Self {
@@ -711,6 +832,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
             }),
         }
     }
