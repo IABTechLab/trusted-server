@@ -277,12 +277,19 @@ pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &
 /// 2) Base64-decode the `x1||nonce||ciphertext+tag` bytes
 /// 3) Compute SHA-256 over those bytes
 /// 4) Return Base64 URL-safe (no padding) digest as `tstoken`
+///
+/// # Panics
+///
+/// This function will not panic under normal circumstances. The internal base64 decode
+/// cannot fail because it operates on data that was just encoded by `encode_url`.
 #[must_use]
 pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> String {
     // Encrypt deterministically using existing helper
     let enc = encode_url(settings, full_url);
     // Decode to raw bytes (x1 + nonce + ciphertext+tag)
-    let raw = URL_SAFE_NO_PAD.decode(enc.as_bytes()).unwrap_or_default();
+    let raw = URL_SAFE_NO_PAD
+        .decode(enc.as_bytes())
+        .expect("decode must succeed for just-encoded data");
     let digest = Sha256::digest(&raw);
     URL_SAFE_NO_PAD.encode(digest)
 }

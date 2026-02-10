@@ -174,11 +174,12 @@ All integrations support:
 
 ### Rewriting System
 
-Integrations can implement three types of rewriting:
+Integrations can implement four types of rewriting:
 
 1. **HTTP Proxying** - Route requests through first-party domain
 2. **HTML Attribute Rewriting** - Modify element attributes during streaming
 3. **Script Content Rewriting** - Transform inline script content
+4. **Head Injection** - Insert HTML snippets at the start of `<head>`
 
 ## Choosing an Integration
 
@@ -242,6 +243,7 @@ You can create your own integrations by implementing the integration traits:
 - `IntegrationProxy` - For HTTP endpoint proxying
 - `IntegrationAttributeRewriter` - For HTML attribute rewriting
 - `IntegrationScriptRewriter` - For script content transformation
+- `IntegrationHeadInjector` - For injecting HTML snippets into `<head>`
 
 See the [Integration Guide](./integration-guide.md) for details on building custom integrations.
 

@@ -82,7 +82,9 @@ mod tests {
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-        let realm = response.get_header(header::WWW_AUTHENTICATE).unwrap();
+        let realm = response
+            .get_header(header::WWW_AUTHENTICATE)
+            .expect("should have WWW-Authenticate header");
         assert_eq!(realm, BASIC_AUTH_REALM);
     }
 

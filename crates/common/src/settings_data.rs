@@ -45,7 +45,7 @@ mod tests {
         let settings = get_settings();
         assert!(settings.is_ok(), "Settings should load from embedded TOML");
 
-        let settings = settings.unwrap();
+        let settings = settings.expect("should load settings from embedded TOML");
         // Verify basic structure is loaded
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());

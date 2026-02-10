@@ -2,7 +2,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
@@ -216,7 +216,10 @@ pub fn handle_publisher_request(
         has_synthetic_cookie
     );
 
-    let backend_name = ensure_backend_from_url(&settings.publisher.origin_url, true)?;
+    let backend_name = BackendConfig::from_url(
+        &settings.publisher.origin_url,
+        settings.proxy.certificate_check,
+    )?;
     let origin_host = settings.publisher.origin_host();
 
     log::debug!(
