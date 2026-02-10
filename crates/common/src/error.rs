@@ -42,6 +42,10 @@ pub enum TrustedServerError {
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
 
+    /// Serialization error.
+    #[display("Serialization error: {message}")]
+    Serialization { message: String },
+
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
@@ -100,6 +104,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+            Self::Serialization { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,

@@ -345,6 +345,8 @@ pub trait IntegrationScriptRewriter: Send + Sync {
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 
+use crate::geo::GeoInfo;
+
 /// Context for HTML post-processors.
 #[derive(Debug)]
 pub struct IntegrationHtmlContext<'a> {
@@ -352,6 +354,7 @@ pub struct IntegrationHtmlContext<'a> {
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
     pub document_state: &'a IntegrationDocumentState,
+    pub geo: Option<&'a GeoInfo>,
 }
 
 /// Trait for integration-provided HTML post-processors.
@@ -817,6 +820,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             document_state: &document_state,
+            geo: None,
         };
 
         assert!(

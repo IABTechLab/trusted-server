@@ -12,7 +12,9 @@ use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_common::publisher::{
+    handle_geo_info, handle_publisher_request, handle_tsjs_dynamic,
+};
 use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -103,6 +105,8 @@ async fn route_request(
         (Method::POST, "/first-party/proxy-rebuild") => {
             handle_first_party_proxy_rebuild(settings, req).await
         }
+        // Geo info endpoint
+        (Method::GET, "/first-party/geo") => handle_geo_info(&req),
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
             .handle_proxy(&m, path, settings, req)
             .await

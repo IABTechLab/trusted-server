@@ -42,6 +42,31 @@ pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServ
     Ok(resp)
 }
 
+/// Returns the geographic information for the request as a JSON response.
+///
+/// Use this endpoint to get the client's location data (City, Country, DMA, etc.)
+/// without making a third-party API call.
+///
+/// # Errors
+///
+/// Returns a 500 error if JSON serialization fails (unlikely).
+pub fn handle_geo_info(req: &Request) -> Result<Response, Report<TrustedServerError>> {
+    use crate::geo::GeoInfo;
+
+    let geo_info = GeoInfo::from_request(req);
+
+    // Create a JSON response
+    let body =
+        serde_json::to_string(&geo_info).change_context(TrustedServerError::Serialization {
+            message: "Failed to serialize geo info".to_string(),
+        })?;
+
+    Ok(Response::from_body(body)
+        .with_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_header("Cache-Control", "private, no-store"))
+}
+
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
@@ -52,6 +77,7 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
+    geo_info: Option<&'a crate::geo::GeoInfo>,
 }
 
 /// Process response body in streaming fashion with compression preservation
@@ -86,6 +112,7 @@ fn process_response_streaming(
             params.request_scheme,
             params.settings,
             params.integration_registry,
+            params.geo_info,
         )?;
 
         let config = PipelineConfig {
@@ -147,6 +174,7 @@ fn create_html_stream_processor(
     request_scheme: &str,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    geo_info: Option<&crate::geo::GeoInfo>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
@@ -156,6 +184,7 @@ fn create_html_stream_processor(
         origin_host,
         request_host,
         request_scheme,
+        geo_info,
     );
 
     Ok(create_html_processor(config))
@@ -219,6 +248,29 @@ pub fn handle_publisher_request(
     let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
     let origin_host = settings.publisher.origin_host();
 
+    // Inject Geo headers for the backend request
+    crate::geo::get_dma_code(&mut req);
+
+    // Extract GeoInfo from request before it is consumed
+    use crate::geo::GeoInfo;
+    let geo_info = GeoInfo::from_request(&req);
+
+    // Capture Geo headers to copy to response
+    let geo_headers: Vec<(String, String)> = [
+        "x-geo-city",
+        "x-geo-country",
+        "x-geo-continent",
+        "x-geo-coordinates",
+        "x-geo-metro-code",
+    ]
+    .iter()
+    .filter_map(|&h| {
+        req.get_header(h)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| (h.to_string(), v.to_string()))
+    })
+    .collect();
+
     log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
@@ -231,6 +283,11 @@ pub fn handle_publisher_request(
         .change_context(TrustedServerError::Proxy {
             message: "Failed to proxy request to origin".to_string(),
         })?;
+
+    // Copy Geo headers to response
+    for (name, value) in geo_headers {
+        response.set_header(name, value);
+    }
 
     // Log all response headers for debugging
     log::debug!("Response headers:");
@@ -276,6 +333,7 @@ pub fn handle_publisher_request(
             settings,
             content_type: &content_type,
             integration_registry,
+            geo_info: geo_info.as_ref(),
         };
         match process_response_streaming(body, &params) {
             Ok(processed_body) => {
