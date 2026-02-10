@@ -630,7 +630,7 @@ impl IntegrationRegistry {
             // Set synthetic ID header on successful responses
             if let Ok(ref mut response) = result {
                 if let Ok(ref synthetic_id) = synthetic_id_result {
-                    response.append_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
                     if !has_synthetic_cookie {
                         response.append_header(
                             header::SET_COOKIE,
