@@ -121,6 +121,7 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
+    let geo_info = config.geo_info.clone();
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -199,6 +200,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let geo_info = geo_info.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -207,6 +209,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         request_scheme: &patterns.request_scheme,
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
+                        geo: geo_info.as_ref(),
                     };
                     // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
                     snippet.push_str(&tsjs::unified_script_tag());
