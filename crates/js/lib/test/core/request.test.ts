@@ -1,13 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Ensure mocks referenced inside vi.mock factory are hoisted
-const { renderMock } = vi.hoisted(() => ({ renderMock: vi.fn() }));
-
 describe('request.requestAds', () => {
   beforeEach(async () => {
     await vi.resetModules();
     document.body.innerHTML = '';
-    renderMock.mockReset();
   });
 
   it('sends fetch and renders creatives via iframe from response', async () => {
@@ -29,9 +25,8 @@ describe('request.requestAds', () => {
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
 
     requestAds();
-    // wait microtasks
-    await Promise.resolve();
-    await Promise.resolve();
+    // Flush microtasks — sendAuction has fetch → .json() → parse chain
+    await new Promise((r) => setTimeout(r, 0));
 
     expect((globalThis as any).fetch).toHaveBeenCalled();
 
@@ -41,15 +36,7 @@ describe('request.requestAds', () => {
     expect(iframe!.srcdoc).toContain(creativeHtml);
   });
 
-  it('handles unexpected third-party response without rendering', async () => {
-    vi.mock('../../src/core/render', async () => {
-      const actual = await vi.importActual<any>('../../src/core/render');
-      return {
-        ...actual,
-        renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
-      };
-    });
-
+  it('does not render on non-JSON response', async () => {
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -58,44 +45,32 @@ describe('request.requestAds', () => {
     });
 
     const { addAdUnits } = await import('../../src/core/registry');
-    const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
+    document.body.innerHTML = '<div id="slot1"></div>';
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
 
     requestAds();
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
 
     expect((globalThis as any).fetch).toHaveBeenCalled();
-    expect(renderMock).not.toHaveBeenCalled();
+    expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('ignores fetch rejection gracefully', async () => {
-    vi.mock('../../src/core/render', async () => {
-      const actual = await vi.importActual<any>('../../src/core/render');
-      return {
-        ...actual,
-        renderCreativeIntoSlot: (slotId: string, html: string) => renderMock(slotId, html),
-      };
-    });
-
     (globalThis as any).fetch = vi.fn().mockRejectedValue(new Error('network-error'));
 
     const { addAdUnits } = await import('../../src/core/registry');
-    const { setConfig } = await import('../../src/core/config');
     const { requestAds } = await import('../../src/core/request');
 
+    document.body.innerHTML = '<div id="slot1"></div>';
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-    setConfig({ mode: 'thirdParty' } as any);
 
     requestAds();
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
 
     expect((globalThis as any).fetch).toHaveBeenCalled();
-    expect(renderMock).not.toHaveBeenCalled();
+    expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('inserts an iframe with creative HTML from unified auction', async () => {
@@ -122,8 +97,8 @@ describe('request.requestAds', () => {
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
     requestAds();
 
-    await Promise.resolve();
-    await Promise.resolve();
+    // Flush microtasks — sendAuction has fetch → .json() → parse chain
+    await new Promise((r) => setTimeout(r, 0));
 
     // Verify iframe was inserted with creative HTML in srcdoc
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
@@ -152,8 +127,7 @@ describe('request.requestAds', () => {
     addAdUnits({ code: 'missing-slot', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
     requestAds();
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
 
     // No iframe should be inserted because the slot isn't present in DOM
     const iframe = document.querySelector('iframe');

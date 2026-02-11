@@ -737,6 +737,28 @@ impl IntegrationRegistry {
         map.into_values().collect()
     }
 
+    /// Return JS module IDs that should be included in the tsjs bundle.
+    ///
+    /// Always includes "creative" (JS-only, no Rust-side registration).
+    /// Excludes integrations that have no JS module (e.g., "nextjs").
+    #[must_use]
+    pub fn js_module_ids(&self) -> Vec<&'static str> {
+        // Rust-only integrations with no corresponding JS module
+        const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
+        // JS-only modules always included (no Rust-side registration)
+        const JS_ALWAYS: &[&str] = &["creative"];
+
+        let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
+
+        for meta in self.registered_integrations() {
+            if !JS_EXCLUDED.contains(&meta.id) && !ids.contains(&meta.id) {
+                ids.push(meta.id);
+            }
+        }
+
+        ids
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn from_rewriters(

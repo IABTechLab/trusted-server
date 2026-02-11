@@ -77,7 +77,9 @@ async fn route_request(
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
-        (Method::GET, path) if path.starts_with("/static/tsjs=") => handle_tsjs_dynamic(&req),
+        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
+            handle_tsjs_dynamic(&req, integration_registry)
+        }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
