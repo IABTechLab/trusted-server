@@ -28,7 +28,7 @@ describe('getPermutiveSegments', () => {
       'permutive-app',
       JSON.stringify({
         core: { cohorts: { all: ['10000001', '10000003', 'adv', 'bhgp'] } },
-      }),
+      })
     );
     expect(getPermutiveSegments()).toEqual(['10000001', '10000003', 'adv', 'bhgp']);
   });
@@ -38,7 +38,7 @@ describe('getPermutiveSegments', () => {
       'permutive-app',
       JSON.stringify({
         core: { cohorts: { all: [123, 456] } },
-      }),
+      })
     );
     expect(getPermutiveSegments()).toEqual(['123', '456']);
   });
@@ -48,11 +48,9 @@ describe('getPermutiveSegments', () => {
       'permutive-app',
       JSON.stringify({
         eventPublication: {
-          eventUpload: [
-            ['key1', { event: { properties: { segments: ['seg1', 'seg2'] } } }],
-          ],
+          eventUpload: [['key1', { event: { properties: { segments: ['seg1', 'seg2'] } } }]],
         },
-      }),
+      })
     );
     expect(getPermutiveSegments()).toEqual(['seg1', 'seg2']);
   });
@@ -67,7 +65,7 @@ describe('getPermutiveSegments', () => {
             ['new', { event: { properties: { segments: ['new1', 'new2'] } } }],
           ],
         },
-      }),
+      })
     );
     // Should return the last (most recent) entry
     expect(getPermutiveSegments()).toEqual(['new1', 'new2']);
@@ -78,7 +76,7 @@ describe('getPermutiveSegments', () => {
       'permutive-app',
       JSON.stringify({
         core: { cohorts: { all: [] } },
-      }),
+      })
     );
     expect(getPermutiveSegments()).toEqual([]);
   });
@@ -88,7 +86,7 @@ describe('getPermutiveSegments', () => {
       'permutive-app',
       JSON.stringify({
         core: { cohorts: { all: ['valid', 123, null, undefined, true, { obj: 1 }] } },
-      }),
+      })
     );
     expect(getPermutiveSegments()).toEqual(['valid', '123']);
   });
