@@ -3,10 +3,30 @@
  * Handles initialization and configuration injection.
  */
 
+interface PrebidConfig {
+    accountId: string;
+    enabled: boolean;
+    bidders: string[];
+    timeout: number;
+    adapter: string;
+    endpoint: string;
+    syncEndpoint: string;
+    cookieSet: boolean;
+    cookiesetUrl: string;
+    debug: boolean;
+    adUnits?: unknown[];
+}
+
+interface Pbjs {
+    que: (() => void)[];
+    setConfig: (config: { s2sConfig: unknown; debug: boolean }) => void;
+    addAdUnits: (units: unknown[]) => void;
+}
+
 declare global {
     interface Window {
-        __tsjs_prebid?: any;
-        pbjs?: any;
+        __tsjs_prebid?: PrebidConfig;
+        pbjs?: Pbjs;
         __trustedServerPrebid?: boolean;
     }
 }
@@ -17,7 +37,8 @@ export function init() {
         return;
     }
 
-    const pbjs = window.pbjs || {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pbjs: Pbjs = (window.pbjs as any) || {};
     pbjs.que = pbjs.que || [];
 
     pbjs.que.push(() => {
