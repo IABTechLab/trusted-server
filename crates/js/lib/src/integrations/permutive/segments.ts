@@ -27,9 +27,7 @@ export function getPermutiveSegments(): string[] {
     const all = data?.core?.cohorts?.all;
     if (Array.isArray(all) && all.length > 0) {
       log.debug('getPermutiveSegments: found segments in core.cohorts.all', { count: all.length });
-      return all
-        .filter((s: unknown) => typeof s === 'string' || typeof s === 'number')
-        .map(String);
+      return all.filter((s: unknown) => typeof s === 'string' || typeof s === 'number').map(String);
     }
 
     // Fallback: eventUpload entries (transient event data)
