@@ -5,8 +5,8 @@ use fastly::{Body, Request, Response};
 use crate::backend::ensure_backend_from_url;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::create_synthetic_cookie;
+use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
 use crate::rsc_flight::RscFlightUrlRewriter;
@@ -198,23 +198,8 @@ pub fn handle_publisher_request(
 
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
-    let has_synthetic_cookie = req
-        .get_header(header::COOKIE)
-        .and_then(|h| h.to_str().ok())
-        .map(|cookies| {
-            cookies.split(';').any(|cookie| {
-                cookie
-                    .trim_start()
-                    .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-            })
-        })
-        .unwrap_or(false);
 
-    log::debug!(
-        "Proxy synthetic IDs - trusted: {}, has_cookie: {}",
-        synthetic_id,
-        has_synthetic_cookie
-    );
+    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id,);
 
     let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
     let origin_host = settings.publisher.origin_host();
@@ -308,12 +293,7 @@ pub fn handle_publisher_request(
     }
 
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-    if !has_synthetic_cookie {
-        response.set_header(
-            header::SET_COOKIE,
-            create_synthetic_cookie(settings, synthetic_id.as_str()),
-        );
-    }
+    set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
 
     Ok(response)
 }

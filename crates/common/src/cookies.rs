@@ -71,6 +71,21 @@ pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> Strin
     )
 }
 
+/// Sets the synthetic ID cookie on the given response.
+///
+/// This helper abstracts the logic of creating the cookie string and appending
+/// the Set-Cookie header to the response.
+pub fn set_synthetic_cookie(
+    settings: &Settings,
+    response: &mut fastly::Response,
+    synthetic_id: &str,
+) {
+    response.append_header(
+        header::SET_COOKIE,
+        create_synthetic_cookie(settings, synthetic_id),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::tests::create_test_settings;
