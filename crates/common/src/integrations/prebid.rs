@@ -57,15 +57,9 @@ pub struct PrebidIntegrationConfig {
     #[serde(default)]
     pub auto_configure: bool,
 
+    /// Ad Units configuration
     #[serde(default)]
-    pub inject_geo: bool,
-
-    #[serde(default = "default_geo_cache_key")]
-    pub geo_cache_key: String,
-}
-
-fn default_geo_cache_key() -> String {
-    "cwgl".to_string()
+    pub ad_units: Vec<serde_json::Value>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -233,9 +227,8 @@ impl crate::integrations::IntegrationHtmlPostProcessor for PrebidHtmlInjector {
         html: &mut String,
         ctx: &crate::integrations::IntegrationHtmlContext<'_>,
     ) -> bool {
-        // Construct the S2S config
-        // Note: We use the trusted server itself as the endpoint
-        let s2s_config = json!({
+        // Construct the Prebid configuration object
+        let config = json!({
             "accountId": "trusted-server",
             "enabled": true,
             "bidders": self.config.bidders,
@@ -245,74 +238,31 @@ impl crate::integrations::IntegrationHtmlPostProcessor for PrebidHtmlInjector {
             "syncEndpoint": format!("{}://{}/cookie_sync", ctx.request_scheme, ctx.request_host),
             "cookieSet": true,
             "cookiesetUrl": format!("{}://{}/setuid", ctx.request_scheme, ctx.request_host),
+            "adUnits": self.config.ad_units,
+            "debug": self.config.debug,
         });
 
-        // Create geo injection script if enabled and geo info is available
-        let geo_script = if self.config.inject_geo {
-            if let Some(geo) = ctx.geo {
-                let geo_data = json!({
-                    "country": geo.country,
-                    "region": geo.region,
-                    "city": geo.city,
-                    "postal_code": "", // Not currently available in GeoInfo
-                });
-
-                // Script to inject geo data into localStorage
-                // We use the configured cache key
-                // We also set the timestamp key (usually cache_key + "t")
-                // And we set window._tudeGeo as a fallback/optimization for Aditude wrapper
-                format!(
-                    r#"<script>
-                    (function() {{
-                        try {{
-                            var geo = {};
-                            var now = Date.now();
-                            localStorage.setItem("{}", JSON.stringify(geo));
-                            localStorage.setItem("{}t", now);
-                            window._tudeGeo = geo;
-                        }} catch (e) {{
-                            console.error("Trusted Server: Failed to inject geo", e);
-                        }}
-                    }})();
-                    </script>"#,
-                    geo_data, self.config.geo_cache_key, self.config.geo_cache_key
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
+        // Script to inject configuration and initialize Prebid via tsjs
         let script = format!(
             r#"<script>
-            (function() {{
-                var pbjs = window.pbjs || {{}};
-                pbjs.que = pbjs.que || [];
-                pbjs.que.push(function() {{
-                    pbjs.setConfig({{
-                        s2sConfig: {}
-                    }});
-                }});
-                window.pbjs = pbjs;
-                window.__trustedServerPrebid = true;
-            }})();
+            window.__tsjs_prebid = {};
+            if (window.tsjs && window.tsjs.modules && window.tsjs.modules.prebid) {{
+                window.tsjs.modules.prebid.init();
+            }}
             </script>"#,
-            s2s_config
+            config
         );
-
-        let final_injection = format!("{geo_script}{script}");
 
         // Inject after <head>
         if let Some(idx) = html.find("<head>") {
             let insert_point = idx + 6;
-            html.insert_str(insert_point, &final_injection);
+            html.insert_str(insert_point, &script);
             true
         } else if let Some(idx) = html.find("<head") {
             // Handle case with attributes like <head class="...">
             if let Some(close_idx) = html[idx..].find('>') {
                 let insert_point = idx + close_idx + 1;
-                html.insert_str(insert_point, &final_injection);
+                html.insert_str(insert_point, &script);
                 true
             } else {
                 false
@@ -913,8 +863,7 @@ mod tests {
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             auto_configure: false,
-            inject_geo: false,
-            geo_cache_key: "cwgl".to_string(),
+            ad_units: vec![],
         }
     }
 
@@ -1271,8 +1220,7 @@ server_url = "https://prebid.example"
             debug_query_params: None,
             script_patterns: vec![],
             auto_configure: true,
-            inject_geo: false,
-            geo_cache_key: "cwgl".to_string(),
+            ad_units: vec![],
         };
         let injector = PrebidHtmlInjector::new(config);
         let params = IntegrationDocumentState::default();
@@ -1288,7 +1236,8 @@ server_url = "https://prebid.example"
         let mut html = "<html><head><title>Test</title></head><body></body></html>".to_string();
         assert!(injector.post_process(&mut html, &ctx));
         assert!(html.starts_with("<html><head><script>"));
-        assert!(html.contains("pbjs.setConfig"));
+        assert!(html.contains("window.__tsjs_prebid ="));
+        assert!(html.contains("window.tsjs.modules.prebid.init()"));
 
         // Case 2: Head with attributes
         let mut html =
@@ -1299,7 +1248,7 @@ server_url = "https://prebid.example"
         // Case 3: No head
         let mut html = "<html><body></body></html>".to_string();
         assert!(!injector.post_process(&mut html, &ctx));
-        assert!(!html.contains("pbjs.setConfig"));
+        assert!(!html.contains("window.__tsjs_prebid ="));
     }
 
     #[test]
@@ -1313,8 +1262,7 @@ server_url = "https://prebid.example"
             debug_query_params: None,
             script_patterns: vec![],
             auto_configure: true,
-            inject_geo: false,
-            geo_cache_key: "cwgl".to_string(),
+            ad_units: vec![],
         };
         let injector = PrebidHtmlInjector::new(config);
         let params = IntegrationDocumentState::default();
@@ -1330,15 +1278,16 @@ server_url = "https://prebid.example"
         injector.post_process(&mut html, &ctx);
 
         // Extract the JSON config from the injected script
-        // Script pattern: ... s2sConfig: { ... } ...
-        let start_marker = "s2sConfig: ";
-        let start_idx =
-            html.find(start_marker).expect("should find s2sConfig") + start_marker.len();
+        // Script pattern: window.__tsjs_prebid = { ... };
+        let start_marker = "window.__tsjs_prebid = ";
+        let start_idx = html
+            .find(start_marker)
+            .expect("should find window.__tsjs_prebid =")
+            + start_marker.len();
         let end_idx = html[start_idx..]
-            .find("}")
-            .expect("should find closing brace")
-            + start_idx
-            + 1; // +1 to include }
+            .find(";")
+            .expect("should find closing semicolon")
+            + start_idx;
 
         let json_str = &html[start_idx..end_idx];
         let json: serde_json::Value =
@@ -1350,66 +1299,5 @@ server_url = "https://prebid.example"
         assert_eq!(json["endpoint"], "https://pub.example/openrtb2/auction");
         assert_eq!(json["accountId"], "trusted-server");
         assert_eq!(json["enabled"], true);
-    }
-
-    #[test]
-    fn html_processor_injects_geo_info() {
-        let html = r#"<html><head></head><body></body></html>"#;
-
-        let mut settings = make_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
-                    "script_patterns": [],
-                    "inject_geo": true,
-                    "geo_cache_key": "cwgl_test",
-                    "auto_configure": true
-                }),
-            )
-            .expect("should update prebid config");
-
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-
-        let geo_info = crate::geo::GeoInfo {
-            city: "New York".to_string(),
-            country: "US".to_string(),
-            continent: "NA".to_string(),
-            latitude: 40.7128,
-            longitude: -74.0060,
-            metro_code: 501,
-            region: Some("NY".to_string()),
-        };
-
-        let config = config_from_settings(&settings, &registry);
-        // Manually override geo_info in config since config_from_settings defaults to None
-        let mut config = config;
-        config.geo_info = Some(geo_info);
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .expect("should process html");
-
-        let result = String::from_utf8(output).expect("valid utf8");
-
-        // Verify geo injection script
-        assert!(result.contains("localStorage.setItem(\"cwgl_test\", JSON.stringify(geo));"));
-        assert!(result.contains("\"country\":\"US\""));
-        assert!(result.contains("\"city\":\"New York\""));
-        assert!(result.contains("\"region\":\"NY\""));
     }
 }

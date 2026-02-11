@@ -150,3 +150,33 @@ pub fn get_dma_code(req: &mut Request) -> Option<String> {
 
     None
 }
+
+/// Returns the geographic information for the request as a JSON response.
+///
+/// Use this endpoint to get the client's location data (City, Country, DMA, etc.)
+/// without making a third-party API call.
+///
+/// # Errors
+///
+/// Returns a 500 error if JSON serialization fails (unlikely).
+pub fn handle_first_party_geo(
+    req: &Request,
+) -> Result<fastly::Response, error_stack::Report<crate::error::TrustedServerError>> {
+    use crate::error::TrustedServerError;
+    use error_stack::ResultExt;
+    use fastly::http::{header, StatusCode};
+    use fastly::Response;
+
+    let geo_info = GeoInfo::from_request(req);
+
+    // Create a JSON response
+    let body =
+        serde_json::to_string(&geo_info).change_context(TrustedServerError::Serialization {
+            message: "Failed to serialize geo info".to_string(),
+        })?;
+
+    Ok(Response::from_body(body)
+        .with_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_header("Cache-Control", "private, no-store"))
+}

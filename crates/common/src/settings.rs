@@ -320,6 +320,35 @@ pub struct Settings {
     pub auction: AuctionConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    #[serde(default)]
+    #[validate(nested)]
+    pub geo: Geo,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct Geo {
+    #[serde(default = "default_geo_inject")]
+    pub inject: bool,
+    #[serde(default = "default_geo_cache_key")]
+    #[validate(length(min = 1))]
+    pub cache_key: String,
+}
+
+impl Default for Geo {
+    fn default() -> Self {
+        Self {
+            inject: default_geo_inject(),
+            cache_key: default_geo_cache_key(),
+        }
+    }
+}
+
+fn default_geo_inject() -> bool {
+    false
+}
+
+fn default_geo_cache_key() -> String {
+    "geo".to_string()
 }
 
 #[allow(unused)]

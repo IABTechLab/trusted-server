@@ -42,31 +42,6 @@ pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServ
     Ok(resp)
 }
 
-/// Returns the geographic information for the request as a JSON response.
-///
-/// Use this endpoint to get the client's location data (City, Country, DMA, etc.)
-/// without making a third-party API call.
-///
-/// # Errors
-///
-/// Returns a 500 error if JSON serialization fails (unlikely).
-pub fn handle_geo_info(req: &Request) -> Result<Response, Report<TrustedServerError>> {
-    use crate::geo::GeoInfo;
-
-    let geo_info = GeoInfo::from_request(req);
-
-    // Create a JSON response
-    let body =
-        serde_json::to_string(&geo_info).change_context(TrustedServerError::Serialization {
-            message: "Failed to serialize geo info".to_string(),
-        })?;
-
-    Ok(Response::from_body(body)
-        .with_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, "application/json")
-        .with_header("Cache-Control", "private, no-store"))
-}
-
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
