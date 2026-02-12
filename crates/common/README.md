@@ -1,6 +1,6 @@
 # trusted-server-common
 
-Utilities shared by Trusted Server components. This crate contains HTML/CSS rewriting helpers used to normalize ad creative assets to first‑party proxy endpoints.
+Utilities shared by Trusted Server components. This crate contains HTML/CSS rewriting helpers used to normalize ad creative assets to proxy endpoints.
 
 ## Creative Rewriting
 
