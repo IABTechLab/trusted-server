@@ -39,6 +39,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
+use url::Url;
 use validator::Validate;
 
 use crate::backend::BackendConfig;
@@ -113,9 +114,28 @@ impl GptIntegration {
     /// - `securepubads.g.doubleclick.net/tag/js/gpt.js`
     /// - `www.googletagservices.com/tag/js/gpt.js` (legacy)
     fn is_gpt_script_url(url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains(SECUREPUBADS_HOST) || lower.contains("googletagservices.com"))
-            && lower.contains("/tag/js/gpt.js")
+        let parsed = Url::parse(url).or_else(|_| {
+            let stripped = url
+                .strip_prefix("//")
+                .ok_or(url::ParseError::RelativeUrlWithoutBase)?;
+            Url::parse(&format!("https://{stripped}"))
+        });
+
+        let Ok(parsed) = parsed else {
+            return false;
+        };
+
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+
+        let host = host.to_ascii_lowercase();
+        let known_host = matches!(
+            host.as_str(),
+            SECUREPUBADS_HOST | "googletagservices.com" | "www.googletagservices.com"
+        );
+
+        known_host && parsed.path().eq_ignore_ascii_case("/tag/js/gpt.js")
     }
 
     /// Fetch and serve the GPT bootstrap script (`gpt.js`).
@@ -312,7 +332,10 @@ impl GptIntegration {
 fn build(settings: &Settings) -> Option<Arc<GptIntegration>> {
     let config = match settings.integration_config::<GptConfig>(GPT_INTEGRATION_ID) {
         Ok(Some(config)) => config,
-        Ok(None) => return None,
+        Ok(None) => {
+            log::debug!("[gpt] Integration disabled or not configured");
+            return None;
+        }
         Err(err) => {
             log::error!("Failed to load GPT integration config: {err:?}");
             return None;
@@ -411,7 +434,7 @@ fn default_script_url() -> String {
 }
 
 fn default_cache_ttl() -> u32 {
-    3600 // 1 hour
+    3600
 }
 
 fn default_rewrite_script() -> bool {
@@ -458,6 +481,11 @@ mod tests {
         );
 
         assert!(
+            GptIntegration::is_gpt_script_url("//securepubads.g.doubleclick.net/tag/js/gpt.js"),
+            "should match protocol-relative GPT CDN URLs"
+        );
+
+        assert!(
             GptIntegration::is_gpt_script_url(
                 "https://SECUREPUBADS.G.DOUBLECLICK.NET/tag/js/gpt.js"
             ),
@@ -474,6 +502,20 @@ mod tests {
                 "https://securepubads.g.doubleclick.net/other/script.js"
             ),
             "should not match other doubleclick paths"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url(
+                "https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js"
+            ),
+            "should not match when GPT host appears only in query text"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url(
+                "https://cdn.example.com/assets/securepubads.g.doubleclick.net/tag/js/gpt.js"
+            ),
+            "should not match when GPT host appears only in path text"
         );
     }
 

@@ -44,7 +44,7 @@ There are three layers:
 
 2. **Script proxy** (server-side) -- Fetches scripts from Google and serves them through the publisher's domain. Script bodies are served **verbatim** with no modification.
 
-3. **Client-side shim** -- A script guard (`script_guard.ts`) patches `Element.prototype.appendChild` and `insertBefore` to intercept dynamically inserted `<script>` and `<link rel="preload">` elements. Any URLs pointing at Google's ad-serving domains are rewritten to the first-party proxy. This is the sole mechanism that routes GPT's cascaded script loads back through the proxy.
+3. **Client-side shim** -- A script guard (`script_guard.ts`) uses six interception layers -- `document.write` interception, `HTMLScriptElement.prototype.src` property descriptor, `setAttribute` patch, `document.createElement` patch, DOM insertion patches, and a `MutationObserver` -- to catch GPT script URLs regardless of how they are set or inserted. The `document.write` layer is the most critical, as GPT's primary loading path uses `document.write` to synchronously inject `pubads_impl.js` into the HTML parser stream. This is the sole mechanism that routes GPT's cascaded script loads back through the proxy.
 
 ## Configuration
 
@@ -90,7 +90,16 @@ The GPT integration includes a TypeScript module bundled into the unified TSJS b
 
 ### Script Guard
 
-Intercepts dynamically inserted `<script>` and `<link rel="preload" as="script">` elements and rewrites Google ad-serving domain URLs to the first-party proxy. Handles:
+The script guard uses six interception layers to catch GPT script URLs regardless of how they are set or inserted into the DOM:
+
+1. **`document.write` / `document.writeln`** -- GPT's primary loading mechanism. When `gpt.js` loads synchronously, it uses `document.write` to inject `<script src="...pubads_impl.js">` directly into the HTML parser stream. The guard intercepts these calls and rewrites GPT domain URLs inside the HTML string before passing it to the native method.
+2. **Property descriptor** on `HTMLScriptElement.prototype.src` -- intercepts `script.src = url` assignments. This catches GPT's async fallback path (used when `document.write` is unavailable, e.g. after page load or with `async` scripts).
+3. **`setAttribute` patch** on `HTMLScriptElement.prototype` -- catches `script.setAttribute('src', url)` calls that bypass the property setter.
+4. **`document.createElement` patch** -- tags every newly created `<script>` element with a per-instance `src` descriptor, ensuring coverage even if the prototype-level descriptor cannot be installed.
+5. **DOM insertion patches** on `appendChild` / `insertBefore` -- catches scripts and `<link rel="preload">` elements whose `src`/`href` is already set at insertion time.
+6. **`MutationObserver`** -- catches elements added via `innerHTML`, `.append()`, or other DOM methods, as well as attribute mutations on existing elements.
+
+Handles these Google ad-serving domains:
 
 - `securepubads.g.doubleclick.net`
 - `pagead2.googlesyndication.com`

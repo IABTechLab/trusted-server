@@ -111,71 +111,119 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// URL patterns for origin-to-proxy host rewriting.
+///
+/// Stores the origin and proxy hosts, generating URL variants on demand for
+/// efficient replacement across HTML attributes.
+struct UrlPatterns {
+    origin_host: String,
+    request_host: String,
+    request_scheme: String,
+}
+
+impl UrlPatterns {
+    fn https_origin(&self) -> String {
+        format!("https://{}", self.origin_host)
+    }
+
+    fn http_origin(&self) -> String {
+        format!("http://{}", self.origin_host)
+    }
+
+    fn protocol_relative_origin(&self) -> String {
+        format!("//{}", self.origin_host)
+    }
+
+    fn replacement_url(&self) -> String {
+        format!("{}://{}", self.request_scheme, self.request_host)
+    }
+
+    fn protocol_relative_replacement(&self) -> String {
+        format!("//{}", self.request_host)
+    }
+
+    fn rewrite_url_value(&self, value: &str) -> Option<String> {
+        if !value.contains(&self.origin_host) {
+            return None;
+        }
+
+        let https_origin = self.https_origin();
+        let http_origin = self.http_origin();
+        let protocol_relative_origin = self.protocol_relative_origin();
+        let replacement_url = self.replacement_url();
+        let protocol_relative_replacement = self.protocol_relative_replacement();
+
+        let mut rewritten = value
+            .replace(&https_origin, &replacement_url)
+            .replace(&http_origin, &replacement_url)
+            .replace(&protocol_relative_origin, &protocol_relative_replacement);
+
+        if rewritten.starts_with(&self.origin_host) {
+            let suffix = &rewritten[self.origin_host.len()..];
+            let boundary_ok = suffix.is_empty()
+                || matches!(
+                    suffix.as_bytes().first(),
+                    Some(b'/') | Some(b'?') | Some(b'#')
+                );
+            if boundary_ok {
+                rewritten = format!("{}{}", self.request_host, suffix);
+            }
+        }
+
+        (rewritten != value).then_some(rewritten)
+    }
+}
+
+/// Rewrite a single URL attribute on an element, applying URL pattern replacement
+/// and integration attribute rewriting.
+///
+/// Returns `Ok(true)` when the element was removed by an integration rewriter.
+fn rewrite_url_attribute(
+    el: &mut lol_html::html_content::Element<'_, '_>,
+    attr_name: &str,
+    patterns: &UrlPatterns,
+    integrations: &IntegrationRegistry,
+) -> Result<bool, Box<dyn core::error::Error + Send + Sync>> {
+    let Some(mut value) = el.get_attribute(attr_name) else {
+        return Ok(false);
+    };
+
+    let original = value.clone();
+    if let Some(rewritten) = patterns.rewrite_url_value(&value) {
+        value = rewritten;
+    }
+
+    match integrations.rewrite_attribute(
+        attr_name,
+        &value,
+        &IntegrationAttributeContext {
+            attribute_name: attr_name,
+            request_host: &patterns.request_host,
+            request_scheme: &patterns.request_scheme,
+            origin_host: &patterns.origin_host,
+        },
+    ) {
+        AttributeRewriteOutcome::Unchanged => {}
+        AttributeRewriteOutcome::Replaced(new_value) => {
+            value = new_value;
+        }
+        AttributeRewriteOutcome::RemoveElement => {
+            el.remove();
+            return Ok(true);
+        }
+    }
+
+    if value != original {
+        el.set_attribute(attr_name, &value)?;
+    }
+    Ok(false)
+}
+
 /// Create an HTML processor with URL replacement and integration hooks
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
-
-    // Simplified URL patterns structure - stores only core data and generates variants on-demand
-    struct UrlPatterns {
-        origin_host: String,
-        request_host: String,
-        request_scheme: String,
-    }
-
-    impl UrlPatterns {
-        fn https_origin(&self) -> String {
-            format!("https://{}", self.origin_host)
-        }
-
-        fn http_origin(&self) -> String {
-            format!("http://{}", self.origin_host)
-        }
-
-        fn protocol_relative_origin(&self) -> String {
-            format!("//{}", self.origin_host)
-        }
-
-        fn replacement_url(&self) -> String {
-            format!("{}://{}", self.request_scheme, self.request_host)
-        }
-
-        fn protocol_relative_replacement(&self) -> String {
-            format!("//{}", self.request_host)
-        }
-
-        fn rewrite_url_value(&self, value: &str) -> Option<String> {
-            if !value.contains(&self.origin_host) {
-                return None;
-            }
-
-            let https_origin = self.https_origin();
-            let http_origin = self.http_origin();
-            let protocol_relative_origin = self.protocol_relative_origin();
-            let replacement_url = self.replacement_url();
-            let protocol_relative_replacement = self.protocol_relative_replacement();
-
-            let mut rewritten = value
-                .replace(&https_origin, &replacement_url)
-                .replace(&http_origin, &replacement_url)
-                .replace(&protocol_relative_origin, &protocol_relative_replacement);
-
-            if rewritten.starts_with(&self.origin_host) {
-                let suffix = &rewritten[self.origin_host.len()..];
-                let boundary_ok = suffix.is_empty()
-                    || matches!(
-                        suffix.as_bytes().first(),
-                        Some(b'/') | Some(b'?') | Some(b'#')
-                    );
-                if boundary_ok {
-                    rewritten = format!("{}{}", self.request_host, suffix);
-                }
-            }
-
-            (rewritten != value).then_some(rewritten)
-        }
-    }
 
     let patterns = Rc::new(UrlPatterns {
         origin_host: config.origin_host.clone(),
@@ -216,116 +264,28 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 Ok(())
             }
         }),
-        // Replace URLs in href attributes
+        // Replace URLs in href, src, and action attributes
         element!("[href]", {
             let patterns = patterns.clone();
             let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut href) = el.get_attribute("href") {
-                    let original_href = href.clone();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&href) {
-                        href = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "href",
-                        &href,
-                        &IntegrationAttributeContext {
-                            attribute_name: "href",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_href) => {
-                            href = integration_href;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if href != original_href {
-                        el.set_attribute("href", &href)?;
-                    }
-                }
+                rewrite_url_attribute(el, "href", &patterns, &integrations)?;
                 Ok(())
             }
         }),
-        // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
             let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut src) = el.get_attribute("src") {
-                    let original_src = src.clone();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&src) {
-                        src = rewritten;
-                    }
-                    match integrations.rewrite_attribute(
-                        "src",
-                        &src,
-                        &IntegrationAttributeContext {
-                            attribute_name: "src",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_src) => {
-                            src = integration_src;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if src != original_src {
-                        el.set_attribute("src", &src)?;
-                    }
-                }
+                rewrite_url_attribute(el, "src", &patterns, &integrations)?;
                 Ok(())
             }
         }),
-        // Replace URLs in action attributes
         element!("[action]", {
             let patterns = patterns.clone();
             let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut action) = el.get_attribute("action") {
-                    let original_action = action.clone();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&action) {
-                        action = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "action",
-                        &action,
-                        &IntegrationAttributeContext {
-                            attribute_name: "action",
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_action) => {
-                            action = integration_action;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if action != original_action {
-                        el.set_attribute("action", &action)?;
-                    }
-                }
+                rewrite_url_attribute(el, "action", &patterns, &integrations)?;
                 Ok(())
             }
         }),
@@ -617,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_html_processor_url_replacement() {
+    fn url_replacement() {
         let config = create_test_config();
         let processor = create_html_processor(config);
 
