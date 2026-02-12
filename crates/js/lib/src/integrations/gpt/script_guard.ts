@@ -237,14 +237,14 @@ function installDocumentWritePatch(): void {
 
   document.write = function patchedWrite(this: Document, ...args: string[]): void {
     const rewrittenArgs = args.map((arg) =>
-      typeof arg === 'string' ? rewriteHtmlString(arg) : arg,
+      typeof arg === 'string' ? rewriteHtmlString(arg) : arg
     );
     nativeDocWrite!.apply(this, rewrittenArgs);
   };
 
   document.writeln = function patchedWriteln(this: Document, ...args: string[]): void {
     const rewrittenArgs = args.map((arg) =>
-      typeof arg === 'string' ? rewriteHtmlString(arg) : arg,
+      typeof arg === 'string' ? rewriteHtmlString(arg) : arg
     );
     nativeDocWriteln!.apply(this, rewrittenArgs);
   };
@@ -357,7 +357,7 @@ function installSetAttributePatch(): void {
   HTMLScriptElement.prototype.setAttribute = function patchedSetAttribute(
     this: HTMLScriptElement,
     name: string,
-    value: string,
+    value: string
   ): void {
     if (typeof name === 'string' && name.toLowerCase() === 'src') {
       const raw = String(value ?? '');
@@ -395,7 +395,7 @@ function installCreateElementPatch(): void {
   document.createElement = function patchedCreateElement(
     this: Document,
     tagName: string,
-    options?: ElementCreationOptions,
+    options?: ElementCreationOptions
   ): HTMLElement {
     const el = nativeCreateElement!.call(this, tagName, options);
     if (typeof tagName === 'string' && tagName.toLowerCase() === 'script') {
@@ -440,7 +440,7 @@ function installDomInsertionPatches(): void {
   Element.prototype.insertBefore = function <T extends Node>(
     this: Element,
     node: T,
-    reference: Node | null,
+    reference: Node | null
   ): T {
     checkNodeAtInsertion(node);
     return nativeInsertBefore!.call(this, node, reference) as T;

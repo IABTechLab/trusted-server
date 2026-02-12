@@ -45,7 +45,7 @@ interface GoogleTag {
   defineSlot(
     adUnitPath: string,
     size: Array<number | number[]>,
-    elementId: string,
+    elementId: string
   ): GoogleTagSlot | null;
   enableServices(): void;
   display(elementId: string): void;

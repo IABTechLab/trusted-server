@@ -67,14 +67,16 @@ describe('GPT script guard', () => {
 
   it('rewrites through instance patch when src descriptor install is unavailable', () => {
     const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
-    const descriptorSpy = vi.spyOn(Object, 'getOwnPropertyDescriptor').mockImplementation(
-      (target: object, property: PropertyKey): PropertyDescriptor | undefined => {
-        if (target === HTMLScriptElement.prototype && property === 'src') {
-          return undefined;
+    const descriptorSpy = vi
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation(
+        (target: object, property: PropertyKey): PropertyDescriptor | undefined => {
+          if (target === HTMLScriptElement.prototype && property === 'src') {
+            return undefined;
+          }
+          return nativeGetOwnPropertyDescriptor(target, property);
         }
-        return nativeGetOwnPropertyDescriptor(target, property);
-      },
-    );
+      );
 
     try {
       installGptGuard();
@@ -84,7 +86,7 @@ describe('GPT script guard', () => {
         'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js';
 
       expect(script.getAttribute('src')).toContain(
-        '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js',
+        '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js'
       );
     } finally {
       descriptorSpy.mockRestore();
@@ -117,7 +119,7 @@ describe('GPT script guard', () => {
 
     expect(script.src).toContain(window.location.host);
     expect(script.src).toContain(
-      '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar',
+      '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar'
     );
   });
 });
