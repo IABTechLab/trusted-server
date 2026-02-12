@@ -221,21 +221,12 @@ impl DataDomeIntegration {
             .into_owned()
     }
 
-    /// Build target URL for proxying SDK requests to `DataDome` (js.datadome.co).
-    fn build_sdk_url(&self, path: &str, query: Option<&str>) -> String {
-        let base = self.config.sdk_origin.trim_end_matches('/');
+    /// Build a target URL from the given origin, path, and optional query string.
+    fn build_target_url(origin: &str, path: &str, query: Option<&str>) -> String {
+        let base = origin.trim_end_matches('/');
         match query {
-            Some(q) => format!("{}{}?{}", base, path, q),
-            None => format!("{}{}", base, path),
-        }
-    }
-
-    /// Build target URL for proxying API requests to `DataDome` (api-js.datadome.co).
-    fn build_api_url(&self, path: &str, query: Option<&str>) -> String {
-        let base = self.config.api_origin.trim_end_matches('/');
-        match query {
-            Some(q) => format!("{}{}?{}", base, path, q),
-            None => format!("{}{}", base, path),
+            Some(q) => format!("{base}{path}?{q}"),
+            None => format!("{base}{path}"),
         }
     }
 
@@ -250,7 +241,8 @@ impl DataDomeIntegration {
 
     /// Handle the /tags.js endpoint - fetch and rewrite the `DataDome` SDK.
     async fn handle_tags_js(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
-        let target_url = self.build_sdk_url("/tags.js", req.get_query_str());
+        let target_url =
+            Self::build_target_url(&self.config.sdk_origin, "/tags.js", req.get_query_str());
 
         log::info!("[datadome] Fetching tags.js from {}", target_url);
 
@@ -315,7 +307,8 @@ impl DataDomeIntegration {
             .unwrap_or(original_path);
 
         // Use api_origin (api-js.datadome.co) for signal collection requests
-        let target_url = self.build_api_url(datadome_path, req.get_query_str());
+        let target_url =
+            Self::build_target_url(&self.config.api_origin, datadome_path, req.get_query_str());
         let api_host = Self::extract_host(&self.config.api_origin);
 
         log::info!(
@@ -652,31 +645,32 @@ mod tests {
     }
 
     #[test]
-    fn build_sdk_url() {
-        let integration = DataDomeIntegration::new(test_config());
-
+    fn build_target_url() {
         assert_eq!(
-            integration.build_sdk_url("/tags.js", None),
+            DataDomeIntegration::build_target_url("https://js.datadome.co", "/tags.js", None),
             "https://js.datadome.co/tags.js"
         );
 
         assert_eq!(
-            integration.build_sdk_url("/tags.js", Some("key=abc")),
+            DataDomeIntegration::build_target_url(
+                "https://js.datadome.co",
+                "/tags.js",
+                Some("key=abc"),
+            ),
             "https://js.datadome.co/tags.js?key=abc"
         );
-    }
-
-    #[test]
-    fn build_api_url() {
-        let integration = DataDomeIntegration::new(test_config());
 
         assert_eq!(
-            integration.build_api_url("/js/check", None),
+            DataDomeIntegration::build_target_url("https://api-js.datadome.co", "/js/check", None,),
             "https://api-js.datadome.co/js/check"
         );
 
         assert_eq!(
-            integration.build_api_url("/js/check", Some("foo=bar")),
+            DataDomeIntegration::build_target_url(
+                "https://api-js.datadome.co",
+                "/js/check",
+                Some("foo=bar"),
+            ),
             "https://api-js.datadome.co/js/check?foo=bar"
         );
     }
