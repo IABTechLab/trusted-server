@@ -645,6 +645,7 @@ mod tests {
             mediator: None,
             timeout_ms: 2000,
             creative_store: "creative_store".to_string(),
+            allowed_context_keys: vec!["permutive_segments".to_string()],
         };
 
         let orchestrator = AuctionOrchestrator::new(config);

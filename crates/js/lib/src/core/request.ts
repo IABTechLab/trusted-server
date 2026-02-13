@@ -1,10 +1,9 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
+import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument } from './render';
 import type { RequestAdsCallback, RequestAdsOptions } from './types';
-
-// getHighestCpmBids is provided by the Prebid extension (shim) to mirror Prebid's API
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
@@ -24,8 +23,9 @@ export function requestAds(
   log.info('requestAds: called', { hasCallback: typeof callback === 'function' });
   try {
     const adUnits = getAllUnits();
-    const payload = { adUnits, config: {} };
-    log.debug('requestAds: payload', { units: adUnits.length });
+    const config = collectContext();
+    const payload = { adUnits, config };
+    log.debug('requestAds: payload', { units: adUnits.length, contextKeys: Object.keys(config) });
 
     // Use unified auction endpoint
     void requestAdsUnified(payload);

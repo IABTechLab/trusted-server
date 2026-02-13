@@ -30,7 +30,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     pub config: Option<JsonValue>,
 }
 
@@ -135,6 +134,31 @@ pub fn convert_tsjs_to_auction_request(
         geo: Some(geo),
     });
 
+    // Forward allowed config entries from the JS request into the context map.
+    // Only keys listed in `auction.allowed_context_keys` are accepted;
+    // unrecognised keys are silently dropped to prevent injection of
+    // arbitrary data by a malicious client payload.
+    let allowed = &settings.auction.allowed_context_keys;
+    let mut context = HashMap::new();
+    if let Some(ref config) = body.config {
+        if let Some(obj) = config.as_object() {
+            for (key, value) in obj {
+                if allowed.iter().any(|k| k == key) {
+                    context.insert(key.clone(), value.clone());
+                } else {
+                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                }
+            }
+            if !context.is_empty() {
+                log::debug!(
+                    "Auction request context: {} entries ({})",
+                    context.len(),
+                    context.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
+
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
         slots,
@@ -152,7 +176,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
-        context: HashMap::new(),
+        context,
     })
 }
 
