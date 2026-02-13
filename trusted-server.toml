@@ -33,6 +33,11 @@ enabled = false  # Set to true to enable request signing
 config_store_id = "<fastly-config-store-id>" # set config/secret store ids for key rotation
 secret_store_id = "<fastly-secret-store-id>"
 
+# Geo configuration
+[geo]
+inject = false
+cache_key = "geo"
+
 [integrations.prebid]
 enabled = true
 server_url = "http://68.183.113.79:8000"

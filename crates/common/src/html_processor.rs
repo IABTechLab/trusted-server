@@ -24,6 +24,7 @@ struct HtmlWithPostProcessing {
     request_host: String,
     request_scheme: String,
     document_state: IntegrationDocumentState,
+    geo_info: Option<crate::geo::GeoInfo>,
 }
 
 impl StreamProcessor for HtmlWithPostProcessing {
@@ -42,6 +43,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
             request_scheme: &self.request_scheme,
             origin_host: &self.origin_host,
             document_state: &self.document_state,
+            geo: self.geo_info.as_ref(),
         };
 
         // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
@@ -90,6 +92,7 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    pub geo_info: Option<crate::geo::GeoInfo>,
 }
 
 impl HtmlProcessorConfig {
@@ -101,12 +104,14 @@ impl HtmlProcessorConfig {
         origin_host: &str,
         request_host: &str,
         request_scheme: &str,
+        geo_info: Option<&crate::geo::GeoInfo>,
     ) -> Self {
         Self {
             origin_host: origin_host.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             integrations: integrations.clone(),
+            geo_info: geo_info.cloned(),
         }
     }
 }
@@ -116,6 +121,7 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
+    let geo_info = config.geo_info.clone();
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -194,6 +200,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let geo_info = geo_info.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -202,6 +209,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         request_scheme: &patterns.request_scheme,
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
+                        geo: geo_info.as_ref(),
                     };
                     // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
                     snippet.push_str(&tsjs::unified_script_tag());
@@ -466,6 +474,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         request_host: config.request_host,
         request_scheme: config.request_scheme,
         document_state,
+        geo_info: config.geo_info,
     }
 }
 
@@ -488,6 +497,7 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
+            geo_info: None,
         }
     }
 
@@ -665,6 +675,7 @@ mod tests {
             "origin.test-publisher.com",
             "proxy.example.com",
             "https",
+            None,
         );
 
         assert_eq!(config.origin_host, "origin.test-publisher.com");

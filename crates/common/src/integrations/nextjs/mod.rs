@@ -121,6 +121,7 @@ mod tests {
             "origin.example.com",
             "test.example.com",
             "https",
+            None,
         )
     }
 

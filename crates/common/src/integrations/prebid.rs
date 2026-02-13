@@ -54,6 +54,12 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    #[serde(default)]
+    pub auto_configure: bool,
+
+    /// Ad Units configuration
+    #[serde(default)]
+    pub ad_units: Vec<serde_json::Value>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -192,15 +198,94 @@ fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
     Some(PrebidIntegration::new(config))
 }
 
+pub struct PrebidHtmlInjector {
+    config: PrebidIntegrationConfig,
+}
+
+impl PrebidHtmlInjector {
+    fn new(config: PrebidIntegrationConfig) -> Arc<Self> {
+        Arc::new(Self { config })
+    }
+}
+
+impl crate::integrations::IntegrationHtmlPostProcessor for PrebidHtmlInjector {
+    fn integration_id(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
+    fn should_process(
+        &self,
+        html: &str,
+        _ctx: &crate::integrations::IntegrationHtmlContext<'_>,
+    ) -> bool {
+        // Only inject if there's a head tag (to be safe) and we haven't already injected
+        html.contains("<head")
+    }
+
+    fn post_process(
+        &self,
+        html: &mut String,
+        ctx: &crate::integrations::IntegrationHtmlContext<'_>,
+    ) -> bool {
+        // Construct the Prebid configuration object
+        let config = json!({
+            "accountId": "trusted-server",
+            "enabled": true,
+            "bidders": self.config.bidders,
+            "timeout": self.config.timeout_ms,
+            "adapter": "prebidServer",
+            "endpoint": format!("{}://{}/openrtb2/auction", ctx.request_scheme, ctx.request_host),
+            "syncEndpoint": format!("{}://{}/cookie_sync", ctx.request_scheme, ctx.request_host),
+            "cookieSet": true,
+            "cookiesetUrl": format!("{}://{}/setuid", ctx.request_scheme, ctx.request_host),
+            "adUnits": self.config.ad_units,
+            "debug": self.config.debug,
+        });
+
+        // Script to inject configuration and initialize Prebid via tsjs
+        let script = format!(
+            r#"<script>
+            window.__tsjs_prebid = {};
+            if (window.tsjs && window.tsjs.modules && window.tsjs.modules.prebid) {{
+                window.tsjs.modules.prebid.init();
+            }}
+            </script>"#,
+            config
+        );
+
+        // Inject after <head>
+        if let Some(idx) = html.find("<head>") {
+            let insert_point = idx + 6;
+            html.insert_str(insert_point, &script);
+            true
+        } else if let Some(idx) = html.find("<head") {
+            // Handle case with attributes like <head class="...">
+            if let Some(close_idx) = html[idx..].find('>') {
+                let insert_point = idx + close_idx + 1;
+                html.insert_str(insert_point, &script);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+}
+
 #[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
-    Some(
-        IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
-            .build(),
-    )
+    let mut builder = IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_attribute_rewriter(integration.clone());
+
+    if integration.config.auto_configure {
+        builder =
+            builder.with_html_post_processor(PrebidHtmlInjector::new(integration.config.clone()));
+    }
+
+    Some(builder.build())
 }
 
 #[async_trait(?Send)]
@@ -753,7 +838,10 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
 mod tests {
     use super::*;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
-    use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
+    use crate::integrations::{
+        AttributeRewriteAction, IntegrationDocumentState, IntegrationHtmlContext,
+        IntegrationHtmlPostProcessor, IntegrationRegistry,
+    };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
@@ -774,6 +862,8 @@ mod tests {
             debug: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            auto_configure: false,
+            ad_units: vec![],
         }
     }
 
@@ -787,6 +877,7 @@ mod tests {
             "origin.example.com",
             "test.example.com",
             "https",
+            None,
         )
     }
 
@@ -1116,5 +1207,97 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script patterns configured
         assert_eq!(routes.len(), 0);
+    }
+
+    #[test]
+    fn test_prebid_html_injector_injection_logic() {
+        let config = PrebidIntegrationConfig {
+            enabled: true,
+            server_url: "http://localhost:8080".to_string(),
+            timeout_ms: 2000,
+            bidders: vec!["bidderA".to_string(), "bidderB".to_string()],
+            debug: false,
+            debug_query_params: None,
+            script_patterns: vec![],
+            auto_configure: true,
+            ad_units: vec![],
+        };
+        let injector = PrebidHtmlInjector::new(config);
+        let params = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &params,
+            geo: None,
+        };
+
+        // Case 1: Simple <head>
+        let mut html = "<html><head><title>Test</title></head><body></body></html>".to_string();
+        assert!(injector.post_process(&mut html, &ctx));
+        assert!(html.starts_with("<html><head><script>"));
+        assert!(html.contains("window.__tsjs_prebid ="));
+        assert!(html.contains("window.tsjs.modules.prebid.init()"));
+
+        // Case 2: Head with attributes
+        let mut html =
+            r#"<html><head lang="en"><title>Test</title></head><body></body></html>"#.to_string();
+        assert!(injector.post_process(&mut html, &ctx));
+        assert!(html.starts_with(r#"<html><head lang="en"><script>"#));
+
+        // Case 3: No head
+        let mut html = "<html><body></body></html>".to_string();
+        assert!(!injector.post_process(&mut html, &ctx));
+        assert!(!html.contains("window.__tsjs_prebid ="));
+    }
+
+    #[test]
+    fn test_prebid_html_injector_config_content() {
+        let config = PrebidIntegrationConfig {
+            enabled: true,
+            server_url: "http://localhost:8080".to_string(),
+            timeout_ms: 2000,
+            bidders: vec!["bidderA".to_string(), "bidderB".to_string()],
+            debug: false,
+            debug_query_params: None,
+            script_patterns: vec![],
+            auto_configure: true,
+            ad_units: vec![],
+        };
+        let injector = PrebidHtmlInjector::new(config);
+        let params = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &params,
+            geo: None,
+        };
+
+        let mut html = "<html><head></head></html>".to_string();
+        injector.post_process(&mut html, &ctx);
+
+        // Extract the JSON config from the injected script
+        // Script pattern: window.__tsjs_prebid = { ... };
+        let start_marker = "window.__tsjs_prebid = ";
+        let start_idx = html
+            .find(start_marker)
+            .expect("should find window.__tsjs_prebid =")
+            + start_marker.len();
+        let end_idx = html[start_idx..]
+            .find(";")
+            .expect("should find closing semicolon")
+            + start_idx;
+
+        let json_str = &html[start_idx..end_idx];
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).expect("should parse valid JSON config");
+
+        assert_eq!(json["timeout"], 2000);
+        assert_eq!(json["bidders"][0], "bidderA");
+        assert_eq!(json["bidders"][1], "bidderB");
+        assert_eq!(json["endpoint"], "https://pub.example/openrtb2/auction");
+        assert_eq!(json["accountId"], "trusted-server");
+        assert_eq!(json["enabled"], true);
     }
 }

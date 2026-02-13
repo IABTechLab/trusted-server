@@ -103,6 +103,10 @@ async fn route_request(
         (Method::POST, "/first-party/proxy-rebuild") => {
             handle_first_party_proxy_rebuild(settings, req).await
         }
+        // Geo info endpoint
+        (Method::GET, "/first-party/geo") => {
+            trusted_server_common::geo::handle_first_party_geo(&req)
+        }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
             .handle_proxy(&m, path, settings, req)
             .await
