@@ -3,6 +3,9 @@
 // integration-specific data-reading code.
 import { log } from '../../core/log';
 
+/** Upper bound on the number of segments we forward to avoid oversized URLs. */
+const MAX_SEGMENTS = 100;
+
 /**
  * Read Permutive segment IDs from localStorage.
  *
@@ -27,7 +30,7 @@ export function getPermutiveSegments(): string[] {
     const all = data?.core?.cohorts?.all;
     if (Array.isArray(all) && all.length > 0) {
       log.debug('getPermutiveSegments: found segments in core.cohorts.all', { count: all.length });
-      return all.filter((s: unknown) => typeof s === 'string' || typeof s === 'number').map(String);
+      return all.filter((s: unknown) => typeof s === 'string' || typeof s === 'number').map(String).slice(0, MAX_SEGMENTS);
     }
 
     // Fallback: eventUpload entries (transient event data)
@@ -44,7 +47,8 @@ export function getPermutiveSegments(): string[] {
           });
           return segments
             .filter((s: unknown) => typeof s === 'string' || typeof s === 'number')
-            .map(String);
+            .map(String)
+            .slice(0, MAX_SEGMENTS);
         }
       }
     }

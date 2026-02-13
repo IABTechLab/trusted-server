@@ -104,18 +104,18 @@ impl AdServerMockProvider {
                     .join(",");
 
                 if !csv.is_empty() {
-                    // Append as query parameter, respecting existing query strings
-                    let sep = if self.config.endpoint.contains('?') {
-                        "&"
-                    } else {
-                        "?"
-                    };
-                    let url = format!("{}{}permutive={}", self.config.endpoint, sep, csv);
-                    log::info!(
-                        "AdServer Mock: appending {} Permutive segments to mediation URL",
-                        segments.len()
-                    );
-                    return url;
+                    // Use url::Url to safely encode the query parameter value,
+                    // preventing injection from unescaped segment values.
+                    if let Ok(mut url) = url::Url::parse(&self.config.endpoint) {
+                        url.query_pairs_mut().append_pair("permutive", &csv);
+                        log::info!(
+                            "AdServer Mock: appending {} Permutive segments to mediation URL",
+                            segments.len()
+                        );
+                        return url.to_string();
+                    }
+                    // Fall through if URL parsing fails (shouldn't happen with valid config)
+                    log::warn!("AdServer Mock: failed to parse endpoint URL, skipping segments");
                 }
             }
         }
@@ -773,7 +773,7 @@ mod tests {
         let url = provider.build_endpoint_url(&request);
         assert_eq!(
             url,
-            "http://localhost:6767/adserver/mediate?permutive=10000001,10000003,adv,bhgp"
+            "http://localhost:6767/adserver/mediate?permutive=10000001%2C10000003%2Cadv%2Cbhgp"
         );
     }
 
@@ -828,7 +828,7 @@ mod tests {
         let url = provider.build_endpoint_url(&request);
         assert_eq!(
             url,
-            "http://localhost:6767/adserver/mediate?debug=true&permutive=123,adv"
+            "http://localhost:6767/adserver/mediate?debug=true&permutive=123%2Cadv"
         );
     }
 }

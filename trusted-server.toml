@@ -109,6 +109,9 @@ enabled = true
 providers = ["prebid"]
 # mediator = "adserver_mock"  # will use mediator when set
 timeout_ms = 2000
+# Context keys the JS client is allowed to forward into auction requests.
+# Keys not in this list are silently dropped. An empty list blocks all keys.
+allowed_context_keys = ["permutive_segments"]
 
 [integrations.aps]
 enabled = false

@@ -134,18 +134,23 @@ pub fn convert_tsjs_to_auction_request(
         geo: GeoInfo::from_request(req),
     });
 
-    // Forward all config entries from the JS request into the context map.
-    // Each integration's context provider contributes its own keys (e.g.
-    // permutive_segments, lockr_ids, …) — we pass them all through so
-    // auction providers can read whatever they need.
+    // Forward allowed config entries from the JS request into the context map.
+    // Only keys listed in `auction.allowed_context_keys` are accepted;
+    // unrecognised keys are silently dropped to prevent injection of
+    // arbitrary data by a malicious client payload.
+    let allowed = &settings.auction.allowed_context_keys;
     let mut context = HashMap::new();
     if let Some(ref config) = body.config {
         if let Some(obj) = config.as_object() {
             for (key, value) in obj {
-                context.insert(key.clone(), value.clone());
+                if allowed.iter().any(|k| k == key) {
+                    context.insert(key.clone(), value.clone());
+                } else {
+                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                }
             }
             if !context.is_empty() {
-                log::info!(
+                log::debug!(
                     "Auction request context: {} entries ({})",
                     context.len(),
                     context.keys().cloned().collect::<Vec<_>>().join(", ")
