@@ -11,6 +11,7 @@ use crate::settings::Settings;
 use std::sync::Arc;
 
 pub mod config;
+pub mod context;
 pub mod endpoints;
 pub mod formats;
 pub mod orchestrator;
@@ -18,6 +19,7 @@ pub mod provider;
 pub mod types;
 
 pub use config::AuctionConfig;
+pub use context::{build_url_with_context_params, ContextQueryParams};
 pub use orchestrator::AuctionOrchestrator;
 pub use provider::AuctionProvider;
 pub use types::{
