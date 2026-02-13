@@ -81,6 +81,18 @@ describe('getPermutiveSegments', () => {
     expect(getPermutiveSegments()).toEqual([]);
   });
 
+  it('caps segments at 100', () => {
+    const ids = Array.from({ length: 150 }, (_, i) => `seg-${i}`);
+    localStorage.setItem(
+      'permutive-app',
+      JSON.stringify({ core: { cohorts: { all: ids } } })
+    );
+    const result = getPermutiveSegments();
+    expect(result).toHaveLength(100);
+    expect(result[0]).toBe('seg-0');
+    expect(result[99]).toBe('seg-99');
+  });
+
   it('filters out non-string non-number values', () => {
     localStorage.setItem(
       'permutive-app',
