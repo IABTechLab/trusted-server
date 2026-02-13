@@ -113,8 +113,9 @@ impl GptIntegration {
     /// Only matches the canonical host:
     /// - `securepubads.g.doubleclick.net/tag/js/gpt.js`
     ///
-    /// The `script_url` config option allows publishers to override this,
-    /// so there is no need to hard-code legacy hosts.
+    /// This matcher is intentionally strict and only controls HTML attribute
+    /// rewriting for the initial bootstrap tag. The `script_url` config option
+    /// still controls which upstream URL `/integrations/gpt/script` fetches.
     fn is_gpt_script_url(url: &str) -> bool {
         let parsed = Url::parse(url).or_else(|_| {
             let stripped = url
