@@ -9,8 +9,8 @@
 //! 3. `pubads_impl_*.js` – lazy-loaded sub-modules (page-level ads, side rails, …)
 //! 4. Auxiliary scripts – viewability, monitoring, error reporting
 //!
-//! All of these are served from `securepubads.g.doubleclick.net` or
-//! `pagead2.googlesyndication.com`. The integration proxies these scripts
+//! All of these are served from `securepubads.g.doubleclick.net`. The
+//! integration proxies these scripts
 //! through the publisher's domain while a client-side shim intercepts
 //! dynamic script insertions and rewrites their URLs to the first-party
 //! proxy so that every subsequent fetch in the cascade routes back through
@@ -110,9 +110,11 @@ impl GptIntegration {
 
     /// Check if a URL points at Google's GPT bootstrap script (`gpt.js`).
     ///
-    /// Matches the two known hosts:
+    /// Only matches the canonical host:
     /// - `securepubads.g.doubleclick.net/tag/js/gpt.js`
-    /// - `www.googletagservices.com/tag/js/gpt.js` (legacy)
+    ///
+    /// The `script_url` config option allows publishers to override this,
+    /// so there is no need to hard-code legacy hosts.
     fn is_gpt_script_url(url: &str) -> bool {
         let parsed = Url::parse(url).or_else(|_| {
             let stripped = url
@@ -129,13 +131,8 @@ impl GptIntegration {
             return false;
         };
 
-        let host = host.to_ascii_lowercase();
-        let known_host = matches!(
-            host.as_str(),
-            SECUREPUBADS_HOST | "googletagservices.com" | "www.googletagservices.com"
-        );
-
-        known_host && parsed.path().eq_ignore_ascii_case("/tag/js/gpt.js")
+        host.eq_ignore_ascii_case(SECUREPUBADS_HOST)
+            && parsed.path().eq_ignore_ascii_case("/tag/js/gpt.js")
     }
 
     /// Fetch and serve the GPT bootstrap script (`gpt.js`).
@@ -476,11 +473,6 @@ mod tests {
         );
 
         assert!(
-            GptIntegration::is_gpt_script_url("https://www.googletagservices.com/tag/js/gpt.js"),
-            "should match the legacy googletagservices.com host"
-        );
-
-        assert!(
             GptIntegration::is_gpt_script_url("//securepubads.g.doubleclick.net/tag/js/gpt.js"),
             "should match protocol-relative GPT CDN URLs"
         );
@@ -541,23 +533,6 @@ mod tests {
             }
             other => panic!("Expected Replace action, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn attribute_rewriter_rewrites_legacy_host() {
-        let integration = GptIntegration::new(test_config());
-        let ctx = test_context();
-
-        let result = integration.rewrite(
-            "src",
-            "https://www.googletagservices.com/tag/js/gpt.js",
-            &ctx,
-        );
-
-        assert!(
-            matches!(result, AttributeRewriteAction::Replace(_)),
-            "should rewrite legacy googletagservices.com URLs"
-        );
     }
 
     #[test]
