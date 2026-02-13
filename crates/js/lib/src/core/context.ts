@@ -8,16 +8,19 @@ import { log } from './log';
  */
 export type ContextProvider = () => Record<string, unknown> | undefined;
 
-const providers: ContextProvider[] = [];
+const providers = new Map<string, ContextProvider>();
 
 /**
  * Register a context provider that will be called before every auction request.
  * Integrations call this at import time to inject their data (e.g. segments,
  * identifiers) into the auction payload without core needing to know about them.
+ *
+ * Re-registering with the same `id` replaces the previous provider, preventing
+ * duplicate accumulation in SPA environments.
  */
-export function registerContextProvider(provider: ContextProvider): void {
-  providers.push(provider);
-  log.debug('context: registered provider', { total: providers.length });
+export function registerContextProvider(id: string, provider: ContextProvider): void {
+  providers.set(id, provider);
+  log.debug('context: registered provider', { id, total: providers.size });
 }
 
 /**
@@ -29,7 +32,7 @@ export function registerContextProvider(provider: ContextProvider): void {
  */
 export function collectContext(): Record<string, unknown> {
   const context: Record<string, unknown> = {};
-  for (const provider of providers) {
+  for (const provider of providers.values()) {
     try {
       const data = provider();
       if (data) Object.assign(context, data);

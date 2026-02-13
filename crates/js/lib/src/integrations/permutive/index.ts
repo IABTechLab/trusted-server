@@ -105,7 +105,7 @@ if (typeof window !== 'undefined') {
   // Register a context provider so Permutive segments are included in auction
   // requests. Core calls collectContext() before every /auction POST — this
   // keeps all Permutive localStorage knowledge inside this integration.
-  registerContextProvider(() => {
+  registerContextProvider('permutive', () => {
     const segments = getPermutiveSegments();
     return segments.length > 0 ? { permutive_segments: segments } : undefined;
   });
