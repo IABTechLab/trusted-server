@@ -65,6 +65,39 @@ describe('GPT script guard', () => {
     }).not.toThrow();
   });
 
+  it('rewrites document.write script URLs by hostname', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain(
+      '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar'
+    );
+  });
+
+  it('does not rewrite document.write URLs that only mention GPT domains in query text', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    const originalHtml =
+      '<script src="https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js"></script>';
+
+    document.write(originalHtml);
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    expect(nativeWriteSpy).toHaveBeenCalledWith(originalHtml);
+  });
+
   it('rewrites through instance patch when src descriptor install is unavailable', () => {
     const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
     const descriptorSpy = vi

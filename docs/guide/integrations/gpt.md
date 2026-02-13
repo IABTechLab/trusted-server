@@ -73,7 +73,7 @@ rewrite_script = true
 - `GET /integrations/gpt/pagead/*` -- Proxies secondary GPT scripts and resources
 - `GET /integrations/gpt/tag/*` -- Proxies tag-path resources
 
-All responses include `X-GPT-Proxy: true` and `X-Script-Source` headers for debugging.
+Successful proxy responses include `X-GPT-Proxy: true` and `X-Script-Source` headers for debugging.
 
 ## Features
 
@@ -92,7 +92,7 @@ The GPT integration includes a TypeScript module bundled into the unified TSJS b
 
 The script guard uses six interception layers to catch GPT script URLs regardless of how they are set or inserted into the DOM:
 
-1. **`document.write` / `document.writeln`** -- GPT's primary loading mechanism. When `gpt.js` loads synchronously, it uses `document.write` to inject `<script src="...pubads_impl.js">` directly into the HTML parser stream. The guard intercepts these calls and rewrites GPT domain URLs inside the HTML string before passing it to the native method.
+1. **`document.write` / `document.writeln`** -- GPT's primary loading mechanism. When `gpt.js` loads synchronously, it uses `document.write` to inject `<script src="...pubads_impl.js">` directly into the HTML parser stream. The guard intercepts these calls and rewrites URLs whose hostname is `securepubads.g.doubleclick.net` inside the HTML string before passing it to the native method.
 2. **Property descriptor** on `HTMLScriptElement.prototype.src` -- intercepts `script.src = url` assignments. This catches GPT's async fallback path (used when `document.write` is unavailable, e.g. after page load or with `async` scripts).
 3. **`setAttribute` patch** on `HTMLScriptElement.prototype` -- catches `script.setAttribute('src', url)` calls that bypass the property setter.
 4. **`document.createElement` patch** -- tags every newly created `<script>` element with a per-instance `src` descriptor, ensuring coverage even if the prototype-level descriptor cannot be installed.
@@ -103,7 +103,7 @@ Intercepts scripts from `securepubads.g.doubleclick.net` and rewrites them to th
 
 ### Command Queue Patch
 
-Takes over `googletag.cmd` so every queued callback runs through a wrapper. This enables future hook points for:
+Takes over `googletag.cmd` so every queued callback is wrapped before GPT executes it. This enables future hook points for:
 
 - Synthetic ID injection as page-level key-value targeting
 - Consent gating of ad requests
@@ -133,7 +133,7 @@ Takes over `googletag.cmd` so every queued callback runs through a wrapper. This
 
 - Verify `rewrite_script` is `true` in config
 - Check that the TSJS bundle with the GPT shim is loaded **before** GPT
-- Inspect console for "GPT guard: installing DOM interception" log message
+- Inspect console for "GPT guard: installing interception for Google ad scripts" log message
 
 ### Ads Not Rendering
 

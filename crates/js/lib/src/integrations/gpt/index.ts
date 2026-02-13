@@ -95,8 +95,8 @@ function wrapCommand(fn: () => void): () => void {
 /**
  * Patch `googletag.cmd` so every pushed callback runs through [`wrapCommand`].
  *
- * Any commands already queued before the shim loads are flushed through the
- * wrapper immediately.
+ * Any commands already queued before the shim loads are re-queued through the
+ * wrapper so GPT executes them later via its normal queue-drain behavior.
  */
 function patchCommandQueue(tag: Partial<GoogleTag>): void {
   const pending = Array.isArray(tag.cmd) ? [...tag.cmd] : [];
