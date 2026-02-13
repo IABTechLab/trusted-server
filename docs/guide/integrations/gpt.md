@@ -17,7 +17,7 @@ Google Publisher Tags (GPT) is the JavaScript library publishers use to define a
 3. `pubads_impl_*.js` -- lazy-loaded sub-modules (page-level ads, side rails, etc.)
 4. Auxiliary scripts -- viewability, monitoring, error reporting
 
-All of these are served from `securepubads.g.doubleclick.net` or `pagead2.googlesyndication.com`.
+All of these are served from `securepubads.g.doubleclick.net`.
 
 ## How It Works
 
@@ -99,11 +99,7 @@ The script guard uses six interception layers to catch GPT script URLs regardles
 5. **DOM insertion patches** on `appendChild` / `insertBefore` -- catches scripts and `<link rel="preload">` elements whose `src`/`href` is already set at insertion time.
 6. **`MutationObserver`** -- catches elements added via `innerHTML`, `.append()`, or other DOM methods, as well as attribute mutations on existing elements.
 
-Handles these Google ad-serving domains:
-
-- `securepubads.g.doubleclick.net`
-- `pagead2.googlesyndication.com`
-- `googletagservices.com`
+Intercepts scripts from `securepubads.g.doubleclick.net` and rewrites them to the first-party proxy.
 
 ### Command Queue Patch
 
