@@ -1,9 +1,25 @@
+//! Google Tag Manager integration for first-party tag delivery.
+//!
+//! Proxies GTM scripts and Google Analytics beacons through the publisher's
+//! domain, improving tracking accuracy and ad-blocker resistance.
+//!
+//! # Endpoints
+//!
+//! | Method | Path | Description |
+//! |--------|------|-------------|
+//! | `GET` | `.../gtm.js` | Proxies and rewrites the GTM script |
+//! | `GET` | `.../gtag/js` | Proxies the gtag script |
+//! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
+//! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::http::StatusCode;
 use fastly::{Request, Response};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -18,6 +34,20 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
+
+/// Regex pattern for matching and rewriting GTM and Google Analytics URLs.
+///
+/// Handles all URL variants:
+/// - `https://www.googletagmanager.com/gtm.js?id=...`
+/// - `//www.googletagmanager.com/gtm.js?id=...`
+/// - `https://www.google-analytics.com/collect`
+/// - `//www.google-analytics.com/g/collect`
+///
+/// The replacement target is `/integrations/google_tag_manager`.
+static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(https?:)?//www\.(googletagmanager|google-analytics)\.com")
+        .expect("GTM URL regex should compile")
+});
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct GoogleTagManagerConfig {
@@ -39,7 +69,7 @@ impl IntegrationConfig for GoogleTagManagerConfig {
 }
 
 fn default_enabled() -> bool {
-    true
+    false
 }
 
 fn default_upstream() -> String {
@@ -55,6 +85,13 @@ impl GoogleTagManagerIntegration {
         Arc::new(Self { config })
     }
 
+    fn error(message: impl Into<String>) -> TrustedServerError {
+        TrustedServerError::Integration {
+            integration: GTM_INTEGRATION_ID.to_string(),
+            message: message.into(),
+        }
+    }
+
     fn upstream_url(&self) -> &str {
         if self.config.upstream_url.is_empty() {
             DEFAULT_UPSTREAM
@@ -63,31 +100,27 @@ impl GoogleTagManagerIntegration {
         }
     }
 
-    fn rewrite_gtm_script(&self, content: &str) -> String {
-        // Rewrite 'www.google-analytics.com' to point to this server's proxy path
-        // path would be /integrations/google_tag_manager
-        let my_integration_path = format!("/integrations/{}", GTM_INTEGRATION_ID);
-
-        // Simplistic replacements - mimic what Cloudflare/others do
-        // Replacements depend on exactly how the string appears in the minified JS.
-        // Common target: "https://www.google-analytics.com"
-        let mut new_content =
-            content.replace("https://www.google-analytics.com", &my_integration_path);
-        new_content = new_content.replace("https://www.googletagmanager.com", &my_integration_path);
-        new_content
+    /// Rewrite GTM and Google Analytics URLs to first-party proxy paths.
+    ///
+    /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
+    /// for both `googletagmanager.com` and `google-analytics.com`.
+    fn rewrite_gtm_urls(content: &str) -> String {
+        let replacement = format!("/integrations/{}", GTM_INTEGRATION_ID);
+        GTM_URL_PATTERN
+            .replace_all(content, replacement.as_str())
+            .into_owned()
     }
 }
 
-#[must_use]
-pub fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
-    let config = settings
-        .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
-        .ok()
-        .flatten()?;
-
-    if !config.enabled {
-        return None;
-    }
+fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
+    let config = match settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID) {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(err) => {
+            log::error!("Failed to load GTM integration config: {err:?}");
+            return None;
+        }
+    };
 
     Some(GoogleTagManagerIntegration::new(config))
 }
@@ -132,7 +165,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
         let method = req.get_method();
-        log::info!("Handling GTM request: {} {}", method, path);
+        log::debug!("Handling GTM request: {} {}", method, path);
 
         let upstream_base = self.upstream_url();
 
@@ -142,6 +175,8 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         } else if path.ends_with("/gtag/js") {
             format!("{}/gtag/js", upstream_base)
         } else if path.ends_with("/collect") {
+            // Analytics beacons always go to google-analytics.com, not the
+            // configurable upstream_url (which is for googletagmanager.com).
             if path.contains("/g/") {
                 "https://www.google-analytics.com/g/collect".to_string()
             } else {
@@ -171,30 +206,26 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             );
         }
 
-        let mut response = proxy_request(settings, req, proxy_config).await?;
+        let mut response = proxy_request(settings, req, proxy_config)
+            .await
+            .change_context(Self::error("Failed to proxy GTM request"))?;
 
-        // Rewrite logic (Primitive version)
-        // If we are serving gtm.js, we want to text-replace "www.google-analytics.com"
-        // with our proxy details to route beacons through us.
+        // If we are serving gtm.js, rewrite internal URLs to route beacons through us.
         if path.ends_with("/gtm.js") {
-            log::info!("Rewriting GTM script content");
-            // Note: This is an expensive operation if the script is large.
-            // Ideally should be streamed, but simple string replacement for now.
-            let body_bytes = response.into_body_bytes();
-            let body_str = String::from_utf8_lossy(&body_bytes).to_string();
-
-            let rewritten_body = self.rewrite_gtm_script(&body_str);
+            if !response.get_status().is_success() {
+                log::warn!("GTM upstream returned status {}", response.get_status());
+                return Ok(response);
+            }
+            log::debug!("Rewriting GTM script content");
+            let body_str = response.take_body_str();
+            let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 
             response = Response::from_body(rewritten_body)
                 .with_header(
                     fastly::http::header::CONTENT_TYPE,
                     "application/javascript; charset=utf-8",
                 )
-                // Enforce 1 hour cache TTL for the script, similar to Permutive
-                .with_header(
-                    fastly::http::header::CACHE_CONTROL,
-                    "public, max-age=3600, immutable",
-                );
+                .with_header(fastly::http::header::CACHE_CONTROL, "public, max-age=3600");
         }
 
         Ok(response)
@@ -217,17 +248,7 @@ impl IntegrationAttributeRewriter for GoogleTagManagerIntegration {
         _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if attr_value.contains("googletagmanager.com/gtm.js") {
-            let encoded_integration_id = urlencoding::encode(self.integration_name());
-            let mut new_value = attr_value.replace(
-                "https://www.googletagmanager.com/gtm.js",
-                &format!("/integrations/{}/gtm.js", encoded_integration_id),
-            );
-            new_value = new_value.replace(
-                "//www.googletagmanager.com/gtm.js",
-                &format!("/integrations/{}/gtm.js", encoded_integration_id),
-            );
-
-            AttributeRewriteAction::replace(new_value)
+            AttributeRewriteAction::replace(Self::rewrite_gtm_urls(attr_value))
         } else {
             AttributeRewriteAction::keep()
         }
@@ -247,17 +268,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
         if content.contains("googletagmanager.com/gtm.js") {
-            let encoded_integration_id = urlencoding::encode(self.integration_name());
-            let my_integration_path = format!("/integrations/{}/gtm.js", encoded_integration_id);
-
-            let mut new_content = content.replace(
-                "https://www.googletagmanager.com/gtm.js",
-                &my_integration_path,
-            );
-            new_content =
-                new_content.replace("//www.googletagmanager.com/gtm.js", &my_integration_path);
-
-            return ScriptRewriteAction::replace(new_content);
+            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(content));
         }
 
         ScriptRewriteAction::keep()
@@ -277,6 +288,33 @@ mod tests {
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
     use std::io::Cursor;
+
+    #[test]
+    fn test_rewrite_gtm_urls() {
+        // All URL patterns should be rewritten via the shared regex
+        let input = r#"
+            var a = "https://www.googletagmanager.com/gtm.js";
+            var b = "//www.googletagmanager.com/gtm.js";
+            var c = "https://www.google-analytics.com/collect";
+            var d = "//www.google-analytics.com/g/collect";
+            var e = "http://www.googletagmanager.com/gtm.js";
+        "#;
+
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
+
+        assert!(result.contains("/integrations/google_tag_manager/gtm.js"));
+        assert!(result.contains("/integrations/google_tag_manager/collect"));
+        assert!(result.contains("/integrations/google_tag_manager/g/collect"));
+        assert!(!result.contains("www.googletagmanager.com"));
+        assert!(!result.contains("www.google-analytics.com"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_non_gtm_urls() {
+        let input = r#"var x = "https://example.com/script.js";"#;
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
+        assert_eq!(input, result);
+    }
 
     #[test]
     fn test_attribute_rewriter() {
@@ -394,7 +432,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             upstream_url: default_upstream(),
         };
 
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert_eq!(config.upstream_url, "https://www.googletagmanager.com");
     }
 
@@ -451,19 +489,12 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
     #[test]
     fn test_handle_response_rewriting() {
-        let config = GoogleTagManagerConfig {
-            enabled: true,
-            container_id: "GTM-TEST".to_string(),
-            upstream_url: default_upstream(),
-        };
-        let integration = GoogleTagManagerIntegration::new(config);
-
         let original_body = r#"
             var x = "https://www.google-analytics.com/collect";
             var y = "https://www.googletagmanager.com/gtm.js";
         "#;
 
-        let rewritten = integration.rewrite_gtm_script(original_body);
+        let rewritten = GoogleTagManagerIntegration::rewrite_gtm_urls(original_body);
 
         assert!(rewritten.contains("/integrations/google_tag_manager/collect"));
         assert!(rewritten.contains("/integrations/google_tag_manager/gtm.js"));
@@ -539,12 +570,15 @@ container_id = "GTM-DEFAULT"
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings
             .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
-            .expect("should get config")
-            .expect("should be enabled");
+            .expect("should get config");
 
-        assert!(config.enabled); // Default is true
-        assert_eq!(config.container_id, "GTM-DEFAULT");
-        assert_eq!(config.upstream_url, "https://www.googletagmanager.com"); // Default upstream
+        // Default is now false, so integration_config returns None for disabled
+        // When we explicitly parse the config with container_id but no enabled field,
+        // the config is present but disabled
+        assert!(
+            config.is_none(),
+            "Config with default enabled=false should return None from integration_config"
+        );
     }
 
     #[test]
@@ -586,26 +620,6 @@ container_id = "GTM-DEFAULT"
         // Verify rewrite happened
         assert!(processed.contains("/integrations/google_tag_manager/gtm.js?id=GTM-TEST"));
         assert!(!processed.contains("https://www.googletagmanager.com/gtm.js"));
-    }
-
-    #[test]
-    fn test_headers() {
-        // This test simulates the header logic used in `handle`
-        // Since `handle` makes network calls, we can't easily unit test it without mocking.
-        // However, we can verify the logic constructs intended headers.
-
-        let response_headers = vec![
-            ("cache-control", "public, max-age=3600, immutable"),
-            ("content-type", "application/javascript; charset=utf-8"),
-        ];
-
-        for (key, value) in response_headers {
-            match key {
-                "cache-control" => assert_eq!(value, "public, max-age=3600, immutable"),
-                "content-type" => assert_eq!(value, "application/javascript; charset=utf-8"),
-                _ => panic!("Unexpected header"),
-            }
-        }
     }
 
     #[test]
@@ -651,17 +665,16 @@ container_id = "GTM-DEFAULT"
         );
 
         let processed = String::from_utf8_lossy(&output);
-        let encoded_id = urlencoding::encode("google_tag_manager");
 
         // 5. Assertions
 
         // a. Link Preload Rewrite:
         // Original: <link rel="preload" href="https://www.googletagmanager.com/gtm.js?id=GTM-522ZT3X6" ...
         // Expected: href="/integrations/google_tag_manager/gtm.js?id=GTM-522ZT3X6"
-        let expected_link = format!("/integrations/{}/gtm.js?id=GTM-522ZT3X6", encoded_id);
+        let expected_link = "/integrations/google_tag_manager/gtm.js?id=GTM-522ZT3X6";
 
         assert!(
-            processed.contains(&expected_link),
+            processed.contains(expected_link),
             "Link preload tag not rewritten correctly"
         );
 
@@ -724,11 +737,10 @@ container_id = "GTM-DEFAULT"
             .expect("should process");
         let processed = String::from_utf8_lossy(&output);
 
-        let encoded_id = urlencoding::encode("google_tag_manager");
-        let expected_src = format!("/integrations/{}/gtm.js", encoded_id);
+        let expected_src = "/integrations/google_tag_manager/gtm.js";
 
         assert!(
-            processed.contains(&expected_src),
+            processed.contains(expected_src),
             "Inline script src not rewritten"
         );
 
@@ -736,5 +748,20 @@ container_id = "GTM-DEFAULT"
             !processed.contains("j.src='https://www.googletagmanager.com/gtm.js"),
             "Original src should be gone"
         );
+    }
+
+    #[test]
+    fn test_error_helper() {
+        let err = GoogleTagManagerIntegration::error("test failure");
+        match err {
+            TrustedServerError::Integration {
+                integration,
+                message,
+            } => {
+                assert_eq!(integration, "google_tag_manager");
+                assert_eq!(message, "test failure");
+            }
+            other => panic!("Expected Integration error, got {:?}", other),
+        }
     }
 }

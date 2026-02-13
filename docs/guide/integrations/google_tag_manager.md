@@ -104,7 +104,7 @@ GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
 
 - Proxies to `https://www.googletagmanager.com/gtm.js`
 - Rewrites internal URLs to use the first-party proxy
-- Strips `Accept-Encoding` during fetch to ensure rewriteable text response
+- Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
 
 ### `GET/POST .../collect` - Analytics Beacon
 
