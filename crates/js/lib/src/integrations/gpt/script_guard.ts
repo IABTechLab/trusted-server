@@ -38,15 +38,8 @@ import { log } from '../../core/log';
 
 const LOG_PREFIX = 'GPT guard';
 
-/** Google ad-serving domains whose scripts should be proxied. */
-const GPT_DOMAINS = [
-  'securepubads.g.doubleclick.net',
-  'pagead2.googlesyndication.com',
-  'googletagservices.com',
-  'www.googletagservices.com',
-] as const;
-
-const GPT_DOMAIN_SET = new Set<string>(GPT_DOMAINS);
+/** The Google ad-serving domain whose scripts should be proxied. */
+const GPT_DOMAIN = 'securepubads.g.doubleclick.net';
 
 /** Integration route prefix on the first-party domain. */
 const PROXY_PREFIX = '/integrations/gpt';
@@ -84,7 +77,7 @@ function parseUrl(url: string): URL | undefined {
  */
 function isGptDomainUrl(url: string): boolean {
   const parsed = parseUrl(url);
-  return !!parsed && GPT_DOMAIN_SET.has(parsed.hostname.toLowerCase());
+  return !!parsed && parsed.hostname.toLowerCase() === GPT_DOMAIN;
 }
 
 /**
@@ -208,7 +201,7 @@ function rewriteLinkHref(element: HTMLLinkElement): void {
  *   `<script src="https://securepubads.g.doubleclick.net/pagead/…/pubads_impl.js" …></script>`
  */
 const SCRIPT_SRC_RE =
-  /(<script\b[^>]*?\bsrc\s*=\s*["'])([^"']*(?:securepubads\.g\.doubleclick\.net|pagead2\.googlesyndication\.com|googletagservices\.com)[^"']*)(["'])/gi;
+  /(<script\b[^>]*?\bsrc\s*=\s*["'])([^"']*securepubads\.g\.doubleclick\.net[^"']*)(["'])/gi;
 
 /**
  * Rewrite GPT domain URLs inside raw HTML strings passed to
