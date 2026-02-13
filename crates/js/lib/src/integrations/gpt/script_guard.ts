@@ -73,7 +73,7 @@ function parseUrl(url: string): URL | undefined {
 }
 
 /**
- * Check if a URL belongs to one of Google's GPT / ad-serving domains.
+ * Check if a URL belongs to the GPT domain we proxy.
  */
 function isGptDomainUrl(url: string): boolean {
   const parsed = parseUrl(url);
@@ -192,13 +192,16 @@ function rewriteLinkHref(element: HTMLLinkElement): void {
 
 /**
  * Regex that matches `src="..."` or `src='...'` attributes inside a
- * `<script>` tag where the URL contains a GPT domain. We capture:
+ * `<script>` tag where the URL text mentions the GPT domain token. We capture:
  *   1. Everything before the URL (the `src=` prefix with quote)
  *   2. The URL itself
  *   3. Everything after the URL (the closing quote)
  *
  * This handles the HTML that GPT's `Xd` function produces, e.g.:
  *   `<script src="https://securepubads.g.doubleclick.net/pagead/…/pubads_impl.js" …></script>`
+ *
+ * Hostname verification still happens in [`maybeRewrite`], so URLs that merely
+ * contain the token in query text are left unchanged.
  */
 const SCRIPT_SRC_RE =
   /(<script\b[^>]*?\bsrc\s*=\s*["'])([^"']*securepubads\.g\.doubleclick\.net[^"']*)(["'])/gi;
@@ -213,7 +216,11 @@ function rewriteHtmlString(html: string): string {
   SCRIPT_SRC_RE.lastIndex = 0;
 
   return html.replace(SCRIPT_SRC_RE, (_match, prefix: string, url: string, suffix: string) => {
-    const rewrittenUrl = rewriteUrl(url);
+    const { url: rewrittenUrl, didRewrite } = maybeRewrite(url);
+    if (!didRewrite) {
+      return `${prefix}${url}${suffix}`;
+    }
+
     log.info(`${LOG_PREFIX}: rewriting document.write script src`, {
       original: url,
       rewritten: rewrittenUrl,
