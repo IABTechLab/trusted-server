@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -16,7 +15,6 @@ use crate::integrations::{
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::get_or_generate_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -140,10 +138,12 @@ impl IntegrationProxy for TestlightIntegration {
             .validate()
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
-        let synthetic_id = get_or_generate_synthetic_id(settings, &req)
-            .change_context(Self::error("Failed to fetch or mint synthetic ID"))?;
+        // Read synthetic ID using the shared utility (checks header + cookie)
+        let synthetic_id = crate::synthetic::get_synthetic_id(&req)
+            .change_context(Self::error("Failed to read synthetic ID"))?
+            .ok_or_else(|| Report::new(Self::error("Missing synthetic ID on request")))?;
 
-        payload.user.id = Some(synthetic_id.clone());
+        payload.user.id = Some(synthetic_id);
 
         let payload_bytes = serde_json::to_vec(&payload)
             .change_context(Self::error("Failed to serialize request body"))?;
@@ -175,7 +175,6 @@ impl IntegrationProxy for TestlightIntegration {
             }
         }
 
-        response.set_header(HEADER_X_SYNTHETIC_ID, &synthetic_id);
         Ok(response)
     }
 }
