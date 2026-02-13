@@ -1,34 +1,33 @@
-use trusted_server_js::{bundle_hash, TsjsBundle};
+use trusted_server_js::{all_module_ids, concatenated_hash};
 
-fn script_src_for(bundle: TsjsBundle) -> String {
+/// `/static` URL for the tsjs bundle with cache-busting hash based on
+/// the concatenated content of the given module set.
+#[must_use]
+pub fn tsjs_script_src(module_ids: &[&str]) -> String {
+    let hash = concatenated_hash(module_ids);
+    format!("/static/tsjs=tsjs-unified.min.js?v={hash}")
+}
+
+/// `<script>` tag for injecting the tsjs bundle.
+#[must_use]
+pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
     format!(
-        "/static/tsjs={}?v={}",
-        bundle.minified_filename(),
-        bundle_hash(bundle)
+        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
+        tsjs_script_src(module_ids)
     )
 }
 
-fn script_tag_for(bundle: TsjsBundle, attrs: &str) -> String {
-    let attr_segment = if attrs.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", attrs)
-    };
-    format!(
-        "<script src=\"{}\"{}></script>",
-        script_src_for(bundle),
-        attr_segment
-    )
+/// `/static` URL using **all** available modules. Used in contexts that lack
+/// an `IntegrationRegistry` (e.g., creative rewriting, config defaults).
+#[must_use]
+pub fn tsjs_script_src_all() -> String {
+    let ids = all_module_ids();
+    tsjs_script_src(&ids)
 }
 
-/// `/static` URL for the unified bundle with cache-busting hash.
+/// `<script>` tag using **all** available modules.
 #[must_use]
-pub fn unified_script_src() -> String {
-    script_src_for(TsjsBundle::Unified)
-}
-
-/// `<script>` tag for injecting the unified bundle.
-#[must_use]
-pub fn unified_script_tag() -> String {
-    script_tag_for(TsjsBundle::Unified, "id=\"trustedserver-js\"")
+pub fn tsjs_script_tag_all() -> String {
+    let ids = all_module_ids();
+    tsjs_script_tag(&ids)
 }

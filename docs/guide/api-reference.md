@@ -449,13 +449,7 @@ Serves the TSJS (Trusted Server JavaScript) library.
 ```
 
 **Module Selection:**
-Controlled at build time via `TSJS_MODULES` environment variable:
-
-```bash
-TSJS_MODULES=creative,ext,permutive cargo build
-```
-
-See [Configuration](./configuration.md) for TSJS build options.
+All integration modules are built at compile time. At runtime, the server concatenates only the modules whose integrations are enabled in `trusted-server.toml` (or env vars). No rebuild is required to change the module set.
 
 ---
 

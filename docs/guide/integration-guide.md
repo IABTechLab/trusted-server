@@ -281,12 +281,12 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
+**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the NPM-bundled Prebid.js already ships in the unified TSJS build.
 
 **Key files**:
 
 - `crates/common/src/integrations/prebid.rs` - Rust implementation
-- `crates/js/lib/src/ext/prebidjs.ts` - TypeScript shim
+- `crates/js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
 
 #### Prebid Integration Details
 
@@ -317,7 +317,7 @@ When the integration is enabled, the `IntegrationAttributeRewriter` removes any 
 
 **4. TSJS Assets & Testing**
 
-The shim implementation lives in `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the shim.
+The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the Prebid.js bundle.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 

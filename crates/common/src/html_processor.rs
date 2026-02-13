@@ -203,8 +203,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
-                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
-                    snippet.push_str(&tsjs::unified_script_tag());
+                    // First inject the TSJS bundle (defines tsjs.setConfig, etc.)
+                    let module_ids = integrations.js_module_ids();
+                    snippet.push_str(&tsjs::tsjs_script_tag(&module_ids));
                     // Then add any integration-specific head inserts (e.g., mode config)
                     // These run after the bundle so tsjs API is available
                     for insert in integrations.head_inserts(&ctx) {

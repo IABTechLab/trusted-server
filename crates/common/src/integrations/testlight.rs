@@ -214,7 +214,7 @@ fn default_timeout_ms() -> u32 {
 
 fn default_shim_src() -> String {
     // Testlight is included in the unified bundle, so we return the unified script source
-    tsjs::unified_script_src()
+    tsjs::tsjs_script_src_all()
 }
 
 fn default_enabled() -> bool {
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_replaces_integration_script() {
-        let shim_src = tsjs::unified_script_src();
+        let shim_src = tsjs::tsjs_script_src_all();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_is_noop_when_disabled() {
-        let shim_src = tsjs::unified_script_src();
+        let shim_src = tsjs::tsjs_script_src_all();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
