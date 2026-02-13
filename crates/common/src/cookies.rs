@@ -179,4 +179,24 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn test_set_synthetic_cookie() {
+        let settings = create_test_settings();
+        let mut response = fastly::Response::new();
+        set_synthetic_cookie(&settings, &mut response, "test-id-123");
+
+        let cookie_header = response
+            .get_header(header::SET_COOKIE)
+            .expect("Set-Cookie header should be present");
+        let cookie_str = cookie_header
+            .to_str()
+            .expect("header should be valid UTF-8");
+
+        let expected = create_synthetic_cookie(&settings, "test-id-123");
+        assert_eq!(
+            cookie_str, expected,
+            "Set-Cookie header should match create_synthetic_cookie output"
+        );
+    }
 }

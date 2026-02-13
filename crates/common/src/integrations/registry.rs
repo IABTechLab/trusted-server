@@ -9,6 +9,7 @@ use fastly::{Request, Response};
 use matchit::Router;
 
 use crate::constants::HEADER_X_SYNTHETIC_ID;
+use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::synthetic::get_or_generate_synthetic_id;
@@ -613,19 +614,31 @@ impl IntegrationRegistry {
         method: &Method,
         path: &str,
         settings: &Settings,
-        req: Request,
+        mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Generate synthetic ID before consuming request
             let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
 
+            // Set synthetic ID header on the request so integrations can read it
+            if let Ok(ref synthetic_id) = synthetic_id_result {
+                req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+            }
+
             let mut result = proxy.handle(settings, req).await;
 
             // Set synthetic ID header on successful responses
             if let Ok(ref mut response) = result {
-                if let Ok(ref synthetic_id) = synthetic_id_result {
-                    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-                    crate::cookies::set_synthetic_cookie(settings, response, synthetic_id.as_str());
+                match synthetic_id_result {
+                    Ok(ref synthetic_id) => {
+                        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                        set_synthetic_cookie(settings, response, synthetic_id.as_str());
+                    }
+                    Err(ref err) => {
+                        log::warn!(
+                            "Failed to generate synthetic ID for integration response: {err:?}"
+                        );
+                    }
                 }
             }
             Some(result)

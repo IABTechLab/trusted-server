@@ -199,7 +199,7 @@ pub fn handle_publisher_request(
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
-    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id,);
+    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
 
     let backend_name = ensure_backend_from_url(&settings.publisher.origin_url)?;
     let origin_host = settings.publisher.origin_host();
