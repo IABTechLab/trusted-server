@@ -587,12 +587,16 @@ impl IntegrationRegistry {
                 }
                 inner
                     .html_rewriters
-                    .extend(registration.attribute_rewriters);
-                inner.script_rewriters.extend(registration.script_rewriters);
+                    .extend(registration.attribute_rewriters.into_iter());
+                inner
+                    .script_rewriters
+                    .extend(registration.script_rewriters.into_iter());
                 inner
                     .html_post_processors
-                    .extend(registration.html_post_processors);
-                inner.head_injectors.extend(registration.head_injectors);
+                    .extend(registration.html_post_processors.into_iter());
+                inner
+                    .head_injectors
+                    .extend(registration.head_injectors.into_iter());
             }
         }
 
@@ -684,11 +688,14 @@ impl IntegrationRegistry {
     /// Collect HTML snippets for insertion at the start of `<head>`.
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        self.inner
-            .head_injectors
-            .iter()
-            .flat_map(|injector| injector.head_inserts(ctx))
-            .collect()
+        let mut inserts = Vec::new();
+        for injector in &self.inner.head_injectors {
+            let mut next = injector.head_inserts(ctx);
+            if !next.is_empty() {
+                inserts.append(&mut next);
+            }
+        }
+        inserts
     }
 
     /// Provide a snapshot of registered integrations and their hooks.
