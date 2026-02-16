@@ -172,7 +172,7 @@ impl PrebidIntegration {
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
-            .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .with_header(header::CACHE_CONTROL, "public, max-age=31536000")
             .with_body(body))
     }
 }
@@ -1076,7 +1076,6 @@ server_url = "https://prebid.example"
             .get_header_str(header::CACHE_CONTROL)
             .expect("should have cache-control");
         assert!(cache_control.contains("max-age=31536000"));
-        assert!(cache_control.contains("immutable"));
 
         let body = response.into_body_str();
         assert!(body.contains("// Script overridden by Trusted Server"));

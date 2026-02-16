@@ -188,10 +188,7 @@ impl LockrIntegration {
             )
             .with_header(
                 header::CACHE_CONTROL,
-                format!(
-                    "public, max-age={}, immutable",
-                    self.config.cache_ttl_seconds
-                ),
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-Lockr-SDK-Proxy", "true")
             .with_header("X-SDK-Source", sdk_url)
