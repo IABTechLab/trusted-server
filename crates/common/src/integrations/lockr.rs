@@ -25,6 +25,7 @@ use validator::Validate;
 
 use crate::backend::ensure_backend_from_url;
 use crate::error::TrustedServerError;
+use crate::http_util::copy_custom_headers;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -290,15 +291,8 @@ impl LockrIntegration {
             to.set_header(header::ORIGIN, origin);
         }
 
-        // Copy any X-* custom headers
-        for header_name in from.get_header_names() {
-            let name_str = header_name.as_str();
-            if name_str.starts_with("x-") || name_str.starts_with("X-") {
-                if let Some(value) = from.get_header(header_name) {
-                    to.set_header(header_name, value);
-                }
-            }
-        }
+        // Copy any X-* custom headers, skipping TS-internal headers
+        copy_custom_headers(from, to);
     }
 }
 
