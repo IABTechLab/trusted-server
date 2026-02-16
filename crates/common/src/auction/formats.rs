@@ -9,9 +9,10 @@ use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::auction::context::ContextValue;
 use crate::auction::types::OrchestratorExt;
 use crate::creative;
 use crate::error::TrustedServerError;
@@ -138,13 +139,28 @@ pub fn convert_tsjs_to_auction_request(
     // Only keys listed in `auction.allowed_context_keys` are accepted;
     // unrecognised keys are silently dropped to prevent injection of
     // arbitrary data by a malicious client payload.
-    let allowed = &settings.auction.allowed_context_keys;
+    let allowed: HashSet<&str> = settings
+        .auction
+        .allowed_context_keys
+        .iter()
+        .map(String::as_str)
+        .collect();
     let mut context = HashMap::new();
     if let Some(ref config) = body.config {
         if let Some(obj) = config.as_object() {
             for (key, value) in obj {
-                if allowed.iter().any(|k| k == key) {
-                    context.insert(key.clone(), value.clone());
+                if allowed.contains(key.as_str()) {
+                    match serde_json::from_value::<ContextValue>(value.clone()) {
+                        Ok(cv) => {
+                            context.insert(key.clone(), cv);
+                        }
+                        Err(_) => {
+                            log::debug!(
+                                "Auction context: dropping key '{}' with unsupported type",
+                                key
+                            );
+                        }
+                    }
                 } else {
                     log::debug!("Auction context: dropping disallowed key '{}'", key);
                 }

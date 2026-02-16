@@ -1085,12 +1085,11 @@ mod tests {
     }
 
     #[test]
-    fn test_auction_allowed_context_keys_defaults_to_permutive_segments() {
+    fn test_auction_allowed_context_keys_defaults_to_empty() {
         let settings = create_test_settings();
-        assert_eq!(
-            settings.auction.allowed_context_keys,
-            vec!["permutive_segments"],
-            "Default allowed_context_keys should contain permutive_segments"
+        assert!(
+            settings.auction.allowed_context_keys.is_empty(),
+            "Default allowed_context_keys should be empty (secure-by-default)"
         );
     }
 

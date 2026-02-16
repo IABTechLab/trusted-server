@@ -4,7 +4,25 @@
 //! forward integration-supplied data (e.g. audience segments) as URL query
 //! parameters without hard-coding integration-specific knowledge.
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+
+/// A strongly-typed context value forwarded from the JS client payload.
+///
+/// Replaces raw `serde_json::Value` so that consumers get compile-time
+/// exhaustiveness checks. The `#[serde(untagged)]` attribute preserves
+/// wire-format compatibility — the JS client sends plain JSON arrays, strings,
+/// or numbers which serde maps to the matching variant in declaration order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ContextValue {
+    /// A list of string values (e.g. audience segment IDs).
+    StringList(Vec<String>),
+    /// A single string value.
+    Text(String),
+    /// A numeric value.
+    Number(f64),
+}
 
 /// Mapping from auction-request context keys to query-parameter names.
 ///
@@ -17,7 +35,7 @@ use std::collections::HashMap;
 /// permutive_segments = "permutive"
 /// lockr_ids          = "lockr"
 /// ```
-pub type ContextQueryParams = HashMap<String, String>;
+pub type ContextQueryParams = BTreeMap<String, String>;
 
 /// Build a URL by appending context values as query parameters according to the
 /// provided mapping.
@@ -34,7 +52,7 @@ pub type ContextQueryParams = HashMap<String, String>;
 #[must_use]
 pub fn build_url_with_context_params(
     base_url: &str,
-    context: &HashMap<String, serde_json::Value>,
+    context: &HashMap<String, ContextValue>,
     mapping: &ContextQueryParams,
 ) -> String {
     let Ok(mut url) = url::Url::parse(base_url) else {
@@ -64,38 +82,28 @@ pub fn build_url_with_context_params(
     url.to_string()
 }
 
-/// Serialise a single [`serde_json::Value`] into a string suitable for a query
-/// parameter value.  Arrays are joined with commas; strings and numbers are
-/// returned directly; anything else yields an empty string (skipped).
-fn serialize_context_value(value: &serde_json::Value) -> String {
+/// Serialise a single [`ContextValue`] into a string suitable for a query
+/// parameter value.  String lists are joined with commas; strings and numbers
+/// are returned directly.
+fn serialize_context_value(value: &ContextValue) -> String {
     match value {
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        _ => String::new(),
+        ContextValue::StringList(items) => items.join(","),
+        ContextValue::Text(s) => s.clone(),
+        ContextValue::Number(n) => n.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_build_url_with_context_params_appends_array() {
         let context = HashMap::from([(
             "permutive_segments".to_string(),
-            json!(["10000001", "10000003", "adv"]),
+            ContextValue::StringList(vec!["10000001".into(), "10000003".into(), "adv".into()]),
         )]);
-        let mapping = HashMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -110,8 +118,11 @@ mod tests {
 
     #[test]
     fn test_build_url_with_context_params_preserves_existing_query() {
-        let context = HashMap::from([("permutive_segments".to_string(), json!(["123", "adv"]))]);
-        let mapping = HashMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let context = HashMap::from([(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec!["123".into(), "adv".into()]),
+        )]);
+        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate?debug=true",
@@ -127,7 +138,7 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_no_matching_keys() {
         let context = HashMap::new();
-        let mapping = HashMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -139,8 +150,11 @@ mod tests {
 
     #[test]
     fn test_build_url_with_context_params_empty_array_skipped() {
-        let context = HashMap::from([("permutive_segments".to_string(), json!([]))]);
-        let mapping = HashMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let context = HashMap::from([(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec![]),
+        )]);
+        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -153,12 +167,18 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_multiple_mappings() {
         let context = HashMap::from([
-            ("permutive_segments".to_string(), json!(["seg1"])),
-            ("lockr_ids".to_string(), json!("lockr-abc-123")),
+            (
+                "permutive_segments".to_string(),
+                ContextValue::StringList(vec!["seg1".into()]),
+            ),
+            (
+                "lockr_ids".to_string(),
+                ContextValue::Text("lockr-abc-123".into()),
+            ),
         ]);
-        let mapping = HashMap::from([
-            ("permutive_segments".to_string(), "permutive".to_string()),
+        let mapping = BTreeMap::from([
             ("lockr_ids".to_string(), "lockr".to_string()),
+            ("permutive_segments".to_string(), "permutive".to_string()),
         ]);
 
         let url = build_url_with_context_params(
@@ -172,8 +192,8 @@ mod tests {
 
     #[test]
     fn test_build_url_with_context_params_scalar_number() {
-        let context = HashMap::from([("count".to_string(), json!(42))]);
-        let mapping = HashMap::from([("count".to_string(), "n".to_string())]);
+        let context = HashMap::from([("count".to_string(), ContextValue::Number(42.0))]);
+        let mapping = BTreeMap::from([("count".to_string(), "n".to_string())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -184,22 +204,45 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_context_value_array() {
-        assert_eq!(serialize_context_value(&json!(["a", "b", 3])), "a,b,3");
+    fn test_serialize_context_value_string_list() {
+        assert_eq!(
+            serialize_context_value(&ContextValue::StringList(vec![
+                "a".into(),
+                "b".into(),
+                "3".into()
+            ])),
+            "a,b,3"
+        );
     }
 
     #[test]
-    fn test_serialize_context_value_string() {
-        assert_eq!(serialize_context_value(&json!("hello")), "hello");
+    fn test_serialize_context_value_text() {
+        assert_eq!(
+            serialize_context_value(&ContextValue::Text("hello".into())),
+            "hello"
+        );
     }
 
     #[test]
     fn test_serialize_context_value_number() {
-        assert_eq!(serialize_context_value(&json!(99)), "99");
+        assert_eq!(serialize_context_value(&ContextValue::Number(99.0)), "99");
     }
 
     #[test]
-    fn test_serialize_context_value_object_returns_empty() {
-        assert_eq!(serialize_context_value(&json!({"a": 1})), "");
+    fn test_context_value_deserialize_array() {
+        let v: ContextValue = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        assert_eq!(v, ContextValue::StringList(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn test_context_value_deserialize_string() {
+        let v: ContextValue = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(v, ContextValue::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_context_value_deserialize_number() {
+        let v: ContextValue = serde_json::from_str("42").unwrap();
+        assert_eq!(v, ContextValue::Number(42.0));
     }
 }
