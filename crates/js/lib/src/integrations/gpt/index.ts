@@ -95,26 +95,46 @@ function wrapCommand(fn: () => void): () => void {
 /**
  * Patch `googletag.cmd` so every pushed callback runs through [`wrapCommand`].
  *
- * Any commands already queued before the shim loads are re-queued through the
- * wrapper so GPT executes them later via its normal queue-drain behavior.
+ * Preserves the existing `tag.cmd` array identity so that GPT's own custom
+ * `cmd.push` behaviour (immediate execution when the library is already
+ * loaded) is not lost. The original `push` is saved and delegated to after
+ * wrapping each callback.
+ *
+ * Already-queued callbacks are re-wrapped in place so GPT processes them
+ * through our wrapper when it drains the queue.
  */
 function patchCommandQueue(tag: Partial<GoogleTag>): void {
-  const pending = Array.isArray(tag.cmd) ? [...tag.cmd] : [];
-  const queue: Array<() => void> = [];
-  tag.cmd = queue;
+  // Ensure the queue exists.
+  if (!Array.isArray(tag.cmd)) {
+    tag.cmd = [];
+  }
+
+  const queue = tag.cmd;
+
+  // Guard against double-patching (idempotent install).
+  if ((queue as { __tsPushed?: boolean }).__tsPushed) {
+    log.debug('GPT shim: command queue already patched, skipping');
+    return;
+  }
 
   const originalPush = queue.push.bind(queue);
+
+  // Override push on the *existing* array — preserves object identity so
+  // GPT (if already loaded) keeps its reference.
   queue.push = function (...callbacks: Array<() => void>): number {
     const wrapped = callbacks.map(wrapCommand);
     return originalPush(...wrapped);
   };
 
-  // Flush any commands that were queued before we took over
-  if (pending.length > 0) {
-    queue.push(...pending);
+  // Mark as patched to prevent double-wrapping.
+  (queue as { __tsPushed?: boolean }).__tsPushed = true;
+
+  // Re-wrap any callbacks that were queued before we patched.
+  for (let i = 0; i < queue.length; i++) {
+    queue[i] = wrapCommand(queue[i]);
   }
 
-  log.debug('GPT shim: command queue patched', { pendingCommands: pending.length });
+  log.debug('GPT shim: command queue patched', { pendingCommands: queue.length });
 }
 
 /**
