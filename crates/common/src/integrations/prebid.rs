@@ -228,7 +228,7 @@ impl crate::integrations::IntegrationHtmlPostProcessor for PrebidHtmlInjector {
         ctx: &crate::integrations::IntegrationHtmlContext<'_>,
     ) -> bool {
         // Construct the Prebid configuration object
-        let config = json!({
+        let mut config = json!({
             "accountId": "trusted-server",
             "enabled": true,
             "bidders": self.config.bidders,
@@ -241,6 +241,19 @@ impl crate::integrations::IntegrationHtmlPostProcessor for PrebidHtmlInjector {
             "adUnits": self.config.ad_units,
             "debug": self.config.debug,
         });
+
+        // Inject Geo information if available
+        if let Some(geo) = ctx.geo {
+            config["geo"] = json!({
+                "city": geo.city,
+                "country": geo.country,
+                "continent": geo.continent,
+                "lat": geo.latitude,
+                "lon": geo.longitude,
+                "metroCode": geo.metro_code,
+                "region": geo.region,
+            });
+        }
 
         // Script to inject configuration and initialize Prebid via tsjs
         let script = format!(

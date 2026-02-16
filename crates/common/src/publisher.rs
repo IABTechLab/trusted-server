@@ -226,12 +226,14 @@ pub fn handle_publisher_request(
     )?;
     let origin_host = settings.publisher.origin_host();
 
-    // Inject Geo headers for the backend request
-    crate::geo::get_dma_code(&mut req);
-
     // Extract GeoInfo from request before it is consumed
     use crate::geo::GeoInfo;
     let geo_info = GeoInfo::from_request(&req);
+
+    // Inject Geo headers for the backend request if available
+    if let Some(geo) = &geo_info {
+        geo.set_headers(&mut req);
+    }
 
     // Capture Geo headers to copy to response
     let geo_headers: Vec<(String, String)> = [
