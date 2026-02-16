@@ -108,6 +108,20 @@ impl GptIntegration {
         }
     }
 
+    /// Build the upstream URL for a proxied GPT request.
+    ///
+    /// Strips the integration prefix from the request path and constructs
+    /// a full URL on the GPT host, preserving the original path and query.
+    ///
+    /// Returns `None` if `request_path` does not start with [`ROUTE_PREFIX`].
+    fn build_upstream_url(request_path: &str, query: Option<&str>) -> Option<String> {
+        let upstream_path = request_path.strip_prefix(ROUTE_PREFIX)?;
+        let query_part = query.map(|q| format!("?{}", q)).unwrap_or_default();
+        Some(format!(
+            "https://{SECUREPUBADS_HOST}{upstream_path}{query_part}"
+        ))
+    }
+
     /// Check if a URL points at Google's GPT bootstrap script (`gpt.js`).
     ///
     /// Only matches the canonical host:
@@ -184,13 +198,9 @@ impl GptIntegration {
             )
             .with_header(
                 header::CACHE_CONTROL,
-                format!(
-                    "public, max-age={}, immutable",
-                    self.config.cache_ttl_seconds
-                ),
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-GPT-Proxy", "true")
-            .with_header("X-Script-Source", script_url)
             .with_body(body);
 
         Self::copy_content_encoding_headers(&gpt_response, &mut response);
@@ -210,19 +220,10 @@ impl GptIntegration {
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let original_path = req.get_path();
+        let query = req.get_url().query();
 
-        // Strip the integration prefix to recover the upstream path.
-        let upstream_path = original_path
-            .strip_prefix(ROUTE_PREFIX)
+        let target_url = Self::build_upstream_url(original_path, query)
             .ok_or_else(|| Self::error(format!("Invalid GPT pagead path: {}", original_path)))?;
-
-        let query = req
-            .get_url()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-
-        let target_url = format!("https://{SECUREPUBADS_HOST}{upstream_path}{query}");
 
         log::info!("GPT proxy: forwarding to {}", target_url);
 
@@ -269,13 +270,9 @@ impl GptIntegration {
             .with_header(header::CONTENT_TYPE, &content_type)
             .with_header(
                 header::CACHE_CONTROL,
-                format!(
-                    "public, max-age={}, immutable",
-                    self.config.cache_ttl_seconds
-                ),
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-GPT-Proxy", "true")
-            .with_header("X-Script-Source", &target_url)
             .with_body(body);
 
         Self::copy_content_encoding_headers(&upstream_response, &mut response);
@@ -770,6 +767,111 @@ mod tests {
         assert!(
             build(&settings).is_none(),
             "should not build when integration is disabled"
+        );
+    }
+
+    // -- Upstream URL building --
+
+    #[test]
+    fn build_upstream_url_strips_prefix_and_preserves_path() {
+        let url = GptIntegration::build_upstream_url(
+            "/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js",
+            None,
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js"),
+            "should strip the integration prefix and build the upstream URL"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_preserves_query_string() {
+        let url = GptIntegration::build_upstream_url(
+            "/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js",
+            Some("cb=123&foo=bar"),
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?cb=123&foo=bar"),
+            "should preserve the query string in the upstream URL"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_handles_tag_routes() {
+        let url =
+            GptIntegration::build_upstream_url("/integrations/gpt/tag/js/gpt.js", Some("v=2"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net/tag/js/gpt.js?v=2"),
+            "should handle /tag/* routes correctly"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_returns_none_for_invalid_prefix() {
+        let url = GptIntegration::build_upstream_url("/some/other/path", None);
+        assert!(
+            url.is_none(),
+            "should return None when path does not start with the integration prefix"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_handles_empty_path_after_prefix() {
+        let url = GptIntegration::build_upstream_url("/integrations/gpt", None);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net"),
+            "should handle path that is exactly the prefix"
+        );
+    }
+
+    // -- Vary header edge cases --
+
+    #[test]
+    fn vary_with_accept_encoding_wildcard() {
+        let result = GptIntegration::vary_with_accept_encoding(Some("*"));
+        assert_eq!(
+            result, "*",
+            "should preserve Vary: * wildcard without appending Accept-Encoding"
+        );
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_case_insensitive() {
+        let result = GptIntegration::vary_with_accept_encoding(Some("Origin, ACCEPT-ENCODING"));
+        assert_eq!(
+            result, "Origin, ACCEPT-ENCODING",
+            "should detect Accept-Encoding case-insensitively"
+        );
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_adds_when_missing() {
+        let result = GptIntegration::vary_with_accept_encoding(Some("Origin"));
+        assert_eq!(
+            result, "Origin, Accept-Encoding",
+            "should append Accept-Encoding when not present"
+        );
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_empty_upstream() {
+        let result = GptIntegration::vary_with_accept_encoding(None);
+        assert_eq!(
+            result, "Accept-Encoding",
+            "should use Accept-Encoding as default when upstream has no Vary"
+        );
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_empty_string() {
+        let result = GptIntegration::vary_with_accept_encoding(Some(""));
+        assert_eq!(
+            result, "Accept-Encoding",
+            "should treat empty string the same as absent Vary"
         );
     }
 }
