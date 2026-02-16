@@ -19,7 +19,7 @@ pub mod provider;
 pub mod types;
 
 pub use config::AuctionConfig;
-pub use context::{build_url_with_context_params, ContextQueryParams};
+pub use context::{build_url_with_context_params, ContextQueryParams, ContextValue};
 pub use orchestrator::AuctionOrchestrator;
 pub use provider::AuctionProvider;
 pub use types::{

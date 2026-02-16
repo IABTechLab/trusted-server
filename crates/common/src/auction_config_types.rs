@@ -57,7 +57,7 @@ fn default_creative_store() -> String {
 }
 
 fn default_allowed_context_keys() -> Vec<String> {
-    vec!["permutive_segments".to_string()]
+    vec![]
 }
 
 #[allow(dead_code)] // Methods used in runtime but not in build script
