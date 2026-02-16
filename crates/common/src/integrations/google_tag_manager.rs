@@ -118,6 +118,51 @@ impl GoogleTagManagerIntegration {
             .replace_all(content, replacement.as_str())
             .into_owned()
     }
+
+    fn build_target_url(&self, req: &Request, path: &str) -> Option<String> {
+        let upstream_base = self.upstream_url();
+
+        let mut target_url = if path.ends_with("/gtm.js") {
+            format!("{}/gtm.js", upstream_base)
+        } else if path.ends_with("/gtag/js") {
+            format!("{}/gtag/js", upstream_base)
+        } else if path.ends_with("/collect") {
+            if path.contains("/g/") {
+                "https://www.google-analytics.com/g/collect".to_string()
+            } else {
+                "https://www.google-analytics.com/collect".to_string()
+            }
+        } else {
+            return None;
+        };
+
+        if let Some(query) = req.get_url().query() {
+            target_url = format!("{}?{}", target_url, query);
+        } else if path.ends_with("/gtm.js") {
+            target_url = format!("{}?id={}", target_url, self.config.container_id);
+        }
+
+        Some(target_url)
+    }
+
+    fn build_proxy_config<'a>(
+        &self,
+        path: &str,
+        _req: &mut Request,
+        target_url: &'a str,
+    ) -> ProxyRequestConfig<'a> {
+        let mut proxy_config = ProxyRequestConfig::new(target_url);
+        proxy_config.forward_synthetic_id = false;
+
+        if path.ends_with("/gtm.js") {
+            proxy_config = proxy_config.with_header(
+                fastly::http::header::ACCEPT_ENCODING,
+                fastly::http::HeaderValue::from_static("identity"),
+            );
+        }
+
+        proxy_config
+    }
 }
 
 fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
@@ -169,52 +214,19 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
     async fn handle(
         &self,
         settings: &Settings,
-        req: Request,
+        mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
         let method = req.get_method();
         log::debug!("Handling GTM request: {} {}", method, path);
 
-        let upstream_base = self.upstream_url();
-
-        // Construct full target URL
-        let mut target_url = if path.ends_with("/gtm.js") {
-            format!("{}/gtm.js", upstream_base)
-        } else if path.ends_with("/gtag/js") {
-            format!("{}/gtag/js", upstream_base)
-        } else if path.ends_with("/collect") {
-            // Analytics beacons always go to google-analytics.com, not the
-            // configurable upstream_url (which is for googletagmanager.com).
-            if path.contains("/g/") {
-                "https://www.google-analytics.com/g/collect".to_string()
-            } else {
-                "https://www.google-analytics.com/collect".to_string()
-            }
-        } else {
+        let Some(target_url) = self.build_target_url(&req, &path) else {
             return Ok(Response::from_status(StatusCode::NOT_FOUND));
         };
 
-        // Append query params if present, or add default ID for gtm.js
-        if let Some(query) = req.get_url().query() {
-            target_url = format!("{}?{}", target_url, query);
-        } else if path.ends_with("/gtm.js") {
-            target_url = format!("{}?id={}", target_url, self.config.container_id);
-        }
-
         log::debug!("Proxying to upstream: {}", target_url);
 
-        let mut proxy_config = ProxyRequestConfig::new(&target_url);
-        // Do not forward the synthetic ID to external Google services.
-        proxy_config.forward_synthetic_id = false;
-
-        // If we are fetching gtm.js, we intend to rewrite the body.
-        // We must ensure the upstream returns uncompressed content.
-        if path.ends_with("/gtm.js") {
-            proxy_config = proxy_config.with_header(
-                fastly::http::header::ACCEPT_ENCODING,
-                fastly::http::HeaderValue::from_static("identity"),
-            );
-        }
+        let proxy_config = self.build_proxy_config(&path, &mut req, &target_url);
 
         let mut response = proxy_request(settings, req, proxy_config)
             .await
@@ -300,6 +312,7 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
+    use fastly::http::Method;
     use std::io::Cursor;
 
     #[test]
@@ -504,6 +517,75 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         assert!(routes
             .iter()
             .any(|r| r.path == "/integrations/google_tag_manager/g/collect"));
+    }
+
+    #[test]
+    fn test_post_collect_proxy_config_includes_payload() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let payload = b"v=2&tid=G-TEST&cid=123&en=page_view".to_vec();
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/g/collect?v=2&tid=G-TEST",
+        );
+        req.set_body(payload.clone());
+
+        let path = req.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req, &path)
+            .expect("should resolve collect target URL");
+        let proxy_config = integration.build_proxy_config(&path, &mut req, &target_url);
+
+        assert_eq!(
+            proxy_config.body.as_deref(),
+            Some(payload.as_slice()),
+            "collect POST should forward payload body"
+        );
+    }
+
+    #[test]
+    fn test_collect_proxy_config_strips_client_ip_forwarding() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let mut req = Request::new(
+            Method::GET,
+            "https://edge.example.com/integrations/google_tag_manager/collect?v=2",
+        );
+        req.set_header(crate::constants::HEADER_X_FORWARDED_FOR, "198.51.100.42");
+
+        let path = req.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req, &path)
+            .expect("should resolve collect target URL");
+        let proxy_config = integration.build_proxy_config(&path, &mut req, &target_url);
+
+        let has_disable_flag =
+            format!("{proxy_config:?}").contains("forward_x_forwarded_for: false");
+        let has_header_override = proxy_config.headers.iter().any(|(name, value)| {
+            name.as_str()
+                .eq_ignore_ascii_case(crate::constants::HEADER_X_FORWARDED_FOR.as_str())
+                && value
+                    .to_str()
+                    .map(|header_value| header_value.is_empty() || header_value != "198.51.100.42")
+                    .unwrap_or(false)
+        });
+
+        assert!(
+            has_disable_flag || has_header_override,
+            "collect routes should disable forwarding client IP via X-Forwarded-For"
+        );
     }
 
     #[test]
