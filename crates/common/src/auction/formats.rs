@@ -108,7 +108,7 @@ pub fn convert_tsjs_to_auction_request(
                 }
 
                 // Extract bidder params from the bids array
-                let mut bidders = std::collections::HashMap::new();
+                let mut bidders = HashMap::new();
                 if let Some(bids) = &unit.bids {
                     for bid in bids {
                         bidders.insert(bid.bidder.clone(), bid.params.clone());
@@ -119,20 +119,20 @@ pub fn convert_tsjs_to_auction_request(
                     id: unit.code.clone(),
                     formats,
                     floor_price: None,
-                    targeting: std::collections::HashMap::new(),
+                    targeting: HashMap::new(),
                     bidders,
                 });
             }
         }
     }
 
-    // Get geo info if available
-    let device = GeoInfo::from_request(req).map(|geo| DeviceInfo {
+    // Build device info with user-agent (always) and geo (if available)
+    let device = Some(DeviceInfo {
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        geo: Some(geo),
+        geo: GeoInfo::from_request(req),
     });
 
     Ok(AuctionRequest {
