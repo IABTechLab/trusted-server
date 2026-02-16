@@ -155,10 +155,7 @@ impl PermutiveIntegration {
             )
             .with_header(
                 header::CACHE_CONTROL,
-                format!(
-                    "public, max-age={}, immutable",
-                    self.config.cache_ttl_seconds
-                ),
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-Permutive-SDK-Proxy", "true")
             .with_header("X-SDK-Source", &sdk_url)
