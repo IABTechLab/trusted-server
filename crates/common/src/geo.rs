@@ -8,7 +8,7 @@ use fastly::Request;
 
 use crate::constants::{
     HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
-    HEADER_X_GEO_METRO_CODE,
+    HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
 
 /// Geographic information extracted from a request.
@@ -98,7 +98,7 @@ impl GeoInfo {
         req.set_header(HEADER_X_GEO_COORDINATES, self.coordinates_string());
         req.set_header(HEADER_X_GEO_METRO_CODE, self.metro_code.to_string());
         if let Some(region) = &self.region {
-            req.set_header("x-geo-region", region);
+            req.set_header(HEADER_X_GEO_REGION, region);
         }
     }
 }

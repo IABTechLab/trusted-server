@@ -5,7 +5,11 @@ use fastly::{Body, Request, Response};
 use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::constants::{
+    COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT,
+    HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
+    HEADER_X_SYNTHETIC_ID,
+};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -236,18 +240,19 @@ pub fn handle_publisher_request(
     }
 
     // Capture Geo headers to copy to response
-    let geo_headers: Vec<(String, String)> = [
-        "x-geo-city",
-        "x-geo-country",
-        "x-geo-continent",
-        "x-geo-coordinates",
-        "x-geo-metro-code",
+    let geo_headers: Vec<(header::HeaderName, String)> = [
+        HEADER_X_GEO_CITY,
+        HEADER_X_GEO_COUNTRY,
+        HEADER_X_GEO_CONTINENT,
+        HEADER_X_GEO_COORDINATES,
+        HEADER_X_GEO_METRO_CODE,
+        HEADER_X_GEO_REGION,
     ]
     .iter()
-    .filter_map(|&h| {
+    .filter_map(|h| {
         req.get_header(h)
             .and_then(|v| v.to_str().ok())
-            .map(|v| (h.to_string(), v.to_string()))
+            .map(|v| (h.clone(), v.to_string()))
     })
     .collect();
 

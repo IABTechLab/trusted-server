@@ -3,6 +3,16 @@
  * Handles initialization and configuration injection.
  */
 
+interface GeoConfig {
+  lat?: number;
+  lon?: number;
+  country?: string;
+  region?: string;
+  metroCode?: string;
+  city?: string;
+  zip?: string;
+}
+
 interface PrebidConfig {
   accountId: string;
   enabled: boolean;
@@ -15,11 +25,16 @@ interface PrebidConfig {
   cookiesetUrl: string;
   debug: boolean;
   adUnits?: unknown[];
+  geo?: GeoConfig;
 }
 
 interface Pbjs {
   que: (() => void)[];
-  setConfig: (config: { s2sConfig: unknown; debug: boolean }) => void;
+  setConfig: (config: {
+    s2sConfig?: unknown;
+    debug?: boolean;
+    ortb2?: { device: { geo: GeoConfig } };
+  }) => void;
   addAdUnits: (units: unknown[]) => void;
 }
 
@@ -59,6 +74,17 @@ export function init() {
       s2sConfig,
       debug: config.debug,
     });
+
+    // Configure Geo/Device data if available
+    if (config.geo) {
+      pbjs.setConfig({
+        ortb2: {
+          device: {
+            geo: config.geo,
+          },
+        },
+      });
+    }
 
     // Add Ad Units if provided
     if (config.adUnits && Array.isArray(config.adUnits)) {
