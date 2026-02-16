@@ -599,7 +599,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let has_header_override = proxy_config.headers.iter().any(|(name, value)| {
             name.as_str()
                 .eq_ignore_ascii_case(crate::constants::HEADER_X_FORWARDED_FOR.as_str())
-                && value == ""
+                && value.is_empty()
         });
 
         assert!(
