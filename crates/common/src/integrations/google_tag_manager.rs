@@ -60,6 +60,10 @@ pub struct GoogleTagManagerConfig {
     #[serde(default = "default_upstream")]
     #[validate(url)]
     pub upstream_url: String,
+    /// Cache max-age in seconds for the rewritten GTM script (default: 900 to match Google's default).
+    #[serde(default = "default_cache_max_age")]
+    #[validate(range(min = 60, max = 86400))]
+    pub cache_max_age: u32,
 }
 
 impl IntegrationConfig for GoogleTagManagerConfig {
@@ -74,6 +78,10 @@ fn default_enabled() -> bool {
 
 fn default_upstream() -> String {
     DEFAULT_UPSTREAM.to_string()
+}
+
+fn default_cache_max_age() -> u32 {
+    900 // Match Google's default
 }
 
 pub struct GoogleTagManagerIntegration {
@@ -196,6 +204,8 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         log::debug!("Proxying to upstream: {}", target_url);
 
         let mut proxy_config = ProxyRequestConfig::new(&target_url);
+        // Do not forward the synthetic ID to external Google services.
+        proxy_config.forward_synthetic_id = false;
 
         // If we are fetching gtm.js, we intend to rewrite the body.
         // We must ensure the upstream returns uncompressed content.
@@ -225,7 +235,10 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                     fastly::http::header::CONTENT_TYPE,
                     "application/javascript; charset=utf-8",
                 )
-                .with_header(fastly::http::header::CACHE_CONTROL, "public, max-age=3600");
+                .with_header(
+                    fastly::http::header::CACHE_CONTROL,
+                    format!("public, max-age={}", self.config.cache_max_age),
+                );
         }
 
         Ok(response)
@@ -322,6 +335,7 @@ mod tests {
             enabled: true,
             container_id: "GTM-TEST".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
 
@@ -377,6 +391,7 @@ mod tests {
             enabled: true,
             container_id: "GTM-TEST".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
         let doc_state = IntegrationDocumentState::default();
@@ -430,6 +445,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             enabled: default_enabled(),
             container_id: "GTM-DEFAULT".to_string(),
             upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
         };
 
         assert!(!config.enabled);
@@ -443,6 +459,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             enabled: true,
             container_id: "GTM-123".to_string(),
             upstream_url: "".to_string(), // Empty string should fallback to default in accessor
+            cache_max_age: default_cache_max_age(),
         };
         let integration_default = GoogleTagManagerIntegration::new(config_default);
         assert_eq!(
@@ -455,6 +472,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             enabled: true,
             container_id: "GTM-123".to_string(),
             upstream_url: "https://gtm.example.com".to_string(),
+            cache_max_age: default_cache_max_age(),
         };
         let integration_custom = GoogleTagManagerIntegration::new(config_custom);
         assert_eq!(integration_custom.upstream_url(), "https://gtm.example.com");
@@ -466,6 +484,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             enabled: true,
             container_id: "GTM-TEST".to_string(),
             upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
         let routes = integration.routes();
