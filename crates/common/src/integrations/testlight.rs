@@ -15,6 +15,7 @@ use crate::integrations::{
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
+use crate::synthetic::get_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -138,10 +139,15 @@ impl IntegrationProxy for TestlightIntegration {
             .validate()
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
-        // Read synthetic ID using the shared utility (checks header + cookie)
-        let synthetic_id = crate::synthetic::get_synthetic_id(&req)
+        // Read synthetic ID from header (set by registry) or cookie
+        let synthetic_id = get_synthetic_id(&req)
             .change_context(Self::error("Failed to read synthetic ID"))?
-            .ok_or_else(|| Report::new(Self::error("Missing synthetic ID on request")))?;
+            .ok_or_else(|| {
+                Report::new(Self::error(
+                    "Synthetic ID not found in request header or cookie — \
+                     check that the integration registry propagated it",
+                ))
+            })?;
 
         payload.user.id = Some(synthetic_id);
 

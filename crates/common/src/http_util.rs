@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(
             target.get_header("x-custom-2").unwrap().to_str().unwrap(),
             "value2",
-            "Should copy arbitary X-header (case insensitive)"
+            "Should copy arbitrary X-header (case insensitive)"
         );
         assert!(
             target.get_header("x-synthetic-id").is_none(),

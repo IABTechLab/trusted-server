@@ -39,6 +39,7 @@ pub const INTERNAL_HEADERS: &[&str] = &[
     "x-pub-user-id",
     "x-subject-id",
     "x-consent-advertising",
+    "x-forwarded-for",
     "x-geo-city",
     "x-geo-continent",
     "x-geo-coordinates",
