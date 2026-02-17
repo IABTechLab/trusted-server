@@ -425,10 +425,10 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
 // JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
 /// - A TOML table / JSON object (standard deserialization)
-/// - A JSON string (e.g. from env var: `'{"X-Robots-Tag": "noindex"}'`)
+/// - A JSON string (e.g. from env var: `'{"Key": "value"}'`)
 ///
-/// This allows setting response headers via environment variables while
-/// preserving header name casing and hyphens.
+/// This allows setting map fields via environment variables while
+/// preserving key casing and special characters like hyphens.
 pub(crate) fn map_from_obj_or_str<'de, D>(
     deserializer: D,
 ) -> Result<HashMap<String, String>, D::Error>
@@ -454,14 +454,13 @@ where
                     .map_err(serde::de::Error::custom)
             } else {
                 Err(serde::de::Error::custom(
-                    "expected JSON object string for response_headers, e.g. '{\"X-Header\": \"value\"}'",
+                    "expected JSON object string, e.g. '{\"Key\": \"value\"}'",
                 ))
             }
         }
         JsonValue::Null => Ok(HashMap::new()),
         other => Err(serde::de::Error::custom(format!(
-            "expected object or JSON string for response_headers, got {}",
-            other
+            "expected object or JSON string, got {other}",
         ))),
     }
 }
@@ -843,32 +842,20 @@ mod tests {
             ENVIRONMENT_VARIABLE_PREFIX, ENVIRONMENT_VARIABLE_SEPARATOR,
         );
 
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
         temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
+            env_key,
+            Some(r#"{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}"#),
             || {
-                temp_env::with_var(
-                    env_key,
-                    Some(r#"{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}"#),
-                    || {
-                        let settings = Settings::from_toml(&toml_str)
-                            .expect("Settings should parse with JSON response_headers env");
-                        assert_eq!(settings.response_headers.len(), 2);
-                        assert_eq!(
-                            settings.response_headers.get("X-Robots-Tag"),
-                            Some(&"noindex".to_string())
-                        );
-                        assert_eq!(
-                            settings.response_headers.get("X-Custom-Header"),
-                            Some(&"custom value".to_string())
-                        );
-                    },
+                let settings = Settings::from_toml(&toml_str)
+                    .expect("Settings should parse with JSON response_headers env");
+                assert_eq!(settings.response_headers.len(), 2);
+                assert_eq!(
+                    settings.response_headers.get("X-Robots-Tag"),
+                    Some(&"noindex".to_string())
+                );
+                assert_eq!(
+                    settings.response_headers.get("X-Custom-Header"),
+                    Some(&"custom value".to_string())
                 );
             },
         );
