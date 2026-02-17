@@ -17,7 +17,7 @@ The Tag Gateway intercepts requests for GTM scripts (`gtm.js`) and Google Analyt
 - **Bypass Ad Blockers**: Serving scripts from a first-party domain can prevent them from being blocked by some ad blockers and privacy extensions.
 - **Extended Cookie Life**: First-party cookies set by these scripts are more durable in environments like Safari (ITP).
 - **Performance**: Utilize edge caching for scripts.
-- **Privacy Control**: Strips client IP addresses before forwarding data to Google.
+- **Privacy Enhancement**: Does not forward client IP to Google (Google sees edge server IP, not user IP).
 
 ## Configuration
 
@@ -86,7 +86,7 @@ Analytics data (events, pageviews) normally sent to `google-analytics.com/collec
 
 `https://your-server.com/integrations/google_tag_manager/collect`
 
-Trusted Server acts as a gateway, stripping client IP addresses (privacy) before forwarding the data to Google.
+Trusted Server acts as a privacy-enhancing gateway. Client IP addresses are not forwarded to Google — Google sees only the edge server IP, not the actual user IP.
 
 ## Core Endpoints
 
