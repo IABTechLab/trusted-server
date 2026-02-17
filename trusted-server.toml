@@ -23,8 +23,11 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
-# [response_headers]
-# X-Custom-Header = "custom header value"
+[response_headers]
+X-Robots-Tag = "noindex, nofollow"
+
+  # "TRUSTED_SERVER__RESPONSE_HEADERS__X-Robots-Tag": "noindex, nofollow",
+
 
 # Request Signing Configuration
 # Enable signing of OpenRTB requests and other API calls
