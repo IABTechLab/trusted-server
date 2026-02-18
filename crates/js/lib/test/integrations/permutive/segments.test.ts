@@ -83,10 +83,7 @@ describe('getPermutiveSegments', () => {
 
   it('caps segments at 100', () => {
     const ids = Array.from({ length: 150 }, (_, i) => `seg-${i}`);
-    localStorage.setItem(
-      'permutive-app',
-      JSON.stringify({ core: { cohorts: { all: ids } } })
-    );
+    localStorage.setItem('permutive-app', JSON.stringify({ core: { cohorts: { all: ids } } }));
     const result = getPermutiveSegments();
     expect(result).toHaveLength(100);
     expect(result[0]).toBe('seg-0');
