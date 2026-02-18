@@ -196,13 +196,22 @@ impl StreamProcessor for HtmlRewriterAdapter {
 |--------|-----|------|
 | **High** (HTML is most common content type; eliminates 222KB+ buffer) | ~30 refactored | Medium — needs test coverage |
 
-#### 1.3 Remove verbose per-request logging
+#### 1.3 Reduce verbose per-request logging
 
-**Files**: `crates/fastly/src/main.rs:37,64-67`
+**Files**: `crates/fastly/src/main.rs:37,64-67,152-177`
 
-**Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level.
+**Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level. The logger is configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above is evaluated.
 
-**Fix**: Remove settings dump or gate behind `log::debug!`.
+**Fix**: Downgrade the Settings dump to `log::debug!` and tighten the logger's `max_level` to `LevelFilter::Info` for production. The `log_fastly` crate supports `filter_module()` for per-module levels if we still want debug output from specific modules. When the level is filtered, `log` macros short-circuit before evaluating arguments — so the `Settings` `Debug` format is never even computed.
+
+```rust
+// Before: everything at Debug and above is serialized
+.max_level(log::LevelFilter::Debug)
+
+// After: Info in production, debug only for specific modules if needed
+.max_level(log::LevelFilter::Info)
+// Optional: .filter_module("trusted_server", log::LevelFilter::Debug)
+```
 
 | Impact | LOC | Risk |
 |--------|-----|------|
