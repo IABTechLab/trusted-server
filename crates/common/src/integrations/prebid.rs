@@ -308,33 +308,30 @@ fn expand_trusted_server_bidders(
     configured_bidders: &[String],
     params: &Json,
 ) -> HashMap<String, Json> {
-    let mut expanded = HashMap::new();
     let per_bidder = params.get(BIDDER_PARAMS_KEY).and_then(Json::as_object);
 
     if configured_bidders.is_empty() {
-        if let Some(per_bidder) = per_bidder {
-            for (bidder, bidder_params) in per_bidder {
-                expanded.insert(bidder.clone(), bidder_params.clone());
-            }
-        }
-        return expanded;
+        return per_bidder
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
     }
 
-    if let Some(per_bidder) = per_bidder {
-        for bidder in configured_bidders {
-            let bidder_params = per_bidder
-                .get(bidder)
-                .cloned()
-                .unwrap_or_else(|| Json::Object(serde_json::Map::new()));
-            expanded.insert(bidder.clone(), bidder_params);
-        }
-    } else {
-        for bidder in configured_bidders {
-            expanded.insert(bidder.clone(), params.clone());
-        }
-    }
-
-    expanded
+    configured_bidders
+        .iter()
+        .map(|bidder| {
+            let value = per_bidder
+                .and_then(|m| m.get(bidder).cloned())
+                .unwrap_or_else(|| {
+                    // No per-bidder map → use entire params as shared config
+                    if per_bidder.is_some() {
+                        Json::Object(Default::default())
+                    } else {
+                        params.clone()
+                    }
+                });
+            (bidder.clone(), value)
+        })
+        .collect()
 }
 
 fn transform_prebid_response(
