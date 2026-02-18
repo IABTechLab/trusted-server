@@ -64,11 +64,6 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     req: Request,
 ) -> Result<Response, Error> {
-    log::info!(
-        "FASTLY_SERVICE_VERSION: {}",
-        ::std::env::var(ENV_FASTLY_SERVICE_VERSION).unwrap_or_else(|_| String::new())
-    );
-
     if let Some(response) = enforce_basic_auth(settings, &req) {
         return Ok(response);
     }
