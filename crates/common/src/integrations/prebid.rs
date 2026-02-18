@@ -24,7 +24,7 @@ use crate::integrations::{
 };
 use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
-    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+    RequestExt, Site, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -571,9 +571,11 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object
+        // Build user object — populate consent from ConsentContext if available.
+        let consent_ctx = request.user.consent.as_ref();
         let user = Some(User {
             id: Some(request.user.id.clone()),
+            consent: consent_ctx.and_then(|c| c.raw_tc_string.clone()),
             ext: Some(UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
@@ -594,16 +596,14 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build regs object if Sec-GPC header is present
-        let regs = if context.request.get_header("Sec-GPC").is_some() {
-            Some(Regs {
-                ext: Some(RegsExt {
-                    us_privacy: Some("1YYN".to_string()),
-                }),
-            })
-        } else {
-            None
-        };
+        // Build regs object from ConsentContext.
+        //
+        // Populates OpenRTB 2.6 canonical fields:
+        //   - regs.gdpr: 1 if GDPR applies (TCF string present)
+        //   - regs.us_privacy: raw US Privacy string
+        //   - regs.gpp: raw GPP string
+        //   - regs.gpp_sid: active GPP section IDs
+        let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
         let request_info = RequestInfo::from_request(context.request);
@@ -648,6 +648,32 @@ impl PrebidAuctionProvider {
             test: self.config.test_mode.then_some(1),
             ext,
         }
+    }
+
+    /// Builds the `regs` object from a [`ConsentContext`].
+    ///
+    /// Returns `None` if no consent-relevant data is present (avoids sending
+    /// an empty `regs` object to Prebid Server).
+    fn build_regs(consent_ctx: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
+        let ctx = consent_ctx?;
+
+        // Only emit regs if there's something to say
+        let has_data = ctx.gdpr_applies
+            || ctx.raw_us_privacy.is_some()
+            || ctx.raw_gpp_string.is_some()
+            || ctx.gpc;
+
+        if !has_data {
+            return None;
+        }
+
+        Some(Regs {
+            gdpr: if ctx.gdpr_applies { Some(1) } else { Some(0) },
+            us_privacy: ctx.raw_us_privacy.clone(),
+            gpp: ctx.raw_gpp_string.clone(),
+            gpp_sid: ctx.gpp_section_ids.clone(),
+            ext: None,
+        })
     }
 
     /// Parse `OpenRTB` response into auction response.

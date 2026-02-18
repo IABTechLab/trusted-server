@@ -3,9 +3,11 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
+use crate::consent::build_consent_context;
+use crate::cookies::{create_synthetic_cookie, handle_request_cookies};
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -202,8 +204,20 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
+    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
+    let cookie_jar = handle_request_cookies(&req)?;
+
+    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
+    // from the incoming request. The ConsentContext carries both raw strings
+    // (for OpenRTB forwarding) and decoded data (for observability).
+    let _consent_context = build_consent_context(cookie_jar.as_ref(), &req);
+
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    let has_synthetic_cookie = cookie_jar
+        .as_ref()
+        .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
+        .is_some();
 
     log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
 
