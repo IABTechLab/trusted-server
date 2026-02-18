@@ -68,5 +68,10 @@ validator = { workspace = true }
 default = []
 
 [dev-dependencies]
+criterion = { workspace = true }
 temp-env = { workspace = true }
 tokio-test = { workspace = true }
+
+[[bench]]
+name = "consent_decode"
+harness = false
