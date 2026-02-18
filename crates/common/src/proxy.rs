@@ -361,6 +361,22 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
+/// Finalize a proxied response, choosing between streaming passthrough and full
+/// content processing based on the `stream_passthrough` flag.
+fn finalize_response(
+    settings: &Settings,
+    req: &Request,
+    url: &str,
+    beresp: Response,
+    stream_passthrough: bool,
+) -> Result<Response, Report<TrustedServerError>> {
+    if stream_passthrough {
+        Ok(finalize_proxied_response_streaming(req, url, beresp))
+    } else {
+        finalize_proxied_response(settings, req, url, beresp)
+    }
+}
+
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
@@ -501,15 +517,7 @@ async fn proxy_with_redirects(
             })?;
 
         if !follow_redirects {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         let status = beresp.get_status();
@@ -523,15 +531,7 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         let Some(location) = beresp
@@ -539,15 +539,7 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         };
 
         if redirect_attempt == MAX_REDIRECTS {
@@ -568,15 +560,7 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         log::info!(
