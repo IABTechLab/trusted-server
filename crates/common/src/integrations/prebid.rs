@@ -858,6 +858,32 @@ impl PrebidAuctionProvider {
         }
     }
 
+    /// Builds the `regs` object from a [`ConsentContext`].
+    ///
+    /// Returns `None` if no consent-relevant data is present (avoids sending
+    /// an empty `regs` object to Prebid Server).
+    fn build_regs(consent_ctx: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
+        let ctx = consent_ctx?;
+
+        // Only emit regs if there's something to say
+        let has_data = ctx.gdpr_applies
+            || ctx.raw_us_privacy.is_some()
+            || ctx.raw_gpp_string.is_some()
+            || ctx.gpc;
+
+        if !has_data {
+            return None;
+        }
+
+        Some(Regs {
+            gdpr: if ctx.gdpr_applies { Some(1) } else { Some(0) },
+            us_privacy: ctx.raw_us_privacy.clone(),
+            gpp: ctx.raw_gpp_string.clone(),
+            gpp_sid: ctx.gpp_section_ids.clone(),
+            ext: None,
+        })
+    }
+
     /// Parse `OpenRTB` response into auction response.
     fn parse_openrtb_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
         let mut bids = Vec::new();

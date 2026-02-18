@@ -168,4 +168,63 @@ mod tests {
 
         assert_eq!(serialized, expected);
     }
+
+    #[test]
+    fn regs_serializes_consent_fields() {
+        let regs = Regs {
+            gdpr: Some(1),
+            us_privacy: Some("1YNN".to_string()),
+            gpp: Some("DBACNY~CPXxRfA".to_string()),
+            gpp_sid: Some(vec![2, 6]),
+            ext: None,
+        };
+
+        let serialized = serde_json::to_value(&regs).expect("should serialize");
+        assert_eq!(serialized["gdpr"], 1);
+        assert_eq!(serialized["us_privacy"], "1YNN");
+        assert_eq!(serialized["gpp"], "DBACNY~CPXxRfA");
+        assert_eq!(serialized["gpp_sid"], serde_json::json!([2, 6]));
+        assert!(
+            serialized.get("ext").is_none(),
+            "ext should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn regs_omits_none_fields() {
+        let regs = Regs::default();
+        let serialized = serde_json::to_value(&regs).expect("should serialize");
+        let obj = serialized.as_object().expect("should be object");
+        assert!(
+            obj.is_empty(),
+            "all-None regs should serialize as empty object"
+        );
+    }
+
+    #[test]
+    fn user_serializes_consent_field() {
+        let user = User {
+            id: Some("user-1".to_string()),
+            consent: Some("CPXxGfAPXxGfA".to_string()),
+            ext: None,
+        };
+
+        let serialized = serde_json::to_value(&user).expect("should serialize");
+        assert_eq!(serialized["consent"], "CPXxGfAPXxGfA");
+    }
+
+    #[test]
+    fn user_omits_consent_when_none() {
+        let user = User {
+            id: Some("user-1".to_string()),
+            consent: None,
+            ext: None,
+        };
+
+        let serialized = serde_json::to_value(&user).expect("should serialize");
+        assert!(
+            serialized.get("consent").is_none(),
+            "consent should be omitted when None"
+        );
+    }
 }
