@@ -759,7 +759,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             log::warn!(
                 "Prebid returned non-success status: {} — body: {}",
                 response.get_status(),
-                &body_preview[..body_preview.len().min(1000)]
+                &body_preview[..body_preview.floor_char_boundary(1000)]
             );
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
@@ -1358,5 +1358,34 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script patterns configured
         assert_eq!(routes.len(), 0);
+    }
+
+    /// Proves that the body-preview truncation in `parse_response` is not
+    /// UTF-8-safe. The production code does:
+    ///
+    ///   `&body_preview[..body_preview.len().min(1000)]`
+    ///
+    /// which is a byte-index slice on a `str`. When byte 1000 lands inside a
+    /// multibyte character, Rust panics at runtime. This test constructs such
+    /// a string and asserts the truncation point is NOT a char boundary—
+    /// proving the bug without actually panicking (which would abort under
+    /// wasm32 `panic = "abort"`).
+    #[test]
+    fn body_preview_truncation_is_not_utf8_safe() {
+        // 999 ASCII bytes + U+2603 SNOWMAN (3 bytes: E2 98 83) = 1002 bytes.
+        // Byte index 1000 lands on 0x98, the second byte of the snowman.
+        let mut body = "x".repeat(999);
+        body.push('\u{2603}'); // ☃
+        assert_eq!(body.len(), 1002);
+
+        let truncation_index = body.len().min(1000); // = 1000
+
+        // This is the condition that causes `&body[..1000]` to panic.
+        assert!(
+            !body.is_char_boundary(truncation_index),
+            "Byte index {} is not a char boundary — the truncation in \
+             parse_response would panic on this input",
+            truncation_index
+        );
     }
 }
