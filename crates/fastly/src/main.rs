@@ -17,6 +17,7 @@ use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
+use trusted_server_common::request_timer::RequestTimer;
 use trusted_server_common::settings::Settings;
 use trusted_server_common::settings_data::get_settings;
 
@@ -25,6 +26,8 @@ use crate::error::to_error_response;
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
+    let mut timer = RequestTimer::new();
+
     init_logger();
 
     let settings = match get_settings() {
@@ -47,11 +50,14 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
 
+    timer.mark_init();
+
     futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         req,
+        &mut timer,
     ))
 }
 
@@ -60,6 +66,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     req: Request,
+    timer: &mut RequestTimer,
 ) -> Result<Response, Error> {
     log::info!(
         "FASTLY_SERVICE_VERSION: {}",
@@ -119,7 +126,7 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(settings, integration_registry, req) {
+            match handle_publisher_request(settings, integration_registry, req, timer) {
                 Ok(response) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);
@@ -135,6 +142,9 @@ async fn route_request(
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
     }
+
+    log::info!("{}", timer.log_line());
+    response.set_header("Server-Timing", timer.header_value());
 
     Ok(response)
 }

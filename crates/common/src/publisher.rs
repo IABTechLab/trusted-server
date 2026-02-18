@@ -6,6 +6,7 @@ use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::request_timer::RequestTimer;
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -176,6 +177,7 @@ pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     mut req: Request,
+    timer: &mut RequestTimer,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -234,6 +236,8 @@ pub fn handle_publisher_request(
         .change_context(TrustedServerError::Proxy {
             message: "Failed to proxy request to origin".to_string(),
         })?;
+
+    timer.mark_backend();
 
     // Log all response headers for debugging
     log::debug!("Response headers:");
@@ -309,6 +313,8 @@ pub fn handle_publisher_request(
             request_host
         );
     }
+
+    timer.mark_process();
 
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     if !has_synthetic_cookie {
