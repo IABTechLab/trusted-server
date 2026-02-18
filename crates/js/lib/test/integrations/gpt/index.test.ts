@@ -7,7 +7,10 @@ import { resetGuardState } from '../../../src/integrations/gpt/script_guard';
 
 type GptWindow = Window & {
   googletag?: {
-    cmd: Array<() => void> & { push: (...items: Array<() => void>) => number; __tsPushed?: boolean };
+    cmd: Array<() => void> & {
+      push: (...items: Array<() => void>) => number;
+      __tsPushed?: boolean;
+    };
     _loaded_?: boolean;
   };
 };
@@ -39,9 +42,7 @@ describe('GPT shim – patchCommandQueue', () => {
 
     installGptShim();
 
-    expect(win.googletag!.cmd).toBe(
-      originalCmd,
-    );
+    expect(win.googletag!.cmd).toBe(originalCmd);
   });
 
   it('preserves custom cmd.push when GPT is already loaded', () => {
