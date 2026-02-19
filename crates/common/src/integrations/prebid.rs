@@ -54,6 +54,18 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// Per-bidder param overrides. Keys are bidder names, values are JSON objects
+    /// whose fields are shallow-merged into the bidder's params before sending
+    /// the `OpenRTB` request. Useful for replacing client-side placement IDs with
+    /// server-to-server equivalents.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bid_param_overrides.kargo]
+    /// placementId = "server_side_placement_123"
+    /// ```
+    #[serde(default)]
+    pub bid_param_overrides: HashMap<String, Json>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -424,6 +436,20 @@ impl PrebidAuctionProvider {
                     }
                 }
 
+                // Apply bid_param_overrides from config (shallow merge)
+                for (name, params) in &mut bidder {
+                    if let Some(Json::Object(ovr)) = self.config.bid_param_overrides.get(name) {
+                        if let Json::Object(base) = params {
+                            log::debug!(
+                                "prebid: overriding bidder params for '{}': keys {:?}",
+                                name,
+                                ovr.keys().collect::<Vec<_>>()
+                            );
+                            base.extend(ovr.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
+                    }
+                }
+
                 Imp {
                     id: slot.id.clone(),
                     banner: Some(Banner { format: formats }),
@@ -751,6 +777,9 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::types::{
+        AdFormat, AdSlot, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+    };
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
     use crate::settings::Settings;
@@ -773,6 +802,7 @@ mod tests {
             debug: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            bid_param_overrides: HashMap::new(),
         }
     }
 
@@ -1114,5 +1144,216 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script patterns configured
         assert_eq!(routes.len(), 0);
+    }
+
+    fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
+        AuctionRequest {
+            id: "test-auction-1".to_string(),
+            slots,
+            publisher: PublisherInfo {
+                domain: "example.com".to_string(),
+                page_url: Some("https://example.com/page".to_string()),
+            },
+            user: UserInfo {
+                id: "synth-123".to_string(),
+                fresh_id: "fresh-456".to_string(),
+                consent: None,
+            },
+            device: Some(DeviceInfo {
+                user_agent: Some("test-agent".to_string()),
+                ip: None,
+                geo: None,
+            }),
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn make_slot(id: &str, bidders: HashMap<String, Json>) -> AdSlot {
+        AdSlot {
+            id: id.to_string(),
+            formats: vec![AdFormat {
+                media_type: MediaType::Banner,
+                width: 300,
+                height: 250,
+            }],
+            floor_price: None,
+            targeting: HashMap::new(),
+            bidders,
+        }
+    }
+
+    fn call_to_openrtb(
+        config: PrebidIntegrationConfig,
+        request: &AuctionRequest,
+    ) -> OpenRtbRequest {
+        let provider = PrebidAuctionProvider::new(config);
+        let settings = make_settings();
+        let fastly_req = Request::new(Method::POST, "https://example.com/auction");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &fastly_req,
+            timeout_ms: 1000,
+            provider_responses: None,
+        };
+        provider.to_openrtb(request, &context, None)
+    }
+
+    fn bidder_params(ortb: &OpenRtbRequest) -> &HashMap<String, Json> {
+        &ortb.imp[0]
+            .ext
+            .as_ref()
+            .expect("should have imp ext")
+            .prebid
+            .bidder
+    }
+
+    #[test]
+    fn bid_param_overrides_replaces_existing_param() {
+        let mut config = base_config();
+        config.bid_param_overrides.insert(
+            "kargo".to_string(),
+            json!({ "placementId": "server_side_456" }),
+        );
+
+        let bidders = HashMap::from([(
+            "kargo".to_string(),
+            json!({ "placementId": "client_side_123" }),
+        )]);
+        let request = make_auction_request(vec![make_slot("slot1", bidders)]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "server_side_456",
+            "override should replace client-side placementId"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_merges_without_removing_existing_fields() {
+        let mut config = base_config();
+        config
+            .bid_param_overrides
+            .insert("kargo".to_string(), json!({ "placementId": "server_456" }));
+
+        let bidders = HashMap::from([(
+            "kargo".to_string(),
+            json!({ "placementId": "client_123", "extra": "keep_me" }),
+        )]);
+        let request = make_auction_request(vec![make_slot("slot1", bidders)]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let kargo = &bidder_params(&ortb)["kargo"];
+        assert_eq!(
+            kargo["placementId"], "server_456",
+            "overridden field should have new value"
+        );
+        assert_eq!(
+            kargo["extra"], "keep_me",
+            "non-overridden fields should be preserved"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_only_affects_matching_bidders() {
+        let mut config = base_config();
+        config
+            .bid_param_overrides
+            .insert("kargo".to_string(), json!({ "placementId": "server_456" }));
+
+        let bidders = HashMap::from([
+            ("kargo".to_string(), json!({ "placementId": "client_123" })),
+            ("rubicon".to_string(), json!({ "accountId": 100 })),
+        ]);
+        let request = make_auction_request(vec![make_slot("slot1", bidders)]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        assert_eq!(
+            params["kargo"]["placementId"], "server_456",
+            "kargo should be overridden"
+        );
+        assert_eq!(
+            params["rubicon"]["accountId"], 100,
+            "rubicon should be untouched"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_noop_when_empty() {
+        let config = base_config();
+
+        let bidders =
+            HashMap::from([("kargo".to_string(), json!({ "placementId": "client_123" }))]);
+        let request = make_auction_request(vec![make_slot("slot1", bidders)]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "client_123",
+            "params should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_applies_to_fallback_bidders() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config
+            .bid_param_overrides
+            .insert("kargo".to_string(), json!({ "placementId": "server_456" }));
+
+        // Empty bidders on slot triggers fallback to config.bidders
+        let request = make_auction_request(vec![make_slot("slot1", HashMap::new())]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "server_456",
+            "override should apply even to fallback bidders with empty params"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_config_parsing_from_toml() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_overrides.kargo]
+placementId = "server_side_123"
+
+[integrations.prebid.bid_param_overrides.rubicon]
+accountId = 99999
+siteId = 88888
+"#;
+
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("should get config")
+            .expect("should be enabled");
+
+        assert_eq!(config.bid_param_overrides.len(), 2);
+        assert_eq!(
+            config.bid_param_overrides["kargo"]["placementId"],
+            "server_side_123"
+        );
+        assert_eq!(config.bid_param_overrides["rubicon"]["accountId"], 99999);
+        assert_eq!(config.bid_param_overrides["rubicon"]["siteId"], 88888);
     }
 }
