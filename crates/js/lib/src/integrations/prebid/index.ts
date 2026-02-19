@@ -249,6 +249,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     [ADAPTER_CODE]: {
       ...(pbjs.bidderSettings?.[ADAPTER_CODE] || {}),
       allowAlternateBidderCodes: true,
+      allowedAlternateBidderCodes: ['*'],
     },
   };
 
