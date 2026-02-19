@@ -42,8 +42,10 @@ server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 debug = false
+# bid_param_overrides = {mocktioneer = {example =  "example_value"}}
 # debug_query_params = ""
 # script_patterns = ["/prebid.js"]
+
 
 [integrations.nextjs]
 enabled = false

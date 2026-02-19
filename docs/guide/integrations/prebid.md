@@ -24,6 +24,10 @@ debug = false
 
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+
+# Optional per-bidder param overrides (shallow merge)
+[integrations.prebid.bid_param_overrides.kargo]
+placementId = "server_side_placement_123"
 ```
 
 ### Configuration Options
@@ -34,6 +38,7 @@ script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.mi
 | `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                  |
 | `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds             |
 | `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                     |
+| `bid_param_overrides` | Table         | `{}`                                                                   | Per-bidder params merged into request bidder params (`override` values win on key conflicts) |
 | `debug`              | Boolean       | `false`                                                                | Enable debug logging                        |
 | `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging   |
 | `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception |
@@ -90,6 +95,42 @@ script_patterns = []
 ```
 
 When a request matches a script pattern, Trusted Server returns an empty JavaScript file with aggressive caching (`max-age=31536000, immutable`).
+
+### Bid Param Overrides
+
+Use `bid_param_overrides` to force specific bidder params before the request is sent to Prebid Server. This is useful when client-side and server-side bidder IDs differ (for example, Kargo `placementId` values).
+
+**Behavior**:
+
+- Overrides are matched by bidder name (for example, `kargo`, `rubicon`)
+- Params are shallow-merged into incoming bidder params
+- Override values replace incoming values when keys conflict
+- Non-conflicting incoming fields are preserved
+- Overrides also apply to fallback bidders created from `bidders = [...]` when slot params are empty
+
+**Example**:
+
+```toml
+[integrations.prebid.bid_param_overrides.kargo]
+placementId = "server_side_placement_123"
+
+[integrations.prebid.bid_param_overrides.rubicon]
+accountId = 1001
+siteId = 2002
+zoneId = 3003
+```
+
+If the incoming request has:
+
+```json
+{"kargo": {"placementId": "client_side_abc", "foo": "bar"}}
+```
+
+the outgoing bidder params become:
+
+```json
+{"kargo": {"placementId": "server_side_placement_123", "foo": "bar"}}
+```
 
 ## Endpoints
 
@@ -157,6 +198,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Injects synthetic ID in the user object
 - Includes device/geo information when available
 - Appends `debug_query_params` to page URL when configured
+- Applies `bid_param_overrides` to `imp.ext.prebid.bidder` before request dispatch
 - Signs requests when request signing is enabled
 
 ## Best Practices
