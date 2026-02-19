@@ -21,3 +21,6 @@ src/*.html
 
 # SSL certificates
 *.pem
+
+/guest-profiles
+/benchmark-results/**

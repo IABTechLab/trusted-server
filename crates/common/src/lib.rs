@@ -51,7 +51,7 @@ pub mod openrtb;
 pub mod proxy;
 pub mod publisher;
 pub mod request_signing;
-pub mod request_timer;
+
 pub mod rsc_flight;
 pub mod settings;
 pub mod settings_data;

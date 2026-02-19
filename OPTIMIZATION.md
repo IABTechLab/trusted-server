@@ -4,11 +4,10 @@
 
 | Item | Status |
 |------|--------|
-| Production timing instrumentation (`RequestTimer`) | **Implemented** (on `feat/optimize-ts`, not yet deployed) |
-| Benchmark tooling (`scripts/benchmark.sh`) | **Implemented** (includes `--profile` mode) |
+| Benchmark tooling (`scripts/benchmark.sh`) | **Implemented** |
+| WASM guest profiling (`scripts/profile.sh`) | **Implemented** (flame graphs via `--profile-guest`) |
 | Viceroy baseline measurements | **Complete** |
 | Staging external TTFB baseline | **Complete** (against staging deployment) |
-| Server-Timing production data | **Blocked** — needs `feat/optimize-ts` deployed to staging |
 | Streaming architecture (`stream_to_client`) | **Planned** — see Phase 2 |
 | Code-level optimizations | **Planned** — see Phase 1 |
 
@@ -35,19 +34,33 @@ streaming.finish()?;
 
 This changes the optimization strategy — **time-to-last-byte (TTLB) and peak memory CAN be significantly reduced**. TTFB itself is still gated by the Fastly platform floor (~200ms) plus backend response time, but body bytes start reaching the client as soon as the first chunk is processed instead of waiting for the entire response to be buffered.
 
-### Compatibility with `#[fastly::main]` — NEEDS SPIKE
+### Compatibility with `#[fastly::main]` — use undecorated `main()` (recommended)
 
-`stream_to_client()` consumes the Response and starts sending. The Fastly SDK enforces that only **one response** is sent per request via `assert_single_downstream_response_is_sent()`. The `#[fastly::main]` macro wraps your function and calls `send_to_client()` on the returned `Response` — so if `stream_to_client()` was already called, the macro **will trigger a panic**.
+For streaming final responses, the Fastly SDK docs already define the intended pattern:
 
-**This is an unresolved design problem that needs a prototype before committing to the streaming architecture.**
+- `Request::from_client()` docs explicitly state it is incompatible with `#[fastly::main]` and recommend an undecorated `main()` with explicit response sending.
+- `Response::send_to_client()` / `Response::stream_to_client()` include the same compatibility guidance.
+- `fastly::init()` is public (doc-hidden) and can be called from raw `main()` to initialize the ABI.
 
-Possible approaches (all need validation):
+This means approach #1 is the correct architecture for streaming paths, and approaches like `std::process::exit(0)` or sentinel responses are unnecessary.
 
-1. **Drop the `#[fastly::main]` macro** — write a raw `main()` that handles the Fastly request lifecycle manually, giving full control over when/how the response is sent. Need to verify the Fastly SDK supports this.
-2. **Use `std::process::exit(0)` after streaming** — call `stream_to_client()`, process, `finish()`, then `exit(0)` before the macro gets a chance to call `send_to_client()`. Ugly, but may work if Fastly doesn't require cleanup.
-3. **Return a sentinel Response** — investigate whether the SDK treats an already-sent response as a no-op instead of panicking. (Current source code suggests it **does** panic — needs testing on actual Fastly Compute, not just source reading.)
+Recommended shape:
 
-**Action item**: Create a minimal Fastly Compute service that calls `stream_to_client()` and test each approach. This spike should be done **before** any Phase 2 implementation work.
+```rust
+fn main() -> Result<(), fastly::Error> {
+    fastly::init();
+    let req = fastly::Request::from_client();
+
+    match route_request(req)? {
+        Some(resp) => resp.send_to_client(), // non-streaming path
+        None => {}                           // streaming path already sent + finished
+    }
+
+    Ok(())
+}
+```
+
+**Action item**: Do a focused spike on real Fastly Compute to validate runtime behavior (no double-send panics across mixed routes, proper error behavior for partially streamed responses, and observability expectations). The API viability question is resolved.
 
 Non-streaming endpoints (static JS, discovery, auction) continue returning `Response` normally. Only the publisher proxy path (the hot path) would use streaming.
 
@@ -86,45 +99,31 @@ Measured on `main` branch. Value is in **relative comparison between branches**,
 
 ### Staging (External)
 
-Measured externally against staging deployment (golf.com proxy), `main` branch (no Server-Timing deployed yet).
+Measured externally against staging deployment (golf.com proxy), `main` branch.
 
 | Endpoint | TTFB | Total | Size | Notes |
 |---|---|---|---|---|
-| `GET /static/tsjs=tsjs-unified.min.js` | ~204 ms | ~219 ms | 28 KB | No backend, pure platform overhead |
+| `GET /static/tsjs=tsjs-unified.min.js` | ~204 ms | ~219 ms | 28 KB | No backend; includes client-network + edge path from benchmark vantage |
 | `GET /` (publisher proxy, golf.com) | ~234 ms | ~441 ms | 230 KB | Backend + processing |
 | `GET /.well-known/trusted-server.json` | ~191 ms | - | - | Returns 500 (needs investigation) |
 
-**Key insight**: Static JS has ~204ms TTFB with zero backend work. This is the **Fastly platform floor** (WASM instantiation + edge routing + TLS). Application code cannot reduce this. The publisher proxy adds only ~30ms TTFB on top — but the full ~441ms total includes waiting for the entire response to be buffered before sending. With streaming, the ~207ms gap between TTFB (234ms) and TTLB (441ms) would shrink because body bytes stream as they're processed instead of being fully buffered.
+**Key insight**: Static JS has ~204ms TTFB with zero backend work **from this specific benchmark vantage point**. That number includes client-to-edge RTT, DNS, TLS/connection state, and edge processing; it is **not** a universal Fastly floor. `WASM` instantiation can contribute on cold paths, but warm requests from clients near a POP can be much lower.
+
+For this dataset, treat static TTFB as an environment baseline and compare deltas: the publisher proxy adds only ~30ms TTFB on top. The larger optimization target is the TTFB→TTLB gap (~207ms here), which streaming can shrink by sending body chunks as they are processed instead of waiting for full buffering.
 
 ---
 
 ## Implementation Plan
 
-### Phase 0: Deploy Server-Timing Instrumentation (DONE, needs deploy)
+### Phase 0: Tooling and Baselines (DONE)
 
 **Branch**: `feat/optimize-ts`
 
-Already implemented:
-- `RequestTimer` in `crates/common/src/request_timer.rs` — tracks `init`, `backend`, `process`, `total` phases
-- `Server-Timing` header emitted on every response
-- Wired into `main.rs` and `publisher.rs`
-- `scripts/benchmark.sh --profile` mode to collect and report Server-Timing data
-
-**Action**: Deploy `feat/optimize-ts` to staging, then run:
-```bash
-BENCH_URL=https://<your-staging>.edgecompute.app ./scripts/benchmark.sh --profile
-```
-
-This gives us the real `init`/`backend`/`process` split for golf.com requests.
-
-**Conflict with Phase 2 streaming**: The `Server-Timing` header is currently set **after** response processing completes (line 147 of `main.rs`), which includes `backend` and `process` phase durations. When we switch to `stream_to_client()` in Phase 2, headers are sent **before** processing starts — so `Server-Timing` cannot include the `backend`/`process`/`total` values.
-
-Options for Phase 2:
-- **Move Server-Timing to a trailer** — `StreamingBody` supports trailers via `StreamingBodyExt::append_trailer()`. Requires client support (browsers generally ignore trailers).
-- **Log-only instrumentation** — keep `RequestTimer` for server-side logging but don't include it in response headers on streaming paths. Non-streaming endpoints still get the header.
-- **Keep both paths** — Phase 0 instrumentation continues working on the buffered path. Once streaming is validated and deployed, accept that Server-Timing headers are only available for non-streaming endpoints (static, auction, discovery).
-
-This is **not a blocker** for Phase 0 — the instrumentation is valuable right now on the current buffered architecture. Just be aware it will need adjustment when streaming lands.
+Completed:
+- `scripts/benchmark.sh` — HTTP load testing with TTFB analysis, cold start detection, endpoint latency breakdown
+- `scripts/profile.sh` — WASM guest profiling via `fastly compute serve --profile-guest`, outputs Firefox Profiler-compatible flame graphs
+- Viceroy baseline measurements (see tables above)
+- Staging external TTFB baseline
 
 ---
 
@@ -217,7 +216,46 @@ impl StreamProcessor for HtmlRewriterAdapter {
 |--------|-----|------|
 | Medium-High | ~3 | None |
 
-#### 1.4 Trivial fixes batch
+#### 1.4 Eliminate redundant `config` crate parsing in `get_settings()` — **22% CPU**
+
+**Files**: `crates/common/src/settings_data.rs`, `crates/common/src/settings.rs`
+
+**Problem**: Flame graph profiling shows `get_settings()` consuming ~22% of per-request CPU. The `build.rs` already merges `trusted-server.toml` + all `TRUSTED_SERVER__*` env vars at compile time and writes a fully-resolved TOML file to `target/trusted-server-out.toml`. But at runtime, `get_settings()` calls `Settings::from_toml()`, which re-runs the entire `config` crate pipeline — `Config::builder().add_source(File).add_source(Environment).build().try_deserialize()` — redundantly scanning env vars and merging sources that were already resolved at build time.
+
+**Root cause**: `settings_data.rs` embeds the build-time-resolved TOML via `include_bytes!`, then hands it to `from_toml()` which treats it as a raw config source and re-layers env vars on top.
+
+**Fix**: Replace `Settings::from_toml()` with direct `toml::from_str()` in `get_settings()`. The embedded TOML is already fully resolved — no `config` crate needed at runtime.
+
+```rust
+// Before (22% CPU — re-runs config crate pipeline + env var scan)
+let settings = Settings::from_toml(toml_str)?;
+
+// After (near-instant — just TOML deserialization)
+let settings: Settings = toml::from_str(toml_str)
+    .change_context(TrustedServerError::Configuration {
+        message: "Failed to deserialize embedded config".to_string(),
+    })?;
+```
+
+**Alternative — binary serialization for near-zero cost**: Since `build.rs` already has a fully constructed `Settings` struct, it could serialize to `postcard` (a `no_std`-compatible, WASM-safe binary format). Runtime deserialization becomes a memcpy-like operation instead of TOML parsing. Requires adding `postcard` + updating `build.rs` to write binary and `settings_data.rs` to deserialize binary.
+
+```rust
+// build.rs: serialize to binary instead of TOML
+let bytes = postcard::to_allocvec(&settings).expect("Failed to serialize");
+fs::write(dest_path, bytes)?;
+
+// settings_data.rs: near-instant deserialization
+let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
+    .change_context(TrustedServerError::Configuration { ... })?;
+```
+
+**Recommendation**: Start with the `toml::from_str()` fix (1-line change, no new deps). If profiling still shows meaningful time in TOML parsing, upgrade to `postcard`.
+
+| Impact | LOC | Risk |
+|--------|-----|------|
+| **Very High** (~22% CPU eliminated) | 1-3 | Low — `build.rs` already resolves everything |
+
+#### 1.5 Trivial fixes batch
 
 | Fix | File | LOC |
 |-----|------|-----|
@@ -319,9 +357,9 @@ This would overlap origin fetch time with auction execution, so the browser star
 After implementing Phases 1-2:
 
 1. Deploy to staging
-2. Run `./scripts/benchmark.sh --profile` against staging
-3. Compare Server-Timing data: `init`/`backend`/`process`/`total` before vs after
-4. Compare external TTFB and time-to-last-byte
+2. Run `./scripts/benchmark.sh` against staging for external TTFB/TTLB
+3. Run `./scripts/profile.sh` locally for flame graph comparison
+4. Compare external TTFB and time-to-last-byte before vs after
 5. Check Fastly dashboard for memory/compute metrics
 6. If improvement is marginal, don't ship the streaming architecture (Phase 2)
 
@@ -337,11 +375,12 @@ After implementing Phases 1-2:
 
 | # | Optimization | Impact | LOC | Risk | Phase |
 |---|---|---|---|---|---|
-| **P0** | Server-Timing instrumentation | Prerequisite | Done | None | 0 |
+| **P0** | Tooling and baselines | Prerequisite | Done | None | 0 |
 | **1.1** | Gzip streaming fix | **High** (memory) | -15/+3 | Low | 1 |
 | **1.2** | HTML rewriter streaming | **High** (memory) | ~30 | Medium | 1 |
 | **1.3** | Remove verbose logging | Medium-High | ~3 | None | 1 |
-| **1.4** | Trivial fixes batch | Low-Medium | ~50 | None | 1 |
+| **1.4** | Eliminate redundant `config` crate in `get_settings()` | **Very High** (~22% CPU) | 1-3 | Low | 1 |
+| **1.5** | Trivial fixes batch | Low-Medium | ~50 | None | 1 |
 | **2.1** | `stream_to_client()` integration | **High** (TTLB) | ~80-120 | Medium | 2 |
 | **2.2** | Concurrent origin + auction | **Very High** | ~150-200 | High | 2 (future) |
 
@@ -405,29 +444,40 @@ brew install hey    # HTTP load testing tool (auto-installed by benchmark.sh)
 ./scripts/benchmark.sh --ttfb             # TTFB analysis only
 ./scripts/benchmark.sh --load-test        # Load test only
 ./scripts/benchmark.sh --cold-start       # Cold start analysis
-./scripts/benchmark.sh --profile          # Server-Timing phase breakdown
 ./scripts/benchmark.sh --save baseline    # Save results to file
 ./scripts/benchmark.sh --compare baseline # Compare against saved results
 ```
 
-### Profiling Against Staging
+### WASM Guest Profiling (Flame Graphs)
+
+`fastly compute serve --profile-guest` samples the WASM call stack every 50us and writes a Firefox Profiler-compatible JSON on exit. This shows exactly which Rust functions consume CPU time — compression, HTML rewriting, string operations, init, etc.
 
 ```bash
-# Requires Server-Timing branch deployed
-BENCH_URL=https://example.edgecompute.app ./scripts/benchmark.sh --profile
+./scripts/profile.sh                           # Profile GET / (publisher proxy)
+./scripts/profile.sh --endpoint /auction \
+    --method POST --body '{"adUnits":[]}'      # Profile specific endpoint
+./scripts/profile.sh --requests 50             # More samples for stable flame graph
+./scripts/profile.sh --no-build                # Skip rebuild
+./scripts/profile.sh --open                    # Auto-open Firefox Profiler (macOS)
+
+# View: drag output file onto https://profiler.firefox.com/
 ```
 
-### What the Benchmark Measures
+The script builds, starts the profiling server, fires requests, stops the server, and saves the profile to `benchmark-results/profiles/`.
 
-| Test | What it tells you |
+### What the Tools Measure
+
+| Tool | What it tells you |
 |---|---|
-| TTFB analysis | 20 sequential requests — detects cold start patterns |
-| Cold start | First vs subsequent request latency |
-| Endpoint latency | Per-endpoint timing breakdown (DNS, connect, TTFB, total) |
-| Load test (hey) | Throughput (req/sec), latency distribution (P50/P95/P99) |
-| Profile | Server-Timing phase breakdown: `init`/`backend`/`process`/`total` with min/avg/max/p95 |
+| `benchmark.sh` — TTFB analysis | 20 sequential requests — detects cold start patterns |
+| `benchmark.sh` — Cold start | First vs subsequent request latency |
+| `benchmark.sh` — Endpoint latency | Per-endpoint timing breakdown (DNS, connect, TTFB, total) |
+| `benchmark.sh` — Load test (hey) | Throughput (req/sec), latency distribution (P50/P95/P99) |
+| `profile.sh` | Per-function CPU time inside WASM — flame graph via `--profile-guest` |
 
-### What the Benchmark Does NOT Measure
+**Use `profile.sh` first** to identify which functions are bottlenecks, then use `benchmark.sh` to measure the impact of fixes on external timing.
+
+### What These Tools Do NOT Measure
 
 - Real Fastly edge performance (Viceroy is a simulator)
 - WASM cold start on actual Fastly infrastructure
@@ -442,11 +492,8 @@ BENCH_URL=https://example.edgecompute.app ./scripts/benchmark.sh --profile
 
 | File | Change |
 |------|--------|
-| `crates/common/src/request_timer.rs` | **New** — `RequestTimer` with `Server-Timing` header output |
-| `crates/common/src/lib.rs` | Added `pub mod request_timer;` |
-| `crates/fastly/src/main.rs` | Wired timer: created at top, `mark_init()`, passed to handlers, `Server-Timing` header set |
-| `crates/common/src/publisher.rs` | Added `mark_backend()` after `req.send()`, `mark_process()` after body processing |
-| `scripts/benchmark.sh` | Added `--profile` mode, auto-install `hey` |
+| `scripts/benchmark.sh` | HTTP load testing, TTFB analysis, cold start detection, auto-install `hey` |
+| `scripts/profile.sh` | WASM guest profiling via `--profile-guest`, flame graph workflow |
 | `OPTIMIZATION.md` | This document |
 
 ### Teammate's `streaming_processor.rs` Changes
@@ -469,9 +516,7 @@ Fix: change `process_through_compression` to accept an optional finalization clo
 
 ### Decisions Needed
 
-1. **Deploy `feat/optimize-ts` to staging?** — Needed to get real Server-Timing data before proceeding with optimizations
-2. **`#[fastly::main]` + `stream_to_client()` spike** — The macro calls `send_to_client()` on the returned Response, which will panic if streaming was already started. We need a minimal prototype to validate the approach before any Phase 2 work. See "Compatibility with `#[fastly::main]`" section above.
-3. **Phase 1 vs Phase 2 priority** — Phase 1 (code fixes) is low risk and can ship independently. Phase 2 (streaming architecture) is higher impact but higher risk, and blocked on decision #2.
-4. **Server-Timing on streaming paths** — `stream_to_client()` sends headers before processing completes, so `Server-Timing` can't include `backend`/`process` phases. Options: trailers, log-only, or accept the limitation. See Phase 0 section.
-5. **Concurrent auction + origin (2.2)** — Not applicable for golf.com. Defer to a separate ticket?
-6. **GzEncoder `finish()` correctness** — Fix the `drop(encoder)` error swallowing in `process_through_compression`, or accept the risk?
+1. **Raw `main()` migration spike** — Validate end-to-end behavior on Fastly Compute when using undecorated `main()` + `Request::from_client()` and mixing buffered + streaming routes in one service.
+2. **Phase 1 vs Phase 2 priority** — Phase 1 (code fixes) is low risk and can ship independently. Phase 2 (streaming architecture) is higher impact and should proceed after decision #1 confirms runtime behavior.
+3. **Concurrent auction + origin (2.2)** — Not applicable for golf.com. Defer to a separate ticket?
+4. **GzEncoder `finish()` correctness** — Fix the `drop(encoder)` error swallowing in `process_through_compression`, or accept the risk?

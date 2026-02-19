@@ -14,7 +14,7 @@
 #   ./scripts/benchmark.sh --cold-start       # Cold start analysis only
 #   ./scripts/benchmark.sh --load-test        # Load test only
 #   ./scripts/benchmark.sh --quick            # Quick smoke test (fewer requests)
-#   ./scripts/benchmark.sh --profile          # Server-Timing phase breakdown (init/backend/process)
+#   ./scripts/benchmark.sh --ttfb             # TTFB analysis only
 #   ./scripts/benchmark.sh --save baseline    # Save results to file
 #   ./scripts/benchmark.sh --compare baseline # Compare against saved results
 #
@@ -273,147 +273,6 @@ run_first_byte_analysis() {
     echo ""
 }
 
-# --- Server-Timing Profiler ---
-
-# Parse "init;dur=1.2, backend;dur=385.4, process;dur=12.3, total;dur=401.5"
-# into associative-style variables: st_init=1.2, st_backend=385.4, etc.
-parse_server_timing() {
-    local header="$1"
-    st_init="" st_backend="" st_process="" st_total=""
-    for part in $(echo "$header" | tr ',' '\n'); do
-        local name dur
-        name=$(echo "$part" | sed 's/;.*//' | tr -d ' ')
-        dur=$(echo "$part" | grep -o 'dur=[0-9.]*' | cut -d= -f2)
-        case "$name" in
-            init)    st_init="$dur" ;;
-            backend) st_backend="$dur" ;;
-            process) st_process="$dur" ;;
-            total)   st_total="$dur" ;;
-        esac
-    done
-}
-
-# Collect Server-Timing data over N requests and print stats
-# Also captures external TTFB and total (TTLB) for streaming comparison
-profile_endpoint() {
-    local method="$1"
-    local url="$2"
-    local label="$3"
-    local iterations="${4:-20}"
-    shift 4
-    local extra_args=("$@")
-
-    local init_vals=() backend_vals=() process_vals=() total_vals=()
-    local ttfb_vals=() ttlb_vals=()
-
-    for i in $(seq 1 "$iterations"); do
-        # Capture both Server-Timing header and curl timing in one request
-        local raw
-        raw=$(curl -s -D- -o /dev/null \
-            -w '\n__CURL_TIMING__ %{time_starttransfer} %{time_total}' \
-            -X "$method" \
-            ${extra_args[@]+"${extra_args[@]}"} \
-            "$url" \
-            --max-time 30 2>/dev/null)
-
-        # Extract Server-Timing header
-        local header
-        header=$(echo "$raw" | grep -i '^server-timing:' | sed 's/[Ss]erver-[Tt]iming: *//')
-
-        # Extract curl timing (TTFB and total in seconds)
-        local curl_timing
-        curl_timing=$(echo "$raw" | grep '__CURL_TIMING__' | sed 's/__CURL_TIMING__ //')
-        if [ -n "$curl_timing" ]; then
-            local ext_ttfb ext_total
-            ext_ttfb=$(echo "$curl_timing" | awk '{printf "%.1f", $1 * 1000}')
-            ext_total=$(echo "$curl_timing" | awk '{printf "%.1f", $2 * 1000}')
-            ttfb_vals+=("$ext_ttfb")
-            ttlb_vals+=("$ext_total")
-        fi
-
-        if [ -z "$header" ]; then
-            continue
-        fi
-
-        parse_server_timing "$header"
-        [ -n "$st_init" ]    && init_vals+=("$st_init")
-        [ -n "$st_backend" ] && backend_vals+=("$st_backend")
-        [ -n "$st_process" ] && process_vals+=("$st_process")
-        [ -n "$st_total" ]   && total_vals+=("$st_total")
-    done
-
-    echo -e "  ${BOLD}$label${RESET}  ($method, $iterations iterations)"
-    echo ""
-    printf "  %-12s  %8s  %8s  %8s  %8s\n" "Phase" "Min" "Avg" "Max" "P95"
-    printf "  %-12s  %8s  %8s  %8s  %8s\n" "----------" "------" "------" "------" "------"
-    print_stats "init"    "${init_vals[@]}"
-    print_stats "backend" "${backend_vals[@]}"
-    print_stats "process" "${process_vals[@]}"
-    print_stats "total"   "${total_vals[@]}"
-    echo ""
-    echo -e "  ${BOLD}External timing (curl):${RESET}"
-    printf "  %-12s  %8s  %8s  %8s  %8s\n" "Metric" "Min" "Avg" "Max" "P95"
-    printf "  %-12s  %8s  %8s  %8s  %8s\n" "----------" "------" "------" "------" "------"
-    print_stats "TTFB"    "${ttfb_vals[@]}"
-    print_stats "TTLB"    "${ttlb_vals[@]}"
-    echo ""
-}
-
-# Compute min/avg/max/p95 from a list of floats
-print_stats() {
-    local name="$1"
-    shift
-    local vals=("$@")
-    local count=${#vals[@]}
-
-    if [ "$count" -eq 0 ]; then
-        printf "  %-12s  %8s  %8s  %8s  %8s\n" "$name" "-" "-" "-" "-"
-        return
-    fi
-
-    # Sort values
-    local sorted
-    sorted=$(printf '%s\n' "${vals[@]}" | sort -g)
-
-    local min avg max p95
-    min=$(echo "$sorted" | head -1)
-    max=$(echo "$sorted" | tail -1)
-
-    local sum
-    sum=$(printf '%s\n' "${vals[@]}" | awk '{s+=$1} END {printf "%.1f", s}')
-    avg=$(echo "$sum $count" | awk '{printf "%.1f", $1/$2}')
-
-    local p95_idx
-    p95_idx=$(echo "$count" | awk '{printf "%d", int($1 * 0.95 + 0.5)}')
-    [ "$p95_idx" -lt 1 ] && p95_idx=1
-    p95=$(echo "$sorted" | sed -n "${p95_idx}p")
-
-    printf "  %-12s  %7.1f   %7.1f   %7.1f   %7.1f\n" "$name" "$min" "$avg" "$max" "$p95"
-}
-
-run_profile() {
-    local iterations="${1:-20}"
-
-    log_header "SERVER-TIMING PROFILE"
-    log_info "Collecting Server-Timing header data over $iterations requests per endpoint"
-    log_info "Phases: init (setup) → backend (origin fetch) → process (body rewrite) → total"
-    echo ""
-
-    profile_endpoint GET "$BASE_URL/static/tsjs=tsjs-unified.min.js" \
-        "Static JS bundle" "$iterations"
-
-    profile_endpoint GET "$BASE_URL/.well-known/trusted-server.json" \
-        "Discovery endpoint" "$iterations"
-
-    profile_endpoint GET "$BASE_URL/" \
-        "Publisher proxy (fallback)" "$iterations"
-
-    profile_endpoint POST "$BASE_URL/auction" \
-        "Auction endpoint" "$iterations" \
-        -H "Content-Type: application/json" \
-        -d "$AUCTION_PAYLOAD"
-}
-
 save_results() {
     local name="$1"
     mkdir -p "$RESULTS_DIR"
@@ -494,9 +353,6 @@ main() {
             ;;
         --ttfb)
             run_first_byte_analysis
-            ;;
-        --profile)
-            run_profile "${2:-20}"
             ;;
         --save)
             save_results "${2:?Usage: --save <name>}"
