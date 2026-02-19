@@ -262,7 +262,6 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 }
 
-
 fn transform_prebid_response(
     response: &mut Json,
     request_host: &str,
@@ -620,24 +619,22 @@ impl AuctionProvider for PrebidAuctionProvider {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // Create signer and compute signature if request signing is enabled
-        let signer_with_signature =
-            if let Some(request_signing_config) = &context.settings.request_signing {
-                if request_signing_config.enabled {
-                    let request_info = RequestInfo::from_request(context.request);
-                    let signer = RequestSigner::from_config()?;
-                    let params = SigningParams::new(
-                        request.id.clone(),
-                        request_info.host,
-                        request_info.scheme,
-                    );
-                    let signature = signer.sign_request(&params)?;
-                    Some((signer, signature, params))
-                } else {
-                    None
-                }
+        let signer_with_signature = if let Some(request_signing_config) =
+            &context.settings.request_signing
+        {
+            if request_signing_config.enabled {
+                let request_info = RequestInfo::from_request(context.request);
+                let signer = RequestSigner::from_config()?;
+                let params =
+                    SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
+                let signature = signer.sign_request(&params)?;
+                Some((signer, signature, params))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // Convert to OpenRTB with all enrichments
         let openrtb = self.to_openrtb(

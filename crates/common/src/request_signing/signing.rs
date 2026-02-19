@@ -58,7 +58,7 @@ pub struct SigningParams {
 }
 
 impl SigningParams {
-    /// Creates a new `SigningParams` with the current timestamp
+    /// Creates a new `SigningParams` with the current timestamp in milliseconds
     #[must_use]
     pub fn new(request_id: String, request_host: String, request_scheme: String) -> Self {
         Self {
@@ -67,7 +67,7 @@ impl SigningParams {
             request_scheme,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+                .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         }
     }
@@ -313,13 +313,13 @@ mod tests {
         assert_eq!(params.request_id, "req-123");
         assert_eq!(params.request_host, "example.com");
         assert_eq!(params.request_scheme, "https");
-        // Timestamp should be recent (within last minute)
-        let now = std::time::SystemTime::now()
+        // Timestamp should be recent (within last minute), in milliseconds
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
-        assert!(params.timestamp <= now);
-        assert!(params.timestamp >= now - 60);
+            .as_millis() as u64;
+        assert!(params.timestamp <= now_ms);
+        assert!(params.timestamp >= now_ms - 60_000);
     }
 
     #[test]
@@ -361,7 +361,10 @@ mod tests {
         let sig1 = signer.sign_request(&params1).unwrap();
         let sig2 = signer.sign_request(&params2).unwrap();
 
-        assert_ne!(sig1, sig2, "Different hosts should produce different signatures");
+        assert_ne!(
+            sig1, sig2,
+            "Different hosts should produce different signatures"
+        );
     }
 
     #[test]
