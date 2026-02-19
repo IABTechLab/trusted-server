@@ -56,7 +56,7 @@ impl Publisher {
             .unwrap_or_else(|| self.origin_url.clone())
     }
 
-    fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         let trimmed = self.origin_url.trim_end_matches('/');
         if trimmed != self.origin_url {
             log::warn!(

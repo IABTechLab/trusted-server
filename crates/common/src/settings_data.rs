@@ -10,8 +10,15 @@ pub use crate::auction_config_types::AuctionConfig;
 const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.toml");
 
 /// Creates a new [`Settings`] instance from the embedded configuration file.
-/// Loads the configuration from the embedded `trusted-server.toml` file
-/// and applies any environment variable overrides.
+///
+/// Deserializes directly via `toml::from_str` instead of [`Settings::from_toml`],
+/// which runs the full `config` crate pipeline (env var scanning, source merging).
+///
+/// This is safe because `build.rs` already calls `Settings::from_toml()` at compile
+/// time — merging `trusted-server.toml` with all `TRUSTED_SERVER__*` env vars — and
+/// writes the fully-resolved result to `target/trusted-server-out.toml`. The embedded
+/// bytes are that resolved output, so re-scanning env vars at runtime is redundant.
+/// See `build.rs::merge_toml()` and the `cargo:rerun-if-env-changed` directives.
 ///
 /// # Errors
 ///
@@ -23,7 +30,12 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         message: "embedded trusted-server.toml file".to_string(),
     })?;
 
-    let settings = Settings::from_toml(toml_str)?;
+    let mut settings: Settings =
+        toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
+            message: "Failed to deserialize embedded config".to_string(),
+        })?;
+
+    settings.publisher.normalize();
 
     // Validate the settings
     settings

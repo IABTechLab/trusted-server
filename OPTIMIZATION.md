@@ -1,82 +1,49 @@
 # Trusted Server Optimization Plan
 
-## Status
+## Summary
 
-| Item | Status |
-|------|--------|
-| Benchmark tooling (`scripts/benchmark.sh`) | **Implemented** |
-| WASM guest profiling (`scripts/profile.sh`) | **Implemented** (flame graphs via `--profile-guest`) |
-| Viceroy baseline measurements | **Complete** |
-| Staging external TTFB baseline | **Complete** (against staging deployment) |
-| Streaming architecture (`stream_to_client`) | **Planned** — see Phase 2 |
-| Code-level optimizations | **Planned** — see Phase 1 |
+This document presents a performance analysis and optimization plan for the Trusted Server running on Fastly Compute (WASM). WASM guest profiling reveals that **HTML processing consumes ~76% of per-request CPU** on the publisher proxy path, with the `lol_html` parser alone accounting for ~47%. The optimization strategy focuses on two phases: (1) low-risk code fixes that reduce memory waste and enable streaming, and (2) an architectural shift to `stream_to_client()` that eliminates response buffering and reduces time-to-last-byte.
 
 ---
 
-## Key Finding: Streaming to Client IS Possible
+## Profiling Results
 
-The Fastly Compute SDK provides `Response::stream_to_client()` which returns a `StreamingBody` handle that implements `std::io::Write`. Headers are sent immediately and body chunks stream as they're written.
+**Methodology**: WASM guest profiling via `fastly compute serve --profile-guest`, 50 requests to `GET /` (publisher proxy to golf.com, 222KB HTML). ~131 samples per request at 50μs intervals. Profiles analyzed in Firefox Profiler.
 
-```rust
-// Current: fully buffered (no bytes reach client until everything is done)
-let body = response.take_body();
-let mut output = Vec::new();
-pipeline.process(body, &mut output)?;    // blocks until complete
-response.set_body(Body::from(output));   // only NOW does client get anything
-return Ok(response);
+### CPU Breakdown — Top Level
 
-// Possible: streaming (headers sent immediately, body chunks as processed)
-let body = response.take_body();
-let mut streaming = response.stream_to_client();  // headers sent NOW
-pipeline.process(body, &mut streaming)?;           // each write() → client
-streaming.finish()?;
-```
+| % CPU | Function | Notes |
+|-------|----------|-------|
+| ~96% | `trusted_server_fastly::main` | Almost all time is in application code |
+| ~90% | `route_request` → `handle_publisher_request` | Publisher proxy is the hot path |
+| **~76%** | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck** |
+| ~~5-8%~~ → **3.3%** | `get_settings()` | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |
+| ~5-7% | `handle_publisher_request` (non-HTML) | Backend send, cookie handling |
 
-This changes the optimization strategy — **time-to-last-byte (TTLB) and peak memory CAN be significantly reduced**. TTFB itself is still gated by the Fastly platform floor (~200ms) plus backend response time, but body bytes start reaching the client as soon as the first chunk is processed instead of waiting for the entire response to be buffered.
+### CPU Breakdown — HTML Processing (~76% total)
 
-### Compatibility with `#[fastly::main]` — use undecorated `main()` (recommended)
+| % CPU | Function | Notes |
+|-------|----------|-------|
+| **~47%** | `lol_html::parser` state machine | HTML tokenizer/parser — character-by-character parsing |
+| ~11% | `create_html_processor` | Building the lol_html rewriter with all handlers |
+| ~18% | Processing callbacks | URL rewriting, attribute scanning, output sink handling |
 
-For streaming final responses, the Fastly SDK docs already define the intended pattern:
+### CPU Breakdown — Other Components
 
-- `Request::from_client()` docs explicitly state it is incompatible with `#[fastly::main]` and recommend an undecorated `main()` with explicit response sending.
-- `Response::send_to_client()` / `Response::stream_to_client()` include the same compatibility guidance.
-- `fastly::init()` is public (doc-hidden) and can be called from raw `main()` to initialize the ABI.
+| % CPU | Function | Notes |
+|-------|----------|-------|
+| ~2% | `IntegrationRegistry` | Route lookup + attribute rewriting + initialization |
+| ~0.8% | Memory allocation (`RawVec::reserve`) | Buffer growth during processing |
+| ~0.5% | Logging (`fern` / `log_fastly`) | Minimal overhead |
+| ~0.5% | Synthetic ID generation | HMAC computation |
+| ~0.5% | Header extraction | `fastly::http::handle::get_header_values` |
 
-This means approach #1 is the correct architecture for streaming paths, and approaches like `std::process::exit(0)` or sentinel responses are unnecessary.
+### Key Takeaways
 
-Recommended shape:
-
-```rust
-fn main() -> Result<(), fastly::Error> {
-    fastly::init();
-    let req = fastly::Request::from_client();
-
-    match route_request(req)? {
-        Some(resp) => resp.send_to_client(), // non-streaming path
-        None => {}                           // streaming path already sent + finished
-    }
-
-    Ok(())
-}
-```
-
-**Action item**: Do a focused spike on real Fastly Compute to validate runtime behavior (no double-send panics across mixed routes, proper error behavior for partially streamed responses, and observability expectations). The API viability question is resolved.
-
-Non-streaming endpoints (static JS, discovery, auction) continue returning `Response` normally. Only the publisher proxy path (the hot path) would use streaming.
-
----
-
-## How to Use This Document
-
-**For any optimization work:**
-
-1. Run `./scripts/benchmark.sh --save baseline` on `main`
-2. Make your change on a branch
-3. Rebuild: `fastly compute build`
-4. Run `./scripts/benchmark.sh --save branch-name`
-5. Compare: `diff benchmark-results/baseline.txt benchmark-results/branch-name.txt`
-6. For production: `BENCH_URL=https://your-staging.edgecompute.app ./scripts/benchmark.sh --profile`
-7. If the numbers don't improve meaningfully, don't ship it
+1. **The lol_html parser at ~47% cannot be directly optimized** — it's doing its job parsing a 222KB HTML page. The focus should be on reducing unnecessary work around it and enabling streaming so processed chunks reach the client sooner.
+2. **`get_settings()` was ~5-8%, now ~3.3% after fix** — `build.rs` already resolves all config at compile time. Replaced `Settings::from_toml()` with direct `toml::from_str()` to eliminate redundant `config` crate pipeline.
+3. **Memory allocation at ~0.8%** confirms buffer growth during processing. Fixing gzip and HTML streaming (items 1.1 + 1.2) should reduce this.
+4. **Logging is negligible** at ~0.5%, but `log::info!("Settings {settings:?}")` still serializes the entire Settings struct on every request.
 
 ---
 
@@ -107,29 +74,68 @@ Measured externally against staging deployment (golf.com proxy), `main` branch.
 | `GET /` (publisher proxy, golf.com) | ~234 ms | ~441 ms | 230 KB | Backend + processing |
 | `GET /.well-known/trusted-server.json` | ~191 ms | - | - | Returns 500 (needs investigation) |
 
-**Key insight**: Static JS has ~204ms TTFB with zero backend work **from this specific benchmark vantage point**. That number includes client-to-edge RTT, DNS, TLS/connection state, and edge processing; it is **not** a universal Fastly floor. `WASM` instantiation can contribute on cold paths, but warm requests from clients near a POP can be much lower.
+**Key insight**: Static JS has ~204ms TTFB with zero backend work **from this specific benchmark vantage point**. That number includes client-to-edge RTT, DNS, TLS/connection state, and edge processing — it is **not** a universal Fastly floor.
 
 For this dataset, treat static TTFB as an environment baseline and compare deltas: the publisher proxy adds only ~30ms TTFB on top. The larger optimization target is the TTFB→TTLB gap (~207ms here), which streaming can shrink by sending body chunks as they are processed instead of waiting for full buffering.
 
 ---
 
-## Implementation Plan
+## Key Finding: Streaming to Client IS Possible
 
-### Phase 0: Tooling and Baselines (DONE)
+The Fastly Compute SDK provides `Response::stream_to_client()` which returns a `StreamingBody` handle that implements `std::io::Write`. Headers are sent immediately and body chunks stream as they're written.
 
-**Branch**: `feat/optimize-ts`
+```rust
+// Current: fully buffered (no bytes reach client until everything is done)
+let body = response.take_body();
+let mut output = Vec::new();
+pipeline.process(body, &mut output)?;    // blocks until complete
+response.set_body(Body::from(output));   // only NOW does client get anything
+return Ok(response);
 
-Completed:
-- `scripts/benchmark.sh` — HTTP load testing with TTFB analysis, cold start detection, endpoint latency breakdown
-- `scripts/profile.sh` — WASM guest profiling via `fastly compute serve --profile-guest`, outputs Firefox Profiler-compatible flame graphs
-- Viceroy baseline measurements (see tables above)
-- Staging external TTFB baseline
+// Possible: streaming (headers sent immediately, body chunks as processed)
+let body = response.take_body();
+let mut streaming = response.stream_to_client();  // headers sent NOW
+pipeline.process(body, &mut streaming)?;           // each write() → client
+streaming.finish()?;
+```
+
+This changes the optimization strategy — **time-to-last-byte (TTLB) and peak memory CAN be significantly reduced**. TTFB itself is still gated by the Fastly platform floor plus backend response time, but body bytes start reaching the client as soon as the first chunk is processed instead of waiting for the entire response to be buffered.
+
+### Compatibility with `#[fastly::main]` — use undecorated `main()` (recommended)
+
+For streaming final responses, the Fastly SDK docs define the intended pattern:
+
+- `Request::from_client()` docs explicitly state it is incompatible with `#[fastly::main]` and recommend an undecorated `main()` with explicit response sending.
+- `Response::send_to_client()` / `Response::stream_to_client()` include the same compatibility guidance.
+- `fastly::init()` is public (doc-hidden) and can be called from raw `main()` to initialize the ABI.
+
+Recommended shape:
+
+```rust
+fn main() -> Result<(), fastly::Error> {
+    fastly::init();
+    let req = fastly::Request::from_client();
+
+    match route_request(req)? {
+        Some(resp) => resp.send_to_client(), // non-streaming path
+        None => {}                           // streaming path already sent + finished
+    }
+
+    Ok(())
+}
+```
+
+**Action item**: Do a focused spike on real Fastly Compute to validate runtime behavior (no double-send panics across mixed routes, proper error behavior for partially streamed responses, and observability expectations).
+
+Non-streaming endpoints (static JS, discovery, auction) continue returning `Response` normally. Only the publisher proxy path (the hot path) would use streaming.
 
 ---
 
+## Implementation Plan
+
 ### Phase 1: Low-Risk Code Optimizations
 
-These are small, safe changes that reduce CPU and memory waste. Ship as one PR, measure before/after.
+Small, safe changes that reduce CPU and memory waste. Ship as one PR, measure before/after.
 
 #### 1.1 Fix gzip streaming — remove full-body buffering
 
@@ -195,39 +201,18 @@ impl StreamProcessor for HtmlRewriterAdapter {
 |--------|-----|------|
 | **High** (HTML is most common content type; eliminates 222KB+ buffer) | ~30 refactored | Medium — needs test coverage |
 
-#### 1.3 Reduce verbose per-request logging
-
-**Files**: `crates/fastly/src/main.rs:37,64-67,152-177`
-
-**Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level. The logger is configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above is evaluated.
-
-**Fix**: Downgrade the Settings dump to `log::debug!` and tighten the logger's `max_level` to `LevelFilter::Info` for production. The `log_fastly` crate supports `filter_module()` for per-module levels if we still want debug output from specific modules. When the level is filtered, `log` macros short-circuit before evaluating arguments — so the `Settings` `Debug` format is never even computed.
-
-```rust
-// Before: everything at Debug and above is serialized
-.max_level(log::LevelFilter::Debug)
-
-// After: Info in production, debug only for specific modules if needed
-.max_level(log::LevelFilter::Info)
-// Optional: .filter_module("trusted_server", log::LevelFilter::Debug)
-```
-
-| Impact | LOC | Risk |
-|--------|-----|------|
-| Medium-High | ~3 | None |
-
-#### 1.4 Eliminate redundant `config` crate parsing in `get_settings()` — **22% CPU**
+#### 1.3 ~~Eliminate redundant `config` crate parsing in `get_settings()` — ~5-8% CPU~~ DONE (~3.3% post-fix)
 
 **Files**: `crates/common/src/settings_data.rs`, `crates/common/src/settings.rs`
 
-**Problem**: Flame graph profiling shows `get_settings()` consuming ~22% of per-request CPU. The `build.rs` already merges `trusted-server.toml` + all `TRUSTED_SERVER__*` env vars at compile time and writes a fully-resolved TOML file to `target/trusted-server-out.toml`. But at runtime, `get_settings()` calls `Settings::from_toml()`, which re-runs the entire `config` crate pipeline — `Config::builder().add_source(File).add_source(Environment).build().try_deserialize()` — redundantly scanning env vars and merging sources that were already resolved at build time.
+**Problem**: Profiling shows `get_settings()` consuming ~5-8% of per-request CPU. The `build.rs` already merges `trusted-server.toml` + all `TRUSTED_SERVER__*` env vars at compile time and writes a fully-resolved TOML file to `target/trusted-server-out.toml`. But at runtime, `get_settings()` calls `Settings::from_toml()`, which re-runs the entire `config` crate pipeline — `Config::builder().add_source(File).add_source(Environment).build().try_deserialize()` — redundantly scanning env vars and merging sources that were already resolved at build time.
 
 **Root cause**: `settings_data.rs` embeds the build-time-resolved TOML via `include_bytes!`, then hands it to `from_toml()` which treats it as a raw config source and re-layers env vars on top.
 
 **Fix**: Replace `Settings::from_toml()` with direct `toml::from_str()` in `get_settings()`. The embedded TOML is already fully resolved — no `config` crate needed at runtime.
 
 ```rust
-// Before (22% CPU — re-runs config crate pipeline + env var scan)
+// Before (~5-8% CPU — re-runs config crate pipeline + env var scan)
 let settings = Settings::from_toml(toml_str)?;
 
 // After (near-instant — just TOML deserialization)
@@ -253,7 +238,29 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 
 | Impact | LOC | Risk |
 |--------|-----|------|
-| **Very High** (~22% CPU eliminated) | 1-3 | Low — `build.rs` already resolves everything |
+| **Medium** (~5-8% → ~3.3% CPU, verified) | 1-3 | Low — `build.rs` already resolves everything |
+
+**Status**: Done. Replaced `Settings::from_toml()` with `toml::from_str()` + explicit `normalize()` + `validate()`. Profiling confirmed: **~5-8% → ~3.3% CPU per request**.
+
+#### 1.4 Reduce verbose per-request logging — ~0.5% CPU
+
+**Files**: `crates/fastly/src/main.rs:37,64-67,152-177`
+
+**Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level. The logger is configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above is evaluated.
+
+**Fix**: Downgrade the Settings dump to `log::debug!` and tighten the logger's `max_level` to `LevelFilter::Info` for production. When the level is filtered, `log` macros short-circuit before evaluating arguments — so the `Settings` `Debug` format is never even computed.
+
+```rust
+// Before: everything at Debug and above is serialized
+.max_level(log::LevelFilter::Debug)
+
+// After: Info in production, debug only for specific modules if needed
+.max_level(log::LevelFilter::Info)
+```
+
+| Impact | LOC | Risk |
+|--------|-----|------|
+| Low (~0.5% CPU) | ~3 | None |
 
 #### 1.5 Trivial fixes batch
 
@@ -271,7 +278,7 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 
 ### Phase 2: Streaming Response Architecture
 
-This is the high-impact architectural change. Uses Fastly's `stream_to_client()` API to send response headers and body chunks to the client as they're processed, instead of buffering everything.
+The high-impact architectural change. Uses Fastly's `stream_to_client()` API to send response headers and body chunks to the client as they're processed, instead of buffering everything.
 
 #### 2.1 Publisher proxy: `stream_to_client()` integration
 
@@ -344,7 +351,7 @@ The idea: use `req.send_async()` to launch the origin fetch concurrently with au
 
 This would overlap origin fetch time with auction execution, so the browser starts receiving `<head>` content (CSS, fonts) while the auction is still running.
 
-**Note**: This requires significant refactoring of the auction orchestrator and HTML processor to support async injection. The pseudo-code in the teammate's proposal (`origin_pending.poll()`, `run_auction_async`) represents the desired architecture but these APIs don't exist yet and would need to be built.
+**Note**: This requires significant refactoring of the auction orchestrator and HTML processor to support async injection.
 
 | Impact | LOC | Risk |
 |--------|-----|------|
@@ -373,16 +380,15 @@ After implementing Phases 1-2:
 
 ## Optimization Summary Table
 
-| # | Optimization | Impact | LOC | Risk | Phase |
-|---|---|---|---|---|---|
-| **P0** | Tooling and baselines | Prerequisite | Done | None | 0 |
-| **1.1** | Gzip streaming fix | **High** (memory) | -15/+3 | Low | 1 |
-| **1.2** | HTML rewriter streaming | **High** (memory) | ~30 | Medium | 1 |
-| **1.3** | Remove verbose logging | Medium-High | ~3 | None | 1 |
-| **1.4** | Eliminate redundant `config` crate in `get_settings()` | **Very High** (~22% CPU) | 1-3 | Low | 1 |
-| **1.5** | Trivial fixes batch | Low-Medium | ~50 | None | 1 |
-| **2.1** | `stream_to_client()` integration | **High** (TTLB) | ~80-120 | Medium | 2 |
-| **2.2** | Concurrent origin + auction | **Very High** | ~150-200 | High | 2 (future) |
+| # | Optimization | Measured CPU | Impact | LOC | Risk | Phase |
+|---|---|---|---|---|---|---|
+| **1.1** | Gzip streaming fix | Part of ~76% HTML pipeline | **High** (memory) | -15/+3 | Low | 1 |
+| **1.2** | HTML rewriter streaming | Part of ~76% HTML pipeline | **High** (memory) | ~30 | Medium | 1 |
+| **1.3** | ~~Eliminate redundant `config` crate~~ | ~~5-8%~~ → **3.3%** | **Done** | 1-3 | Low | 1 |
+| **1.4** | Reduce verbose logging | ~0.5% | Low | ~3 | None | 1 |
+| **1.5** | Trivial fixes batch | <1% combined | Low | ~50 | None | 1 |
+| **2.1** | `stream_to_client()` integration | N/A (architectural) | **High** (TTLB) | ~80-120 | Medium | 2 |
+| **2.2** | Concurrent origin + auction | N/A (architectural) | **Very High** | ~150-200 | High | 2 (future) |
 
 ---
 
@@ -423,8 +429,8 @@ Client → Fastly Edge → [WASM starts]
   → StreamingBody.finish()                      done
 ```
 
-**Memory**: ~8KB chunk buffer + lol_html internal state (significantly less than 4x response size — exact savings need measurement)
-**TTLB**: client receives first body bytes after first processed chunk, instead of waiting for all processing to complete. For a 222KB page, the savings is the entire processing time (decompression + rewriting + recompression).
+**Memory**: ~8KB chunk buffer + lol_html internal state (significantly less than 4x response size)
+**TTLB**: client receives first body bytes after first processed chunk, instead of waiting for all processing to complete
 
 ---
 
@@ -450,7 +456,7 @@ brew install hey    # HTTP load testing tool (auto-installed by benchmark.sh)
 
 ### WASM Guest Profiling (Flame Graphs)
 
-`fastly compute serve --profile-guest` samples the WASM call stack every 50us and writes a Firefox Profiler-compatible JSON on exit. This shows exactly which Rust functions consume CPU time — compression, HTML rewriting, string operations, init, etc.
+`fastly compute serve --profile-guest` samples the WASM call stack every 50μs and writes a Firefox Profiler-compatible JSON on exit. This shows exactly which Rust functions consume CPU time — compression, HTML rewriting, string operations, init, etc.
 
 ```bash
 ./scripts/profile.sh                           # Profile GET / (publisher proxy)
@@ -486,15 +492,21 @@ The script builds, starts the profiling server, fires requests, stops the server
 
 ---
 
+## How to Use This Document
+
+**For any optimization work:**
+
+1. Run `./scripts/benchmark.sh --save baseline` on `main`
+2. Make your change on a branch
+3. Rebuild: `fastly compute build`
+4. Run `./scripts/benchmark.sh --save branch-name`
+5. Compare: `diff benchmark-results/baseline.txt benchmark-results/branch-name.txt`
+6. Run `./scripts/profile.sh` for flame graph comparison
+7. If the numbers don't improve meaningfully, don't ship it
+
+---
+
 ## Notes for Team
-
-### What's already on `feat/optimize-ts` branch (uncommitted)
-
-| File | Change |
-|------|--------|
-| `scripts/benchmark.sh` | HTTP load testing, TTFB analysis, cold start detection, auto-install `hey` |
-| `scripts/profile.sh` | WASM guest profiling via `--profile-guest`, flame graph workflow |
-| `OPTIMIZATION.md` | This document |
 
 ### Teammate's `streaming_processor.rs` Changes
 
