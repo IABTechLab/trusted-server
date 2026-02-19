@@ -230,6 +230,19 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       }
     }
 
+    // Ensure the trustedServer adapter is allowed to return bids under any
+    // bidder code (e.g. "mocktioneer", "appnexus") from the server-side seat.
+    // Re-applied on every requestBids call so that publisher code that
+    // overwrites pbjs.bidderSettings doesn't drop our setting.
+    pbjs.bidderSettings = {
+      ...(pbjs.bidderSettings || {}),
+      [ADAPTER_CODE]: {
+        ...(pbjs.bidderSettings?.[ADAPTER_CODE] || {}),
+        allowAlternateBidderCodes: true,
+        allowedAlternateBidderCodes: ['*'],
+      },
+    };
+
     return originalRequestBids(opts);
   };
 
@@ -241,17 +254,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     pbjsConfig.bidderTimeout = merged.timeout;
   }
   pbjs.setConfig(pbjsConfig as PbjsConfig);
-
-  // Allow the trustedServer adapter to return bids under the real bidder codes
-  // (e.g. "mocktioneer", "appnexus") from the server-side seat.
-  pbjs.bidderSettings = {
-    ...(pbjs.bidderSettings || {}),
-    [ADAPTER_CODE]: {
-      ...(pbjs.bidderSettings?.[ADAPTER_CODE] || {}),
-      allowAlternateBidderCodes: true,
-      allowedAlternateBidderCodes: ['*'],
-    },
-  };
 
   // processQueue() must be called after all modules are loaded when using
   // prebid.js via NPM.
