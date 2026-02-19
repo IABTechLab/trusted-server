@@ -9,7 +9,6 @@ use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYN
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
-
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
