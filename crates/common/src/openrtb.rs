@@ -124,7 +124,7 @@ pub struct TrustedServerExt {
     pub request_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_scheme: Option<String>,
-    /// Unix timestamp for replay protection
+    /// Unix timestamp in milliseconds for replay protection
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
 }
