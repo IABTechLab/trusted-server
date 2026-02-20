@@ -161,7 +161,13 @@ export function installGptShim(): boolean {
   return true;
 }
 
-// Self-initialise on import (guarded for SSR safety)
-if (typeof window !== 'undefined') {
+// Self-initialise on import when the server-side GPT integration is enabled.
+// The trusted server injects `window.__tsjs_gpt_enabled = true` via an inline
+// script (IntegrationHeadInjector) so the shim stays dormant when the GPT proxy
+// routes are not registered.
+if (
+  typeof window !== 'undefined' &&
+  (window as Record<string, unknown>).__tsjs_gpt_enabled
+) {
   installGptShim();
 }

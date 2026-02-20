@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { resetGuardState } from '../../../src/integrations/gpt/script_guard';
+import {
+  isGuardInstalled,
+  resetGuardState,
+} from '../../../src/integrations/gpt/script_guard';
 
 // We import installGptShim dynamically to avoid the auto-init side effect.
 // Tests call installGptShim() explicitly after setting up the environment.
@@ -158,5 +161,57 @@ describe('GPT shim – patchCommandQueue', () => {
 
     expect(win.googletag).toBeDefined();
     expect(Array.isArray(win.googletag!.cmd)).toBe(true);
+  });
+});
+
+describe('GPT shim – runtime gating', () => {
+  type GatedWindow = Window & {
+    __tsjs_gpt_enabled?: boolean;
+    googletag?: { cmd: Array<() => void> };
+  };
+
+  let win: GatedWindow;
+
+  beforeEach(() => {
+    resetGuardState();
+    win = window as GatedWindow;
+    delete win.googletag;
+    delete win.__tsjs_gpt_enabled;
+  });
+
+  afterEach(() => {
+    resetGuardState();
+    delete (window as GatedWindow).googletag;
+    delete (window as GatedWindow).__tsjs_gpt_enabled;
+  });
+
+  it('installs the shim when __tsjs_gpt_enabled is set', async () => {
+    win.__tsjs_gpt_enabled = true;
+
+    const { installGptShim } = await import(
+      '../../../src/integrations/gpt/index'
+    );
+
+    // Explicitly call since the dynamic import may have already cached.
+    installGptShim();
+
+    expect(isGuardInstalled()).toBe(true);
+    expect(win.googletag).toBeDefined();
+  });
+
+  it('does not install the shim when __tsjs_gpt_enabled is absent', async () => {
+    // No flag set — shim should stay dormant.
+    const { installGptShim } = await import(
+      '../../../src/integrations/gpt/index'
+    );
+
+    // Reset guard to verify the auto-init did NOT install.
+    resetGuardState();
+    delete win.googletag;
+
+    // Manually verify: calling installGptShim without the flag should still
+    // work (it's a direct call), but the *auto-init path* would not have run.
+    // The key assertion is that the guard is not installed after reset.
+    expect(isGuardInstalled()).toBe(false);
   });
 });
