@@ -334,7 +334,7 @@ describe('GTM Beacon Guard', () => {
     navigator.sendBeacon = sendBeaconSpy;
 
     fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-      Promise.resolve(new Response('', { status: 204 }))
+      Promise.resolve(new Response('', { status: 200 }))
     );
     window.fetch = fetchSpy;
 

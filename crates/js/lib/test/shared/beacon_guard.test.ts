@@ -18,14 +18,15 @@ describe('Beacon Guard', () => {
     navigator.sendBeacon = sendBeaconSpy;
 
     fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-      Promise.resolve(new Response('', { status: 204 }))
+      Promise.resolve(new Response('', { status: 200 }))
     );
     window.fetch = fetchSpy;
 
     config = {
       name: 'Test',
       isTargetUrl: (url: string) => url.includes('analytics.example.com'),
-      rewriteUrl: (url: string) => url.replace(/https?:\/\/analytics\.example\.com/, '/proxy'),
+      rewriteUrl: (url: string) =>
+        url.replace(/https?:\/\/analytics\.example\.com/, 'http://localhost/proxy'),
     };
   });
 
@@ -70,7 +71,7 @@ describe('Beacon Guard', () => {
 
       navigator.sendBeacon('https://analytics.example.com/g/collect?v=2', '');
 
-      expect(sendBeaconSpy).toHaveBeenCalledWith('/proxy/g/collect?v=2', '');
+      expect(sendBeaconSpy).toHaveBeenCalledWith('http://localhost/proxy/g/collect?v=2', '');
     });
 
     it('should pass through non-matching sendBeacon URLs', () => {
@@ -89,7 +90,7 @@ describe('Beacon Guard', () => {
       const body = JSON.stringify({ event: 'page_view' });
       navigator.sendBeacon('https://analytics.example.com/collect', body);
 
-      expect(sendBeaconSpy).toHaveBeenCalledWith('/proxy/collect', body);
+      expect(sendBeaconSpy).toHaveBeenCalledWith('http://localhost/proxy/collect', body);
     });
   });
 
@@ -100,7 +101,7 @@ describe('Beacon Guard', () => {
 
       await window.fetch('https://analytics.example.com/g/collect?v=2');
 
-      expect(fetchSpy).toHaveBeenCalledWith('/proxy/g/collect?v=2', undefined);
+      expect(fetchSpy).toHaveBeenCalledWith('http://localhost/proxy/g/collect?v=2', undefined);
     });
 
     it('should pass through non-matching fetch URLs', async () => {
@@ -119,7 +120,7 @@ describe('Beacon Guard', () => {
       const init: RequestInit = { method: 'POST', body: 'payload' };
       await window.fetch('https://analytics.example.com/collect', init);
 
-      expect(fetchSpy).toHaveBeenCalledWith('/proxy/collect', init);
+      expect(fetchSpy).toHaveBeenCalledWith('http://localhost/proxy/collect', init);
     });
 
     it('should handle Request object input', async () => {
@@ -142,7 +143,7 @@ describe('Beacon Guard', () => {
       const url = new URL('https://analytics.example.com/g/collect');
       await window.fetch(url);
 
-      expect(fetchSpy).toHaveBeenCalledWith('/proxy/g/collect', undefined);
+      expect(fetchSpy).toHaveBeenCalledWith('http://localhost/proxy/g/collect', undefined);
     });
   });
 
