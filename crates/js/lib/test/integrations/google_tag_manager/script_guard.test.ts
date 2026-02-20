@@ -80,9 +80,9 @@ describe('GTM Script Interception Guard', () => {
       expect(extractGtmPath('https://www.googletagmanager.com/gtm.js?id=GTM-XXXX')).toBe(
         '/gtm.js?id=GTM-XXXX'
       );
-      expect(
-        extractGtmPath('https://www.google-analytics.com/g/collect?v=2&tid=G-TEST')
-      ).toBe('/g/collect?v=2&tid=G-TEST');
+      expect(extractGtmPath('https://www.google-analytics.com/g/collect?v=2&tid=G-TEST')).toBe(
+        '/g/collect?v=2&tid=G-TEST'
+      );
     });
 
     it('should handle bare domain', () => {
@@ -107,7 +107,9 @@ describe('GTM Script Interception Guard', () => {
       const rewritten = rewriteGtmUrl(
         'https://www.googletagmanager.com/gtm.js?id=GTM-XXXX&l=dataLayer'
       );
-      expect(rewritten).toContain('/integrations/google_tag_manager/gtm.js?id=GTM-XXXX&l=dataLayer');
+      expect(rewritten).toContain(
+        '/integrations/google_tag_manager/gtm.js?id=GTM-XXXX&l=dataLayer'
+      );
     });
   });
 

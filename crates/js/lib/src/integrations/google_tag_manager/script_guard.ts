@@ -51,9 +51,7 @@ function extractGtmPath(url: string): string {
   } catch {
     // Fallback: extract path after the domain
     console.debug('[GTM Guard] URL parsing failed, using fallback for:', url);
-    const match = url.match(
-      /www\.(?:googletagmanager|google-analytics)\.com(\/[^'"\s]*)/i,
-    );
+    const match = url.match(/www\.(?:googletagmanager|google-analytics)\.com(\/[^'"\s]*)/i);
     return match?.[1] || '/gtm.js';
   }
 }
