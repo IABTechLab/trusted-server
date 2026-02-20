@@ -37,19 +37,30 @@ const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 
 /// Regex pattern for matching and rewriting GTM and Google Analytics URLs.
 ///
-/// Handles all URL variants:
+/// Handles full and protocol-relative URL variants:
 /// - `https://www.googletagmanager.com/gtm.js?id=...`
 /// - `//www.googletagmanager.com/gtm.js?id=...`
 /// - `https://www.google-analytics.com/collect`
 /// - `//www.google-analytics.com/g/collect`
-/// - `"www.googletagmanager.com"` (bare domain in GTM JSON config data)
+///
+/// **Requires `//` prefix** — bare domain strings like `"www.googletagmanager.com"`
+/// are intentionally NOT matched. gtag.js stores domains as bare strings and
+/// constructs URLs dynamically (`"https://" + domain + "/path"`). Rewriting
+/// the bare domain produces broken URLs like
+/// `https://integrations/google_tag_manager/path` because the script still
+/// prepends `"https://"`.
+///
+/// **Does NOT include `analytics.google.com`** — same dynamic URL construction
+/// issue. Full URLs containing `analytics.google.com` are handled by
+/// [`is_rewritable_url`] for HTML attribute rewriting where we see the
+/// complete URL.
 ///
 /// Captures a trailing delimiter (`/` or `"`) in group 2 to prevent false matches
 /// on subdomains (e.g., `www.googletagmanager.com.evil.com`).
 ///
 /// The replacement target is `/integrations/google_tag_manager` + the captured delimiter.
 static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:https?:)?(?://)?www\.(googletagmanager|google-analytics)\.com([/"])"#)
+    Regex::new(r#"(?:https?:)?//www\.(googletagmanager|google-analytics)\.com([/"])"#)
         .expect("GTM URL regex should compile")
 });
 
@@ -115,7 +126,7 @@ impl GoogleTagManagerIntegration {
     /// Rewrite GTM and Google Analytics URLs to first-party proxy paths.
     ///
     /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
-    /// for both `googletagmanager.com` and `google-analytics.com`.
+    /// for `googletagmanager.com` and `google-analytics.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
         let replacement = format!("/integrations/{}$2", GTM_INTEGRATION_ID);
         GTM_URL_PATTERN
@@ -132,8 +143,8 @@ impl GoogleTagManagerIntegration {
         if url.contains("googletagmanager.com") {
             return url.contains("/gtm.js") || url.contains("/gtag/js") || url.contains("/gtag.js");
         }
-        // Match google-analytics.com URLs for beacons we proxy
-        if url.contains("google-analytics.com") {
+        // Match google-analytics.com and analytics.google.com URLs for beacons we proxy
+        if url.contains("google-analytics.com") || url.contains("analytics.google.com") {
             return url.contains("/collect") || url.contains("/g/collect");
         }
         false
@@ -333,6 +344,9 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
     fn rewrite(&self, content: &str, _ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
+        // Note: analytics.google.com is intentionally excluded — gtag.js stores
+        // that domain as a bare string and constructs URLs dynamically, so
+        // rewriting it in scripts produces broken URLs.
         if content.contains("googletagmanager.com") || content.contains("google-analytics.com") {
             return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(content));
         }
@@ -378,6 +392,20 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_does_not_touch_analytics_google_com() {
+        // analytics.google.com must NOT be rewritten in scripts — gtag.js stores
+        // the bare domain string and constructs URLs dynamically with
+        // "https://" + domain + "/g/collect", so rewriting the domain produces
+        // the broken URL https://integrations/google_tag_manager/g/collect.
+        let input = r#"var f = "https://analytics.google.com/g/collect";"#;
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
+        assert_eq!(
+            input, result,
+            "analytics.google.com should not be rewritten by regex"
+        );
+    }
+
+    #[test]
     fn test_rewrite_preserves_non_gtm_urls() {
         let input = r#"var x = "https://example.com/script.js";"#;
         let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
@@ -390,6 +418,25 @@ mod tests {
         let input = r#"var x = "https://www.googletagmanager.com.evil.com/collect";"#;
         let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
         assert_eq!(input, result, "should not rewrite spoofed subdomain URLs");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_touch_bare_domain_strings() {
+        // Bare domain strings (without // prefix) must NOT be rewritten.
+        // gtag.js stores domains as bare strings and constructs URLs dynamically:
+        //   "https://" + domain + "/g/collect"
+        // Rewriting the bare domain produces broken URLs like:
+        //   https://integrations/google_tag_manager/g/collect
+        let input = r#"var d = "www.googletagmanager.com";"#;
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
+        assert_eq!(input, result, "bare domain strings should not be rewritten");
+
+        let input2 = r#"var d = "www.google-analytics.com";"#;
+        let result2 = GoogleTagManagerIntegration::rewrite_gtm_urls(input2);
+        assert_eq!(
+            input2, result2,
+            "bare google-analytics domain should not be rewritten"
+        );
     }
 
     #[test]

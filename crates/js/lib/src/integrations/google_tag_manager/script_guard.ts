@@ -1,3 +1,4 @@
+import { createBeaconGuard } from '../../shared/beacon_guard';
 import { createScriptGuard } from '../../shared/script_guard';
 
 /**
@@ -12,9 +13,9 @@ import { createScriptGuard } from '../../shared/script_guard';
  * the original path and query string.
  */
 
-/** Regex to match www.googletagmanager.com or www.google-analytics.com as domains */
+/** Regex to match GTM/GA domains: www.googletagmanager.com, www.google-analytics.com, analytics.google.com */
 const GTM_URL_PATTERN =
-  /^(?:https?:)?(?:\/\/)?www\.(googletagmanager|google-analytics)\.com(?:\/|$)/i;
+  /^(?:https?:)?(?:\/\/)?(www\.(googletagmanager|google-analytics)\.com|analytics\.google\.com)(?:\/|$)/i;
 
 /**
  * Check if a URL is a GTM or Google Analytics URL.
@@ -23,6 +24,7 @@ const GTM_URL_PATTERN =
  * Valid patterns:
  * - https://www.googletagmanager.com/gtm.js?id=GTM-XXXX
  * - https://www.google-analytics.com/g/collect
+ * - https://analytics.google.com/g/collect
  * - //www.googletagmanager.com/gtm.js?id=GTM-XXXX
  *
  * Invalid:
@@ -51,7 +53,9 @@ function extractGtmPath(url: string): string {
   } catch {
     // Fallback: extract path after the domain
     console.debug('[GTM Guard] URL parsing failed, using fallback for:', url);
-    const match = url.match(/www\.(?:googletagmanager|google-analytics)\.com(\/[^'"\s]*)/i);
+    const match = url.match(
+      /(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(\/[^'"\s]*)/i
+    );
     return match?.[1] || '/gtm.js';
   }
 }
@@ -69,9 +73,19 @@ const guard = createScriptGuard({
   rewriteUrl: rewriteGtmUrl,
 });
 
+const beaconGuard = createBeaconGuard({
+  name: 'GTM',
+  isTargetUrl: isGtmUrl,
+  rewriteUrl: rewriteGtmUrl,
+});
+
 export const installGtmGuard = guard.install;
 export const isGuardInstalled = guard.isInstalled;
 export const resetGuardState = guard.reset;
+
+export const installGtmBeaconGuard = beaconGuard.install;
+export const isBeaconGuardInstalled = beaconGuard.isInstalled;
+export const resetBeaconGuardState = beaconGuard.reset;
 
 // Export for testing
 export { isGtmUrl, extractGtmPath, rewriteGtmUrl };
