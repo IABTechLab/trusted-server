@@ -16,28 +16,34 @@ use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
-/// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
 ///
-/// Returns 404 for invalid paths or missing bundle files; otherwise serves the requested bundle.
+/// Concatenates core + enabled integration JS modules at runtime based on the
+/// `IntegrationRegistry`. The URL remains `/static/tsjs=tsjs-unified(.min).js`
+/// for backward compatibility.
 ///
 /// # Errors
 ///
 /// This function never returns an error; the Result type is for API consistency.
-pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServerError>> {
+pub fn handle_tsjs_dynamic(
+    req: &Request,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
+    const ALLOWED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
-    // Normalize .min.js to .js for matching
-    let normalized = filename.replace(".min.js", ".js");
-
-    let Some(body) = trusted_server_js::bundle_for_filename(&normalized) else {
+    if !ALLOWED_FILENAMES.contains(&filename) {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
-    };
+    }
 
-    let mut resp = serve_static_with_etag(body, req, "application/javascript; charset=utf-8");
+    // Concatenate core + enabled integration modules
+    let module_ids = integration_registry.js_module_ids();
+    let body = trusted_server_js::concatenate_modules(&module_ids);
+
+    let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
     resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
@@ -179,8 +185,8 @@ pub fn handle_publisher_request(
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
-    // Prebid.js requests are not intercepted here anymore. The HTML processor rewrites
-    // any Prebid script references to `/static/tsjs-ext.min.js` when auto-configure is enabled.
+    // Prebid.js requests are not intercepted here anymore. The HTML processor removes
+    // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
     // Extract request host and scheme from headers (supports X-Forwarded-Host/Proto for chained proxies)
     let request_info = RequestInfo::from_request(&req);
@@ -525,8 +531,9 @@ pub fn handle_publisher_request_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::Method;
+    use fastly::http::{Method, StatusCode};
 
     #[test]
     fn test_content_type_detection() {
@@ -638,6 +645,34 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn tsjs_dynamic_returns_not_found_for_unknown_filename() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=unknown.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_unified_bundle_for_known_filename() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-unified.min.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(response.get_status(), StatusCode::OK);
     }
 
     // Tests related to serving Prebid.js directly or intercepting its paths were removed.

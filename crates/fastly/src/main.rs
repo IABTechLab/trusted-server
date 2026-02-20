@@ -6,6 +6,9 @@ use log_fastly::Logger;
 use trusted_server_common::auction::endpoints::handle_auction;
 use trusted_server_common::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
+use trusted_server_common::constants::{
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+};
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
@@ -130,7 +133,9 @@ async fn route_request(
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
-        (Method::GET, path) if path.starts_with("/static/tsjs=") => handle_tsjs_dynamic(&req),
+        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
+            handle_tsjs_dynamic(&req, integration_registry)
+        }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
@@ -170,6 +175,13 @@ async fn route_request(
 
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
+
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
+    }
 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);

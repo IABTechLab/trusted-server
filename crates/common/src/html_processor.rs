@@ -223,13 +223,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
-                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
-                    snippet.push_str(&tsjs::unified_script_tag());
-                    // Then add any integration-specific head inserts (e.g., mode config)
-                    // These run after the bundle so tsjs API is available
+                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
+                    // so it's available when the bundle's auto-init code reads it.
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
+                    // Then inject the TSJS bundle — its top-level init code can now
+                    // read the config that was set by the inline scripts above.
+                    let module_ids = integrations.js_module_ids();
+                    snippet.push_str(&tsjs::tsjs_script_tag(&module_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -628,12 +630,12 @@ mod tests {
             .expect("should keep existing head content");
 
         assert!(
-            tsjs_index < head_index,
-            "should inject head snippet after tsjs tag"
+            head_index < tsjs_index,
+            "should inject config before tsjs bundle so auto-init can read it"
         );
         assert!(
-            head_index < title_index,
-            "should prepend head snippet before existing head content"
+            tsjs_index < title_index,
+            "should prepend all injected content before existing head content"
         );
     }
 
