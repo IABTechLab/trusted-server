@@ -4,7 +4,6 @@ Trusted Server is an open-source, cloud based orchestration framework and runtim
 
 Trusted Server is the new execution layer for the open-web, returning control of 1st party data, security, and overall user-experience back to publishers.
 
-
 ## Documentation
 
 The guide in `docs/guide/` (published at the link below) is the source of truth for human-readable documentation. This README is a brief overview.
@@ -40,7 +39,7 @@ fastly compute serve
 cargo fmt
 
 # Lint
-cargo clippy --all-targets --all-features --workspace --no-deps
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Run tests
 cargo test
