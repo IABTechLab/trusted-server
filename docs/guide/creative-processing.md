@@ -744,13 +744,14 @@ IntegrationRegistration::builder("my_integration")
 
 ### Bundle Types
 
-Available bundles (from `crates/js/lib/src/integrations/`):
+Each integration is built as a separate IIFE at compile time (`crates/js/lib/dist/`):
 
-- `tsjs-core.min.js` - Core API (always included)
-- `tsjs-ext.min.js` - Extensions (Prebid integration)
-- `tsjs-creative.min.js` - Creative tracking utilities
-- `tsjs-permutive.min.js` - Permutive integration
-- `tsjs-testlight.min.js` - Testlight integration
+- `tsjs-core.js` — Core API (always included)
+- `tsjs-creative.js` — Creative click-guard and tracking
+- `tsjs-prebid.js` — Prebid.js NPM bundle with trustedServer adapter
+- `tsjs-lockr.js`, `tsjs-permutive.js`, `tsjs-didomi.js`, `tsjs-datadome.js`, `tsjs-testlight.js` — Other integrations
+
+At runtime, the server concatenates `tsjs-core.js` + the modules for enabled integrations. The URL stays `/static/tsjs=tsjs-unified.min.js?v=<hash>` for backward compatibility.
 
 ## Performance Optimization
 
