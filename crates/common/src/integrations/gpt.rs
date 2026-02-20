@@ -46,7 +46,8 @@ use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -347,7 +348,8 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     Some(
         IntegrationRegistration::builder(GPT_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_attribute_rewriter(integration.clone())
+            .with_head_injector(integration)
             .build(),
     )
 }
@@ -418,6 +420,16 @@ impl IntegrationAttributeRewriter for GptIntegration {
     }
 }
 
+impl IntegrationHeadInjector for GptIntegration {
+    fn integration_id(&self) -> &'static str {
+        GPT_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec!["<script>window.__tsjs_gpt_enabled=true;</script>".to_string()]
+    }
+}
+
 // Default value functions
 
 fn default_enabled() -> bool {
@@ -439,6 +451,7 @@ fn default_rewrite_script() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::IntegrationDocumentState;
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> GptConfig {
@@ -872,6 +885,37 @@ mod tests {
         assert_eq!(
             result, "Accept-Encoding",
             "should treat empty string the same as absent Vary"
+        );
+    }
+
+    // -- Head injector --
+
+    #[test]
+    fn head_injector_emits_enable_flag() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 1, "should emit exactly one head insert");
+        assert_eq!(
+            inserts[0], "<script>window.__tsjs_gpt_enabled=true;</script>",
+            "should set __tsjs_gpt_enabled flag for the client-side GPT shim"
+        );
+    }
+
+    #[test]
+    fn head_injector_integration_id() {
+        let integration = GptIntegration::new(test_config());
+        assert_eq!(
+            IntegrationHeadInjector::integration_id(integration.as_ref()),
+            "gpt"
         );
     }
 }
