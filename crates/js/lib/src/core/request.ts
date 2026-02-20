@@ -11,7 +11,6 @@ export interface RequestAdsOptions {
   timeout?: number;
 }
 
-
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
