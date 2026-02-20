@@ -34,7 +34,7 @@ SERVER_PID=""
 # Defaults
 ENDPOINT="/"
 METHOD="GET"
-REQUESTS=20
+REQUESTS=100
 BODY=""
 SKIP_BUILD=false
 AUTO_OPEN=false
@@ -162,7 +162,7 @@ fi
 log_header "START PROFILING SERVER"
 log_info "Starting fastly compute serve --profile-guest..."
 
-(cd "$PROJECT_ROOT" && fastly compute serve --profile-guest 2>&1) &
+(cd "$PROJECT_ROOT" &&  set -a && source .env && set +a && fastly compute serve --profile-guest 2>&1) &
 SERVER_PID=$!
 log_info "Server PID: $SERVER_PID"
 

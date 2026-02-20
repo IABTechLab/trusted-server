@@ -12,7 +12,7 @@ use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_common::publisher::handle_tsjs_dynamic;
 use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -23,18 +23,22 @@ use trusted_server_common::settings_data::get_settings;
 mod error;
 use crate::error::to_error_response;
 
-#[fastly::main]
-fn main(req: Request) -> Result<Response, Error> {
+use trusted_server_common::publisher::RouteResult;
+
+fn main() {
+    fastly::init();
     init_logger();
+    let req = Request::from_client();
 
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return;
         }
     };
-    log::info!("Settings {settings:?}");
+    log::debug!("Settings {settings:?}");
 
     // Build the auction orchestrator once at startup
     let orchestrator = build_orchestrator(&settings);
@@ -43,16 +47,26 @@ fn main(req: Request) -> Result<Response, Error> {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to create integration registry: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return;
         }
     };
 
-    futures::executor::block_on(route_request(
+    match futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         req,
-    ))
+    )) {
+        Ok(RouteResult::Buffered(resp)) => resp.send_to_client(),
+        Ok(RouteResult::Streamed) => { /* already streamed */ }
+        Err(e) => {
+            log::error!("Request routing failed: {:?}", e);
+            Response::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body(format!("Internal Server Error: {}", e))
+                .send_to_client();
+        }
+    }
 }
 
 async fn route_request(
@@ -60,19 +74,58 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     req: Request,
-) -> Result<Response, Error> {
-    log::info!(
+) -> Result<RouteResult, Error> {
+    log::debug!(
         "FASTLY_SERVICE_VERSION: {}",
         ::std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
     );
 
-    if let Some(response) = enforce_basic_auth(settings, &req) {
-        return Ok(response);
+    if let Some(mut response) = enforce_basic_auth(settings, &req) {
+        for (key, value) in &settings.response_headers {
+            response.set_header(key, value);
+        }
+        return Ok(RouteResult::Buffered(response));
     }
 
     // Get path and method for routing
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
+
+    // Check if it's the publisher proxy fallback
+    let is_publisher_proxy = match (method.clone(), path.as_str()) {
+        (Method::GET, p) if p.starts_with("/static/tsjs=") => false,
+        (Method::GET, "/.well-known/trusted-server.json") => false,
+        (Method::POST, "/verify-signature") => false,
+        (Method::POST, "/admin/keys/rotate") => false,
+        (Method::POST, "/admin/keys/deactivate") => false,
+        (Method::POST, "/auction") => false,
+        (Method::GET, "/first-party/proxy") => false,
+        (Method::GET, "/first-party/click") => false,
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => false,
+        (Method::POST, "/first-party/proxy-rebuild") => false,
+        (m, p) if integration_registry.has_route(&m, p) => false,
+        _ => true,
+    };
+
+    if is_publisher_proxy {
+        log::info!(
+            "No known route matched for path: {}, proxying to publisher origin",
+            path
+        );
+
+        use trusted_server_common::publisher::handle_publisher_request_streaming;
+        match handle_publisher_request_streaming(settings, integration_registry, req) {
+            Ok(route_result) => return Ok(route_result),
+            Err(e) => {
+                log::error!("Failed to proxy to publisher origin: {:?}", e);
+                let mut err_resp = to_error_response(&e);
+                for (key, value) in &settings.response_headers {
+                    err_resp.set_header(key, value);
+                }
+                return Ok(RouteResult::Buffered(err_resp));
+            }
+        }
+    }
 
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
@@ -112,21 +165,7 @@ async fn route_request(
                 }))
             }),
 
-        // No known route matched, proxy to publisher origin as fallback
-        _ => {
-            log::info!(
-                "No known route matched for path: {}, proxying to publisher origin",
-                path
-            );
-
-            match handle_publisher_request(settings, integration_registry, req) {
-                Ok(response) => Ok(response),
-                Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    Err(e)
-                }
-            }
-        }
+        _ => unreachable!(),
     };
 
     // Convert any errors to HTTP error responses
@@ -136,7 +175,7 @@ async fn route_request(
         response.set_header(key, value);
     }
 
-    Ok(response)
+    Ok(RouteResult::Buffered(response))
 }
 
 fn init_logger() {

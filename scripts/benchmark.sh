@@ -37,6 +37,7 @@ set -euo pipefail
 # --- Configuration ---
 BASE_URL="${BENCH_URL:-http://127.0.0.1:7676}"
 RESULTS_DIR="$(cd "$(dirname "$0")/.." && pwd)/benchmark-results"
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 CURL_FORMAT='
 {
   "dns_ms":        %{time_namelookup},
@@ -117,7 +118,7 @@ timed_curl() {
     local extra_args=("$@")
 
     local result
-    result=$(curl -s -o /dev/null -w "$CURL_FORMAT" \
+    result=$(curl -s -A "$UA" -o /dev/null -w "$CURL_FORMAT" \
         -X "$method" \
         ${extra_args[@]+"${extra_args[@]}"} \
         "$url" \
@@ -229,19 +230,19 @@ run_load_test() {
 
     echo -e "${BOLD}GET / (publisher proxy) - ${total_requests} requests, ${concurrency} concurrent${RESET}"
     echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/" 2>&1 | \
+    hey -U "$UA" -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/" 2>&1 | \
         grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
     echo ""
 
     echo -e "${BOLD}GET /static/tsjs=tsjs-unified.min.js (static) - ${total_requests} requests, ${concurrency} concurrent${RESET}"
     echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/static/tsjs=tsjs-unified.min.js" 2>&1 | \
+    hey -U "$UA" -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/static/tsjs=tsjs-unified.min.js" 2>&1 | \
         grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
     echo ""
 
     echo -e "${BOLD}POST /auction - ${total_requests} requests, ${concurrency} concurrent${RESET}"
     echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 \
+    hey -U "$UA" -n "$total_requests" -c "$concurrency" -t 30 \
         -m POST \
         -H "Content-Type: application/json" \
         -d "$AUCTION_PAYLOAD" \
@@ -263,7 +264,7 @@ run_first_byte_analysis() {
 
     for i in $(seq 1 20); do
         local result
-        result=$(curl -s -o /dev/null -w "%{time_starttransfer} %{time_total}" \
+        result=$(curl -s -A "$UA" -o /dev/null -w "%{time_starttransfer} %{time_total}" \
             "$BASE_URL/" --max-time 30 2>/dev/null)
         local ttfb total
         ttfb=$(echo "$result" | awk '{printf "%.2f", $1 * 1000}')

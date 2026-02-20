@@ -321,6 +321,207 @@ pub fn handle_publisher_request(
     Ok(response)
 }
 
+pub enum RouteResult {
+    /// Response fully buffered — send via send_to_client()
+    Buffered(Response),
+    /// Response already streamed to client
+    Streamed,
+}
+
+/// Streaming version of publisher request handling.
+/// Uses `stream_to_client()` for text responses, falling back to buffered for errors.
+pub fn handle_publisher_request_streaming(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    mut req: Request,
+) -> Result<RouteResult, Report<TrustedServerError>> {
+    log::debug!("Streaming: Proxying request to publisher_origin");
+
+    let request_info = RequestInfo::from_request(&req);
+    let request_host = &request_info.host;
+    let request_scheme = &request_info.scheme;
+
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    let has_synthetic_cookie = req
+        .get_header(header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .map(|cookies| {
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim_start()
+                    .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            })
+        })
+        .unwrap_or(false);
+
+    let backend_name = BackendConfig::from_url(
+        &settings.publisher.origin_url,
+        settings.proxy.certificate_check,
+    )?;
+    let origin_host = settings.publisher.origin_host();
+
+    req.set_header("host", &origin_host);
+
+    let mut response = req
+        .send(&backend_name)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to proxy request to origin".to_string(),
+        })?;
+
+    let content_type = response
+        .get_header(header::CONTENT_TYPE)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_string();
+
+    let should_process = content_type.contains("text/")
+        || content_type.contains("application/javascript")
+        || content_type.contains("application/json");
+
+    // Gate: only stream 2xx processable text responses with a request host
+    // Non-processable but successful responses can still be buffered and passed through efficiently
+    // Wait: if it's successful but NOT processable, should we stream it or buffer it?
+    // It's fine to fall back to the buffered return, it will be sent via `send_to_client()` in main.rs.
+    // Actually, `stream_to_client()` with no processing means we have to pump the body.
+    // Let's just buffer it for now to match exactly what we have in the legacy path, since process_response_streaming
+    // also skips if !should_process.
+    // But wait, the standard path skips `process_response_streaming` but returns the buffered Response.
+    // Returning `RouteResult::Buffered(response)` handles this perfectly.
+
+    // Check if we will stream
+    let will_stream =
+        response.get_status().is_success() && should_process && !request_host.is_empty();
+
+    if !will_stream {
+        log::debug!(
+            "Falling back to buffered for response - status: {}, should_process: {}, request_host: '{}'",
+            response.get_status(),
+            should_process,
+            request_host
+        );
+        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+        if !has_synthetic_cookie {
+            response.set_header(
+                header::SET_COOKIE,
+                create_synthetic_cookie(settings, synthetic_id.as_str()),
+            );
+        }
+        return Ok(RouteResult::Buffered(response));
+    }
+
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    log::debug!(
+        "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+        content_type, content_encoding, request_host, origin_host
+    );
+
+    let body = response.take_body();
+    let compression = Compression::from_content_encoding(&content_encoding);
+
+    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+    if !has_synthetic_cookie {
+        response.set_header(
+            header::SET_COOKIE,
+            create_synthetic_cookie(settings, synthetic_id.as_str()),
+        );
+    }
+
+    // Add global settings headers before streaming since we commit headers
+    for (key, value) in &settings.response_headers {
+        response.set_header(key, value);
+    }
+
+    // Remove content-length since we stream and modify size
+    response.remove_header(header::CONTENT_LENGTH);
+
+    // Commit to streaming — headers (including our additions) sent NOW
+    let streaming_body = response.stream_to_client();
+    let mut buffered_streaming_body = std::io::BufWriter::with_capacity(8192, streaming_body);
+
+    let params = ProcessResponseParams {
+        content_encoding: &content_encoding,
+        origin_host: &origin_host,
+        origin_url: &settings.publisher.origin_url,
+        request_host,
+        request_scheme,
+        settings,
+        content_type: &content_type,
+        integration_registry,
+    };
+
+    let is_html = params.content_type.contains("text/html");
+    let is_rsc_flight = params.content_type.contains("text/x-component");
+
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: 8192,
+    };
+
+    let process_result = if is_html {
+        match create_html_stream_processor(
+            params.origin_host,
+            params.request_host,
+            params.request_scheme,
+            params.settings,
+            params.integration_registry,
+        ) {
+            Ok(processor) => {
+                let mut pipeline = StreamingPipeline::new(config, processor);
+                pipeline.process(body, &mut buffered_streaming_body)
+            }
+            Err(e) => {
+                log::error!("Failed to create html stream processor: {:?}", e);
+                // We've already sent headers, we can't change the status. Just return.
+                return Ok(RouteResult::Streamed);
+            }
+        }
+    } else if is_rsc_flight {
+        let processor = RscFlightUrlRewriter::new(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        let mut pipeline = StreamingPipeline::new(config, processor);
+        pipeline.process(body, &mut buffered_streaming_body)
+    } else {
+        let replacer = create_url_replacer(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        pipeline.process(body, &mut buffered_streaming_body)
+    };
+
+    match process_result {
+        Ok(()) => match buffered_streaming_body.into_inner() {
+            Ok(streaming_body) => {
+                if let Err(e) = streaming_body.finish() {
+                    log::error!("Failed to finish streaming_body: {:?}", e);
+                } else {
+                    log::debug!("Completed streaming processing of response body");
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to flush buffered streaming body: {:?}", e.error());
+            }
+        },
+        Err(e) => {
+            log::error!("Streaming failed mid-flight: {:?}", e);
+        }
+    }
+
+    Ok(RouteResult::Streamed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
