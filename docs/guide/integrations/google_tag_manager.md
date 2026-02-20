@@ -106,6 +106,22 @@ GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
 - Rewrites internal URLs to use the first-party proxy
 - Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
 
+### `GET .../gtag/js` - GA4 Tag Proxy
+
+Proxies the Google Analytics 4 tag library (gtag.js).
+
+**Request**:
+
+```
+GET /integrations/google_tag_manager/gtag/js?id=G-XXXXXXXX
+```
+
+**Behavior**:
+
+- Proxies to `https://www.googletagmanager.com/gtag/js`
+- Rewrites internal URLs to use the first-party proxy
+- Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
+
 ### `GET/POST .../collect` - Analytics Beacon
 
 Proxies analytics events (GA4/UA).

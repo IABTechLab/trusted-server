@@ -42,10 +42,14 @@ const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// - `//www.googletagmanager.com/gtm.js?id=...`
 /// - `https://www.google-analytics.com/collect`
 /// - `//www.google-analytics.com/g/collect`
+/// - `"www.googletagmanager.com"` (bare domain in GTM JSON config data)
 ///
-/// The replacement target is `/integrations/google_tag_manager`.
+/// Captures a trailing delimiter (`/` or `"`) in group 2 to prevent false matches
+/// on subdomains (e.g., `www.googletagmanager.com.evil.com`).
+///
+/// The replacement target is `/integrations/google_tag_manager` + the captured delimiter.
 static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(https?:)?//www\.(googletagmanager|google-analytics)\.com")
+    Regex::new(r#"(?:https?:)?(?://)?www\.(googletagmanager|google-analytics)\.com([/"])"#)
         .expect("GTM URL regex should compile")
 });
 
@@ -113,12 +117,30 @@ impl GoogleTagManagerIntegration {
     /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
     /// for both `googletagmanager.com` and `google-analytics.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
-        let replacement = format!("/integrations/{}", GTM_INTEGRATION_ID);
+        let replacement = format!("/integrations/{}$2", GTM_INTEGRATION_ID);
         GTM_URL_PATTERN
             .replace_all(content, replacement.as_str())
             .into_owned()
     }
 
+    /// Whether an attribute value URL should be rewritten to first-party.
+    /// Only matches URLs for which we have corresponding proxy routes
+    /// (gtm.js, gtag/js, collect, g/collect). Excludes ns.html and other
+    /// GTM endpoints we don't proxy.
+    fn is_rewritable_url(url: &str) -> bool {
+        // Match googletagmanager.com URLs for scripts we proxy
+        if url.contains("googletagmanager.com") {
+            return url.contains("/gtm.js") || url.contains("/gtag/js") || url.contains("/gtag.js");
+        }
+        // Match google-analytics.com URLs for beacons we proxy
+        if url.contains("google-analytics.com") {
+            return url.contains("/collect") || url.contains("/g/collect");
+        }
+        false
+    }
+
+    /// Both `/gtag/js` (canonical) and `/gtag.js` (alternate) are accepted;
+    /// upstream always normalizes to `/gtag/js`.
     fn is_rewritable_script(&self, path: &str) -> bool {
         path.ends_with("/gtm.js") || path.ends_with("/gtag/js") || path.ends_with("/gtag.js")
     }
@@ -291,7 +313,7 @@ impl IntegrationAttributeRewriter for GoogleTagManagerIntegration {
         attr_value: &str,
         _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if attr_value.contains("googletagmanager.com/gtm.js") {
+        if Self::is_rewritable_url(attr_value) {
             AttributeRewriteAction::replace(Self::rewrite_gtm_urls(attr_value))
         } else {
             AttributeRewriteAction::keep()
@@ -311,7 +333,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
     fn rewrite(&self, content: &str, _ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
-        if content.contains("googletagmanager.com/gtm.js") {
+        if content.contains("googletagmanager.com") || content.contains("google-analytics.com") {
             return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(content));
         }
 
@@ -363,6 +385,14 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_rejects_subdomain_spoofing() {
+        // Should NOT rewrite URLs where the GTM domain is a subdomain of another domain
+        let input = r#"var x = "https://www.googletagmanager.com.evil.com/collect";"#;
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
+        assert_eq!(input, result, "should not rewrite spoofed subdomain URLs");
+    }
+
+    #[test]
     fn test_attribute_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
@@ -408,7 +438,42 @@ mod tests {
             );
         }
 
-        // Case 3: Other URL (should be kept)
+        // Case 3: gtag/js URL in href (preload link)
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://www.googletagmanager.com/gtag/js?id=G-DQMZGMPHXN",
+            &ctx,
+        );
+        if let AttributeRewriteAction::Replace(val) = action {
+            assert_eq!(
+                val,
+                "/integrations/google_tag_manager/gtag/js?id=G-DQMZGMPHXN"
+            );
+        } else {
+            panic!(
+                "Expected Replace action for gtag/js preload href, got {:?}",
+                action
+            );
+        }
+
+        // Case 4: google-analytics.com URL in href
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://www.google-analytics.com/g/collect",
+            &ctx,
+        );
+        if let AttributeRewriteAction::Replace(val) = action {
+            assert_eq!(val, "/integrations/google_tag_manager/g/collect");
+        } else {
+            panic!(
+                "Expected Replace action for google-analytics href, got {:?}",
+                action
+            );
+        }
+
+        // Case 5: Other URL (should be kept)
         let action = IntegrationAttributeRewriter::rewrite(
             &*integration,
             "src",
