@@ -17,7 +17,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -277,7 +277,7 @@ impl AuctionProvider for AdServerMockProvider {
             })?;
 
         // Send async
-        let backend_name = ensure_backend_from_url(&self.config.endpoint, true).change_context(
+        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
             TrustedServerError::Auction {
                 message: format!(
                     "Failed to resolve backend for mediation endpoint: {}",
@@ -340,7 +340,7 @@ impl AuctionProvider for AdServerMockProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.endpoint, true).ok()
+        BackendConfig::from_url(&self.config.endpoint, true).ok()
     }
 }
 
@@ -470,20 +470,26 @@ mod tests {
 
         auction_request.context.insert(
             "provider_responses".to_string(),
-            serde_json::to_value(&bidder_responses).unwrap(),
+            serde_json::to_value(&bidder_responses).expect("should serialize bidder responses"),
         );
 
         let mediation_req = provider
             .build_mediation_request(&auction_request, &bidder_responses)
-            .unwrap();
+            .expect("should build mediation request");
 
         // Verify structure
         assert_eq!(mediation_req["id"], "test-auction-123");
-        assert_eq!(mediation_req["imp"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            mediation_req["imp"]
+                .as_array()
+                .expect("imp should be array")
+                .len(),
+            1
+        );
         assert_eq!(
             mediation_req["ext"]["bidder_responses"]
                 .as_array()
-                .unwrap()
+                .expect("bidder_responses should be array")
                 .len(),
             2
         );

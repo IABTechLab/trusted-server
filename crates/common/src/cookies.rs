@@ -83,8 +83,8 @@ mod tests {
         let jar = parse_cookies_to_jar(header_value);
 
         assert!(jar.iter().count() == 2);
-        assert_eq!(jar.get("c1").unwrap().value(), "v1");
-        assert_eq!(jar.get("c2").unwrap().value(), "v2");
+        assert_eq!(jar.get("c1").expect("should have cookie c1").value(), "v1");
+        assert_eq!(jar.get("c2").expect("should have cookie c2").value(), "v2");
     }
 
     #[test]
@@ -93,7 +93,7 @@ mod tests {
         let jar = parse_cookies_to_jar(cookie_str);
 
         assert!(jar.iter().count() == 1);
-        assert_eq!(jar.get("c1").unwrap().value(), "v2");
+        assert_eq!(jar.get("c1").expect("should have cookie c1").value(), "v2");
     }
 
     #[test]
@@ -120,8 +120,8 @@ mod tests {
             .expect("should have cookie jar");
 
         assert!(jar.iter().count() == 2);
-        assert_eq!(jar.get("c1").unwrap().value(), "v1");
-        assert_eq!(jar.get("c2").unwrap().value(), "v2");
+        assert_eq!(jar.get("c1").expect("should have cookie c1").value(), "v1");
+        assert_eq!(jar.get("c2").expect("should have cookie c2").value(), "v2");
     }
 
     #[test]

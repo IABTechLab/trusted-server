@@ -12,7 +12,7 @@ use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::settings::IntegrationConfig;
 
@@ -453,7 +453,7 @@ impl AuctionProvider for ApsAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.endpoint, true).change_context(
+        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
             TrustedServerError::Auction {
                 message: format!(
                     "Failed to resolve backend for APS endpoint: {}",
@@ -518,7 +518,7 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.endpoint, true).ok()
+        BackendConfig::from_url(&self.config.endpoint, true).ok()
     }
 }
 

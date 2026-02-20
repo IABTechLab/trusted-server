@@ -6,23 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Retrieve Rust version
         id: rust-version
@@ -32,11 +24,10 @@ jobs:
       - name: Set up rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: "clippy, rustfmt"
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-
-      - name: Add wasm32-wasi target
-        run: rustup target add wasm32-wasip1
+          target: wasm32-wasip1
+          components: "clippy, rustfmt"
+          cache-shared-key: cargo-${{ runner.os }}
 
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1

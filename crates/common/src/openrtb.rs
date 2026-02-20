@@ -67,6 +67,8 @@ pub struct UserExt {
 #[derive(Debug, Serialize, Default)]
 pub struct Device {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ua: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo: Option<Geo>,
 }
 

@@ -361,6 +361,22 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
+/// Finalize a proxied response, choosing between streaming passthrough and full
+/// content processing based on the `stream_passthrough` flag.
+fn finalize_response(
+    settings: &Settings,
+    req: &Request,
+    url: &str,
+    beresp: Response,
+    stream_passthrough: bool,
+) -> Result<Response, Report<TrustedServerError>> {
+    if stream_passthrough {
+        Ok(finalize_proxied_response_streaming(req, url, beresp))
+    } else {
+        finalize_proxied_response(settings, req, url, beresp)
+    }
+}
+
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
@@ -479,12 +495,10 @@ async fn proxy_with_redirects(
             }));
         }
 
-        let backend_name = crate::backend::ensure_origin_backend(
-            &scheme,
-            host,
-            parsed_url.port(),
-            settings.proxy.certificate_check,
-        )?;
+        let backend_name = crate::backend::BackendConfig::new(&scheme, host)
+            .port(parsed_url.port())
+            .certificate_check(settings.proxy.certificate_check)
+            .ensure()?;
 
         let mut proxy_req = Request::new(current_method.clone(), &current_url);
         copy_proxy_forward_headers(req, &mut proxy_req);
@@ -503,15 +517,7 @@ async fn proxy_with_redirects(
             })?;
 
         if !follow_redirects {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         let status = beresp.get_status();
@@ -525,15 +531,7 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         let Some(location) = beresp
@@ -541,15 +539,7 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         };
 
         if redirect_attempt == MAX_REDIRECTS {
@@ -570,15 +560,7 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            return if stream_passthrough {
-                Ok(finalize_proxied_response_streaming(
-                    req,
-                    &current_url,
-                    beresp,
-                ))
-            } else {
-                finalize_proxied_response(settings, req, &current_url, beresp)
-            };
+            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
         log::info!(
@@ -1183,7 +1165,6 @@ mod tests {
     #[tokio::test]
     async fn proxy_sign_preserves_non_standard_port() {
         let settings = create_test_settings();
-        // Test with non-standard port (e.g., 9443)
         let body = serde_json::json!({
             "url": "https://cdn.example.com:9443/img/300x250.svg",
         });
@@ -1191,8 +1172,12 @@ mod tests {
         req.set_body(body.to_string());
         let mut resp = handle_first_party_proxy_sign(&settings, req)
             .await
-            .expect("sign ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
+            .expect("should sign URL with non-standard port");
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::OK,
+            "should return 200 for valid sign request"
+        );
         let json = resp.take_body_str();
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
@@ -1315,8 +1300,8 @@ mod tests {
         let loc = resp
             .get_header(header::LOCATION)
             .and_then(|h| h.to_str().ok())
-            .unwrap();
-        let parsed = url::Url::parse(loc).expect("should parse location");
+            .expect("Location header should be present and valid");
+        let parsed = url::Url::parse(loc).expect("Location should be a valid URL");
         let mut pairs: std::collections::HashMap<String, String> = parsed
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -1343,7 +1328,7 @@ mod tests {
             Method::POST,
             "https://edge.example/first-party/proxy-rebuild",
         );
-        req.set_body(serde_json::to_string(&body).unwrap());
+        req.set_body(serde_json::to_string(&body).expect("test JSON should serialize"));
         let mut resp = handle_first_party_proxy_rebuild(&settings, req)
             .await
             .expect("rebuild ok");
@@ -1462,37 +1447,46 @@ mod tests {
         copy_proxy_forward_headers(&src, &mut dst);
 
         assert_eq!(
-            dst.get_header(HEADER_USER_AGENT).unwrap().to_str().unwrap(),
+            dst.get_header(HEADER_USER_AGENT)
+                .expect("User-Agent header should be copied")
+                .to_str()
+                .expect("User-Agent should be valid UTF-8"),
             "UA/1.0"
         );
         assert_eq!(
-            dst.get_header(HEADER_ACCEPT).unwrap().to_str().unwrap(),
+            dst.get_header(HEADER_ACCEPT)
+                .expect("Accept header should be copied")
+                .to_str()
+                .expect("Accept should be valid UTF-8"),
             "image/*"
         );
         assert_eq!(
             dst.get_header(HEADER_ACCEPT_LANGUAGE)
-                .unwrap()
+                .expect("Accept-Language header should be copied")
                 .to_str()
-                .unwrap(),
+                .expect("Accept-Language should be valid UTF-8"),
             "en-US"
         );
         // Accept-Encoding is overridden to only include supported encodings
         assert_eq!(
             dst.get_header(HEADER_ACCEPT_ENCODING)
-                .unwrap()
+                .expect("Accept-Encoding header should be set")
                 .to_str()
-                .unwrap(),
+                .expect("Accept-Encoding should be valid UTF-8"),
             SUPPORTED_ENCODINGS
         );
         assert_eq!(
-            dst.get_header(HEADER_REFERER).unwrap().to_str().unwrap(),
+            dst.get_header(HEADER_REFERER)
+                .expect("Referer header should be copied")
+                .to_str()
+                .expect("Referer should be valid UTF-8"),
             "https://pub.example/page"
         );
         assert_eq!(
             dst.get_header(HEADER_X_FORWARDED_FOR)
-                .unwrap()
+                .expect("X-Forwarded-For header should be copied")
                 .to_str()
-                .unwrap(),
+                .expect("X-Forwarded-For should be valid UTF-8"),
             "203.0.113.1"
         );
     }
@@ -1544,9 +1538,9 @@ mod tests {
             .expect("finalize should succeed");
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/html; charset=utf-8");
         let cc = out
             .get_header(header::CACHE_CONTROL)
@@ -1574,9 +1568,9 @@ mod tests {
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/css; charset=utf-8");
     }
 
@@ -1607,7 +1601,7 @@ mod tests {
             "https://cdn.example.com:9443/creatives/300x250.html",
             beresp,
         )
-        .expect("finalize should succeed");
+        .expect("should finalize HTML response with non-standard port URL");
 
         let body = out.take_body_str();
 
@@ -1630,9 +1624,9 @@ mod tests {
         // Since CT was missing and Accept indicates image, it should set generic image/*
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "image/*");
     }
 
@@ -1649,9 +1643,9 @@ mod tests {
         assert_eq!(out.get_status(), StatusCode::ACCEPTED);
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "application/json");
         let body = out.take_body_str();
         assert_eq!(body, "{\"ok\":true}");
@@ -1669,8 +1663,10 @@ mod tests {
 
         // Gzip compress the HTML
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(html.as_bytes()).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder
+            .write_all(html.as_bytes())
+            .expect("gzip write should succeed");
+        let compressed = encoder.finish().expect("gzip finish should succeed");
 
         let beresp = Response::from_status(StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -1686,14 +1682,14 @@ mod tests {
             .get_header(header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
             .to_str()
-            .unwrap();
+            .expect("Content-Encoding should be valid UTF-8");
         assert_eq!(ce, "gzip");
 
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -1724,7 +1720,9 @@ mod tests {
         let mut compressed = Vec::new();
         {
             let mut encoder = CompressorWriter::new(&mut compressed, 4096, 4, 22);
-            encoder.write_all(css.as_bytes()).unwrap();
+            encoder
+                .write_all(css.as_bytes())
+                .expect("brotli write should succeed");
         }
 
         let beresp = Response::from_status(StatusCode::OK)
@@ -1741,14 +1739,14 @@ mod tests {
             .get_header(header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
             .to_str()
-            .unwrap();
+            .expect("Content-Encoding should be valid UTF-8");
         assert_eq!(ce, "br");
 
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -1787,9 +1785,9 @@ mod tests {
 
         let ct = out
             .get_header(header::CONTENT_TYPE)
-            .unwrap()
+            .expect("Content-Type header should be present")
             .to_str()
-            .unwrap();
+            .expect("Content-Type should be valid UTF-8");
         assert_eq!(ct, "text/html; charset=utf-8");
 
         let body = out.take_body_str();

@@ -666,6 +666,32 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 - `replace(content)` - Replace script content
 - `remove_node()` - Delete script element
 
+### Head Injectors
+
+Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
+
+**Example**: An integration injects configuration that runs after the TSJS API is available
+
+```rust
+impl IntegrationHeadInjector for MyIntegration {
+    fn integration_id(&self) -> &'static str { "my_integration" }
+
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![format!(
+            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
+            ctx.request_host
+        )]
+    }
+}
+```
+
+**Behavior**:
+
+- Snippets are prepended into `<head>` after the TSJS bundle tag
+- Called once per HTML response
+- Multiple integrations can each contribute snippets
+- If no snippets are returned, no extra markup is added
+
 See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
 
 ## TSJS Injection
@@ -718,13 +744,14 @@ IntegrationRegistration::builder("my_integration")
 
 ### Bundle Types
 
-Available bundles (from `crates/js/lib/src/integrations/`):
+Each integration is built as a separate IIFE at compile time (`crates/js/lib/dist/`):
 
-- `tsjs-core.min.js` - Core API (always included)
-- `tsjs-ext.min.js` - Extensions (Prebid integration)
-- `tsjs-creative.min.js` - Creative tracking utilities
-- `tsjs-permutive.min.js` - Permutive integration
-- `tsjs-testlight.min.js` - Testlight integration
+- `tsjs-core.js` — Core API (always included)
+- `tsjs-creative.js` — Creative click-guard and tracking
+- `tsjs-prebid.js` — Prebid.js NPM bundle with trustedServer adapter
+- `tsjs-lockr.js`, `tsjs-permutive.js`, `tsjs-didomi.js`, `tsjs-datadome.js`, `tsjs-testlight.js` — Other integrations
+
+At runtime, the server concatenates `tsjs-core.js` + the modules for enabled integrations. The URL stays `/static/tsjs=tsjs-unified.min.js?v=<hash>` for backward compatibility.
 
 ## Performance Optimization
 

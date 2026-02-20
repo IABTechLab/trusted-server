@@ -1,5 +1,8 @@
 name: "Run Tests"
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -13,31 +16,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Retrieve Rust version
         id: rust-version
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
-      - name: Set up Rust tool chain
+      - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
 
-      - name: Add wasm32-wasi target
-        run: rustup target add wasm32-wasip1
+      - name: Get Viceroy cache key
+        id: viceroy-rev
+        run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> $GITHUB_OUTPUT
 
-      - name: Setup Viceroy (from main since 0.14.3 is broken)
+      - name: Cache Viceroy binary
+        id: cache-viceroy
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/viceroy
+          key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+
+      - name: Install Viceroy (from main since 0.14.3 is broken)
+        if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
       - name: Run tests

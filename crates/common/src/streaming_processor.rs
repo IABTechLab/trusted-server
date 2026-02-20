@@ -224,26 +224,25 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         Ok(())
     }
 
-    /// Process gzip compressed input to uncompressed output (decompression only)
-    fn process_gzip_to_none<R: Read, W: Write>(
+    /// Decompress input, process content, and write uncompressed output.
+    fn decompress_and_process<R: Read, W: Write>(
         &mut self,
-        input: R,
+        mut decoder: R,
         mut output: W,
+        codec_name: &str,
     ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-
-        // Decompress input
-        let mut decoder = GzDecoder::new(input);
         let mut decompressed = Vec::new();
         decoder
             .read_to_end(&mut decompressed)
             .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress gzip".to_string(),
+                message: format!("Failed to decompress {codec_name}"),
             })?;
 
-        log::info!("Decompressed size: {} bytes", decompressed.len());
+        log::info!(
+            "{codec_name} decompressed size: {} bytes",
+            decompressed.len()
+        );
 
-        // Process the decompressed content
         let processed = self
             .processor
             .process_chunk(&decompressed, true)
@@ -251,9 +250,8 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("Processed size: {} bytes", processed.len());
+        log::info!("{codec_name} processed size: {} bytes", processed.len());
 
-        // Write uncompressed output
         output
             .write_all(&processed)
             .change_context(TrustedServerError::Proxy {
@@ -261,6 +259,17 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         Ok(())
+    }
+
+    /// Process gzip compressed input to uncompressed output (decompression only)
+    fn process_gzip_to_none<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        output: W,
+    ) -> Result<(), Report<TrustedServerError>> {
+        use flate2::read::GzDecoder;
+
+        self.decompress_and_process(GzDecoder::new(input), output, "gzip")
     }
 
     /// Process deflate compressed stream
@@ -283,42 +292,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     fn process_deflate_to_none<R: Read, W: Write>(
         &mut self,
         input: R,
-        mut output: W,
+        output: W,
     ) -> Result<(), Report<TrustedServerError>> {
         use flate2::read::ZlibDecoder;
 
-        // Decompress input
-        let mut decoder = ZlibDecoder::new(input);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress deflate".to_string(),
-            })?;
-
-        log::info!(
-            "Deflate->None decompressed size: {} bytes",
-            decompressed.len()
-        );
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Deflate->None processed size: {} bytes", processed.len());
-
-        // Write uncompressed output
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
-
-        Ok(())
+        self.decompress_and_process(ZlibDecoder::new(input), output, "deflate")
     }
 
     /// Process brotli compressed stream
@@ -346,42 +324,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     fn process_brotli_to_none<R: Read, W: Write>(
         &mut self,
         input: R,
-        mut output: W,
+        output: W,
     ) -> Result<(), Report<TrustedServerError>> {
         use brotli::Decompressor;
 
-        // Decompress input
-        let mut decoder = Decompressor::new(input, 4096);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress brotli".to_string(),
-            })?;
-
-        log::info!(
-            "Brotli->None decompressed size: {} bytes",
-            decompressed.len()
-        );
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Brotli->None processed size: {} bytes", processed.len());
-
-        // Write uncompressed output
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
-
-        Ok(())
+        self.decompress_and_process(Decompressor::new(input, 4096), output, "brotli")
     }
 
     /// Generic processing through compression layers
@@ -551,9 +498,14 @@ mod tests {
         let input = b"hello world";
         let mut output = Vec::new();
 
-        pipeline.process(&input[..], &mut output).unwrap();
+        pipeline
+            .process(&input[..], &mut output)
+            .expect("pipeline should process uncompressed input");
 
-        assert_eq!(String::from_utf8(output).unwrap(), "hi world");
+        assert_eq!(
+            String::from_utf8(output).expect("output should be valid UTF-8"),
+            "hi world"
+        );
     }
 
     #[test]
@@ -598,22 +550,28 @@ mod tests {
 
         // Test that intermediate chunks return empty
         let chunk1 = b"<html><body>";
-        let result1 = adapter.process_chunk(chunk1, false).unwrap();
+        let result1 = adapter
+            .process_chunk(chunk1, false)
+            .expect("should process chunk1");
         assert_eq!(result1.len(), 0, "Should return empty for non-last chunk");
 
         let chunk2 = b"<p>original</p>";
-        let result2 = adapter.process_chunk(chunk2, false).unwrap();
+        let result2 = adapter
+            .process_chunk(chunk2, false)
+            .expect("should process chunk2");
         assert_eq!(result2.len(), 0, "Should return empty for non-last chunk");
 
         // Test that last chunk processes everything
         let chunk3 = b"</body></html>";
-        let result3 = adapter.process_chunk(chunk3, true).unwrap();
+        let result3 = adapter
+            .process_chunk(chunk3, true)
+            .expect("should process final chunk");
         assert!(
             !result3.is_empty(),
             "Should return processed content for last chunk"
         );
 
-        let output = String::from_utf8(result3).unwrap();
+        let output = String::from_utf8(result3).expect("output should be valid UTF-8");
         assert!(output.contains("replaced"), "Should have replaced content");
         assert!(output.contains("<html>"), "Should have complete HTML");
     }
@@ -639,16 +597,20 @@ mod tests {
         let mut last_chunk = chunks.next().unwrap_or(&[]);
 
         for chunk in chunks {
-            let result = adapter.process_chunk(last_chunk, false).unwrap();
+            let result = adapter
+                .process_chunk(last_chunk, false)
+                .expect("should process intermediate chunk");
             assert_eq!(result.len(), 0, "Intermediate chunks should return empty");
             last_chunk = chunk;
         }
 
         // Process last chunk
-        let result = adapter.process_chunk(last_chunk, true).unwrap();
+        let result = adapter
+            .process_chunk(last_chunk, true)
+            .expect("should process last chunk");
         assert!(!result.is_empty(), "Last chunk should return content");
 
-        let output = String::from_utf8(result).unwrap();
+        let output = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(
             output.contains("Paragraph 999"),
             "Should contain all content"
@@ -663,15 +625,21 @@ mod tests {
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
         // Process some content
-        adapter.process_chunk(b"<html>", false).unwrap();
-        adapter.process_chunk(b"<body>test</body>", false).unwrap();
+        adapter
+            .process_chunk(b"<html>", false)
+            .expect("should process html tag");
+        adapter
+            .process_chunk(b"<body>test</body>", false)
+            .expect("should process body");
 
         // Reset should clear accumulated input
         adapter.reset();
 
         // After reset, adapter should be ready for new input
-        let result = adapter.process_chunk(b"<p>new</p>", true).unwrap();
-        let output = String::from_utf8(result).unwrap();
+        let result = adapter
+            .process_chunk(b"<p>new</p>", true)
+            .expect("should process new content after reset");
+        let output = String::from_utf8(result).expect("output should be valid UTF-8");
         assert_eq!(
             output, "<p>new</p>",
             "Should only contain new input after reset"
@@ -701,9 +669,11 @@ mod tests {
         let input = b"<html><body><a href=\"https://example.com\">Link</a></body></html>";
         let mut output = Vec::new();
 
-        pipeline.process(&input[..], &mut output).unwrap();
+        pipeline
+            .process(&input[..], &mut output)
+            .expect("pipeline should process HTML");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert!(
             result.contains("https://test.com"),
             "Should have replaced URL"
