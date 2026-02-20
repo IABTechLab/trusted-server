@@ -1,9 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  isGuardInstalled,
-  resetGuardState,
-} from '../../../src/integrations/gpt/script_guard';
+import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
 
 // We import installGptShim dynamically to avoid the auto-init side effect.
 // Tests call installGptShim() explicitly after setting up the environment.
@@ -188,9 +185,7 @@ describe('GPT shim – runtime gating', () => {
   it('installs the shim when __tsjs_gpt_enabled is set', async () => {
     win.__tsjs_gpt_enabled = true;
 
-    const { installGptShim } = await import(
-      '../../../src/integrations/gpt/index'
-    );
+    const { installGptShim } = await import('../../../src/integrations/gpt/index');
 
     // Explicitly call since the dynamic import may have already cached.
     installGptShim();
@@ -201,9 +196,7 @@ describe('GPT shim – runtime gating', () => {
 
   it('does not install the shim when __tsjs_gpt_enabled is absent', async () => {
     // No flag set — shim should stay dormant.
-    const { installGptShim } = await import(
-      '../../../src/integrations/gpt/index'
-    );
+    await import('../../../src/integrations/gpt/index');
 
     // Reset guard to verify the auto-init did NOT install.
     resetGuardState();

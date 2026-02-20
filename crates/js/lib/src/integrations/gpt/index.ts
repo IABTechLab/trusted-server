@@ -165,9 +165,6 @@ export function installGptShim(): boolean {
 // The trusted server injects `window.__tsjs_gpt_enabled = true` via an inline
 // script (IntegrationHeadInjector) so the shim stays dormant when the GPT proxy
 // routes are not registered.
-if (
-  typeof window !== 'undefined' &&
-  (window as Record<string, unknown>).__tsjs_gpt_enabled
-) {
+if (typeof window !== 'undefined' && (window as Record<string, unknown>).__tsjs_gpt_enabled) {
   installGptShim();
 }
