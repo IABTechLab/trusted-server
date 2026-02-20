@@ -327,8 +327,9 @@ pub fn handle_publisher_request(
     Ok(response)
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum RouteResult {
-    /// Response fully buffered — send via send_to_client()
+    /// Response fully buffered — send via `send_to_client()`
     Buffered(Response),
     /// Response already streamed to client
     Streamed,
@@ -336,6 +337,10 @@ pub enum RouteResult {
 
 /// Streaming version of publisher request handling.
 /// Uses `stream_to_client()` for text responses, falling back to buffered for errors.
+///
+/// # Errors
+///
+/// Returns an error if the generation of a synthetic ID fails, or if making the backend HTTP request to the origin fails.
 pub fn handle_publisher_request_streaming(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,

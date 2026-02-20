@@ -378,7 +378,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 }
 
-/// Output sink that writes lol_html output chunks into a shared `Rc<RefCell<Vec<u8>>>` buffer.
+/// Output sink that writes `lol_html` output chunks into a shared `Rc<RefCell<Vec<u8>>>` buffer.
 struct RcVecSink(Rc<RefCell<Vec<u8>>>);
 
 impl lol_html::OutputSink for RcVecSink {
@@ -389,8 +389,8 @@ impl lol_html::OutputSink for RcVecSink {
 
 /// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`.
 ///
-/// Uses lol_html's incremental streaming API: each incoming chunk is written to
-/// the rewriter immediately, and whatever output lol_html has ready is drained
+/// Uses `lol_html`'s incremental streaming API: each incoming chunk is written to
+/// the rewriter immediately, and whatever output `lol_html` has ready is drained
 /// and returned. This avoids buffering the full document before processing begins.
 pub struct HtmlRewriterAdapter {
     rewriter: Option<lol_html::HtmlRewriter<'static, RcVecSink>>,
