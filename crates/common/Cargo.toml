@@ -41,6 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 trusted-server-js = { path = "../js" }
 url = { workspace = true }
 urlencoding = { workspace = true }

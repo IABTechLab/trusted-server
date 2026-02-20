@@ -1,5 +1,6 @@
 use core::str;
 
+#[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
@@ -357,13 +358,32 @@ impl Settings {
 
     /// Creates a new [`Settings`] instance from a TOML string.
     ///
-    /// Parses the provided TOML configuration and applies any environment
-    /// variable overrides using the `TRUSTED_SERVER__` prefix.
+    /// Deserializes the TOML directly without scanning for environment variable
+    /// overrides. For build-time configuration that merges `TRUSTED_SERVER__*`
+    /// env vars, use [`Settings::from_toml_with_env`].
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        let mut settings: Self =
+            toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
+                message: "Failed to deserialize TOML configuration".to_string(),
+            })?;
+
+        settings.publisher.normalize();
+        Ok(settings)
+    }
+
+    /// Parses TOML and merges `TRUSTED_SERVER__*` environment variable overrides.
+    /// Test-only helper for verifying env var override behavior.
+    /// At build time, `build.rs::merge_toml()` performs this merging directly.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if the TOML is invalid or env var merging fails
+    #[cfg(test)]
+    pub fn from_toml_with_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
             .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
@@ -709,7 +729,7 @@ mod tests {
             Some("https://origin.test-publisher.com"),
             || {
                 temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                    let res = Settings::from_toml(&toml_str);
+                    let res = Settings::from_toml_with_env(&toml_str);
                     if res.is_err() {
                         eprintln!("JSON override error: {:?}", res.as_ref().err());
                     }
@@ -761,7 +781,7 @@ mod tests {
             || {
                 temp_env::with_var(env_key0, Some("smartadserver"), || {
                     temp_env::with_var(env_key1, Some("openx"), || {
-                        let res = Settings::from_toml(&toml_str);
+                        let res = Settings::from_toml_with_env(&toml_str);
                         if res.is_err() {
                             eprintln!("Indexed override error: {:?}", res.as_ref().err());
                         }
@@ -820,7 +840,7 @@ mod tests {
                 temp_env::with_var(path_key, Some("^/env-handler"), || {
                     temp_env::with_var(username_key, Some("env-user"), || {
                         temp_env::with_var(password_key, Some("env-pass"), || {
-                            let settings = Settings::from_toml(&toml_str)
+                            let settings = Settings::from_toml_with_env(&toml_str)
                                 .expect("Settings should load from env");
                             assert_eq!(settings.handlers.len(), 1);
                             let handler = &settings.handlers[0];
@@ -846,7 +866,7 @@ mod tests {
             env_key,
             Some(r#"{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}"#),
             || {
-                let settings = Settings::from_toml(&toml_str)
+                let settings = Settings::from_toml_with_env(&toml_str)
                     .expect("Settings should parse with JSON response_headers env");
                 assert_eq!(settings.response_headers.len(), 2);
                 assert_eq!(
@@ -880,7 +900,7 @@ mod tests {
             ),
             Some("https://change-publisher.com"),
             || {
-                let settings = Settings::from_toml(&crate_test_settings_str());
+                let settings = Settings::from_toml_with_env(&crate_test_settings_str());
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
@@ -904,7 +924,7 @@ mod tests {
             ),
             Some("https://change-publisher.com"),
             || {
-                let settings = Settings::from_toml(&toml_str);
+                let settings = Settings::from_toml_with_env(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
@@ -1009,7 +1029,7 @@ mod tests {
                         temp_env::with_var(timeout_key, Some("2500"), || {
                             temp_env::with_var(rewrite_key, Some("true"), || {
                                 temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml(&toml_str)
+                                    let settings = Settings::from_toml_with_env(&toml_str)
                                         .expect("Settings should load");
 
                                     let config = settings
