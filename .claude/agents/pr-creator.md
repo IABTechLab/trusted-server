@@ -171,6 +171,7 @@ Do **not** use labels as a substitute for types.
 - Use imperative mood (e.g., "Add caching to proxy" not "Added caching").
 - The summary should focus on _why_, not just _what_.
 - Always base PRs against `main` unless told otherwise.
+- Always assign the PR to the current user (`--assignee @me`).
 - Never force-push or rebase without explicit user approval.
 - Do **not** include any byline, "Generated with" footer, or `Co-Authored-By`
   trailer in PR bodies or commit messages.
