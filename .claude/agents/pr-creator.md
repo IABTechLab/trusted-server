@@ -74,47 +74,50 @@ EOF
 After creating the PR, move the linked issue on the project board — but only
 if it is **not** already in "In review" or "Done".
 
-1. Get the issue node ID:
+1. Get the issue's project item ID and current status:
 
    ```
-   gh issue view <number> --json id --jq '.id'
-   ```
-
-2. Query the project item and current status:
-
-   ```
-   gh api graphql -f query='query {
-     node(id: "<issue_node_id>") {
+   gh api graphql -f query='query($issueId: ID!) {
+     node(id: $issueId) {
        ... on Issue {
-         projectItems(first: 5) {
+         projectItems(first: 10) {
            nodes {
              id
-             project { title }
              fieldValueByName(name: "Status") {
-               ... on ProjectV2ItemFieldSingleSelectValue {
-                 name
-                 optionId
-                 field { ... on ProjectV2SingleSelectField { id options { id name } } }
-               }
+               ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
              }
            }
          }
        }
      }
-   }'
+   }' -f issueId="$(gh issue view <number> --json id --jq '.id')"
    ```
 
-3. If current status is not "In review" or "Done", update it:
+2. If current status is not "In review" or "Done", update it:
+
    ```
    gh api graphql -f query='mutation {
      updateProjectV2ItemFieldValue(input: {
-       projectId: "<project_id>"
+       projectId: "PVT_kwDOBPEB8s4BFKrl"
        itemId: "<item_id>"
-       fieldId: "<status_field_id>"
-       value: { singleSelectOptionId: "<in_review_option_id>" }
+       fieldId: "PVTSSF_lADOBPEB8s4BFKrlzg2lUrA"
+       value: { singleSelectOptionId: "4424127f" }
      }) { projectV2Item { id } }
    }'
    ```
+
+3. If the issue is not yet on the project, add it first:
+
+   ```
+   gh api graphql -f query='mutation {
+     addProjectV2ItemById(input: {
+       projectId: "PVT_kwDOBPEB8s4BFKrl"
+       contentId: "<issue_node_id>"
+     }) { item { id } }
+   }'
+   ```
+
+   Then set the status as above.
 
 ### Project Board Reference
 
