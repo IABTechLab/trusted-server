@@ -75,11 +75,13 @@ After creating the PR, move the linked issue on the project board — but only
 if it is **not** already in "In review" or "Done".
 
 1. Get the issue node ID:
+
    ```
    gh issue view <number> --json id --jq '.id'
    ```
 
 2. Query the project item and current status:
+
    ```
    gh api graphql -f query='query {
      node(id: "<issue_node_id>") {
@@ -118,14 +120,14 @@ if it is **not** already in "In review" or "Done".
 
 Project: **Trusted Server Development**
 
-| Status | Option ID |
-| ------ | --------- |
-| Backlog | `8b41a45a` |
-| Ready | `f75ad846` |
+| Status      | Option ID  |
+| ----------- | ---------- |
+| Backlog     | `8b41a45a` |
+| Ready       | `f75ad846` |
 | In progress | `47fc9ee4` |
-| In review | `4424127f` |
-| Done | `98236657` |
-| Won't Fix | `b622b030` |
+| In review   | `4424127f` |
+| Done        | `98236657` |
+| Won't Fix   | `b622b030` |
 
 Field ID: `PVTSSF_lADOBPEB8s4BFKrlzg2lUrA`
 Project ID: `PVT_kwDOBPEB8s4BFKrl`
