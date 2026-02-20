@@ -3,7 +3,14 @@ import { log, LogLevel } from './log';
 import type { Config, GamConfig } from './types';
 import { RequestMode } from './types';
 
-let CONFIG: Config = { mode: RequestMode.FirstParty };
+export interface Config {
+  debug?: boolean;
+  logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
+  [key: string]: unknown;
+}
+
+let CONFIG: Config = {};
+
 
 // Lazy import to avoid circular dependencies - GAM integration may not be present
 let setGamConfigFn: ((cfg: GamConfig) => void) | null | undefined = undefined;

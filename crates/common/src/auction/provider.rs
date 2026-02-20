@@ -62,7 +62,7 @@ pub trait AuctionProvider: Send + Sync {
     ///
     /// This is used by the orchestrator to correlate responses with providers
     /// when using `select()` to wait for multiple concurrent requests.
-    /// The backend name should match what `ensure_backend_from_url()` returns
+    /// The backend name should match what `BackendConfig::from_url()` returns
     /// for this provider's endpoint.
     fn backend_name(&self) -> Option<String> {
         None

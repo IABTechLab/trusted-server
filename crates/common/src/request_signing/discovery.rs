@@ -58,10 +58,12 @@ mod tests {
         });
 
         let discovery = TrustedServerDiscovery::new(jwks);
-        let serialized = serde_json::to_string(&discovery).unwrap();
+        let serialized =
+            serde_json::to_string(&discovery).expect("should serialize discovery document");
 
         // Verify it's valid JSON
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
 
         assert_eq!(parsed["version"], "1.0");
         assert!(parsed.get("jwks").is_some());
@@ -80,8 +82,10 @@ mod tests {
         });
 
         let discovery = TrustedServerDiscovery::new(jwks);
-        let serialized = serde_json::to_string(&discovery).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let serialized =
+            serde_json::to_string(&discovery).expect("should serialize discovery document");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
 
         assert!(parsed["jwks"]["keys"].is_array());
         assert_eq!(parsed["jwks"]["keys"][0]["kid"], "test-key");

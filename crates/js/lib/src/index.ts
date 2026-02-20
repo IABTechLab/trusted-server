@@ -1,41 +1,5 @@
-// Unified tsjs bundle entry point
-// This file conditionally imports modules based on build-time configuration
-import { modules, type ModuleName } from './generated-modules';
-import { log } from './core/log';
-
-const VERSION = '0.1.0-unified';
-
-// Log which modules are included in this build
-const includedModules = Object.keys(modules) as ModuleName[];
-log.info('tsjs unified bundle initialized', {
-  version: VERSION,
-  modules: includedModules,
-});
-
-// The core module sets up the main API and should always be included
-// If core is included, it will have already initialized the tsjs global
-// and set up the queue system
-
-// Initialize optional modules if they're included
-for (const [moduleName, moduleExports] of Object.entries(modules)) {
-  if (moduleName === 'core') {
-    // Core is already initialized via its own IIFE-style init code
-    continue;
-  }
-
-  // For other modules, check if they have an init function or are self-initializing
-  if (typeof moduleExports === 'object' && moduleExports !== null) {
-    // Log that the module is available
-    log.debug(`tsjs: module '${moduleName}' loaded`);
-
-    // Some modules like 'ext' are self-initializing (they run on import)
-    // Some modules like 'creative' export an API object
-    // We don't need to do anything special here - just importing them is enough
-  }
-}
-
-// Re-export core types for convenience
+// Barrel re-export for convenience and tests.
+// At build time, each module (core + integrations) is built as a separate IIFE
+// by build-all.mjs. The Rust server concatenates the enabled modules at runtime.
 export type { AdUnit, TsjsApi } from './core/types';
-
-// Export the modules object for advanced use cases
-export { modules };
+export { log } from './core/log';

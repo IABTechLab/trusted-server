@@ -28,10 +28,11 @@ export interface TsjsApi {
   renderAllAdUnits(): void;
   setConfig?(cfg: Config): void;
   getConfig?(): Config;
-  // Core API: requestAds; accepts same signatures as Prebid's requestBids
-  requestAds?(opts?: RequestAdsOptions): void;
-  requestAds?(callback: RequestAdsCallback, opts?: RequestAdsOptions): void;
-  getHighestCpmBids?(adUnitCodes?: string | string[]): ReadonlyArray<HighestCpmBid>;
+  requestAds?(opts?: { bidsBackHandler?: () => void; timeout?: number }): void;
+  requestAds?(
+    callback: () => void,
+    opts?: { bidsBackHandler?: () => void; timeout?: number }
+  ): void;
   log?: {
     setLevel(l: 'silent' | 'error' | 'warn' | 'info' | 'debug'): void;
     getLevel(): 'silent' | 'error' | 'warn' | 'info' | 'debug';
@@ -40,11 +41,6 @@ export interface TsjsApi {
     error(...args: unknown[]): void;
     debug(...args: unknown[]): void;
   };
-}
-
-export enum RequestMode {
-  FirstParty = 'firstParty',
-  ThirdParty = 'thirdParty',
 }
 
 /** GAM interceptor configuration. */

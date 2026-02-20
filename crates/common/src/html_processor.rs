@@ -111,7 +111,7 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Create an HTML processor with URL replacement and optional Prebid injection
+/// Create an HTML processor with URL replacement and integration hooks
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
@@ -203,13 +203,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
-                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
-                    snippet.push_str(&tsjs::unified_script_tag());
-                    // Then add any integration-specific head inserts (e.g., mode config)
-                    // These run after the bundle so tsjs API is available
+                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
+                    // so it's available when the bundle's auto-init code reads it.
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
+                    // Then inject the TSJS bundle — its top-level init code can now
+                    // read the config that was set by the inline scripts above.
+                    let module_ids = integrations.js_module_ids();
+                    snippet.push_str(&tsjs::tsjs_script_tag(&module_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -474,6 +476,7 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+        IntegrationHeadInjector, IntegrationHtmlContext,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -537,11 +540,82 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let processed = String::from_utf8(output).unwrap();
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
 
         assert!(processed.contains("keep-me"));
         assert!(!processed.contains("remove-me"));
+    }
+
+    #[test]
+    fn integration_head_injector_prepends_after_tsjs_once() {
+        struct TestHeadInjector;
+
+        impl IntegrationHeadInjector for TestHeadInjector {
+            fn integration_id(&self) -> &'static str {
+                "test"
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                vec![r#"<script>window.__testHeadInjector=true;</script>"#.to_string()]
+            }
+        }
+
+        let html = r#"<html><head><title>Test</title></head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
+            Vec::new(),
+            Vec::new(),
+            vec![Arc::new(TestHeadInjector)],
+        );
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
+
+        let tsjs_marker = "id=\"trustedserver-js\"";
+        let head_marker = "window.__testHeadInjector=true";
+
+        assert_eq!(
+            processed.matches(tsjs_marker).count(),
+            1,
+            "should inject unified tsjs tag once"
+        );
+        assert_eq!(
+            processed.matches(head_marker).count(),
+            1,
+            "should inject head snippet once"
+        );
+
+        let tsjs_index = processed
+            .find(tsjs_marker)
+            .expect("should include unified tsjs tag");
+        let head_index = processed
+            .find(head_marker)
+            .expect("should include head snippet");
+        let title_index = processed
+            .find("<title>")
+            .expect("should keep existing head content");
+
+        assert!(
+            head_index < tsjs_index,
+            "should inject config before tsjs bundle so auto-init can read it"
+        );
+        assert!(
+            tsjs_index < title_index,
+            "should prepend all injected content before existing head content"
+        );
     }
 
     #[test]
@@ -570,9 +644,9 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
+            .expect("pipeline should process HTML");
 
-        let result = String::from_utf8(output).unwrap();
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert!(result.contains(r#"href="https://test.example.com/page""#));
         assert!(result.contains(r#"href="//test.example.com/proto""#));
         assert!(result.contains(r#"href="test.example.com/bare""#));
@@ -631,8 +705,8 @@ mod tests {
         let mut output = Vec::new();
         pipeline
             .process(Cursor::new(html.as_bytes()), &mut output)
-            .unwrap();
-        let result = String::from_utf8(output).unwrap();
+            .expect("pipeline should process HTML");
+        let result = String::from_utf8(output).expect("output should be valid UTF-8");
 
         // Assertions - only URL attribute replacements are expected
         // Check URL replacements (not all occurrences will be replaced since
@@ -733,8 +807,10 @@ mod tests {
 
         // Compress
         let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-        encoder.write_all(html.as_bytes()).unwrap();
-        let compressed_input = encoder.finish().unwrap();
+        encoder
+            .write_all(html.as_bytes())
+            .expect("should write to gzip encoder");
+        let compressed_input = encoder.finish().expect("should finish gzip encoding");
 
         println!("Compressed input size: {} bytes", compressed_input.len());
 
@@ -754,7 +830,7 @@ mod tests {
         let mut compressed_output = Vec::new();
         pipeline
             .process(Cursor::new(&compressed_input), &mut compressed_output)
-            .unwrap();
+            .expect("pipeline should process gzipped HTML");
 
         // Ensure we produced output
         assert!(
@@ -765,7 +841,9 @@ mod tests {
         // Decompress and verify
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).unwrap();
+        decoder
+            .read_to_string(&mut decompressed)
+            .expect("should decompress gzip output");
 
         let remaining_urls = decompressed.matches("www.test-publisher.com").count();
         let replaced_urls = decompressed

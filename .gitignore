@@ -18,3 +18,6 @@ src/*.html
 .claude
 .specstory
 .vscode
+
+# SSL certificates
+*.pem

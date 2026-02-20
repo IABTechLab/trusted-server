@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::Validate;
 
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{IntegrationEndpoint, IntegrationProxy, IntegrationRegistration};
 use crate::settings::{IntegrationConfig, Settings};
@@ -203,7 +203,7 @@ impl IntegrationProxy for DidomiIntegration {
         let target_url = self
             .build_target_url(base_origin, consent_path, req.get_query_str())
             .change_context(Self::error("Failed to build Didomi target URL"))?;
-        let backend_name = ensure_backend_from_url(base_origin, true)
+        let backend_name = BackendConfig::from_url(base_origin, true)
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
@@ -261,7 +261,7 @@ mod tests {
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let url = integration
             .build_target_url("https://sdk.privacy-center.org", "/loader.js", Some("v=1"))
-            .unwrap();
+            .expect("should build target URL");
         assert_eq!(url, "https://sdk.privacy-center.org/loader.js?v=1");
     }
 

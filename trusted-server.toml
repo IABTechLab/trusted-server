@@ -25,6 +25,9 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 # Allows publishers to include tags such as X-Robots-Tag: noindex
 # [response_headers]
 # X-Custom-Header = "custom header value"
+#
+# Or via environment variable (JSON preserves header name casing and hyphens):
+# TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
 
 # Request Signing Configuration
 # Enable signing of OpenRTB requests and other API calls
@@ -38,10 +41,9 @@ enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = false
 debug = false
 # debug_query_params = ""
-# script_handler = "/prebid.js"
+# script_patterns = ["/prebid.js"]
 
 [integrations.nextjs]
 enabled = false
@@ -75,6 +77,18 @@ sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 
+# DataDome bot protection integration
+# Proxies tags.js and signal collection API through first-party context
+# Endpoints:
+#   GET  /integrations/datadome/tags.js  - Proxied SDK script
+#   ANY  /integrations/datadome/js/*     - Signal collection API
+[integrations.datadome]
+enabled = false
+sdk_origin = "https://js.datadome.co"
+api_origin = "https://api-js.datadome.co"
+cache_ttl_seconds = 3600
+rewrite_sdk = true 
+
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
 # Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")
@@ -83,6 +97,12 @@ rewrite_sdk = true
 #     "*.edgecompute.app",
 # ]
 
+
+# Proxy configuration
+# [proxy]
+# Enable TLS certificate verification when proxying to HTTPS origins.
+# Defaults to true. Set to false only for local development with self-signed certificates.
+# certificate_check = true
 
 [auction]
 enabled = true

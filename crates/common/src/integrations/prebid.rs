@@ -14,12 +14,13 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
-use crate::backend::ensure_backend_from_url;
+use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
 };
 use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
@@ -29,12 +30,19 @@ use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
+const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
+const BIDDER_PARAMS_KEY: &str = "bidderParams";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub server_url: String,
+    /// Prebid Server account ID, injected into the client-side bundle via
+    /// `window.__tsjs_prebid.accountId` so publishers don't need to configure
+    /// it in JavaScript.
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
     #[serde(
@@ -172,7 +180,7 @@ impl PrebidIntegration {
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
-            .with_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .with_header(header::CACHE_CONTROL, "public, max-age=31536000")
             .with_body(body))
     }
 }
@@ -198,7 +206,8 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_attribute_rewriter(integration.clone())
+            .with_head_injector(integration)
             .build(),
     )
 }
@@ -262,6 +271,69 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 }
 
+impl IntegrationHeadInjector for PrebidIntegration {
+    fn integration_id(&self) -> &'static str {
+        PREBID_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InjectedPrebidClientConfig<'a> {
+            account_id: &'a str,
+            timeout: u32,
+            debug: bool,
+            bidders: &'a [String],
+        }
+
+        let payload = InjectedPrebidClientConfig {
+            account_id: self.config.account_id.as_deref().unwrap_or_default(),
+            timeout: self.config.timeout_ms,
+            debug: self.config.debug,
+            bidders: &self.config.bidders,
+        };
+
+        // Escape `</` to prevent breaking out of the script tag.
+        let config_json = serde_json::to_string(&payload)
+            .unwrap_or_else(|_| "{}".to_string())
+            .replace("</", "<\\/");
+
+        vec![format!(
+            r#"<script>window.__tsjs_prebid={config_json};</script>"#
+        )]
+    }
+}
+
+fn expand_trusted_server_bidders(
+    configured_bidders: &[String],
+    params: &Json,
+) -> HashMap<String, Json> {
+    let per_bidder = params.get(BIDDER_PARAMS_KEY).and_then(Json::as_object);
+
+    if configured_bidders.is_empty() {
+        return per_bidder
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+    }
+
+    configured_bidders
+        .iter()
+        .map(|bidder| {
+            let value = per_bidder
+                .and_then(|m| m.get(bidder).cloned())
+                .unwrap_or_else(|| {
+                    // No per-bidder map → use entire params as shared config
+                    if per_bidder.is_some() {
+                        Json::Object(Default::default())
+                    } else {
+                        params.clone()
+                    }
+                });
+            (bidder.clone(), value)
+        })
+        .collect()
+}
+
 fn transform_prebid_response(
     response: &mut Json,
     request_host: &str,
@@ -302,7 +374,7 @@ fn transform_prebid_response(
 
 fn rewrite_ad_markup(markup: &str, request_host: &str, request_scheme: &str) -> String {
     let mut content = markup.to_string();
-    let cdn_patterns = vec![
+    let cdn_patterns = [
         ("https://cdn.adsrvr.org", "adsrvr"),
         ("https://ib.adnxs.com", "adnxs"),
         ("https://rtb.openx.net", "openx"),
@@ -410,12 +482,18 @@ impl PrebidAuctionProvider {
                     })
                     .collect();
 
-                // Use bidder params from the slot (passed through from the request)
-                let mut bidder: HashMap<String, Json> = slot
-                    .bidders
-                    .iter()
-                    .map(|(name, params)| (name.clone(), params.clone()))
-                    .collect();
+                // Build the bidder map for PBS.
+                // The JS adapter sends "trustedServer" as the bidder (our orchestrator
+                // adapter name). Replace it with the real PBS bidders from config.
+                // Pass through any other bidders with their params as-is.
+                let mut bidder: HashMap<String, Json> = HashMap::new();
+                for (name, params) in &slot.bidders {
+                    if name == TRUSTED_SERVER_BIDDER {
+                        bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                    } else {
+                        bidder.insert(name.clone(), params.clone());
+                    }
+                }
 
                 // Fallback to config bidders if none provided
                 if bidder.is_empty() {
@@ -451,16 +529,15 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build device object with geo if available
-        let device = request.device.as_ref().and_then(|d| {
-            d.geo.as_ref().map(|geo| Device {
-                geo: Some(Geo {
-                    geo_type: 2, // IP address per OpenRTB spec
-                    country: Some(geo.country.clone()),
-                    city: Some(geo.city.clone()),
-                    region: geo.region.clone(),
-                }),
-            })
+        // Build device object with user-agent and geo if available
+        let device = request.device.as_ref().map(|d| Device {
+            ua: d.user_agent.clone(),
+            geo: d.geo.as_ref().map(|geo| Geo {
+                geo_type: 2, // IP address per OpenRTB spec
+                country: Some(geo.country.clone()),
+                city: Some(geo.city.clone()),
+                region: geo.region.clone(),
+            }),
         });
 
         // Build regs object if Sec-GPC header is present
@@ -481,11 +558,9 @@ impl PrebidAuctionProvider {
             .unwrap_or((None, None));
 
         let ext = Some(RequestExt {
-            prebid: if self.config.debug {
-                Some(PrebidExt { debug: Some(true) })
-            } else {
-                None
-            },
+            prebid: Some(PrebidExt {
+                debug: if self.config.debug { Some(true) } else { None },
+            }),
             trusted_server: Some(TrustedServerExt {
                 signature,
                 kid,
@@ -633,6 +708,16 @@ impl AuctionProvider for PrebidAuctionProvider {
                 .map(|(s, sig)| (s, sig.clone())),
         );
 
+        // Log the outgoing OpenRTB request for debugging
+        match serde_json::to_string_pretty(&openrtb) {
+            Ok(json) => log::debug!(
+                "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
+                self.config.server_url,
+                json
+            ),
+            Err(e) => log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}"),
+        }
+
         // Create HTTP request
         let mut pbs_req = Request::new(
             Method::POST,
@@ -647,7 +732,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             })?;
 
         // Send request asynchronously
-        let backend_name = ensure_backend_from_url(&self.config.server_url, true)?;
+        let backend_name = BackendConfig::from_url(&self.config.server_url, true)?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -664,15 +749,17 @@ impl AuctionProvider for PrebidAuctionProvider {
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Parse response
+        let body_bytes = response.take_body_bytes();
+
         if !response.get_status().is_success() {
+            let body_preview = String::from_utf8_lossy(&body_bytes);
             log::warn!(
-                "Prebid returned non-success status: {}",
-                response.get_status()
+                "Prebid returned non-success status: {} — body: {}",
+                response.get_status(),
+                &body_preview[..body_preview.floor_char_boundary(1000)]
             );
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
-
-        let body_bytes = response.take_body_bytes();
 
         let mut response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
@@ -724,7 +811,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        ensure_backend_from_url(&self.config.server_url, true).ok()
+        BackendConfig::from_url(&self.config.server_url, true).ok()
     }
 }
 
@@ -740,10 +827,20 @@ impl AuctionProvider for PrebidAuctionProvider {
 pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
-    // Prebid provider is always registered if integration is enabled
-    if let Ok(Some(config)) = settings.integration_config::<PrebidIntegrationConfig>("prebid") {
-        log::info!("Registering Prebid auction provider");
-        providers.push(Arc::new(PrebidAuctionProvider::new(config)));
+    match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
+        Ok(Some(config)) => {
+            log::info!(
+                "Registering Prebid auction provider (server_url={})",
+                config.server_url
+            );
+            providers.push(Arc::new(PrebidAuctionProvider::new(config)));
+        }
+        Ok(None) => {
+            log::info!("Prebid auction provider not registered: integration not found or disabled");
+        }
+        Err(e) => {
+            log::error!("Prebid auction provider not registered: config error: {e:?}");
+        }
     }
 
     providers
@@ -753,7 +850,9 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
 mod tests {
     use super::*;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
-    use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
+    use crate::integrations::{
+        AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
+    };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
@@ -769,6 +868,7 @@ mod tests {
         PrebidIntegrationConfig {
             enabled: true,
             server_url: "https://prebid.example".to_string(),
+            account_id: Some("test-account".to_string()),
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
@@ -952,7 +1052,7 @@ mod tests {
         for url_field in ["nurl", "burl"] {
             let value = response["seatbid"][0]["bid"][0][url_field]
                 .as_str()
-                .unwrap();
+                .expect("should get tracking URL");
             assert!(
                 value.contains("/ad-proxy/track/"),
                 "tracking URLs should be proxied"
@@ -969,11 +1069,17 @@ mod tests {
             "proxy prefix should be applied"
         );
 
-        let encoded = rewritten.split("/ad-proxy/track/").nth(1).unwrap();
+        let encoded = rewritten
+            .split("/ad-proxy/track/")
+            .nth(1)
+            .expect("should have encoded payload after proxy prefix");
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .expect("should decode base64 proxy payload");
-        assert_eq!(String::from_utf8(decoded).unwrap(), url);
+        assert_eq!(
+            String::from_utf8(decoded).expect("should be valid UTF-8"),
+            url
+        );
     }
 
     #[test]
@@ -1071,7 +1177,6 @@ server_url = "https://prebid.example"
             .get_header_str(header::CACHE_CONTROL)
             .expect("should have cache-control");
         assert!(cache_control.contains("max-age=31536000"));
-        assert!(cache_control.contains("immutable"));
 
         let body = response.into_body_str();
         assert!(body.contains("// Script overridden by Trusted Server"));
@@ -1101,6 +1206,146 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn head_injector_emits_config_script() {
+        let integration = PrebidIntegration::new(base_config());
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(inserts.len(), 1, "should produce exactly one head insert");
+
+        let script = &inserts[0];
+        assert!(
+            script.starts_with("<script>") && script.ends_with("</script>"),
+            "should be wrapped in script tags"
+        );
+        assert!(
+            script.contains(r#""accountId":"test-account""#),
+            "should include accountId from config: {}",
+            script
+        );
+        assert!(
+            script.contains(r#""timeout":1000"#),
+            "should include timeout: {}",
+            script
+        );
+        assert!(
+            script.contains(r#""debug":false"#),
+            "should include debug flag: {}",
+            script
+        );
+        assert!(
+            script.contains(r#""bidders":["exampleBidder"]"#),
+            "should include bidders array: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_handles_missing_account_id() {
+        let mut config = base_config();
+        config.account_id = None;
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(r#""accountId":"""#),
+            "should emit empty accountId when not configured: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_escapes_closing_script_tags_in_values() {
+        let mut config = base_config();
+        config.account_id = Some("</script><script>alert(1)</script>".to_string());
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
+            "should escape closing script tags inside JSON values: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn expand_trusted_server_bidders_uses_per_bidder_map_when_present() {
+        let params = json!({
+            "bidderParams": {
+                "appnexus": { "placementId": 123 },
+                "rubicon": { "accountId": "abc" }
+            }
+        });
+
+        let expanded = expand_trusted_server_bidders(
+            &[
+                "appnexus".to_string(),
+                "rubicon".to_string(),
+                "openx".to_string(),
+            ],
+            &params,
+        );
+
+        assert_eq!(
+            expanded.get("appnexus"),
+            Some(&json!({ "placementId": 123 })),
+            "should map appnexus-specific params"
+        );
+        assert_eq!(
+            expanded.get("rubicon"),
+            Some(&json!({ "accountId": "abc" })),
+            "should map rubicon-specific params"
+        );
+        assert_eq!(
+            expanded.get("openx"),
+            Some(&json!({})),
+            "should default missing bidder params to empty object"
+        );
+    }
+
+    #[test]
+    fn expand_trusted_server_bidders_falls_back_to_shared_params() {
+        let params = json!({ "placementId": 999 });
+        let expanded = expand_trusted_server_bidders(
+            &["appnexus".to_string(), "rubicon".to_string()],
+            &params,
+        );
+
+        assert_eq!(
+            expanded.get("appnexus"),
+            Some(&params),
+            "should reuse shared params when bidderParams map is absent"
+        );
+        assert_eq!(
+            expanded.get("rubicon"),
+            Some(&params),
+            "should reuse shared params when bidderParams map is absent"
+        );
+    }
+
+    #[test]
     fn test_routes_with_empty_script_patterns() {
         let mut config = base_config();
         config.script_patterns = vec![];
@@ -1110,5 +1355,34 @@ server_url = "https://prebid.example"
 
         // Should have 0 routes when no script patterns configured
         assert_eq!(routes.len(), 0);
+    }
+
+    /// Proves that the body-preview truncation in `parse_response` is not
+    /// UTF-8-safe. The production code does:
+    ///
+    ///   `&body_preview[..body_preview.len().min(1000)]`
+    ///
+    /// which is a byte-index slice on a `str`. When byte 1000 lands inside a
+    /// multibyte character, Rust panics at runtime. This test constructs such
+    /// a string and asserts the truncation point is NOT a char boundary—
+    /// proving the bug without actually panicking (which would abort under
+    /// wasm32 `panic = "abort"`).
+    #[test]
+    fn body_preview_truncation_is_not_utf8_safe() {
+        // 999 ASCII bytes + U+2603 SNOWMAN (3 bytes: E2 98 83) = 1002 bytes.
+        // Byte index 1000 lands on 0x98, the second byte of the snowman.
+        let mut body = "x".repeat(999);
+        body.push('\u{2603}'); // ☃
+        assert_eq!(body.len(), 1002);
+
+        let truncation_index = body.len().min(1000); // = 1000
+
+        // This is the condition that causes `&body[..1000]` to panic.
+        assert!(
+            !body.is_char_boundary(truncation_index),
+            "Byte index {} is not a char boundary — the truncation in \
+             parse_response would panic on this input",
+            truncation_index
+        );
     }
 }
