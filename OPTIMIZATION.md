@@ -376,6 +376,8 @@ After implementing Phases 1-2:
 - No regression on static endpoints or auction
 - Code complexity is justified by measured improvement
 
+**Current Status:** The streaming architecture changes (Phases 1 and 2.1) have been implemented and pushed to the `feat/optimize-html-streaming` branch. Local testing with `curl` has demonstrated significant TTFB improvements (from ~0.716s buffered to ~0.256s streaming) while verifying functional correctness against Fastly Compute's local testing environment. **External environment testing and load testing on the staging edge network is currently due/pending.**
+
 ---
 
 ## Optimization Summary Table
