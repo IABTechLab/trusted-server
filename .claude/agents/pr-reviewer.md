@@ -170,31 +170,29 @@ Include findings that cannot be pinpointed to a single line (cross-cutting
 concerns, architectural issues, dependency problems) in the review body:
 
 ```markdown
-## Staff Engineer Review
-
-### Summary
+## Summary
 
 <1-2 sentence overview of the changes and overall assessment>
 
-### Findings
+## Findings
 
-#### P0 — Blockers
-
-- **Title**: description (file:line)
-
-#### P1 — High
+### P0 — Blockers
 
 - **Title**: description (file:line)
 
-#### P2 — Medium
+### P1 — High
+
+- **Title**: description (file:line)
+
+### P2 — Medium
 
 - **Title**: description
 
-#### P3 — Low
+### P3 — Low
 
 - **Title**: description
 
-### CI Status
+## CI Status
 
 - fmt: PASS/FAIL
 - clippy: PASS/FAIL
@@ -251,8 +249,9 @@ Output:
 - Don't nitpick style that `cargo fmt` handles — focus on substance.
 - Don't flag things that are correct but unfamiliar — verify before flagging.
 - Cross-reference findings: if an issue appears in multiple places, group them.
-- Do not include any byline, "Generated with" footer, or `Co-Authored-By`
-  trailer in review comments.
+- Do not include any byline, "Generated with" footer, `Co-Authored-By`
+  trailer, or self-referential titles (e.g., "Staff Engineer Review") in
+  review comments or the review body.
 - If the diff is very large (>50 files), prioritize `crates/common/` changes
   and new files over mechanical changes (Cargo.lock, generated code).
 - Never submit a review without explicit user approval of the findings.
