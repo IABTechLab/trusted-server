@@ -24,12 +24,12 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 
 ## Toolchain
 
-| Tool | Version / Target |
-|------|-----------------|
-| Rust | 1.91.1 (pinned in `rust-toolchain.toml`) |
-| WASM target | `wasm32-wasip1` |
-| Node | LTS (for JS build) |
-| Viceroy | Latest (Fastly local simulator) |
+| Tool        | Version / Target                         |
+| ----------- | ---------------------------------------- |
+| Rust        | 1.91.1 (pinned in `rust-toolchain.toml`) |
+| WASM target | `wasm32-wasip1`                          |
+| Node        | LTS (for JS build)                       |
+| Viceroy     | Latest (Fastly local simulator)          |
 
 ---
 
@@ -248,6 +248,7 @@ Bad: `"fix: added feature flags"`
 ## Integration System
 
 Integrations register in Rust via:
+
 ```rust
 IntegrationRegistration::builder(ID)
     .with_proxy()
@@ -272,12 +273,12 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File | Purpose |
-|------|---------|
-| `fastly.toml` | Fastly service configuration and build settings |
+| File                  | Purpose                                                    |
+| --------------------- | ---------------------------------------------------------- |
+| `fastly.toml`         | Fastly service configuration and build settings            |
 | `trusted-server.toml` | Application settings (ad servers, KV stores, ID templates) |
-| `rust-toolchain.toml` | Pins Rust version to 1.91.1 |
-| `.env.dev` | Local development environment variables |
+| `rust-toolchain.toml` | Pins Rust version to 1.91.1                                |
+| `.env.dev`            | Local development environment variables                    |
 
 ---
 
@@ -323,15 +324,16 @@ Every PR must pass:
 
 For complex tasks, use specialized subagents (`.claude/agents/`):
 
-| Agent | When to use |
-|-------|-------------|
-| `build-validator` | Validate build across native + wasm32-wasip1 targets |
-| `code-architect` | Analyze architecture, suggest improvements |
-| `code-simplifier` | Find and simplify overly complex code |
-| `verify-app` | Full verification pipeline (build + test + lint) |
-| `pr-creator` | Create well-structured pull requests |
-| `issue-creator` | Create GitHub issues with proper types via GraphQL |
-| `repo-explorer` | Explore and answer questions about the codebase |
+| Agent             | When to use                                                          |
+| ----------------- | -------------------------------------------------------------------- |
+| `build-validator` | Validate build across native + wasm32-wasip1 targets                 |
+| `code-architect`  | Analyze architecture, suggest improvements                           |
+| `code-simplifier` | Find and simplify overly complex code                                |
+| `verify-app`      | Full verification pipeline (build + test + lint)                     |
+| `pr-creator`      | Create well-structured pull requests                                 |
+| `pr-reviewer`     | Staff-engineer PR review with inline GitHub comments (user approves) |
+| `issue-creator`   | Create GitHub issues with proper types via GraphQL                   |
+| `repo-explorer`   | Explore and answer questions about the codebase                      |
 
 ### Multi-Phase Workflow (for complex tasks)
 
@@ -349,43 +351,44 @@ both runtime behavior and build/tooling changes.
 
 ### Selection Matrix
 
-| Situation | Use first | Optional follow-up | Expected output |
-|-----------|-----------|-------------------|-----------------|
-| Unfamiliar code area | `repo-explorer` | `code-architect` | File map and risk hotspots |
-| Multi-crate change | `repo-explorer` | `code-architect`, `build-validator` | Change plan and validation scope |
-| CI/build failures | `build-validator` | `repo-explorer` | Failing combos and fault area |
-| Design/API proposal | `code-architect` | `repo-explorer` | Architecture concerns and options |
-| Cleanup/refactor | `code-simplifier` | `build-validator` | Simplification summary and checks |
-| Pre-PR readiness | `build-validator` | `verify-app`, `pr-creator` | Pass/fail report and PR draft |
+| Situation            | Use first         | Optional follow-up                  | Expected output                    |
+| -------------------- | ----------------- | ----------------------------------- | ---------------------------------- |
+| Unfamiliar code area | `repo-explorer`   | `code-architect`                    | File map and risk hotspots         |
+| Multi-crate change   | `repo-explorer`   | `code-architect`, `build-validator` | Change plan and validation scope   |
+| CI/build failures    | `build-validator` | `repo-explorer`                     | Failing combos and fault area      |
+| Design/API proposal  | `code-architect`  | `repo-explorer`                     | Architecture concerns and options  |
+| Cleanup/refactor     | `code-simplifier` | `build-validator`                   | Simplification summary and checks  |
+| Pre-PR readiness     | `build-validator` | `verify-app`, `pr-creator`          | Pass/fail report and PR draft      |
+| PR review            | `pr-reviewer`     | `code-architect`, `repo-explorer`   | Inline GitHub review with findings |
 
 ---
 
 ## Slash Commands
 
-| Command | Purpose |
-|---------|---------|
-| `/test-all` | Run full test suite (Rust + JS) |
-| `/check-ci` | Run all CI checks locally |
-| `/verify` | Full verification: build, test, lint |
+| Command           | Purpose                                   |
+| ----------------- | ----------------------------------------- |
+| `/test-all`       | Run full test suite (Rust + JS)           |
+| `/check-ci`       | Run all CI checks locally                 |
+| `/verify`         | Full verification: build, test, lint      |
 | `/review-changes` | Review staged/unstaged changes for issues |
-| `/test-crate` | Test a specific crate by name |
+| `/test-crate`     | Test a specific crate by name             |
 
 ---
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `crates/common/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()` |
-| `crates/common/src/tsjs.rs` | Script tag generation with module IDs |
-| `crates/common/src/html_processor.rs` | Injects `<script>` at `<head>` start |
-| `crates/common/src/publisher.rs` | `/static/tsjs=` handler, concatenates modules |
-| `crates/common/src/synthetic.rs` | Synthetic ID generation |
-| `crates/common/src/cookies.rs` | Cookie handling |
-| `crates/common/src/gdpr.rs` | GDPR consent management |
-| `crates/common/src/http_wrapper.rs` | HTTP abstractions |
-| `crates/js/build.rs` | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/js/src/bundle.rs` | Module map, concatenation, hashing |
+| File                                         | Purpose                                           |
+| -------------------------------------------- | ------------------------------------------------- |
+| `crates/common/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
+| `crates/common/src/tsjs.rs`                  | Script tag generation with module IDs             |
+| `crates/common/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
+| `crates/common/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| `crates/common/src/synthetic.rs`             | Synthetic ID generation                           |
+| `crates/common/src/cookies.rs`               | Cookie handling                                   |
+| `crates/common/src/gdpr.rs`                  | GDPR consent management                           |
+| `crates/common/src/http_wrapper.rs`          | HTTP abstractions                                 |
+| `crates/js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
+| `crates/js/src/bundle.rs`                    | Module map, concatenation, hashing                |
 
 ---
 
