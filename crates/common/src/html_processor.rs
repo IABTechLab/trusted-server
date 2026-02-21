@@ -20,6 +20,10 @@ use crate::tsjs;
 struct HtmlWithPostProcessing {
     inner: HtmlRewriterAdapter,
     post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    /// Accumulated output from intermediate chunks. Only used when
+    /// `post_processors` is non-empty, because post-processors (e.g. RSC
+    /// placeholder substitution) need the complete document to operate on.
+    accumulated_output: Vec<u8>,
     origin_host: String,
     request_host: String,
     request_scheme: String,
@@ -29,12 +33,27 @@ struct HtmlWithPostProcessing {
 impl StreamProcessor for HtmlWithPostProcessing {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         let output = self.inner.process_chunk(chunk, is_last)?;
-        if !is_last || output.is_empty() || self.post_processors.is_empty() {
+
+        // No post-processors → stream through immediately (fast path).
+        if self.post_processors.is_empty() {
             return Ok(output);
         }
 
-        let Ok(output_str) = std::str::from_utf8(&output) else {
-            return Ok(output);
+        // Post-processors registered → must accumulate so they can operate on
+        // the complete document (e.g. RSC placeholder substitution).
+        self.accumulated_output.extend_from_slice(&output);
+        if !is_last {
+            return Ok(Vec::new());
+        }
+
+        // All chunks received — run post-processing on the complete output.
+        let full_output = std::mem::take(&mut self.accumulated_output);
+        if full_output.is_empty() {
+            return Ok(full_output);
+        }
+
+        let Ok(output_str) = std::str::from_utf8(&full_output) else {
+            return Ok(full_output);
         };
 
         let ctx = IntegrationHtmlContext {
@@ -50,10 +69,10 @@ impl StreamProcessor for HtmlWithPostProcessing {
             .iter()
             .any(|p| p.should_process(output_str, &ctx))
         {
-            return Ok(output);
+            return Ok(full_output);
         }
 
-        let mut html = String::from_utf8(output).map_err(|e| {
+        let mut html = String::from_utf8(full_output).map_err(|e| {
             io::Error::other(format!(
                 "HTML post-processing expected valid UTF-8 output: {e}"
             ))
@@ -79,6 +98,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
 
     fn reset(&mut self) {
         self.inner.reset();
+        self.accumulated_output.clear();
         self.document_state.clear();
     }
 }
@@ -464,6 +484,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     HtmlWithPostProcessing {
         inner: HtmlRewriterAdapter::new(rewriter_settings),
         post_processors,
+        accumulated_output: Vec::new(),
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
