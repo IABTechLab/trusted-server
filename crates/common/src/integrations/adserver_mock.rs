@@ -9,10 +9,11 @@ use fastly::http::Method;
 use fastly::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use validator::Validate;
 
+use crate::auction::context::{build_url_with_context_params, ContextQueryParams};
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
@@ -42,6 +43,17 @@ pub struct AdServerMockConfig {
     /// Optional price floor (minimum acceptable CPM)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_floor: Option<f64>,
+
+    /// Mapping from auction-request context keys to query-parameter names.
+    /// Allows forwarding integration-supplied data (e.g. audience segments)
+    /// to the mediation endpoint without hard-coding integration knowledge.
+    ///
+    /// ```toml
+    /// [integrations.adserver_mock.context_query_params]
+    /// permutive_segments = "permutive"
+    /// ```
+    #[serde(default)]
+    pub context_query_params: ContextQueryParams,
 }
 
 fn default_enabled() -> bool {
@@ -59,6 +71,7 @@ impl Default for AdServerMockConfig {
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: default_timeout_ms(),
             price_floor: None,
+            context_query_params: BTreeMap::new(),
         }
     }
 }
@@ -83,6 +96,20 @@ impl AdServerMockProvider {
     #[must_use]
     pub fn new(config: AdServerMockConfig) -> Self {
         Self { config }
+    }
+
+    /// Build the mediation endpoint URL, appending context values as query
+    /// parameters according to the `context_query_params` config mapping.
+    ///
+    /// For example, with `context_query_params = { permutive_segments = "permutive" }`
+    /// and segments `[10000001, 10000003]` in context, the URL becomes
+    /// `https://…/adserver/mediate?permutive=10000001,10000003`.
+    fn build_endpoint_url(&self, request: &AuctionRequest) -> String {
+        build_url_with_context_params(
+            &self.config.endpoint,
+            &request.context,
+            &self.config.context_query_params,
+        )
     }
 
     /// Build mediation request from auction request and bidder responses.
@@ -256,8 +283,11 @@ impl AuctionProvider for AdServerMockProvider {
 
         log::debug!("AdServer Mock: mediation request: {:?}", mediation_req);
 
+        // Build endpoint URL with optional Permutive segments query string
+        let endpoint_url = self.build_endpoint_url(request);
+
         // Create HTTP POST request
-        let mut req = Request::new(Method::POST, &self.config.endpoint);
+        let mut req = Request::new(Method::POST, &endpoint_url);
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
         if let Ok(url) = url::Url::parse(&self.config.endpoint) {
@@ -379,6 +409,7 @@ pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::context::ContextValue;
     use crate::auction::types::*;
 
     fn create_test_auction_request() -> AuctionRequest {
@@ -421,12 +452,12 @@ mod tests {
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: Some(1.00),
+            context_query_params: BTreeMap::new(),
         };
 
         let provider = AdServerMockProvider::new(config);
-        let mut auction_request = create_test_auction_request();
+        let auction_request = create_test_auction_request();
 
-        // Add bidder responses to context
         let bidder_responses = vec![
             AuctionResponse {
                 provider: "amazon-aps".to_string(),
@@ -467,11 +498,6 @@ mod tests {
                 metadata: HashMap::new(),
             },
         ];
-
-        auction_request.context.insert(
-            "provider_responses".to_string(),
-            serde_json::to_value(&bidder_responses).expect("should serialize bidder responses"),
-        );
 
         let mediation_req = provider
             .build_mediation_request(&auction_request, &bidder_responses)
@@ -711,6 +737,112 @@ mod tests {
         assert_eq!(
             bid2.price, None,
             "Bid without price field should have None price"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_with_context_query_params() {
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+            context_query_params: BTreeMap::from([(
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
+            )]),
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.context.insert(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec![
+                "10000001".into(),
+                "10000003".into(),
+                "adv".into(),
+                "bhgp".into(),
+            ]),
+        );
+
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(
+            url,
+            "http://localhost:6767/adserver/mediate?permutive=10000001%2C10000003%2Cadv%2Cbhgp"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_no_mapping_no_params() {
+        // With an empty context_query_params, no query params are appended
+        // even if context contains data.
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+            context_query_params: BTreeMap::new(),
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.context.insert(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec!["10000001".into()]),
+        );
+
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(url, "http://localhost:6767/adserver/mediate");
+    }
+
+    #[test]
+    fn test_build_endpoint_url_empty_array_skipped() {
+        let config = AdServerMockConfig {
+            context_query_params: BTreeMap::from([(
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.context.insert(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec![]),
+        );
+
+        let url = provider.build_endpoint_url(&request);
+        assert!(
+            !url.contains("permutive="),
+            "Empty segments should not add query param"
+        );
+    }
+
+    #[test]
+    fn test_build_endpoint_url_preserves_existing_query_params() {
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+            context_query_params: BTreeMap::from([(
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
+            )]),
+        };
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.context.insert(
+            "permutive_segments".to_string(),
+            ContextValue::StringList(vec!["123".into(), "adv".into()]),
+        );
+
+        let url = provider.build_endpoint_url(&request);
+        assert_eq!(
+            url,
+            "http://localhost:6767/adserver/mediate?debug=true&permutive=123%2Cadv"
         );
     }
 }

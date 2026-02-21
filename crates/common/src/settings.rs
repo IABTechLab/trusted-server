@@ -1083,4 +1083,45 @@ mod tests {
         assert!(!rewrite.is_excluded("not a url"));
         assert!(!rewrite.is_excluded(""));
     }
+
+    #[test]
+    fn test_auction_allowed_context_keys_defaults_to_empty() {
+        let settings = create_test_settings();
+        assert!(
+            settings.auction.allowed_context_keys.is_empty(),
+            "Default allowed_context_keys should be empty (secure-by-default)"
+        );
+    }
+
+    #[test]
+    fn test_auction_allowed_context_keys_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            allowed_context_keys = ["permutive_segments", "lockr_ids"]
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        assert_eq!(
+            settings.auction.allowed_context_keys,
+            vec!["permutive_segments", "lockr_ids"]
+        );
+    }
+
+    #[test]
+    fn test_auction_empty_allowed_context_keys_blocks_all() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            allowed_context_keys = []
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        assert!(
+            settings.auction.allowed_context_keys.is_empty(),
+            "Empty allowed_context_keys should be respected (blocks all keys)"
+        );
+    }
 }

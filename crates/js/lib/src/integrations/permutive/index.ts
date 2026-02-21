@@ -1,6 +1,8 @@
 import { log } from '../../core/log';
+import { registerContextProvider } from '../../core/context';
 
 import { installPermutiveGuard } from './script_guard';
+import { getPermutiveSegments } from './segments';
 
 declare const permutive: {
   config: {
@@ -99,6 +101,14 @@ function waitForPermutiveSDK(callback: () => void, maxAttempts = 50) {
 
 if (typeof window !== 'undefined') {
   installPermutiveGuard();
+
+  // Register a context provider so Permutive segments are included in auction
+  // requests. Core calls collectContext() before every /auction POST — this
+  // keeps all Permutive localStorage knowledge inside this integration.
+  registerContextProvider('permutive', () => {
+    const segments = getPermutiveSegments();
+    return segments.length > 0 ? { permutive_segments: segments } : undefined;
+  });
 
   waitForPermutiveSDK(() => installPermutiveShim());
 }

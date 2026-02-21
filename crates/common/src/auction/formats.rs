@@ -9,9 +9,10 @@ use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::auction::context::ContextValue;
 use crate::auction::types::OrchestratorExt;
 use crate::creative;
 use crate::error::TrustedServerError;
@@ -30,7 +31,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     pub config: Option<JsonValue>,
 }
 
@@ -135,6 +135,46 @@ pub fn convert_tsjs_to_auction_request(
         geo: GeoInfo::from_request(req),
     });
 
+    // Forward allowed config entries from the JS request into the context map.
+    // Only keys listed in `auction.allowed_context_keys` are accepted;
+    // unrecognised keys are silently dropped to prevent injection of
+    // arbitrary data by a malicious client payload.
+    let allowed: HashSet<&str> = settings
+        .auction
+        .allowed_context_keys
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut context = HashMap::new();
+    if let Some(ref config) = body.config {
+        if let Some(obj) = config.as_object() {
+            for (key, value) in obj {
+                if allowed.contains(key.as_str()) {
+                    match serde_json::from_value::<ContextValue>(value.clone()) {
+                        Ok(cv) => {
+                            context.insert(key.clone(), cv);
+                        }
+                        Err(_) => {
+                            log::debug!(
+                                "Auction context: dropping key '{}' with unsupported type",
+                                key
+                            );
+                        }
+                    }
+                } else {
+                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                }
+            }
+            if !context.is_empty() {
+                log::debug!(
+                    "Auction request context: {} entries ({})",
+                    context.len(),
+                    context.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
+
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
         slots,
@@ -152,7 +192,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
-        context: HashMap::new(),
+        context,
     })
 }
 

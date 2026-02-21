@@ -109,6 +109,9 @@ enabled = true
 providers = ["prebid"]
 # mediator = "adserver_mock"  # will use mediator when set
 timeout_ms = 2000
+# Context keys the JS client is allowed to forward into auction requests.
+# Keys not in this list are silently dropped. An empty list blocks all keys.
+allowed_context_keys = ["permutive_segments"]
 
 [integrations.aps]
 enabled = false
@@ -120,5 +123,11 @@ timeout_ms = 1000
 enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
+
+# Map auction-request context keys to mediation URL query parameters.
+# Each key is a context key from the JS client; the value becomes the
+# query parameter name. Arrays are joined with commas.
+[integrations.adserver_mock.context_query_params]
+permutive_segments = "permutive"
 
 
