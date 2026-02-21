@@ -6,6 +6,7 @@ pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
 pub mod didomi;
+pub mod gam;
 pub mod lockr;
 pub mod nextjs;
 pub mod permutive;
@@ -32,5 +33,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         lockr::register,
         didomi::register,
         datadome::register,
+        gam::register,
     ]
 }
