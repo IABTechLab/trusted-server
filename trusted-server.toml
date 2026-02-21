@@ -116,6 +116,11 @@ pub_id = "your-aps-publisher-id"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
 timeout_ms = 1000
 
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-XXXXXX"
+# upstream_url = "https://www.googletagmanager.com"
+
 [integrations.adserver_mock]
 enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
