@@ -26,7 +26,7 @@ use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
     RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
 };
-use crate::request_signing::RequestSigner;
+use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
@@ -466,7 +466,7 @@ impl PrebidAuctionProvider {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        signer: Option<(&RequestSigner, String)>,
+        signer: Option<(&RequestSigner, String, &SigningParams)>,
     ) -> OpenRtbRequest {
         let imps: Vec<Imp> = request
             .slots
@@ -553,19 +553,28 @@ impl PrebidAuctionProvider {
 
         // Build ext object
         let request_info = RequestInfo::from_request(context.request);
-        let (signature, kid) = signer
-            .map(|(s, sig)| (Some(sig), Some(s.kid.clone())))
-            .unwrap_or((None, None));
+        let (version, signature, kid, ts) = signer
+            .map(|(s, sig, params)| {
+                (
+                    Some(SIGNING_VERSION.to_string()),
+                    Some(sig),
+                    Some(s.kid.clone()),
+                    Some(params.timestamp),
+                )
+            })
+            .unwrap_or((None, None, None, None));
 
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
                 debug: if self.config.debug { Some(true) } else { None },
             }),
             trusted_server: Some(TrustedServerExt {
+                version,
                 signature,
                 kid,
                 request_host: Some(request_info.host),
                 request_scheme: Some(request_info.scheme),
+                ts,
             }),
         });
 
@@ -686,18 +695,22 @@ impl AuctionProvider for PrebidAuctionProvider {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // Create signer and compute signature if request signing is enabled
-        let signer_with_signature =
-            if let Some(request_signing_config) = &context.settings.request_signing {
-                if request_signing_config.enabled {
-                    let signer = RequestSigner::from_config()?;
-                    let signature = signer.sign(request.id.as_bytes())?;
-                    Some((signer, signature))
-                } else {
-                    None
-                }
+        let signer_with_signature = if let Some(request_signing_config) =
+            &context.settings.request_signing
+        {
+            if request_signing_config.enabled {
+                let request_info = RequestInfo::from_request(context.request);
+                let signer = RequestSigner::from_config()?;
+                let params =
+                    SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
+                let signature = signer.sign_request(&params)?;
+                Some((signer, signature, params))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // Convert to OpenRTB with all enrichments
         let openrtb = self.to_openrtb(
@@ -705,7 +718,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             context,
             signer_with_signature
                 .as_ref()
-                .map(|(s, sig)| (s, sig.clone())),
+                .map(|(s, sig, params)| (s, sig.clone(), params)),
         );
 
         // Log the outgoing OpenRTB request for debugging
