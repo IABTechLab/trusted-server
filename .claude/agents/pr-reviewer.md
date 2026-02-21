@@ -42,18 +42,19 @@ git diff main...HEAD --name-only
 Read each file in its entirety. Do not skip files or skim — a thorough review
 requires understanding the full context of every change.
 
-### 3. Run CI gates
+### 3. Check CI status
 
-Verify the branch is healthy before reviewing:
+Check the PR's CI status from GitHub first — do not report "Not run" when
+checks have already run:
 
 ```
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
-cd crates/js/lib && npx vitest run
+gh pr checks <number> --repo IABTechLab/trusted-server
 ```
 
-Note any CI failures in the review but continue with the code review regardless.
+If the PR has passing CI checks, report them as PASS in the review. Only run
+CI locally if checks haven't run yet or if you need to verify a specific
+failure. Note any CI failures in the review but continue with the code review
+regardless.
 
 ### 4. Deep analysis
 
