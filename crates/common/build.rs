@@ -43,6 +43,8 @@ fn rerun_if_changed() {
 }
 
 fn merge_toml() {
+    use config::{Config, Environment, File, FileFormat};
+
     // Get the OUT_DIR where we'll copy the config file
     let dest_path = Path::new(TRUSTED_SERVER_OUTPUT_CONFIG_PATH);
 
@@ -51,9 +53,19 @@ fn merge_toml() {
     let toml_content = fs::read_to_string(init_config_path)
         .unwrap_or_else(|_| panic!("Failed to read {:?}", init_config_path));
 
-    // For build time: use from_toml to parse with environment variables
-    let settings = settings::Settings::from_toml(&toml_content)
-        .expect("Failed to parse settings at build time");
+    // Merge TOML + TRUSTED_SERVER__* env vars at build time using the config crate.
+    // At runtime, from_toml() skips this — the embedded TOML is already resolved.
+    let environment = Environment::default()
+        .prefix(settings::ENVIRONMENT_VARIABLE_PREFIX)
+        .separator(settings::ENVIRONMENT_VARIABLE_SEPARATOR);
+    let config = Config::builder()
+        .add_source(File::from_str(&toml_content, FileFormat::Toml))
+        .add_source(environment)
+        .build()
+        .expect("Failed to build configuration at build time");
+    let settings: settings::Settings = config
+        .try_deserialize()
+        .expect("Failed to deserialize configuration at build time");
 
     // Write the merged settings to the output directory as TOML
     let merged_toml =
