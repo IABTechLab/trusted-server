@@ -110,14 +110,18 @@ For each changed file, evaluate:
 
 ### 5. Classify findings
 
-Assign each finding a severity:
+Assign each finding a severity. Use emojis from the project's
+[code review emoji guide](https://github.com/erikthedeveloper/code-review-emoji-guide)
+(referenced in `CONTRIBUTING.md`):
 
-| Severity     | Criteria                                                           |
-| ------------ | ------------------------------------------------------------------ |
-| P0 — Blocker | Must fix before merge: bugs, data loss, security, CI failures      |
-| P1 — High    | Should fix: race conditions, API design issues, missing validation |
-| P2 — Medium  | Recommended: inconsistencies, test gaps, dead code                 |
-| P3 — Low     | Nice to have: style, minor improvements, documentation             |
+| Severity     | Emoji | Criteria                                                           |
+| ------------ | ----- | ------------------------------------------------------------------ |
+| P0 — Blocker | 🔧    | Must fix before merge: bugs, data loss, security, CI failures      |
+| P1 — High    | 🔧    | Should fix: race conditions, API design issues, missing validation |
+| P2 — Medium  | 🤔    | Recommended: inconsistencies, test gaps, dead code                 |
+| P3 — Low     | ⛏     | Nice to have: style, minor improvements, documentation             |
+
+Also use 👍 to highlight particularly good code or design decisions.
 
 ### 6. Present findings for user approval
 
@@ -161,7 +165,7 @@ comment. Use the file's **current line number** (not diff position) with the
   "path": "crates/common/src/publisher.rs",
   "line": 166,
   "side": "RIGHT",
-  "body": "**P1 — Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
+  "body": "🔧 **Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
 }
 ````
 
@@ -177,19 +181,19 @@ concerns, architectural issues, dependency problems) in the review body:
 
 ## Findings
 
-### P0 — Blockers
+### 🔧 Blockers (P0)
 
 - **Title**: description (file:line)
 
-### P1 — High
+### 🔧 High (P1)
 
 - **Title**: description (file:line)
 
-### P2 — Medium
+### 🤔 Medium (P2)
 
 - **Title**: description
 
-### P3 — Low
+### ⛏ Low (P3)
 
 - **Title**: description
 
