@@ -75,8 +75,8 @@ For each changed file, evaluate:
 #### Convention compliance (from CLAUDE.md)
 
 - `expect("should ...")` instead of `unwrap()` in production code
-- `thiserror` for library errors, `anyhow` for application-level
-- `tracing` macros (not `println!`)
+- `error-stack` (`Report<E>`) with `derive_more::Display` for errors (not thiserror/anyhow)
+- `log` macros (not `println!`)
 - `vi.hoisted()` for mock definitions in JS tests
 - Integration IDs match JS directory names
 - Colocated tests with `#[cfg(test)]`

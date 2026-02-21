@@ -156,7 +156,7 @@ pub struct UserId(Uuid);
 
 ### Crate Preferences
 
-- `tracing` (not `log`) for instrumentation.
+- `log` (with `log-fastly`) for instrumentation.
 - `similar_asserts` for test assertions.
 - `insta` for snapshot tests.
 
@@ -215,19 +215,12 @@ impl core::error::Error for MyError {}
 
 ---
 
-## Tracing Practices
+## Logging Practices
 
-- Use level-specific macros: `info!`, `debug!`, `trace!`, `warn!`, `error!`.
-- Provide structured data as named arguments.
+- Use `log` crate level-specific macros: `log::info!`, `log::debug!`, `log::trace!`, `log::warn!`, `log::error!`.
+- Provide context in log messages with format strings.
 - Format messages with present-tense verbs.
-- Apply `#[tracing::instrument]` with `err`, `skip()`, and `fields()`:
-
-```rust
-#[tracing::instrument(level = "debug", err, skip(password), fields(user_id = user.id))]
-async fn authenticate_user(user: &User, password: &[u8]) -> Result<AuthToken, AuthError> {
-    // ...
-}
-```
+- Use `log-fastly` as the backend for Fastly Compute.
 
 ---
 
@@ -395,7 +388,7 @@ both runtime behavior and build/tooling changes.
 ## What NOT to Do
 
 - Do not add unnecessary dependencies without justification.
-- Do not use `println!` / `eprintln!` — use `tracing` macros.
+- Do not use `println!` / `eprintln!` — use `log` macros.
 - Do not use `unwrap()` in production code — use `expect("should ...")`.
 - Do not use thiserror — use `derive_more::Display` + `impl Error`.
 - Do not use wildcard imports.
