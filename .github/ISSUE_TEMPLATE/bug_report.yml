@@ -1,0 +1,75 @@
+name: Bug Report
+description: Report a bug in Trusted Server
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below so we can reproduce and fix it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the bug.
+      placeholder: |
+        1. Configure trusted-server.toml with ...
+        2. Run `fastly compute serve`
+        3. Send a request to ...
+        4. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Which part of the project is affected?
+      multiple: true
+      options:
+        - Core (synthetic IDs, cookies, GDPR)
+        - Integrations (prebid, lockr, permutive, etc.)
+        - HTML processing / JS injection
+        - Ad serving (Equativ)
+        - Fastly runtime
+        - JS build pipeline
+        - CI / Tooling
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Git SHA or version.
+      placeholder: "commit abc1234"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste any error messages or logs.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help (OS, Rust version, related issues).
