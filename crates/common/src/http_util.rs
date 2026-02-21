@@ -4,7 +4,27 @@ use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use sha2::{Digest, Sha256};
 
+use crate::constants::INTERNAL_HEADERS;
 use crate::settings::Settings;
+
+/// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
+///
+/// This filters out all headers listed in [`INTERNAL_HEADERS`] to prevent leaking
+/// internal identity, geo-enrichment, and debugging data to downstream third-party
+/// services. Integrations that forward custom headers should use this utility
+/// instead of manually iterating over header names.
+pub fn copy_custom_headers(from: &Request, to: &mut Request) {
+    for header_name in from.get_header_names() {
+        let name_str = header_name.as_str();
+        if (name_str.starts_with("x-") || name_str.starts_with("X-"))
+            && !INTERNAL_HEADERS.contains(&name_str)
+        {
+            if let Some(value) = from.get_header(header_name) {
+                to.set_header(header_name, value);
+            }
+        }
+    }
+}
 
 /// Extracted request information for host rewriting.
 ///
@@ -445,6 +465,38 @@ mod tests {
         assert_eq!(
             info.scheme, "https",
             "Scheme should use X-Forwarded-Proto in chained proxy scenarios"
+        );
+    }
+
+    #[test]
+    fn test_copy_custom_headers_filters_internal() {
+        let mut req = Request::new(fastly::http::Method::GET, "https://example.com");
+        req.set_header("x-custom-1", "value1");
+        // HeaderName is case-insensitive and always lowercase, but set_header accepts strings
+        req.set_header("X-Custom-2", "value2");
+        req.set_header("x-synthetic-id", "should not copy");
+        req.set_header("x-geo-country", "US");
+
+        let mut target = Request::new(fastly::http::Method::GET, "https://target.com");
+        copy_custom_headers(&req, &mut target);
+
+        assert_eq!(
+            target.get_header("x-custom-1").unwrap().to_str().unwrap(),
+            "value1",
+            "Should copy arbitrary x-header"
+        );
+        assert_eq!(
+            target.get_header("x-custom-2").unwrap().to_str().unwrap(),
+            "value2",
+            "Should copy arbitrary X-header (case insensitive)"
+        );
+        assert!(
+            target.get_header("x-synthetic-id").is_none(),
+            "Should filter x-synthetic-id"
+        );
+        assert!(
+            target.get_header("x-geo-country").is_none(),
+            "Should filter x-geo-country"
         );
     }
 }

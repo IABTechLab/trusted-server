@@ -33,3 +33,29 @@ pub const HEADER_ACCEPT: HeaderName = HeaderName::from_static("accept");
 pub const HEADER_ACCEPT_LANGUAGE: HeaderName = HeaderName::from_static("accept-language");
 pub const HEADER_ACCEPT_ENCODING: HeaderName = HeaderName::from_static("accept-encoding");
 pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
+
+/// TS-internal header names that must NOT be forwarded to downstream third-party services.
+///
+/// These headers are used internally by Trusted Server for identity, geo-enrichment,
+/// debugging, and compression hints. Leaking them to external origins could expose
+/// user tracking data and internal implementation details.
+///
+/// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
+/// in `const` context.
+pub const INTERNAL_HEADERS: &[&str] = &[
+    "x-synthetic-id",
+    "x-pub-user-id",
+    "x-subject-id",
+    "x-consent-advertising",
+    "x-forwarded-for",
+    "x-geo-city",
+    "x-geo-continent",
+    "x-geo-coordinates",
+    "x-geo-country",
+    "x-geo-info-available",
+    "x-geo-metro-code",
+    "x-geo-region",
+    "x-request-id",
+    "x-compress-hint",
+    "x-debug-fastly-pop",
+];
