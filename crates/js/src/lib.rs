@@ -1,3 +1,3 @@
 pub mod bundle;
 
-pub use bundle::{bundle_for_filename, bundle_hash, bundle_hash_for_filename, TsjsBundle};
+pub use bundle::{all_module_ids, concatenate_modules, concatenated_hash, module_bundle};

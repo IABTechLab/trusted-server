@@ -5,8 +5,8 @@ use fastly::{Body, Request, Response};
 use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::create_synthetic_cookie;
+use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
 use crate::rsc_flight::RscFlightUrlRewriter;
@@ -16,28 +16,34 @@ use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
-/// Accepts: `tsjs-core(.min).js`, `tsjs-ext(.min).js`, `tsjs-creative(.min).js`
 ///
-/// Returns 404 for invalid paths or missing bundle files; otherwise serves the requested bundle.
+/// Concatenates core + enabled integration JS modules at runtime based on the
+/// `IntegrationRegistry`. The URL remains `/static/tsjs=tsjs-unified(.min).js`
+/// for backward compatibility.
 ///
 /// # Errors
 ///
 /// This function never returns an error; the Result type is for API consistency.
-pub fn handle_tsjs_dynamic(req: &Request) -> Result<Response, Report<TrustedServerError>> {
+pub fn handle_tsjs_dynamic(
+    req: &Request,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
+    const ALLOWED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
-    // Normalize .min.js to .js for matching
-    let normalized = filename.replace(".min.js", ".js");
-
-    let Some(body) = trusted_server_js::bundle_for_filename(&normalized) else {
+    if !ALLOWED_FILENAMES.contains(&filename) {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
-    };
+    }
 
-    let mut resp = serve_static_with_etag(body, req, "application/javascript; charset=utf-8");
+    // Concatenate core + enabled integration modules
+    let module_ids = integration_registry.js_module_ids();
+    let body = trusted_server_js::concatenate_modules(&module_ids);
+
+    let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
     resp.set_header(HEADER_X_COMPRESS_HINT, "on");
     Ok(resp)
 }
@@ -179,8 +185,8 @@ pub fn handle_publisher_request(
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
-    // Prebid.js requests are not intercepted here anymore. The HTML processor rewrites
-    // any Prebid script references to `/static/tsjs-ext.min.js` when auto-configure is enabled.
+    // Prebid.js requests are not intercepted here anymore. The HTML processor removes
+    // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
     // Extract request host and scheme from headers (supports X-Forwarded-Host/Proto for chained proxies)
     let request_info = RequestInfo::from_request(&req);
@@ -198,23 +204,8 @@ pub fn handle_publisher_request(
 
     // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
-    let has_synthetic_cookie = req
-        .get_header(header::COOKIE)
-        .and_then(|h| h.to_str().ok())
-        .map(|cookies| {
-            cookies.split(';').any(|cookie| {
-                cookie
-                    .trim_start()
-                    .starts_with(&format!("{}=", COOKIE_SYNTHETIC_ID))
-            })
-        })
-        .unwrap_or(false);
 
-    log::debug!(
-        "Proxy synthetic IDs - trusted: {}, has_cookie: {}",
-        synthetic_id,
-        has_synthetic_cookie
-    );
+    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -311,12 +302,7 @@ pub fn handle_publisher_request(
     }
 
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-    if !has_synthetic_cookie {
-        response.set_header(
-            header::SET_COOKIE,
-            create_synthetic_cookie(settings, synthetic_id.as_str()),
-        );
-    }
+    set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
 
     Ok(response)
 }
@@ -324,8 +310,9 @@ pub fn handle_publisher_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::Method;
+    use fastly::http::{Method, StatusCode};
 
     #[test]
     fn test_content_type_detection() {
@@ -437,6 +424,34 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn tsjs_dynamic_returns_not_found_for_unknown_filename() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=unknown.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_unified_bundle_for_known_filename() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-unified.min.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(response.get_status(), StatusCode::OK);
     }
 
     // Tests related to serving Prebid.js directly or intercepting its paths were removed.

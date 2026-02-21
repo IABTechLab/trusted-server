@@ -83,32 +83,6 @@ export function renderAllAdUnits(): void {
   }
 }
 
-// Swap the slot contents for a creative iframe and write HTML into it safely.
-export function renderCreativeIntoSlot(slotId: string, html: string): void {
-  const el = findSlot(slotId);
-  if (!el) {
-    log.warn('renderCreativeIntoSlot: slot not found; skipping render', { slotId });
-    return;
-  }
-  try {
-    // Clear previous content
-    el.innerHTML = '';
-    // Determine size if available
-    const unit = getUnit(slotId);
-    const sz = (unit && firstSize(unit)) || [300, 250];
-    const iframe = createAdIframe(el, {
-      name: `tsjs_iframe_${slotId}`,
-      title: 'Ad content',
-      width: sz[0],
-      height: sz[1],
-    });
-    writeHtmlToIframe(iframe, html);
-    log.info('renderCreativeIntoSlot: rendered', { slotId, width: sz[0], height: sz[1] });
-  } catch (err) {
-    log.warn('renderCreativeIntoSlot: failed', { slotId, err });
-  }
-}
-
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
 // Construct a sandboxed iframe sized for the ad so we can render arbitrary HTML.
@@ -155,27 +129,10 @@ export function createAdIframe(
   return iframe;
 }
 
-function writeHtmlToIframe(iframe: HTMLIFrameElement, creativeHtml: string): void {
-  try {
-    const doc = (iframe.contentDocument || iframe.contentWindow?.document) as Document | undefined;
-    if (!doc) return;
-    const html = buildIframeDocument(creativeHtml);
-    doc.open();
-    doc.write(html);
-    doc.close();
-  } catch (err) {
-    log.warn('renderCreativeIntoSlot: iframe write failed', { err });
-  }
-}
-
-function buildIframeDocument(creativeHtml: string): string {
+// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
+export function buildCreativeDocument(creativeHtml: string): string {
   return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', NORMALIZE_CSS).replace(
     '%CREATIVE_HTML%',
     creativeHtml
   );
-}
-
-// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
-export function buildCreativeDocument(creativeHtml: string): string {
-  return buildIframeDocument(creativeHtml);
 }

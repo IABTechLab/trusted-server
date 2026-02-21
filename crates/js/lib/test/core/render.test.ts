@@ -6,13 +6,17 @@ describe('render', () => {
     document.body.innerHTML = '';
   });
 
-  it('injects creative into existing slot (via iframe)', async () => {
-    const { renderCreativeIntoSlot } = await import('../../src/core/render');
+  it('creates a sandboxed iframe with creative HTML via srcdoc', async () => {
+    const { createAdIframe, buildCreativeDocument } = await import('../../src/core/render');
     const div = document.createElement('div');
     div.id = 'slotA';
     document.body.appendChild(div);
-    renderCreativeIntoSlot('slotA', '<span>ad</span>');
-    const iframe = document.getElementById('slotA')!.querySelector('iframe');
+
+    const iframe = createAdIframe(div, { name: 'test', width: 300, height: 250 });
+    iframe.srcdoc = buildCreativeDocument('<span>ad</span>');
+
     expect(iframe).toBeTruthy();
+    expect(iframe.srcdoc).toContain('<span>ad</span>');
+    expect(div.querySelector('iframe')).toBe(iframe);
   });
 });

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -16,7 +15,7 @@ use crate::integrations::{
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::get_or_generate_synthetic_id;
+use crate::synthetic::get_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -140,10 +139,17 @@ impl IntegrationProxy for TestlightIntegration {
             .validate()
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
-        let synthetic_id = get_or_generate_synthetic_id(settings, &req)
-            .change_context(Self::error("Failed to fetch or mint synthetic ID"))?;
+        // Read synthetic ID from header (set by registry) or cookie
+        let synthetic_id = get_synthetic_id(&req)
+            .change_context(Self::error("Failed to read synthetic ID"))?
+            .ok_or_else(|| {
+                Report::new(Self::error(
+                    "Synthetic ID not found in request header or cookie — \
+                     check that the integration registry propagated it",
+                ))
+            })?;
 
-        payload.user.id = Some(synthetic_id.clone());
+        payload.user.id = Some(synthetic_id);
 
         let payload_bytes = serde_json::to_vec(&payload)
             .change_context(Self::error("Failed to serialize request body"))?;
@@ -175,7 +181,6 @@ impl IntegrationProxy for TestlightIntegration {
             }
         }
 
-        response.set_header(HEADER_X_SYNTHETIC_ID, &synthetic_id);
         Ok(response)
     }
 }
@@ -214,7 +219,7 @@ fn default_timeout_ms() -> u32 {
 
 fn default_shim_src() -> String {
     // Testlight is included in the unified bundle, so we return the unified script source
-    tsjs::unified_script_src()
+    tsjs::tsjs_script_src_all()
 }
 
 fn default_enabled() -> bool {
@@ -255,7 +260,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_replaces_integration_script() {
-        let shim_src = tsjs::unified_script_src();
+        let shim_src = tsjs::tsjs_script_src_all();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),
@@ -285,7 +290,7 @@ mod tests {
 
     #[test]
     fn html_rewriter_is_noop_when_disabled() {
-        let shim_src = tsjs::unified_script_src();
+        let shim_src = tsjs::tsjs_script_src_all();
         let config = TestlightConfig {
             enabled: true,
             endpoint: "https://example.com/openrtb".to_string(),

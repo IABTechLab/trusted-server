@@ -1,90 +1,60 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use hex::encode;
 use sha2::{Digest, Sha256};
 
-#[derive(Copy, Clone)]
-struct TsjsMeta {
-    filename: &'static str,
-    bundle: &'static str,
+include!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
+
+/// Return the JS bundle content for a given module ID (e.g., "core", "prebid").
+#[must_use]
+pub fn module_bundle(id: &str) -> Option<&'static str> {
+    module_map().get(id).copied()
 }
 
-impl TsjsMeta {
-    const fn new(filename: &'static str, bundle: &'static str) -> Self {
-        Self { filename, bundle }
-    }
+/// Return all available module IDs, in discovery order (core first).
+#[must_use]
+pub fn all_module_ids() -> Vec<&'static str> {
+    TSJS_MODULES.iter().map(|m| m.id).collect()
 }
 
-const TSJS_BUNDLE_COUNT: usize = 1;
+/// Concatenate core + the requested integration modules into a single JS string.
+///
+/// Core is always included first regardless of whether it appears in `ids`.
+/// Each IIFE is separated by `;\n` for safety.
+#[must_use]
+pub fn concatenate_modules(ids: &[&str]) -> String {
+    let map = module_map();
+    let mut parts: Vec<&str> = Vec::new();
 
-#[repr(usize)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum TsjsBundle {
-    Unified,
-}
-
-const METAS: [TsjsMeta; TSJS_BUNDLE_COUNT] = [TsjsMeta::new(
-    "tsjs-unified.js",
-    include_str!(concat!(env!("OUT_DIR"), "/tsjs-unified.js")),
-)];
-
-const ALL_BUNDLES: [TsjsBundle; TSJS_BUNDLE_COUNT] = [TsjsBundle::Unified];
-
-impl TsjsBundle {
-    pub const COUNT: usize = TSJS_BUNDLE_COUNT;
-
-    #[must_use]
-    pub const fn filename(self) -> &'static str {
-        METAS[self as usize].filename
+    // Core always first
+    if let Some(core) = map.get("core") {
+        parts.push(core);
     }
 
-    #[must_use]
-    pub fn minified_filename(self) -> String {
-        let base = self.filename();
-        match base.strip_suffix(".js") {
-            Some(stem) => format!("{stem}.min.js"),
-            None => format!("{base}.min.js"),
+    // Then requested modules (excluding core, already included)
+    for id in ids {
+        if *id == "core" {
+            continue;
+        }
+        if let Some(bundle) = map.get(id) {
+            parts.push(bundle);
         }
     }
 
-    pub(crate) const fn bundle(self) -> &'static str {
-        METAS[self as usize].bundle
-    }
-
-    pub(crate) fn filename_map() -> &'static std::collections::HashMap<&'static str, TsjsBundle> {
-        static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, TsjsBundle>> =
-            std::sync::OnceLock::new();
-
-        MAP.get_or_init(|| {
-            ALL_BUNDLES
-                .iter()
-                .copied()
-                .map(|bundle| (bundle.filename(), bundle))
-                .collect::<std::collections::HashMap<_, _>>()
-        })
-    }
-
-    #[must_use]
-    pub fn from_filename(name: &str) -> Option<Self> {
-        Self::filename_map().get(name).copied()
-    }
+    parts.join(";\n")
 }
 
+/// SHA-256 hash of the concatenated modules, for cache-busting URLs.
 #[must_use]
-pub fn bundle_hash(bundle: TsjsBundle) -> String {
-    hash_bundle(bundle.bundle())
-}
-
-#[must_use]
-pub fn bundle_for_filename(name: &str) -> Option<&'static str> {
-    TsjsBundle::from_filename(name).map(TsjsBundle::bundle)
-}
-
-#[must_use]
-pub fn bundle_hash_for_filename(name: &str) -> Option<String> {
-    TsjsBundle::from_filename(name).map(|bundle| hash_bundle(bundle.bundle()))
-}
-
-fn hash_bundle(bundle: &'static str) -> String {
+pub fn concatenated_hash(ids: &[&str]) -> String {
+    let body = concatenate_modules(ids);
     let mut hasher = Sha256::new();
-    hasher.update(bundle.as_bytes());
+    hasher.update(body.as_bytes());
     encode(hasher.finalize())
+}
+
+fn module_map() -> &'static HashMap<&'static str, &'static str> {
+    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    MAP.get_or_init(|| TSJS_MODULES.iter().map(|m| (m.id, m.bundle)).collect())
 }

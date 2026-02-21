@@ -310,7 +310,7 @@ pub struct Settings {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "map_from_obj_or_str")]
     pub response_headers: HashMap<String, String>,
     pub request_signing: Option<RequestSigning>,
     #[serde(default)]
@@ -423,6 +423,48 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
 // This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
 // represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
 // JSON arrays or comma-separated values.
+/// Deserializes a `HashMap<String, String>` from either:
+/// - A TOML table / JSON object (standard deserialization)
+/// - A JSON string (e.g. from env var: `'{"Key": "value"}'`)
+///
+/// This allows setting map fields via environment variables while
+/// preserving key casing and special characters like hyphens.
+pub(crate) fn map_from_obj_or_str<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = JsonValue::deserialize(deserializer)?;
+    match v {
+        JsonValue::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    JsonValue::String(s) => s,
+                    other => other.to_string(),
+                };
+                Ok((k, val))
+            })
+            .collect(),
+        JsonValue::String(s) => {
+            let txt = s.trim();
+            if txt.starts_with('{') {
+                serde_json::from_str::<HashMap<String, String>>(txt)
+                    .map_err(serde::de::Error::custom)
+            } else {
+                Err(serde::de::Error::custom(
+                    "expected JSON object string, e.g. '{\"Key\": \"value\"}'",
+                ))
+            }
+        }
+        JsonValue::Null => Ok(HashMap::new()),
+        other => Err(serde::de::Error::custom(format!(
+            "expected object or JSON string, got {other}",
+        ))),
+    }
+}
+
 pub(crate) fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -788,6 +830,33 @@ mod tests {
                         });
                     });
                 });
+            },
+        );
+    }
+
+    #[test]
+    fn test_response_headers_override_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let env_key = format!(
+            "{}{}RESPONSE_HEADERS",
+            ENVIRONMENT_VARIABLE_PREFIX, ENVIRONMENT_VARIABLE_SEPARATOR,
+        );
+
+        temp_env::with_var(
+            env_key,
+            Some(r#"{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}"#),
+            || {
+                let settings = Settings::from_toml(&toml_str)
+                    .expect("Settings should parse with JSON response_headers env");
+                assert_eq!(settings.response_headers.len(), 2);
+                assert_eq!(
+                    settings.response_headers.get("X-Robots-Tag"),
+                    Some(&"noindex".to_string())
+                );
+                assert_eq!(
+                    settings.response_headers.get("X-Custom-Header"),
+                    Some(&"custom value".to_string())
+                );
             },
         );
     }

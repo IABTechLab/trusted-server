@@ -434,9 +434,15 @@ Cache-Control = "public, max-age=3600"
 
 **Environment Override**:
 
+Use a JSON object to preserve header name casing and hyphens:
+
 ```bash
-TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER="custom value"
+TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
 ```
+
+::: tip Why JSON?
+Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER` lose hyphens and casing (becoming `x_custom_header`). The JSON format preserves exact header names.
+:::
 
 **Use Cases**:
 
