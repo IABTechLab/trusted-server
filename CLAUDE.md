@@ -87,7 +87,7 @@ cargo install viceroy          # Fastly local test runtime
 
 - Use the **2024 edition** of Rust.
 - Prefer `derive_more` over manual trait implementations.
-- Use `#[expect(lint, reason = "...")]` over `#[allow(lint)]`.
+- Use `#[allow(lint)]` to suppress lints when necessary.
 - Use `rustfmt` to format code.
 - Invoke clippy with `--all-targets --all-features -- -D warnings`.
 - Use `cargo doc --no-deps --all-features` for checking documentation.
@@ -106,12 +106,7 @@ pub struct UserId(Uuid);
 
 - Functions should **never** take more than 7 arguments — use a struct instead.
 - Take references for immutable access, mutable references for modification. Only take ownership when the function consumes the value.
-- Make functions `const` whenever possible.
-- Preferred argument types (when it doesn't reduce performance):
-  - `impl AsRef<str>` instead of `&str` or `&String`
-  - `impl AsRef<Path>` instead of `&Path` or `&PathBuf`
-  - `impl IntoIterator<Item = &T>` when only iterating
-  - `&[T]` instead of `&Vec<T>`
+- Prefer `&[T]` instead of `&Vec<T>`.
 - Never use `impl Into<Option<_>>` — it hides that `None` can be passed.
 
 ### `From` / `Into`
@@ -120,14 +115,6 @@ pub struct UserId(Uuid);
 - Prefer `Type::from(value)` over `value.into()` for clarity.
 - For wrapper types (`Cow`, `Arc`, `Rc`, `Box`), use explicit constructors.
 
-### Smart Pointers
-
-- Always use `Arc::clone(&pointer)` instead of `pointer.clone()` to clearly indicate you're cloning the reference.
-
-### Async Patterns
-
-- Use `impl Future<Output = T> + Send` in trait definitions.
-
 ### Allocations
 
 - Minimize allocations — reuse buffers, prefer borrowed data.
@@ -135,18 +122,15 @@ pub struct UserId(Uuid);
 
 ### Naming Conventions
 
-- Do **not** prefix test names with `test_` (avoids `test::test_name`).
 - Avoid abbreviations unless widely recognized (e.g., `Http`, `Json` — not `Ctx`).
 - Do not suffix names with their types (`users` not `usersList`).
 
 ### Import Style
 
 - No local imports within functions or blocks.
-- No wildcard imports (`use super::*`, `use crate::module::*`).
+- `use super::*` is acceptable in `#[cfg(test)]` modules only.
 - Never use a prelude `use crate::prelude::*`.
-- Prefer `core` > `alloc` > `std` to minimize dependencies.
 - Use `use Trait as _` when you only need trait methods, not the trait name.
-- Prefer qualified imports for frequently used types.
 
 ### Comments and Assertions
 
@@ -157,8 +141,6 @@ pub struct UserId(Uuid);
 ### Crate Preferences
 
 - `log` (with `log-fastly`) for instrumentation.
-- `similar_asserts` for test assertions.
-- `insta` for snapshot tests.
 
 ---
 
@@ -195,7 +177,6 @@ impl core::error::Error for MyError {}
 - Test both happy paths and error conditions.
 - Use `expect()` / `expect_err()` with `"should ..."` messages instead of `unwrap()`.
 - Use `json!` macro instead of raw JSON strings.
-- Do not prefix test function names with `test_`.
 - Follow the same code quality standards in test code as production code.
 - For JS tests: use `vi.hoisted()` for mock definitions referenced in `vi.mock()` factories.
 
@@ -391,7 +372,7 @@ both runtime behavior and build/tooling changes.
 - Do not use `println!` / `eprintln!` — use `log` macros.
 - Do not use `unwrap()` in production code — use `expect("should ...")`.
 - Do not use thiserror — use `derive_more::Display` + `impl Error`.
-- Do not use wildcard imports.
+- Do not use wildcard imports (except `use super::*` in test modules).
 - Do not commit `.env` files or secrets.
 - Do not make large refactors without approval.
 - Always run tests and linting before committing.
