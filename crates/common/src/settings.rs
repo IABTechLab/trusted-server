@@ -56,7 +56,6 @@ impl Publisher {
             })
             .unwrap_or_else(|| self.origin_url.clone())
     }
-
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -363,18 +362,10 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let toml = File::from_str(toml_str, FileFormat::Toml);
-        let config = Config::builder().add_source(toml).build().change_context(
-            TrustedServerError::Configuration {
-                message: "Failed to build configuration".to_string(),
-            },
-        )?;
         let settings: Self =
-            config
-                .try_deserialize()
-                .change_context(TrustedServerError::Configuration {
-                    message: "Failed to deserialize configuration".to_string(),
-                })?;
+            toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
+                message: "Failed to deserialize TOML configuration".to_string(),
+            })?;
 
         Ok(settings)
     }
