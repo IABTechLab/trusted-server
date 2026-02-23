@@ -21,6 +21,7 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 pub struct Publisher {
     pub domain: String,
     pub cookie_domain: String,
+    #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
@@ -56,16 +57,6 @@ impl Publisher {
             .unwrap_or_else(|| self.origin_url.clone())
     }
 
-    fn normalize(&mut self) {
-        let trimmed = self.origin_url.trim_end_matches('/');
-        if trimmed != self.origin_url {
-            log::warn!(
-                "publisher.origin_url ends with '/': normalizing to {}",
-                trimmed
-            );
-            self.origin_url = trimmed.to_string();
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -122,6 +113,16 @@ impl IntegrationSettings {
         }
     }
 
+    /// Normalizes all entries in place, converting JSON-encoded strings from
+    /// environment variables into their proper typed representations.
+    /// Called eagerly after deserialization so that TOML serialization in
+    /// build.rs preserves correct types.
+    pub fn normalize(&mut self) {
+        for value in self.entries.values_mut() {
+            *value = Self::normalize_env_value(value.clone());
+        }
+    }
+
     /// Retrieves and validates a typed configuration for an integration.
     ///
     /// # Errors
@@ -139,9 +140,7 @@ impl IntegrationSettings {
             None => return Ok(None),
         };
 
-        let normalized = Self::normalize_env_value(raw.clone());
-
-        let config: T = serde_json::from_value(normalized).change_context(
+        let config: T = serde_json::from_value(raw.clone()).change_context(
             TrustedServerError::Configuration {
                 message: format!(
                     "Integration '{integration_id}' configuration could not be parsed"
@@ -355,15 +354,41 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Creates a new [`Settings`] instance from a TOML string.
+    /// Creates a new [`Settings`] instance from a pre-built TOML string.
     ///
-    /// Parses the provided TOML configuration and applies any environment
-    /// variable overrides using the `TRUSTED_SERVER__` prefix.
+    /// Use this for the runtime path where the TOML has already been
+    /// fully resolved (env vars baked in by build.rs).
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        let toml = File::from_str(toml_str, FileFormat::Toml);
+        let config = Config::builder().add_source(toml).build().change_context(
+            TrustedServerError::Configuration {
+                message: "Failed to build configuration".to_string(),
+            },
+        )?;
+        let settings: Self =
+            config
+                .try_deserialize()
+                .change_context(TrustedServerError::Configuration {
+                    message: "Failed to deserialize configuration".to_string(),
+                })?;
+
+        Ok(settings)
+    }
+
+    /// Creates a new [`Settings`] instance from a TOML string, applying
+    /// environment variable overrides using the `TRUSTED_SERVER__` prefix.
+    ///
+    /// Used by build.rs to merge the base config with env vars before
+    /// baking the result into the binary.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
             .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
@@ -383,7 +408,7 @@ impl Settings {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
 
-        settings.publisher.normalize();
+        settings.integrations.normalize();
         Ok(settings)
     }
 
@@ -408,6 +433,16 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
+    if value.ends_with('/') {
+        let mut err = ValidationError::new("trailing_slash");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must not end with '/'".into());
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn validate_path(value: &str) -> Result<(), ValidationError> {
@@ -491,7 +526,24 @@ where
         JsonValue::String(s) => {
             let txt = s.trim();
             if txt.starts_with('[') {
-                serde_json::from_str::<Vec<T>>(txt).map_err(serde::de::Error::custom)
+                if let Ok(vec) = serde_json::from_str::<Vec<T>>(txt) {
+                    return Ok(vec);
+                }
+                // Not valid JSON array — strip brackets and split on commas
+                let inner = txt[1..txt.len() - 1].trim();
+                let parts: Vec<&str> = inner
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                let mut out: Vec<T> = Vec::with_capacity(parts.len());
+                for p in parts {
+                    let json = format!("\"{}\"", p.replace('"', "\\\""));
+                    let parsed: T =
+                        serde_json::from_str(&json).map_err(serde::de::Error::custom)?;
+                    out.push(parsed);
+                }
+                Ok(out)
             } else {
                 let parts = if txt.contains(',') {
                     txt.split(',')
@@ -524,8 +576,10 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
 
-    use crate::integrations::{nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig};
-    use crate::streaming_replacer::create_url_replacer;
+    use crate::integrations::{
+        nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
+        testlight::TestlightConfig,
+    };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
@@ -617,31 +671,17 @@ mod tests {
     }
 
     #[test]
-    fn from_toml_normalizes_trailing_slash_in_origin_url() {
+    fn validate_rejects_trailing_slash_in_origin_url() {
         let toml_str = crate_test_settings_str().replace(
             r#"origin_url = "https://origin.test-publisher.com""#,
             r#"origin_url = "https://origin.test-publisher.com/""#,
         );
 
-        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
-        assert_eq!(
-            settings.publisher.origin_url, "https://origin.test-publisher.com",
-            "origin_url should be normalized by trimming trailing slashes"
-        );
-
-        let origin_host = settings.publisher.origin_host();
-        let mut replacer = create_url_replacer(
-            &origin_host,
-            &settings.publisher.origin_url,
-            "proxy.example.com",
-            "https",
-        );
-
-        let processed = replacer.process_chunk(b"https://origin.test-publisher.com/news", true);
-        let rewritten = String::from_utf8(processed).expect("should be valid UTF-8");
-        assert_eq!(
-            rewritten, "https://proxy.example.com/news",
-            "rewriting should keep the delimiter slash between host and path"
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
+        let result = settings.validate();
+        assert!(
+            result.is_err(),
+            "origin_url ending with '/' should fail validation"
         );
     }
 
@@ -709,7 +749,7 @@ mod tests {
             Some("https://origin.test-publisher.com"),
             || {
                 temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                    let res = Settings::from_toml(&toml_str);
+                    let res = Settings::from_toml_and_env(&toml_str);
                     if res.is_err() {
                         eprintln!("JSON override error: {:?}", res.as_ref().err());
                     }
@@ -761,7 +801,7 @@ mod tests {
             || {
                 temp_env::with_var(env_key0, Some("smartadserver"), || {
                     temp_env::with_var(env_key1, Some("openx"), || {
-                        let res = Settings::from_toml(&toml_str);
+                        let res = Settings::from_toml_and_env(&toml_str);
                         if res.is_err() {
                             eprintln!("Indexed override error: {:?}", res.as_ref().err());
                         }
@@ -820,7 +860,7 @@ mod tests {
                 temp_env::with_var(path_key, Some("^/env-handler"), || {
                     temp_env::with_var(username_key, Some("env-user"), || {
                         temp_env::with_var(password_key, Some("env-pass"), || {
-                            let settings = Settings::from_toml(&toml_str)
+                            let settings = Settings::from_toml_and_env(&toml_str)
                                 .expect("Settings should load from env");
                             assert_eq!(settings.handlers.len(), 1);
                             let handler = &settings.handlers[0];
@@ -846,7 +886,7 @@ mod tests {
             env_key,
             Some(r#"{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}"#),
             || {
-                let settings = Settings::from_toml(&toml_str)
+                let settings = Settings::from_toml_and_env(&toml_str)
                     .expect("Settings should parse with JSON response_headers env");
                 assert_eq!(settings.response_headers.len(), 2);
                 assert_eq!(
@@ -880,7 +920,7 @@ mod tests {
             ),
             Some("https://change-publisher.com"),
             || {
-                let settings = Settings::from_toml(&crate_test_settings_str());
+                let settings = Settings::from_toml_and_env(&crate_test_settings_str());
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
@@ -904,7 +944,7 @@ mod tests {
             ),
             Some("https://change-publisher.com"),
             || {
-                let settings = Settings::from_toml(&toml_str);
+                let settings = Settings::from_toml_and_env(&toml_str);
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
@@ -1009,7 +1049,7 @@ mod tests {
                         temp_env::with_var(timeout_key, Some("2500"), || {
                             temp_env::with_var(rewrite_key, Some("true"), || {
                                 temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml(&toml_str)
+                                    let settings = Settings::from_toml_and_env(&toml_str)
                                         .expect("Settings should load");
 
                                     let config = settings
@@ -1056,6 +1096,86 @@ mod tests {
             .expect("integration parsing should succeed");
 
         assert!(config.is_none(), "Disabled integrations should be skipped");
+    }
+
+    /// Tests the full build.rs round-trip: env vars are baked into Settings
+    /// at build time via from_toml_and_env, serialized to TOML, then parsed
+    /// back at runtime via from_toml. Verifies that env-sourced integration
+    /// values (strings like "true") are normalized to proper types so the
+    /// serialized TOML has correct types.
+    #[test]
+    fn test_env_var_roundtrip_normalizes_integration_types() {
+        let toml_str = crate_test_settings_str();
+
+        let integration_prefix = format!(
+            "{}{}INTEGRATIONS{}TESTLIGHT{}",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+        );
+        let enabled_key = format!("{}ENABLED", integration_prefix);
+        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
+
+        temp_env::with_var(enabled_key, Some("true"), || {
+            temp_env::with_var(
+                endpoint_key,
+                Some("https://testlight-env.test/auction"),
+                || {
+                    // Step 1: Parse with env vars (what build.rs does)
+                    let settings =
+                        Settings::from_toml_and_env(&toml_str).expect("Settings should parse");
+
+                    // Verify normalization converted "true" to bool
+                    let raw = settings.integrations.get("testlight").unwrap();
+                    assert!(
+                        raw.get("enabled").unwrap().is_boolean(),
+                        "enabled should be normalized to bool, got: {:?}",
+                        raw.get("enabled")
+                    );
+
+                    // Step 2: Serialize to TOML (what build.rs does)
+                    let merged_toml =
+                        toml::to_string_pretty(&settings).expect("Should serialize to TOML");
+
+                    // Step 3: Parse back (what runtime does)
+                    let runtime_settings =
+                        Settings::from_toml(&merged_toml).expect("Runtime should parse");
+
+                    let config = runtime_settings
+                        .integration_config::<TestlightConfig>("testlight")
+                        .expect("should get config")
+                        .expect("should be enabled");
+
+                    assert_eq!(config.endpoint, "https://testlight-env.test/auction");
+                    assert!(config.enabled);
+                },
+            );
+        });
+    }
+
+    /// Verifies that from_toml does NOT read environment variables.
+    /// The runtime path should only use the pre-built TOML.
+    #[test]
+    fn test_from_toml_ignores_env_vars() {
+        let toml_str = crate_test_settings_str();
+
+        temp_env::with_var(
+            format!(
+                "{}{}PUBLISHER{}DOMAIN",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+            ),
+            Some("env-override.com"),
+            || {
+                let settings = Settings::from_toml(&toml_str).expect("should parse");
+                assert_eq!(
+                    settings.publisher.domain, "test-publisher.com",
+                    "from_toml should ignore env vars"
+                );
+            },
+        );
     }
 
     #[test]
