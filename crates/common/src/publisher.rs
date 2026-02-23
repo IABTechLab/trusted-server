@@ -5,7 +5,10 @@ use fastly::{Body, Request, Response};
 use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::constants::{
+    COOKIE_SYNTHETIC_ID, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_COMPRESS_HINT,
+    HEADER_X_SYNTHETIC_ID, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+};
 use crate::cookies::create_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -440,6 +443,13 @@ pub fn handle_publisher_request_streaming(
             header::SET_COOKIE,
             create_synthetic_cookie(settings, synthetic_id.as_str()),
         );
+    }
+
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
     }
 
     // Add global settings headers before streaming since we commit headers
