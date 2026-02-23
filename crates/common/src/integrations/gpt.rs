@@ -10,11 +10,11 @@
 //! 4. Auxiliary scripts – viewability, monitoring, error reporting
 //!
 //! All of these are served from `securepubads.g.doubleclick.net`. The
-//! integration proxies these scripts
-//! through the publisher's domain while a client-side shim intercepts
-//! dynamic script insertions and rewrites their URLs to the first-party
-//! proxy so that every subsequent fetch in the cascade routes back through
-//! the trusted server.
+//! integration proxies these scripts through the publisher's domain
+//! while a client-side shim intercepts dynamic script insertions and
+//! rewrites their URLs to the first-party proxy so that every
+//! subsequent fetch in the cascade routes back through the trusted
+//! server.
 //!
 //! ## How It Works
 //!

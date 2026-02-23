@@ -73,7 +73,7 @@ rewrite_script = true
 - `GET /integrations/gpt/pagead/*` -- Proxies secondary GPT scripts and resources
 - `GET /integrations/gpt/tag/*` -- Proxies tag-path resources
 
-Successful proxy responses include `X-GPT-Proxy: true` and `X-Script-Source` headers for debugging.
+Successful proxy responses include the `X-GPT-Proxy: true` header for debugging.
 
 ## Features
 
@@ -147,8 +147,8 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ## Implementation
 
-- **Rust**: [crates/common/src/integrations/gpt.rs](https://github.com/AnomalyCo/trusted-server/blob/main/crates/common/src/integrations/gpt.rs)
-- **TypeScript**: [crates/js/lib/src/integrations/gpt/](https://github.com/AnomalyCo/trusted-server/blob/main/crates/js/lib/src/integrations/gpt/)
+- **Rust**: [crates/common/src/integrations/gpt.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/gpt.rs)
+- **TypeScript**: [crates/js/lib/src/integrations/gpt/](https://github.com/IABTechLab/trusted-server/blob/main/crates/js/lib/src/integrations/gpt/)
 
 ## Next Steps
 
