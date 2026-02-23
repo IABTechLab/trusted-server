@@ -9,6 +9,7 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use validator::Validate;
+use crate::settings::map_from_obj_or_str;
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
@@ -72,7 +73,7 @@ pub struct PrebidIntegrationConfig {
     /// [integrations.prebid.bid_param_overrides.kargo]
     /// placementId = "server_side_placement_123"
     /// ```
-    #[serde(default)]
+    #[serde(default, deserialize_with = "map_from_obj_or_str")]
     pub bid_param_overrides: HashMap<String, Json>,
 }
 
