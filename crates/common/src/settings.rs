@@ -1090,8 +1090,8 @@ mod tests {
     }
 
     /// Tests the full build.rs round-trip: env vars are baked into Settings
-    /// at build time via from_toml_and_env, serialized to TOML, then parsed
-    /// back at runtime via from_toml. Verifies that env-sourced integration
+    /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
+    /// back at runtime via `from_toml`. Verifies that env-sourced integration
     /// values (strings like "true") are normalized to proper types so the
     /// serialized TOML has correct types.
     #[test]
@@ -1145,7 +1145,7 @@ mod tests {
         });
     }
 
-    /// Verifies that from_toml does NOT read environment variables.
+    /// Verifies that `from_toml` does NOT read environment variables.
     /// The runtime path should only use the pre-built TOML.
     #[test]
     fn test_from_toml_ignores_env_vars() {
