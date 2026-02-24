@@ -35,6 +35,12 @@ use crate::settings::{IntegrationConfig, Settings};
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 
+/// Regex pattern for validating GTM container IDs.
+/// Format: GTM-XXXXXX where X is alphanumeric.
+static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^GTM-[A-Z0-9]{4,20}$").expect("GTM container ID regex should compile")
+});
+
 /// Regex pattern for matching and rewriting GTM and Google Analytics URLs.
 ///
 /// Handles full and protocol-relative URL variants:
@@ -69,7 +75,7 @@ pub struct GoogleTagManagerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// GTM Container ID (e.g., "GTM-XXXXXX").
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 50), custom(function = "validate_container_id"))]
     pub container_id: String,
     /// Upstream URL for GTM (defaults to <https://www.googletagmanager.com>).
     #[serde(default = "default_upstream")]
@@ -99,6 +105,16 @@ fn default_cache_max_age() -> u32 {
     900 // Match Google's default
 }
 
+fn validate_container_id(container_id: &str) -> Result<(), validator::ValidationError> {
+    if GTM_CONTAINER_ID_PATTERN.is_match(container_id) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new(
+            "container_id must match format GTM-XXXXXX where X is alphanumeric",
+        ))
+    }
+}
+
 pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
 }
@@ -116,11 +132,7 @@ impl GoogleTagManagerIntegration {
     }
 
     fn upstream_url(&self) -> &str {
-        if self.config.upstream_url.is_empty() {
-            DEFAULT_UPSTREAM
-        } else {
-            &self.config.upstream_url
-        }
+        &self.config.upstream_url
     }
 
     /// Rewrite GTM and Google Analytics URLs to first-party proxy paths.
@@ -163,12 +175,10 @@ impl GoogleTagManagerIntegration {
             format!("{}/gtm.js", upstream_base)
         } else if path.ends_with("/gtag/js") || path.ends_with("/gtag.js") {
             format!("{}/gtag/js", upstream_base) // Always normalize to /gtag/js upstream as it's canonical
+        } else if path.ends_with("/g/collect") {
+            "https://www.google-analytics.com/g/collect".to_string()
         } else if path.ends_with("/collect") {
-            if path.contains("/g/") {
-                "https://www.google-analytics.com/g/collect".to_string()
-            } else {
-                "https://www.google-analytics.com/collect".to_string()
-            }
+            "https://www.google-analytics.com/collect".to_string()
         } else {
             return None;
         };
@@ -443,7 +453,7 @@ mod tests {
     fn test_attribute_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST".to_string(),
+            container_id: "GTM-TEST1234".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
             cache_max_age: default_cache_max_age(),
         };
@@ -460,11 +470,14 @@ mod tests {
         let action = IntegrationAttributeRewriter::rewrite(
             &*integration,
             "src",
-            "https://www.googletagmanager.com/gtm.js?id=GTM-TEST",
+            "https://www.googletagmanager.com/gtm.js?id=GTM-TEST1234",
             &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
-            assert_eq!(val, "/integrations/google_tag_manager/gtm.js?id=GTM-TEST");
+            assert_eq!(
+                val,
+                "/integrations/google_tag_manager/gtm.js?id=GTM-TEST1234"
+            );
         } else {
             panic!("Expected Replace action for HTTPS URL, got {:?}", action);
         }
@@ -473,11 +486,14 @@ mod tests {
         let action = IntegrationAttributeRewriter::rewrite(
             &*integration,
             "src",
-            "//www.googletagmanager.com/gtm.js?id=GTM-TEST",
+            "//www.googletagmanager.com/gtm.js?id=GTM-TEST1234",
             &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
-            assert_eq!(val, "/integrations/google_tag_manager/gtm.js?id=GTM-TEST");
+            assert_eq!(
+                val,
+                "/integrations/google_tag_manager/gtm.js?id=GTM-TEST1234"
+            );
         } else {
             panic!(
                 "Expected Replace action for protocol-relative URL, got {:?}",
@@ -534,7 +550,7 @@ mod tests {
     fn test_script_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST".to_string(),
+            container_id: "GTM-TEST1234".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
             cache_max_age: default_cache_max_age(),
         };
@@ -599,11 +615,11 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
     #[test]
     fn test_upstream_url_logic() {
-        // Default upstream
+        // Default upstream (via serde default)
         let config_default = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-123".to_string(),
-            upstream_url: "".to_string(), // Empty string should fallback to default in accessor
+            container_id: "GTM-TEST1234123".to_string(),
+            upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
         };
         let integration_default = GoogleTagManagerIntegration::new(config_default);
@@ -615,7 +631,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // Custom upstream
         let config_custom = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-123".to_string(),
+            container_id: "GTM-TEST1234123".to_string(),
             upstream_url: "https://gtm.example.com".to_string(),
             cache_max_age: default_cache_max_age(),
         };
@@ -627,7 +643,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_routes_registered() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST".to_string(),
+            container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
         };
@@ -658,7 +674,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_post_collect_proxy_config_includes_payload() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST".to_string(),
+            container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
         };
@@ -688,7 +704,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_collect_proxy_config_strips_client_ip_forwarding() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST".to_string(),
+            container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
         };
@@ -848,7 +864,7 @@ container_id = "GTM-DEFAULT"
     #[test]
     fn test_html_processor_pipeline_rewrites_gtm() {
         let html = r#"<html><head>
-            <script src="https://www.googletagmanager.com/gtm.js?id=GTM-TEST"></script>
+            <script src="https://www.googletagmanager.com/gtm.js?id=GTM-TEST1234"></script>
         </head><body></body></html>"#;
 
         let mut settings = make_settings();
@@ -859,7 +875,7 @@ container_id = "GTM-DEFAULT"
                 "google_tag_manager",
                 &serde_json::json!({
                     "enabled": true,
-                    "container_id": "GTM-TEST",
+                    "container_id": "GTM-TEST1234",
                     "upstream_url": "https://www.googletagmanager.com"
                 }),
             )
@@ -882,7 +898,7 @@ container_id = "GTM-DEFAULT"
         let processed = String::from_utf8_lossy(&output);
 
         // Verify rewrite happened
-        assert!(processed.contains("/integrations/google_tag_manager/gtm.js?id=GTM-TEST"));
+        assert!(processed.contains("/integrations/google_tag_manager/gtm.js?id=GTM-TEST1234"));
         assert!(!processed.contains("https://www.googletagmanager.com/gtm.js"));
     }
 
@@ -1011,6 +1027,84 @@ container_id = "GTM-DEFAULT"
         assert!(
             !processed.contains("j.src='https://www.googletagmanager.com/gtm.js"),
             "Original src should be gone"
+        );
+    }
+
+    #[test]
+    fn test_container_id_validation_accepts_valid_ids() {
+        // Valid container IDs with different lengths
+        let valid_ids = vec![
+            "GTM-ABCD",      // Minimum length (4 chars)
+            "GTM-TEST1234",  // 8 chars
+            "GTM-ABC123XYZ", // 10 chars
+            "GTM-12345678901234567890", // Maximum length (20 chars)
+            "GTM-MIXEDCASE123", // Mixed alphanumeric
+        ];
+
+        for container_id in valid_ids {
+            let config = GoogleTagManagerConfig {
+                enabled: true,
+                container_id: container_id.to_string(),
+                upstream_url: default_upstream(),
+                cache_max_age: default_cache_max_age(),
+            };
+
+            assert!(
+                config.validate().is_ok(),
+                "Container ID '{}' should be valid",
+                container_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_container_id_validation_rejects_invalid_ids() {
+        // Invalid container IDs
+        let invalid_ids = vec![
+            ("GTM-ABC", "too short (3 chars)"),
+            ("GTM-123456789012345678901", "too long (21 chars)"),
+            ("INVALID", "missing GTM- prefix"),
+            ("GTM-", "empty after prefix"),
+            ("gtm-ABCD", "lowercase prefix"),
+            ("GTM-abc123", "lowercase chars"),
+            ("GTM-AB@CD", "special characters"),
+            ("GTM-AB CD", "spaces"),
+            ("", "empty string"),
+        ];
+
+        for (container_id, reason) in invalid_ids {
+            let config = GoogleTagManagerConfig {
+                enabled: true,
+                container_id: container_id.to_string(),
+                upstream_url: default_upstream(),
+                cache_max_age: default_cache_max_age(),
+            };
+
+            assert!(
+                config.validate().is_err(),
+                "Container ID '{}' should be invalid ({})",
+                container_id,
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_container_id_validation_max_length() {
+        // Test that max length constraint is enforced
+        let too_long = "GTM-".to_string() + &"X".repeat(50); // 54 chars total
+
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: too_long.clone(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+        };
+
+        assert!(
+            config.validate().is_err(),
+            "Container ID with {} chars should be rejected (max 50)",
+            too_long.len()
         );
     }
 

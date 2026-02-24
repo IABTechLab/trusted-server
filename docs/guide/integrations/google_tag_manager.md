@@ -19,6 +19,16 @@ The Tag Gateway intercepts requests for GTM scripts (`gtm.js`) and Google Analyt
 - **Performance**: Utilize edge caching for scripts.
 - **Privacy Enhancement**: Does not forward client IP to Google (Google sees edge server IP, not user IP).
 
+**Privacy vs. Analytics Tradeoff**:
+
+Client IP addresses are intentionally **not forwarded** to Google Analytics. This means:
+
+- ✅ **Privacy**: User IP addresses remain private and are not sent to Google
+- ⚠️ **Analytics**: Geographic targeting and user location data will be based on the edge server's IP, not the actual user's location
+- ⚠️ **Accuracy**: Analytics reports may show less accurate geographic distribution
+
+This is a deliberate privacy-first design choice. If your use case requires accurate geographic data, you may need to consider alternative approaches.
+
 ## Configuration
 
 Add the GTM configuration to `trusted-server.toml`:
@@ -145,6 +155,24 @@ POST /integrations/google_tag_manager/g/collect?v=2&...
 The integration requires the upstream `gtm.js` to be uncompressed to perform string replacement. Trusted Server fetches it with `Accept-Encoding: identity`.
 
 _Note: Trusted Server will re-compress the response (gzip/brotli) before sending it to the user if the `compression` feature is enabled._
+
+### Cache Behavior
+
+- **Script Caching**: `gtm.js` and `gtag/js` are cached with `Cache-Control: public, max-age=900` (15 minutes) by default
+- **Cache Duration**: Configurable via `cache_max_age` setting (60-86400 seconds)
+- **Edge Caching**: Fastly edge nodes will cache scripts according to the Cache-Control headers
+
+**Stale Cache Handling**:
+
+If the Google upstream is unreachable when a cached script expires:
+- The edge will attempt to fetch a fresh copy from Google
+- If the fetch fails, the request will fail (no stale content is served)
+- Consider implementing `stale-while-revalidate` at the CDN level if you need fallback behavior
+
+For production deployments, monitor upstream availability and consider:
+- Setting up health checks for Google's endpoints
+- Configuring appropriate cache TTLs based on your update frequency needs
+- Implementing retry logic at the edge platform level
 
 ### Direct Proxying
 

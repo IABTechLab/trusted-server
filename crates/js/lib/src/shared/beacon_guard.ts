@@ -55,6 +55,8 @@ function extractUrl(input: RequestInfo | URL): string | null {
  */
 export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
   let installed = false;
+  let originalSendBeacon: typeof navigator.sendBeacon | null = null;
+  let originalFetch: typeof window.fetch | null = null;
   const prefix = `${config.name} beacon guard`;
 
   function install(): void {
@@ -72,21 +74,21 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
 
     // --- Patch navigator.sendBeacon ---
     if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      const originalSendBeacon = navigator.sendBeacon.bind(navigator);
+      originalSendBeacon = navigator.sendBeacon.bind(navigator);
 
       navigator.sendBeacon = function (url: string, data?: BodyInit | null): boolean {
         if (config.isTargetUrl(url)) {
           const rewritten = config.rewriteUrl(url);
           log.info(`${prefix}: rewriting sendBeacon`, { original: url, rewritten });
-          return originalSendBeacon(rewritten, data);
+          return originalSendBeacon!(rewritten, data);
         }
-        return originalSendBeacon(url, data);
+        return originalSendBeacon!(url, data);
       };
     }
 
     // --- Patch window.fetch ---
     if (typeof window.fetch === 'function') {
-      const originalFetch = window.fetch.bind(window);
+      originalFetch = window.fetch.bind(window);
 
       window.fetch = function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
         const url = extractUrl(input);
@@ -98,12 +100,12 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
           // If the input was a Request, create a new one with the rewritten URL
           if (input instanceof Request) {
             const newRequest = new Request(rewritten, input);
-            return originalFetch(newRequest, init);
+            return originalFetch!(newRequest, init);
           }
-          return originalFetch(rewritten, init);
+          return originalFetch!(rewritten, init);
         }
 
-        return originalFetch(input, init);
+        return originalFetch!(input, init);
       };
     }
 
@@ -116,7 +118,16 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
   }
 
   function reset(): void {
+    if (originalSendBeacon && typeof navigator !== 'undefined') {
+      navigator.sendBeacon = originalSendBeacon;
+      originalSendBeacon = null;
+    }
+    if (originalFetch && typeof window !== 'undefined') {
+      window.fetch = originalFetch;
+      originalFetch = null;
+    }
     installed = false;
+    log.debug(`${prefix}: reset and uninstalled`);
   }
 
   return { install, isInstalled, reset };
