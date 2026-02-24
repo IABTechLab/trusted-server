@@ -1,5 +1,3 @@
-use core::str;
-
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
@@ -322,37 +320,6 @@ pub struct Settings {
 
 #[allow(unused)]
 impl Settings {
-    /// Creates a new [`Settings`] instance from the embedded configuration file.
-    ///
-    /// Loads the configuration from the embedded `trusted-server.toml` file
-    /// and applies any environment variable overrides.
-    ///
-    /// # Errors
-    ///
-    /// - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
-    /// - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
-    /// - [`TrustedServerError::InsecureSecretKey`] if the secret key is set to the default value
-    pub fn new() -> Result<Self, Report<TrustedServerError>> {
-        let toml_bytes = include_bytes!("../../../trusted-server.toml");
-        let toml_str =
-            str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {
-                message: "embedded trusted-server.toml file".to_string(),
-            })?;
-
-        let settings = Self::from_toml(toml_str)?;
-
-        // Validate that the secret key is not the default
-        if settings.synthetic.secret_key == "secret-key" {
-            return Err(Report::new(TrustedServerError::InsecureSecretKey));
-        }
-
-        if !settings.proxy.certificate_check {
-            log::warn!("INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified");
-        }
-
-        Ok(settings)
-    }
-
     /// Creates a new [`Settings`] instance from a pre-built TOML string.
     ///
     /// Use this for the runtime path where the TOML has already been
@@ -400,6 +367,13 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+
+        settings.validate().map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Build-time configuration validation failed: {err}"),
+            })
+        })?;
+
         Ok(settings)
     }
 
@@ -516,7 +490,7 @@ where
         }
         JsonValue::String(s) => {
             let txt = s.trim();
-            if txt.starts_with('[') {
+            if txt.starts_with('[') && txt.ends_with(']') {
                 if let Ok(vec) = serde_json::from_str::<Vec<T>>(txt) {
                     return Ok(vec);
                 }
@@ -572,47 +546,6 @@ mod tests {
         testlight::TestlightConfig,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
-
-    #[test]
-    fn test_settings_new() {
-        // Test that Settings::new() loads successfully
-        let settings = Settings::new();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
-
-        let settings = settings.expect("should load settings from embedded TOML");
-
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-
-        let prebid_cfg = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("Prebid config query should succeed")
-            .expect("Prebid config should load from default settings");
-        assert!(!prebid_cfg.server_url.is_empty());
-        assert!(
-            settings
-                .integration_config::<NextJsIntegrationConfig>("nextjs")
-                .expect("Next.js config query should succeed")
-                .is_none(),
-            "Next.js integration should be disabled by default"
-        );
-        let raw_nextjs = settings
-            .integrations
-            .get("nextjs")
-            .expect("embedded config should include nextjs block");
-        assert_eq!(raw_nextjs["enabled"], json!(false));
-        assert_eq!(
-            raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]),
-            "Next.js rewrite attributes should include href/link/siteBaseUrl/siteProductionDomain/url for RSC navigation"
-        );
-
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
-    }
 
     #[test]
     fn test_settings_from_valid_toml() {

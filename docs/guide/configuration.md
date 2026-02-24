@@ -7,7 +7,7 @@ Learn how to configure Trusted Server for your deployment.
 Trusted Server uses a flexible configuration system based on:
 
 1. **TOML Files** - `trusted-server.toml` for base configuration
-2. **Environment Variables** - Runtime overrides with `TRUSTED_SERVER__` prefix
+2. **Environment Variables** - Build-time overrides with `TRUSTED_SERVER__` prefix (baked into the binary by `build.rs`)
 3. **Fastly Stores** - KV/Config/Secret stores for runtime data
 
 ## Quick Start
@@ -32,7 +32,9 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 
 ### Environment Variable Overrides
 
-Override any setting at runtime:
+Override any setting at build time. Environment variables are merged into the
+config by `build.rs` and baked into the compiled binary — they are **not** read
+at runtime.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
@@ -97,7 +99,11 @@ bidders = ["kargo", "rubicon", "appnexus"]
 
 The sections below consolidate the full configuration reference on this page.
 
-## Environment Variable Overrides
+## Environment Variable Overrides (Build-Time)
+
+Environment variables with the `TRUSTED_SERVER__` prefix are merged into the
+base TOML configuration by `build.rs` at compile time. The resulting config is
+embedded in the binary. Changing an environment variable requires a rebuild.
 
 ### Format
 
@@ -1041,6 +1047,7 @@ trusted-server.dev.toml      # Development overrides
 
 **Environment Variables Not Applied**:
 
+- Env vars are applied at **build time** only — rebuild after changing them
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm variable is exported: `echo $VARIABLE_NAME`
@@ -1051,9 +1058,9 @@ trusted-server.dev.toml      # Development overrides
 **Print Loaded Config** (test only):
 
 ```rust
-use trusted_server_common::settings::Settings;
+use trusted_server_common::settings_data::get_settings;
 
-let settings = Settings::new()?;
+let settings = get_settings()?;
 println!("{:#?}", settings);
 ```
 
