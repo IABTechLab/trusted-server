@@ -199,6 +199,7 @@ mod tests {
                     providers: 2,
                     total_bids: 3,
                     time_ms: 12,
+                    provider_details: vec![],
                 },
             }),
         };
@@ -224,7 +225,8 @@ mod tests {
                     "strategy": "parallel_only",
                     "providers": 2,
                     "total_bids": 3,
-                    "time_ms": 12
+                    "time_ms": 12,
+                    "provider_details": []
                 }
             }
         });

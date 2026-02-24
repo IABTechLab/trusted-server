@@ -146,6 +146,41 @@ pub struct Bid {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Per-provider summary included in the auction response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSummary {
+    /// Provider name (e.g., "prebid", "aps").
+    pub name: String,
+    /// Bid status from this provider.
+    pub status: BidStatus,
+    /// Number of bids returned.
+    pub bid_count: usize,
+    /// Unique bidder/seat names (e.g., "kargo", "pubmatic", "ix").
+    pub bidders: Vec<String>,
+    /// Response time in milliseconds.
+    pub time_ms: u64,
+    /// Provider-specific metadata (from [`AuctionResponse::metadata`]).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl From<&AuctionResponse> for ProviderSummary {
+    fn from(response: &AuctionResponse) -> Self {
+        let mut bidders: Vec<String> = response.bids.iter().map(|b| b.bidder.clone()).collect();
+        bidders.sort_unstable();
+        bidders.dedup();
+
+        Self {
+            name: response.provider.clone(),
+            status: response.status.clone(),
+            bid_count: response.bids.len(),
+            bidders,
+            time_ms: response.response_time_ms,
+            metadata: response.metadata.clone(),
+        }
+    }
+}
+
 /// `OpenRTB` response metadata for the orchestrator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorExt {
@@ -153,6 +188,8 @@ pub struct OrchestratorExt {
     pub providers: usize,
     pub total_bids: usize,
     pub time_ms: u64,
+    /// Per-provider breakdown of the auction.
+    pub provider_details: Vec<ProviderSummary>,
 }
 
 /// Status of bid response.
