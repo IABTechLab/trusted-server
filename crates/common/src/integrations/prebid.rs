@@ -837,7 +837,19 @@ impl AuctionProvider for PrebidAuctionProvider {
             transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
         }
 
-        let auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+
+        // Attach per-bidder timing and errors from the Prebid Server response.
+        // `responsetimemillis` contains an entry for every invited bidder, even
+        // those that returned no bids, making it the canonical source for
+        // "who was in the auction."
+        let ext = response_json.get("ext");
+        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
+            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
+        }
+        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
+            auction_response = auction_response.with_metadata("errors", errors.clone());
+        }
 
         log::info!(
             "Prebid returned {} bids in {}ms",
