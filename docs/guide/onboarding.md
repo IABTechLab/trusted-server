@@ -99,13 +99,13 @@ Ask your manager or onboarding buddy for calendar invites to relevant meetings.
 
 ### Documentation
 
-| Resource                                                                                  | Description                                   |
-| ----------------------------------------------------------------------------------------- | --------------------------------------------- |
-| [README.md](https://github.com/IABTechLab/trusted-server/blob/main/README.md)             | Project overview and setup                    |
-| [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md) | Contribution guidelines                       |
-| [AGENTS.md](https://github.com/IABTechLab/trusted-server/blob/main/AGENTS.md)             | AI assistant guidance / architecture overview |
-| [SEQUENCE.md](https://github.com/IABTechLab/trusted-server/blob/main/SEQUENCE.md)         | Request flow diagrams                         |
-| [FAQ_POC.md](https://github.com/IABTechLab/trusted-server/blob/main/FAQ_POC.md)           | Frequently asked questions                    |
+| Resource                                                                                  | Description                                 |
+| ----------------------------------------------------------------------------------------- | ------------------------------------------- |
+| [README.md](https://github.com/IABTechLab/trusted-server/blob/main/README.md)             | Project overview and setup                  |
+| [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md) | Contribution guidelines                     |
+| [CLAUDE.md](https://github.com/IABTechLab/trusted-server/blob/main/CLAUDE.md)             | AI agent conventions and project guidelines |
+| [SEQUENCE.md](https://github.com/IABTechLab/trusted-server/blob/main/SEQUENCE.md)         | Request flow diagrams                       |
+| [FAQ_POC.md](https://github.com/IABTechLab/trusted-server/blob/main/FAQ_POC.md)           | Frequently asked questions                  |
 
 For docs site development, see `docs/README.md`.
 

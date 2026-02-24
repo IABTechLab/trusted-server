@@ -1,0 +1,58 @@
+name: Story
+description: A user-facing feature or capability
+labels: ["story"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe a new feature or capability from the user's perspective.
+
+  - type: textarea
+    id: user-story
+    attributes:
+      label: User story
+      description: "As a [role], I want [goal] so that [benefit]."
+      placeholder: "As a publisher, I want ... so that ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: What must be true for this story to be considered done?
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Affected area
+      description: Which part of the project would this touch?
+      multiple: true
+      options:
+        - Core (synthetic IDs, cookies, GDPR)
+        - Integrations (prebid, lockr, permutive, etc.)
+        - HTML processing / JS injection
+        - Ad serving (Equativ)
+        - Fastly runtime
+        - JS build pipeline
+        - Documentation
+        - CI / Tooling
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed approach
+      description: How should this be implemented? Include API examples if relevant.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, mockups, related issues, or prior art.
