@@ -39,6 +39,7 @@ placementId = "server_side_placement_123"
 | `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds             |
 | `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                     |
 | `bid_param_overrides` | Table         | `{}`                                                                   | Per-bidder params merged into request bidder params (`override` values win on key conflicts) |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; zone overrides take precedence over `bid_param_overrides` |
 | `debug`              | Boolean       | `false`                                                                | Enable debug logging                        |
 | `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging   |
 | `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception |
@@ -136,7 +137,7 @@ the outgoing bidder params become:
 
 Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides. This is designed for bidders like Kargo that use different server-to-server placement IDs per ad zone.
 
-The JS adapter extracts the zone from the ad unit code (e.g., `ad-header-0` → `header`, `ad-fixed_bottom-0` → `fixed_bottom`) and sends it alongside the bidder params. The server then uses this zone to look up the correct override.
+The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad unit (e.g., `"header"`, `"in_content"`, `"fixed_bottom"`) and sends it alongside the bidder params. The server then uses this zone to look up the correct override. When `mediaTypes.banner.name` is not set, no zone is sent and zone overrides are skipped for that impression.
 
 **Behavior**:
 
@@ -234,7 +235,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Injects synthetic ID in the user object
 - Includes device/geo information when available
 - Appends `debug_query_params` to page URL when configured
-- Applies `bid_param_overrides` to `imp.ext.prebid.bidder` before request dispatch
+- Applies `bid_param_overrides` and `bid_param_zone_overrides` to `imp.ext.prebid.bidder` before request dispatch
 - Signs requests when request signing is enabled
 
 ## Best Practices

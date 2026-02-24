@@ -24,22 +24,6 @@ const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
 const ZONE_KEY = 'zone';
 
-/**
- * Extract the ad-slot zone from a Prebid ad unit code.
- *
- * Publisher codes follow the pattern `ad-{zone}-...` where the zone is a
- * lowercase identifier that may contain underscores (e.g. `"fixed_bottom"`).
- *
- * Examples:
- * - `"ad-header-0"` → `"header"`
- * - `"ad-fixed_bottom-0"` → `"fixed_bottom"`
- * - `"ad-in_content-abc123-in_content-2"` → `"in_content"`
- */
-export function extractZone(code: string): string | undefined {
-  const match = code.match(/^ad-([a-z][a-z_]*)/);
-  return match?.[1];
-}
-
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
   /** Auction endpoint path. Defaults to '/auction'. */
@@ -235,17 +219,27 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         bidderParams[bid.bidder] = bid.params ?? {};
       }
 
-      // Include the ad-slot zone so the server can apply zone-specific
+      // WORKAROUND: Read the zone from mediaTypes.banner.name. This is NOT a
+      // standard Prebid.js field — publishers must add it as a custom property
+      // in their ad unit config. The server uses it to apply zone-specific
       // bid-param overrides (e.g. mapping zones to s2s placement IDs).
-      const zone = extractZone(unit.code ?? '');
+      // TODO: Replace with a proper zone signal once available.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const zone = (unit as any).mediaTypes?.banner?.name as string | undefined;
+
       const tsParams: Record<string, unknown> = {
         [BIDDER_PARAMS_KEY]: bidderParams,
         ...(zone ? { [ZONE_KEY]: zone } : {}),
       };
       const existingTsBid = unit.bids.find((b) => b.bidder === ADAPTER_CODE);
       if (existingTsBid) {
-        existingTsBid.params = {
+        const paramsWithoutZone = {
           ...(existingTsBid.params ?? {}),
+        };
+        delete paramsWithoutZone[ZONE_KEY];
+
+        existingTsBid.params = {
+          ...paramsWithoutZone,
           ...tsParams,
         };
       } else {

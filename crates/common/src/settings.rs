@@ -429,26 +429,29 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
 ///
 /// This allows setting map fields via environment variables while
 /// preserving key casing and special characters like hyphens.
-pub(crate) fn map_from_obj_or_str<'de, D, V>(
+pub(crate) fn map_from_obj_or_str<'de, D>(
     deserializer: D,
-) -> Result<HashMap<String, V>, D::Error>
+) -> Result<HashMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
-    V: DeserializeOwned,
 {
     let v = JsonValue::deserialize(deserializer)?;
     match v {
         JsonValue::Object(map) => map
             .into_iter()
             .map(|(k, v)| {
-                let val: V = serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+                let val = match v {
+                    JsonValue::String(s) => s,
+                    other => other.to_string(),
+                };
                 Ok((k, val))
             })
             .collect(),
         JsonValue::String(s) => {
             let txt = s.trim();
             if txt.starts_with('{') {
-                serde_json::from_str::<HashMap<String, V>>(txt).map_err(serde::de::Error::custom)
+                serde_json::from_str::<HashMap<String, String>>(txt)
+                    .map_err(serde::de::Error::custom)
             } else {
                 Err(serde::de::Error::custom(
                     "expected JSON object string, e.g. '{\"Key\": \"value\"}'",
