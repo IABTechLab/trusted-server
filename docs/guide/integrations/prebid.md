@@ -132,6 +132,42 @@ the outgoing bidder params become:
 {"kargo": {"placementId": "server_side_placement_123", "foo": "bar"}}
 ```
 
+### Bid Param Zone Overrides
+
+Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides. This is designed for bidders like Kargo that use different server-to-server placement IDs per ad zone.
+
+The JS adapter extracts the zone from the ad unit code (e.g., `ad-header-0` → `header`, `ad-fixed_bottom-0` → `fixed_bottom`) and sends it alongside the bidder params. The server then uses this zone to look up the correct override.
+
+**Behavior**:
+
+- When a zone override matches a bidder + zone combination, it is applied instead of any `bid_param_overrides` entry for that bidder
+- When no zone override matches (unknown zone or missing zone), `bid_param_overrides` is used as a fallback
+- Override params are shallow-merged, same as `bid_param_overrides`
+- Both `bid_param_overrides` and `bid_param_zone_overrides` can coexist; zone overrides take priority
+
+**Example**:
+
+```toml
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header       = {placementId = "_s2sHeaderPlacement"}
+in_content   = {placementId = "_s2sContentPlacement"}
+fixed_bottom = {placementId = "_s2sBottomPlacement"}
+```
+
+If the incoming request for zone `header` has:
+
+```json
+{"kargo": {"placementId": "client_side_abc"}}
+```
+
+the outgoing bidder params become:
+
+```json
+{"kargo": {"placementId": "_s2sHeaderPlacement"}}
+```
+
+For an unrecognised zone (e.g., `sidebar`), the override falls through to `bid_param_overrides` if configured, or leaves the incoming params unchanged.
+
 ## Endpoints
 
 ### GET /first-party/ad

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::settings::map_from_obj_or_str;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use error_stack::{Report, ResultExt};
@@ -9,7 +10,6 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use validator::Validate;
-use crate::settings::map_from_obj_or_str;
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
@@ -33,6 +33,7 @@ use crate::settings::{IntegrationConfig, Settings};
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
+const ZONE_KEY: &str = "zone";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -75,6 +76,22 @@ pub struct PrebidIntegrationConfig {
     /// ```
     #[serde(default, deserialize_with = "map_from_obj_or_str")]
     pub bid_param_overrides: HashMap<String, Json>,
+    /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
+    /// inner key is a zone name (sent by the JS adapter from the ad-unit code),
+    /// and the value is a JSON object shallow-merged into that bidder's params.
+    ///
+    /// When a matching zone override is found for a bidder it takes precedence
+    /// over any entry in [`bid_param_overrides`] for that bidder.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bid_param_zone_overrides.kargo]
+    /// header       = {placementId = "_s2sHeaderId"}
+    /// in_content   = {placementId = "_s2sContentId"}
+    /// fixed_bottom = {placementId = "_s2sBottomId"}
+    /// ```
+    #[serde(default, deserialize_with = "map_from_obj_or_str")]
+    pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -495,6 +512,14 @@ impl PrebidAuctionProvider {
                     })
                     .collect();
 
+                // Extract zone from trustedServer params (sent by the JS
+                // adapter from the ad-unit code, e.g. "header", "fixed_bottom").
+                let zone: Option<&str> = slot
+                    .bidders
+                    .get(TRUSTED_SERVER_BIDDER)
+                    .and_then(|p| p.get(ZONE_KEY))
+                    .and_then(Json::as_str);
+
                 // Build the bidder map for PBS.
                 // The JS adapter sends "trustedServer" as the bidder (our orchestrator
                 // adapter name). Replace it with the real PBS bidders from config.
@@ -515,9 +540,29 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                // Apply bid_param_overrides from config (shallow merge)
+                // Apply overrides.  Zone-specific overrides take precedence
+                // over the blanket `bid_param_overrides` for the same bidder.
                 for (name, params) in &mut bidder {
-                    if let Some(Json::Object(ovr)) = self.config.bid_param_overrides.get(name) {
+                    let zone_override = zone.and_then(|z| {
+                        self.config
+                            .bid_param_zone_overrides
+                            .get(name.as_str())
+                            .and_then(|zones| zones.get(z))
+                    });
+
+                    if let Some(Json::Object(ovr)) = zone_override {
+                        if let Json::Object(base) = params {
+                            log::debug!(
+                                "prebid: zone override for '{}' zone '{}': keys {:?}",
+                                name,
+                                zone.unwrap_or(""),
+                                ovr.keys().collect::<Vec<_>>()
+                            );
+                            base.extend(ovr.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
+                    } else if let Some(Json::Object(ovr)) =
+                        self.config.bid_param_overrides.get(name)
+                    {
                         if let Json::Object(base) = params {
                             log::debug!(
                                 "prebid: overriding bidder params for '{}': keys {:?}",
@@ -587,6 +632,7 @@ impl PrebidAuctionProvider {
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
                 debug: if self.config.debug { Some(true) } else { None },
+                returnallbidstatus: Some(true),
             }),
             trusted_server: Some(TrustedServerExt {
                 signature,
@@ -793,6 +839,11 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
+        match serde_json::to_string_pretty(&response_json) {
+            Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
+            Err(e) => log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}"),
+        }
+
         let request_host = response_json
             .get("ext")
             .and_then(|ext| ext.get("trusted_server"))
@@ -905,6 +956,7 @@ mod tests {
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             bid_param_overrides: HashMap::new(),
+            bid_param_zone_overrides: HashMap::new(),
         }
     }
 
@@ -1626,5 +1678,253 @@ siteId = 88888
         );
         assert_eq!(config.bid_param_overrides["rubicon"]["accountId"], 99999);
         assert_eq!(config.bid_param_overrides["rubicon"]["siteId"], 88888);
+    }
+
+    // ========================================================================
+    // bid_param_zone_overrides tests
+    // ========================================================================
+
+    /// Helper: build a slot whose bidders entry is a trustedServer payload
+    /// with per-bidder params and an optional zone.
+    fn make_ts_slot(id: &str, bidder_params: &Json, zone: Option<&str>) -> AdSlot {
+        let mut ts_params = json!({ BIDDER_PARAMS_KEY: bidder_params });
+        if let Some(z) = zone {
+            ts_params[ZONE_KEY] = json!(z);
+        }
+        make_slot(
+            id,
+            HashMap::from([(TRUSTED_SERVER_BIDDER.to_string(), ts_params)]),
+        )
+    }
+
+    #[test]
+    fn zone_override_replaces_placement_id() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "s2s_header_id" }),
+            )]),
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client_side_123" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "s2s_header_id",
+            "zone override should replace the client-side placementId"
+        );
+    }
+
+    #[test]
+    fn zone_override_skips_bid_param_overrides_for_matched_bidder() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        // Both override types configured for kargo
+        config
+            .bid_param_overrides
+            .insert("kargo".to_string(), json!({ "placementId": "blanket_id" }));
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "zone_header_id" }),
+            )]),
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "zone_header_id",
+            "zone override should win over bid_param_overrides"
+        );
+    }
+
+    #[test]
+    fn zone_override_falls_back_to_bid_param_overrides_for_unknown_zone() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_overrides.insert(
+            "kargo".to_string(),
+            json!({ "placementId": "blanket_fallback" }),
+        );
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "zone_header_id" }),
+            )]),
+        );
+
+        // Zone "sidebar" is NOT in the zone overrides map
+        let slot = make_ts_slot(
+            "ad-sidebar-0",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            Some("sidebar"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "blanket_fallback",
+            "unrecognised zone should fall back to bid_param_overrides"
+        );
+    }
+
+    #[test]
+    fn zone_override_no_zone_uses_bid_param_overrides() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config
+            .bid_param_overrides
+            .insert("kargo".to_string(), json!({ "placementId": "blanket_id" }));
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "zone_header_id" }),
+            )]),
+        );
+
+        // No zone in the trustedServer params
+        let slot = make_ts_slot(
+            "slot1",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "blanket_id",
+            "missing zone should use bid_param_overrides"
+        );
+    }
+
+    #[test]
+    fn zone_override_only_affects_configured_bidders() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string(), "rubicon".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "s2s_header_id" }),
+            )]),
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "kargo": { "placementId": "client_kargo" },
+                "rubicon": { "accountId": 100 }
+            }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        assert_eq!(
+            params["kargo"]["placementId"], "s2s_header_id",
+            "kargo should get zone override"
+        );
+        assert_eq!(
+            params["rubicon"]["accountId"], 100,
+            "rubicon should be untouched"
+        );
+    }
+
+    #[test]
+    fn zone_override_merges_with_existing_params() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([("header".to_string(), json!({ "placementId": "s2s_header" }))]),
+        );
+
+        // Client sends extra field alongside placementId
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client_123", "extra": "keep_me" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let kargo = &bidder_params(&ortb)["kargo"];
+        assert_eq!(
+            kargo["placementId"], "s2s_header",
+            "overridden field should have the zone value"
+        );
+        assert_eq!(
+            kargo["extra"], "keep_me",
+            "non-overridden fields should be preserved"
+        );
+    }
+
+    #[test]
+    fn zone_overrides_config_parsing_from_toml() {
+        let toml_str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = {placementId = "_s2sHeader"}
+in_content = {placementId = "_s2sContent"}
+fixed_bottom = {placementId = "_s2sBottom"}
+"#;
+
+        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("should get config")
+            .expect("should be enabled");
+
+        let kargo_zones = &config.bid_param_zone_overrides["kargo"];
+        assert_eq!(kargo_zones.len(), 3, "should have three zone entries");
+        assert_eq!(
+            kargo_zones["header"]["placementId"], "_s2sHeader",
+            "should parse header zone"
+        );
+        assert_eq!(
+            kargo_zones["in_content"]["placementId"], "_s2sContent",
+            "should parse in_content zone"
+        );
+        assert_eq!(
+            kargo_zones["fixed_bottom"]["placementId"], "_s2sBottom",
+            "should parse fixed_bottom zone"
+        );
     }
 }
