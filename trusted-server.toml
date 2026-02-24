@@ -42,15 +42,14 @@ server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 debug = false
+# debug_query_params = ""
+# script_patterns = ["/prebid.js"]
+
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
 # and includes it in the request. The server maps zone → s2s placementId here.
 [integrations.prebid.bid_param_zone_overrides.kargo]
-header = {placementId = "_kn1KdG0VJY"}
-in_content = {placementId = "_kn1KdG0VJY"}
-fixed_bottom = {placementId = "_kn1KdG0VJY"}
-# debug_query_params = ""
-# script_patterns = ["/prebid.js"]
+# header = {placementId = "_abc"}
 
 [integrations.nextjs]
 enabled = false

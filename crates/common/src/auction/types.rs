@@ -246,3 +246,133 @@ impl AuctionResponse {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_bid(bidder: &str) -> Bid {
+        Bid {
+            slot_id: "slot-1".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: bidder.to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn provider_summary_from_successful_response() {
+        let response = AuctionResponse::success(
+            "prebid",
+            vec![make_bid("kargo"), make_bid("pubmatic"), make_bid("ix")],
+            95,
+        );
+
+        let summary = ProviderSummary::from(&response);
+
+        assert_eq!(summary.name, "prebid", "should use provider name");
+        assert_eq!(summary.status, BidStatus::Success, "should preserve status");
+        assert_eq!(summary.bid_count, 3, "should count all bids");
+        assert_eq!(
+            summary.bidders,
+            vec!["ix", "kargo", "pubmatic"],
+            "should list unique bidders sorted"
+        );
+        assert_eq!(summary.time_ms, 95, "should preserve response time");
+        assert!(summary.metadata.is_empty(), "should have no metadata");
+    }
+
+    #[test]
+    fn provider_summary_deduplicates_bidder_names() {
+        let response = AuctionResponse::success(
+            "prebid",
+            vec![make_bid("kargo"), make_bid("kargo"), make_bid("pubmatic")],
+            50,
+        );
+
+        let summary = ProviderSummary::from(&response);
+
+        assert_eq!(
+            summary.bid_count, 3,
+            "should count all bids including dupes"
+        );
+        assert_eq!(
+            summary.bidders,
+            vec!["kargo", "pubmatic"],
+            "should deduplicate bidder names"
+        );
+    }
+
+    #[test]
+    fn provider_summary_from_no_bid_response() {
+        let response = AuctionResponse::no_bid("aps", 110);
+
+        let summary = ProviderSummary::from(&response);
+
+        assert_eq!(summary.name, "aps", "should use provider name");
+        assert_eq!(
+            summary.status,
+            BidStatus::NoBid,
+            "should preserve no-bid status"
+        );
+        assert_eq!(summary.bid_count, 0, "should have zero bids");
+        assert!(summary.bidders.is_empty(), "should have no bidders");
+    }
+
+    #[test]
+    fn provider_summary_from_error_response() {
+        let response = AuctionResponse::error("prebid", 200);
+
+        let summary = ProviderSummary::from(&response);
+
+        assert_eq!(
+            summary.status,
+            BidStatus::Error,
+            "should preserve error status"
+        );
+        assert_eq!(summary.bid_count, 0, "should have zero bids");
+        assert!(summary.bidders.is_empty(), "should have no bidders");
+    }
+
+    #[test]
+    fn provider_summary_passes_through_metadata() {
+        let response = AuctionResponse::success("prebid", vec![make_bid("kargo")], 80)
+            .with_metadata("responsetimemillis", json!({"kargo": 70, "pubmatic": 90}))
+            .with_metadata("errors", json!({"pubmatic": [{"code": 1}]}));
+
+        let summary = ProviderSummary::from(&response);
+
+        assert_eq!(summary.metadata.len(), 2, "should forward all metadata");
+        assert_eq!(
+            summary.metadata["responsetimemillis"],
+            json!({"kargo": 70, "pubmatic": 90}),
+            "should preserve responsetimemillis"
+        );
+        assert_eq!(
+            summary.metadata["errors"],
+            json!({"pubmatic": [{"code": 1}]}),
+            "should preserve errors"
+        );
+    }
+
+    #[test]
+    fn provider_summary_skips_metadata_in_serialization_when_empty() {
+        let response = AuctionResponse::no_bid("aps", 100);
+        let summary = ProviderSummary::from(&response);
+
+        let json = serde_json::to_value(&summary).expect("should serialize");
+
+        assert!(
+            json.get("metadata").is_none(),
+            "should omit metadata field when empty"
+        );
+    }
+}
