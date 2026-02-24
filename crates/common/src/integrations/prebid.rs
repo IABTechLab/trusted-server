@@ -605,7 +605,6 @@ impl PrebidAuctionProvider {
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
                 debug: if self.config.debug { Some(true) } else { None },
-                returnallbidstatus: None,
             }),
             trusted_server: Some(TrustedServerExt {
                 signature,
