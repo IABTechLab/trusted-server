@@ -364,6 +364,15 @@ pub trait IntegrationHtmlPostProcessor: Send + Sync {
     /// Identifier for logging/diagnostics.
     fn integration_id(&self) -> &'static str;
 
+    /// Return `true` when this processor requires buffering of subsequent
+    /// streamed output so [`Self::post_process`] can run against complete HTML.
+    ///
+    /// Defaults to `true` for correctness: processors that do not override this
+    /// method will continue to receive whole-document HTML as before.
+    fn needs_accumulation(&self, _document_state: &IntegrationDocumentState) -> bool {
+        true
+    }
+
     /// Fast preflight check to decide whether post-processing should run for this document.
     ///
     /// Implementations should keep this cheap (e.g., a substring check) because it may run on
@@ -942,6 +951,17 @@ mod tests {
         assert!(
             !processor.should_process("<html></html>", &ctx),
             "Default `should_process` should be false to avoid running post-processing unexpectedly"
+        );
+    }
+
+    #[test]
+    fn default_html_post_processor_needs_accumulation_is_true() {
+        let processor = NoopHtmlPostProcessor;
+        let document_state = IntegrationDocumentState::default();
+
+        assert!(
+            processor.needs_accumulation(&document_state),
+            "Default `needs_accumulation` should be true for post-processing correctness"
         );
     }
 

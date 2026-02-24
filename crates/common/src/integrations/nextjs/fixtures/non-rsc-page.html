@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Static Page - No RSC</title>
+    <link rel="stylesheet" href="https://origin.example.com/styles/main.css"/>
+    <link rel="icon" href="https://origin.example.com/favicon.ico"/>
+  </head>
+  <body>
+    <nav>
+      <a href="https://origin.example.com/">Home</a>
+      <a href="https://origin.example.com/about">About</a>
+      <a href="https://origin.example.com/contact">Contact</a>
+    </nav>
+    <main>
+      <h1>Welcome</h1>
+      <p>This is a static page without any React Server Components.</p>
+      <p>It contains regular HTML with URLs that should be rewritten:</p>
+      <ul>
+        <li><a href="https://origin.example.com/docs">Documentation</a></li>
+        <li><a href="https://origin.example.com/api">API</a></li>
+        <li><a href="https://origin.example.com/support">Support</a></li>
+      </ul>
+      <img src="https://origin.example.com/images/banner.jpg" alt="Banner" width="960" height="320"/>
+      <form action="https://origin.example.com/search" method="get">
+        <input type="text" name="q" placeholder="Search..."/>
+        <button type="submit">Search</button>
+      </form>
+    </main>
+    <footer>
+      <a href="https://origin.example.com/privacy">Privacy</a>
+      <a href="https://origin.example.com/terms">Terms</a>
+    </footer>
+    <script>console.log("analytics loaded");</script>
+    <script>window.dataLayer = window.dataLayer || []; window.dataLayer.push({"page": "static"});</script>
+  </body>
+</html>
