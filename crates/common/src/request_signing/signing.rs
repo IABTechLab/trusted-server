@@ -6,6 +6,7 @@
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
 use error_stack::{Report, ResultExt};
+use serde::Serialize;
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
@@ -48,6 +49,20 @@ pub struct RequestSigner {
 /// Current version of the signing protocol
 pub const SIGNING_VERSION: &str = "1.1";
 
+/// Canonical payload structure for request signing.
+///
+/// Serialized as JSON to prevent signature confusion attacks that could
+/// exploit delimiter-based formats.
+#[derive(Serialize)]
+struct SigningPayload<'a> {
+    version: &'a str,
+    kid: &'a str,
+    host: &'a str,
+    scheme: &'a str,
+    id: &'a str,
+    ts: u64,
+}
+
 /// Parameters for enhanced request signing
 #[derive(Debug, Clone)]
 pub struct SigningParams {
@@ -74,13 +89,26 @@ impl SigningParams {
 
     /// Builds the canonical payload string for signing.
     ///
-    /// Format: `kid:request_host:request_scheme:id:ts`
-    #[must_use]
-    pub fn build_payload(&self, kid: &str) -> String {
-        format!(
-            "{}:{}:{}:{}:{}",
-            kid, self.request_host, self.request_scheme, self.request_id, self.timestamp
-        )
+    /// The payload is a JSON-serialized [`SigningPayload`] to prevent signature
+    /// confusion attacks that could exploit delimiter-based formats.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be serialized to JSON.
+    pub fn build_payload(&self, kid: &str) -> Result<String, Report<TrustedServerError>> {
+        let payload = SigningPayload {
+            version: SIGNING_VERSION,
+            kid,
+            host: &self.request_host,
+            scheme: &self.request_scheme,
+            id: &self.request_id,
+            ts: self.timestamp,
+        };
+        serde_json::to_string(&payload).map_err(|e| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Failed to serialize signing payload: {}", e),
+            })
+        })
     }
 }
 
@@ -124,7 +152,8 @@ impl RequestSigner {
 
     /// Signs a request using the enhanced v1.1 signing protocol.
     ///
-    /// The signed payload format is: `kid:request_host:request_scheme:id:ts`
+    /// The signed payload is a JSON object containing version, kid, host,
+    /// scheme, id, and ts fields.
     ///
     /// # Errors
     ///
@@ -133,7 +162,7 @@ impl RequestSigner {
         &self,
         params: &SigningParams,
     ) -> Result<String, Report<TrustedServerError>> {
-        let payload = params.build_payload(&self.kid);
+        let payload = params.build_payload(&self.kid)?;
         self.sign(payload.as_bytes())
     }
 }
@@ -298,8 +327,17 @@ mod tests {
             timestamp: 1706900000,
         };
 
-        let payload = params.build_payload("kid-abc");
-        assert_eq!(payload, "kid-abc:example.com:https:req-123:1706900000");
+        let payload = params
+            .build_payload("kid-abc")
+            .expect("should build payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("should be valid JSON");
+        assert_eq!(parsed["version"], SIGNING_VERSION);
+        assert_eq!(parsed["kid"], "kid-abc");
+        assert_eq!(parsed["host"], "example.com");
+        assert_eq!(parsed["scheme"], "https");
+        assert_eq!(parsed["id"], "req-123");
+        assert_eq!(parsed["ts"], 1706900000);
     }
 
     #[test]
@@ -335,7 +373,7 @@ mod tests {
         assert!(!signature.is_empty());
 
         // Verify the signature is valid by reconstructing the payload
-        let payload = params.build_payload(&signer.kid);
+        let payload = params.build_payload(&signer.kid).unwrap();
         let result = verify_signature(payload.as_bytes(), &signature, &signer.kid).unwrap();
         assert!(result, "Enhanced signature should be valid");
     }
@@ -365,10 +403,5 @@ mod tests {
             sig1, sig2,
             "Different hosts should produce different signatures"
         );
-    }
-
-    #[test]
-    fn test_signing_version_constant() {
-        assert_eq!(SIGNING_VERSION, "1.1");
     }
 }
