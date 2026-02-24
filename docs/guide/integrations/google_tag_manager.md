@@ -165,11 +165,13 @@ _Note: Trusted Server will re-compress the response (gzip/brotli) before sending
 **Stale Cache Handling**:
 
 If the Google upstream is unreachable when a cached script expires:
+
 - The edge will attempt to fetch a fresh copy from Google
 - If the fetch fails, the request will fail (no stale content is served)
 - Consider implementing `stale-while-revalidate` at the CDN level if you need fallback behavior
 
 For production deployments, monitor upstream availability and consider:
+
 - Setting up health checks for Google's endpoints
 - Configuring appropriate cache TTLs based on your update frequency needs
 - Implementing retry logic at the edge platform level

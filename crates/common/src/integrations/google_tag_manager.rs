@@ -1034,11 +1034,11 @@ container_id = "GTM-DEFAULT"
     fn test_container_id_validation_accepts_valid_ids() {
         // Valid container IDs with different lengths
         let valid_ids = vec![
-            "GTM-ABCD",      // Minimum length (4 chars)
-            "GTM-TEST1234",  // 8 chars
-            "GTM-ABC123XYZ", // 10 chars
+            "GTM-ABCD",                 // Minimum length (4 chars)
+            "GTM-TEST1234",             // 8 chars
+            "GTM-ABC123XYZ",            // 10 chars
             "GTM-12345678901234567890", // Maximum length (20 chars)
-            "GTM-MIXEDCASE123", // Mixed alphanumeric
+            "GTM-MIXEDCASE123",         // Mixed alphanumeric
         ];
 
         for container_id in valid_ids {
