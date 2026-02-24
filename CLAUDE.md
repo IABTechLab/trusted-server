@@ -69,6 +69,12 @@ cargo check
 # JS tests
 cd crates/js/lib && npx vitest run
 
+# JS format
+cd crates/js/lib && npm run format
+
+# Docs format
+cd docs && npm run format
+
 # JS build
 cd crates/js/lib && node build-all.mjs
 ```
@@ -264,6 +270,8 @@ Every PR must pass:
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace`
 4. JS build and test (`cd crates/js/lib && npx vitest run`)
+5. JS format (`cd crates/js/lib && npm run format`)
+6. Docs format (`cd docs && npm run format`)
 
 ---
 

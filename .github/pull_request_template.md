@@ -27,6 +27,8 @@ Closes #
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo fmt --all -- --check`
 - [ ] JS tests: `cd crates/js/lib && npx vitest run`
+- [ ] JS format: `cd crates/js/lib && npm run format`
+- [ ] Docs format: `cd docs && npm run format`
 - [ ] WASM build: `cargo build --bin trusted-server-fastly --release --target wasm32-wasip1`
 - [ ] Manual testing via `fastly compute serve`
 - [ ] Other: <!-- describe -->

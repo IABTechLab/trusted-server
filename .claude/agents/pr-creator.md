@@ -24,6 +24,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 cd crates/js/lib && npx vitest run
+cd crates/js/lib && npm run format
+cd docs && npm run format
 ```
 
 If any gate fails, report the failure and stop — do not create a broken PR.

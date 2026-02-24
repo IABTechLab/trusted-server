@@ -34,7 +34,19 @@ cargo test --workspace
 cd crates/js/lib && npx vitest run
 ```
 
-### 5. WASM Build
+### 5. JS Format
+
+```bash
+cd crates/js/lib && npm run format
+```
+
+### 6. Docs Format
+
+```bash
+cd docs && npm run format
+```
+
+### 7. WASM Build
 
 ```bash
 cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
@@ -44,12 +56,14 @@ cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
 
 Report a table of results:
 
-| Step       | Status    | Notes              |
-| ---------- | --------- | ------------------ |
-| Format     | Pass/Fail | ...                |
-| Clippy     | Pass/Fail | ...                |
-| Rust Tests | Pass/Fail | X passed, Y failed |
-| JS Tests   | Pass/Fail | X passed, Y failed |
-| WASM Build | Pass/Fail | ...                |
+| Step        | Status    | Notes              |
+| ----------- | --------- | ------------------ |
+| Format      | Pass/Fail | ...                |
+| Clippy      | Pass/Fail | ...                |
+| Rust Tests  | Pass/Fail | X passed, Y failed |
+| JS Tests    | Pass/Fail | X passed, Y failed |
+| JS Format   | Pass/Fail | ...                |
+| Docs Format | Pass/Fail | ...                |
+| WASM Build  | Pass/Fail | ...                |
 
 If any step fails, include the error output and suggest a fix.

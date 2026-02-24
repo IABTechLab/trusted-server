@@ -6,5 +6,7 @@ Full verification: build, test, and lint the entire project.
 4. `cargo clippy --all-targets --all-features -- -D warnings`
 5. `cargo test --workspace`
 6. `cd crates/js/lib && npx vitest run`
+7. `cd crates/js/lib && npm run format`
+8. `cd docs && npm run format`
 
 Report results for each step. Stop and investigate if any step fails.
