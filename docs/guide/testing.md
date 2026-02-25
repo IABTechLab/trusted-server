@@ -240,7 +240,7 @@ cargo fmt
 
 ```bash
 # Run clippy with all checks
-cargo clippy --all-targets --all-features --workspace --no-deps
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Fix clippy warnings automatically
 cargo clippy --fix --allow-dirty
@@ -274,7 +274,7 @@ jobs:
       - name: Run tests
         run: cargo test
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features --workspace --no-deps
+        run: cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Debugging Tests

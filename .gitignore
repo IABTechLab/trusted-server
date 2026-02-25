@@ -15,9 +15,14 @@ src/*.html
 .DS_Store
 
 # IDE
-.claude
 .specstory
 .vscode
+
+# Claude Code — ignore all, then whitelist shared config
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+!.claude/agents/
 
 # SSL certificates
 *.pem
