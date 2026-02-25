@@ -35,6 +35,12 @@ use crate::settings::{IntegrationConfig, Settings};
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 
+/// Error type for payload size validation
+#[derive(Debug)]
+enum PayloadSizeError {
+    TooLarge { actual: usize, max: usize },
+}
+
 /// Regex pattern for validating GTM container IDs.
 /// Format: GTM-XXXXXX where X is alphanumeric.
 static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
@@ -48,6 +54,8 @@ static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// - `//www.googletagmanager.com/gtm.js?id=...`
 /// - `https://www.google-analytics.com/collect`
 /// - `//www.google-analytics.com/g/collect`
+/// - `https://analytics.google.com/g/collect`
+/// - `//analytics.google.com/g/collect`
 ///
 /// **Requires `//` prefix** — bare domain strings like `"www.googletagmanager.com"`
 /// are intentionally NOT matched. gtag.js stores domains as bare strings and
@@ -56,17 +64,16 @@ static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// `https://integrations/google_tag_manager/path` because the script still
 /// prepends `"https://"`.
 ///
-/// **Does NOT include `analytics.google.com`** — same dynamic URL construction
-/// issue. Full URLs containing `analytics.google.com` are handled by
-/// [`is_rewritable_url`] for HTML attribute rewriting where we see the
-/// complete URL.
+/// **Full URL matching for `analytics.google.com`** — Only full URLs with `//` prefix
+/// are matched and rewritten (e.g., `https://analytics.google.com/g/collect`).
+/// Bare domain strings are not matched due to the same dynamic URL construction issue.
 ///
-/// Captures a trailing delimiter (`/` or `"`) in group 2 to prevent false matches
+/// Captures a trailing delimiter (`/` or `"`) in the last group to prevent false matches
 /// on subdomains (e.g., `www.googletagmanager.com.evil.com`).
 ///
 /// The replacement target is `/integrations/google_tag_manager` + the captured delimiter.
 static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:https?:)?//www\.(googletagmanager|google-analytics)\.com([/"])"#)
+    Regex::new(r#"(?:https?:)?//(?:www\.(googletagmanager|google-analytics)\.com|analytics\.google\.com)([/"])"#)
         .expect("GTM URL regex should compile")
 });
 
@@ -85,6 +92,11 @@ pub struct GoogleTagManagerConfig {
     #[serde(default = "default_cache_max_age")]
     #[validate(range(min = 60, max = 86400))]
     pub cache_max_age: u32,
+    /// Maximum allowed size for POST beacon bodies in bytes (default: 65536 / 64KB).
+    /// Prevents memory pressure from oversized payloads on public /collect endpoints.
+    #[serde(default = "default_max_beacon_body_size")]
+    #[validate(range(min = 1024, max = 1048576))]
+    pub max_beacon_body_size: usize,
 }
 
 impl IntegrationConfig for GoogleTagManagerConfig {
@@ -103,6 +115,10 @@ fn default_upstream() -> String {
 
 fn default_cache_max_age() -> u32 {
     900 // Match Google's default
+}
+
+fn default_max_beacon_body_size() -> usize {
+    65536 // 64KB - prevents memory pressure from oversized payloads
 }
 
 fn validate_container_id(container_id: &str) -> Result<(), validator::ValidationError> {
@@ -150,16 +166,55 @@ impl GoogleTagManagerIntegration {
     /// Only matches URLs for which we have corresponding proxy routes
     /// (gtm.js, gtag/js, collect, g/collect). Excludes ns.html and other
     /// GTM endpoints we don't proxy.
+    ///
+    /// Uses proper URL parsing to prevent false positives from substring matching.
+    /// For example, rejects URLs like `https://evil.com/?u=https://www.google-analytics.com/collect`
     fn is_rewritable_url(url: &str) -> bool {
-        // Match googletagmanager.com URLs for scripts we proxy
-        if url.contains("googletagmanager.com") {
-            return url.contains("/gtm.js") || url.contains("/gtag/js") || url.contains("/gtag.js");
+        // List of supported paths we proxy (must match route handlers)
+        const SUPPORTED_PATHS: &[&str] =
+            &["/gtm.js", "/gtag/js", "/gtag.js", "/collect", "/g/collect"];
+
+        // Parse URL to extract host and path
+        // Support both absolute URLs (https://...) and protocol-relative URLs (//...)
+        let url_to_parse = if url.starts_with("//") {
+            format!("https:{}", url)
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            // Relative URLs or other formats - not rewritable via this integration
+            return false;
+        };
+
+        // Extract host and path from URL
+        // Format: https://host/path?query
+        let without_protocol = url_to_parse
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+
+        let (host, path_with_query) = match without_protocol.split_once('/') {
+            Some((h, p)) => (h, format!("/{}", p)),
+            None => return false, // No path component
+        };
+
+        // Extract path without query string or fragment
+        let path = path_with_query
+            .split('?')
+            .next()
+            .and_then(|p| p.split('#').next())
+            .unwrap_or("");
+
+        // Validate host is exactly one of our supported GTM/GA domains
+        let valid_host = matches!(
+            host,
+            "www.googletagmanager.com" | "www.google-analytics.com" | "analytics.google.com"
+        );
+
+        if !valid_host {
+            return false;
         }
-        // Match google-analytics.com and analytics.google.com URLs for beacons we proxy
-        if url.contains("google-analytics.com") || url.contains("analytics.google.com") {
-            return url.contains("/collect") || url.contains("/g/collect");
-        }
-        false
+
+        // Validate path is in our allowlist
+        SUPPORTED_PATHS.contains(&path)
     }
 
     /// Both `/gtag/js` (canonical) and `/gtag.js` (alternate) are accepted;
@@ -197,14 +252,48 @@ impl GoogleTagManagerIntegration {
         path: &str,
         req: &mut Request,
         target_url: &'a str,
-    ) -> ProxyRequestConfig<'a> {
+    ) -> Result<ProxyRequestConfig<'a>, PayloadSizeError> {
         let mut proxy_config = ProxyRequestConfig::new(target_url);
         proxy_config.forward_synthetic_id = false;
 
         // If it's a POST request (e.g. /collect beacon), we must manually attach the body
         // because ProxyRequestConfig doesn't automatically copy it from the source request.
         if req.get_method() == Method::POST {
-            let body_bytes = req.take_body_bytes();
+            // Read body with size cap to prevent unbounded memory allocation.
+            // Read in chunks and reject early if body exceeds max_beacon_body_size.
+            let mut body = req.take_body();
+            let mut body_bytes = Vec::new();
+            let max_size = self.config.max_beacon_body_size;
+            const CHUNK_SIZE: usize = 8192; // 8KB chunks
+
+            for chunk_result in body.read_chunks(CHUNK_SIZE) {
+                let chunk = chunk_result.map_err(|e| {
+                    log::error!("Error reading request body: {}", e);
+                    // Convert I/O error to size error for uniform handling
+                    PayloadSizeError::TooLarge {
+                        actual: 0,
+                        max: max_size,
+                    }
+                })?;
+
+                // Check if adding this chunk would exceed the limit
+                // This prevents buffering oversized bodies into memory
+                if body_bytes.len() + chunk.len() > max_size {
+                    let total_size = body_bytes.len() + chunk.len();
+                    log::warn!(
+                        "POST body size {} exceeds max {} (rejected during chunked read)",
+                        total_size,
+                        max_size
+                    );
+                    return Err(PayloadSizeError::TooLarge {
+                        actual: total_size,
+                        max: max_size,
+                    });
+                }
+
+                body_bytes.extend_from_slice(&chunk);
+            }
+
             proxy_config.body = Some(body_bytes);
         }
 
@@ -222,7 +311,7 @@ impl GoogleTagManagerIntegration {
             );
         }
 
-        proxy_config
+        Ok(proxy_config)
     }
 }
 
@@ -282,13 +371,54 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         let method = req.get_method();
         log::debug!("Handling GTM request: {} {}", method, path);
 
+        // Validate body size for POST requests to prevent memory pressure
+        // Check Content-Length header if present for early rejection
+        if method == Method::POST {
+            if let Some(content_length_str) =
+                req.get_header_str(fastly::http::header::CONTENT_LENGTH)
+            {
+                match content_length_str.parse::<usize>() {
+                    Ok(content_length) => {
+                        // Early rejection based on Content-Length
+                        if content_length > self.config.max_beacon_body_size {
+                            log::warn!(
+                                "Rejecting POST beacon with Content-Length {} exceeding max {}",
+                                content_length,
+                                self.config.max_beacon_body_size
+                            );
+                            return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+                        }
+                    }
+                    Err(_) => {
+                        // Invalid Content-Length header
+                        log::warn!("POST request with malformed Content-Length header");
+                        return Ok(Response::from_status(StatusCode::BAD_REQUEST));
+                    }
+                }
+            }
+            // If Content-Length is missing, we'll check actual size after read
+            // This maintains compatibility with HTTP/2 and intermediaries
+        }
+
         let Some(target_url) = self.build_target_url(&req, &path) else {
             return Ok(Response::from_status(StatusCode::NOT_FOUND));
         };
 
         log::debug!("Proxying to upstream: {}", target_url);
 
-        let proxy_config = self.build_proxy_config(&path, &mut req, &target_url);
+        // Handle payload size errors explicitly to return 413 instead of 502
+        let proxy_config = match self.build_proxy_config(&path, &mut req, &target_url) {
+            Ok(config) => config,
+            Err(PayloadSizeError::TooLarge { actual, max }) => {
+                // This catches cases where Content-Length was incorrect
+                log::warn!(
+                    "Returning 413: actual body size {} exceeds max {} (Content-Length mismatch)",
+                    actual,
+                    max
+                );
+                return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+            }
+        };
 
         let mut response = proxy_request(settings, req, proxy_config)
             .await
@@ -390,6 +520,8 @@ mod tests {
             var c = "https://www.google-analytics.com/collect";
             var d = "//www.google-analytics.com/g/collect";
             var e = "http://www.googletagmanager.com/gtm.js";
+            var f = "https://analytics.google.com/g/collect";
+            var g = "//analytics.google.com/collect";
         "#;
 
         let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
@@ -399,19 +531,25 @@ mod tests {
         assert!(result.contains("/integrations/google_tag_manager/g/collect"));
         assert!(!result.contains("www.googletagmanager.com"));
         assert!(!result.contains("www.google-analytics.com"));
+        assert!(
+            !result.contains("analytics.google.com"),
+            "analytics.google.com should be rewritten"
+        );
     }
 
     #[test]
-    fn test_rewrite_does_not_touch_analytics_google_com() {
-        // analytics.google.com must NOT be rewritten in scripts — gtag.js stores
-        // the bare domain string and constructs URLs dynamically with
-        // "https://" + domain + "/g/collect", so rewriting the domain produces
-        // the broken URL https://integrations/google_tag_manager/g/collect.
+    fn test_rewrite_analytics_google_com_full_urls() {
+        // Full analytics.google.com URLs (with // prefix) SHOULD be rewritten
+        // for HTML attributes where we see the complete URL.
         let input = r#"var f = "https://analytics.google.com/g/collect";"#;
         let result = GoogleTagManagerIntegration::rewrite_gtm_urls(input);
-        assert_eq!(
-            input, result,
-            "analytics.google.com should not be rewritten by regex"
+        assert!(
+            result.contains("/integrations/google_tag_manager/g/collect"),
+            "Full analytics.google.com URLs should be rewritten"
+        );
+        assert!(
+            !result.contains("analytics.google.com"),
+            "analytics.google.com should be replaced"
         );
     }
 
@@ -456,6 +594,7 @@ mod tests {
             container_id: "GTM-TEST1234".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
 
@@ -536,7 +675,23 @@ mod tests {
             );
         }
 
-        // Case 5: Other URL (should be kept)
+        // Case 5: analytics.google.com URL in href
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://analytics.google.com/g/collect?v=2",
+            &ctx,
+        );
+        if let AttributeRewriteAction::Replace(val) = action {
+            assert_eq!(val, "/integrations/google_tag_manager/g/collect?v=2");
+        } else {
+            panic!(
+                "Expected Replace action for analytics.google.com href, got {:?}",
+                action
+            );
+        }
+
+        // Case 6: Other URL (should be kept)
         let action = IntegrationAttributeRewriter::rewrite(
             &*integration,
             "src",
@@ -547,12 +702,94 @@ mod tests {
     }
 
     #[test]
+    fn test_attribute_rewriter_rejects_false_positives() {
+        // Test that URLs with GTM domains in query parameters or paths are NOT rewritten
+        // This verifies the fix for P2: proper URL parsing instead of substring matching
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let ctx = IntegrationAttributeContext {
+            attribute_name: "href",
+            request_host: "example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+        };
+
+        // Case 1: GTM domain in query parameter - should NOT be rewritten
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://evil.com/?redirect=https://www.google-analytics.com/collect",
+            &ctx,
+        );
+        assert!(
+            matches!(action, AttributeRewriteAction::Keep),
+            "URLs with GTM domains in query params should not be rewritten"
+        );
+
+        // Case 2: GTM domain in path component - should NOT be rewritten
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://example.com/www.googletagmanager.com/gtm.js",
+            &ctx,
+        );
+        assert!(
+            matches!(action, AttributeRewriteAction::Keep),
+            "URLs with GTM domains in path should not be rewritten"
+        );
+
+        // Case 3: Unsupported path on valid GTM domain - should NOT be rewritten
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://www.googletagmanager.com/ns.html",
+            &ctx,
+        );
+        assert!(
+            matches!(action, AttributeRewriteAction::Keep),
+            "Unsupported paths like ns.html should not be rewritten"
+        );
+
+        // Case 4: Fragment with GTM domain - should NOT be rewritten
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "href",
+            "https://example.com/page#https://www.googletagmanager.com/gtm.js",
+            &ctx,
+        );
+        assert!(
+            matches!(action, AttributeRewriteAction::Keep),
+            "URLs with GTM domains in fragment should not be rewritten"
+        );
+
+        // Case 5: Valid GTM URL should STILL be rewritten (sanity check)
+        let action = IntegrationAttributeRewriter::rewrite(
+            &*integration,
+            "src",
+            "https://www.googletagmanager.com/gtm.js?id=GTM-TEST",
+            &ctx,
+        );
+        assert!(
+            matches!(action, AttributeRewriteAction::Replace(_)),
+            "Valid GTM URLs should still be rewritten"
+        );
+    }
+
+    #[test]
     fn test_script_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
             container_id: "GTM-TEST1234".to_string(),
             upstream_url: "https://www.googletagmanager.com".to_string(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
         let doc_state = IntegrationDocumentState::default();
@@ -607,6 +844,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-DEFAULT".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
 
         assert!(!config.enabled);
@@ -621,6 +859,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-TEST1234123".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration_default = GoogleTagManagerIntegration::new(config_default);
         assert_eq!(
@@ -634,6 +873,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-TEST1234123".to_string(),
             upstream_url: "https://gtm.example.com".to_string(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration_custom = GoogleTagManagerIntegration::new(config_custom);
         assert_eq!(integration_custom.upstream_url(), "https://gtm.example.com");
@@ -646,6 +886,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
         let routes = integration.routes();
@@ -677,6 +918,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
 
@@ -691,12 +933,260 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
-        let proxy_config = integration.build_proxy_config(&path, &mut req, &target_url);
+        let proxy_config = integration
+            .build_proxy_config(&path, &mut req, &target_url)
+            .expect("should build proxy config");
 
         assert_eq!(
             proxy_config.body.as_deref(),
             Some(payload.as_slice()),
             "collect POST should forward payload body"
+        );
+    }
+
+    #[test]
+    fn test_oversized_post_body_rejected() {
+        let max_size = default_max_beacon_body_size();
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: max_size,
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Create a payload larger than the configured max size (64KB by default)
+        let oversized_payload = vec![b'X'; max_size + 1];
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req.set_body(oversized_payload.clone());
+
+        let path = req.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req, &path)
+            .expect("should resolve collect target URL");
+
+        // Attempt to build proxy config should fail due to oversized body
+        let result = integration.build_proxy_config(&path, &mut req, &target_url);
+
+        assert!(result.is_err(), "Oversized POST body should be rejected");
+
+        if let Err(PayloadSizeError::TooLarge { actual, max }) = result {
+            assert_eq!(actual, max_size + 1, "Should report actual size");
+            assert_eq!(max, max_size, "Should report max size");
+        } else {
+            panic!("Expected PayloadSizeError::TooLarge");
+        }
+    }
+
+    #[test]
+    fn test_custom_max_beacon_body_size() {
+        // Test with a custom smaller limit
+        let custom_max_size = 1024; // 1KB
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: custom_max_size,
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Payload just under the custom limit should succeed
+        let acceptable_payload = vec![b'X'; custom_max_size - 1];
+        let mut req1 = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req1.set_body(acceptable_payload.clone());
+
+        let path = req1.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req1, &path)
+            .expect("should resolve collect target URL");
+
+        let result = integration.build_proxy_config(&path, &mut req1, &target_url);
+        assert!(result.is_ok(), "Payload under custom limit should succeed");
+
+        // Payload over the custom limit should fail
+        let oversized_payload = vec![b'X'; custom_max_size + 1];
+        let mut req2 = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req2.set_body(oversized_payload);
+
+        let target_url2 = integration
+            .build_target_url(&req2, &path)
+            .expect("should resolve collect target URL");
+
+        let result2 = integration.build_proxy_config(&path, &mut req2, &target_url2);
+        assert!(
+            result2.is_err(),
+            "Payload over custom limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_incorrect_content_length_returns_413() {
+        // Verify that when Content-Length is incorrect (smaller than actual body),
+        // we still catch it and return 413 (not 502)
+        let max_size = default_max_beacon_body_size();
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: max_size,
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Create oversized payload but with incorrect (small) Content-Length
+        let oversized_payload = vec![b'X'; max_size + 1];
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req.set_body(oversized_payload.clone());
+        // Set Content-Length to a small value (incorrect)
+        req.set_header(
+            fastly::http::header::CONTENT_LENGTH,
+            (max_size / 2).to_string(),
+        );
+
+        let path = req.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req, &path)
+            .expect("should resolve collect target URL");
+
+        // build_proxy_config should detect the mismatch and return PayloadSizeError
+        let result = integration.build_proxy_config(&path, &mut req, &target_url);
+
+        assert!(
+            result.is_err(),
+            "Should reject when actual body exceeds max despite low Content-Length"
+        );
+
+        // Verify it's a PayloadSizeError::TooLarge
+        if let Err(PayloadSizeError::TooLarge { actual, max }) = result {
+            assert_eq!(actual, oversized_payload.len(), "Should report actual size");
+            assert_eq!(max, max_size, "Should report max size");
+        } else {
+            panic!("Expected PayloadSizeError::TooLarge");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_returns_413_for_oversized_post() {
+        // Verify that handle() actually returns 413 status code for oversized POST
+        let max_size = 1024; // Use small size for testing
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: max_size,
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Create oversized payload with correct Content-Length
+        let oversized_payload = vec![b'X'; max_size + 1];
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req.set_body(oversized_payload.clone());
+        req.set_header(
+            fastly::http::header::CONTENT_LENGTH,
+            oversized_payload.len().to_string(),
+        );
+
+        let settings = make_settings();
+        let response = integration
+            .handle(&settings, req)
+            .await
+            .expect("handle should not return error");
+
+        // Verify we get 413 Payload Too Large, not 502 Bad Gateway
+        assert_eq!(
+            response.get_status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Should return 413 for oversized POST body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_returns_400_for_invalid_content_length() {
+        // Verify that handle() returns 400 Bad Request for malformed Content-Length
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Create POST request with invalid Content-Length header
+        let payload = b"v=2&tid=G-TEST&cid=123".to_vec();
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req.set_body(payload);
+        req.set_header(fastly::http::header::CONTENT_LENGTH, "not-a-number");
+
+        let settings = make_settings();
+        let response = integration
+            .handle(&settings, req)
+            .await
+            .expect("handle should not return error");
+
+        // Verify we get 400 Bad Request for malformed Content-Length
+        assert_eq!(
+            response.get_status(),
+            StatusCode::BAD_REQUEST,
+            "Should return 400 for malformed Content-Length"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_accepts_post_without_content_length() {
+        // Verify that POST without Content-Length is accepted (for HTTP/2 compatibility)
+        // but still checked against max size after read
+        let max_size = default_max_beacon_body_size();
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-TEST1234".to_string(),
+            upstream_url: default_upstream(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: max_size,
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        // Create small POST request without Content-Length header
+        let small_payload = b"v=2&tid=G-TEST&cid=123".to_vec();
+        let mut req = Request::new(
+            Method::POST,
+            "https://edge.example.com/integrations/google_tag_manager/collect",
+        );
+        req.set_body(small_payload);
+        // Intentionally NOT setting Content-Length header (HTTP/2 scenario)
+
+        let path = req.get_path().to_string();
+        let target_url = integration
+            .build_target_url(&req, &path)
+            .expect("should resolve collect target URL");
+
+        // build_proxy_config should accept small payloads even without Content-Length
+        let result = integration.build_proxy_config(&path, &mut req, &target_url);
+
+        assert!(
+            result.is_ok(),
+            "Should accept small POST without Content-Length (HTTP/2 compat)"
         );
     }
 
@@ -707,6 +1197,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GTM-TEST1234".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
 
@@ -720,7 +1211,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
-        let proxy_config = integration.build_proxy_config(&path, &mut req, &target_url);
+        let proxy_config = integration
+            .build_proxy_config(&path, &mut req, &target_url)
+            .expect("should build proxy config");
 
         // We check if X-Forwarded-For is explicitly overridden with an empty string,
         // which effectively strips it during proxy forwarding due to header override logic.
@@ -743,6 +1236,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             container_id: "GT-123".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
         let integration = GoogleTagManagerIntegration::new(config);
 
@@ -755,7 +1249,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve gtag target URL");
-        let proxy_config = integration.build_proxy_config(&path, &mut req, &target_url);
+        let proxy_config = integration
+            .build_proxy_config(&path, &mut req, &target_url)
+            .expect("should build proxy config");
 
         let has_identity = proxy_config.headers.iter().any(|(name, value)| {
             name == fastly::http::header::ACCEPT_ENCODING && value == "identity"
@@ -1047,6 +1543,7 @@ container_id = "GTM-DEFAULT"
                 container_id: container_id.to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
+                max_beacon_body_size: default_max_beacon_body_size(),
             };
 
             assert!(
@@ -1078,6 +1575,7 @@ container_id = "GTM-DEFAULT"
                 container_id: container_id.to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
+                max_beacon_body_size: default_max_beacon_body_size(),
             };
 
             assert!(
@@ -1099,6 +1597,7 @@ container_id = "GTM-DEFAULT"
             container_id: too_long.clone(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
         };
 
         assert!(

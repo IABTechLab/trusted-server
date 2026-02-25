@@ -18,7 +18,14 @@ const GTM_URL_PATTERN =
   /^(?:https?:)?(?:\/\/)?(www\.(googletagmanager|google-analytics)\.com|analytics\.google\.com)(?:\/|$)/i;
 
 /**
- * Check if a URL is a GTM or Google Analytics URL.
+ * Supported paths that the server can proxy.
+ * Must match the route patterns defined in the GoogleTagManagerIntegration handler
+ * in crates/common/src/integrations/google_tag_manager.rs
+ */
+const SUPPORTED_PATHS = ['/gtm.js', '/gtag/js', '/gtag.js', '/collect', '/g/collect'];
+
+/**
+ * Check if a URL is a GTM or Google Analytics URL with a supported path.
  * Matches the logic from google_tag_manager.rs GTM_URL_PATTERN.
  *
  * Valid patterns:
@@ -30,9 +37,32 @@ const GTM_URL_PATTERN =
  * Invalid:
  * - https://googletagmanager.com/gtm.js (missing www.)
  * - https://example.com/www.googletagmanager.com (domain mismatch)
+ * - https://www.googletagmanager.com/ns.html (unsupported path)
  */
 function isGtmUrl(url: string): boolean {
-  return !!url && GTM_URL_PATTERN.test(url);
+  if (!url || !GTM_URL_PATTERN.test(url)) {
+    return false;
+  }
+
+  // Extract path from URL to validate it's a supported route
+  try {
+    const normalizedUrl = url.startsWith('//')
+      ? `https:${url}`
+      : url.startsWith('http')
+        ? url
+        : `https://${url}`;
+
+    const parsed = new URL(normalizedUrl);
+    const path = parsed.pathname;
+
+    // Check if the path matches any of our supported paths
+    // Note: pathname never includes query strings, so exact match is sufficient
+    return SUPPORTED_PATHS.some((supportedPath) => path === supportedPath);
+  } catch {
+    // Fail closed: if URL parsing fails, reject the URL rather than
+    // using a permissive fallback that could match malformed strings
+    return false;
+  }
 }
 
 /**

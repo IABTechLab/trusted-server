@@ -38,15 +38,19 @@ Add the GTM configuration to `trusted-server.toml`:
 enabled = true
 container_id = "GTM-XXXXXX"
 # upstream_url = "https://www.googletagmanager.com" # Optional override
+# cache_max_age = 900 # Optional: Cache duration in seconds (default: 900)
+# max_beacon_body_size = 65536 # Optional: Max POST body size in bytes (default: 65536 / 64KB)
 ```
 
 ### Configuration Options
 
-| Field          | Type    | Required | Description                                   |
-| -------------- | ------- | -------- | --------------------------------------------- |
-| `enabled`      | boolean | No       | Enable/disable integration (default: `false`) |
-| `container_id` | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)    |
-| `upstream_url` | string  | No       | Custom upstream URL (advanced usage)          |
+| Field                  | Type    | Required | Description                                                             |
+| ---------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                           |
+| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                              |
+| `upstream_url`         | string  | No       | Custom upstream URL (default: `https://www.googletagmanager.com`)       |
+| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)         |
+| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`) |
 
 ## How It Works
 
@@ -147,6 +151,25 @@ POST /integrations/google_tag_manager/g/collect?v=2&...
 - Proxies to `https://www.google-analytics.com/g/collect`
 - Forwarding: User-Agent, Referer, Payload
 - Privacy: Does NOT forward client IP (Google sees Trusted Server IP)
+
+**POST Request Handling**:
+
+The endpoint validates POST request sizes to prevent memory pressure:
+
+- If `Content-Length` header is present and valid:
+  - Requests exceeding `max_beacon_body_size` are rejected early with `413 Payload Too Large`
+  - Valid requests proceed normally
+- If `Content-Length` header is malformed: `400 Bad Request`
+- If `Content-Length` header is missing: Request is accepted (HTTP/2 compatible)
+  - Body is read in 8KB chunks with size validation
+  - Reading stops immediately if `max_beacon_body_size` is exceeded
+  - Oversized bodies return `413 Payload Too Large` without buffering the full payload
+
+**Memory Protection**:
+
+The implementation uses chunked reading to prevent unbounded memory allocation. Bodies are read in small chunks (8KB), and size is validated incrementally. This ensures that even if a client sends a malicious multi-gigabyte POST (with no Content-Length or an incorrect one), the server will reject it after reading at most `max_beacon_body_size + 8KB` into memory.
+
+This approach maintains compatibility with HTTP/2 and HTTP/3 clients while providing robust protection against memory exhaustion attacks.
 
 ## Performance & Caching
 

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+
 import {
   installGtmGuard,
   isGuardInstalled,
@@ -60,6 +61,25 @@ describe('GTM Script Interception Guard', () => {
       expect(isGtmUrl('')).toBe(false);
       expect(isGtmUrl(null as unknown as string)).toBe(false);
       expect(isGtmUrl(undefined as unknown as string)).toBe(false);
+    });
+
+    it('should only match supported paths', () => {
+      // Supported paths
+      expect(isGtmUrl('https://www.googletagmanager.com/gtm.js')).toBe(true);
+      expect(isGtmUrl('https://www.googletagmanager.com/gtag/js')).toBe(true);
+      expect(isGtmUrl('https://www.googletagmanager.com/gtag.js')).toBe(true);
+      expect(isGtmUrl('https://www.google-analytics.com/collect')).toBe(true);
+      expect(isGtmUrl('https://www.google-analytics.com/g/collect')).toBe(true);
+
+      // Unsupported paths should be rejected
+      expect(isGtmUrl('https://www.googletagmanager.com/ns.html')).toBe(false);
+      expect(isGtmUrl('https://www.googletagmanager.com/other.js')).toBe(false);
+      expect(isGtmUrl('https://www.google-analytics.com/analytics.js')).toBe(false);
+    });
+
+    it('should match supported paths with query parameters', () => {
+      expect(isGtmUrl('https://www.googletagmanager.com/gtm.js?id=GTM-XXXX')).toBe(true);
+      expect(isGtmUrl('https://www.google-analytics.com/collect?v=2&tid=G-TEST')).toBe(true);
     });
   });
 
@@ -207,6 +227,20 @@ describe('GTM Script Interception Guard', () => {
       expect(script.getAttribute('async')).toBe('');
       expect(script.getAttribute('data-nscript')).toBe('afterInteractive');
     });
+
+    it('should not rewrite unsupported GTM paths', () => {
+      installGtmGuard();
+
+      const container = document.createElement('div');
+      const script = document.createElement('script');
+      script.src = 'https://www.googletagmanager.com/ns.html?id=GTM-XXXX';
+
+      container.appendChild(script);
+
+      // ns.html is not a supported path, so it should not be rewritten
+      expect(script.src).toBe('https://www.googletagmanager.com/ns.html?id=GTM-XXXX');
+      expect(script.src).toContain('googletagmanager.com');
+    });
   });
 
   describe('insertBefore interception', () => {
@@ -330,12 +364,10 @@ describe('GTM Beacon Guard', () => {
     originalSendBeacon = navigator.sendBeacon;
     originalFetch = window.fetch;
 
-    sendBeaconSpy = vi.fn((_url: string | URL, _data?: BodyInit | null) => true);
+    sendBeaconSpy = vi.fn(() => true);
     navigator.sendBeacon = sendBeaconSpy;
 
-    fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-      Promise.resolve(new Response('', { status: 200 }))
-    );
+    fetchSpy = vi.fn(() => Promise.resolve(new Response('', { status: 200 })));
     window.fetch = fetchSpy;
 
     resetBeaconGuardState();
