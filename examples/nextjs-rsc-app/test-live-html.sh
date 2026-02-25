@@ -15,6 +15,11 @@ PORT=3099
 URL=${1:-"http://localhost:$PORT/"}
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+cleanup() {
+    rm -f "${TEST_FILE:-}" "${TEMP_FIXTURE:-}"
+}
+trap cleanup EXIT
+
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║         LIVE RSC STREAMING TEST                            ║"
 echo "╚════════════════════════════════════════════════════════════╝"
@@ -189,6 +194,5 @@ cd "$PROJECT_ROOT"
 cargo test --test test_live_html -- --nocapture
 
 # Cleanup
-rm -f "$TEST_FILE" "$TEMP_FIXTURE"
 echo
-echo "✅ Test complete! Cleaned up temp files."
+echo "✅ Test complete!"

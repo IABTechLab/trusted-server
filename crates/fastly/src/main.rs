@@ -28,6 +28,57 @@ use crate::error::to_error_response;
 
 use trusted_server_common::publisher::RouteResult;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteTarget {
+    TsjsDynamic,
+    Discovery,
+    VerifySignature,
+    RotateKey,
+    DeactivateKey,
+    Auction,
+    FirstPartyProxy,
+    FirstPartyClick,
+    FirstPartySign,
+    FirstPartyProxyRebuild,
+    Integration,
+    PublisherProxy,
+}
+
+fn classify_route(
+    method: &Method,
+    path: &str,
+    integration_registry: &IntegrationRegistry,
+) -> RouteTarget {
+    match (method.clone(), path) {
+        (Method::GET, p) if p.starts_with("/static/tsjs=") => RouteTarget::TsjsDynamic,
+        (Method::GET, "/.well-known/trusted-server.json") => RouteTarget::Discovery,
+        (Method::POST, "/verify-signature") => RouteTarget::VerifySignature,
+        (Method::POST, "/admin/keys/rotate") => RouteTarget::RotateKey,
+        (Method::POST, "/admin/keys/deactivate") => RouteTarget::DeactivateKey,
+        (Method::POST, "/auction") => RouteTarget::Auction,
+        (Method::GET, "/first-party/proxy") => RouteTarget::FirstPartyProxy,
+        (Method::GET, "/first-party/click") => RouteTarget::FirstPartyClick,
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
+            RouteTarget::FirstPartySign
+        }
+        (Method::POST, "/first-party/proxy-rebuild") => RouteTarget::FirstPartyProxyRebuild,
+        (m, p) if integration_registry.has_route(&m, p) => RouteTarget::Integration,
+        _ => RouteTarget::PublisherProxy,
+    }
+}
+
+fn apply_standard_response_headers(response: &mut Response, settings: &Settings) {
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
+    }
+    for (key, value) in &settings.response_headers {
+        response.set_header(key, value);
+    }
+}
+
 fn main() {
     fastly::init();
     init_logger();
@@ -84,33 +135,15 @@ async fn route_request(
     );
 
     if let Some(mut response) = enforce_basic_auth(settings, &req) {
-        for (key, value) in &settings.response_headers {
-            response.set_header(key, value);
-        }
+        apply_standard_response_headers(&mut response, settings);
         return Ok(RouteResult::Buffered(response));
     }
 
     // Get path and method for routing
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
-
-    // Check if it's the publisher proxy fallback
-    let is_publisher_proxy = match (method.clone(), path.as_str()) {
-        (Method::GET, p) if p.starts_with("/static/tsjs=") => false,
-        (Method::GET, "/.well-known/trusted-server.json") => false,
-        (Method::POST, "/verify-signature") => false,
-        (Method::POST, "/admin/keys/rotate") => false,
-        (Method::POST, "/admin/keys/deactivate") => false,
-        (Method::POST, "/auction") => false,
-        (Method::GET, "/first-party/proxy") => false,
-        (Method::GET, "/first-party/click") => false,
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => false,
-        (Method::POST, "/first-party/proxy-rebuild") => false,
-        (m, p) if integration_registry.has_route(&m, p) => false,
-        _ => true,
-    };
-
-    if is_publisher_proxy {
+    let target = classify_route(&method, &path, integration_registry);
+    if target == RouteTarget::PublisherProxy {
         log::info!(
             "No known route matched for path: {}, proxying to publisher origin",
             path
@@ -122,70 +155,40 @@ async fn route_request(
             Err(e) => {
                 log::error!("Failed to proxy to publisher origin: {:?}", e);
                 let mut err_resp = to_error_response(&e);
-                for (key, value) in &settings.response_headers {
-                    err_resp.set_header(key, value);
-                }
+                apply_standard_response_headers(&mut err_resp, settings);
                 return Ok(RouteResult::Buffered(err_resp));
             }
         }
     }
 
     // Match known routes and handle them
-    let result = match (method, path.as_str()) {
-        // Serve the tsjs library
-        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&req, integration_registry)
-        }
-
-        // Discovery endpoint for trusted-server capabilities and JWKS
-        (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, req)
-        }
-
-        // Signature verification endpoint
-        (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
-
-        // Key rotation admin endpoints
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
-        (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
-
-        // Unified auction endpoint (returns creative HTML inline)
-        (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
-
-        // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
-        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, req).await
-        }
-        (Method::POST, "/first-party/proxy-rebuild") => {
+    let result = match target {
+        RouteTarget::TsjsDynamic => handle_tsjs_dynamic(&req, integration_registry),
+        RouteTarget::Discovery => handle_trusted_server_discovery(settings, req),
+        RouteTarget::VerifySignature => handle_verify_signature(settings, req),
+        RouteTarget::RotateKey => handle_rotate_key(settings, req),
+        RouteTarget::DeactivateKey => handle_deactivate_key(settings, req),
+        RouteTarget::Auction => handle_auction(settings, orchestrator, req).await,
+        RouteTarget::FirstPartyProxy => handle_first_party_proxy(settings, req).await,
+        RouteTarget::FirstPartyClick => handle_first_party_click(settings, req).await,
+        RouteTarget::FirstPartySign => handle_first_party_proxy_sign(settings, req).await,
+        RouteTarget::FirstPartyProxyRebuild => {
             handle_first_party_proxy_rebuild(settings, req).await
         }
-        (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, req)
+        RouteTarget::Integration => integration_registry
+            .handle_proxy(&method, &path, settings, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
             }),
-
-        _ => unreachable!(),
+        RouteTarget::PublisherProxy => unreachable!(),
     };
 
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
-
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        response.set_header(HEADER_X_TS_VERSION, v);
-    }
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response.set_header(HEADER_X_TS_ENV, "staging");
-    }
-
-    for (key, value) in &settings.response_headers {
-        response.set_header(key, value);
-    }
+    apply_standard_response_headers(&mut response, settings);
 
     Ok(RouteResult::Buffered(response))
 }
