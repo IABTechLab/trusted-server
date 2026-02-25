@@ -23,8 +23,8 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
-    RequestExt, Site, TrustedServerExt, User, UserExt,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest,
+    PrebidExt, PrebidImpExt, Regs, RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::RequestSigner;
 use crate::settings::{IntegrationConfig, Settings};
@@ -521,12 +521,25 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object — populate consent from ConsentContext if available.
+        // Build user object — populate consent at both OpenRTB 2.6 top-level
+        // and Prebid ext-based locations (dual placement).
         let consent_ctx = request.user.consent.as_ref();
+        let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: Some(request.user.id.clone()),
-            consent: consent_ctx.and_then(|c| c.raw_tc_string.clone()),
+            // OpenRTB 2.6 top-level consent field
+            consent: raw_tc.clone(),
             ext: Some(UserExt {
+                // Prebid ext-based consent field
+                consent: raw_tc,
+                consented_providers_settings: consent_ctx
+                    .and_then(|c| c.raw_ac_string.as_ref())
+                    .map(|ac| ConsentedProvidersSettings {
+                        consented_providers: Some(ac.clone()),
+                    }),
+                // EIDs will be populated by identity providers; consent gating
+                // is applied via `gate_eids_by_consent` before they are set here.
+                eids: None,
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
         });
@@ -585,12 +598,14 @@ impl PrebidAuctionProvider {
 
     /// Builds the `regs` object from a [`ConsentContext`].
     ///
-    /// Returns `None` if no consent-relevant data is present (avoids sending
+    /// Populates consent fields at **both** `OpenRTB` 2.6 top-level locations
+    /// and the `regs.ext.*` locations that Prebid Server reads today.
+    ///
+    /// Returns [`None`] if no consent-relevant data is present (avoids sending
     /// an empty `regs` object to Prebid Server).
     fn build_regs(consent_ctx: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
         let ctx = consent_ctx?;
 
-        // Only emit regs if there's something to say
         let has_data = ctx.gdpr_applies
             || ctx.raw_us_privacy.is_some()
             || ctx.raw_gpp_string.is_some()
@@ -600,12 +615,23 @@ impl PrebidAuctionProvider {
             return None;
         }
 
-        Some(Regs {
-            gdpr: if ctx.gdpr_applies { Some(1) } else { Some(0) },
+        let gdpr = if ctx.gdpr_applies { Some(1) } else { Some(0) };
+
+        // Build ext first so the dual-placement fields are cloned once from
+        // ConsentContext (into ext), then once more into Regs top-level.
+        let ext = RegsExt {
+            gdpr,
             us_privacy: ctx.raw_us_privacy.clone(),
             gpp: ctx.raw_gpp_string.clone(),
             gpp_sid: ctx.gpp_section_ids.clone(),
-            ext: None,
+        };
+
+        Some(Regs {
+            gdpr: ext.gdpr,
+            us_privacy: ext.us_privacy.clone(),
+            gpp: ext.gpp.clone(),
+            gpp_sid: ext.gpp_sid.clone(),
+            ext: Some(ext),
         })
     }
 

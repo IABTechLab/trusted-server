@@ -4,6 +4,8 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::consent;
+use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -41,8 +43,12 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    // Extract consent from request cookies and headers.
+    let cookie_jar = handle_request_cookies(&req)?;
+    let consent_context = consent::build_consent_context(cookie_jar.as_ref(), &req);
+
     // Convert tsjs request format to auction request
-    let auction_request = convert_tsjs_to_auction_request(&body, settings, &req)?;
+    let auction_request = convert_tsjs_to_auction_request(&body, settings, &req, consent_context)?;
 
     // Create auction context
     let context = AuctionContext {
