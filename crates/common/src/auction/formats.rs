@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::auction::types::OrchestratorExt;
+use crate::consent::ConsentContext;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -63,7 +65,12 @@ pub struct BannerUnit {
     pub sizes: Vec<Vec<u32>>,
 }
 
-/// Convert tsjs/Prebid.js request format to internal `AuctionRequest`.
+/// Convert tsjs/Prebid.js request format to internal [`AuctionRequest`].
+///
+/// The `consent` parameter carries decoded consent signals extracted from the
+/// incoming request's cookies and headers. It is populated by the caller
+/// (the `/auction` endpoint handler) and forwarded through to the
+/// [`OpenRTB`][`crate::openrtb::OpenRtbRequest`] bid request.
 ///
 /// # Errors
 ///
@@ -74,6 +81,7 @@ pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
     req: &Request,
+    consent: ConsentContext,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     // Generate synthetic ID
     let synthetic_id = get_or_generate_synthetic_id(settings, req).change_context(
@@ -179,7 +187,7 @@ pub fn convert_tsjs_to_auction_request(
         user: UserInfo {
             id: synthetic_id,
             fresh_id,
-            consent: None,
+            consent: Some(consent),
         },
         device,
         site: Some(SiteInfo {

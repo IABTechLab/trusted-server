@@ -114,6 +114,11 @@ pub struct ConsentContext {
     pub gpp_section_ids: Option<Vec<u16>>,
     /// Raw US Privacy string from `us_privacy` cookie.
     pub raw_us_privacy: Option<String>,
+    /// Raw Google Additional Consent (AC) string.
+    ///
+    /// Covers ad tech providers not in the IAB Global Vendor List but
+    /// participating in the Google ecosystem. Format: `{version}~{ids}~dv.`
+    pub raw_ac_string: Option<String>,
 
     /// Whether GDPR applies to this request (derived from TCF presence).
     pub gdpr_applies: bool,
@@ -137,6 +142,7 @@ impl ConsentContext {
         self.raw_tc_string.is_none()
             && self.raw_gpp_string.is_none()
             && self.raw_us_privacy.is_none()
+            && self.raw_ac_string.is_none()
             && self.tcf.is_none()
             && self.gpp.is_none()
             && self.us_privacy.is_none()
@@ -190,6 +196,72 @@ pub struct TcfConsent {
 
     /// Special feature opt-ins (12 bits).
     pub special_feature_opt_ins: Vec<bool>,
+}
+
+impl TcfConsent {
+    /// Looks up a 1-indexed purpose in a TCF bitfield.
+    ///
+    /// Returns `false` for purpose 0 (invalid) and out-of-range indices.
+    fn purpose_bit(bits: &[bool], purpose: usize) -> bool {
+        purpose
+            .checked_sub(1)
+            .and_then(|idx| bits.get(idx).copied())
+            .unwrap_or(false)
+    }
+
+    /// Checks whether consent was granted for a specific TCF purpose.
+    ///
+    /// Purposes are 1-indexed per the TCF specification (Purpose 1 = index 0).
+    /// Returns `false` if the purpose is out of range.
+    #[must_use]
+    pub fn has_purpose_consent(&self, purpose: usize) -> bool {
+        Self::purpose_bit(&self.purpose_consents, purpose)
+    }
+
+    /// Checks whether legitimate interest was established for a specific TCF purpose.
+    ///
+    /// Purposes are 1-indexed per the TCF specification.
+    /// Returns `false` if the purpose is out of range.
+    #[must_use]
+    pub fn has_purpose_li(&self, purpose: usize) -> bool {
+        Self::purpose_bit(&self.purpose_legitimate_interests, purpose)
+    }
+
+    /// Checks whether a specific vendor has been granted consent.
+    #[must_use]
+    pub fn has_vendor_consent(&self, vendor_id: u16) -> bool {
+        self.vendor_consents.contains(&vendor_id)
+    }
+
+    /// Checks whether a specific vendor has established legitimate interest.
+    #[must_use]
+    pub fn has_vendor_li(&self, vendor_id: u16) -> bool {
+        self.vendor_legitimate_interests.contains(&vendor_id)
+    }
+
+    /// Whether Purpose 1 (Store/access information on a device) is consented.
+    ///
+    /// Required for any EID or cookie-based identifier to be set.
+    #[must_use]
+    pub fn has_storage_consent(&self) -> bool {
+        self.has_purpose_consent(1)
+    }
+
+    /// Whether Purpose 2 (Basic ads) is consented.
+    ///
+    /// Required for bid adapters to participate in the auction.
+    #[must_use]
+    pub fn has_basic_ads_consent(&self) -> bool {
+        self.has_purpose_consent(2)
+    }
+
+    /// Whether Purpose 4 (Personalized ads) is consented.
+    ///
+    /// Controls whether user first-party data and EIDs are transmitted.
+    #[must_use]
+    pub fn has_personalized_ads_consent(&self) -> bool {
+        self.has_purpose_consent(4)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +504,99 @@ mod tests {
             ConsentSource::default(),
             ConsentSource::None,
             "default source should be None"
+        );
+    }
+
+    fn make_tcf_consent() -> TcfConsent {
+        TcfConsent {
+            version: 2,
+            cmp_id: 1,
+            cmp_version: 1,
+            consent_screen: 1,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 42,
+            tcf_policy_version: 4,
+            created_ds: 0,
+            last_updated_ds: 0,
+            // Purposes 1, 2, 4 consented (indices 0, 1, 3)
+            purpose_consents: vec![
+                true, true, false, true, false, false, false, false, false, false, false, false,
+            ],
+            // Purpose 7 LI (index 6)
+            purpose_legitimate_interests: vec![
+                false, false, false, false, false, false, true, false, false, false, false, false,
+            ],
+            vendor_consents: vec![10, 32, 755],
+            vendor_legitimate_interests: vec![32],
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    #[test]
+    fn tcf_has_purpose_consent() {
+        let tcf = make_tcf_consent();
+        assert!(tcf.has_purpose_consent(1), "should have Purpose 1 consent");
+        assert!(tcf.has_purpose_consent(2), "should have Purpose 2 consent");
+        assert!(
+            !tcf.has_purpose_consent(3),
+            "should not have Purpose 3 consent"
+        );
+        assert!(tcf.has_purpose_consent(4), "should have Purpose 4 consent");
+    }
+
+    #[test]
+    fn tcf_purpose_consent_out_of_range() {
+        let tcf = make_tcf_consent();
+        assert!(
+            !tcf.has_purpose_consent(0),
+            "purpose 0 should return false (1-indexed)"
+        );
+        assert!(
+            !tcf.has_purpose_consent(99),
+            "out-of-range purpose should return false"
+        );
+    }
+
+    #[test]
+    fn tcf_has_purpose_li() {
+        let tcf = make_tcf_consent();
+        assert!(
+            tcf.has_purpose_li(7),
+            "should have Purpose 7 legitimate interest"
+        );
+        assert!(
+            !tcf.has_purpose_li(1),
+            "should not have Purpose 1 legitimate interest"
+        );
+    }
+
+    #[test]
+    fn tcf_has_vendor_consent() {
+        let tcf = make_tcf_consent();
+        assert!(
+            tcf.has_vendor_consent(755),
+            "should have consent for vendor 755"
+        );
+        assert!(
+            !tcf.has_vendor_consent(999),
+            "should not have consent for vendor 999"
+        );
+    }
+
+    #[test]
+    fn tcf_convenience_methods() {
+        let tcf = make_tcf_consent();
+        assert!(
+            tcf.has_storage_consent(),
+            "should have storage consent (P1)"
+        );
+        assert!(
+            tcf.has_basic_ads_consent(),
+            "should have basic ads consent (P2)"
+        );
+        assert!(
+            tcf.has_personalized_ads_consent(),
+            "should have personalized ads consent (P4)"
         );
     }
 }
