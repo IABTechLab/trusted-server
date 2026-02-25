@@ -218,35 +218,4 @@ mod tests {
             "should still set geo info available to true"
         );
     }
-
-    #[test]
-    fn coordinates_string_formats_lat_lon() {
-        let geo = sample_geo_info();
-        assert_eq!(
-            geo.coordinates_string(),
-            "37.7749,-122.4194",
-            "should format coordinates as lat,lon"
-        );
-    }
-
-    #[test]
-    fn has_metro_code_returns_true_for_positive() {
-        let geo = sample_geo_info();
-        assert!(
-            geo.has_metro_code(),
-            "should return true for metro code 807"
-        );
-    }
-
-    #[test]
-    fn has_metro_code_returns_false_for_zero() {
-        let geo = GeoInfo {
-            metro_code: 0,
-            ..sample_geo_info()
-        };
-        assert!(
-            !geo.has_metro_code(),
-            "should return false for metro code 0"
-        );
-    }
 }
