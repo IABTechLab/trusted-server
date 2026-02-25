@@ -4,11 +4,11 @@
 //! information from incoming requests, particularly DMA (Designated Market Area) codes.
 
 use fastly::geo::geo_lookup;
-use fastly::Request;
+use fastly::{Request, Response};
 
 use crate::constants::{
     HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
-    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
 
 /// Geographic information extracted from a request.
@@ -81,72 +81,172 @@ impl GeoInfo {
     pub fn has_metro_code(&self) -> bool {
         self.metro_code > 0
     }
+
+    /// Sets geo information headers on the response.
+    ///
+    /// Adds `x-geo-city`, `x-geo-country`, `x-geo-continent`, `x-geo-coordinates`,
+    /// `x-geo-metro-code`, `x-geo-region` (when available), and
+    /// `x-geo-info-available: true` to the given response.
+    pub fn set_response_headers(&self, response: &mut Response) {
+        response.set_header(HEADER_X_GEO_CITY, &self.city);
+        response.set_header(HEADER_X_GEO_COUNTRY, &self.country);
+        response.set_header(HEADER_X_GEO_CONTINENT, &self.continent);
+        response.set_header(HEADER_X_GEO_COORDINATES, self.coordinates_string());
+        response.set_header(HEADER_X_GEO_METRO_CODE, self.metro_code.to_string());
+        if let Some(ref region) = self.region {
+            response.set_header(HEADER_X_GEO_REGION, region);
+        }
+        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "true");
+    }
 }
 
-/// Extracts the DMA (Designated Market Area) code from the request's geolocation data.
-///
-/// This function:
-/// 1. Checks if running in Fastly environment
-/// 2. Performs geo lookup based on client IP
-/// 3. Sets various geo headers on the request
-/// 4. Returns the metro code (DMA) if available
-///
-/// # Arguments
-///
-/// * `req` - The request to extract DMA code from
-///
-/// # Returns
-///
-/// The DMA/metro code as a string if available, None otherwise
-pub fn get_dma_code(req: &mut Request) -> Option<String> {
-    // Debug: Check if we're running in Fastly environment
-    log::info!("Fastly Environment Check:");
-    log::info!(
-        "  FASTLY_POP: {}",
-        std::env::var("FASTLY_POP").unwrap_or_else(|_| "not in Fastly".to_string())
-    );
-    log::info!(
-        "  FASTLY_REGION: {}",
-        std::env::var("FASTLY_REGION").unwrap_or_else(|_| "not in Fastly".to_string())
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::Response;
 
-    // Get detailed geo information using geo_lookup
-    if let Some(geo) = req.get_client_ip_addr().and_then(geo_lookup) {
-        log::info!("Geo Information Found:");
+    fn sample_geo_info() -> GeoInfo {
+        GeoInfo {
+            city: "San Francisco".to_string(),
+            country: "US".to_string(),
+            continent: "NorthAmerica".to_string(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            metro_code: 807,
+            region: Some("CA".to_string()),
+        }
+    }
 
-        // Set all available geo information in headers
-        let city = geo.city();
-        req.set_header(HEADER_X_GEO_CITY, city);
-        log::info!("  City: {}", city);
+    #[test]
+    fn set_response_headers_sets_all_geo_headers() {
+        let geo = sample_geo_info();
+        let mut response = Response::new();
 
-        let country = geo.country_code();
-        req.set_header(HEADER_X_GEO_COUNTRY, country);
-        log::info!("  Country: {}", country);
+        geo.set_response_headers(&mut response);
 
-        req.set_header(HEADER_X_GEO_CONTINENT, format!("{:?}", geo.continent()));
-        log::info!("  Continent: {:?}", geo.continent());
-
-        req.set_header(
-            HEADER_X_GEO_COORDINATES,
-            format!("{},{}", geo.latitude(), geo.longitude()),
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_CITY)
+                .expect("should have city header")
+                .to_str()
+                .expect("should be valid str"),
+            "San Francisco",
+            "should set city header"
         );
-        log::info!("  Location: ({}, {})", geo.latitude(), geo.longitude());
-
-        // Get and set the metro code (DMA)
-        let metro_code = geo.metro_code();
-        req.set_header(HEADER_X_GEO_METRO_CODE, metro_code.to_string());
-        log::info!("Found DMA/Metro code: {}", metro_code);
-        return Some(metro_code.to_string());
-    } else {
-        log::info!("No geo information available for the request");
-        req.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_COUNTRY)
+                .expect("should have country header")
+                .to_str()
+                .expect("should be valid str"),
+            "US",
+            "should set country header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_CONTINENT)
+                .expect("should have continent header")
+                .to_str()
+                .expect("should be valid str"),
+            "NorthAmerica",
+            "should set continent header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_COORDINATES)
+                .expect("should have coordinates header")
+                .to_str()
+                .expect("should be valid str"),
+            "37.7749,-122.4194",
+            "should set coordinates header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_METRO_CODE)
+                .expect("should have metro code header")
+                .to_str()
+                .expect("should be valid str"),
+            "807",
+            "should set metro code header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_REGION)
+                .expect("should have region header")
+                .to_str()
+                .expect("should be valid str"),
+            "CA",
+            "should set region header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_INFO_AVAILABLE)
+                .expect("should have info available header")
+                .to_str()
+                .expect("should be valid str"),
+            "true",
+            "should set geo info available to true"
+        );
     }
 
-    // If no metro code is found, log all request headers for debugging
-    log::info!("No DMA/Metro code found. All request headers:");
-    for (name, value) in req.get_headers() {
-        log::info!("  {}: {:?}", name, value);
+    #[test]
+    fn set_response_headers_omits_region_when_none() {
+        let geo = GeoInfo {
+            region: None,
+            ..sample_geo_info()
+        };
+        let mut response = Response::new();
+
+        geo.set_response_headers(&mut response);
+
+        assert!(
+            response.get_header(HEADER_X_GEO_REGION).is_none(),
+            "should not set region header when region is None"
+        );
+        // Other headers should still be present
+        assert!(
+            response.get_header(HEADER_X_GEO_CITY).is_some(),
+            "should still set city header"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_GEO_INFO_AVAILABLE)
+                .expect("should have info available header")
+                .to_str()
+                .expect("should be valid str"),
+            "true",
+            "should still set geo info available to true"
+        );
     }
 
-    None
+    #[test]
+    fn coordinates_string_formats_lat_lon() {
+        let geo = sample_geo_info();
+        assert_eq!(
+            geo.coordinates_string(),
+            "37.7749,-122.4194",
+            "should format coordinates as lat,lon"
+        );
+    }
+
+    #[test]
+    fn has_metro_code_returns_true_for_positive() {
+        let geo = sample_geo_info();
+        assert!(
+            geo.has_metro_code(),
+            "should return true for metro code 807"
+        );
+    }
+
+    #[test]
+    fn has_metro_code_returns_false_for_zero() {
+        let geo = GeoInfo {
+            metro_code: 0,
+            ..sample_geo_info()
+        };
+        assert!(
+            !geo.has_metro_code(),
+            "should return false for metro code 0"
+        );
+    }
 }
