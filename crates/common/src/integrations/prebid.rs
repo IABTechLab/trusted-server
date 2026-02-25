@@ -611,6 +611,7 @@ impl PrebidAuctionProvider {
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
                 debug: if self.config.debug { Some(true) } else { None },
+                returnallbidstatus: if self.config.debug { Some(true) } else { None },
             }),
             trusted_server: Some(TrustedServerExt {
                 version,
@@ -632,6 +633,7 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
+            test: if self.config.debug { Some(1) } else { None },
             ext,
         }
     }
@@ -827,11 +829,13 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
-        if log::log_enabled!(log::Level::Debug) {
+        // Log the full response body when debug is enabled to surface
+        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
+        if self.config.debug {
             match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
+                Ok(json) => log::debug!("Prebid OpenRTB response:\n{json}"),
                 Err(e) => {
-                    log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}")
+                    log::warn!("Prebid: failed to serialize response for logging: {e}");
                 }
             }
         }
