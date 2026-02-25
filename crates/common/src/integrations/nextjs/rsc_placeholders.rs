@@ -18,12 +18,45 @@ pub(super) const RSC_PAYLOAD_PLACEHOLDER_SUFFIX: &str = "__";
 #[derive(Default)]
 pub(super) struct NextJsRscPostProcessState {
     pub(super) payloads: Vec<String>,
+    /// Set to `true` when a fragmented script was observed during the streaming
+    /// pass (i.e. `lol_html` delivered script text in multiple chunks). The
+    /// placeholder rewriter cannot process fragmented scripts, so the
+    /// post-processor's fallback re-parse path must handle them. This flag
+    /// ensures accumulation is triggered even when no payloads were captured
+    /// via placeholders. For non-RSC scripts the post-processor's
+    /// `should_process` check will return false, so the only cost is buffering.
+    pub(super) saw_fragmented_script: bool,
 }
 
 impl NextJsRscPostProcessState {
     pub(super) fn take_payloads(&mut self) -> Vec<String> {
         std::mem::take(&mut self.payloads)
     }
+}
+
+/// Returns `true` if the streaming pass detected RSC content that requires
+/// post-processing.
+///
+/// This covers two scenarios:
+/// 1. Unfragmented RSC scripts whose payloads were captured as placeholders.
+/// 2. Fragmented RSC scripts (script text split across `lol_html` chunks)
+///    that the placeholder rewriter could not process — the post-processor's
+///    fallback re-parse path will handle these.
+///
+/// Used by `HtmlWithPostProcessing` to decide whether to start
+/// accumulating output for post-processing.
+#[must_use]
+pub(super) fn needs_post_processing(
+    document_state: &crate::integrations::IntegrationDocumentState,
+) -> bool {
+    document_state
+        .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
+        .is_some_and(|state| {
+            let guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !guard.payloads.is_empty() || guard.saw_fragmented_script
+        })
 }
 
 fn rsc_payload_placeholder(index: usize) -> String {
@@ -58,8 +91,20 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         // Fragmented scripts are handled by the post-processor which re-parses the final HTML.
         // This avoids corrupting non-RSC scripts that happen to be fragmented during streaming.
         if !ctx.is_last_in_text_node {
-            // Script is fragmented - skip placeholder processing.
-            // The post-processor will handle RSC scripts at end-of-document.
+            // Script is fragmented — skip placeholder processing but flag it so
+            // that `HtmlWithPostProcessing` knows to accumulate output for the
+            // post-processor's fallback re-parse path. We flag any fragmented
+            // script (not just those containing `__next_f`) because the RSC
+            // marker can itself be split across chunk boundaries.
+            let state = ctx
+                .document_state
+                .get_or_insert_with(NEXTJS_INTEGRATION_ID, || {
+                    Mutex::new(NextJsRscPostProcessState::default())
+                });
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.saw_fragmented_script = true;
             return ScriptRewriteAction::keep();
         }
 
@@ -183,12 +228,18 @@ mod tests {
             "Final chunk of fragmented script should be kept"
         );
 
-        // No payloads should be stored - post-processor will handle this
+        // No payloads should be stored - post-processor will handle this via re-parse
+        let stored = state
+            .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
+            .expect("RSC state should be created for fragmented RSC scripts");
+        let guard = stored.lock().expect("should lock Next.js RSC state");
         assert!(
-            state
-                .get::<Mutex<NextJsRscPostProcessState>>(NEXTJS_INTEGRATION_ID)
-                .is_none(),
-            "No RSC state should be created for fragmented scripts"
+            guard.payloads.is_empty(),
+            "No payloads should be captured for fragmented scripts"
+        );
+        assert!(
+            guard.saw_fragmented_script,
+            "Fragmented scripts should set the saw_fragmented_script flag"
         );
     }
 

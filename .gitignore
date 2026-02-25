@@ -24,3 +24,7 @@ src/*.html
 
 /guest-profiles
 /benchmark-results/**
+
+# Next.js example app
+examples/nextjs-rsc-app/node_modules/
+examples/nextjs-rsc-app/.next/

@@ -1,0 +1,22 @@
+{
+  "name": "nextjs-rsc-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Next.js App Router app for testing Trusted Server RSC integration",
+  "scripts": {
+    "dev": "next dev --port 3099",
+    "build": "next build",
+    "start": "next start --port 3099",
+    "capture-fixtures": "bash scripts/capture-fixtures.sh"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

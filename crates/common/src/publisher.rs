@@ -170,6 +170,18 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
+fn apply_standard_response_headers(settings: &Settings, response: &mut Response) {
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
+    }
+    for (key, value) in &settings.response_headers {
+        response.set_header(key, value);
+    }
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// This function forwards incoming requests to the configured origin URL,
@@ -384,6 +396,7 @@ pub fn handle_publisher_request_streaming(
         );
         response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
         set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+        apply_standard_response_headers(settings, &mut response);
         return Ok(RouteResult::Buffered(response));
     }
 
@@ -403,18 +416,7 @@ pub fn handle_publisher_request_streaming(
 
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
-
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        response.set_header(HEADER_X_TS_VERSION, v);
-    }
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response.set_header(HEADER_X_TS_ENV, "staging");
-    }
-
-    // Add global settings headers before streaming since we commit headers
-    for (key, value) in &settings.response_headers {
-        response.set_header(key, value);
-    }
+    apply_standard_response_headers(settings, &mut response);
 
     // Remove content-length since we stream and modify size
     response.remove_header(header::CONTENT_LENGTH);

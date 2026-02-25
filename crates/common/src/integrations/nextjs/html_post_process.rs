@@ -9,7 +9,8 @@ use crate::integrations::{IntegrationHtmlContext, IntegrationHtmlPostProcessor};
 
 use super::rsc::rewrite_rsc_scripts_combined_with_limit;
 use super::rsc_placeholders::{
-    NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX, RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
+    needs_post_processing, NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX,
+    RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
 };
 use super::shared::find_rsc_push_payload_range;
 use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
@@ -27,6 +28,15 @@ impl NextJsHtmlPostProcessor {
 impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
     fn integration_id(&self) -> &'static str {
         NEXTJS_INTEGRATION_ID
+    }
+
+    fn needs_accumulation(
+        &self,
+        document_state: &crate::integrations::IntegrationDocumentState,
+    ) -> bool {
+        self.config.enabled
+            && !self.config.rewrite_attributes.is_empty()
+            && needs_post_processing(document_state)
     }
 
     fn should_process(&self, html: &str, ctx: &IntegrationHtmlContext<'_>) -> bool {
