@@ -160,7 +160,7 @@ pub struct ProviderSummary {
     /// Response time in milliseconds.
     pub time_ms: u64,
     /// Provider-specific metadata (from [`AuctionResponse::metadata`]).
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -189,6 +189,7 @@ pub struct OrchestratorExt {
     pub total_bids: usize,
     pub time_ms: u64,
     /// Per-provider breakdown of the auction.
+    #[serde(default)]
     pub provider_details: Vec<ProviderSummary>,
 }
 

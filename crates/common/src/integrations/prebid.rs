@@ -1700,4 +1700,62 @@ fixed_bottom = {placementId = "_s2sBottom"}
             "should parse fixed_bottom zone"
         );
     }
+
+    #[test]
+    fn parse_response_preserves_responsetimemillis_and_errors_metadata() {
+        let provider = PrebidAuctionProvider::new(base_config());
+
+        // Minimal valid OpenRTB response with ext containing diagnostics.
+        let response_json = json!({
+            "seatbid": [{
+                "seat": "kargo",
+                "bid": [{
+                    "impid": "slot-1",
+                    "price": 2.50,
+                    "adm": "<div>ad</div>"
+                }]
+            }],
+            "ext": {
+                "responsetimemillis": {
+                    "kargo": 98,
+                    "appnexus": 0,
+                    "ix": 120
+                },
+                "errors": {
+                    "openx": [{"code": 1, "message": "timeout"}]
+                }
+            }
+        });
+
+        // Replicate the metadata extraction logic from `run_auction`.
+        let mut auction_response = provider.parse_openrtb_response(&response_json, 150);
+
+        let ext = response_json.get("ext");
+        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
+            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
+        }
+        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
+            auction_response = auction_response.with_metadata("errors", errors.clone());
+        }
+
+        // Verify bids were parsed.
+        assert_eq!(auction_response.bids.len(), 1, "should parse one bid");
+
+        // Verify responsetimemillis is preserved.
+        let rtm = auction_response
+            .metadata
+            .get("responsetimemillis")
+            .expect("should have responsetimemillis in metadata");
+        assert_eq!(rtm["kargo"], 98);
+        assert_eq!(rtm["appnexus"], 0);
+        assert_eq!(rtm["ix"], 120);
+
+        // Verify errors are preserved.
+        let errors = auction_response
+            .metadata
+            .get("errors")
+            .expect("should have errors in metadata");
+        assert_eq!(errors["openx"][0]["code"], 1);
+        assert_eq!(errors["openx"][0]["message"], "timeout");
+    }
 }
