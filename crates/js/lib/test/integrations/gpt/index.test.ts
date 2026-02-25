@@ -180,31 +180,39 @@ describe('GPT shim – runtime gating', () => {
     resetGuardState();
     delete (window as GatedWindow).googletag;
     delete (window as GatedWindow).__tsjs_gpt_enabled;
+    delete (window as Record<string, unknown>).__tsjs_installGptShim;
   });
 
-  it('installs the shim when __tsjs_gpt_enabled is set', async () => {
-    win.__tsjs_gpt_enabled = true;
-
+  it('installs the shim when activation function is called (simulates server inline script)', async () => {
     const { installGptShim } = await import('../../../src/integrations/gpt/index');
 
-    // Explicitly call since the dynamic import may have already cached.
+    // Simulate what the server-injected inline script does:
+    // set the flag then call the activation function.
+    win.__tsjs_gpt_enabled = true;
     installGptShim();
 
     expect(isGuardInstalled()).toBe(true);
     expect(win.googletag).toBeDefined();
   });
 
-  it('does not install the shim when __tsjs_gpt_enabled is absent', async () => {
-    // No flag set — shim should stay dormant.
+  it('registers __tsjs_installGptShim on window after import', async () => {
+    vi.resetModules();
     await import('../../../src/integrations/gpt/index');
 
-    // Reset guard to verify the auto-init did NOT install.
-    resetGuardState();
-    delete win.googletag;
+    expect(typeof (window as Record<string, unknown>).__tsjs_installGptShim).toBe('function');
+  });
 
-    // Manually verify: calling installGptShim without the flag should still
-    // work (it's a direct call), but the *auto-init path* would not have run.
-    // The key assertion is that the guard is not installed after reset.
+  it('does not install the shim when only imported (no explicit activation)', async () => {
+    // Reset modules so the next dynamic import re-evaluates the module.
+    vi.resetModules();
+
+    // Import a fresh copy — the module should register the activation
+    // function on `window` but NOT call `installGptShim()` on its own.
+    await import('../../../src/integrations/gpt/index');
+
+    // Assert immediately — the guard must not be installed because the
+    // module only registers `__tsjs_installGptShim`, it does not auto-init.
     expect(isGuardInstalled()).toBe(false);
+    expect(win.googletag).toBeUndefined();
   });
 });

@@ -161,10 +161,14 @@ export function installGptShim(): boolean {
   return true;
 }
 
-// Self-initialise on import when the server-side GPT integration is enabled.
-// The trusted server injects `window.__tsjs_gpt_enabled = true` via an inline
-// script (IntegrationHeadInjector) so the shim stays dormant when the GPT proxy
-// routes are not registered.
-if (typeof window !== 'undefined' && (window as Record<string, unknown>).__tsjs_gpt_enabled) {
-  installGptShim();
+// Register the activation function on `window` so the server-injected inline
+// script can call it explicitly. The server emits:
+//   <script>window.__tsjs_gpt_enabled=true;
+//          window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>
+// Because that inline <script> runs *after* the unified bundle has evaluated,
+// the function is guaranteed to be available by the time the inline script
+// executes. This avoids a race where the module-scope auto-init would check
+// `__tsjs_gpt_enabled` before the flag is set.
+if (typeof window !== 'undefined') {
+  (window as Record<string, unknown>).__tsjs_installGptShim = installGptShim;
 }

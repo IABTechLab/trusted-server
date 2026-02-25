@@ -426,7 +426,14 @@ impl IntegrationHeadInjector for GptIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec!["<script>window.__tsjs_gpt_enabled=true;</script>".to_string()]
+        // Set the enable flag and explicitly call the activation function
+        // registered by the GPT shim module. The unified bundle's <script> tag
+        // is emitted before this inline script, so `__tsjs_installGptShim` is
+        // guaranteed to exist when this executes.
+        vec![
+            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+                .to_string(),
+        ]
     }
 }
 
@@ -905,8 +912,9 @@ mod tests {
 
         assert_eq!(inserts.len(), 1, "should emit exactly one head insert");
         assert_eq!(
-            inserts[0], "<script>window.__tsjs_gpt_enabled=true;</script>",
-            "should set __tsjs_gpt_enabled flag for the client-side GPT shim"
+            inserts[0],
+            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
+            "should set the enable flag and call the GPT shim activation function"
         );
     }
 
