@@ -66,12 +66,13 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     req: Request,
 ) -> Result<Response, Error> {
-    if let Some(response) = enforce_basic_auth(settings, &req) {
+    // Extract geo info before auth check or routing consumes the request
+    let geo_info = GeoInfo::from_request(&req);
+
+    if let Some(mut response) = enforce_basic_auth(settings, &req) {
+        apply_geo_headers(&geo_info, &mut response);
         return Ok(response);
     }
-
-    // Extract geo info before routing consumes the request
-    let geo_info = GeoInfo::from_request(&req);
 
     // Get path and method for routing
     let path = req.get_path().to_string();
@@ -137,12 +138,7 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
-    // Set geo headers on the response
-    if let Some(ref geo) = geo_info {
-        geo.set_response_headers(&mut response);
-    } else {
-        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
-    }
+    apply_geo_headers(&geo_info, &mut response);
 
     if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
         response.set_header(HEADER_X_TS_VERSION, v);
@@ -156,6 +152,16 @@ async fn route_request(
     }
 
     Ok(response)
+}
+
+/// Sets geo headers on a response. If geo data is available, sets all `x-geo-*`
+/// headers; otherwise sets `x-geo-info-available: false`.
+fn apply_geo_headers(geo_info: &Option<GeoInfo>, response: &mut Response) {
+    if let Some(ref geo) = geo_info {
+        geo.set_response_headers(response);
+    } else {
+        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
+    }
 }
 
 fn init_logger() {
