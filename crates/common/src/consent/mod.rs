@@ -27,7 +27,7 @@ pub mod types;
 pub mod us_privacy;
 
 pub use extraction::extract_consent_signals;
-pub use types::{ConsentContext, ConsentSource, RawConsentSignals};
+pub use types::{ConsentContext, ConsentSource, RawConsentSignals, TcfConsent};
 
 use cookie::CookieJar;
 use fastly::Request;
@@ -59,6 +59,24 @@ pub fn extract_and_log_consent(jar: Option<&CookieJar>, req: &Request) -> RawCon
     signals
 }
 
+/// Decodes a raw consent string, logging a warning on failure.
+///
+/// Returns [`None`] and logs at `warn` level if decoding fails, preserving
+/// the raw string for proxy-mode forwarding.
+fn decode_or_warn<T, E: core::fmt::Display>(
+    raw: Option<&str>,
+    label: &str,
+    decode: fn(&str) -> Result<T, E>,
+) -> Option<T> {
+    raw.and_then(|s| match decode(s) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            log::warn!("Failed to decode {label}: {e}");
+            None
+        }
+    })
+}
+
 /// Builds a [`ConsentContext`] from previously extracted raw signals.
 ///
 /// This is the decode + normalize stage of the pipeline. Each signal is
@@ -66,44 +84,21 @@ pub fn extract_and_log_consent(jar: Option<&CookieJar>, req: &Request) -> RawCon
 /// corresponding decoded field is left as `None`.
 #[must_use]
 pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext {
-    // Decode US Privacy
-    let decoded_us_privacy =
-        signals
-            .raw_us_privacy
-            .as_deref()
-            .and_then(|s| match us_privacy::decode_us_privacy(s) {
-                Ok(usp) => Some(usp),
-                Err(e) => {
-                    log::warn!("Failed to decode US Privacy string: {e}");
-                    None
-                }
-            });
-
-    // Decode TCF v2
-    let decoded_tcf =
-        signals
-            .raw_tc_string
-            .as_deref()
-            .and_then(|s| match tcf::decode_tc_string(s) {
-                Ok(tcf) => Some(tcf),
-                Err(e) => {
-                    log::warn!("Failed to decode TC String: {e}");
-                    None
-                }
-            });
-
-    // Decode GPP
-    let decoded_gpp =
-        signals
-            .raw_gpp_string
-            .as_deref()
-            .and_then(|s| match gpp::decode_gpp_string(s) {
-                Ok(gpp_consent) => Some(gpp_consent),
-                Err(e) => {
-                    log::warn!("Failed to decode GPP string: {e}");
-                    None
-                }
-            });
+    let decoded_us_privacy = decode_or_warn(
+        signals.raw_us_privacy.as_deref(),
+        "US Privacy string",
+        us_privacy::decode_us_privacy,
+    );
+    let decoded_tcf = decode_or_warn(
+        signals.raw_tc_string.as_deref(),
+        "TC String",
+        tcf::decode_tc_string,
+    );
+    let decoded_gpp = decode_or_warn(
+        signals.raw_gpp_string.as_deref(),
+        "GPP string",
+        gpp::decode_gpp_string,
+    );
 
     // Resolve GPP section IDs:
     // - Prefer decoded GPP section IDs (authoritative).
@@ -127,6 +122,9 @@ pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext
         raw_gpp_string: signals.raw_gpp_string.clone(),
         gpp_section_ids,
         raw_us_privacy: signals.raw_us_privacy.clone(),
+        // AC string extraction not yet implemented — will be added when
+        // the CMP-specific cookie source is determined (Phase 1a).
+        raw_ac_string: None,
 
         gdpr_applies,
         tcf: decoded_tcf,
@@ -135,6 +133,52 @@ pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext
 
         gpc: signals.gpc,
         source: ConsentSource::Cookie,
+    }
+}
+
+/// Filters Extended User IDs based on TCF consent.
+///
+/// Per Prebid's tcfControl enforcement:
+/// - **Purpose 1** (Store/access information on a device) must be consented
+///   for any EID to exist (identifiers require cookie/localStorage access).
+/// - **Purpose 4** (Personalized ads) must be consented for EIDs to be
+///   transmitted in the bid request.
+///
+/// Returns [`None`] if consent is missing or insufficient, stripping all EIDs
+/// from the outgoing bid request.
+#[must_use]
+pub fn gate_eids_by_consent<T>(
+    eids: Option<Vec<T>>,
+    consent_ctx: Option<&ConsentContext>,
+) -> Option<Vec<T>> {
+    let eids = eids?;
+    if eids.is_empty() {
+        return None;
+    }
+
+    // Resolve the effective TCF consent — standalone or from GPP.
+    let tcf = consent_ctx.and_then(|ctx| {
+        ctx.tcf
+            .as_ref()
+            .or_else(|| ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()))
+    });
+
+    match tcf {
+        Some(tcf) if tcf.has_storage_consent() && tcf.has_personalized_ads_consent() => Some(eids),
+        Some(_) => {
+            log::info!("EIDs stripped: TCF Purpose 1 or 4 consent missing");
+            None
+        }
+        None => {
+            // No TCF data — if GDPR applies, block EIDs as a precaution.
+            if consent_ctx.is_some_and(|c| c.gdpr_applies) {
+                log::info!("EIDs stripped: GDPR applies but no TCF consent available");
+                None
+            } else {
+                // Non-GDPR context with no TCF — pass through.
+                Some(eids)
+            }
+        }
     }
 }
 
