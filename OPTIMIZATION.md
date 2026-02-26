@@ -15,10 +15,10 @@ This document presents a performance analysis and optimization plan for the Trus
 | % CPU | Function | Notes |
 |-------|----------|-------|
 | ~96% | `trusted_server_fastly::main` | Almost all time is in application code |
-| ~90% | `route_request` → `handle_publisher_request` | Publisher proxy is the hot path |
+| ~90% | `route_request` → `handle_publisher_request_streaming` | Publisher proxy is the hot path |
 | **~76%** | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck** |
 | ~~5-8%~~ → **3.3%** | `get_settings()` | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |
-| ~5-7% | `handle_publisher_request` (non-HTML) | Backend send, cookie handling |
+| ~5-7% | `handle_publisher_request_streaming` (non-HTML) | Backend send, cookie handling |
 
 ### CPU Breakdown — HTML Processing (~76% total)
 
@@ -242,25 +242,19 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 
 **Status**: Done. Replaced `Settings::from_toml()` with `toml::from_str()` + explicit `normalize()` + `validate()`. Profiling confirmed: **~5-8% → ~3.3% CPU per request**.
 
-#### 1.4 Reduce verbose per-request logging — ~0.5% CPU
+#### 1.4 ~~Reduce verbose per-request logging — ~0.5% CPU~~ DONE
 
-**Files**: `crates/fastly/src/main.rs:37,64-67,152-177`
+**Files**: `crates/fastly/src/main.rs`
 
-**Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level. The logger is configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above is evaluated.
+**Problem**: The logger was configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above was evaluated — including `log::debug!("Settings {settings:?}")` which serializes the entire Settings struct (~2KB) on every request.
 
-**Fix**: Downgrade the Settings dump to `log::debug!` and tighten the logger's `max_level` to `LevelFilter::Info` for production. When the level is filtered, `log` macros short-circuit before evaluating arguments — so the `Settings` `Debug` format is never even computed.
-
-```rust
-// Before: everything at Debug and above is serialized
-.max_level(log::LevelFilter::Debug)
-
-// After: Info in production, debug only for specific modules if needed
-.max_level(log::LevelFilter::Info)
-```
+**Fix**: Tightened `max_level` to `LevelFilter::Info`. Debug macros now short-circuit before evaluating arguments.
 
 | Impact | LOC | Risk |
 |--------|-----|------|
 | Low (~0.5% CPU) | ~3 | None |
+
+**Status**: Done. Logger `max_level` set to `Info` in production.
 
 #### 1.5 Trivial fixes batch
 
@@ -284,14 +278,14 @@ The high-impact architectural change. Uses Fastly's `stream_to_client()` API to 
 
 **Files**: `crates/common/src/publisher.rs`, `crates/fastly/src/main.rs`
 
-**Current flow** (fully buffered):
+**Previous flow** (fully buffered, removed):
 ```
 req.send() → wait for full response → take_body()
   → process_response_streaming() → collects into Vec<u8>
   → Body::from(output) → return complete Response
 ```
 
-**New flow** (streaming):
+**Current flow** (streaming, implemented in `handle_publisher_request_streaming`):
 ```
 req.send() → take_body() → set response headers
   → stream_to_client() → returns StreamingBody (headers sent immediately)
@@ -343,6 +337,8 @@ match pipeline.process(backend_body, &mut client_body) {
 |--------|-----|------|
 | **High** — reduces time-to-last-byte and peak memory for all proxied pages | ~80-120 | Medium — error handling requires careful design |
 
+**Status**: Done. Implemented in `handle_publisher_request_streaming`. Legacy buffered path removed. External monitoring confirmed 70-75% TTFB reduction.
+
 #### 2.2 Concurrent origin fetch + auction (future)
 
 **Not applicable for golf.com** (no on-page auction), but for publishers with auction.
@@ -376,7 +372,7 @@ After implementing Phases 1-2:
 - No regression on static endpoints or auction
 - Code complexity is justified by measured improvement
 
-**Current Status:** The streaming architecture changes (Phases 1 and 2.1) have been implemented and pushed to the `feat/optimize-html-streaming` branch. Local testing with `curl` has demonstrated significant TTFB improvements (from ~0.716s buffered to ~0.256s streaming) while verifying functional correctness against Fastly Compute's local testing environment. **External environment testing and load testing on the staging edge network is currently due/pending.**
+**Current Status:** The streaming architecture changes (Phases 1 and 2.1) have been implemented on the `feat/optimize-html-streaming` branch. The legacy buffered path (`handle_publisher_request` + `process_response_streaming`) has been removed — all publisher proxy traffic now uses `handle_publisher_request_streaming`. Local testing with `curl` demonstrated significant TTFB improvements (from ~0.716s buffered to ~0.256s streaming). External synthetic monitoring confirmed 70-75% Wait Time (TTFB) reduction on staging. **External load testing on the staging edge network is currently due/pending.**
 
 ---
 
@@ -387,16 +383,16 @@ After implementing Phases 1-2:
 | **1.1** | Gzip streaming fix | Part of ~76% HTML pipeline | **High** (memory) | -15/+3 | Low | 1 |
 | **1.2** | HTML rewriter streaming | Part of ~76% HTML pipeline | **High** (memory) | ~30 | Medium | 1 |
 | **1.3** | ~~Eliminate redundant `config` crate~~ | ~~5-8%~~ → **3.3%** | **Done** | 1-3 | Low | 1 |
-| **1.4** | Reduce verbose logging | ~0.5% | Low | ~3 | None | 1 |
+| **1.4** | ~~Reduce verbose logging~~ | ~~~0.5%~~ | **Done** | ~3 | None | 1 |
 | **1.5** | Trivial fixes batch | <1% combined | Low | ~50 | None | 1 |
-| **2.1** | `stream_to_client()` integration | N/A (architectural) | **High** (TTLB) | ~80-120 | Medium | 2 |
+| **2.1** | ~~`stream_to_client()` integration~~ | N/A (architectural) | **Done** (70-75% TTFB reduction) | ~80-120 | Medium | 2 |
 | **2.2** | Concurrent origin + auction | N/A (architectural) | **Very High** | ~150-200 | High | 2 (future) |
 
 ---
 
-## Architecture: Current vs Target
+## Architecture: Previous vs Current
 
-### Current (fully buffered)
+### Previous (fully buffered, removed)
 
 ```
 Client → Fastly Edge → [WASM starts]
@@ -414,12 +410,12 @@ Client → Fastly Edge → [WASM starts]
 **Memory**: compressed + decompressed + processed + recompressed = ~4x response size
 **TTLB**: cannot send any bytes until all processing is complete
 
-### Target (streaming)
+### Current (streaming, implemented)
 
 ```
 Client → Fastly Edge → [WASM starts]
   → init (settings, orchestrator, registry)     ~1ms
-  → req.send(backend)                           blocks for full response (same as current)
+  → req.send(backend)                           blocks for full response
   → response.take_body()                        body available as Read stream
   → validate status, set response headers
   → stream_to_client()                          headers sent to client NOW

@@ -6,16 +6,13 @@ use log_fastly::Logger;
 use trusted_server_common::auction::endpoints::handle_auction;
 use trusted_server_common::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
-use trusted_server_common::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
-};
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_common::publisher::handle_tsjs_dynamic;
+use trusted_server_common::publisher::{apply_standard_response_headers, handle_tsjs_dynamic};
 use trusted_server_common::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -49,33 +46,24 @@ fn classify_route(
     path: &str,
     integration_registry: &IntegrationRegistry,
 ) -> RouteTarget {
-    match (method.clone(), path) {
-        (Method::GET, p) if p.starts_with("/static/tsjs=") => RouteTarget::TsjsDynamic,
-        (Method::GET, "/.well-known/trusted-server.json") => RouteTarget::Discovery,
-        (Method::POST, "/verify-signature") => RouteTarget::VerifySignature,
-        (Method::POST, "/admin/keys/rotate") => RouteTarget::RotateKey,
-        (Method::POST, "/admin/keys/deactivate") => RouteTarget::DeactivateKey,
-        (Method::POST, "/auction") => RouteTarget::Auction,
-        (Method::GET, "/first-party/proxy") => RouteTarget::FirstPartyProxy,
-        (Method::GET, "/first-party/click") => RouteTarget::FirstPartyClick,
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
+    if path.starts_with("/static/tsjs=") && method == Method::GET {
+        return RouteTarget::TsjsDynamic;
+    }
+
+    match (method, path) {
+        (&Method::GET, "/.well-known/trusted-server.json") => RouteTarget::Discovery,
+        (&Method::POST, "/verify-signature") => RouteTarget::VerifySignature,
+        (&Method::POST, "/admin/keys/rotate") => RouteTarget::RotateKey,
+        (&Method::POST, "/admin/keys/deactivate") => RouteTarget::DeactivateKey,
+        (&Method::POST, "/auction") => RouteTarget::Auction,
+        (&Method::GET, "/first-party/proxy") => RouteTarget::FirstPartyProxy,
+        (&Method::GET, "/first-party/click") => RouteTarget::FirstPartyClick,
+        (&Method::GET, "/first-party/sign") | (&Method::POST, "/first-party/sign") => {
             RouteTarget::FirstPartySign
         }
-        (Method::POST, "/first-party/proxy-rebuild") => RouteTarget::FirstPartyProxyRebuild,
-        (m, p) if integration_registry.has_route(&m, p) => RouteTarget::Integration,
+        (&Method::POST, "/first-party/proxy-rebuild") => RouteTarget::FirstPartyProxyRebuild,
+        (m, p) if integration_registry.has_route(m, p) => RouteTarget::Integration,
         _ => RouteTarget::PublisherProxy,
-    }
-}
-
-fn apply_standard_response_headers(response: &mut Response, settings: &Settings) {
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        response.set_header(HEADER_X_TS_VERSION, v);
-    }
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response.set_header(HEADER_X_TS_ENV, "staging");
-    }
-    for (key, value) in &settings.response_headers {
-        response.set_header(key, value);
     }
 }
 
@@ -135,7 +123,7 @@ async fn route_request(
     );
 
     if let Some(mut response) = enforce_basic_auth(settings, &req) {
-        apply_standard_response_headers(&mut response, settings);
+        apply_standard_response_headers(settings, &mut response);
         return Ok(RouteResult::Buffered(response));
     }
 
@@ -155,7 +143,7 @@ async fn route_request(
             Err(e) => {
                 log::error!("Failed to proxy to publisher origin: {:?}", e);
                 let mut err_resp = to_error_response(&e);
-                apply_standard_response_headers(&mut err_resp, settings);
+                apply_standard_response_headers(settings, &mut err_resp);
                 return Ok(RouteResult::Buffered(err_resp));
             }
         }
@@ -188,7 +176,7 @@ async fn route_request(
 
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
-    apply_standard_response_headers(&mut response, settings);
+    apply_standard_response_headers(settings, &mut response);
 
     Ok(RouteResult::Buffered(response))
 }
@@ -197,7 +185,7 @@ fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
         .echo_stdout(true)
-        .max_level(log::LevelFilter::Debug)
+        .max_level(log::LevelFilter::Info)
         .build()
         .expect("Failed to build Logger");
 
