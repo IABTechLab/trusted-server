@@ -754,13 +754,17 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
 
         // Log the outgoing OpenRTB request for debugging
-        match serde_json::to_string_pretty(&openrtb) {
-            Ok(json) => log::debug!(
-                "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
-                self.config.server_url,
-                json
-            ),
-            Err(e) => log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}"),
+        if log::log_enabled!(log::Level::Debug) {
+            match serde_json::to_string_pretty(&openrtb) {
+                Ok(json) => log::debug!(
+                    "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
+                    self.config.server_url,
+                    json
+                ),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}")
+                }
+            }
         }
 
         // Create HTTP request
@@ -811,9 +815,13 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
-        match serde_json::to_string_pretty(&response_json) {
-            Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
-            Err(e) => log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}"),
+        if log::log_enabled!(log::Level::Debug) {
+            match serde_json::to_string_pretty(&response_json) {
+                Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}")
+                }
+            }
         }
 
         let request_host = response_json
