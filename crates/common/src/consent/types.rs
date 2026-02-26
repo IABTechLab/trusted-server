@@ -48,14 +48,19 @@ pub struct RawConsentSignals {
 }
 
 impl RawConsentSignals {
+    /// Returns `true` when at least one consent cookie signal is present.
+    #[must_use]
+    pub fn has_cookie_signals(&self) -> bool {
+        self.raw_tc_string.is_some()
+            || self.raw_gpp_string.is_some()
+            || self.raw_gpp_sid.is_some()
+            || self.raw_us_privacy.is_some()
+    }
+
     /// Returns `true` when no consent signals were found on the request.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.raw_tc_string.is_none()
-            && self.raw_gpp_string.is_none()
-            && self.raw_gpp_sid.is_none()
-            && self.raw_us_privacy.is_none()
-            && !self.gpc
+        !self.has_cookie_signals() && !self.gpc
     }
 }
 
@@ -129,8 +134,17 @@ pub struct ConsentContext {
     /// Decoded US Privacy signal.
     pub us_privacy: Option<UsPrivacy>,
 
+    /// Whether the TCF consent string has expired (age exceeds configured max).
+    ///
+    /// When `true` and `check_expiration` is enabled, the decoded `tcf` field
+    /// is cleared (treated as no consent) but the raw string is preserved for
+    /// proxy-mode forwarding.
+    pub expired: bool,
+
     /// Global Privacy Control signal from `Sec-GPC` header.
     pub gpc: bool,
+    /// Detected privacy jurisdiction for this request.
+    pub jurisdiction: super::jurisdiction::Jurisdiction,
     /// Source of the consent data (for debugging).
     pub source: ConsentSource,
 }
@@ -325,6 +339,16 @@ impl fmt::Display for PrivacyFlag {
     }
 }
 
+impl From<bool> for PrivacyFlag {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Yes
+        } else {
+            Self::No
+        }
+    }
+}
+
 impl fmt::Display for UsPrivacy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -403,6 +427,32 @@ mod tests {
             ..Default::default()
         };
         assert!(!signals.is_empty(), "should not be empty with gpc=true");
+    }
+
+    #[test]
+    fn has_no_cookie_signals_with_only_gpc() {
+        let signals = RawConsentSignals {
+            gpc: true,
+            ..Default::default()
+        };
+
+        assert!(
+            !signals.has_cookie_signals(),
+            "should not report cookie signals when only gpc is present"
+        );
+    }
+
+    #[test]
+    fn has_cookie_signals_with_tc_string() {
+        let signals = RawConsentSignals {
+            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            signals.has_cookie_signals(),
+            "should report cookie signals when tc string is present"
+        );
     }
 
     #[test]
