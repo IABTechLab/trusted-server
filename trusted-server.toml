@@ -96,7 +96,7 @@ cache_ttl_seconds = 3600
 rewrite_sdk = true
 
 [integrations.gpt]
-enabled = true
+enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
