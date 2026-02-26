@@ -147,6 +147,10 @@ async fn route_request(
 ///
 /// Called from every response path (including auth early-returns) so that all
 /// outgoing responses carry a consistent set of Trusted Server headers.
+///
+/// Header precedence (last write wins): geo headers are set first, then
+/// version/staging, then operator-configured `settings.response_headers`.
+/// This means operators can intentionally override any managed header.
 fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut Response) {
     if let Some(geo) = geo_info {
         geo.set_response_headers(response);

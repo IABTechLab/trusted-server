@@ -92,7 +92,9 @@ impl GeoInfo {
         response.set_header(HEADER_X_GEO_COUNTRY, &self.country);
         response.set_header(HEADER_X_GEO_CONTINENT, &self.continent);
         response.set_header(HEADER_X_GEO_COORDINATES, self.coordinates_string());
-        response.set_header(HEADER_X_GEO_METRO_CODE, self.metro_code.to_string());
+        if self.has_metro_code() {
+            response.set_header(HEADER_X_GEO_METRO_CODE, self.metro_code.to_string());
+        }
         if let Some(ref region) = self.region {
             response.set_header(HEADER_X_GEO_REGION, region);
         }
@@ -186,6 +188,26 @@ mod tests {
                 .expect("should be valid str"),
             "true",
             "should set geo info available to true"
+        );
+    }
+
+    #[test]
+    fn set_response_headers_omits_metro_code_when_zero() {
+        let geo = GeoInfo {
+            metro_code: 0,
+            ..sample_geo_info()
+        };
+        let mut response = Response::new();
+
+        geo.set_response_headers(&mut response);
+
+        assert!(
+            response.get_header(HEADER_X_GEO_METRO_CODE).is_none(),
+            "should not set metro code header when metro_code is 0"
+        );
+        assert!(
+            response.get_header(HEADER_X_GEO_CITY).is_some(),
+            "should still set city header"
         );
     }
 
