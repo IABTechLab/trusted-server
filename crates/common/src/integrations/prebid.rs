@@ -876,6 +876,24 @@ impl AuctionProvider for PrebidAuctionProvider {
         if let Some(errors) = ext.and_then(|e| e.get("errors")) {
             auction_response = auction_response.with_metadata("errors", errors.clone());
         }
+        if let Some(warnings) = ext.and_then(|e| e.get("warnings")) {
+            auction_response = auction_response.with_metadata("warnings", warnings.clone());
+        }
+
+        // When debug is enabled, surface the additional Prebid Server debug
+        // data: httpcalls, resolvedrequest, and per-bid status.
+        if self.config.debug {
+            if let Some(debug) = ext.and_then(|e| e.get("debug")) {
+                auction_response = auction_response.with_metadata("debug", debug.clone());
+            }
+            if let Some(bidstatus) = ext
+                .and_then(|e| e.get("prebid"))
+                .and_then(|p| p.get("bidstatus"))
+            {
+                auction_response =
+                    auction_response.with_metadata("bidstatus", bidstatus.clone());
+            }
+        }
 
         log::info!(
             "Prebid returned {} bids in {}ms",
