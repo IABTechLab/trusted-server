@@ -8,9 +8,23 @@ use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 
-use crate::constants::COOKIE_SYNTHETIC_ID;
+use crate::constants::{
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_SYNTHETIC_ID, COOKIE_US_PRIVACY,
+};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+
+/// Cookie names carrying privacy consent signals.
+///
+/// Used by [`strip_cookies`] to remove consent signals from a `Cookie` header
+/// before forwarding requests to partners that receive consent through the
+/// `OpenRTB` body instead.
+pub const CONSENT_COOKIE_NAMES: &[&str] = &[
+    COOKIE_EUCONSENT_V2,
+    COOKIE_GPP,
+    COOKIE_GPP_SID,
+    COOKIE_US_PRIVACY,
+];
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
 
@@ -55,6 +69,59 @@ pub fn handle_request_cookies(
         None => {
             log::debug!("No cookie header found in request");
             Ok(None)
+        }
+    }
+}
+
+/// Strips named cookies from a `Cookie` header value string.
+///
+/// Parses the semicolon-separated cookie pairs, filters out any whose name
+/// matches one of `cookie_names`, and reconstructs the header string.
+///
+/// Returns an empty string if all cookies were stripped or the input was empty.
+#[must_use]
+pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
+    cookie_header
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| {
+            if let Some(name) = pair.split('=').next() {
+                !cookie_names.contains(&name.trim())
+            } else {
+                true
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Copies the `Cookie` header from one request to another, optionally
+/// stripping consent cookies.
+///
+/// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
+/// are removed before forwarding. If stripping leaves no cookies, the header
+/// is omitted entirely. Non-UTF-8 cookie headers are forwarded unchanged.
+pub fn forward_cookie_header(from: &Request, to: &mut Request, strip_consent: bool) {
+    let Some(cookie_value) = from.get_header(header::COOKIE) else {
+        return;
+    };
+
+    if !strip_consent {
+        to.set_header(header::COOKIE, cookie_value);
+        return;
+    }
+
+    match cookie_value.to_str() {
+        Ok(s) => {
+            let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
+            if !stripped.is_empty() {
+                to.set_header(header::COOKIE, &stripped);
+            }
+        }
+        Err(_) => {
+            // Non-UTF-8 Cookie header — forward as-is
+            to.set_header(header::COOKIE, cookie_value);
         }
     }
 }
@@ -198,5 +265,44 @@ mod tests {
             cookie_str, expected,
             "Set-Cookie header should match create_synthetic_cookie output"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // strip_cookies tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_strip_cookies_removes_consent() {
+        let header = "euconsent-v2=BOE; __gpp=DBAC; session=abc123; us_privacy=1YNN";
+        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
+        assert_eq!(stripped, "session=abc123");
+    }
+
+    #[test]
+    fn test_strip_cookies_preserves_non_consent() {
+        let header = "session=abc123; theme=dark";
+        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
+        assert_eq!(stripped, "session=abc123; theme=dark");
+    }
+
+    #[test]
+    fn test_strip_cookies_empty_input() {
+        let stripped = strip_cookies("", CONSENT_COOKIE_NAMES);
+        assert_eq!(stripped, "");
+    }
+
+    #[test]
+    fn test_strip_cookies_all_stripped() {
+        let header = "euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2,6; us_privacy=1YNN";
+        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
+        assert_eq!(stripped, "");
+    }
+
+    #[test]
+    fn test_strip_cookies_with_complex_values() {
+        // Cookie values can contain '=' characters
+        let header = "euconsent-v2=BOE=xyz; session=abc=123=def";
+        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
+        assert_eq!(stripped, "session=abc=123=def");
     }
 }

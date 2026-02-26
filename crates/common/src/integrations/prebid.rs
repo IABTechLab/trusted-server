@@ -15,6 +15,8 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::backend::BackendConfig;
+use crate::consent_config::ConsentForwardingMode;
+use crate::cookies::forward_cookie_header;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -62,6 +64,13 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// How consent signals are forwarded to Prebid Server.
+    ///
+    /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
+    /// - `cookies_only` — consent cookies forwarded, body consent fields omitted
+    /// - `both` — consent in both cookies and body (default)
+    #[serde(default)]
+    pub consent_forwarding: ConsentForwardingMode,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -416,9 +425,17 @@ fn make_first_party_proxy_url(
     )
 }
 
-fn copy_request_headers(from: &Request, to: &mut Request) {
+/// Copies browser headers to the outgoing Prebid Server request.
+///
+/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
+/// stripped from the `Cookie` header since consent travels exclusively
+/// through the `OpenRTB` body.
+fn copy_request_headers(
+    from: &Request,
+    to: &mut Request,
+    consent_forwarding: ConsentForwardingMode,
+) {
     let headers_to_copy = [
-        header::COOKIE,
         header::USER_AGENT,
         header::HeaderName::from_static("x-forwarded-for"),
         header::REFERER,
@@ -430,6 +447,8 @@ fn copy_request_headers(from: &Request, to: &mut Request) {
             to.set_header(header_name, value);
         }
     }
+
+    forward_cookie_header(from, to, consent_forwarding.strips_consent_cookies());
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -523,7 +542,13 @@ impl PrebidAuctionProvider {
 
         // Build user object — populate consent at both OpenRTB 2.6 top-level
         // and Prebid ext-based locations (dual placement).
-        let consent_ctx = request.user.consent.as_ref();
+        // In cookies_only mode, body consent fields are omitted — consent
+        // travels exclusively through the forwarded Cookie header.
+        let consent_ctx = if self.config.consent_forwarding.includes_body_consent() {
+            request.user.consent.as_ref()
+        } else {
+            None
+        };
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: Some(request.user.id.clone()),
@@ -775,7 +800,11 @@ impl AuctionProvider for PrebidAuctionProvider {
             Method::POST,
             format!("{}/openrtb2/auction", self.config.server_url),
         );
-        copy_request_headers(context.request, &mut pbs_req);
+        copy_request_headers(
+            context.request,
+            &mut pbs_req,
+            self.config.consent_forwarding,
+        );
 
         pbs_req
             .set_body_json(&openrtb)
@@ -926,6 +955,7 @@ mod tests {
             debug: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            consent_forwarding: ConsentForwardingMode::Both,
         }
     }
 
