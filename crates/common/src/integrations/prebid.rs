@@ -53,6 +53,12 @@ pub struct PrebidIntegrationConfig {
     pub bidders: Vec<String>,
     #[serde(default)]
     pub debug: bool,
+    /// Sets the `OpenRTB` `test: 1` flag on outgoing requests. When enabled,
+    /// bidders treat the auction as non-billable test traffic, which can
+    /// significantly reduce fill rates. Separate from `debug` so you can get
+    /// debug diagnostics without suppressing real demand.
+    #[serde(default)]
+    pub test_mode: bool,
     #[serde(default)]
     pub debug_query_params: Option<String>,
     /// Patterns to match Prebid script URLs for serving empty JS.
@@ -635,7 +641,7 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
-            test: debug_enabled.then_some(1),
+            test: self.config.test_mode.then_some(1),
             ext,
         }
     }
@@ -1008,6 +1014,7 @@ mod tests {
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
+            test_mode: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             bid_param_zone_overrides: HashMap::new(),
@@ -1475,9 +1482,8 @@ server_url = "https://prebid.example"
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
 
         assert_eq!(
-            openrtb.test,
-            Some(1),
-            "should set top-level OpenRTB test field when debug is enabled"
+            openrtb.test, None,
+            "debug alone should not set top-level OpenRTB test field"
         );
 
         let prebid_ext = openrtb
@@ -1497,10 +1503,9 @@ server_url = "https://prebid.example"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
-        assert_eq!(
-            serialized["test"],
-            json!(1),
-            "should serialize top-level test as 1 when debug is enabled"
+        assert!(
+            serialized.get("test").is_none(),
+            "debug alone should not serialize top-level test"
         );
         assert_eq!(
             serialized["ext"]["prebid"]["debug"],
@@ -1511,6 +1516,33 @@ server_url = "https://prebid.example"
             serialized["ext"]["prebid"]["returnallbidstatus"],
             json!(true),
             "should serialize ext.prebid.returnallbidstatus when debug is enabled"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_test_flag_when_test_mode_enabled() {
+        let mut config = base_config();
+        config.test_mode = true;
+
+        let provider = PrebidAuctionProvider::new(config);
+        let auction_request = create_test_auction_request();
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.test,
+            Some(1),
+            "should set top-level OpenRTB test field when test_mode is enabled"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["test"],
+            json!(1),
+            "should serialize top-level test as 1 when test_mode is enabled"
         );
     }
 
@@ -1526,7 +1558,7 @@ server_url = "https://prebid.example"
 
         assert_eq!(
             openrtb.test, None,
-            "should omit top-level OpenRTB test field when debug is disabled"
+            "should omit top-level OpenRTB test field when test_mode is disabled"
         );
 
         let prebid_ext = openrtb
@@ -1546,7 +1578,7 @@ server_url = "https://prebid.example"
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         assert!(
             serialized.get("test").is_none(),
-            "should not serialize top-level test when debug is disabled"
+            "should not serialize top-level test when test_mode is disabled"
         );
 
         let prebid = serialized["ext"]["prebid"]
