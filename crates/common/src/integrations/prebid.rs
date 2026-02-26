@@ -579,9 +579,13 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build device object with user-agent and geo if available
+        // Build device object with user-agent, client IP, and geo if available.
+        // Forwarding the real client IP is critical: without it PBS infers the
+        // IP from the incoming connection (a data-center / edge IP), causing
+        // bidders like PubMatic to filter the traffic as non-human.
         let device = request.device.as_ref().map(|d| Device {
             ua: d.user_agent.clone(),
+            ip: d.ip.clone(),
             geo: d.geo.as_ref().map(|geo| Geo {
                 geo_type: 2, // IP address per OpenRTB spec
                 country: Some(geo.country.clone()),
