@@ -10,6 +10,7 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
@@ -314,6 +315,8 @@ pub struct Settings {
     pub rewrite: Rewrite,
     #[serde(default)]
     pub auction: AuctionConfig,
+    #[serde(default)]
+    pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
 }

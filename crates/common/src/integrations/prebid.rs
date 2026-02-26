@@ -15,6 +15,8 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::backend::BackendConfig;
+use crate::consent_config::ConsentForwardingMode;
+use crate::cookies::forward_cookie_header;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -23,8 +25,8 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
-    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest,
+    PrebidExt, PrebidImpExt, Regs, RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -62,6 +64,13 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// How consent signals are forwarded to Prebid Server.
+    ///
+    /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
+    /// - `cookies_only` — consent cookies forwarded, body consent fields omitted
+    /// - `both` — consent in both cookies and body (default)
+    #[serde(default)]
+    pub consent_forwarding: ConsentForwardingMode,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -415,9 +424,17 @@ fn make_first_party_proxy_url(
     )
 }
 
-fn copy_request_headers(from: &Request, to: &mut Request) {
+/// Copies browser headers to the outgoing Prebid Server request.
+///
+/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
+/// stripped from the `Cookie` header since consent travels exclusively
+/// through the `OpenRTB` body.
+fn copy_request_headers(
+    from: &Request,
+    to: &mut Request,
+    consent_forwarding: ConsentForwardingMode,
+) {
     let headers_to_copy = [
-        header::COOKIE,
         header::USER_AGENT,
         header::HeaderName::from_static("x-forwarded-for"),
         header::REFERER,
@@ -429,6 +446,8 @@ fn copy_request_headers(from: &Request, to: &mut Request) {
             to.set_header(header_name, value);
         }
     }
+
+    forward_cookie_header(from, to, consent_forwarding.strips_consent_cookies());
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -520,10 +539,31 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object
+        // Build user object — populate consent at both OpenRTB 2.6 top-level
+        // and Prebid ext-based locations (dual placement).
+        // In cookies_only mode, body consent fields are omitted — consent
+        // travels exclusively through the forwarded Cookie header.
+        let consent_ctx = if self.config.consent_forwarding.includes_body_consent() {
+            request.user.consent.as_ref()
+        } else {
+            None
+        };
+        let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: Some(request.user.id.clone()),
+            // OpenRTB 2.6 top-level consent field
+            consent: raw_tc.clone(),
             ext: Some(UserExt {
+                // Prebid ext-based consent field
+                consent: raw_tc,
+                consented_providers_settings: consent_ctx
+                    .and_then(|c| c.raw_ac_string.as_ref())
+                    .map(|ac| ConsentedProvidersSettings {
+                        consented_providers: Some(ac.clone()),
+                    }),
+                // EIDs will be populated by identity providers; consent gating
+                // is applied via `gate_eids_by_consent` before they are set here.
+                eids: None,
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
         });
@@ -539,16 +579,14 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build regs object if Sec-GPC header is present
-        let regs = if context.request.get_header("Sec-GPC").is_some() {
-            Some(Regs {
-                ext: Some(RegsExt {
-                    us_privacy: Some("1YYN".to_string()),
-                }),
-            })
-        } else {
-            None
-        };
+        // Build regs object from ConsentContext.
+        //
+        // Populates OpenRTB 2.6 canonical fields:
+        //   - regs.gdpr: 1 if GDPR applies (TCF string present)
+        //   - regs.us_privacy: raw US Privacy string
+        //   - regs.gpp: raw GPP string
+        //   - regs.gpp_sid: active GPP section IDs
+        let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
         let request_info = RequestInfo::from_request(context.request);
@@ -589,6 +627,45 @@ impl PrebidAuctionProvider {
             regs,
             ext,
         }
+    }
+
+    /// Builds the `regs` object from a [`ConsentContext`].
+    ///
+    /// Populates consent fields at **both** `OpenRTB` 2.6 top-level locations
+    /// and the `regs.ext.*` locations that Prebid Server reads today.
+    ///
+    /// Returns [`None`] if no consent-relevant data is present (avoids sending
+    /// an empty `regs` object to Prebid Server).
+    fn build_regs(consent_ctx: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
+        let ctx = consent_ctx?;
+
+        let has_data = ctx.gdpr_applies
+            || ctx.raw_us_privacy.is_some()
+            || ctx.raw_gpp_string.is_some()
+            || ctx.gpc;
+
+        if !has_data {
+            return None;
+        }
+
+        let gdpr = if ctx.gdpr_applies { Some(1) } else { Some(0) };
+
+        // Build ext first so the dual-placement fields are cloned once from
+        // ConsentContext (into ext), then once more into Regs top-level.
+        let ext = RegsExt {
+            gdpr,
+            us_privacy: ctx.raw_us_privacy.clone(),
+            gpp: ctx.raw_gpp_string.clone(),
+            gpp_sid: ctx.gpp_section_ids.clone(),
+        };
+
+        Some(Regs {
+            gdpr: ext.gdpr,
+            us_privacy: ext.us_privacy.clone(),
+            gpp: ext.gpp.clone(),
+            gpp_sid: ext.gpp_sid.clone(),
+            ext: Some(ext),
+        })
     }
 
     /// Parse `OpenRTB` response into auction response.
@@ -735,7 +812,11 @@ impl AuctionProvider for PrebidAuctionProvider {
             Method::POST,
             format!("{}/openrtb2/auction", self.config.server_url),
         );
-        copy_request_headers(context.request, &mut pbs_req);
+        copy_request_headers(
+            context.request,
+            &mut pbs_req,
+            self.config.consent_forwarding,
+        );
 
         pbs_req
             .set_body_json(&openrtb)
@@ -886,6 +967,7 @@ mod tests {
             debug: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            consent_forwarding: ConsentForwardingMode::Both,
         }
     }
 

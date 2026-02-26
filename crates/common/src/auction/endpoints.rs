@@ -4,7 +4,10 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::consent;
+use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
@@ -41,8 +44,19 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    // Extract consent from request cookies, headers, and geo.
+    let cookie_jar = handle_request_cookies(&req)?;
+    let geo = GeoInfo::from_request(&req);
+    let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
+        jar: cookie_jar.as_ref(),
+        req: &req,
+        config: &settings.consent,
+        geo: geo.as_ref(),
+        synthetic_id: None, // Auction requests don't carry a Synthetic ID yet.
+    });
+
     // Convert tsjs request format to auction request
-    let auction_request = convert_tsjs_to_auction_request(&body, settings, &req)?;
+    let auction_request = convert_tsjs_to_auction_request(&body, settings, &req, consent_context)?;
 
     // Create auction context
     let context = AuctionContext {

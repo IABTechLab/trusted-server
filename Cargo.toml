@@ -58,6 +58,7 @@ handlebars = "6.4.0"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.4.0"
+iab_gpp = "0.1"
 jose-jwk = "0.1.2"
 log = "0.4.28"
 log-fastly = "0.11.12"
@@ -79,3 +80,4 @@ urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
 which = "8"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }

@@ -34,6 +34,10 @@ build = """
         [[local_server.kv_stores.creative_store]]
             key = "placeholder"
             data = "placeholder"
+
+        [[local_server.kv_stores.consent_store]]
+            key = "placeholder"
+            data = "placeholder"
     [local_server.secret_stores]
         [[local_server.secret_stores.signing_keys]]
             key = "ts-2025-10-A"

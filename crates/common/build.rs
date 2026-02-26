@@ -1,10 +1,13 @@
-#![allow(clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
 #[path = "src/error.rs"]
 mod error;
 
 #[path = "src/auction_config_types.rs"]
 mod auction_config_types;
+
+#[path = "src/consent_config.rs"]
+mod consent_config;
 
 #[path = "src/settings.rs"]
 mod settings;
