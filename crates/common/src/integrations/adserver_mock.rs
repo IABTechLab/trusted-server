@@ -283,7 +283,7 @@ impl AuctionProvider for AdServerMockProvider {
 
         log::debug!("AdServer Mock: mediation request: {:?}", mediation_req);
 
-        // Build endpoint URL with optional Permutive segments query string
+        // Build endpoint URL with context-driven query parameters
         let endpoint_url = self.build_endpoint_url(request);
 
         // Create HTTP POST request

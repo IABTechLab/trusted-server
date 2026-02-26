@@ -1,6 +1,7 @@
 //! Auction configuration types (separated to avoid circular deps in build.rs).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32,7 +33,7 @@ pub struct AuctionConfig {
     /// are forwarded into the `AuctionRequest.context`. Unrecognised keys are
     /// silently dropped. An empty list blocks all context keys.
     #[serde(default = "default_allowed_context_keys")]
-    pub allowed_context_keys: Vec<String>,
+    pub allowed_context_keys: HashSet<String>,
 }
 
 impl Default for AuctionConfig {
@@ -43,7 +44,7 @@ impl Default for AuctionConfig {
             mediator: None,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
-            allowed_context_keys: default_allowed_context_keys(),
+            allowed_context_keys: HashSet::new(),
         }
     }
 }
@@ -56,8 +57,8 @@ fn default_creative_store() -> String {
     "creative_store".to_string()
 }
 
-fn default_allowed_context_keys() -> Vec<String> {
-    vec![]
+fn default_allowed_context_keys() -> HashSet<String> {
+    HashSet::new()
 }
 
 #[allow(dead_code)] // Methods used in runtime but not in build script

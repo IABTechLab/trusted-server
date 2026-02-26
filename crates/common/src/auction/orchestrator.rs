@@ -509,7 +509,7 @@ mod tests {
     };
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::Request;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::AuctionOrchestrator;
 
@@ -645,7 +645,7 @@ mod tests {
             mediator: None,
             timeout_ms: 2000,
             creative_store: "creative_store".to_string(),
-            allowed_context_keys: vec!["permutive_segments".to_string()],
+            allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
         };
 
         let orchestrator = AuctionOrchestrator::new(config);

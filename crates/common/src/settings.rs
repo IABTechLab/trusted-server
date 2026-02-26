@@ -540,6 +540,7 @@ mod tests {
     use super::*;
     use regex::Regex;
     use serde_json::json;
+    use std::collections::HashSet;
 
     use crate::integrations::{
         nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
@@ -1149,7 +1150,7 @@ mod tests {
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
-            vec!["permutive_segments", "lockr_ids"]
+            HashSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
         );
     }
 

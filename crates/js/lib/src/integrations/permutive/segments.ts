@@ -55,8 +55,8 @@ export function getPermutiveSegments(): string[] {
         }
       }
     }
-  } catch {
-    log.debug('getPermutiveSegments: failed to read from localStorage');
+  } catch (err) {
+    log.debug('getPermutiveSegments: failed to read segments', err);
   }
   return [];
 }

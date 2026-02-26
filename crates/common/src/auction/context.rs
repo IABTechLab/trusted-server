@@ -230,19 +230,20 @@ mod tests {
 
     #[test]
     fn test_context_value_deserialize_array() {
-        let v: ContextValue = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        let v: ContextValue =
+            serde_json::from_str(r#"["a","b"]"#).expect("should deserialize string list");
         assert_eq!(v, ContextValue::StringList(vec!["a".into(), "b".into()]));
     }
 
     #[test]
     fn test_context_value_deserialize_string() {
-        let v: ContextValue = serde_json::from_str(r#""hello""#).unwrap();
+        let v: ContextValue = serde_json::from_str(r#""hello""#).expect("should deserialize text");
         assert_eq!(v, ContextValue::Text("hello".into()));
     }
 
     #[test]
     fn test_context_value_deserialize_number() {
-        let v: ContextValue = serde_json::from_str("42").unwrap();
+        let v: ContextValue = serde_json::from_str("42").expect("should deserialize number");
         assert_eq!(v, ContextValue::Number(42.0));
     }
 }
