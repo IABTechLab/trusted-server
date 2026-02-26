@@ -60,6 +60,8 @@ else
     BOLD='' GREEN='' YELLOW='' RED='' CYAN='' RESET=''
 fi
 
+METRICS_SUMMARY=()
+
 # --- Helpers ---
 
 log_header() {
@@ -138,7 +140,7 @@ timed_curl() {
     ttfb_ms=$(echo "$ttfb * 1000" | bc 2>/dev/null || echo "$ttfb")
 
     printf "  %-40s  HTTP %s  TTFB: %8.2f ms  Total: %8.2f ms  Size: %s bytes\n" \
-        "$label" "$code" "$ttfb_ms" "$total_ms" "$size"
+        "$label" "$code" "$ttfb_ms" "$total_ms" "$size" >&2
 
     echo "$result"
 }
@@ -215,6 +217,84 @@ run_endpoint_latency() {
     echo ""
 }
 
+run_load_benchmark() {
+    local name="$1"
+    local total_requests="$2"
+    local concurrency="$3"
+    local repeats="$4"
+    local method="$5"
+    local url="$6"
+    shift 6
+    local extra_args=("$@")
+
+    echo -e "${BOLD}${method} ${url} - ${total_requests} requests, ${concurrency} concurrent (${repeats} runs)${RESET}"
+    echo ""
+
+    local rps_values=()
+    local p50_values=()
+    local p95_values=()
+
+    for r in $(seq 1 "$repeats"); do
+        # Warmup (discarded)
+        hey -n 50 -c "$concurrency" -t 30 ${extra_args[@]+"${extra_args[@]}"} "$url" > /dev/null 2>&1
+
+        # Measured
+        local output
+        output=$(hey -n "$total_requests" -c "$concurrency" -t 30 ${extra_args[@]+"${extra_args[@]}"} "$url" 2>&1)
+        
+        # Display the 1st run's full output for human readability
+        if [ "$r" -eq 1 ]; then
+            echo "$output" | grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
+        fi
+        
+        local rps p50 p95
+        rps=$(echo "$output" | awk '/Requests\/sec:/ {print $2}')
+        p50=$(echo "$output" | awk '/50% in/ {print $3}')
+        p95=$(echo "$output" | awk '/95% in/ {print $3}')
+        
+        rps=${rps:-0}
+        p50=${p50:-0}
+        p95=${p95:-0}
+        
+        rps_values+=("$rps")
+        p50_values+=("$p50")
+        p95_values+=("$p95")
+        
+        if [ "$repeats" -gt 1 ]; then
+            echo "  Run $r: $rps req/sec, p50: $p50 secs, p95: $p95 secs"
+        fi
+    done
+
+    # Compute mean and stddev for RPS and P50
+    local mean_rps mean_p50 mean_p95
+    if [ "$repeats" -eq 1 ]; then
+        mean_rps="${rps_values[0]}"
+        mean_p50="${p50_values[0]}"
+        mean_p95="${p95_values[0]}"
+    else
+        mean_rps=$(printf "%s\n" "${rps_values[@]}" | awk '{sum+=$1; sumsq+=$1*$1} END {if(NR>0){mean=sum/NR; stddev=sqrt(sumsq/NR - mean*mean); printf "%.2f ± %.2f", mean, stddev}else{print "0"}}')
+        mean_p50=$(printf "%s\n" "${p50_values[@]}" | awk '{sum+=$1; sumsq+=$1*$1} END {if(NR>0){mean=sum/NR; stddev=sqrt(sumsq/NR - mean*mean); printf "%.4f ± %.4f", mean, stddev}else{print "0"}}')
+        mean_p95=$(printf "%s\n" "${p95_values[@]}" | awk '{sum+=$1; sumsq+=$1*$1} END {if(NR>0){mean=sum/NR; stddev=sqrt(sumsq/NR - mean*mean); printf "%.4f ± %.4f", mean, stddev}else{print "0"}}')
+    fi
+
+    if [ "$repeats" -gt 1 ]; then
+        echo "  -> Avg RPS: $mean_rps"
+        echo "  -> Avg P50: $mean_p50 secs"
+        echo "  -> Avg P95: $mean_p95 secs"
+        echo ""
+    fi
+    
+    # Store for metrics summary
+    local calc_mean_rps calc_mean_p50 calc_mean_p95
+    calc_mean_rps=$(printf "%s\n" "${rps_values[@]}" | awk '{sum+=$1} END {if(NR>0) printf "%.2f", sum/NR}')
+    calc_mean_p50=$(printf "%s\n" "${p50_values[@]}" | awk '{sum+=$1} END {if(NR>0) printf "%.4f", sum/NR}')
+    calc_mean_p95=$(printf "%s\n" "${p95_values[@]}" | awk '{sum+=$1} END {if(NR>0) printf "%.4f", sum/NR}')
+    
+    METRICS_SUMMARY+=("${name}_rps=$calc_mean_rps")
+    METRICS_SUMMARY+=("${name}_p50=$calc_mean_p50")
+    METRICS_SUMMARY+=("${name}_p95=$calc_mean_p95")
+}
+
 run_load_test() {
     if ! check_hey; then
         return
@@ -226,28 +306,11 @@ run_load_test() {
 
     local total_requests="${1:-200}"
     local concurrency="${2:-10}"
+    local repeats="${3:-3}"
 
-    echo -e "${BOLD}GET / (publisher proxy) - ${total_requests} requests, ${concurrency} concurrent${RESET}"
-    echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/" 2>&1 | \
-        grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
-    echo ""
-
-    echo -e "${BOLD}GET /static/tsjs=tsjs-unified.min.js (static) - ${total_requests} requests, ${concurrency} concurrent${RESET}"
-    echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 "$BASE_URL/static/tsjs=tsjs-unified.min.js" 2>&1 | \
-        grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
-    echo ""
-
-    echo -e "${BOLD}POST /auction - ${total_requests} requests, ${concurrency} concurrent${RESET}"
-    echo ""
-    hey -n "$total_requests" -c "$concurrency" -t 30 \
-        -m POST \
-        -H "Content-Type: application/json" \
-        -d "$AUCTION_PAYLOAD" \
-        "$BASE_URL/auction" 2>&1 | \
-        grep -E "(Requests/sec|Total:|Slowest:|Fastest:|Average:|requests done)|Status code|Latency distribution" -A 20
-    echo ""
+    run_load_benchmark "publisher_proxy" "$total_requests" "$concurrency" "$repeats" GET "$BASE_URL/"
+    run_load_benchmark "static_js" "$total_requests" "$concurrency" "$repeats" GET "$BASE_URL/static/tsjs=tsjs-unified.min.js"
+    run_load_benchmark "auction" "$total_requests" "$concurrency" "$repeats" POST "$BASE_URL/auction" -m POST -H "Content-Type: application/json" -d "$AUCTION_PAYLOAD"
 }
 
 run_first_byte_analysis() {
@@ -307,8 +370,38 @@ compare_results() {
     run_all 2>&1 > "$current"
 
     log_header "COMPARISON: current vs $name"
+    
+    local base_metrics curr_metrics
+    base_metrics=$(mktemp)
+    curr_metrics=$(mktemp)
+    
+    awk '/^---METRICS---$/ {flag=1; next} flag {print}' "$baseline" > "$base_metrics"
+    awk '/^---METRICS---$/ {flag=1; next} flag {print}' "$current" > "$curr_metrics"
+    
+    if [ -s "$base_metrics" ] && [ -s "$curr_metrics" ]; then
+        echo -e "${BOLD}Metrics Delta (vs baseline):${RESET}"
+        printf "  %-30s %-15s -> %-15s %s\n" "Metric" "Baseline" "Current" "Delta"
+        printf "  %-30s %-15s    %-15s %s\n" "------" "--------" "-------" "-----"
+        
+        while IFS='=' read -r key curr_val; do
+            base_val=$(grep "^${key}=" "$base_metrics" | cut -d= -f2 || true)
+            if [ -n "$base_val" ] && [ "$base_val" != "0" ] && [ "$base_val" != "0.00" ] && [ "$base_val" != "0.0000" ]; then
+                # Calculate delta
+                delta=$(echo "scale=2; (($curr_val - $base_val) / $base_val) * 100" | bc -l 2>/dev/null || echo "0")
+                if [ "$(echo "$delta > 0" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+                    delta="+${delta}%"
+                else
+                    delta="${delta}%"
+                fi
+                printf "  %-30s %-15s -> %-15s %s\n" "$key" "$base_val" "$curr_val" "$delta"
+            fi
+        done < "$curr_metrics"
+        echo ""
+    fi
+    
+    echo -e "${BOLD}Full Output Diff:${RESET}"
     diff --color=auto -u "$baseline" "$current" || true
-    rm -f "$current"
+    rm -f "$current" "$base_metrics" "$curr_metrics"
 }
 
 run_all() {
@@ -321,7 +414,13 @@ run_all() {
     run_cold_start
     run_first_byte_analysis
     run_endpoint_latency
-    run_load_test 200 10
+    run_load_test 200 10 3
+
+    echo ""
+    echo "---METRICS---"
+    for metric in ${METRICS_SUMMARY[@]+"${METRICS_SUMMARY[@]}"}; do
+        echo "$metric"
+    done
 }
 
 run_quick() {
@@ -331,7 +430,13 @@ run_quick() {
     echo "Server: $BASE_URL"
 
     run_first_byte_analysis
-    run_load_test 50 5
+    run_load_test 50 5 1
+
+    echo ""
+    echo "---METRICS---"
+    for metric in ${METRICS_SUMMARY[@]+"${METRICS_SUMMARY[@]}"}; do
+        echo "$metric"
+    done
 }
 
 # --- Main ---
