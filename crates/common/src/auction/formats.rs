@@ -12,7 +12,6 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::auction::types::OrchestratorExt;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -22,7 +21,8 @@ use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
+    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
+    PublisherInfo, SiteInfo, UserInfo,
 };
 
 /// Request body format for auction endpoints (tsjs/Prebid.js format).
@@ -230,6 +230,13 @@ pub fn convert_to_openrtb_response(
         "parallel_only"
     };
 
+    // Build per-provider summaries from the orchestration result
+    let provider_details: Vec<ProviderSummary> = result
+        .provider_responses
+        .iter()
+        .map(ProviderSummary::from)
+        .collect();
+
     let response_body = OpenRtbResponse {
         id: auction_request.id.to_string(),
         seatbid: seatbids,
@@ -239,6 +246,7 @@ pub fn convert_to_openrtb_response(
                 providers: result.provider_responses.len(),
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
+                provider_details,
             },
         }),
     };

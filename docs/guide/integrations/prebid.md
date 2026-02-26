@@ -24,19 +24,25 @@ debug = false
 
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
+
+# Optional per-bidder, per-zone param overrides (shallow merge)
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header       = {placementId = "_s2sHeaderPlacement"}
+in_content   = {placementId = "_s2sContentPlacement"}
 ```
 
 ### Configuration Options
 
-| Field                | Type          | Default                                                                | Description                                 |
-| -------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
-| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                   |
-| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                  |
-| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds             |
-| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                     |
-| `debug`              | Boolean       | `false`                                                                | Enable debug logging                        |
-| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging   |
-| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception |
+| Field                      | Type          | Default                                                                | Description                                                                             |
+| -------------------------- | ------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                               |
+| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                              |
+| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                         |
+| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                 |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; zone values are shallow-merged into bidder params |
+| `debug`                    | Boolean       | `false`                                                                | Enable debug logging                                                                    |
+| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                               |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                             |
 
 ## Features
 
@@ -90,6 +96,42 @@ script_patterns = []
 ```
 
 When a request matches a script pattern, Trusted Server returns an empty JavaScript file with aggressive caching (`max-age=31536000, immutable`).
+
+### Bid Param Zone Overrides
+
+Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides. This is designed for bidders like Kargo that use different server-to-server placement IDs per ad zone.
+
+The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad unit (e.g., `"header"`, `"in_content"`, `"fixed_bottom"`) and sends it alongside the bidder params. The server then uses this zone to look up the correct override. When `mediaTypes.banner.name` is not set, no zone is sent and zone overrides are skipped for that impression.
+
+**Behavior**:
+
+- Overrides are matched by bidder name + zone combination
+- Override params are shallow-merged into incoming bidder params (override values win on key conflicts)
+- Non-conflicting incoming fields are preserved
+- When no zone override matches (unknown zone or missing zone), incoming params are left unchanged
+
+**Example**:
+
+```toml
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header       = {placementId = "_s2sHeaderPlacement"}
+in_content   = {placementId = "_s2sContentPlacement"}
+fixed_bottom = {placementId = "_s2sBottomPlacement"}
+```
+
+If the incoming request for zone `header` has:
+
+```json
+{ "kargo": { "placementId": "client_side_abc" } }
+```
+
+the outgoing bidder params become:
+
+```json
+{ "kargo": { "placementId": "_s2sHeaderPlacement" } }
+```
+
+For an unrecognised zone (e.g., `sidebar`), the incoming params are left unchanged.
 
 ## Endpoints
 
@@ -157,6 +199,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Injects synthetic ID in the user object
 - Includes device/geo information when available
 - Appends `debug_query_params` to page URL when configured
+- Applies `bid_param_zone_overrides` to `imp.ext.prebid.bidder` before request dispatch
 - Signs requests when request signing is enabled
 
 ## Best Practices
