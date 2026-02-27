@@ -1,4 +1,4 @@
-# 🛡️ Trusted Server — First-Party Proxying Flow
+# 🛡️ Trusted Server — Proxying Flow
 
 ## 🔄 System Flow Diagram
 
@@ -80,7 +80,7 @@ sequenceDiagram
     activate TS
     activate PBS
     activate DSP
-    JS->>TS: GET /first-party/ad<br/>(with signals)
+    JS->>TS: GET /ad/render<br/>(with signals)
     TS->>PBS: POST /openrtb2/auction<br/>(OpenRTB 2.x)
     PBS->>DSP: POST bid request
     DSP-->>PBS: 200 bid response
