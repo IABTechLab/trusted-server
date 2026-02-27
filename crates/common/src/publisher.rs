@@ -1,11 +1,14 @@
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
-use fastly::{Body, Request, Response};
+use fastly::{Request, Response};
 
 use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::constants::{
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_COMPRESS_HINT,
+    HEADER_X_SYNTHETIC_ID, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+};
 use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
@@ -50,7 +53,6 @@ pub fn handle_tsjs_dynamic(
 
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
-    content_encoding: &'a str,
     origin_host: &'a str,
     origin_url: &'a str,
     request_host: &'a str,
@@ -58,92 +60,6 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
-}
-
-/// Process response body in streaming fashion with compression preservation
-fn process_response_streaming(
-    body: Body,
-    params: &ProcessResponseParams,
-) -> Result<Body, Report<TrustedServerError>> {
-    // Check if this is HTML content
-    let is_html = params.content_type.contains("text/html");
-    let is_rsc_flight = params.content_type.contains("text/x-component");
-    log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
-        params.content_type,
-        params.content_encoding,
-        is_html,
-        is_rsc_flight,
-        params.origin_host
-    );
-
-    // Determine compression type
-    let compression = Compression::from_content_encoding(params.content_encoding);
-
-    // Create output body to collect results
-    let mut output = Vec::new();
-
-    // Choose processor based on content type
-    if is_html {
-        // Use HTML rewriter for HTML content
-        let processor = create_html_stream_processor(
-            params.origin_host,
-            params.request_host,
-            params.request_scheme,
-            params.settings,
-            params.integration_registry,
-        )?;
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
-    } else if is_rsc_flight {
-        // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
-        // corrupt the stream by changing byte lengths without updating the prefixes.
-        let processor = RscFlightUrlRewriter::new(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
-    } else {
-        // Use simple text replacer for non-HTML content
-        let replacer = create_url_replacer(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, replacer);
-        pipeline.process(body, &mut output)?;
-    }
-
-    log::debug!(
-        "Streaming processing complete - output size: {} bytes",
-        output.len()
-    );
-    Ok(Body::from(output))
 }
 
 /// Create a unified HTML stream processor
@@ -167,45 +83,48 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
-/// Proxies requests to the publisher's origin server.
+/// Apply standard Trusted Server response headers (version, staging flag, custom headers).
 ///
-/// This function forwards incoming requests to the configured origin URL,
-/// preserving headers and request body. It's used as a fallback for routes
-/// not explicitly handled by the trusted server.
+/// This should be called on every response before sending to the client, regardless of
+/// whether the response is buffered or streamed.
+pub fn apply_standard_response_headers(settings: &Settings, response: &mut Response) {
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
+    }
+    for (key, value) in &settings.response_headers {
+        response.set_header(key, value);
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum RouteResult {
+    /// Response fully buffered — send via `send_to_client()`
+    Buffered(Response),
+    /// Response already streamed to client
+    Streamed,
+}
+
+/// Streaming version of publisher request handling.
+/// Uses `stream_to_client()` for text responses, falling back to buffered for errors.
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if:
-/// - The proxy request fails
-/// - The origin backend is unreachable
-pub fn handle_publisher_request(
+/// Returns an error if the generation of a synthetic ID fails, or if making the backend HTTP request to the origin fails.
+pub fn handle_publisher_request_streaming(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    log::debug!("Proxying request to publisher_origin");
+) -> Result<RouteResult, Report<TrustedServerError>> {
+    log::debug!("Streaming: Proxying request to publisher_origin");
 
-    // Prebid.js requests are not intercepted here anymore. The HTML processor removes
-    // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
-
-    // Extract request host and scheme from headers (supports X-Forwarded-Host/Proto for chained proxies)
     let request_info = RequestInfo::from_request(&req);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
-    log::debug!(
-        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
-        request_host,
-        request_scheme,
-        req.get_header("x-forwarded-host"),
-        req.get_header(header::HOST),
-        req.get_header("x-forwarded-proto"),
-    );
-
-    // Generate synthetic identifiers before the request body is consumed.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
-
-    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -213,11 +132,6 @@ pub fn handle_publisher_request(
     )?;
     let origin_host = settings.publisher.origin_host();
 
-    log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
-        backend_name,
-        settings.publisher.origin_url
-    );
     req.set_header("host", &origin_host);
 
     let mut response = req
@@ -226,13 +140,6 @@ pub fn handle_publisher_request(
             message: "Failed to proxy request to origin".to_string(),
         })?;
 
-    // Log all response headers for debugging
-    log::debug!("Response headers:");
-    for (name, value) in response.get_headers() {
-        log::debug!("  {}: {:?}", name, value);
-    }
-
-    // Check if the response has a text-based content type that we should process
     let content_type = response
         .get_header(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
@@ -243,68 +150,125 @@ pub fn handle_publisher_request(
         || content_type.contains("application/javascript")
         || content_type.contains("application/json");
 
-    if should_process && !request_host.is_empty() {
-        // Check if the response is compressed
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_lowercase();
+    // Only stream 2xx text responses that need processing. Non-processable responses
+    // fall back to buffered return via `RouteResult::Buffered`.
+    let will_stream =
+        response.get_status().is_success() && should_process && !request_host.is_empty();
 
-        // Log response details for debugging
+    if !will_stream {
         log::debug!(
-            "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-            content_type, content_encoding, request_host, origin_host
-        );
-
-        // Take the response body for streaming processing
-        let body = response.take_body();
-
-        // Process the body using streaming approach
-        let params = ProcessResponseParams {
-            content_encoding: &content_encoding,
-            origin_host: &origin_host,
-            origin_url: &settings.publisher.origin_url,
-            request_host,
-            request_scheme,
-            settings,
-            content_type: &content_type,
-            integration_registry,
-        };
-        match process_response_streaming(body, &params) {
-            Ok(processed_body) => {
-                // Set the processed body back
-                response.set_body(processed_body);
-
-                // Remove Content-Length as the size has likely changed
-                response.remove_header(header::CONTENT_LENGTH);
-
-                // Keep Content-Encoding header since we're returning compressed content
-                log::debug!(
-                    "Preserved Content-Encoding: {} for compressed response",
-                    content_encoding
-                );
-
-                log::debug!("Completed streaming processing of response body");
-            }
-            Err(e) => {
-                log::error!("Failed to process response body: {:?}", e);
-                // Return an error response
-                return Err(e);
-            }
-        }
-    } else {
-        log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}'",
+            "Falling back to buffered for response - status: {}, should_process: {}, request_host: '{}'",
+            response.get_status(),
             should_process,
             request_host
         );
+        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+        set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+        apply_standard_response_headers(settings, &mut response);
+        return Ok(RouteResult::Buffered(response));
     }
+
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    log::debug!(
+        "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+        content_type, content_encoding, request_host, origin_host
+    );
+
+    let body = response.take_body();
+    let compression = Compression::from_content_encoding(&content_encoding);
 
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+    apply_standard_response_headers(settings, &mut response);
 
-    Ok(response)
+    // Remove content-length since we stream and modify size
+    response.remove_header(header::CONTENT_LENGTH);
+
+    // Commit to streaming — headers (including our additions) sent NOW
+    let streaming_body = response.stream_to_client();
+    let mut buffered_streaming_body = std::io::BufWriter::with_capacity(8192, streaming_body);
+
+    let params = ProcessResponseParams {
+        origin_host: &origin_host,
+        origin_url: &settings.publisher.origin_url,
+        request_host,
+        request_scheme,
+        settings,
+        content_type: &content_type,
+        integration_registry,
+    };
+
+    let is_html = params.content_type.contains("text/html");
+    let is_rsc_flight = params.content_type.contains("text/x-component");
+
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: 8192,
+    };
+
+    let process_result = if is_html {
+        match create_html_stream_processor(
+            params.origin_host,
+            params.request_host,
+            params.request_scheme,
+            params.settings,
+            params.integration_registry,
+        ) {
+            Ok(processor) => {
+                let mut pipeline = StreamingPipeline::new(config, processor);
+                pipeline.process(body, &mut buffered_streaming_body)
+            }
+            Err(e) => {
+                log::error!("Failed to create html stream processor: {:?}", e);
+                // We've already sent headers, we can't change the status. Just return.
+                return Ok(RouteResult::Streamed);
+            }
+        }
+    } else if is_rsc_flight {
+        let processor = RscFlightUrlRewriter::new(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        let mut pipeline = StreamingPipeline::new(config, processor);
+        pipeline.process(body, &mut buffered_streaming_body)
+    } else {
+        let replacer = create_url_replacer(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        pipeline.process(body, &mut buffered_streaming_body)
+    };
+
+    match process_result {
+        Ok(()) => match buffered_streaming_body.into_inner() {
+            Ok(streaming_body) => {
+                if let Err(e) = streaming_body.finish() {
+                    log::error!("Failed to finish streaming_body: {:?}", e);
+                } else {
+                    log::debug!("Completed streaming processing of response body");
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to flush buffered streaming body: {:?}", e.error());
+            }
+        },
+        Err(e) => {
+            log::error!("Streaming failed mid-flight: {:?}", e);
+        }
+    }
+
+    Ok(RouteResult::Streamed)
 }
 
 #[cfg(test)]
@@ -397,12 +361,6 @@ mod tests {
             );
         }
     }
-
-    // Note: test_streaming_compressed_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
-
-    // Note: test_streaming_brotli_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
 
     #[test]
     fn test_content_encoding_detection() {

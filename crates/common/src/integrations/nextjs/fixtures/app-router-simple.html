@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charSet="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Next.js RSC Test App</title>
+    <link rel="stylesheet" href="https://origin.example.com/styles/main.css"/>
+    <link rel="icon" href="https://origin.example.com/favicon.ico"/>
+    <link rel="preload" as="script" href="https://origin.example.com/_next/static/chunks/main-abc123.js"/>
+    <link rel="preload" as="script" href="https://origin.example.com/_next/static/chunks/webpack-def456.js"/>
+  </head>
+  <body>
+    <nav><a href="https://origin.example.com/">Home</a><a href="https://origin.example.com/about">About</a><a href="https://origin.example.com/blog/hello-world">Blog</a></nav>
+    <main>
+      <div>
+        <h1>Welcome to the Test App</h1>
+        <p>Visit our <a href="https://origin.example.com/getting-started">getting started guide</a>.</p>
+        <ul>
+          <li><a href="https://origin.example.com/docs">Documentation</a><span> - Learn about the platform</span></li>
+          <li><a href="https://origin.example.com/api/v1">API Reference</a><span> - Explore the REST API</span></li>
+          <li><a href="https://origin.example.com/dashboard">Dashboard</a><span> - View your analytics</span></li>
+        </ul>
+        <img src="https://origin.example.com/images/hero.jpg" alt="Hero" width="800" height="400"/>
+      </div>
+    </main>
+    <footer><a href="https://origin.example.com/privacy">Privacy Policy</a><a href="https://origin.example.com/terms">Terms of Service</a></footer>
+    <script>(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,null])</script>
+    <script>self.__next_f.push([1,"1:{\"url\":\"https://origin.example.com/docs\",\"title\":\"Documentation\"}\n"])</script>
+    <script>self.__next_f.push([1,"2:{\"url\":\"https://origin.example.com/api/v1\",\"title\":\"API Reference\"}\n"])</script>
+    <script>self.__next_f.push([1,"3:{\"url\":\"https://origin.example.com/dashboard\",\"title\":\"Dashboard\"}\n"])</script>
+    <script src="https://origin.example.com/_next/static/chunks/main-abc123.js" async=""></script>
+    <script src="https://origin.example.com/_next/static/chunks/webpack-def456.js" async=""></script>
+  </body>
+</html>
