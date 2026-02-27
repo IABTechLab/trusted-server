@@ -621,15 +621,15 @@ price_floor = 0.50
 
 #### `[integrations.prebid]`
 
-| Field            | Type     | Default           | Description                                                                 |
-| ---------------- | -------- | ----------------- | --------------------------------------------------------------------------- |
-| `enabled`        | bool     | `true`            | Enable Prebid provider                                                      |
-| `server_url`     | string   | —                 | Prebid Server URL (required)                                                |
-| `timeout_ms`     | u32      | `1000`            | Request timeout                                                             |
-| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                 |
-| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                   |
-| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `returnallbidstatus`) |
-| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                         |
+| Field            | Type     | Default           | Description                                                                            |
+| ---------------- | -------- | ----------------- | -------------------------------------------------------------------------------------- |
+| `enabled`        | bool     | `true`            | Enable Prebid provider                                                                 |
+| `server_url`     | string   | —                 | Prebid Server URL (required)                                                           |
+| `timeout_ms`     | u32      | `1000`            | Request timeout                                                                        |
+| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                            |
+| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                              |
+| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
+| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
 
 #### `[integrations.aps]`
 

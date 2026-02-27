@@ -1551,6 +1551,38 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn to_openrtb_serializes_device_ip_when_present() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("test-agent".to_string()),
+            ip: Some("203.0.113.42".to_string()),
+            geo: None,
+        });
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb
+                .device
+                .as_ref()
+                .and_then(|device| device.ip.as_deref()),
+            Some("203.0.113.42"),
+            "should propagate client IP into OpenRTB device.ip"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["device"]["ip"],
+            json!("203.0.113.42"),
+            "should serialize device.ip when client IP is available"
+        );
+    }
+
+    #[test]
     fn to_openrtb_omits_debug_flags_when_disabled() {
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
