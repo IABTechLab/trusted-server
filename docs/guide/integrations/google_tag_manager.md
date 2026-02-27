@@ -1,0 +1,234 @@
+# Google Tag Manager Integration
+
+**Category**: Tag Management
+**Status**: Production
+**Type**: First-Party Tag Gateway
+
+## Overview
+
+The Google Tag Manager (GTM) integration enables Trusted Server to act as a first-party proxy for GTM scripts and analytics beacons. This improves performance, tracking accuracy, and privacy control by serving these assets from your own domain.
+
+## What is the Tag Gateway?
+
+The Tag Gateway intercepts requests for GTM scripts (`gtm.js`) and Google Analytics beacons (`collect`). Instead of the user's browser connecting directly to Google content servers, it connects to your Trusted Server. Trusted Server then fetches the content from Google and serves it back to the user.
+
+**Benefits**:
+
+- **Bypass Ad Blockers**: Serving scripts from a first-party domain can prevent them from being blocked by some ad blockers and privacy extensions.
+- **Extended Cookie Life**: First-party cookies set by these scripts are more durable in environments like Safari (ITP).
+- **Performance**: Utilize edge caching for scripts.
+- **Privacy Enhancement**: Does not forward client IP to Google (Google sees edge server IP, not user IP).
+
+**Privacy vs. Analytics Tradeoff**:
+
+Client IP addresses are intentionally **not forwarded** to Google Analytics. This means:
+
+- ✅ **Privacy**: User IP addresses remain private and are not sent to Google
+- ⚠️ **Analytics**: Geographic targeting and user location data will be based on the edge server's IP, not the actual user's location
+- ⚠️ **Accuracy**: Analytics reports may show less accurate geographic distribution
+
+This is a deliberate privacy-first design choice. If your use case requires accurate geographic data, you may need to consider alternative approaches.
+
+## Configuration
+
+Add the GTM configuration to `trusted-server.toml`:
+
+```toml
+[integrations.google_tag_manager]
+enabled = true
+container_id = "GTM-XXXXXX"
+# upstream_url = "https://www.googletagmanager.com" # Optional override
+# cache_max_age = 900 # Optional: Cache duration in seconds (default: 900)
+# max_beacon_body_size = 65536 # Optional: Max POST body size in bytes (default: 65536 / 64KB)
+```
+
+### Configuration Options
+
+| Field                  | Type    | Required | Description                                                             |
+| ---------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `enabled`              | boolean | No       | Enable/disable integration (default: `false`)                           |
+| `container_id`         | string  | Yes      | Your GTM Container ID (e.g., `GTM-A1B2C3`)                              |
+| `upstream_url`         | string  | No       | Custom upstream URL (default: `https://www.googletagmanager.com`)       |
+| `cache_max_age`        | number  | No       | Cache duration in seconds (default: `900`, range: `60`-`86400`)         |
+| `max_beacon_body_size` | number  | No       | Max POST body size in bytes (default: `65536`, range: `1024`-`1048576`) |
+
+## How It Works
+
+```mermaid
+flowchart TD
+  user["User Browser"]
+  server["Trusted Server"]
+  google["Google Servers<br/>(gtm.js, collect)"]
+
+  user -- "1. Request HTML" --> server
+  server -- "2. Rewrite HTML<br/>(src=/integrations/...)" --> user
+  user -- "3. Request Script<br/>(gtm.js w/ ID)" --> server
+  server -- "4. Fetch Script" --> google
+  google -- "5. Return Script" --> server
+  server -- "6. Rewrite Script Content<br/>(replace www.google-analytics.com)" --> user
+  user -- "7. Send Beacon<br/>(/collect w/ data)" --> server
+  server -- "8. Proxy Beacon" --> google
+```
+
+### 1. Script Rewriting
+
+When Trusted Server processes an HTML response, it automatically rewrites GTM script tags to point to the local proxy:
+
+**Before:**
+
+```html
+<script src="https://www.googletagmanager.com/gtm.js?id=GTM-XXXXXX"></script>
+```
+
+**After:**
+
+```html
+<script src="/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"></script>
+```
+
+### 2. Script Proxying
+
+The proxy intercepts requests for the GTM library and modifies it on-the-fly. This is critical for First-Party context.
+
+1.  **Fetch**: Retrieves the original `gtm.js` from Google.
+2.  **Rewrite**: Replaces hardcoded references to `www.google-analytics.com` and `www.googletagmanager.com` with the local proxy path.
+3.  **Serve**: Returns the modified script with correct caching headers.
+
+### 3. Beacon Proxying
+
+Analytics data (events, pageviews) normally sent to `google-analytics.com/collect` are now routed to:
+
+`https://your-server.com/integrations/google_tag_manager/collect`
+
+Trusted Server acts as a privacy-enhancing gateway. Client IP addresses are not forwarded to Google — Google sees only the edge server IP, not the actual user IP.
+
+## Core Endpoints
+
+### `GET .../gtm.js` - Script Proxy
+
+Proxies the Google Tag Manager library.
+
+**Request**:
+
+```
+GET /integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX
+```
+
+**Behavior**:
+
+- Proxies to `https://www.googletagmanager.com/gtm.js`
+- Rewrites internal URLs to use the first-party proxy
+- Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
+
+### `GET .../gtag/js` - GA4 Tag Proxy
+
+Proxies the Google Analytics 4 tag library (gtag.js).
+
+**Request**:
+
+```
+GET /integrations/google_tag_manager/gtag/js?id=G-XXXXXXXX
+```
+
+**Behavior**:
+
+- Proxies to `https://www.googletagmanager.com/gtag/js`
+- Rewrites internal URLs to use the first-party proxy
+- Sets `Accept-Encoding: identity` during fetch to ensure rewriteable text response
+
+### `GET/POST .../collect` - Analytics Beacon
+
+Proxies analytics events (GA4/UA).
+
+**Request**:
+
+```
+POST /integrations/google_tag_manager/g/collect?v=2&...
+```
+
+**Behavior**:
+
+- Proxies to `https://www.google-analytics.com/g/collect`
+- Forwarding: User-Agent, Referer, Payload
+- Privacy: Does NOT forward client IP (Google sees Trusted Server IP)
+
+**POST Request Handling**:
+
+The endpoint validates POST request sizes to prevent memory pressure:
+
+- If `Content-Length` header is present and valid:
+  - Requests exceeding `max_beacon_body_size` are rejected early with `413 Payload Too Large`
+  - Valid requests proceed normally
+- If `Content-Length` header is malformed: `400 Bad Request`
+- If `Content-Length` header is missing: Request is accepted (HTTP/2 compatible)
+  - Body is read in 8KB chunks with size validation
+  - Reading stops immediately if `max_beacon_body_size` is exceeded
+  - Oversized bodies return `413 Payload Too Large` without buffering the full payload
+
+**Memory Protection**:
+
+The implementation uses chunked reading to prevent unbounded memory allocation. Bodies are read in small chunks (8KB), and size is validated incrementally. This ensures that even if a client sends a malicious multi-gigabyte POST (with no Content-Length or an incorrect one), the server will reject it after reading at most `max_beacon_body_size + 8KB` into memory.
+
+This approach maintains compatibility with HTTP/2 and HTTP/3 clients while providing robust protection against memory exhaustion attacks.
+
+## Performance & Caching
+
+### Compression
+
+The integration requires the upstream `gtm.js` to be uncompressed to perform string replacement. Trusted Server fetches it with `Accept-Encoding: identity`.
+
+_Note: Trusted Server will re-compress the response (gzip/brotli) before sending it to the user if the `compression` feature is enabled._
+
+### Cache Behavior
+
+- **Script Caching**: `gtm.js` and `gtag/js` are cached with `Cache-Control: public, max-age=900` (15 minutes) by default
+- **Cache Duration**: Configurable via `cache_max_age` setting (60-86400 seconds)
+- **Edge Caching**: Fastly edge nodes will cache scripts according to the Cache-Control headers
+
+**Stale Cache Handling**:
+
+If the Google upstream is unreachable when a cached script expires:
+
+- The edge will attempt to fetch a fresh copy from Google
+- If the fetch fails, the request will fail (no stale content is served)
+- Consider implementing `stale-while-revalidate` at the CDN level if you need fallback behavior
+
+For production deployments, monitor upstream availability and consider:
+
+- Setting up health checks for Google's endpoints
+- Configuring appropriate cache TTLs based on your update frequency needs
+- Implementing retry logic at the edge platform level
+
+### Direct Proxying
+
+Beacon requests (`/collect`) are proxied directly using streaming, minimizing latency overhead.
+
+## Manual Verification
+
+You can verify the integration using `curl`:
+
+**Test Script Result**:
+
+```bash
+curl -v "http://localhost:8080/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"
+```
+
+_Expected_: `200 OK`. Body should contain `/integrations/google_tag_manager` instead of `google-analytics.com`.
+
+**Test Beacon Result**:
+
+```bash
+curl -v -X POST "http://localhost:8080/integrations/google_tag_manager/g/collect?v=2&tid=G-TEST"
+```
+
+_Expected_: `200 OK` (or 204).
+
+## Implementation Details
+
+See [crates/common/src/integrations/google_tag_manager.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/google_tag_manager.rs).
+
+## Next Steps
+
+- Review [Prebid Integration](/guide/integrations/prebid) for header bidding.
+- Check [Configuration Guide](/guide/configuration) for other integration settings.
+- Learn more about [Synthetic IDs](/guide/synthetic-ids) which are generated alongside this integration.

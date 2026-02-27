@@ -448,6 +448,84 @@ describe('prebid/installPrebidNpm', () => {
       expect(adUnits[0].bids[0].bidder).toBe('trustedServer');
     });
 
+    it('includes zone from mediaTypes.banner.name in trustedServer params', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [
+        {
+          code: 'ad-header-0',
+          mediaTypes: { banner: { name: 'header', sizes: [[728, 90]] } },
+          bids: [{ bidder: 'kargo', params: { placementId: '_abc' } }],
+        },
+        {
+          code: 'ad-fixed_bottom-0',
+          mediaTypes: { banner: { name: 'fixed_bottom', sizes: [[728, 90]] } },
+          bids: [{ bidder: 'kargo', params: { placementId: '_def' } }],
+        },
+      ];
+      pbjs.requestBids({ adUnits } as any);
+
+      const tsBid0 = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid0.params.zone).toBe('header');
+
+      const tsBid1 = adUnits[1].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid1.params.zone).toBe('fixed_bottom');
+    });
+
+    it('omits zone when mediaTypes.banner.name is not set', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [
+        {
+          code: 'ad-header-0',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ];
+      pbjs.requestBids({ adUnits } as any);
+
+      const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBeUndefined();
+    });
+
+    it('omits zone when ad unit has no mediaTypes', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [{ bids: [{ bidder: 'rubicon', params: {} }] }];
+      pbjs.requestBids({ adUnits } as any);
+
+      const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBeUndefined();
+    });
+
+    it('clears stale zone when existing trustedServer bid is reused', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [
+        {
+          code: 'ad-header-0',
+          mediaTypes: { banner: { name: 'header', sizes: [[300, 250]] } },
+          bids: [
+            { bidder: 'trustedServer', params: { custom: 'keep' } },
+            { bidder: 'kargo', params: { placementId: '_abc' } },
+          ],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as any);
+
+      let tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBe('header');
+      expect(tsBid.params.custom).toBe('keep');
+
+      delete adUnits[0].mediaTypes.banner.name;
+      pbjs.requestBids({ adUnits } as any);
+
+      tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBeUndefined();
+      expect(tsBid.params.custom).toBe('keep');
+    });
+
     it('falls back to pbjs.adUnits when requestObj has no adUnits', () => {
       const pbjs = installPrebidNpm();
 

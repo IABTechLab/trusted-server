@@ -26,12 +26,13 @@ use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
     RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
 };
-use crate::request_signing::RequestSigner;
+use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
+const ZONE_KEY: &str = "zone";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -62,6 +63,20 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
+    /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
+    /// — a non-standard Prebid.js field used as a temporary workaround),
+    /// and the value is a JSON object shallow-merged into that bidder's params.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bid_param_zone_overrides.kargo]
+    /// header       = {placementId = "_s2sHeaderId"}
+    /// in_content   = {placementId = "_s2sContentId"}
+    /// fixed_bottom = {placementId = "_s2sBottomId"}
+    /// ```
+    #[serde(default)]
+    pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -333,7 +348,6 @@ fn expand_trusted_server_bidders(
         })
         .collect()
 }
-
 fn transform_prebid_response(
     response: &mut Json,
     request_host: &str,
@@ -466,7 +480,7 @@ impl PrebidAuctionProvider {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        signer: Option<(&RequestSigner, String)>,
+        signer: Option<(&RequestSigner, String, &SigningParams)>,
     ) -> OpenRtbRequest {
         let imps: Vec<Imp> = request
             .slots
@@ -481,6 +495,14 @@ impl PrebidAuctionProvider {
                         h: f.height,
                     })
                     .collect();
+
+                // Extract zone from trustedServer params (sent by the JS
+                // adapter from `mediaTypes.banner.name`, e.g. "header", "fixed_bottom").
+                let zone: Option<&str> = slot
+                    .bidders
+                    .get(TRUSTED_SERVER_BIDDER)
+                    .and_then(|p| p.get(ZONE_KEY))
+                    .and_then(Json::as_str);
 
                 // Build the bidder map for PBS.
                 // The JS adapter sends "trustedServer" as the bidder (our orchestrator
@@ -499,6 +521,28 @@ impl PrebidAuctionProvider {
                 if bidder.is_empty() {
                     for b in &self.config.bidders {
                         bidder.insert(b.clone(), Json::Object(serde_json::Map::new()));
+                    }
+                }
+
+                // Apply zone-specific bid param overrides when configured.
+                for (name, params) in &mut bidder {
+                    let zone_override = zone.and_then(|z| {
+                        self.config
+                            .bid_param_zone_overrides
+                            .get(name.as_str())
+                            .and_then(|zones| zones.get(z))
+                    });
+
+                    if let Some(Json::Object(ovr)) = zone_override {
+                        if let Json::Object(base) = params {
+                            log::debug!(
+                                "prebid: zone override for '{}' zone '{}': keys {:?}",
+                                name,
+                                zone.unwrap_or(""),
+                                ovr.keys().collect::<Vec<_>>()
+                            );
+                            base.extend(ovr.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
                     }
                 }
 
@@ -553,19 +597,28 @@ impl PrebidAuctionProvider {
 
         // Build ext object
         let request_info = RequestInfo::from_request(context.request);
-        let (signature, kid) = signer
-            .map(|(s, sig)| (Some(sig), Some(s.kid.clone())))
-            .unwrap_or((None, None));
+        let (version, signature, kid, ts) = signer
+            .map(|(s, sig, params)| {
+                (
+                    Some(SIGNING_VERSION.to_string()),
+                    Some(sig),
+                    Some(s.kid.clone()),
+                    Some(params.timestamp),
+                )
+            })
+            .unwrap_or((None, None, None, None));
 
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
                 debug: if self.config.debug { Some(true) } else { None },
             }),
             trusted_server: Some(TrustedServerExt {
+                version,
                 signature,
                 kid,
                 request_host: Some(request_info.host),
                 request_scheme: Some(request_info.scheme),
+                ts,
             }),
         });
 
@@ -686,18 +739,22 @@ impl AuctionProvider for PrebidAuctionProvider {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // Create signer and compute signature if request signing is enabled
-        let signer_with_signature =
-            if let Some(request_signing_config) = &context.settings.request_signing {
-                if request_signing_config.enabled {
-                    let signer = RequestSigner::from_config()?;
-                    let signature = signer.sign(request.id.as_bytes())?;
-                    Some((signer, signature))
-                } else {
-                    None
-                }
+        let signer_with_signature = if let Some(request_signing_config) =
+            &context.settings.request_signing
+        {
+            if request_signing_config.enabled {
+                let request_info = RequestInfo::from_request(context.request);
+                let signer = RequestSigner::from_config()?;
+                let params =
+                    SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
+                let signature = signer.sign_request(&params)?;
+                Some((signer, signature, params))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // Convert to OpenRTB with all enrichments
         let openrtb = self.to_openrtb(
@@ -705,17 +762,21 @@ impl AuctionProvider for PrebidAuctionProvider {
             context,
             signer_with_signature
                 .as_ref()
-                .map(|(s, sig)| (s, sig.clone())),
+                .map(|(s, sig, params)| (s, sig.clone(), params)),
         );
 
         // Log the outgoing OpenRTB request for debugging
-        match serde_json::to_string_pretty(&openrtb) {
-            Ok(json) => log::debug!(
-                "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
-                self.config.server_url,
-                json
-            ),
-            Err(e) => log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}"),
+        if log::log_enabled!(log::Level::Debug) {
+            match serde_json::to_string_pretty(&openrtb) {
+                Ok(json) => log::debug!(
+                    "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
+                    self.config.server_url,
+                    json
+                ),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}")
+                }
+            }
         }
 
         // Create HTTP request
@@ -766,6 +827,15 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
+        if log::log_enabled!(log::Level::Debug) {
+            match serde_json::to_string_pretty(&response_json) {
+                Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}")
+                }
+            }
+        }
+
         let request_host = response_json
             .get("ext")
             .and_then(|ext| ext.get("trusted_server"))
@@ -787,7 +857,19 @@ impl AuctionProvider for PrebidAuctionProvider {
             transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
         }
 
-        let auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+
+        // Attach per-bidder timing and errors from the Prebid Server response.
+        // `responsetimemillis` contains an entry for every invited bidder, even
+        // those that returned no bids, making it the canonical source for
+        // "who was in the auction."
+        let ext = response_json.get("ext");
+        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
+            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
+        }
+        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
+            auction_response = auction_response.with_metadata("errors", errors.clone());
+        }
 
         log::info!(
             "Prebid returned {} bids in {}ms",
@@ -849,6 +931,9 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::types::{
+        AdFormat, AdSlot, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+    };
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
@@ -874,6 +959,7 @@ mod tests {
             debug: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            bid_param_zone_overrides: HashMap::new(),
         }
     }
 
@@ -888,6 +974,32 @@ mod tests {
             "test.example.com",
             "https",
         )
+    }
+
+    /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
+    const TOML_BASE: &str = r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "test-secret"
+
+[synthetic]
+counter_store = "test-counter-store"
+opid_store = "test-opid-store"
+secret_key = "test-secret-key"
+template = "{{client_ip}}:{{user_agent}}"
+"#;
+
+    /// Parse a TOML string containing only the `[integrations.prebid]` section
+    /// (plus any sub-tables) into a [`PrebidIntegrationConfig`].
+    fn parse_prebid_toml(prebid_section: &str) -> PrebidIntegrationConfig {
+        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
+        settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("should get config")
+            .expect("should be enabled")
     }
 
     #[test]
@@ -1092,30 +1204,14 @@ mod tests {
 
     #[test]
     fn test_script_patterns_config_parsing() {
-        let toml_str = r#"
-[publisher]
-domain = "test-publisher.com"
-cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
-proxy_secret = "test-secret"
-
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
-secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
-
+        let config = parse_prebid_toml(
+            r#"
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid.example"
 script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
-"#;
-
-        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
-        let config = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("should get config")
-            .expect("should be enabled");
+"#,
+        );
 
         assert_eq!(config.script_patterns.len(), 2);
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
@@ -1126,31 +1222,14 @@ script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
 
     #[test]
     fn test_script_patterns_defaults() {
-        let toml_str = r#"
-[publisher]
-domain = "test-publisher.com"
-cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
-proxy_secret = "test-secret"
-
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
-secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
-
+        let config = parse_prebid_toml(
+            r#"
 [integrations.prebid]
 enabled = true
 server_url = "https://prebid.example"
-"#;
+"#,
+        );
 
-        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
-        let config = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("should get config")
-            .expect("should be enabled");
-
-        // Should have default script patterns
         assert!(!config.script_patterns.is_empty());
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
         assert!(config
@@ -1384,5 +1463,319 @@ server_url = "https://prebid.example"
              parse_response would panic on this input",
             truncation_index
         );
+    }
+
+    fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
+        AuctionRequest {
+            id: "test-auction-1".to_string(),
+            slots,
+            publisher: PublisherInfo {
+                domain: "example.com".to_string(),
+                page_url: Some("https://example.com/page".to_string()),
+            },
+            user: UserInfo {
+                id: "synth-123".to_string(),
+                fresh_id: "fresh-456".to_string(),
+                consent: None,
+            },
+            device: Some(DeviceInfo {
+                user_agent: Some("test-agent".to_string()),
+                ip: None,
+                geo: None,
+            }),
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn make_slot(id: &str, bidders: HashMap<String, Json>) -> AdSlot {
+        AdSlot {
+            id: id.to_string(),
+            formats: vec![AdFormat {
+                media_type: MediaType::Banner,
+                width: 300,
+                height: 250,
+            }],
+            floor_price: None,
+            targeting: HashMap::new(),
+            bidders,
+        }
+    }
+
+    fn call_to_openrtb(
+        config: PrebidIntegrationConfig,
+        request: &AuctionRequest,
+    ) -> OpenRtbRequest {
+        let provider = PrebidAuctionProvider::new(config);
+        let settings = make_settings();
+        let fastly_req = Request::new(Method::POST, "https://example.com/auction");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &fastly_req,
+            timeout_ms: 1000,
+            provider_responses: None,
+        };
+        provider.to_openrtb(request, &context, None)
+    }
+
+    fn bidder_params(ortb: &OpenRtbRequest) -> &HashMap<String, Json> {
+        &ortb.imp[0]
+            .ext
+            .as_ref()
+            .expect("should have imp ext")
+            .prebid
+            .bidder
+    }
+
+    // ========================================================================
+    // bid_param_zone_overrides tests
+    // ========================================================================
+
+    /// Helper: build a slot whose bidders entry is a trustedServer payload
+    /// with per-bidder params and an optional zone.
+    fn make_ts_slot(id: &str, bidder_params: &Json, zone: Option<&str>) -> AdSlot {
+        let mut ts_params = json!({ BIDDER_PARAMS_KEY: bidder_params });
+        if let Some(z) = zone {
+            ts_params[ZONE_KEY] = json!(z);
+        }
+        make_slot(
+            id,
+            HashMap::from([(TRUSTED_SERVER_BIDDER.to_string(), ts_params)]),
+        )
+    }
+
+    #[test]
+    fn zone_override_replaces_placement_id() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "s2s_header_id" }),
+            )]),
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client_side_123" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "s2s_header_id",
+            "zone override should replace the client-side placementId"
+        );
+    }
+
+    #[test]
+    fn zone_override_noop_for_unknown_zone() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "zone_header_id" }),
+            )]),
+        );
+
+        // Zone "sidebar" is NOT in the zone overrides map
+        let slot = make_ts_slot(
+            "ad-sidebar-0",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            Some("sidebar"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "client_123",
+            "unrecognised zone should pass through original params"
+        );
+    }
+
+    #[test]
+    fn zone_override_noop_when_no_zone() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "zone_header_id" }),
+            )]),
+        );
+
+        // No zone in the trustedServer params
+        let slot = make_ts_slot(
+            "slot1",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "client_123",
+            "missing zone should pass through original params"
+        );
+    }
+
+    #[test]
+    fn zone_override_only_affects_configured_bidders() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string(), "rubicon".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([(
+                "header".to_string(),
+                json!({ "placementId": "s2s_header_id" }),
+            )]),
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "kargo": { "placementId": "client_kargo" },
+                "rubicon": { "accountId": 100 }
+            }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        assert_eq!(
+            params["kargo"]["placementId"], "s2s_header_id",
+            "kargo should get zone override"
+        );
+        assert_eq!(
+            params["rubicon"]["accountId"], 100,
+            "rubicon should be untouched"
+        );
+    }
+
+    #[test]
+    fn zone_override_merges_with_existing_params() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        config.bid_param_zone_overrides.insert(
+            "kargo".to_string(),
+            HashMap::from([("header".to_string(), json!({ "placementId": "s2s_header" }))]),
+        );
+
+        // Client sends extra field alongside placementId
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client_123", "extra": "keep_me" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let kargo = &bidder_params(&ortb)["kargo"];
+        assert_eq!(
+            kargo["placementId"], "s2s_header",
+            "overridden field should have the zone value"
+        );
+        assert_eq!(
+            kargo["extra"], "keep_me",
+            "non-overridden fields should be preserved"
+        );
+    }
+
+    #[test]
+    fn zone_overrides_config_parsing_from_toml() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = {placementId = "_s2sHeader"}
+in_content = {placementId = "_s2sContent"}
+fixed_bottom = {placementId = "_s2sBottom"}
+"#,
+        );
+
+        let kargo_zones = &config.bid_param_zone_overrides["kargo"];
+        assert_eq!(kargo_zones.len(), 3, "should have three zone entries");
+        assert_eq!(
+            kargo_zones["header"]["placementId"], "_s2sHeader",
+            "should parse header zone"
+        );
+        assert_eq!(
+            kargo_zones["in_content"]["placementId"], "_s2sContent",
+            "should parse in_content zone"
+        );
+        assert_eq!(
+            kargo_zones["fixed_bottom"]["placementId"], "_s2sBottom",
+            "should parse fixed_bottom zone"
+        );
+    }
+
+    #[test]
+    fn parse_response_preserves_responsetimemillis_and_errors_metadata() {
+        let provider = PrebidAuctionProvider::new(base_config());
+
+        // Minimal valid OpenRTB response with ext containing diagnostics.
+        let response_json = json!({
+            "seatbid": [{
+                "seat": "kargo",
+                "bid": [{
+                    "impid": "slot-1",
+                    "price": 2.50,
+                    "adm": "<div>ad</div>"
+                }]
+            }],
+            "ext": {
+                "responsetimemillis": {
+                    "kargo": 98,
+                    "appnexus": 0,
+                    "ix": 120
+                },
+                "errors": {
+                    "openx": [{"code": 1, "message": "timeout"}]
+                }
+            }
+        });
+
+        // Replicate the metadata extraction logic from `run_auction`.
+        let mut auction_response = provider.parse_openrtb_response(&response_json, 150);
+
+        let ext = response_json.get("ext");
+        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
+            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
+        }
+        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
+            auction_response = auction_response.with_metadata("errors", errors.clone());
+        }
+
+        // Verify bids were parsed.
+        assert_eq!(auction_response.bids.len(), 1, "should parse one bid");
+
+        // Verify responsetimemillis is preserved.
+        let rtm = auction_response
+            .metadata
+            .get("responsetimemillis")
+            .expect("should have responsetimemillis in metadata");
+        assert_eq!(rtm["kargo"], 98);
+        assert_eq!(rtm["appnexus"], 0);
+        assert_eq!(rtm["ix"], 120);
+
+        // Verify errors are preserved.
+        let errors = auction_response
+            .metadata
+            .get("errors")
+            .expect("should have errors in metadata");
+        assert_eq!(errors["openx"][0]["code"], 1);
+        assert_eq!(errors["openx"][0]["message"], "timeout");
     }
 }

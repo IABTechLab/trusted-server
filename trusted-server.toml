@@ -45,6 +45,12 @@ debug = false
 # debug_query_params = ""
 # script_patterns = ["/prebid.js"]
 
+# Zone-specific bid param overrides for Kargo s2s placement IDs.
+# The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
+# and includes it in the request. The server maps zone → s2s placementId here.
+[integrations.prebid.bid_param_zone_overrides.kargo]
+# header = {placementId = "_abc"}
+
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
@@ -115,6 +121,11 @@ enabled = false
 pub_id = "your-aps-publisher-id"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
 timeout_ms = 1000
+
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-XXXXXX"
+# upstream_url = "https://www.googletagmanager.com"
 
 [integrations.adserver_mock]
 enabled = false
