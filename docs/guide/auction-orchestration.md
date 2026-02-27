@@ -341,6 +341,8 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 - Bids include decoded `price` (clear decimal CPM)
 - Creative HTML provided in `adm` field
 - Creative URLs rewritten to first-party proxy format
+- Per-bidder timing (`responsetimemillis`), errors, and warnings always attached as response metadata
+- When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) also included
 
 ```toml
 [integrations.prebid]
@@ -619,14 +621,15 @@ price_floor = 0.50
 
 #### `[integrations.prebid]`
 
-| Field            | Type     | Default           | Description                                 |
-| ---------------- | -------- | ----------------- | ------------------------------------------- |
-| `enabled`        | bool     | `true`            | Enable Prebid provider                      |
-| `server_url`     | string   | —                 | Prebid Server URL (required)                |
-| `timeout_ms`     | u32      | `1000`            | Request timeout                             |
-| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot |
-| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts   |
-| `debug`          | bool     | `false`           | Enable Prebid debug mode                    |
+| Field            | Type     | Default           | Description                                                                 |
+| ---------------- | -------- | ----------------- | --------------------------------------------------------------------------- |
+| `enabled`        | bool     | `true`            | Enable Prebid provider                                                      |
+| `server_url`     | string   | —                 | Prebid Server URL (required)                                                |
+| `timeout_ms`     | u32      | `1000`            | Request timeout                                                             |
+| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                 |
+| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                   |
+| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `returnallbidstatus`) |
+| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                         |
 
 #### `[integrations.aps]`
 
