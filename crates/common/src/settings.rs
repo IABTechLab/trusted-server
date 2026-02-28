@@ -294,6 +294,76 @@ impl Default for Proxy {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct BackendTimeouts {
+    /// Connection timeout in seconds.
+    #[serde(default = "default_connect_timeout")]
+    pub connect: u64,
+    /// First byte timeout in seconds.
+    #[serde(default = "default_first_byte_timeout")]
+    pub first_byte: u64,
+    /// Between bytes timeout in seconds.
+    #[serde(default = "default_between_bytes_timeout")]
+    pub between_bytes: u64,
+}
+
+fn default_connect_timeout() -> u64 {
+    10
+}
+
+fn default_first_byte_timeout() -> u64 {
+    15
+}
+
+fn default_between_bytes_timeout() -> u64 {
+    10
+}
+
+impl Default for BackendTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: default_connect_timeout(),
+            first_byte: default_first_byte_timeout(),
+            between_bytes: default_between_bytes_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct PathPattern {
+    /// Optional host pattern. If None, matches all hosts (wildcard).
+    pub host: Option<String>,
+    /// Optional path prefix to match (e.g., "/.api/").
+    pub path_prefix: Option<String>,
+    /// Optional path regex pattern to match (e.g., "^/image/upload/").
+    pub path_regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct BackendRoutingConfig {
+    /// Origin URL for this backend (e.g., <https://raven-public.prod.saymedia.com>).
+    /// The actual Fastly backend will be created dynamically at request time.
+    #[validate(length(min = 1))]
+    pub origin_url: String,
+    /// List of domains that should route to this backend.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Optional path-based routing patterns.
+    #[serde(default)]
+    #[validate(nested)]
+    pub path_patterns: Vec<PathPattern>,
+    /// Enable TLS certificate verification for this backend.
+    #[serde(default = "default_certificate_check")]
+    pub certificate_check: bool,
+    /// Unique identifier for logging/debugging (optional).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Backend-specific timeouts (unused - for future use).
+    #[serde(default)]
+    #[validate(nested)]
+    pub timeouts: BackendTimeouts,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -316,6 +386,11 @@ pub struct Settings {
     pub auction: AuctionConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    /// Optional multi-backend routing configuration.
+    /// Use `BackendRouter::new()` to create a router from this config.
+    #[serde(default)]
+    #[validate(nested)]
+    pub backends: Vec<BackendRoutingConfig>,
 }
 
 #[allow(unused)]

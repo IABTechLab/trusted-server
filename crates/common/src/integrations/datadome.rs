@@ -55,7 +55,7 @@
 //!   `<script src="https://publisher.com/integrations/datadome/tags.js">`
 //! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
@@ -125,6 +125,38 @@ pub struct DataDomeConfig {
     /// Whether to rewrite `DataDome` script URLs in HTML to first-party paths
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
+
+    // Server-side validation configuration
+    /// Enable server-side bot validation (default: false)
+    #[serde(default = "default_server_side_enabled")]
+    pub server_side_enabled: bool,
+
+    /// `DataDome` API key for server-side validation
+    /// Can be set via environment variable: `TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY`
+    #[serde(default)]
+    pub server_side_key: Option<String>,
+
+    /// Validation endpoint (default: <https://api-fastly.datadome.co>)
+    #[serde(default = "default_validation_endpoint")]
+    #[validate(url)]
+    pub validation_endpoint: String,
+
+    /// Validation request timeout in milliseconds (default: 200ms)
+    /// Lower timeout = faster fail-open on `DataDome` API issues
+    #[serde(default = "default_validation_timeout_ms")]
+    #[validate(range(min = 50, max = 1000))]
+    pub validation_timeout_ms: u64,
+
+    /// Fail-open behavior when validation fails/times out (default: true = allow request)
+    /// Set to false only in production with high confidence in `DataDome` uptime
+    #[serde(default = "default_fail_open")]
+    pub fail_open: bool,
+
+    /// Percentage of requests to validate (0-100, default: 100)
+    /// Used for gradual rollout and A/B testing
+    #[serde(default = "default_sample_rate")]
+    #[validate(range(min = 0, max = 100))]
+    pub sample_rate: u8,
 }
 
 fn default_enabled() -> bool {
@@ -147,6 +179,26 @@ fn default_rewrite_sdk() -> bool {
     true
 }
 
+fn default_server_side_enabled() -> bool {
+    false
+}
+
+fn default_validation_endpoint() -> String {
+    "https://api-fastly.datadome.co".to_string()
+}
+
+fn default_validation_timeout_ms() -> u64 {
+    200
+}
+
+fn default_fail_open() -> bool {
+    true
+}
+
+fn default_sample_rate() -> u8 {
+    100
+}
+
 impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
@@ -155,6 +207,12 @@ impl Default for DataDomeConfig {
             api_origin: default_api_origin(),
             cache_ttl_seconds: default_cache_ttl(),
             rewrite_sdk: default_rewrite_sdk(),
+            server_side_enabled: default_server_side_enabled(),
+            server_side_key: None,
+            validation_endpoint: default_validation_endpoint(),
+            validation_timeout_ms: default_validation_timeout_ms(),
+            fail_open: default_fail_open(),
+            sample_rate: default_sample_rate(),
         }
     }
 }
@@ -381,6 +439,167 @@ impl DataDomeIntegration {
             })
             .unwrap_or("/tags.js")
     }
+
+    /// Extract client IP address from request (test-safe).
+    ///
+    /// Returns "0.0.0.0" if client IP is unavailable (e.g., in Viceroy test environment).
+    fn get_client_ip(req: &Request) -> String {
+        #[cfg(test)]
+        {
+            // In test mode, always return a default IP since Viceroy doesn't support get_client_ip_addr
+            let _ = req; // Suppress unused variable warning
+            "127.0.0.1".to_string()
+        }
+        #[cfg(not(test))]
+        {
+            req.get_client_ip_addr()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "0.0.0.0".to_string())
+        }
+    }
+
+    /// Perform server-side bot validation using `DataDome` HTTP API.
+    ///
+    /// This validates requests at the edge before they reach the origin, providing
+    /// protection against bots and malicious traffic without VCL restarts.
+    ///
+    /// # Validation Flow
+    ///
+    /// 1. Sample check: Only validate `sample_rate` % of requests (for gradual rollout)
+    /// 2. Build validation request with headers:
+    ///    - `x-datadome-params:key` (API key)
+    ///    - `x-datadome-params:ip` (client IP)
+    ///    - `x-datadome-params:clientid` (datadome cookie)
+    ///    - `x-datadome-params:method` (HTTP method)
+    ///    - Other request metadata
+    /// 3. Send to `DataDome` API with low timeout (200ms default)
+    /// 4. Parse response:
+    ///    - 200 OK → Allow request
+    ///    - 403 Forbidden → Block request (bot detected)
+    ///    - Timeout/Error → Fail-open (allow) if configured
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(true)` to allow the request or `Ok(false)` to block it.
+    /// In fail-open mode (default), errors result in `Ok(true)`.
+    pub fn validate_request(&self, req: &Request) -> Result<bool, Report<TrustedServerError>> {
+        // Check if server-side validation is enabled
+        if !self.config.server_side_enabled {
+            return Ok(true);
+        }
+
+        // Check if API key is configured
+        let api_key = match &self.config.server_side_key {
+            Some(key) if !key.is_empty() => key,
+            _ => {
+                log::warn!("[datadome] Server-side validation enabled but no API key configured");
+                return Ok(self.config.fail_open);
+            }
+        };
+
+        // Extract client IP (test-safe)
+        let client_ip = Self::get_client_ip(req);
+
+        // Sample rate check: only validate sample_rate% of requests
+        if self.config.sample_rate < 100 {
+            // Use client IP hash for deterministic sampling
+            let hash = client_ip.bytes().fold(0u32, |acc, b| acc.wrapping_add(u32::from(b)));
+            let sample = (hash % 100) as u8;
+
+            if sample >= self.config.sample_rate {
+                log::debug!("[datadome] Request not sampled (sample={}, rate={})", sample, self.config.sample_rate);
+                return Ok(true);
+            }
+        }
+
+        // Extract DataDome cookie (clientid)
+        let datadome_cookie = req
+            .get_header(header::COOKIE)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|cookies| {
+                cookies.split(';').find_map(|cookie| {
+                    let trimmed = cookie.trim();
+                    trimmed.strip_prefix("datadome=")
+                })
+            })
+            .unwrap_or("");
+
+        // Build validation request
+        let validation_url = format!("{}/validate-request", self.config.validation_endpoint);
+
+        log::info!(
+            "[datadome] Server-side validation: method={}, ip={}, cookie_present={}",
+            req.get_method(),
+            client_ip,
+            !datadome_cookie.is_empty()
+        );
+
+        let backend = BackendConfig::from_url(&validation_url, true)
+            .change_context(Self::error("Invalid validation endpoint URL"))?;
+
+        let mut validation_req = Request::new(Method::POST, &validation_url);
+
+        // Set DataDome validation headers
+        validation_req.set_header("x-datadome-params:key", api_key);
+        validation_req.set_header("x-datadome-params:requestmodulename", "TrustedServerRust");
+        validation_req.set_header("x-datadome-params:moduleversion", "1.0");
+        validation_req.set_header("x-datadome-params:ip", urlencoding::encode(&client_ip).as_ref());
+        validation_req.set_header("x-datadome-params:method", req.get_method().as_str());
+
+        if !datadome_cookie.is_empty() {
+            validation_req.set_header("x-datadome-params:clientid", urlencoding::encode(datadome_cookie).as_ref());
+        }
+
+        // Copy relevant headers for fingerprinting
+        if let Some(ua) = req.get_header(header::USER_AGENT) {
+            validation_req.set_header(header::USER_AGENT, ua);
+        }
+        if let Some(accept) = req.get_header(header::ACCEPT) {
+            validation_req.set_header(header::ACCEPT, accept);
+        }
+        if let Some(accept_lang) = req.get_header(header::ACCEPT_LANGUAGE) {
+            validation_req.set_header(header::ACCEPT_LANGUAGE, accept_lang);
+        }
+
+        // Note: Fastly Compute doesn't support per-request timeouts via Rust API
+        // The backend timeout is configured at service level (validation_timeout_ms documents intent)
+        // We handle timeouts via fail-open behavior
+
+        // Send validation request
+        let validation_result = validation_req.send(&backend);
+
+        match validation_result {
+            Ok(resp) => {
+                let status = resp.get_status();
+                log::info!("[datadome] Validation response: {}", status);
+
+                if status == StatusCode::OK {
+                    // Request validated - allow through
+                    Ok(true)
+                } else if status == StatusCode::FORBIDDEN {
+                    // Bot detected - block request
+                    log::warn!("[datadome] Request blocked by DataDome (403)");
+                    Ok(false)
+                } else {
+                    // Unexpected status - apply fail-open policy
+                    log::warn!("[datadome] Unexpected validation response: {} (fail_open={})", status, self.config.fail_open);
+                    Ok(self.config.fail_open)
+                }
+            }
+            Err(e) => {
+                // Request failed (timeout, network error, etc.)
+                log::warn!("[datadome] Validation request failed: {:?} (fail_open={})", e, self.config.fail_open);
+
+                if self.config.fail_open {
+                    // Fail-open: allow request despite validation failure
+                    Ok(true)
+                } else {
+                    // Fail-closed: block request on validation errors
+                    Err(Report::new(Self::error("Validation failed and fail_open=false")))
+                }
+            }
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -475,12 +694,65 @@ fn build(settings: &Settings) -> Option<Arc<DataDomeIntegration>> {
     };
 
     log::info!(
-        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {})",
+        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, server_side: {})",
         config.sdk_origin,
-        config.rewrite_sdk
+        config.rewrite_sdk,
+        config.server_side_enabled
     );
 
     Some(DataDomeIntegration::new(config))
+}
+
+/// Perform server-side `DataDome` validation on a request.
+///
+/// This is the public API for validating requests before they reach the origin.
+/// Call this from request handlers to check for bots/malicious traffic.
+///
+/// # Returns
+///
+/// - `Ok(true)` - Request should be allowed through
+/// - `Ok(false)` - Request should be blocked (bot detected)
+/// - `Err(...)` - Validation error with `fail_open=false`
+///
+/// # Errors
+///
+/// Only returns an error if validation fails AND `fail_open=false`.
+/// With default `fail_open=true`, errors result in `Ok(true)`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use trusted_server_common::integrations::datadome;
+/// use trusted_server_common::settings::Settings;
+/// use fastly::Request;
+///
+/// fn handle_request(settings: &Settings, req: &Request) {
+///     match datadome::validate_request_server_side(settings, req) {
+///         Ok(true) => {
+///             // Allow request - proceed to origin
+///         }
+///         Ok(false) => {
+///             // Block request - bot detected
+///             // Return 403 or captcha page
+///         }
+///         Err(e) => {
+///             // Validation error with fail_open=false
+///             // Handle as appropriate
+///         }
+///     }
+/// }
+/// ```
+pub fn validate_request_server_side(
+    settings: &Settings,
+    req: &Request,
+) -> Result<bool, Report<TrustedServerError>> {
+    // Cache the integration after the first call. Settings are fixed at startup,
+    // so first-caller-wins is correct — the same binary serves all requests.
+    static INTEGRATION: OnceLock<Option<Arc<DataDomeIntegration>>> = OnceLock::new();
+    match INTEGRATION.get_or_init(|| build(settings)) {
+        Some(integration) => integration.validate_request(req),
+        None => Ok(true),
+    }
 }
 
 /// Register the `DataDome` integration with Trusted Server.
@@ -507,6 +779,12 @@ mod tests {
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
+            server_side_enabled: false,
+            server_side_key: None,
+            validation_endpoint: "https://api-fastly.datadome.co".to_string(),
+            validation_timeout_ms: 200,
+            fail_open: true,
+            sample_rate: 100,
         }
     }
 

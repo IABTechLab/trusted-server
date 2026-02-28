@@ -26,3 +26,6 @@ src/*.html
 
 # SSL certificates
 *.pem
+
+# Fastly VCL exports (reference snapshots, not source)
+*.vcl

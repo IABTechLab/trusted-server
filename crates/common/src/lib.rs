@@ -36,6 +36,7 @@ pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
 pub mod backend;
+pub mod backend_router;
 pub mod constants;
 pub mod cookies;
 pub mod creative;

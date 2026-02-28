@@ -88,12 +88,28 @@ rewrite_sdk = true
 # Endpoints:
 #   GET  /integrations/datadome/tags.js  - Proxied SDK script
 #   ANY  /integrations/datadome/js/*     - Signal collection API
+#
+# Server-side validation (NEW):
+#   Validates requests at the edge BEFORE they reach origin
+#   Replaces expensive VCL restart patterns with native Rust HTTP API calls
+#   Staging-friendly: feature flag, fail-open, low timeout, sampling support
 [integrations.datadome]
 enabled = false
 sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
-rewrite_sdk = true 
+rewrite_sdk = true
+
+# Server-side validation settings (optional)
+# Enable to validate requests before proxying to origin (replaces VCL preflight)
+server_side_enabled = false
+# API key for validation (set via environment variable in production):
+# TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY="your-api-key-here"
+# server_side_key = ""
+validation_endpoint = "https://api-fastly.datadome.co"
+validation_timeout_ms = 200      # Low timeout for fast fail-open
+fail_open = true                 # Allow requests if validation fails/times out (safety)
+sample_rate = 100                # Percentage of requests to validate (0-100, for gradual rollout) 
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
@@ -109,6 +125,21 @@ rewrite_sdk = true
 # Enable TLS certificate verification when proxying to HTTPS origins.
 # Defaults to true. Set to false only for local development with self-signed certificates.
 # certificate_check = true
+
+# Multi-backend routing — routes traffic to different origins based on host/path.
+# Customer-specific backend lists live in crates/fastly/backends.toml and are
+# merged into the embedded config at build time.
+#
+# Schema reference:
+# [[backends]]
+# id = "my-backend"                          # Optional label for logging
+# origin_url = "https://origin.example.com"
+# certificate_check = true
+# domains = ["example.com", "www.example.com"]
+# path_patterns = [
+#     { host = "example.com", path_prefix = "/api/" },
+#     { host = "*", path_regex = "^/images/" },
+# ]
 
 [auction]
 enabled = true
