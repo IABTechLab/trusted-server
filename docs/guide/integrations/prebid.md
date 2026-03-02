@@ -21,6 +21,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus"]
 debug = false
+# test_mode = false
 
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
@@ -33,16 +34,60 @@ in_content   = {placementId = "_s2sContentPlacement"}
 
 ### Configuration Options
 
-| Field                      | Type          | Default                                                                | Description                                                                             |
-| -------------------------- | ------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                               |
-| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                              |
-| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                         |
-| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                 |
-| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; zone values are shallow-merged into bidder params |
-| `debug`                    | Boolean       | `false`                                                                | Enable debug logging                                                                    |
-| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                               |
-| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                             |
+| Field                      | Type          | Default                                                                | Description                                                                                                                                      |
+| -------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                        |
+| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                       |
+| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                  |
+| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                          |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; zone values are shallow-merged into bidder params                                                          |
+| `debug`                    | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)             |
+| `test_mode`                | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand |
+| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                        |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                      |
+
+## Debug Mode
+
+When `debug = true`, the Prebid integration enables additional diagnostics on both the outgoing OpenRTB request and the incoming response.
+
+### Outgoing request flags
+
+| OpenRTB field                   | Value  | Purpose                                                                                             |
+| ------------------------------- | ------ | --------------------------------------------------------------------------------------------------- |
+| `ext.prebid.debug`              | `true` | Tells Prebid Server to include `ext.debug` in the response (httpcalls, resolvedrequest)             |
+| `ext.prebid.returnallbidstatus` | `true` | Asks Prebid Server to return per-bid status for every bidder, including those that returned no bids |
+
+### Response metadata enrichment
+
+The Prebid provider extracts metadata from the Prebid Server response and attaches it to the `AuctionResponse.metadata` map:
+
+**Always-on fields** (present regardless of `debug`):
+
+| Key                  | Source                   | Description                    |
+| -------------------- | ------------------------ | ------------------------------ |
+| `responsetimemillis` | `ext.responsetimemillis` | Per-bidder response times (ms) |
+| `errors`             | `ext.errors`             | Per-bidder error diagnostics   |
+| `warnings`           | `ext.warnings`           | Per-bidder warning diagnostics |
+
+**Debug-only fields** (only when `debug = true`):
+
+| Key         | Source                 | Description                                              |
+| ----------- | ---------------------- | -------------------------------------------------------- |
+| `debug`     | `ext.debug`            | Prebid Server debug payload (httpcalls, resolvedrequest) |
+| `bidstatus` | `ext.prebid.bidstatus` | Per-bid status from every invited bidder                 |
+
+::: warning
+Enabling `debug` increases response sizes and adds overhead. Use it in development or when diagnosing auction issues — not in production.
+:::
+
+### Test mode vs. debug
+
+`test_mode` and `debug` are independent flags:
+
+- **`debug`** — Enables diagnostic data without affecting bidder behavior. Bidders still treat the auction as live.
+- **`test_mode`** — Sets the top-level OpenRTB `test: 1` flag. Bidders treat the request as non-billable test traffic, which can significantly reduce fill rates.
+
+You can combine both to get debug diagnostics on test traffic, or use `debug` alone to inspect live auctions without affecting revenue.
 
 ## Features
 
@@ -197,7 +242,9 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Converts ad slots to OpenRTB `imp` objects with bidder params
 - Adds site metadata with publisher domain and page URL
 - Injects synthetic ID in the user object
-- Includes device/geo information when available
+- Includes device info (user-agent, client IP) and geo when available
+- Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
+- Sets the top-level `test: 1` flag when `test_mode` is enabled
 - Appends `debug_query_params` to page URL when configured
 - Applies `bid_param_zone_overrides` to `imp.ext.prebid.bidder` before request dispatch
 - Signs requests when request signing is enabled
