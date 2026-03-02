@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/fastly", 
     "crates/js",
+    "crates/openrtb",
 ]
 
 # Build defaults exclude the web-only tsjs crate, which is compiled via wasm-pack.
