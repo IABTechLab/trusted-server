@@ -4,6 +4,7 @@ use fastly::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
 use crate::settings::Settings;
 
@@ -22,8 +23,8 @@ pub struct AuctionRequest {
     pub device: Option<DeviceInfo>,
     /// Site information
     pub site: Option<SiteInfo>,
-    /// Additional context
-    pub context: HashMap<String, serde_json::Value>,
+    /// Additional context forwarded from the JS client payload.
+    pub context: HashMap<String, ContextValue>,
 }
 
 /// Represents a single ad slot/impression.

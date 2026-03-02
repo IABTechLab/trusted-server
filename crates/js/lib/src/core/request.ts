@@ -1,5 +1,6 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
+import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument } from './render';
 import { buildAdRequest, sendAuction } from './auction';
@@ -28,8 +29,9 @@ export function requestAds(
   log.info('requestAds: called', { hasCallback: typeof callback === 'function' });
   try {
     const adUnits = getAllUnits();
-    const payload = buildAdRequest(adUnits);
-    log.debug('requestAds: payload', { units: adUnits.length });
+    const config = collectContext();
+    const payload = { ...buildAdRequest(adUnits), config };
+    log.debug('requestAds: payload', { units: adUnits.length, contextKeys: Object.keys(config) });
 
     // Use unified auction endpoint
     void sendAuction('/auction', payload)
