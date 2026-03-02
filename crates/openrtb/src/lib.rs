@@ -14,6 +14,8 @@ pub struct BidRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<App>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub dooh: Option<Dooh>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<Device>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<User>,
@@ -35,6 +37,8 @@ pub struct BidRequest {
     pub wlang: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wlangb: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acat: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bcat: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +77,10 @@ pub struct Regs {
     pub gdpr: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub us_privacy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpp_sid: Option<Vec<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
 }
@@ -116,6 +124,12 @@ pub struct Imp {
     pub ssai: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty: Option<Qty>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dt: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<Refresh>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
 }
@@ -221,6 +235,8 @@ pub struct Video {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mincpmpersec: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub durfloors: Option<Vec<DurFloors>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
@@ -276,6 +292,8 @@ pub struct Audio {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mincpmpersec: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub durfloors: Option<Vec<DurFloors>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
@@ -327,6 +345,8 @@ pub struct Deal {
     pub bidfloor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bidfloorcur: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durfloors: Option<Vec<DurFloors>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +429,28 @@ pub struct App {
     pub keywords: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kwarray: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dooh {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venuetype: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venuetypetax: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<Publisher>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
 }
@@ -752,6 +794,49 @@ pub struct BrandVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qty {
+    pub multiplier: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sourcetype: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Refresh {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refsettings: Option<Vec<RefSettings>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reftype: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minint: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurFloors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mindur: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maxdur: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidfloor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BidResponse {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -844,4 +929,100 @@ pub struct Bid {
     pub slotinpod: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Object>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BidRequest;
+    use serde_json::json;
+
+    #[test]
+    fn preserves_openrtb_26_privacy_dooh_and_refresh_fields() {
+        let payload = json!({
+            "id": "request-1",
+            "imp": [
+                {
+                    "id": "imp-1",
+                    "banner": {
+                        "w": 300,
+                        "h": 250
+                    },
+                    "qty": {
+                        "multiplier": 14.2,
+                        "sourcetype": 1,
+                        "vendor": "measurement.example"
+                    },
+                    "dt": 1735689600000.0,
+                    "refresh": {
+                        "refsettings": [
+                            {
+                                "reftype": 1,
+                                "minint": 30
+                            }
+                        ],
+                        "count": 2
+                    },
+                    "video": {
+                        "mimes": ["video/mp4"],
+                        "durfloors": [
+                            {
+                                "mindur": 1,
+                                "bidfloor": 5.0
+                            }
+                        ]
+                    }
+                }
+            ],
+            "dooh": {
+                "id": "screen-group-1",
+                "venuetype": ["retail"],
+                "venuetypetax": 1,
+                "domain": "inventory.example"
+            },
+            "regs": {
+                "gpp": "DBABMA~CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA",
+                "gpp_sid": [7],
+                "gdpr": 1
+            },
+            "acat": ["IAB1"]
+        });
+
+        let bid_request: BidRequest =
+            serde_json::from_value(payload.clone()).expect("should deserialize OpenRTB 2.6 fields");
+        let serialized =
+            serde_json::to_value(&bid_request).expect("should serialize OpenRTB 2.6 fields");
+
+        assert_eq!(
+            serialized["regs"]["gpp"], payload["regs"]["gpp"],
+            "should preserve regs.gpp"
+        );
+        assert_eq!(
+            serialized["regs"]["gpp_sid"], payload["regs"]["gpp_sid"],
+            "should preserve regs.gpp_sid"
+        );
+        assert_eq!(
+            serialized["acat"], payload["acat"],
+            "should preserve bidrequest.acat"
+        );
+        assert_eq!(
+            serialized["dooh"], payload["dooh"],
+            "should preserve bidrequest.dooh"
+        );
+        assert_eq!(
+            serialized["imp"][0]["qty"], payload["imp"][0]["qty"],
+            "should preserve imp.qty"
+        );
+        assert_eq!(
+            serialized["imp"][0]["dt"], payload["imp"][0]["dt"],
+            "should preserve imp.dt"
+        );
+        assert_eq!(
+            serialized["imp"][0]["refresh"], payload["imp"][0]["refresh"],
+            "should preserve imp.refresh"
+        );
+        assert_eq!(
+            serialized["imp"][0]["video"]["durfloors"], payload["imp"][0]["video"]["durfloors"],
+            "should preserve video.durfloors"
+        );
+    }
 }
