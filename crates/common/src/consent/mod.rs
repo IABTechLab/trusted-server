@@ -42,11 +42,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cookie::CookieJar;
 use fastly::Request;
 
-use crate::consent_config::{ConsentConfig, ConsentMode};
+use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
 use crate::geo::GeoInfo;
 
 /// Number of deciseconds in one day (86 400 seconds × 10).
 const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
+
+/// GPP section ID for EU TCF v2.
+const GPP_SECTION_ID_TCF_EU_V2: u16 = 2;
 
 /// Inputs to the consent processing pipeline.
 ///
@@ -90,15 +93,17 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // In proxy mode, skip decoding entirely.
     if input.config.mode == ConsentMode::Proxy {
         let jur = jurisdiction::detect_jurisdiction(input.geo, input.config);
-        let gdpr_applies = signals.raw_tc_string.is_some();
+        let gpp_section_ids = signals
+            .raw_gpp_sid
+            .as_deref()
+            .and_then(gpp::parse_gpp_sid_cookie);
+        let gdpr_applies =
+            has_eu_tcf_signal(signals.raw_tc_string.is_some(), gpp_section_ids.as_deref());
         log::debug!("Consent proxy mode: jurisdiction={jur}, skipping decode");
         return ConsentContext {
             raw_tc_string: signals.raw_tc_string,
             raw_gpp_string: signals.raw_gpp_string,
-            gpp_section_ids: signals
-                .raw_gpp_sid
-                .as_deref()
-                .and_then(gpp::parse_gpp_sid_cookie),
+            gpp_section_ids,
             raw_us_privacy: signals.raw_us_privacy,
             raw_ac_string: None,
             gdpr_applies,
@@ -123,6 +128,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
     let mut ctx = build_context_from_signals(&signals);
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+    apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
 
@@ -135,32 +141,41 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
 /// Marks TCF consent as expired when it exceeds the configured maximum age.
 ///
-/// Clears the decoded `tcf` field (treated as no consent) but preserves the
-/// raw string for proxy-mode forwarding. Re-evaluates `gdpr_applies` based
-/// on whether a GPP EU TCF section is still available.
+/// Clears whichever decoded TCF source is active (`tcf` or `gpp.eu_tcf`) but
+/// preserves raw strings for proxy-mode forwarding.
 fn apply_expiration_check(ctx: &mut ConsentContext, config: &ConsentConfig) {
     if !config.check_expiration {
         return;
     }
 
-    let tcf = match &ctx.tcf {
-        Some(tcf) => tcf,
-        None => return,
+    let (is_expired, age_days) = {
+        let Some(tcf) = effective_tcf(ctx) else {
+            return;
+        };
+        (
+            is_consent_expired(tcf, config.max_consent_age_days),
+            consent_age_days(tcf),
+        )
     };
 
-    if !is_consent_expired(tcf, config.max_consent_age_days) {
+    if !is_expired {
         return;
     }
 
-    let age_days = consent_age_days(tcf);
     log::warn!(
         "TCF consent expired (age: {age_days}d, max: {}d)",
         config.max_consent_age_days
     );
     ctx.expired = true;
-    ctx.tcf = None;
-    // Re-evaluate: GDPR may still apply if GPP has a TCF section.
-    ctx.gdpr_applies = ctx.gpp.as_ref().is_some_and(|g| g.eu_tcf.is_some());
+
+    if ctx.tcf.is_some() {
+        ctx.tcf = None;
+    } else if let Some(gpp) = &mut ctx.gpp {
+        gpp.eu_tcf = None;
+    }
+
+    ctx.gdpr_applies =
+        has_eu_tcf_signal(ctx.raw_tc_string.is_some(), ctx.gpp_section_ids.as_deref());
 }
 
 /// Constructs a US Privacy string from GPC when no explicit cookie exists
@@ -245,9 +260,10 @@ pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext
                 .and_then(gpp::parse_gpp_sid_cookie)
         });
 
-    // GDPR applies if we have a TCF string (standalone or from GPP).
+    // GDPR applies when an EU TCF signal is present via standalone TC string
+    // or via GPP section ID 2.
     let gdpr_applies =
-        decoded_tcf.is_some() || decoded_gpp.as_ref().is_some_and(|g| g.eu_tcf.is_some());
+        has_eu_tcf_signal(signals.raw_tc_string.is_some(), gpp_section_ids.as_deref());
 
     ConsentContext {
         raw_tc_string: signals.raw_tc_string.clone(),
@@ -269,6 +285,88 @@ pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext
         jurisdiction: jurisdiction::Jurisdiction::default(),
         source: ConsentSource::Cookie,
     }
+}
+
+/// Resolves whether an EU TCF signal is present from raw signal hints.
+#[must_use]
+fn has_eu_tcf_signal(raw_tc_present: bool, gpp_section_ids: Option<&[u16]>) -> bool {
+    raw_tc_present || gpp_section_ids.is_some_and(|ids| ids.contains(&GPP_SECTION_ID_TCF_EU_V2))
+}
+
+/// Returns the effective decoded TCF consent for enforcement decisions.
+#[must_use]
+fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
+    ctx.tcf
+        .as_ref()
+        .or_else(|| ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()))
+}
+
+/// Returns whether TCF consent allows EID transmission.
+#[must_use]
+fn allows_eid_transmission(tcf: &types::TcfConsent) -> bool {
+    tcf.has_storage_consent() && tcf.has_personalized_ads_consent()
+}
+
+/// Resolves conflicts between standalone TC and GPP EU TCF consents.
+fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfig) {
+    let Some(standalone_tcf) = ctx.tcf.clone() else {
+        return;
+    };
+    let Some(gpp_tcf) = ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()).cloned() else {
+        return;
+    };
+
+    let standalone_allows = allows_eid_transmission(&standalone_tcf);
+    let gpp_allows = allows_eid_transmission(&gpp_tcf);
+
+    if standalone_allows == gpp_allows {
+        return;
+    }
+
+    let select_gpp = match config.conflict_resolution.mode {
+        ConflictMode::Restrictive => !gpp_allows,
+        ConflictMode::Permissive => gpp_allows,
+        ConflictMode::Newest => select_newest_signal(
+            &standalone_tcf,
+            &gpp_tcf,
+            config.conflict_resolution.freshness_threshold_days,
+        )
+        .unwrap_or(!gpp_allows),
+    };
+
+    let source = if select_gpp { "gpp" } else { "standalone" };
+    log::info!(
+        "TCF conflict detected; mode={:?}, selected={source}",
+        config.conflict_resolution.mode
+    );
+
+    ctx.tcf = Some(if select_gpp { gpp_tcf } else { standalone_tcf });
+}
+
+/// Returns whether GPP should win under the `newest` strategy.
+#[must_use]
+fn select_newest_signal(
+    standalone_tcf: &types::TcfConsent,
+    gpp_tcf: &types::TcfConsent,
+    freshness_threshold_days: u32,
+) -> Option<bool> {
+    let threshold_ds = u64::from(freshness_threshold_days) * DECISECONDS_PER_DAY;
+
+    let standalone_delta = standalone_tcf
+        .last_updated_ds
+        .saturating_sub(gpp_tcf.last_updated_ds);
+    if standalone_delta > threshold_ds {
+        return Some(false);
+    }
+
+    let gpp_delta = gpp_tcf
+        .last_updated_ds
+        .saturating_sub(standalone_tcf.last_updated_ds);
+    if gpp_delta > threshold_ds {
+        return Some(true);
+    }
+
+    None
 }
 
 /// Returns the current time in deciseconds since the Unix epoch.
@@ -338,15 +436,10 @@ pub fn gate_eids_by_consent<T>(
         return None;
     }
 
-    // Resolve the effective TCF consent — standalone or from GPP.
-    let tcf = consent_ctx.and_then(|ctx| {
-        ctx.tcf
-            .as_ref()
-            .or_else(|| ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()))
-    });
+    let tcf = consent_ctx.and_then(effective_tcf);
 
     match tcf {
-        Some(tcf) if tcf.has_storage_consent() && tcf.has_personalized_ads_consent() => Some(eids),
+        Some(tcf) if allows_eid_transmission(tcf) => Some(eids),
         Some(_) => {
             log::info!("EIDs stripped: TCF Purpose 1 or 4 consent missing");
             None
@@ -390,6 +483,7 @@ fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
 
     // Re-detect jurisdiction from current geo (may differ from stored value).
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+    apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
 
@@ -460,7 +554,7 @@ fn log_consent_context(ctx: &ConsentContext) {
     };
 
     let gpp_status = signal_status(ctx.gpp.is_some(), ctx.raw_gpp_string.is_some());
-    let usp_status = signal_status(ctx.us_privacy.is_some(), false);
+    let usp_status = signal_status(ctx.us_privacy.is_some(), ctx.raw_us_privacy.is_some());
 
     log::info!(
         "Consent context: jurisdiction={}, tcf={tcf_status}, gpp={gpp_status}, \
@@ -476,10 +570,78 @@ fn log_consent_context(ctx: &ConsentContext) {
 mod tests {
     use fastly::Request;
 
-    use super::{build_consent_context, should_try_kv_fallback, ConsentPipelineInput};
-    use crate::consent::types::RawConsentSignals;
-    use crate::consent_config::{ConsentConfig, ConsentMode};
+    use super::{
+        apply_expiration_check, apply_tcf_conflict_resolution, build_consent_context,
+        build_context_from_signals, should_try_kv_fallback, ConsentPipelineInput,
+    };
+    use crate::consent::types::{ConsentContext, GppConsent, RawConsentSignals, TcfConsent};
+    use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
+
+    fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {
+        TcfConsent {
+            version: 2,
+            cmp_id: 1,
+            cmp_version: 1,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 1,
+            tcf_policy_version: 4,
+            created_ds: last_updated_ds,
+            last_updated_ds,
+            purpose_consents: vec![
+                true,
+                false,
+                false,
+                allows_eids,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ],
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    fn make_conflicting_context(
+        standalone_last_updated_ds: u64,
+        standalone_allows_eids: bool,
+        gpp_last_updated_ds: u64,
+        gpp_allows_eids: bool,
+    ) -> ConsentContext {
+        ConsentContext {
+            raw_tc_string: Some("standalone".to_owned()),
+            raw_gpp_string: Some("gpp".to_owned()),
+            gpp_section_ids: Some(vec![2]),
+            gdpr_applies: true,
+            tcf: Some(make_tcf(standalone_last_updated_ds, standalone_allows_eids)),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: Some(make_tcf(gpp_last_updated_ds, gpp_allows_eids)),
+            }),
+            ..ConsentContext::default()
+        }
+    }
 
     #[test]
     fn kv_fallback_allowed_when_only_gpc_present() {
@@ -535,5 +697,126 @@ mod tests {
             "should preserve raw TC string in proxy mode"
         );
         assert!(ctx.tcf.is_none(), "should skip TCF decoding in proxy mode");
+    }
+
+    #[test]
+    fn proxy_mode_marks_gdpr_when_gpp_sid_contains_tcf_section() {
+        let jar = parse_cookies_to_jar("__gpp_sid=2,6");
+        let req = Request::get("https://example.com");
+        let config = ConsentConfig {
+            mode: ConsentMode::Proxy,
+            ..ConsentConfig::default()
+        };
+
+        let ctx = build_consent_context(&ConsentPipelineInput {
+            jar: Some(&jar),
+            req: &req,
+            config: &config,
+            geo: None,
+            synthetic_id: None,
+        });
+
+        assert!(
+            ctx.gdpr_applies,
+            "should set gdpr_applies when __gpp_sid includes section 2"
+        );
+    }
+
+    #[test]
+    fn marks_gdpr_when_gpp_sid_contains_tcf_section_even_if_gpp_decode_fails() {
+        let signals = RawConsentSignals {
+            raw_gpp_string: Some("invalid-gpp".to_owned()),
+            raw_gpp_sid: Some("2,6".to_owned()),
+            ..RawConsentSignals::default()
+        };
+
+        let ctx = build_context_from_signals(&signals);
+
+        assert!(
+            ctx.gdpr_applies,
+            "should set gdpr_applies when section 2 exists even if __gpp decode fails"
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_restrictive_prefers_denial() {
+        let mut ctx = make_conflicting_context(10, true, 20, false);
+        let config = ConsentConfig::default();
+
+        apply_tcf_conflict_resolution(&mut ctx, &config);
+
+        let tcf = ctx
+            .tcf
+            .expect("should keep an effective TCF after resolution");
+        assert!(
+            !tcf.has_personalized_ads_consent(),
+            "restrictive mode should choose the denying signal"
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_permissive_prefers_grant() {
+        let mut ctx = make_conflicting_context(10, true, 20, false);
+        let mut config = ConsentConfig::default();
+        config.conflict_resolution.mode = ConflictMode::Permissive;
+
+        apply_tcf_conflict_resolution(&mut ctx, &config);
+
+        let tcf = ctx
+            .tcf
+            .expect("should keep an effective TCF after resolution");
+        assert!(
+            tcf.has_personalized_ads_consent(),
+            "permissive mode should choose the granting signal"
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_newest_prefers_fresher_signal() {
+        let mut ctx = make_conflicting_context(2 * super::DECISECONDS_PER_DAY, true, 0, false);
+        let mut config = ConsentConfig::default();
+        config.conflict_resolution.mode = ConflictMode::Newest;
+        config.conflict_resolution.freshness_threshold_days = 1;
+
+        apply_tcf_conflict_resolution(&mut ctx, &config);
+
+        let tcf = ctx
+            .tcf
+            .expect("should keep an effective TCF after resolution");
+        assert!(
+            tcf.has_personalized_ads_consent(),
+            "newest mode should pick the signal that is newer than threshold"
+        );
+    }
+
+    #[test]
+    fn expiration_clears_gpp_embedded_tcf() {
+        let mut ctx = ConsentContext {
+            raw_gpp_string: Some("DBACNY".to_owned()),
+            gpp_section_ids: Some(vec![2]),
+            gdpr_applies: true,
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: Some(make_tcf(0, true)),
+            }),
+            ..ConsentContext::default()
+        };
+        let config = ConsentConfig {
+            max_consent_age_days: 0,
+            ..ConsentConfig::default()
+        };
+
+        apply_expiration_check(&mut ctx, &config);
+
+        assert!(ctx.expired, "should mark embedded TCF as expired");
+        assert!(
+            ctx.gpp.as_ref().is_some_and(|g| g.eu_tcf.is_none()),
+            "should clear decoded GPP embedded TCF when expired"
+        );
+        assert!(
+            ctx.gdpr_applies,
+            "should keep gdpr_applies true when raw EU TCF signal is still present"
+        );
     }
 }
