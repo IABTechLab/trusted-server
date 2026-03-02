@@ -2408,6 +2408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-openrtb"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

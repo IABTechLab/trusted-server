@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/fastly",
     "crates/js",
+    "crates/openrtb",
 ]
 # integration-tests is intentionally excluded from workspace members because it
 # requires a native target (testcontainers, reqwest) while the workspace default
