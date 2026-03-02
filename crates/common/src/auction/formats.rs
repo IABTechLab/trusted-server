@@ -16,7 +16,10 @@ use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid};
+use crate::openrtb::{
+    build_openrtb_bid, build_openrtb_response, build_seat_bid, maybe_object_from_serializable,
+    OpenRtbBidFields, ResponseExt,
+};
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -240,21 +243,18 @@ pub fn convert_to_openrtb_response(
             String::new()
         };
 
-        let openrtb_bid = OpenRtbBid {
+        let openrtb_bid = build_openrtb_bid(OpenRtbBidFields {
             id: format!("{}-{}", bid.bidder, slot_id),
             impid: slot_id.to_string(),
             price,
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
-            w: Some(bid.width),
-            h: Some(bid.height),
+            width: Some(bid.width),
+            height: Some(bid.height),
             adomain: Some(bid.adomain.clone().unwrap_or_default()),
-        };
-
-        seatbids.push(SeatBid {
-            seat: Some(bid.bidder.clone()),
-            bid: vec![openrtb_bid],
         });
+
+        seatbids.push(build_seat_bid(Some(bid.bidder.clone()), vec![openrtb_bid]));
     }
 
     // Determine strategy name for response metadata
@@ -271,10 +271,10 @@ pub fn convert_to_openrtb_response(
         .map(ProviderSummary::from)
         .collect();
 
-    let response_body = OpenRtbResponse {
-        id: auction_request.id.to_string(),
-        seatbid: seatbids,
-        ext: Some(ResponseExt {
+    let response_body = build_openrtb_response(
+        auction_request.id.to_string(),
+        seatbids,
+        maybe_object_from_serializable(&ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),
                 providers: result.provider_responses.len(),
@@ -283,7 +283,7 @@ pub fn convert_to_openrtb_response(
                 provider_details,
             },
         }),
-    };
+    );
 
     let body_bytes =
         serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {

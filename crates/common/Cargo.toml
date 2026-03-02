@@ -43,6 +43,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 trusted-server-js = { path = "../js" }
+trusted-server-openrtb = { path = "../openrtb" }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }

@@ -23,8 +23,9 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Regs,
-    RegsExt, RequestExt, Site, TrustedServerExt, User, UserExt,
+    build_banner, build_device, build_format, build_geo, build_imp, build_openrtb_request,
+    build_regs, build_site, build_user, maybe_object_from_serializable, ImpExt, OpenRtbRequest,
+    PrebidExt, PrebidImpExt, RegsExt, RequestExt, TrustedServerExt, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -488,18 +489,15 @@ impl PrebidAuctionProvider {
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
     ) -> OpenRtbRequest {
-        let imps: Vec<Imp> = request
+        let imps = request
             .slots
             .iter()
             .map(|slot| {
-                let formats: Vec<Format> = slot
+                let formats = slot
                     .formats
                     .iter()
                     .filter(|f| f.media_type == MediaType::Banner)
-                    .map(|f| Format {
-                        w: f.width,
-                        h: f.height,
-                    })
+                    .map(|f| build_format(f.width, f.height))
                     .collect();
 
                 // Extract zone from trustedServer params (sent by the JS
@@ -552,13 +550,13 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                Imp {
-                    id: slot.id.clone(),
-                    banner: Some(Banner { format: formats }),
-                    ext: Some(ImpExt {
+                build_imp(
+                    slot.id.clone(),
+                    Some(build_banner(formats)),
+                    maybe_object_from_serializable(&ImpExt {
                         prebid: PrebidImpExt { bidder },
                     }),
-                }
+                )
             })
             .collect();
 
@@ -572,35 +570,36 @@ impl PrebidAuctionProvider {
         });
 
         // Build user object
-        let user = Some(User {
-            id: Some(request.user.id.clone()),
-            ext: Some(UserExt {
+        let user = Some(build_user(
+            Some(request.user.id.clone()),
+            maybe_object_from_serializable(&UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
-        });
+        ));
 
         // Build device object with user-agent, client IP, and geo if available.
         // Forwarding the real client IP is critical: without it PBS infers the
         // IP from the incoming connection (a data-center / edge IP), causing
         // bidders like PubMatic to filter the traffic as non-human.
-        let device = request.device.as_ref().map(|d| Device {
-            ua: d.user_agent.clone(),
-            ip: d.ip.clone(),
-            geo: d.geo.as_ref().map(|geo| Geo {
-                geo_type: 2, // IP address per OpenRTB spec
-                country: Some(geo.country.clone()),
-                city: Some(geo.city.clone()),
-                region: geo.region.clone(),
-            }),
+        let device = request.device.as_ref().map(|d| {
+            build_device(
+                d.user_agent.clone(),
+                d.ip.clone(),
+                d.geo.as_ref().map(|geo| {
+                    build_geo(
+                        Some(geo.country.clone()),
+                        Some(geo.city.clone()),
+                        geo.region.clone(),
+                    )
+                }),
+            )
         });
 
         // Build regs object if Sec-GPC header is present
         let regs = if context.request.get_header("Sec-GPC").is_some() {
-            Some(Regs {
-                ext: Some(RegsExt {
-                    us_privacy: Some("1YYN".to_string()),
-                }),
-            })
+            Some(build_regs(maybe_object_from_serializable(&RegsExt {
+                us_privacy: Some("1YYN".to_string()),
+            })))
         } else {
             None
         };
@@ -620,7 +619,7 @@ impl PrebidAuctionProvider {
 
         let debug_enabled = self.config.debug;
 
-        let ext = Some(RequestExt {
+        let ext = maybe_object_from_serializable(&RequestExt {
             prebid: Some(PrebidExt {
                 debug: debug_enabled.then_some(true),
                 returnallbidstatus: debug_enabled.then_some(true),
@@ -635,19 +634,16 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        OpenRtbRequest {
-            id: request.id.clone(),
-            imp: imps,
-            site: Some(Site {
-                domain: Some(request.publisher.domain.clone()),
-                page: page_url,
-            }),
+        build_openrtb_request(
+            request.id.clone(),
+            imps,
+            Some(build_site(Some(request.publisher.domain.clone()), page_url)),
             user,
             device,
             regs,
-            test: self.config.test_mode.then_some(1),
+            self.config.test_mode.then_some(1),
             ext,
-        }
+        )
     }
 
     /// Parse `OpenRTB` response into auction response.
