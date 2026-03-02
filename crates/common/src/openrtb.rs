@@ -1,107 +1,335 @@
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::auction::types::OrchestratorExt;
 
-/// Minimal subset of `OpenRTB` 2.x bid request used by Trusted Server.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub struct OpenRtbRequest {
-    /// Unique ID of the bid request, provided by the exchange.
+pub type Object = trusted_server_openrtb::Object;
+pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
+pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
+pub type OpenRtbBid = trusted_server_openrtb::Bid;
+
+pub use trusted_server_openrtb::{Banner, Device, Format, Geo, Imp, Regs, SeatBid, Site, User};
+
+fn clamp_u32_to_i32(value: u32) -> i32 {
+    value.min(i32::MAX as u32) as i32
+}
+
+pub fn object_from_serializable<T: Serialize>(value: &T) -> Object {
+    match serde_json::to_value(value) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) | Err(_) => Map::new(),
+    }
+}
+
+pub fn maybe_object_from_serializable<T: Serialize>(value: &T) -> Option<Object> {
+    let map = object_from_serializable(value);
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+#[must_use]
+pub fn build_format(width: u32, height: u32) -> Format {
+    Format {
+        w: Some(clamp_u32_to_i32(width)),
+        h: Some(clamp_u32_to_i32(height)),
+        wratio: None,
+        hratio: None,
+        wmin: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_banner(formats: Vec<Format>) -> Banner {
+    Banner {
+        format: Some(formats),
+        w: None,
+        h: None,
+        btype: None,
+        battr: None,
+        pos: None,
+        mimes: None,
+        topframe: None,
+        expdir: None,
+        api: None,
+        id: None,
+        vcm: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_imp(id: String, banner: Option<Banner>, ext: Option<Object>) -> Imp {
+    Imp {
+        id,
+        metric: None,
+        banner,
+        video: None,
+        audio: None,
+        native: None,
+        pmp: None,
+        displaymanager: None,
+        displaymanagerver: None,
+        instl: None,
+        tagid: None,
+        bidfloor: None,
+        bidfloorcur: None,
+        clickbrowser: None,
+        secure: None,
+        iframebuster: None,
+        rwdd: None,
+        ssai: None,
+        exp: None,
+        qty: None,
+        dt: None,
+        refresh: None,
+        ext,
+    }
+}
+
+#[must_use]
+pub fn build_site(domain: Option<String>, page: Option<String>) -> Site {
+    Site {
+        id: None,
+        name: None,
+        domain,
+        cattax: None,
+        cat: None,
+        sectioncat: None,
+        pagecat: None,
+        page,
+        r#ref: None,
+        search: None,
+        mobile: None,
+        privacypolicy: None,
+        publisher: None,
+        content: None,
+        keywords: None,
+        kwarray: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_user(id: Option<String>, ext: Option<Object>) -> User {
+    User {
+        id,
+        buyeruid: None,
+        yob: None,
+        gender: None,
+        keywords: None,
+        kwarray: None,
+        customdata: None,
+        geo: None,
+        data: None,
+        consent: None,
+        eids: None,
+        ext,
+    }
+}
+
+#[must_use]
+pub fn build_geo(country: Option<String>, city: Option<String>, region: Option<String>) -> Geo {
+    Geo {
+        lat: None,
+        lon: None,
+        r#type: Some(2),
+        accuracy: None,
+        lastfix: None,
+        ipservice: None,
+        country,
+        region,
+        metro: None,
+        city,
+        zip: None,
+        utcoffset: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_device(ua: Option<String>, ip: Option<String>, geo: Option<Geo>) -> Device {
+    Device {
+        geo,
+        dnt: None,
+        lmt: None,
+        ua,
+        sua: None,
+        ip,
+        ipv6: None,
+        devicetype: None,
+        make: None,
+        model: None,
+        os: None,
+        osv: None,
+        hwv: None,
+        h: None,
+        w: None,
+        ppi: None,
+        pxratio: None,
+        js: None,
+        geofetch: None,
+        flashver: None,
+        language: None,
+        langb: None,
+        carrier: None,
+        mccmnc: None,
+        connectiontype: None,
+        ifa: None,
+        didsha1: None,
+        didmd5: None,
+        dpidsha1: None,
+        dpidmd5: None,
+        macsha1: None,
+        macmd5: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_regs(ext: Option<Object>) -> Regs {
+    Regs {
+        coppa: None,
+        gdpr: None,
+        us_privacy: None,
+        gpp: None,
+        gpp_sid: None,
+        ext,
+    }
+}
+
+#[must_use]
+pub fn build_openrtb_request(
+    id: String,
+    imp: Vec<Imp>,
+    site: Option<Site>,
+    user: Option<User>,
+    device: Option<Device>,
+    regs: Option<Regs>,
+    test: Option<i32>,
+    ext: Option<Object>,
+) -> OpenRtbRequest {
+    OpenRtbRequest {
+        id,
+        imp,
+        site,
+        app: None,
+        dooh: None,
+        device,
+        user,
+        test,
+        at: None,
+        tmax: None,
+        wseat: None,
+        bseat: None,
+        allimps: None,
+        cur: None,
+        wlang: None,
+        wlangb: None,
+        acat: None,
+        bcat: None,
+        cattax: None,
+        badv: None,
+        bapp: None,
+        source: None,
+        regs,
+        ext,
+    }
+}
+
+pub struct OpenRtbBidFields {
     pub id: String,
-    pub imp: Vec<Imp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub site: Option<Site>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<User>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<Device>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub regs: Option<Regs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub test: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<RequestExt>,
+    pub impid: String,
+    pub price: f64,
+    pub adm: Option<String>,
+    pub crid: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub adomain: Option<Vec<String>>,
+}
+
+#[must_use]
+pub fn build_openrtb_bid(fields: OpenRtbBidFields) -> OpenRtbBid {
+    OpenRtbBid {
+        id: fields.id,
+        impid: fields.impid,
+        price: fields.price,
+        nurl: None,
+        burl: None,
+        lurl: None,
+        adm: fields.adm,
+        adid: None,
+        adomain: fields.adomain,
+        bundle: None,
+        iurl: None,
+        cid: None,
+        crid: fields.crid,
+        tactic: None,
+        cattax: None,
+        cat: None,
+        attr: None,
+        apis: None,
+        api: None,
+        protocol: None,
+        qagmediarating: None,
+        language: None,
+        langb: None,
+        dealid: None,
+        w: fields.width.map(clamp_u32_to_i32),
+        h: fields.height.map(clamp_u32_to_i32),
+        wratio: None,
+        hratio: None,
+        exp: None,
+        dur: None,
+        mtype: None,
+        slotinpod: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_seat_bid(seat: Option<String>, bid: Vec<OpenRtbBid>) -> SeatBid {
+    SeatBid {
+        bid,
+        seat,
+        group: None,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_openrtb_response(
+    id: String,
+    seatbid: Vec<SeatBid>,
+    ext: Option<Object>,
+) -> OpenRtbResponse {
+    OpenRtbResponse {
+        id,
+        seatbid: Some(seatbid),
+        bidid: None,
+        cur: None,
+        customdata: None,
+        nbr: None,
+        ext,
+    }
 }
 
 #[derive(Debug, Serialize)]
-pub struct Imp {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub banner: Option<Banner>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<ImpExt>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Banner {
-    pub format: Vec<Format>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Format {
-    pub w: u32,
-    pub h: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Site {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<String>,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct User {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<UserExt>,
-}
-
-#[derive(Debug, Serialize, Default)]
 pub struct UserExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synthetic_fresh: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default)]
-pub struct Device {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ua: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub geo: Option<Geo>,
-}
-
 #[derive(Debug, Serialize)]
-pub struct Geo {
-    /// Location type per `OpenRTB` spec (1=GPS, 2=IP address, 3=user provided)
-    #[serde(rename = "type")]
-    pub geo_type: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub country: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub city: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct Regs {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<RegsExt>,
-}
-
-#[derive(Debug, Serialize, Default)]
 pub struct RegsExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub us_privacy: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize)]
 pub struct RequestExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prebid: Option<PrebidExt>,
@@ -109,7 +337,7 @@ pub struct RequestExt {
     pub trusted_server: Option<TrustedServerExt>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize)]
 pub struct PrebidExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
@@ -117,7 +345,7 @@ pub struct PrebidExt {
     pub returnallbidstatus: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize)]
 pub struct TrustedServerExt {
     /// Version of the signing protocol (e.g., "1.1")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,39 +373,6 @@ pub struct PrebidImpExt {
     pub bidder: std::collections::HashMap<String, Value>,
 }
 
-/// Minimal subset of `OpenRTB` 2.x bid response used by Trusted Server.
-#[derive(Debug, Serialize)]
-pub struct OpenRtbResponse {
-    pub id: String,
-    pub seatbid: Vec<SeatBid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<ResponseExt>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SeatBid {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seat: Option<String>,
-    pub bid: Vec<OpenRtbBid>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct OpenRtbBid {
-    pub id: String,
-    pub impid: String,
-    pub price: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adm: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub crid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub w: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub h: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adomain: Option<Vec<String>>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
@@ -185,36 +380,35 @@ pub struct ResponseExt {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid};
+    use super::*;
     use crate::auction::types::OrchestratorExt;
 
     #[test]
-    fn openrtb_response_serializes_expected_fields() {
-        let response = OpenRtbResponse {
-            id: "auction-1".to_string(),
-            seatbid: vec![SeatBid {
-                seat: Some("bidder-a".to_string()),
-                bid: vec![OpenRtbBid {
-                    id: "bidder-a-slot-1".to_string(),
-                    impid: "slot-1".to_string(),
-                    price: 1.25,
-                    adm: Some("<div>Test Creative HTML</div>".to_string()),
-                    crid: Some("bidder-a-creative".to_string()),
-                    w: Some(300),
-                    h: Some(250),
-                    adomain: Some(vec!["example.com".to_string()]),
-                }],
-            }],
-            ext: Some(ResponseExt {
-                orchestrator: OrchestratorExt {
-                    strategy: "parallel_only".to_string(),
-                    providers: 2,
-                    total_bids: 3,
-                    time_ms: 12,
-                    provider_details: vec![],
-                },
-            }),
-        };
+    fn openrtb_response_round_trips_through_builder() {
+        let bid = build_openrtb_bid(OpenRtbBidFields {
+            id: "bidder-a-slot-1".to_string(),
+            impid: "slot-1".to_string(),
+            price: 1.25,
+            adm: Some("<div>Test Creative HTML</div>".to_string()),
+            crid: Some("bidder-a-creative".to_string()),
+            width: Some(300),
+            height: Some(250),
+            adomain: Some(vec!["example.com".to_string()]),
+        });
+
+        let seatbid = build_seat_bid(Some("bidder-a".to_string()), vec![bid]);
+
+        let ext = maybe_object_from_serializable(&ResponseExt {
+            orchestrator: OrchestratorExt {
+                strategy: "parallel_only".to_string(),
+                providers: 2,
+                total_bids: 3,
+                time_ms: 12,
+                provider_details: vec![],
+            },
+        });
+
+        let response = build_openrtb_response("auction-1".to_string(), vec![seatbid], ext);
 
         let serialized = serde_json::to_value(&response).expect("should serialize");
         let expected = serde_json::json!({
