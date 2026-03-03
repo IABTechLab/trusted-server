@@ -42,7 +42,7 @@ fn main() {
         if let Some(npm_path) = npm.as_deref() {
             if !ts_dir.join("node_modules").exists() {
                 let status = Command::new(npm_path)
-                    .arg("install")
+                    .arg("ci")
                     .current_dir(&ts_dir)
                     .status();
                 if !status
@@ -50,7 +50,7 @@ fn main() {
                     .map(std::process::ExitStatus::success)
                     .unwrap_or(false)
                 {
-                    warn!("tsjs: npm install failed; using existing dist if available");
+                    warn!("tsjs: npm ci failed; using existing dist if available");
                 }
             }
         }

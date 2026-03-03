@@ -589,7 +589,7 @@ ERROR: npm run build:custom failed
 
 ```bash
 cd crates/js/lib
-npm install
+npm ci
 ```
 
 2. Test build manually:

@@ -13,7 +13,7 @@ VitePress documentation site for Trusted Server.
 
 ```bash
 # Install dependencies
-npm install
+npm ci
 
 # Start dev server (available at localhost:5173)
 npm run dev
