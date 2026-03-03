@@ -1,4 +1,11 @@
-use trusted_server_js::{all_module_ids, concatenated_hash};
+use trusted_server_js::{all_module_ids_excluding, concatenated_hash, single_module_hash};
+
+/// Module IDs loaded with `defer` in a separate `<script>` tag.
+///
+/// Single source of truth — imported by
+/// [`IntegrationRegistry`](crate::integrations::IntegrationRegistry) and
+/// [`handle_tsjs_dynamic`](crate::publisher::handle_tsjs_dynamic).
+pub const DEFERRED_MODULE_IDS: &[&str] = &["prebid"];
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -17,17 +24,47 @@ pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
     )
 }
 
-/// `/static` URL using **all** available modules. Used in contexts that lack
-/// an `IntegrationRegistry` (e.g., creative rewriting, config defaults).
+/// `/static` URL using all available modules **except** deferred ones.
+///
+/// Used in contexts that lack an
+/// [`IntegrationRegistry`](crate::integrations::IntegrationRegistry) (e.g., creative
+/// rewriting, config defaults).
 #[must_use]
 pub fn tsjs_script_src_all() -> String {
-    let ids = all_module_ids();
+    let ids = all_module_ids_excluding(DEFERRED_MODULE_IDS);
     tsjs_script_src(&ids)
 }
 
-/// `<script>` tag using **all** available modules.
+/// `<script>` tag using all available modules **except** deferred ones.
 #[must_use]
 pub fn tsjs_script_tag_all() -> String {
-    let ids = all_module_ids();
+    let ids = all_module_ids_excluding(DEFERRED_MODULE_IDS);
     tsjs_script_tag(&ids)
+}
+
+/// `/static` URL for a single deferred module with its own cache-busting hash.
+#[must_use]
+pub fn tsjs_deferred_script_src(module_id: &str) -> String {
+    let hash = single_module_hash(module_id).unwrap_or_default();
+    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+}
+
+/// `<script defer>` tag for a single deferred module.
+#[must_use]
+pub fn tsjs_deferred_script_tag(module_id: &str) -> String {
+    format!(
+        "<script src=\"{}\" defer></script>",
+        tsjs_deferred_script_src(module_id)
+    )
+}
+
+/// Generate all deferred `<script defer>` tags for the given module IDs.
+///
+/// Returns an empty string when no deferred modules are present.
+#[must_use]
+pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
+    module_ids
+        .iter()
+        .map(|id| tsjs_deferred_script_tag(id))
+        .collect::<String>()
 }

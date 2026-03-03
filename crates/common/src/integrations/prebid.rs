@@ -1129,12 +1129,16 @@ template = "{{client_ip}}:{{user_agent}}"
             "Unified bundle should be injected"
         );
         assert!(
-            !processed.contains("prebid.min.js"),
-            "Prebid script should be removed when auto-config is enabled"
+            !processed.contains("cdn.prebid.org/prebid.min.js"),
+            "Publisher prebid script should be removed when auto-config is enabled"
         );
         assert!(
             !processed.contains("cdn.prebid.org/prebid.js"),
             "Prebid preload should be removed when auto-config is enabled"
+        );
+        assert!(
+            processed.contains("tsjs-prebid.min.js"),
+            "Deferred prebid bundle should be injected"
         );
     }
 

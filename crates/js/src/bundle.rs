@@ -54,6 +54,28 @@ pub fn concatenated_hash(ids: &[&str]) -> String {
     encode(hasher.finalize())
 }
 
+/// SHA-256 hash of a single module's content (without prepending core).
+///
+/// Used for cache-busting URLs of deferred modules served individually.
+#[must_use]
+pub fn single_module_hash(id: &str) -> Option<String> {
+    module_bundle(id).map(|content| {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        encode(hasher.finalize())
+    })
+}
+
+/// Return all available module IDs except those in `exclude`.
+#[must_use]
+pub fn all_module_ids_excluding(exclude: &[&str]) -> Vec<&'static str> {
+    TSJS_MODULES
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| !exclude.contains(id))
+        .collect()
+}
+
 fn module_map() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| TSJS_MODULES.iter().map(|m| (m.id, m.bundle)).collect())

@@ -313,7 +313,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The Prebid module is loaded as a separate `<script defer>` tag after the main TSJS bundle, so dropping the publisher assets prevents duplicate downloads. The server-injected config (`window.__tsjs_prebid`) is an inline script that runs before both bundles, ensuring configuration is available when the deferred Prebid module auto-initializes.
 
 **4. TSJS Assets & Testing**
 

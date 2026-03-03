@@ -789,6 +789,28 @@ impl IntegrationRegistry {
         ids
     }
 
+    /// Return JS module IDs for the main (synchronous) bundle, excluding
+    /// deferred modules like prebid.
+    #[must_use]
+    pub fn js_module_ids_immediate(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| !crate::tsjs::DEFERRED_MODULE_IDS.contains(id))
+            .collect()
+    }
+
+    /// Return JS module IDs that should be loaded with `defer`.
+    ///
+    /// Only includes deferred modules that are actually enabled in this
+    /// registry. Returns an empty vec when prebid is not configured.
+    #[must_use]
+    pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| crate::tsjs::DEFERRED_MODULE_IDS.contains(id))
+            .collect()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn from_rewriters(
@@ -1336,6 +1358,103 @@ mod tests {
         assert!(
             response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
             "POST response should have x-synthetic-id header"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_immediate_excludes_prebid() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let immediate = registry.js_module_ids_immediate();
+        let deferred = registry.js_module_ids_deferred();
+
+        assert!(
+            all.contains(&"prebid"),
+            "should include prebid in full list"
+        );
+        assert!(
+            !immediate.contains(&"prebid"),
+            "should not include prebid in immediate IDs"
+        );
+        assert!(
+            deferred.contains(&"prebid"),
+            "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_deferred_empty_when_prebid_disabled() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": false,
+                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        let deferred = registry.js_module_ids_deferred();
+        assert!(
+            deferred.is_empty(),
+            "should have no deferred IDs when prebid is disabled"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_split_is_exhaustive() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let mut recombined = registry.js_module_ids_immediate();
+        recombined.extend(registry.js_module_ids_deferred());
+        recombined.sort();
+
+        let mut all_sorted = all;
+        all_sorted.sort();
+
+        assert_eq!(
+            recombined, all_sorted,
+            "should reconstruct full module list from immediate + deferred"
         );
     }
 }
