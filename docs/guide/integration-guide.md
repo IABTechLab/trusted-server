@@ -268,9 +268,15 @@ By following these steps you can ship independent integration modules that plug 
 
 ## Existing Integrations
 
-Two built-in integrations demonstrate how the framework pieces fit together:
+Two built-in integrations demonstrate how the framework pieces fit together.
+
+Integrations are loaded in one of two ways:
+- **Immediate** (default) — concatenated into the main `tsjs-unified.min.js` bundle, loaded synchronously at `<head>` start.
+- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Deferred module IDs are listed in `DEFERRED_MODULE_IDS` in `crates/common/src/tsjs.rs`.
 
 ### Testlight
+
+**Loading**: Immediate
 
 **Purpose**: Sample partner stub showing request proxying, attribute rewrites, and asset injection.
 
@@ -281,7 +287,9 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the NPM-bundled Prebid.js already ships in the unified TSJS build.
+**Loading**: Deferred (`<script defer>`)
+
+**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
 
 **Key files**:
 

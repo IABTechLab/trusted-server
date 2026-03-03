@@ -237,9 +237,10 @@ IntegrationRegistration::builder(ID)
     .build()
 ```
 
-- Integration IDs match JS directory names: `prebid`, `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
+- Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
 - `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
-- `IntegrationRegistry::js_module_ids()` maps registered integrations to JS module names.
+- Deferred integrations (listed in `DEFERRED_MODULE_IDS` in `tsjs.rs`) are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
+- `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
 ## JS Build Pipeline
 
