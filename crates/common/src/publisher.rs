@@ -67,17 +67,17 @@ pub fn handle_tsjs_dynamic(
 
 /// Extract a module ID from a deferred-module filename like `tsjs-prebid.min.js`.
 ///
-/// Returns `Some(&'static str)` if the filename matches a known deferred module
-/// ID, `None` otherwise. Only explicitly listed IDs are accepted for security.
+/// Returns `Some(&'static str)` if the filename matches a known JS module ID,
+/// `None` otherwise. The caller must additionally verify that the module is
+/// both deferred and enabled via the [`IntegrationRegistry`].
 fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
     let stem = filename
         .strip_prefix("tsjs-")
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
-    crate::tsjs::DEFERRED_MODULE_IDS
-        .iter()
-        .find(|&&id| id == stem)
-        .copied()
+    trusted_server_js::all_module_ids()
+        .into_iter()
+        .find(|&id| id == stem)
 }
 
 /// Parameters for processing response streaming
@@ -509,8 +509,8 @@ mod tests {
         );
         assert_eq!(
             parse_deferred_module_filename("tsjs-core.min.js"),
-            None,
-            "should reject non-deferred modules"
+            Some("core"),
+            "should accept any known module ID (deferred check happens in caller)"
         );
         assert_eq!(
             parse_deferred_module_filename("prebid.min.js"),

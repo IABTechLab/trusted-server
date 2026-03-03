@@ -322,7 +322,7 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                     let injected = injected_ts_creative.clone();
                     move |el| {
                         if !injected.get() {
-                            let script_tag = tsjs::tsjs_script_tag_all();
+                            let script_tag = tsjs::tsjs_script_tag(&["creative"]);
                             el.prepend(&script_tag, ContentType::Html);
                             injected.set(true);
                         }

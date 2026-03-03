@@ -1,11 +1,4 @@
-use trusted_server_js::{all_module_ids_excluding, concatenated_hash, single_module_hash};
-
-/// Module IDs loaded with `defer` in a separate `<script>` tag.
-///
-/// Single source of truth — imported by
-/// [`IntegrationRegistry`](crate::integrations::IntegrationRegistry) and
-/// [`handle_tsjs_dynamic`](crate::publisher::handle_tsjs_dynamic).
-pub const DEFERRED_MODULE_IDS: &[&str] = &["prebid"];
+use trusted_server_js::{concatenated_hash, single_module_hash};
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -22,24 +15,6 @@ pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
         "<script src=\"{}\" id=\"trustedserver-js\"></script>",
         tsjs_script_src(module_ids)
     )
-}
-
-/// `/static` URL using all available modules **except** deferred ones.
-///
-/// Used in contexts that lack an
-/// [`IntegrationRegistry`](crate::integrations::IntegrationRegistry) (e.g., creative
-/// rewriting, config defaults).
-#[must_use]
-pub fn tsjs_script_src_all() -> String {
-    let ids = all_module_ids_excluding(DEFERRED_MODULE_IDS);
-    tsjs_script_src(&ids)
-}
-
-/// `<script>` tag using all available modules **except** deferred ones.
-#[must_use]
-pub fn tsjs_script_tag_all() -> String {
-    let ids = all_module_ids_excluding(DEFERRED_MODULE_IDS);
-    tsjs_script_tag(&ids)
 }
 
 /// `/static` URL for a single deferred module with its own cache-busting hash.

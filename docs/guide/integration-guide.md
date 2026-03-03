@@ -272,7 +272,7 @@ Two built-in integrations demonstrate how the framework pieces fit together.
 
 Integrations are loaded in one of two ways:
 - **Immediate** (default) — concatenated into the main `tsjs-unified.min.js` bundle, loaded synchronously at `<head>` start.
-- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Deferred module IDs are listed in `DEFERRED_MODULE_IDS` in `crates/common/src/tsjs.rs`.
+- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Integrations opt in by calling `.with_deferred_js()` on their registration builder.
 
 ### Testlight
 

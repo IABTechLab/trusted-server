@@ -390,6 +390,7 @@ pub trait IntegrationHeadInjector: Send + Sync {
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
+    pub js_deferred: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -413,6 +414,7 @@ impl IntegrationRegistrationBuilder {
         Self {
             registration: IntegrationRegistration {
                 integration_id,
+                js_deferred: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -458,6 +460,14 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Mark this integration's JS module for deferred loading via
+    /// `<script defer>` instead of the main synchronous bundle.
+    #[must_use]
+    pub fn with_deferred_js(mut self) -> Self {
+        self.registration.js_deferred = true;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -476,6 +486,7 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    deferred_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -495,6 +506,7 @@ impl Default for IntegrationRegistryInner {
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
+            deferred_js_ids: Vec::new(),
         }
     }
 }
@@ -600,6 +612,9 @@ impl IntegrationRegistry {
                 inner
                     .head_injectors
                     .extend(registration.head_injectors.into_iter());
+                if registration.js_deferred {
+                    inner.deferred_js_ids.push(registration.integration_id);
+                }
             }
         }
 
@@ -790,24 +805,26 @@ impl IntegrationRegistry {
     }
 
     /// Return JS module IDs for the main (synchronous) bundle, excluding
-    /// deferred modules like prebid.
+    /// modules registered with [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js).
     #[must_use]
     pub fn js_module_ids_immediate(&self) -> Vec<&'static str> {
         self.js_module_ids()
             .into_iter()
-            .filter(|id| !crate::tsjs::DEFERRED_MODULE_IDS.contains(id))
+            .filter(|id| !self.inner.deferred_js_ids.contains(id))
             .collect()
     }
 
-    /// Return JS module IDs that should be loaded with `defer`.
+    /// Return JS module IDs that should be loaded with `<script defer>`.
     ///
-    /// Only includes deferred modules that are actually enabled in this
-    /// registry. Returns an empty vec when prebid is not configured.
+    /// Only includes modules registered with
+    /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
+    /// that are actually enabled. Returns an empty vec when no deferred
+    /// integrations are configured.
     #[must_use]
     pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
         self.js_module_ids()
             .into_iter()
-            .filter(|id| crate::tsjs::DEFERRED_MODULE_IDS.contains(id))
+            .filter(|id| self.inner.deferred_js_ids.contains(id))
             .collect()
     }
 
@@ -829,6 +846,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -852,6 +870,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -907,6 +926,7 @@ impl IntegrationRegistry {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }

@@ -66,16 +66,6 @@ pub fn single_module_hash(id: &str) -> Option<String> {
     })
 }
 
-/// Return all available module IDs except those in `exclude`.
-#[must_use]
-pub fn all_module_ids_excluding(exclude: &[&str]) -> Vec<&'static str> {
-    TSJS_MODULES
-        .iter()
-        .map(|m| m.id)
-        .filter(|id| !exclude.contains(id))
-        .collect()
-}
-
 fn module_map() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| TSJS_MODULES.iter().map(|m| (m.id, m.bundle)).collect())

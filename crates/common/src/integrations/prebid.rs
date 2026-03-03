@@ -223,6 +223,7 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
+            .with_deferred_js()
             .build(),
     )
 }
