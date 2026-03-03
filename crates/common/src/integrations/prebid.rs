@@ -53,6 +53,12 @@ pub struct PrebidIntegrationConfig {
     pub bidders: Vec<String>,
     #[serde(default)]
     pub debug: bool,
+    /// Sets the `OpenRTB` `test: 1` flag on outgoing requests. When enabled,
+    /// bidders treat the auction as non-billable test traffic, which can
+    /// significantly reduce fill rates. Separate from `debug` so you can get
+    /// debug diagnostics without suppressing real demand.
+    #[serde(default)]
+    pub test_mode: bool,
     #[serde(default)]
     pub debug_query_params: Option<String>,
     /// Patterns to match Prebid script URLs for serving empty JS.
@@ -574,9 +580,13 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        // Build device object with user-agent and geo if available
+        // Build device object with user-agent, client IP, and geo if available.
+        // Forwarding the real client IP is critical: without it PBS infers the
+        // IP from the incoming connection (a data-center / edge IP), causing
+        // bidders like PubMatic to filter the traffic as non-human.
         let device = request.device.as_ref().map(|d| Device {
             ua: d.user_agent.clone(),
+            ip: d.ip.clone(),
             geo: d.geo.as_ref().map(|geo| Geo {
                 geo_type: 2, // IP address per OpenRTB spec
                 country: Some(geo.country.clone()),
@@ -609,9 +619,12 @@ impl PrebidAuctionProvider {
             })
             .unwrap_or((None, None, None, None));
 
+        let debug_enabled = self.config.debug;
+
         let ext = Some(RequestExt {
             prebid: Some(PrebidExt {
-                debug: if self.config.debug { Some(true) } else { None },
+                debug: debug_enabled.then_some(true),
+                returnallbidstatus: debug_enabled.then_some(true),
             }),
             trusted_server: Some(TrustedServerExt {
                 version,
@@ -633,6 +646,7 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
+            test: self.config.test_mode.then_some(1),
             ext,
         }
     }
@@ -662,6 +676,54 @@ impl PrebidAuctionProvider {
             AuctionResponse::no_bid("prebid", response_time_ms)
         } else {
             AuctionResponse::success("prebid", bids, response_time_ms)
+        }
+    }
+
+    /// Enrich an [`AuctionResponse`] with metadata extracted from the Prebid
+    /// Server response `ext`.
+    ///
+    /// Always-on fields: `responsetimemillis`, `errors`, `warnings`.
+    /// Debug-only fields (gated on `config.debug`): `debug`, `bidstatus`.
+    fn enrich_response_metadata(
+        &self,
+        response_json: &Json,
+        auction_response: &mut AuctionResponse,
+    ) {
+        let ext = response_json.get("ext");
+
+        // Always attach per-bidder timing and diagnostics.
+        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
+            auction_response
+                .metadata
+                .insert("responsetimemillis".to_string(), rtm.clone());
+        }
+        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
+            auction_response
+                .metadata
+                .insert("errors".to_string(), errors.clone());
+        }
+        if let Some(warnings) = ext.and_then(|e| e.get("warnings")) {
+            auction_response
+                .metadata
+                .insert("warnings".to_string(), warnings.clone());
+        }
+
+        // When debug is enabled, surface httpcalls, resolvedrequest, and
+        // per-bid status from the Prebid Server response.
+        if self.config.debug {
+            if let Some(debug) = ext.and_then(|e| e.get("debug")) {
+                auction_response
+                    .metadata
+                    .insert("debug".to_string(), debug.clone());
+            }
+            if let Some(bidstatus) = ext
+                .and_then(|e| e.get("prebid"))
+                .and_then(|p| p.get("bidstatus"))
+            {
+                auction_response
+                    .metadata
+                    .insert("bidstatus".to_string(), bidstatus.clone());
+            }
         }
     }
 
@@ -828,11 +890,13 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
 
-        if log::log_enabled!(log::Level::Debug) {
+        // Log the full response body when debug is enabled to surface
+        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
+        if self.config.debug && log::log_enabled!(log::Level::Debug) {
             match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::debug!("Prebid OpenRTB response:\n{}", json),
+                Ok(json) => log::debug!("Prebid OpenRTB response:\n{json}"),
                 Err(e) => {
-                    log::warn!("Prebid: failed to serialize OpenRTB response for logging: {e}")
+                    log::warn!("Prebid: failed to serialize response for logging: {e}");
                 }
             }
         }
@@ -859,18 +923,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
-
-        // Attach per-bidder timing and errors from the Prebid Server response.
-        // `responsetimemillis` contains an entry for every invited bidder, even
-        // those that returned no bids, making it the canonical source for
-        // "who was in the auction."
-        let ext = response_json.get("ext");
-        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
-            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
-        }
-        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
-            auction_response = auction_response.with_metadata("errors", errors.clone());
-        }
+        self.enrich_response_metadata(&response_json, &mut auction_response);
 
         log::info!(
             "Prebid returned {} bids in {}ms",
@@ -916,6 +969,12 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
                 "Registering Prebid auction provider (server_url={})",
                 config.server_url
             );
+            if config.debug {
+                log::warn!(
+                    "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+                     bidstatus) will be included in /auction responses"
+                );
+            }
             providers.push(Arc::new(PrebidAuctionProvider::new(config)));
         }
         Ok(None) => {
@@ -933,7 +992,7 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
 mod tests {
     use super::*;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
@@ -943,7 +1002,9 @@ mod tests {
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
+    use fastly::Request;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::io::Cursor;
 
     fn make_settings() -> Settings {
@@ -958,9 +1019,51 @@ mod tests {
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
+            test_mode: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             bid_param_zone_overrides: HashMap::new(),
+        }
+    }
+
+    fn create_test_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "auction-123".to_string(),
+            slots: vec![AdSlot {
+                id: "slot-1".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "pub.example".to_string(),
+                page_url: Some("https://pub.example/article".to_string()),
+            },
+            user: UserInfo {
+                id: "user-123".to_string(),
+                fresh_id: "fresh-456".to_string(),
+                consent: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn create_test_auction_context<'a>(
+        settings: &'a Settings,
+        request: &'a Request,
+    ) -> AuctionContext<'a> {
+        AuctionContext {
+            settings,
+            request,
+            timeout_ms: 1000,
+            provider_responses: None,
         }
     }
 
@@ -1375,6 +1478,164 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn to_openrtb_includes_debug_flags_when_enabled() {
+        let mut config = base_config();
+        config.debug = true;
+
+        let provider = PrebidAuctionProvider::new(config);
+        let auction_request = create_test_auction_request();
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.test, None,
+            "debug alone should not set top-level OpenRTB test field"
+        );
+
+        let prebid_ext = openrtb
+            .ext
+            .as_ref()
+            .and_then(|ext| ext.prebid.as_ref())
+            .expect("should include ext.prebid");
+        assert_eq!(
+            prebid_ext.debug,
+            Some(true),
+            "should include ext.prebid.debug when debug is enabled"
+        );
+        assert_eq!(
+            prebid_ext.returnallbidstatus,
+            Some(true),
+            "should include ext.prebid.returnallbidstatus when debug is enabled"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert!(
+            serialized.get("test").is_none(),
+            "debug alone should not serialize top-level test"
+        );
+        assert_eq!(
+            serialized["ext"]["prebid"]["debug"],
+            json!(true),
+            "should serialize ext.prebid.debug when debug is enabled"
+        );
+        assert_eq!(
+            serialized["ext"]["prebid"]["returnallbidstatus"],
+            json!(true),
+            "should serialize ext.prebid.returnallbidstatus when debug is enabled"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_test_flag_when_test_mode_enabled() {
+        let mut config = base_config();
+        config.test_mode = true;
+
+        let provider = PrebidAuctionProvider::new(config);
+        let auction_request = create_test_auction_request();
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.test,
+            Some(1),
+            "should set top-level OpenRTB test field when test_mode is enabled"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["test"],
+            json!(1),
+            "should serialize top-level test as 1 when test_mode is enabled"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_serializes_device_ip_when_present() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("test-agent".to_string()),
+            ip: Some("203.0.113.42".to_string()),
+            geo: None,
+        });
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb
+                .device
+                .as_ref()
+                .and_then(|device| device.ip.as_deref()),
+            Some("203.0.113.42"),
+            "should propagate client IP into OpenRTB device.ip"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["device"]["ip"],
+            json!("203.0.113.42"),
+            "should serialize device.ip when client IP is available"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_debug_flags_when_disabled() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.test, None,
+            "should omit top-level OpenRTB test field when test_mode is disabled"
+        );
+
+        let prebid_ext = openrtb
+            .ext
+            .as_ref()
+            .and_then(|ext| ext.prebid.as_ref())
+            .expect("should include ext.prebid");
+        assert_eq!(
+            prebid_ext.debug, None,
+            "should omit ext.prebid.debug when debug is disabled"
+        );
+        assert_eq!(
+            prebid_ext.returnallbidstatus, None,
+            "should omit ext.prebid.returnallbidstatus when debug is disabled"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert!(
+            serialized.get("test").is_none(),
+            "should not serialize top-level test when test_mode is disabled"
+        );
+
+        let prebid = serialized["ext"]["prebid"]
+            .as_object()
+            .expect("should serialize ext.prebid object");
+        assert!(
+            !prebid.contains_key("debug"),
+            "should not serialize ext.prebid.debug when debug is disabled"
+        );
+        assert!(
+            !prebid.contains_key("returnallbidstatus"),
+            "should not serialize ext.prebid.returnallbidstatus when debug is disabled"
+        );
+    }
+
+    #[test]
     fn expand_trusted_server_bidders_uses_per_bidder_map_when_present() {
         let params = json!({
             "bidderParams": {
@@ -1727,10 +1988,9 @@ fixed_bottom = {placementId = "_s2sBottom"}
     }
 
     #[test]
-    fn parse_response_preserves_responsetimemillis_and_errors_metadata() {
+    fn enrich_response_metadata_attaches_always_on_fields() {
         let provider = PrebidAuctionProvider::new(base_config());
 
-        // Minimal valid OpenRTB response with ext containing diagnostics.
         let response_json = json!({
             "seatbid": [{
                 "seat": "kargo",
@@ -1748,39 +2008,109 @@ fixed_bottom = {placementId = "_s2sBottom"}
                 },
                 "errors": {
                     "openx": [{"code": 1, "message": "timeout"}]
+                },
+                "warnings": {
+                    "kargo": [{"code": 10, "message": "bid floor"}]
+                },
+                "debug": {
+                    "httpcalls": {"kargo": []}
+                },
+                "prebid": {
+                    "bidstatus": [{"bidder": "kargo", "status": "bid"}]
                 }
             }
         });
 
-        // Replicate the metadata extraction logic from `run_auction`.
         let mut auction_response = provider.parse_openrtb_response(&response_json, 150);
+        provider.enrich_response_metadata(&response_json, &mut auction_response);
 
-        let ext = response_json.get("ext");
-        if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
-            auction_response = auction_response.with_metadata("responsetimemillis", rtm.clone());
-        }
-        if let Some(errors) = ext.and_then(|e| e.get("errors")) {
-            auction_response = auction_response.with_metadata("errors", errors.clone());
-        }
-
-        // Verify bids were parsed.
         assert_eq!(auction_response.bids.len(), 1, "should parse one bid");
 
-        // Verify responsetimemillis is preserved.
+        // Always-on fields should be present.
         let rtm = auction_response
             .metadata
             .get("responsetimemillis")
-            .expect("should have responsetimemillis in metadata");
+            .expect("should have responsetimemillis");
         assert_eq!(rtm["kargo"], 98);
         assert_eq!(rtm["appnexus"], 0);
         assert_eq!(rtm["ix"], 120);
 
-        // Verify errors are preserved.
         let errors = auction_response
             .metadata
             .get("errors")
-            .expect("should have errors in metadata");
+            .expect("should have errors");
         assert_eq!(errors["openx"][0]["code"], 1);
-        assert_eq!(errors["openx"][0]["message"], "timeout");
+
+        let warnings = auction_response
+            .metadata
+            .get("warnings")
+            .expect("should have warnings");
+        assert_eq!(warnings["kargo"][0]["code"], 10);
+
+        // Debug-gated fields should NOT be present (base_config has debug: false).
+        assert!(
+            !auction_response.metadata.contains_key("debug"),
+            "should not include debug when config.debug is false"
+        );
+        assert!(
+            !auction_response.metadata.contains_key("bidstatus"),
+            "should not include bidstatus when config.debug is false"
+        );
+    }
+
+    #[test]
+    fn enrich_response_metadata_includes_debug_fields_when_enabled() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+
+        let response_json = json!({
+            "seatbid": [],
+            "ext": {
+                "responsetimemillis": {"kargo": 50},
+                "debug": {
+                    "httpcalls": {"kargo": [{"uri": "https://pbs.example/bid", "status": 200}]},
+                    "resolvedrequest": {"id": "resolved-123"}
+                },
+                "prebid": {
+                    "bidstatus": [
+                        {"bidder": "kargo", "status": "bid"},
+                        {"bidder": "openx", "status": "timeout"}
+                    ]
+                }
+            }
+        });
+
+        let mut auction_response = provider.parse_openrtb_response(&response_json, 100);
+        provider.enrich_response_metadata(&response_json, &mut auction_response);
+
+        // Always-on field should still be present.
+        assert!(
+            auction_response.metadata.contains_key("responsetimemillis"),
+            "should have responsetimemillis"
+        );
+
+        // Debug-gated fields should now be present.
+        let debug = auction_response
+            .metadata
+            .get("debug")
+            .expect("should have debug when config.debug is true");
+        assert_eq!(
+            debug["httpcalls"]["kargo"][0]["status"], 200,
+            "should include httpcalls from PBS debug response"
+        );
+        assert_eq!(
+            debug["resolvedrequest"]["id"], "resolved-123",
+            "should include resolvedrequest from PBS debug response"
+        );
+
+        let bidstatus = auction_response
+            .metadata
+            .get("bidstatus")
+            .expect("should have bidstatus when config.debug is true");
+        let statuses = bidstatus.as_array().expect("bidstatus should be array");
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0]["bidder"], "kargo");
+        assert_eq!(statuses[1]["status"], "timeout");
     }
 }

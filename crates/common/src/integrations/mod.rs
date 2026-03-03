@@ -7,6 +7,7 @@ pub mod aps;
 pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
+pub mod gpt;
 pub mod lockr;
 pub mod nextjs;
 pub mod permutive;
@@ -34,5 +35,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         didomi::register,
         google_tag_manager::register,
         datadome::register,
+        gpt::register,
     ]
 }
