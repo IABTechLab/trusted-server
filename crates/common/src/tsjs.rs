@@ -1,4 +1,4 @@
-use trusted_server_js::{concatenated_hash, single_module_hash};
+use trusted_server_js::{all_module_ids, concatenated_hash, single_module_hash};
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -15,6 +15,27 @@ pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
         "<script src=\"{}\" id=\"trustedserver-js\"></script>",
         tsjs_script_src(module_ids)
     )
+}
+
+/// `/static` URL for the unified bundle with a conservative cache-busting hash.
+///
+/// Hashes all compiled module IDs so the cache invalidates whenever any module
+/// changes. Over-invalidates slightly (includes deferred modules in the hash)
+/// but never serves stale content. Use [`tsjs_script_src`] with exact module
+/// IDs when the [`IntegrationRegistry`] is available.
+#[must_use]
+pub fn tsjs_unified_script_src() -> String {
+    let ids = all_module_ids();
+    tsjs_script_src(&ids)
+}
+
+/// `<script>` tag for the unified bundle with a conservative cache-busting hash.
+///
+/// See [`tsjs_unified_script_src`] for details.
+#[must_use]
+pub fn tsjs_unified_script_tag() -> String {
+    let ids = all_module_ids();
+    tsjs_script_tag(&ids)
 }
 
 /// `/static` URL for a single deferred module with its own cache-busting hash.
