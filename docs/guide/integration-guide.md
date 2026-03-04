@@ -212,12 +212,12 @@ impl IntegrationScriptRewriter for MyIntegration {
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
 ::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js` because the unified TSJS bundle is injected automatically at the start of `<head>`.
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
 :::
 
 ### 5b. Implement Head Injection (Optional)
 
-If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts that run after the unified TSJS bundle), implement `IntegrationHeadInjector`. Snippets returned by this trait are prepended into `<head>` immediately after the TSJS bundle tag, so the `tsjs` API is available.
+If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts or global bootstraps), implement `IntegrationHeadInjector`. Snippets are prepended into `<head>` before the TSJS bundle tags, so they run first.
 
 ```rust
 impl IntegrationHeadInjector for MyIntegration {
@@ -232,7 +232,7 @@ impl IntegrationHeadInjector for MyIntegration {
 }
 ```
 
-`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated after the unified script tag and prepended together, so ordering between integrations is not guaranteed — keep snippets self-contained.
+`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained.
 
 ::: tip When to Use Head Injection
 Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
@@ -251,7 +251,7 @@ Add the module to `crates/common/src/integrations/mod.rs`'s builder list. The re
 
 Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/integrations/` (for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build` script automatically discovers every file in that directory and produces a bundle named `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
 
-Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) can simply drop the legacy tag because the unified bundle is injected automatically at the start of `<head>`.
+Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own deferred bundle automatically.
 
 ### 8. Test Locally
 
@@ -326,7 +326,7 @@ When the integration is enabled, the `IntegrationAttributeRewriter` removes any 
 
 **4. TSJS Assets & Testing**
 
-The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the Prebid.js bundle.
+The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 

@@ -321,7 +321,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             .replace("</", "<\\/");
 
         vec![format!(
-            r#"<script>window.__tsjs_prebid={config_json};</script>"#
+            r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
         )]
     }
 }
