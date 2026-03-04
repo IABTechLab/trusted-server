@@ -1388,7 +1388,7 @@ template = "{{client_ip}}:{{user_agent}}"
     }
 
     #[test]
-    fn test_script_patterns_config_parsing() {
+    fn script_patterns_config_parsing() {
         let config = parse_prebid_toml(
             r#"
 [integrations.prebid]
@@ -1406,7 +1406,7 @@ script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
     }
 
     #[test]
-    fn test_script_patterns_defaults() {
+    fn script_patterns_defaults() {
         let config = parse_prebid_toml(
             r#"
 [integrations.prebid]
@@ -1423,7 +1423,7 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn test_script_handler_returns_empty_js() {
+    fn script_handler_returns_empty_js() {
         let integration = PrebidIntegration::new(base_config());
 
         let response = integration
@@ -1447,7 +1447,7 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn test_routes_includes_script_patterns() {
+    fn routes_include_script_patterns() {
         let integration = PrebidIntegration::new(base_config());
 
         let routes = integration.routes();
