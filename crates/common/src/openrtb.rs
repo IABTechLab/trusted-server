@@ -8,7 +8,9 @@ pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
 
-pub use trusted_server_openrtb::{Banner, Device, Format, Geo, Imp, Regs, SeatBid, Site, User};
+pub use trusted_server_openrtb::{
+    Banner, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, User,
+};
 
 fn clamp_u32_to_i32(value: u32) -> i32 {
     value.min(i32::MAX as u32) as i32
@@ -62,7 +64,15 @@ pub fn build_banner(formats: Vec<Format>) -> Banner {
 }
 
 #[must_use]
-pub fn build_imp(id: String, banner: Option<Banner>, ext: Option<Object>) -> Imp {
+pub fn build_imp(
+    id: String,
+    banner: Option<Banner>,
+    bidfloor: Option<f64>,
+    bidfloorcur: Option<String>,
+    secure: Option<i32>,
+    tagid: Option<String>,
+    ext: Option<Object>,
+) -> Imp {
     Imp {
         id,
         metric: None,
@@ -74,11 +84,11 @@ pub fn build_imp(id: String, banner: Option<Banner>, ext: Option<Object>) -> Imp
         displaymanager: None,
         displaymanagerver: None,
         instl: None,
-        tagid: None,
-        bidfloor: None,
-        bidfloorcur: None,
+        tagid,
+        bidfloor,
+        bidfloorcur,
         clickbrowser: None,
-        secure: None,
+        secure,
         iframebuster: None,
         rwdd: None,
         ssai: None,
@@ -91,7 +101,12 @@ pub fn build_imp(id: String, banner: Option<Banner>, ext: Option<Object>) -> Imp
 }
 
 #[must_use]
-pub fn build_site(domain: Option<String>, page: Option<String>) -> Site {
+pub fn build_site(
+    domain: Option<String>,
+    page: Option<String>,
+    r#ref: Option<String>,
+    publisher: Option<Publisher>,
+) -> Site {
     Site {
         id: None,
         name: None,
@@ -101,11 +116,11 @@ pub fn build_site(domain: Option<String>, page: Option<String>) -> Site {
         sectioncat: None,
         pagecat: None,
         page,
-        r#ref: None,
+        r#ref,
         search: None,
         mobile: None,
         privacypolicy: None,
-        publisher: None,
+        publisher,
         content: None,
         keywords: None,
         kwarray: None,
@@ -113,8 +128,21 @@ pub fn build_site(domain: Option<String>, page: Option<String>) -> Site {
     }
 }
 
+/// Build a minimal `Publisher` object with just a domain.
 #[must_use]
-pub fn build_user(id: Option<String>, ext: Option<Object>) -> User {
+pub fn build_publisher(domain: Option<String>) -> Publisher {
+    Publisher {
+        id: None,
+        name: None,
+        cattax: None,
+        cat: None,
+        domain,
+        ext: None,
+    }
+}
+
+#[must_use]
+pub fn build_user(id: Option<String>, consent: Option<String>, ext: Option<Object>) -> User {
     User {
         id,
         buyeruid: None,
@@ -125,24 +153,31 @@ pub fn build_user(id: Option<String>, ext: Option<Object>) -> User {
         customdata: None,
         geo: None,
         data: None,
-        consent: None,
+        consent,
         eids: None,
         ext,
     }
 }
 
 #[must_use]
-pub fn build_geo(country: Option<String>, city: Option<String>, region: Option<String>) -> Geo {
+pub fn build_geo(
+    country: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    metro: Option<String>,
+) -> Geo {
     Geo {
-        lat: None,
-        lon: None,
+        lat,
+        lon,
         r#type: Some(2),
         accuracy: None,
         lastfix: None,
         ipservice: None,
         country,
         region,
-        metro: None,
+        metro,
         city,
         zip: None,
         utcoffset: None,
@@ -151,10 +186,16 @@ pub fn build_geo(country: Option<String>, city: Option<String>, region: Option<S
 }
 
 #[must_use]
-pub fn build_device(ua: Option<String>, ip: Option<String>, geo: Option<Geo>) -> Device {
+pub fn build_device(
+    ua: Option<String>,
+    ip: Option<String>,
+    geo: Option<Geo>,
+    dnt: Option<i32>,
+    language: Option<String>,
+) -> Device {
     Device {
         geo,
-        dnt: None,
+        dnt,
         lmt: None,
         ua,
         sua: None,
@@ -173,7 +214,7 @@ pub fn build_device(ua: Option<String>, ip: Option<String>, geo: Option<Geo>) ->
         js: None,
         geofetch: None,
         flashver: None,
-        language: None,
+        language,
         langb: None,
         carrier: None,
         mccmnc: None,
@@ -190,43 +231,48 @@ pub fn build_device(ua: Option<String>, ip: Option<String>, geo: Option<Geo>) ->
 }
 
 #[must_use]
-pub fn build_regs(ext: Option<Object>) -> Regs {
+pub fn build_regs(gdpr: Option<i32>, us_privacy: Option<String>, ext: Option<Object>) -> Regs {
     Regs {
         coppa: None,
-        gdpr: None,
-        us_privacy: None,
+        gdpr,
+        us_privacy,
         gpp: None,
         gpp_sid: None,
         ext,
     }
 }
 
+/// Parameters for building an `OpenRTB` bid request.
+pub struct OpenRtbRequestParams {
+    pub id: String,
+    pub imp: Vec<Imp>,
+    pub site: Option<Site>,
+    pub user: Option<User>,
+    pub device: Option<Device>,
+    pub regs: Option<Regs>,
+    pub test: Option<i32>,
+    pub tmax: Option<i32>,
+    pub cur: Option<Vec<String>>,
+    pub ext: Option<Object>,
+}
+
 #[must_use]
-pub fn build_openrtb_request(
-    id: String,
-    imp: Vec<Imp>,
-    site: Option<Site>,
-    user: Option<User>,
-    device: Option<Device>,
-    regs: Option<Regs>,
-    test: Option<i32>,
-    ext: Option<Object>,
-) -> OpenRtbRequest {
+pub fn build_openrtb_request(params: OpenRtbRequestParams) -> OpenRtbRequest {
     OpenRtbRequest {
-        id,
-        imp,
-        site,
+        id: params.id,
+        imp: params.imp,
+        site: params.site,
         app: None,
         dooh: None,
-        device,
-        user,
-        test,
+        device: params.device,
+        user: params.user,
+        test: params.test,
         at: None,
-        tmax: None,
+        tmax: params.tmax,
         wseat: None,
         bseat: None,
         allimps: None,
-        cur: None,
+        cur: params.cur,
         wlang: None,
         wlangb: None,
         acat: None,
@@ -235,8 +281,8 @@ pub fn build_openrtb_request(
         badv: None,
         bapp: None,
         source: None,
-        regs,
-        ext,
+        regs: params.regs,
+        ext: params.ext,
     }
 }
 
