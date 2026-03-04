@@ -23,10 +23,9 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    build_banner, build_device, build_format, build_geo, build_imp, build_openrtb_request,
-    build_publisher, build_regs, build_site, build_user, maybe_object_from_serializable, ImpExt,
-    OpenRtbRequest, OpenRtbRequestParams, PrebidExt, PrebidImpExt, RequestExt, TrustedServerExt,
-    UserExt,
+    clamp_u32_to_i32, maybe_object_from_serializable, Banner, Device, Format, Geo, Imp, ImpExt,
+    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RequestExt, Site, TrustedServerExt,
+    User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -498,7 +497,11 @@ impl PrebidAuctionProvider {
                     .formats
                     .iter()
                     .filter(|f| f.media_type == MediaType::Banner)
-                    .map(|f| build_format(f.width, f.height))
+                    .map(|f| Format {
+                        w: Some(clamp_u32_to_i32(f.width)),
+                        h: Some(clamp_u32_to_i32(f.height)),
+                        ..Default::default()
+                    })
                     .collect();
 
                 // Extract zone from trustedServer params (sent by the JS
@@ -551,20 +554,24 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                build_imp(
-                    slot.id.clone(),
-                    Some(build_banner(formats)),
-                    slot.floor_price,
+                Imp {
+                    id: slot.id.clone(),
+                    banner: Some(Banner {
+                        format: Some(formats),
+                        ..Default::default()
+                    }),
+                    bidfloor: slot.floor_price,
                     // NOTE: Currency is hardcoded to USD. If multi-currency
                     // support is needed, this should come from config or the
                     // AdSlot itself.
-                    slot.floor_price.map(|_| "USD".to_string()),
-                    Some(1), // secure: require HTTPS creatives
-                    Some(slot.id.clone()),
-                    maybe_object_from_serializable(&ImpExt {
+                    bidfloorcur: slot.floor_price.map(|_| "USD".to_string()),
+                    secure: Some(1), // require HTTPS creatives
+                    tagid: Some(slot.id.clone()),
+                    ext: maybe_object_from_serializable(&ImpExt {
                         prebid: PrebidImpExt { bidder },
                     }),
-                )
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -578,13 +585,14 @@ impl PrebidAuctionProvider {
         });
 
         // Build user object with consent string when available
-        let user = Some(build_user(
-            Some(request.user.id.clone()),
-            request.user.consent.clone(),
-            maybe_object_from_serializable(&UserExt {
+        let user = Some(User {
+            id: Some(request.user.id.clone()),
+            consent: request.user.consent.clone(),
+            ext: maybe_object_from_serializable(&UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
-        ));
+            ..Default::default()
+        });
 
         // Extract DNT header and Accept-Language from the original request
         let dnt = context.request.get_header_str("DNT").and_then(|v| {
@@ -610,28 +618,27 @@ impl PrebidAuctionProvider {
         // Forwarding the real client IP is critical: without it PBS infers the
         // IP from the incoming connection (a data-center / edge IP), causing
         // bidders like PubMatic to filter the traffic as non-human.
-        let device = request.device.as_ref().map(|d| {
-            build_device(
-                d.user_agent.clone(),
-                d.ip.clone(),
-                d.geo.as_ref().map(|geo| {
-                    build_geo(
-                        Some(geo.country.clone()),
-                        Some(geo.city.clone()),
-                        geo.region.clone(),
-                        Some(geo.latitude),
-                        Some(geo.longitude),
-                        // DMA/metro code: convert i64 to string for OpenRTB
-                        if geo.metro_code > 0 {
-                            Some(geo.metro_code.to_string())
-                        } else {
-                            None
-                        },
-                    )
-                }),
-                dnt,
-                language,
-            )
+        let device = request.device.as_ref().map(|d| Device {
+            ua: d.user_agent.clone(),
+            ip: d.ip.clone(),
+            geo: d.geo.as_ref().map(|geo| Geo {
+                country: Some(geo.country.clone()),
+                city: Some(geo.city.clone()),
+                region: geo.region.clone(),
+                lat: Some(geo.latitude),
+                lon: Some(geo.longitude),
+                // DMA/metro code: convert i64 to string for OpenRTB
+                metro: if geo.metro_code > 0 {
+                    Some(geo.metro_code.to_string())
+                } else {
+                    None
+                },
+                r#type: Some(2),
+                ..Default::default()
+            }),
+            dnt,
+            language,
+            ..Default::default()
         });
 
         // Build regs object. Set GDPR flag when consent string is present,
@@ -656,7 +663,11 @@ impl PrebidAuctionProvider {
             } else {
                 None
             };
-            Some(build_regs(gdpr, us_privacy, None))
+            Some(Regs {
+                gdpr,
+                us_privacy,
+                ..Default::default()
+            })
         } else {
             None
         };
@@ -697,23 +708,28 @@ impl PrebidAuctionProvider {
             .get_header_str(header::REFERER)
             .map(std::string::ToString::to_string);
 
-        build_openrtb_request(OpenRtbRequestParams {
+        OpenRtbRequest {
             id: request.id.clone(),
             imp: imps,
-            site: Some(build_site(
-                Some(request.publisher.domain.clone()),
-                page_url,
-                referer,
-                Some(build_publisher(Some(request.publisher.domain.clone()))),
-            )),
+            site: Some(Site {
+                domain: Some(request.publisher.domain.clone()),
+                page: page_url,
+                r#ref: referer,
+                publisher: Some(Publisher {
+                    domain: Some(request.publisher.domain.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             user,
             device,
             regs,
             test: self.config.test_mode.then_some(1),
-            tmax: Some(self.config.timeout_ms.min(i32::MAX as u32) as i32),
+            tmax: Some(clamp_u32_to_i32(self.config.timeout_ms)),
             cur: Some(vec!["USD".to_string()]),
             ext,
-        })
+            ..Default::default()
+        }
     }
 
     /// Parse `OpenRTB` response into auction response.
@@ -2051,7 +2067,7 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn test_routes_with_empty_script_patterns() {
+    fn routes_with_empty_script_patterns() {
         let mut config = base_config();
         config.script_patterns = vec![];
         let integration = PrebidIntegration::new(config);
@@ -2062,32 +2078,28 @@ server_url = "https://prebid.example"
         assert_eq!(routes.len(), 0);
     }
 
-    /// Proves that the body-preview truncation in `parse_response` is not
-    /// UTF-8-safe. The production code does:
-    ///
-    ///   `&body_preview[..body_preview.len().min(1000)]`
-    ///
-    /// which is a byte-index slice on a `str`. When byte 1000 lands inside a
-    /// multibyte character, Rust panics at runtime. This test constructs such
-    /// a string and asserts the truncation point is NOT a char boundary—
-    /// proving the bug without actually panicking (which would abort under
-    /// wasm32 `panic = "abort"`).
+    /// Verifies body-preview truncation keeps a UTF-8 char boundary.
     #[test]
-    fn body_preview_truncation_is_not_utf8_safe() {
+    fn body_preview_truncation_is_utf8_safe() {
         // 999 ASCII bytes + U+2603 SNOWMAN (3 bytes: E2 98 83) = 1002 bytes.
         // Byte index 1000 lands on 0x98, the second byte of the snowman.
         let mut body = "x".repeat(999);
         body.push('\u{2603}'); // ☃
         assert_eq!(body.len(), 1002);
 
-        let truncation_index = body.len().min(1000); // = 1000
-
-        // This is the condition that causes `&body[..1000]` to panic.
+        let truncation_index = body.floor_char_boundary(1000);
         assert!(
-            !body.is_char_boundary(truncation_index),
-            "Byte index {} is not a char boundary — the truncation in \
-             parse_response would panic on this input",
-            truncation_index
+            body.is_char_boundary(truncation_index),
+            "should truncate at a valid UTF-8 boundary"
+        );
+        assert_eq!(
+            body[..truncation_index].len(),
+            999,
+            "should drop the partial multibyte character"
+        );
+        assert_eq!(
+            truncation_index, 999,
+            "should step back to the previous char boundary"
         );
     }
 
@@ -2144,17 +2156,12 @@ server_url = "https://prebid.example"
         provider.to_openrtb(request, &context, None)
     }
 
-    fn bidder_params(ortb: &OpenRtbRequest) -> HashMap<String, Json> {
+    fn bidder_params(ortb: &OpenRtbRequest) -> &serde_json::Map<String, Json> {
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let bidder_map = ext
-            .get("prebid")
+        ext.get("prebid")
             .and_then(|p| p.get("bidder"))
             .and_then(|b| b.as_object())
-            .expect("should have prebid.bidder in imp ext");
-        bidder_map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .expect("should have prebid.bidder in imp ext")
     }
 
     // ========================================================================
@@ -2309,7 +2316,8 @@ server_url = "https://prebid.example"
         let request = make_auction_request(vec![slot]);
 
         let ortb = call_to_openrtb(config, &request);
-        let kargo = &bidder_params(&ortb)["kargo"];
+        let params = bidder_params(&ortb);
+        let kargo = &params["kargo"];
         assert_eq!(
             kargo["placementId"], "s2s_header",
             "overridden field should have the zone value"

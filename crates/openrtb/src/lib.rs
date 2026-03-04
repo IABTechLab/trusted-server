@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 pub type Object = Map<String, Value>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BidRequest {
     pub id: String,
     pub imp: Vec<Imp>,
@@ -55,7 +55,7 @@ pub struct BidRequest {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Source {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fd: Option<i32>,
@@ -69,7 +69,7 @@ pub struct Source {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Regs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coppa: Option<i32>,
@@ -85,7 +85,7 @@ pub struct Regs {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Imp {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,7 +134,7 @@ pub struct Imp {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metric {
     #[serde(rename = "type")]
     pub r#type: String,
@@ -145,7 +145,7 @@ pub struct Metric {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Banner {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<Vec<Format>>,
@@ -175,7 +175,7 @@ pub struct Banner {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Video {
     pub mimes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,7 +242,7 @@ pub struct Video {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Audio {
     pub mimes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,7 +299,7 @@ pub struct Audio {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Native {
     pub request: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,7 +312,7 @@ pub struct Native {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Format {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub w: Option<i32>,
@@ -328,7 +328,7 @@ pub struct Format {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pmp {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_auction: Option<i32>,
@@ -338,7 +338,7 @@ pub struct Pmp {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Deal {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -357,7 +357,7 @@ pub struct Deal {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Site {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -395,7 +395,7 @@ pub struct Site {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct App {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -433,7 +433,7 @@ pub struct App {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Dooh {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -455,7 +455,7 @@ pub struct Dooh {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Publisher {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -471,7 +471,7 @@ pub struct Publisher {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Content {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -531,7 +531,7 @@ pub struct Content {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Producer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -547,7 +547,7 @@ pub struct Producer {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Device {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geo: Option<Geo>,
@@ -617,7 +617,7 @@ pub struct Device {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Geo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lat: Option<f64>,
@@ -647,7 +647,7 @@ pub struct Geo {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct User {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -675,7 +675,7 @@ pub struct User {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Data {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -687,7 +687,7 @@ pub struct Data {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Segment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -699,7 +699,7 @@ pub struct Segment {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Network {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -711,7 +711,7 @@ pub struct Network {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Channel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -723,7 +723,7 @@ pub struct Channel {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SupplyChain {
     pub complete: i32,
     pub nodes: Vec<SupplyChainNode>,
@@ -732,7 +732,7 @@ pub struct SupplyChain {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SupplyChainNode {
     pub asi: String,
     pub sid: String,
@@ -747,7 +747,7 @@ pub struct SupplyChainNode {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Eid {
     pub source: String,
     pub uids: Vec<Uid>,
@@ -755,7 +755,7 @@ pub struct Eid {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Uid {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -764,7 +764,7 @@ pub struct Uid {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browsers: Option<Vec<BrandVersion>>,
@@ -784,7 +784,7 @@ pub struct UserAgent {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrandVersion {
     pub brand: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -793,7 +793,7 @@ pub struct BrandVersion {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Qty {
     pub multiplier: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -804,7 +804,7 @@ pub struct Qty {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Refresh {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refsettings: Option<Vec<RefSettings>>,
@@ -814,7 +814,7 @@ pub struct Refresh {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RefSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reftype: Option<i32>,
@@ -824,7 +824,7 @@ pub struct RefSettings {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DurFloors {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mindur: Option<i32>,
@@ -836,7 +836,7 @@ pub struct DurFloors {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BidResponse {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -853,7 +853,7 @@ pub struct BidResponse {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeatBid {
     pub bid: Vec<Bid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -864,7 +864,7 @@ pub struct SeatBid {
     pub ext: Option<Object>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Bid {
     pub id: String,
     pub impid: String,
