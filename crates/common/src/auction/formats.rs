@@ -17,8 +17,8 @@ use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{
-    build_openrtb_bid, build_openrtb_response, build_seat_bid, maybe_object_from_serializable,
-    OpenRtbBidFields, ResponseExt,
+    clamp_u32_to_i32, maybe_object_from_serializable, OpenRtbBid, OpenRtbResponse, ResponseExt,
+    SeatBid,
 };
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -208,7 +208,7 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
-    let mut seatbids = Vec::new();
+    let mut seatbids = Vec::with_capacity(result.winning_bids.len());
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -243,18 +243,23 @@ pub fn convert_to_openrtb_response(
             String::new()
         };
 
-        let openrtb_bid = build_openrtb_bid(OpenRtbBidFields {
+        let openrtb_bid = OpenRtbBid {
             id: format!("{}-{}", bid.bidder, slot_id),
             impid: slot_id.to_string(),
             price,
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
-            width: Some(bid.width),
-            height: Some(bid.height),
+            w: Some(clamp_u32_to_i32(bid.width)),
+            h: Some(clamp_u32_to_i32(bid.height)),
             adomain: Some(bid.adomain.clone().unwrap_or_default()),
-        });
+            ..Default::default()
+        };
 
-        seatbids.push(build_seat_bid(Some(bid.bidder.clone()), vec![openrtb_bid]));
+        seatbids.push(SeatBid {
+            seat: Some(bid.bidder.clone()),
+            bid: vec![openrtb_bid],
+            ..Default::default()
+        });
     }
 
     // Determine strategy name for response metadata
@@ -271,10 +276,10 @@ pub fn convert_to_openrtb_response(
         .map(ProviderSummary::from)
         .collect();
 
-    let response_body = build_openrtb_response(
-        auction_request.id.to_string(),
-        seatbids,
-        maybe_object_from_serializable(&ResponseExt {
+    let response_body = OpenRtbResponse {
+        id: auction_request.id.to_string(),
+        seatbid: Some(seatbids),
+        ext: maybe_object_from_serializable(&ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),
                 providers: result.provider_responses.len(),
@@ -283,7 +288,8 @@ pub fn convert_to_openrtb_response(
                 provider_details,
             },
         }),
-    );
+        ..Default::default()
+    };
 
     let body_bytes =
         serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {
