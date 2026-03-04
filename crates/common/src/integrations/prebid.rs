@@ -24,8 +24,9 @@ use crate::integrations::{
 };
 use crate::openrtb::{
     build_banner, build_device, build_format, build_geo, build_imp, build_openrtb_request,
-    build_regs, build_site, build_user, maybe_object_from_serializable, ImpExt, OpenRtbRequest,
-    PrebidExt, PrebidImpExt, RegsExt, RequestExt, TrustedServerExt, UserExt,
+    build_publisher, build_regs, build_site, build_user, maybe_object_from_serializable, ImpExt,
+    OpenRtbRequest, OpenRtbRequestParams, PrebidExt, PrebidImpExt, RequestExt, TrustedServerExt,
+    UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -553,6 +554,10 @@ impl PrebidAuctionProvider {
                 build_imp(
                     slot.id.clone(),
                     Some(build_banner(formats)),
+                    slot.floor_price,
+                    slot.floor_price.map(|_| "USD".to_string()),
+                    Some(1), // secure: require HTTPS creatives
+                    Some(slot.id.clone()),
                     maybe_object_from_serializable(&ImpExt {
                         prebid: PrebidImpExt { bidder },
                     }),
@@ -569,15 +574,36 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object
+        // Build user object with consent string when available
         let user = Some(build_user(
             Some(request.user.id.clone()),
+            request.user.consent.clone(),
             maybe_object_from_serializable(&UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
         ));
 
-        // Build device object with user-agent, client IP, and geo if available.
+        // Extract DNT header and Accept-Language from the original request
+        let dnt = context.request.get_header_str("DNT").and_then(|v| {
+            if v.trim() == "1" {
+                Some(1)
+            } else {
+                None
+            }
+        });
+
+        let language = context
+            .request
+            .get_header_str(header::ACCEPT_LANGUAGE)
+            .and_then(|v| {
+                // Extract the primary language tag (e.g., "en" from "en-US,en;q=0.9")
+                v.split(',')
+                    .next()
+                    .and_then(|tag| tag.split(';').next())
+                    .map(|tag| tag.trim().to_string())
+            });
+
+        // Build device object with user-agent, client IP, geo, DNT, and language.
         // Forwarding the real client IP is critical: without it PBS infers the
         // IP from the incoming connection (a data-center / edge IP), causing
         // bidders like PubMatic to filter the traffic as non-human.
@@ -590,16 +616,34 @@ impl PrebidAuctionProvider {
                         Some(geo.country.clone()),
                         Some(geo.city.clone()),
                         geo.region.clone(),
+                        Some(geo.latitude),
+                        Some(geo.longitude),
+                        // DMA/metro code: convert i64 to string for OpenRTB
+                        if geo.metro_code > 0 {
+                            Some(geo.metro_code.to_string())
+                        } else {
+                            None
+                        },
                     )
                 }),
+                dnt,
+                language.clone(),
             )
         });
 
-        // Build regs object if Sec-GPC header is present
-        let regs = if context.request.get_header("Sec-GPC").is_some() {
-            Some(build_regs(maybe_object_from_serializable(&RegsExt {
-                us_privacy: Some("1YYN".to_string()),
-            })))
+        // Build regs object. Set GDPR flag when consent string is present,
+        // and us_privacy when Sec-GPC header signals opt-out.
+        let has_consent = request.user.consent.is_some();
+        let has_gpc = context.request.get_header("Sec-GPC").is_some();
+
+        let regs = if has_consent || has_gpc {
+            let gdpr = if has_consent { Some(1) } else { None };
+            let us_privacy = if has_gpc {
+                Some("1YYN".to_string())
+            } else {
+                None
+            };
+            Some(build_regs(gdpr, us_privacy, None))
         } else {
             None
         };
@@ -634,16 +678,29 @@ impl PrebidAuctionProvider {
             }),
         });
 
-        build_openrtb_request(
-            request.id.clone(),
-            imps,
-            Some(build_site(Some(request.publisher.domain.clone()), page_url)),
+        // Extract Referer header for site.ref
+        let referer = context
+            .request
+            .get_header_str(header::REFERER)
+            .map(std::string::ToString::to_string);
+
+        build_openrtb_request(OpenRtbRequestParams {
+            id: request.id.clone(),
+            imp: imps,
+            site: Some(build_site(
+                Some(request.publisher.domain.clone()),
+                page_url,
+                referer,
+                Some(build_publisher(Some(request.publisher.domain.clone()))),
+            )),
             user,
             device,
             regs,
-            self.config.test_mode.then_some(1),
+            test: self.config.test_mode.then_some(1),
+            tmax: Some(self.config.timeout_ms.min(i32::MAX as u32) as i32),
+            cur: Some(vec!["USD".to_string()]),
             ext,
-        )
+        })
     }
 
     /// Parse `OpenRTB` response into auction response.
@@ -1489,15 +1546,17 @@ server_url = "https://prebid.example"
         let prebid_ext = openrtb
             .ext
             .as_ref()
-            .and_then(|ext| ext.prebid.as_ref())
+            .and_then(|ext| ext.get("prebid"))
             .expect("should include ext.prebid");
         assert_eq!(
-            prebid_ext.debug,
+            prebid_ext.get("debug").and_then(serde_json::Value::as_bool),
             Some(true),
             "should include ext.prebid.debug when debug is enabled"
         );
         assert_eq!(
-            prebid_ext.returnallbidstatus,
+            prebid_ext
+                .get("returnallbidstatus")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "should include ext.prebid.returnallbidstatus when debug is enabled"
         );
@@ -1596,14 +1655,16 @@ server_url = "https://prebid.example"
         let prebid_ext = openrtb
             .ext
             .as_ref()
-            .and_then(|ext| ext.prebid.as_ref())
+            .and_then(|ext| ext.get("prebid"))
             .expect("should include ext.prebid");
         assert_eq!(
-            prebid_ext.debug, None,
+            prebid_ext.get("debug"),
+            None,
             "should omit ext.prebid.debug when debug is disabled"
         );
         assert_eq!(
-            prebid_ext.returnallbidstatus, None,
+            prebid_ext.get("returnallbidstatus"),
+            None,
             "should omit ext.prebid.returnallbidstatus when debug is disabled"
         );
 
@@ -1775,13 +1836,17 @@ server_url = "https://prebid.example"
         provider.to_openrtb(request, &context, None)
     }
 
-    fn bidder_params(ortb: &OpenRtbRequest) -> &HashMap<String, Json> {
-        &ortb.imp[0]
-            .ext
-            .as_ref()
-            .expect("should have imp ext")
-            .prebid
-            .bidder
+    fn bidder_params(ortb: &OpenRtbRequest) -> HashMap<String, Json> {
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let bidder_map = ext
+            .get("prebid")
+            .and_then(|p| p.get("bidder"))
+            .and_then(|b| b.as_object())
+            .expect("should have prebid.bidder in imp ext");
+        bidder_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     // ========================================================================
