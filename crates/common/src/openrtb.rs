@@ -370,12 +370,6 @@ pub struct UserExt {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RegsExt {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub us_privacy: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct RequestExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prebid: Option<PrebidExt>,

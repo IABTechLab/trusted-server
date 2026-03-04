@@ -555,6 +555,9 @@ impl PrebidAuctionProvider {
                     slot.id.clone(),
                     Some(build_banner(formats)),
                     slot.floor_price,
+                    // NOTE: Currency is hardcoded to USD. If multi-currency
+                    // support is needed, this should come from config or the
+                    // AdSlot itself.
                     slot.floor_price.map(|_| "USD".to_string()),
                     Some(1), // secure: require HTTPS creatives
                     Some(slot.id.clone()),
@@ -627,14 +630,24 @@ impl PrebidAuctionProvider {
                     )
                 }),
                 dnt,
-                language.clone(),
+                language,
             )
         });
 
         // Build regs object. Set GDPR flag when consent string is present,
         // and us_privacy when Sec-GPC header signals opt-out.
+        //
+        // NOTE: Setting gdpr=1 whenever a TCF consent string exists is the
+        // conservative approach — it may reduce fill for non-EU traffic where
+        // a CMP sets a consent string regardless of jurisdiction. A more
+        // precise approach would derive GDPR applicability from the consent
+        // string itself (segment 0 encodes `isSubjectToGDPR`) or from user
+        // geo (EU/EEA country check).
         let has_consent = request.user.consent.is_some();
-        let has_gpc = context.request.get_header("Sec-GPC").is_some();
+        let has_gpc = context
+            .request
+            .get_header_str("Sec-GPC")
+            .is_some_and(|v| v.trim() == "1");
 
         let regs = if has_consent || has_gpc {
             let gdpr = if has_consent { Some(1) } else { None };
@@ -1684,6 +1697,301 @@ server_url = "https://prebid.example"
         assert!(
             !prebid.contains_key("returnallbidstatus"),
             "should not serialize ext.prebid.returnallbidstatus when debug is disabled"
+        );
+    }
+
+    // ========================================================================
+    // OpenRTB field enrichment tests
+    // ========================================================================
+
+    #[test]
+    fn to_openrtb_sets_bidfloor_from_slot_floor_price() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.slots[0].floor_price = Some(1.5);
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let imp = &openrtb.imp[0];
+
+        assert_eq!(imp.bidfloor, Some(1.5), "should set bidfloor from slot");
+        assert_eq!(
+            imp.bidfloorcur.as_deref(),
+            Some("USD"),
+            "should set bidfloorcur when floor is present"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_bidfloor_when_no_floor_price() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request(); // floor_price is None
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let imp = &openrtb.imp[0];
+
+        assert_eq!(imp.bidfloor, None, "should omit bidfloor when not set");
+        assert_eq!(
+            imp.bidfloorcur, None,
+            "should omit bidfloorcur when floor not set"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_secure_and_tagid() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let imp = &openrtb.imp[0];
+
+        assert_eq!(imp.secure, Some(1), "should require HTTPS creatives");
+        assert_eq!(
+            imp.tagid.as_deref(),
+            Some("slot-1"),
+            "should set tagid from slot id"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_includes_consent_and_gdpr_flag() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.user.as_ref().and_then(|u| u.consent.as_deref()),
+            Some("BOtest-consent-string"),
+            "should forward consent string to user.consent"
+        );
+        assert_eq!(
+            openrtb.regs.as_ref().and_then(|r| r.gdpr),
+            Some(1),
+            "should set regs.gdpr when consent is present"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_regs_when_no_consent_or_gpc() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request(); // consent=None
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert!(openrtb.regs.is_none(), "should omit regs entirely");
+    }
+
+    #[test]
+    fn to_openrtb_sets_gpc_us_privacy() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("Sec-GPC", "1");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let regs = openrtb.regs.as_ref().expect("should have regs");
+
+        assert_eq!(
+            regs.us_privacy.as_deref(),
+            Some("1YYN"),
+            "should set us_privacy from Sec-GPC: 1"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_ignores_gpc_header_with_non_one_value() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("Sec-GPC", "0");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert!(
+            openrtb.regs.is_none(),
+            "should not set regs when Sec-GPC is not '1'"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_dnt_from_header() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: None,
+        });
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("DNT", "1");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let device = openrtb.device.as_ref().expect("should have device");
+
+        assert_eq!(device.dnt, Some(1), "should set dnt from DNT header");
+    }
+
+    #[test]
+    fn to_openrtb_sets_language_from_accept_language() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: None,
+        });
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("Accept-Language", "en-US,en;q=0.9,fr;q=0.8");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let device = openrtb.device.as_ref().expect("should have device");
+
+        assert_eq!(
+            device.language.as_deref(),
+            Some("en-US"),
+            "should extract primary language tag"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_geo_lat_lon_metro() {
+        use crate::geo::GeoInfo;
+
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: Some("1.2.3.4".to_string()),
+            geo: Some(GeoInfo {
+                city: "New York".to_string(),
+                country: "US".to_string(),
+                continent: "NA".to_string(),
+                latitude: 40.7128,
+                longitude: -74.006,
+                metro_code: 501,
+                region: Some("NY".to_string()),
+            }),
+        });
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let geo = openrtb
+            .device
+            .as_ref()
+            .and_then(|d| d.geo.as_ref())
+            .expect("should have geo");
+
+        assert_eq!(geo.lat, Some(40.7128), "should set latitude");
+        assert_eq!(geo.lon, Some(-74.006), "should set longitude");
+        assert_eq!(
+            geo.metro.as_deref(),
+            Some("501"),
+            "should set metro (DMA code)"
+        );
+        assert_eq!(geo.country.as_deref(), Some("US"));
+        assert_eq!(geo.city.as_deref(), Some("New York"));
+        assert_eq!(geo.region.as_deref(), Some("NY"));
+    }
+
+    #[test]
+    fn to_openrtb_sets_tmax_and_cur() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.tmax,
+            Some(1000),
+            "should set tmax from config timeout_ms"
+        );
+        assert_eq!(
+            openrtb.cur.as_deref(),
+            Some(&["USD".to_string()][..]),
+            "should set cur to USD"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_site_ref_from_referer_header() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("Referer", "https://google.com/search?q=test");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let site = openrtb.site.as_ref().expect("should have site");
+
+        assert_eq!(
+            site.r#ref.as_deref(),
+            Some("https://google.com/search?q=test"),
+            "should set site.ref from Referer header"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_site_publisher() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let publisher = openrtb
+            .site
+            .as_ref()
+            .and_then(|s| s.publisher.as_ref())
+            .expect("should have site.publisher");
+
+        assert_eq!(
+            publisher.domain.as_deref(),
+            Some("pub.example"),
+            "should set publisher domain"
         );
     }
 
