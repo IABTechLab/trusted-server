@@ -47,7 +47,7 @@ chacha20poly1305 = "0.10"
 chrono = "0.4.44"
 config = "0.15.19"
 cookie = "0.18.1"
-derive_more = { version = "2.0", features = ["display", "error"] }
+derive_more = { version = "2.1", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 error-stack = "0.6"
 fastly = "0.11.12"
