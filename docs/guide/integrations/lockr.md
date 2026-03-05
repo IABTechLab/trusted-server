@@ -1,267 +1,105 @@
 # Lockr Integration
 
-**Category**: Identity
+**Category**: Identity / Data Collection
 **Status**: Production
-**Type**: Identity Management & Privacy Vault
+**Type**: Proxy + Attribute Rewriter
 
 ## Overview
 
-The Lockr integration enables first-party identity resolution and privacy-compliant data management through Lockr's identity vault platform. This integration provides secure, consented identity synchronization while maintaining GDPR compliance.
+The Lockr integration serves Lockr's SDK and API through first-party routes. It has two main goals:
 
-## What is Lockr?
+1. Rewrite Lockr SDK URLs in HTML so browsers load the SDK from your domain.
+2. Proxy Lockr API calls through Trusted Server instead of calling Lockr directly from the page.
 
-Lockr is an identity resolution and privacy platform that helps publishers manage user identities across fragmented environments (cookieless browsers, multiple devices, etc.) while respecting user privacy and consent.
-
-**Key Capabilities**:
-
-- Privacy-preserving identity graphs
-- Consent-based data sharing
-- Secure identity vault
-- Cross-device user recognition
-- Publisher-owned identity infrastructure
-
-## How It Works
-
-```
-┌──────────────────────────────────────────────────┐
-│  User Visit                                      │
-│  ↓                                               │
-│  Trusted Server generates Synthetic ID           │
-│  ↓                                               │
-│  Lockr Integration maps to Lockr Identity        │
-│  ↓                                               │
-│  Identity synchronized (with consent)            │
-│  ↓                                               │
-│  Lockr ID added to bid requests (user.ext.eids) │
-└──────────────────────────────────────────────────┘
-```
+This integration currently focuses on transport and routing. It does **not** inject OpenRTB EIDs or run a dedicated identity-sync endpoint.
 
 ## Configuration
-
-Add Lockr configuration to `trusted-server.toml`:
 
 ```toml
 [integrations.lockr]
 enabled = true
-api_endpoint = "https://api.lockr.io"
-organization_id = "your-org-id"
-project_id = "your-project-id"
+app_id = "your-lockr-app-id"
+
+# Optional overrides
+api_endpoint = "https://identity.lockr.kr"
+sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+rewrite_sdk_host = true
+# origin_override = "https://www.example.com"
 ```
 
 ### Configuration Options
 
-| Field             | Type    | Required | Description                                   |
-| ----------------- | ------- | -------- | --------------------------------------------- |
-| `enabled`         | boolean | No       | Enable/disable integration (default: `false`) |
-| `api_endpoint`    | string  | Yes      | Lockr API endpoint URL                        |
-| `organization_id` | string  | Yes      | Your Lockr organization ID                    |
-| `project_id`      | string  | Yes      | Your Lockr project ID                         |
+| Field               | Type    | Default                                     | Description                                            |
+| ------------------- | ------- | ------------------------------------------- | ------------------------------------------------------ |
+| `enabled`           | boolean | `true`                                      | Enable/disable the integration                         |
+| `app_id`            | string  | Required                                    | Lockr app identifier (required by config validation)   |
+| `api_endpoint`      | string  | `https://identity.lockr.kr`                 | Upstream Lockr API base URL                            |
+| `sdk_url`           | string  | `https://aim.loc.kr/identity-lockr-v1.0.js` | Upstream Lockr SDK URL                                 |
+| `cache_ttl_seconds` | integer | `3600`                                      | Cache TTL for proxied SDK response                     |
+| `rewrite_sdk`       | boolean | `true`                                      | Rewrite Lockr SDK script URLs in HTML                  |
+| `rewrite_sdk_host`  | boolean | `true`                                      | Rewrite obfuscated host assignment inside the SDK body |
+| `origin_override`   | string  | `None`                                      | Optional `Origin` override forwarded to Lockr API      |
 
-### Environment Variables
+## Routes
 
-```bash
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__API_ENDPOINT=https://api.lockr.io
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__ORGANIZATION_ID=your-org-id
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__PROJECT_ID=your-project-id
-```
+When enabled, Lockr registers these first-party routes:
 
-## Features
+- `GET /integrations/lockr/sdk`
+  - Fetches the SDK from `sdk_url`
+  - Optionally rewrites the SDK host assignment to `/integrations/lockr/api`
+  - Returns JavaScript with cache headers
 
-### Identity Synchronization
+- `GET /integrations/lockr/api/*`
+- `POST /integrations/lockr/api/*`
+  - Proxies requests to `api_endpoint` with the same path suffix and query string
+  - Forwards common request headers and custom `X-*` headers (excluding TS-internal headers)
 
-Lockr integration automatically syncs Trusted Server synthetic IDs with Lockr's identity vault:
+## HTML Rewriting
 
-1. User visits site (Trusted Server generates synthetic ID)
-2. If GDPR consent granted, sync with Lockr
-3. Lockr returns unified identity
-4. Identity available for bid requests and analytics
+If `rewrite_sdk = true`, the integration rewrites Lockr SDK URLs in `src` and `href` attributes to:
 
-### Privacy Vault
+`https://{request_host}/integrations/lockr/sdk`
 
-User data is stored securely in Lockr's privacy vault:
+This allows pages to load Lockr from your first-party domain.
 
-- Encrypted at rest
-- Consent-based access
-- User right to erasure
-- Data portability support
+## SDK Host Rewriting
 
-### Extended ID (EID) Support
+If `rewrite_sdk_host = true`, Trusted Server rewrites the obfuscated host expression inside the SDK body to:
 
-Lockr identities are injected into OpenRTB bid requests as Extended Identifiers:
+`'host': '/integrations/lockr/api'`
 
-```json
-{
-  "user": {
-    "ext": {
-      "eids": [
-        {
-          "source": "lockr.io",
-          "uids": [
-            {
-              "id": "lockr-user-id-123",
-              "atype": 1
-            }
-          ]
-        }
-      ]
-    }
-  }
-}
-```
+That keeps SDK API traffic on the first-party route automatically.
 
-## Use Cases
+## Example Flow
 
-### 1. Cookieless Identity Resolution
-
-**Problem**: Safari and Firefox block third-party cookies, fragmenting user identity.
-
-**Solution**: Lockr provides first-party identity resolution that works across cookieless environments.
-
-**Benefit**: Maintain user recognition and monetization in privacy-focused browsers.
-
-### 2. Cross-Device User Recognition
-
-**Problem**: Users access content from multiple devices, appearing as different users.
-
-**Solution**: Lockr's identity graph links devices to a unified user profile.
-
-**Benefit**: Better audience targeting and frequency capping across devices.
-
-### 3. Privacy-Compliant Data Sharing
-
-**Problem**: Sharing user data with partners raises GDPR/CCPA compliance risks.
-
-**Solution**: Lockr enforces consent-based access to identity data.
-
-**Benefit**: Compliant data monetization without regulatory risk.
-
-## Implementation Details
-
-The Lockr integration is implemented in [crates/common/src/integrations/lockr.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/lockr.rs).
-
-### Key Components
-
-**Identity Sync Endpoint**:
-
-- Route: `/integrations/lockr/sync`
-- Method: POST
-- Purpose: Synchronize synthetic ID with Lockr vault
-
-**ID Mapping**:
-
-- Maps Trusted Server synthetic ID → Lockr unified ID
-- Cached for performance
-- Respects consent status
-
-**Consent Validation**:
-
-- Checks GDPR consent before syncing
-- Integrates with CMP (e.g., Didomi)
-- Respects user withdrawal of consent
-
-## Best Practices
-
-### 1. Consent First
-
-Always validate consent before initiating Lockr sync:
-
-```rust
-if !has_gdpr_consent() {
-    return; // Skip Lockr sync
-}
-```
-
-### 2. Cache Lockr IDs
-
-Cache Lockr identity mappings to reduce API calls:
-
-- TTL: 24 hours recommended
-- Invalidate on consent withdrawal
-- Use KV store for persistence
-
-### 3. Monitor Sync Rate
-
-Track Lockr sync success/failure rates:
-
-- Alert on elevated failures
-- Monitor API latency
-- Track consent decline impact
-
-### 4. Test Identity Flow
-
-Validate end-to-end identity flow:
-
-```bash
-# 1. Generate synthetic ID
-curl https://edge.example.com/
-
-# 2. Verify Lockr sync (check logs)
-# 3. Validate EID in bid request
-```
+1. Page includes Lockr SDK URL.
+2. HTML rewriter swaps it to `/integrations/lockr/sdk`.
+3. Browser requests first-party SDK endpoint.
+4. Trusted Server fetches upstream SDK, optionally rewrites host, and serves it.
+5. SDK API calls go to `/integrations/lockr/api/*`.
+6. Trusted Server proxies those API requests to Lockr upstream.
 
 ## Troubleshooting
 
-### Lockr Sync Fails
+### SDK URL not rewritten
 
-**Symptoms**:
+- Ensure `rewrite_sdk = true`.
+- Confirm the page uses a Lockr SDK URL pattern the integration recognizes.
+- Verify the Lockr integration is enabled.
 
-- No Lockr ID in bid requests
-- Sync endpoint returns errors
+### API requests do not reach Lockr
 
-**Solutions**:
+- Confirm calls target `/integrations/lockr/api/*`.
+- Verify `api_endpoint` is reachable from the edge.
+- If Lockr rejects origin, set `origin_override`.
 
-- Verify `organization_id` and `project_id` are correct
-- Check Lockr API endpoint is reachable
-- Ensure GDPR consent is granted
-- Review Lockr API credentials
+### SDK loads but still calls third-party host
 
-### Missing EID in Bid Requests
+- Ensure `rewrite_sdk_host = true`.
+- Check response header `X-Lockr-Host-Rewritten` on `/integrations/lockr/sdk`.
 
-**Symptoms**:
+## Implementation
 
-- Lockr sync succeeds but EID missing from OpenRTB
-
-**Solutions**:
-
-- Verify OpenRTB request builder includes `user.ext.eids`
-- Check integration is registered in IntegrationRegistry
-- Ensure `contribute_eids()` method is implemented
-
-## Performance
-
-### Typical Latency
-
-- Identity sync: 50-100ms
-- Cached lookup: <5ms
-- API timeout: 500ms (configurable)
-
-### Optimization Tips
-
-- Enable caching for repeat visitors
-- Batch sync operations when possible
-- Use async/non-blocking sync
-- Monitor API quota usage
-
-## Security Considerations
-
-### API Credentials
-
-- Store Lockr credentials in secret management system
-- Rotate credentials periodically
-- Never commit credentials to git
-- Use environment variables in production
-
-### Data Privacy
-
-- Only sync with explicit user consent
-- Implement right to erasure
-- Audit data access logs
-- Encrypt data in transit (HTTPS)
-
-## Next Steps
-
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for identity generation
-- Review [GDPR Compliance](/guide/gdpr-compliance) for consent management
-- Explore [Didomi Integration](/guide/integrations/didomi) for CMP integration
-- Check [Configuration Reference](/guide/configuration) for advanced options
+See `crates/common/src/integrations/lockr.rs` for the full implementation.

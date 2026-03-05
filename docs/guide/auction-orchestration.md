@@ -101,7 +101,7 @@ sequenceDiagram
 
       APS-->>Orch: AuctionResponse<br/>(APS bids)
     and
-      Orch->>Prebid: POST /openrtb2/auction<br/>OpenRTB 2.x format
+      Orch->>Prebid: POST /openrtb2/auction<br/>OpenRTB 2.6 format
       Note right of Orch: { "id": "request",<br/>  "imp": [{ "id": "header-banner",<br/>    "banner": { "w": 728, "h": 90 } }] }
 
       Prebid->>Mock: OpenRTB request
@@ -191,7 +191,7 @@ AuctionOrchestrator.run_auction()
   └─[parallel_mediation]─── Forward all bids to mediator for final selection
   │
   ▼
-Convert OrchestrationResult → OpenRTB 2.x Response
+Convert OrchestrationResult → OpenRTB 2.6 Response
   │
   ├─ Rewrite creative HTML with first-party proxy URLs
   ├─ Add ext.orchestrator metadata
@@ -326,7 +326,7 @@ This split enables true parallel execution: all requests launch first, then the 
 
 ### Prebid Provider
 
-Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid Server instance.
+Transforms auction requests into OpenRTB 2.6 format and sends them to a Prebid Server instance.
 
 **Request transformation:**
 
@@ -432,7 +432,7 @@ pub struct AuctionRequest {
     pub user: UserInfo,                                // Synthetic ID, fresh ID, consent
     pub device: Option<DeviceInfo>,                    // UA, IP, geo
     pub site: Option<SiteInfo>,                        // Domain, page
-    pub context: HashMap<String, serde_json::Value>,   // Additional metadata
+    pub context: HashMap<String, ContextValue>,         // Additional metadata
 }
 ```
 
@@ -516,7 +516,7 @@ The `POST /auction` endpoint accepts a Prebid.js-compatible `AdRequest`:
 }
 ```
 
-### Response Format (OpenRTB 2.x)
+### Response Format (OpenRTB 2.6)
 
 Auction results are returned in standard OpenRTB format with an `ext.orchestrator` metadata block:
 
@@ -589,11 +589,11 @@ timeout_ms = 2000
 
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.example.com"
+server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon"]
-auto_configure = true
 debug = false
+script_patterns = ["/prebid.js", "/prebid.min.js"]
 
 [integrations.aps]
 enabled = true
@@ -621,15 +621,15 @@ price_floor = 0.50
 
 #### `[integrations.prebid]`
 
-| Field            | Type     | Default           | Description                                                                            |
-| ---------------- | -------- | ----------------- | -------------------------------------------------------------------------------------- |
-| `enabled`        | bool     | `true`            | Enable Prebid provider                                                                 |
-| `server_url`     | string   | —                 | Prebid Server URL (required)                                                           |
-| `timeout_ms`     | u32      | `1000`            | Request timeout                                                                        |
-| `bidders`        | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                            |
-| `auto_configure` | bool     | `true`            | Auto-remove client-side prebid.js scripts                                              |
-| `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
-| `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
+| Field             | Type     | Default           | Description                                                                            |
+| ----------------- | -------- | ----------------- | -------------------------------------------------------------------------------------- |
+| `enabled`         | bool     | `true`            | Enable Prebid provider                                                                 |
+| `server_url`      | string   | —                 | Prebid Server URL (required)                                                           |
+| `timeout_ms`      | u32      | `1000`            | Request timeout                                                                        |
+| `bidders`         | string[] | `["mocktioneer"]` | Default bidders when not specified per-slot                                            |
+| `debug`           | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
+| `test_mode`       | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
+| `script_patterns` | string[] | Prebid defaults   | Script paths to intercept and replace with a no-op script                              |
 
 #### `[integrations.aps]`
 
@@ -676,7 +676,7 @@ TRUSTED_SERVER__AUCTION__ENABLED=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=prebid,aps
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://pbs.example.com
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://pbs.example.com/openrtb2/auction
 TRUSTED_SERVER__INTEGRATIONS__APS__PUB_ID=5128
 ```
 
