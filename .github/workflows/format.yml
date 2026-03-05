@@ -32,6 +32,9 @@ jobs:
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
