@@ -10,7 +10,7 @@ path = "tests/integration.rs"
 harness = true
 
 [dev-dependencies]
-testcontainers = "0.25"
+testcontainers = { version = "0.25", features = ["blocking"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 scraper = "0.21"
 tempfile = "3.0"

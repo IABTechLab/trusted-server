@@ -1,6 +1,7 @@
-use error_stack::{Result, ResultExt};
+use error_stack::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 /// Test error types (platform-agnostic)
 #[derive(Debug, derive_more::Display)]
@@ -71,10 +72,33 @@ pub enum TestError {
 
 impl core::error::Error for TestError {}
 
-/// Configuration for runtime environments
+/// Configuration for runtime environments.
+///
+/// Holds the temp file so the config is not deleted while the runtime is alive.
 pub struct RuntimeConfig {
-    pub config_path: PathBuf,
-    pub wasm_path: PathBuf,
+    /// Handle to the temp config file — dropped when `RuntimeConfig` is dropped.
+    _config_file: NamedTempFile,
+    wasm_path: PathBuf,
+}
+
+impl RuntimeConfig {
+    /// Create a new runtime configuration from a temp file and WASM binary path.
+    pub fn new(config_file: NamedTempFile, wasm_path: PathBuf) -> Self {
+        Self {
+            _config_file: config_file,
+            wasm_path,
+        }
+    }
+
+    /// Path to the generated config file on disk.
+    pub fn config_path(&self) -> &Path {
+        self._config_file.path()
+    }
+
+    /// Path to the WASM binary.
+    pub fn wasm_path(&self) -> &Path {
+        &self.wasm_path
+    }
 }
 
 /// Platform-agnostic process handle

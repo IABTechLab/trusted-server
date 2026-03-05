@@ -1,32 +1,32 @@
 use super::runtime::TestError;
-use error_stack::{Result, ResultExt};
+use error_stack::Result;
 use scraper::{Html, Selector};
 
-/// Assert that HTML contains script tag with expected tsjs module reference
+/// Parse a CSS selector, mapping the error to [`TestError::InvalidSelector`]
+fn parse_selector(selector: &str) -> Result<Selector, TestError> {
+    Selector::parse(selector).map_err(|_| error_stack::report!(TestError::InvalidSelector))
+}
+
+/// Assert that HTML contains a script tag with expected tsjs module reference.
+///
+/// Looks for `<script src="/static/tsjs=core,prebid,...">` and verifies
+/// all expected modules are present in the URL.
 ///
 /// # Errors
 ///
-/// Returns [`TestError::ScriptTagNotFound`] if no matching script tag exists
-/// Returns [`TestError::MissingModule`] if expected module ID is not found
+/// Returns [`TestError::ScriptTagNotFound`] if no matching script tag exists.
+/// Returns [`TestError::MissingModule`] if an expected module ID is absent.
 pub fn assert_script_tag_present(html: &str, expected_modules: &[&str]) -> Result<(), TestError> {
     let document = Html::parse_document(html);
-
-    // Find script tags with src attribute containing /static/tsjs=
-    let selector = Selector::parse("script[src*='/static/tsjs=']")
-        .change_context(TestError::InvalidSelector)?;
-
-    let mut found_script = false;
+    let selector = parse_selector("script[src*='/static/tsjs=']")?;
 
     for element in document.select(&selector) {
         if let Some(src) = element.value().attr("src") {
-            found_script = true;
-
-            // Extract module IDs from URL query parameter
+            // Extract module IDs from URL path segment
             // Expected format: /static/tsjs=core,prebid,lockr
             if let Some(query_part) = src.split("tsjs=").nth(1) {
                 let modules: Vec<&str> = query_part.split(',').collect();
 
-                // Verify all expected modules are present
                 for expected in expected_modules {
                     if !modules.contains(expected) {
                         return Err(error_stack::report!(TestError::MissingModule {
@@ -40,44 +40,31 @@ pub fn assert_script_tag_present(html: &str, expected_modules: &[&str]) -> Resul
         }
     }
 
-    if !found_script {
-        return Err(error_stack::report!(TestError::ScriptTagNotFound));
-    }
-
-    Ok(())
+    Err(error_stack::report!(TestError::ScriptTagNotFound))
 }
 
-/// Assert that HTML attributes are rewritten with expected prefix
+/// Assert that HTML attributes matching a selector are rewritten with expected prefix.
 ///
-/// Verifies that the trusted-server correctly rewrites attributes like href, src, srcset
+/// Verifies that the trusted-server correctly rewrites attributes (e.g. `href`, `src`)
 /// to use the first-party proxy endpoint.
-///
-/// # Arguments
-///
-/// * `html` - HTML content to parse
-/// * `selector` - CSS selector to find target elements (e.g., "a[href]", "img[src]")
-/// * `attr_name` - Attribute name to check (e.g., "href", "src", "srcset")
-/// * `expected_prefix` - Expected URL prefix after rewriting (e.g., "/first-party/proxy?url=")
 ///
 /// # Errors
 ///
-/// Returns [`TestError::InvalidSelector`] if CSS selector is malformed
-/// Returns [`TestError::ElementNotFound`] if no matching elements exist
-/// Returns [`TestError::AttributeNotRewritten`] if attribute doesn't have expected prefix
+/// Returns [`TestError::InvalidSelector`] if CSS selector is malformed.
+/// Returns [`TestError::ElementNotFound`] if no matching elements exist.
+/// Returns [`TestError::AttributeNotRewritten`] if attribute does not have expected prefix.
 pub fn assert_attribute_rewritten(
     html: &str,
-    selector: &str,
+    css_selector: &str,
     attr_name: &str,
     expected_prefix: &str,
 ) -> Result<(), TestError> {
     let document = Html::parse_document(html);
-
-    let parsed_selector =
-        Selector::parse(selector).change_context(TestError::InvalidSelector)?;
+    let selector = parse_selector(css_selector)?;
 
     let mut found_element = false;
 
-    for element in document.select(&parsed_selector) {
+    for element in document.select(&selector) {
         if let Some(attr_value) = element.value().attr(attr_name) {
             found_element = true;
 
@@ -94,99 +81,85 @@ pub fn assert_attribute_rewritten(
     Ok(())
 }
 
-/// Assert that HTTP response contains GDPR consent signal
+/// Assert that an HTTP response body contains GDPR consent signals.
 ///
-/// Verifies that the trusted-server correctly propagates GDPR consent signals
-/// in response headers or body.
+/// Checks for GDPR signal presence in the response body text. The trusted-server
+/// may embed GDPR state in injected scripts or propagate consent via response content.
 ///
 /// # Errors
 ///
-/// Returns [`TestError::GdprSignalMissing`] if no GDPR signal is found
-pub fn assert_gdpr_signal(response: &reqwest::blocking::Response) -> Result<(), TestError> {
-    // Check for GDPR signal in headers
-    // The trusted-server sets X-GDPR-Consent header when GDPR applies
-    if response.headers().contains_key("X-GDPR-Consent") {
+/// Returns [`TestError::GdprSignalMissing`] if no GDPR signal is found.
+pub fn assert_gdpr_signal_in_body(body: &str) -> Result<(), TestError> {
+    if body.contains("gdprApplies") || body.contains("gdpr_consent") || body.contains("__tcfapi") {
         return Ok(());
-    }
-
-    // Alternative: Check for GDPR signal in response body
-    // Some integrations may embed GDPR state in the injected script
-    if let Ok(body) = response.text() {
-        if body.contains("gdprApplies") || body.contains("gdpr_consent") {
-            return Ok(());
-        }
     }
 
     Err(error_stack::report!(TestError::GdprSignalMissing))
 }
 
-/// Assert that HTML contains expected number of elements matching selector
+/// Assert that HTML contains expected number of elements matching a selector.
 ///
 /// # Errors
 ///
-/// Returns [`TestError::InvalidSelector`] if CSS selector is malformed
+/// Returns [`TestError::InvalidSelector`] if CSS selector is malformed.
+/// Returns [`TestError::ElementNotFound`] if actual count differs from expected.
 pub fn assert_element_count(
     html: &str,
-    selector: &str,
+    css_selector: &str,
     expected_count: usize,
 ) -> Result<(), TestError> {
     let document = Html::parse_document(html);
+    let selector = parse_selector(css_selector)?;
 
-    let parsed_selector =
-        Selector::parse(selector).change_context(TestError::InvalidSelector)?;
-
-    let actual_count = document.select(&parsed_selector).count();
+    let actual_count = document.select(&selector).count();
 
     if actual_count != expected_count {
-        return Err(error_stack::report!(TestError::ElementNotFound).attach_printable(
-            format!(
+        return Err(
+            error_stack::report!(TestError::ElementNotFound).attach_printable(format!(
                 "Expected {} elements matching '{}', found {}",
-                expected_count, selector, actual_count
-            ),
-        ));
+                expected_count, css_selector, actual_count
+            )),
+        );
     }
 
     Ok(())
 }
 
-/// Assert that script tag is injected at the start of `<head>`
+/// Assert that the tsjs script tag is injected at the start of `<head>`.
 ///
-/// This verifies the HTML processor correctly positions the script tag
-/// to ensure early execution before other scripts.
+/// Verifies the HTML processor positions the script tag before other elements
+/// to ensure early execution.
 ///
 /// # Errors
 ///
-/// Returns [`TestError::ScriptTagNotFound`] if script is not at expected position
+/// Returns [`TestError::ScriptTagNotFound`] if script is not at expected position.
+/// Returns [`TestError::ElementNotFound`] if `<head>` element is missing.
 pub fn assert_script_position(html: &str) -> Result<(), TestError> {
     let document = Html::parse_document(html);
-
-    // Find the <head> element
-    let head_selector = Selector::parse("head").change_context(TestError::InvalidSelector)?;
+    let head_selector = parse_selector("head")?;
 
     let head = document
         .select(&head_selector)
         .next()
         .ok_or_else(|| error_stack::report!(TestError::ElementNotFound))?;
 
-    // Get first child of <head>
-    let first_child = head
-        .first_child()
-        .ok_or_else(|| error_stack::report!(TestError::ElementNotFound))?;
-
-    // Verify first child is our injected script tag
-    if let Some(element) = first_child.value().as_element() {
-        if element.name() == "script" {
-            if let Some(src) = element.attr("src") {
-                if src.contains("/static/tsjs=") {
-                    return Ok(());
+    // Check first element child of <head> is our script
+    for child in head.children() {
+        if let Some(element) = child.value().as_element() {
+            if element.name() == "script" {
+                if let Some(src) = element.attr("src") {
+                    if src.contains("/static/tsjs=") {
+                        return Ok(());
+                    }
                 }
             }
+            // First element child is not our script
+            break;
         }
     }
 
-    Err(error_stack::report!(TestError::ScriptTagNotFound).attach_printable(
-        "Script tag not found at start of <head>",
-    ))
+    Err(error_stack::report!(TestError::ScriptTagNotFound)
+        .attach_printable("Script tag not found at start of <head>"))
 }
 
 #[cfg(test)]
@@ -194,7 +167,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_assert_script_tag_present_success() {
+    fn script_tag_present_with_expected_modules() {
         let html = r#"
             <!DOCTYPE html>
             <html>
@@ -210,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_script_tag_present_missing_module() {
+    fn script_tag_present_fails_on_missing_module() {
         let html = r#"
             <!DOCTYPE html>
             <html>
@@ -229,7 +202,18 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_attribute_rewritten_success() {
+    fn script_tag_present_fails_when_no_script() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html><head></head><body></body></html>
+        "#;
+
+        let result = assert_script_tag_present(html, &["core"]);
+        assert!(result.is_err(), "should fail when no script tag exists");
+    }
+
+    #[test]
+    fn attribute_rewritten_with_expected_prefix() {
         let html = r#"
             <a href="/first-party/proxy?url=https://example.com">Link</a>
         "#;
@@ -239,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_attribute_rewritten_not_rewritten() {
+    fn attribute_rewritten_fails_when_not_rewritten() {
         let html = r#"
             <a href="https://example.com">Link</a>
         "#;
@@ -249,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_element_count_success() {
+    fn element_count_matches() {
         let html = r#"
             <div>
                 <p>First</p>
@@ -262,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_element_count_mismatch() {
+    fn element_count_fails_on_mismatch() {
         let html = r#"
             <div>
                 <p>First</p>
@@ -271,6 +255,21 @@ mod tests {
         "#;
 
         let result = assert_element_count(html, "p", 3);
-        assert!(result.is_err(), "should fail when count doesn't match");
+        assert!(result.is_err(), "should fail when count does not match");
+    }
+
+    #[test]
+    fn gdpr_signal_detected_in_body() {
+        assert_gdpr_signal_in_body("window.__tcfapi = function() {}")
+            .expect("should detect TCF API signal");
+
+        assert_gdpr_signal_in_body("var gdprApplies = true;")
+            .expect("should detect gdprApplies signal");
+    }
+
+    #[test]
+    fn gdpr_signal_missing_from_body() {
+        let result = assert_gdpr_signal_in_body("<html><body>No GDPR here</body></html>");
+        assert!(result.is_err(), "should fail when no GDPR signal exists");
     }
 }

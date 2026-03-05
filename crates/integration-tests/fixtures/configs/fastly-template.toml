@@ -1,0 +1,97 @@
+# Fastly Compute configuration template for integration tests.
+# The test harness mutates `publisher.origin_url` and integration toggles
+# at runtime via RuntimeConfigBuilder.
+
+[[handlers]]
+path = "^/secure"
+username = "user"
+password = "pass"
+
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "PLACEHOLDER"
+proxy_secret = "integration-test-proxy-secret"
+
+[synthetic]
+counter_store = "counter_store"
+opid_store = "opid_store"
+secret_key = "integration-test-secret"
+template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
+
+[request_signing]
+enabled = false
+config_store_id = "unused"
+secret_store_id = "unused"
+
+[integrations.prebid]
+enabled = false
+server_url = "http://127.0.0.1:9999"
+timeout_ms = 1000
+bidders = ["appnexus"]
+debug = false
+
+[integrations.nextjs]
+enabled = false
+rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+max_combined_payload_bytes = 10485760
+
+[integrations.testlight]
+endpoint = "https://testlight.example/openrtb2/auction"
+timeout_ms = 1200
+rewrite_scripts = true
+
+[integrations.didomi]
+enabled = false
+sdk_origin = "https://sdk.privacy-center.org"
+api_origin = "https://api.privacy-center.org"
+
+[integrations.permutive]
+enabled = false
+organization_id = ""
+workspace_id = ""
+project_id = ""
+api_endpoint = "https://api.permutive.com"
+secure_signals_endpoint = "https://secure-signals.permutive.app"
+
+[integrations.lockr]
+enabled = false
+app_id = ""
+api_endpoint = "https://identity.loc.kr"
+sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.datadome]
+enabled = false
+sdk_origin = "https://js.datadome.co"
+api_origin = "https://api-js.datadome.co"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.gpt]
+enabled = false
+script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = true
+
+[auction]
+enabled = false
+providers = ["prebid"]
+timeout_ms = 2000
+allowed_context_keys = []
+
+[integrations.aps]
+enabled = false
+pub_id = "test-aps-publisher-id"
+endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
+timeout_ms = 1000
+
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-TEST"
+
+[integrations.adserver_mock]
+enabled = false
+endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
+timeout_ms = 1000

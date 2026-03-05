@@ -39,30 +39,30 @@ impl RuntimeConfigBuilder {
 
     pub fn build(self) -> Result<super::RuntimeConfig, TestError> {
         // Parse template as TOML
-        let mut config: toml::Value = toml::from_str(&self.template)
-            .change_context(TestError::ConfigParse)?;
+        let mut config: toml::Value =
+            toml::from_str(&self.template).change_context(TestError::ConfigParse)?;
 
         // Set origin_url if provided
         if let Some(origin_url) = self.origin_url {
             if let Some(publisher) = config.get_mut("publisher") {
                 if let Some(publisher_table) = publisher.as_table_mut() {
-                    publisher_table.insert(
-                        "origin_url".to_string(),
-                        toml::Value::String(origin_url),
-                    );
+                    publisher_table
+                        .insert("origin_url".to_string(), toml::Value::String(origin_url));
                 }
             }
         }
 
-        // Enable integrations if provided
+        // Enable specified integrations
+        // Config structure: [integrations.<id>] with `enabled = true/false`
         if !self.integrations.is_empty() {
-            if let Some(integrations_config) = config
+            if let Some(integrations_table) = config
                 .get_mut("integrations")
-                .and_then(|v| v.get_mut("config"))
                 .and_then(|v| v.as_table_mut())
             {
                 for integration_id in &self.integrations {
-                    if let Some(integration_entry) = integrations_config.get_mut(integration_id) {
+                    if let Some(integration_entry) =
+                        integrations_table.get_mut(integration_id.as_str())
+                    {
                         if let Some(table) = integration_entry.as_table_mut() {
                             table.insert("enabled".to_string(), toml::Value::Boolean(true));
                         }
@@ -73,19 +73,14 @@ impl RuntimeConfigBuilder {
 
         // Write to temp file
         let mut file = NamedTempFile::new().change_context(TestError::ConfigWrite)?;
-        let content =
-            toml::to_string_pretty(&config).change_context(TestError::ConfigSerialize)?;
+        let content = toml::to_string_pretty(&config).change_context(TestError::ConfigSerialize)?;
         file.write_all(content.as_bytes())
             .change_context(TestError::ConfigWrite)?;
 
-        let config_path = file.into_temp_path().to_path_buf();
         let wasm_path = self
             .wasm_path
             .unwrap_or_else(super::runtime::wasm_binary_path);
 
-        Ok(super::RuntimeConfig {
-            config_path,
-            wasm_path,
-        })
+        Ok(super::RuntimeConfig::new(file, wasm_path))
     }
 }
