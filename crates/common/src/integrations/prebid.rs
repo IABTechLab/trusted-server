@@ -23,9 +23,8 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    clamp_u32_to_i32, maybe_object_from_serializable, Banner, Device, Format, Geo, Imp, ImpExt,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RequestExt, Site, TrustedServerExt,
-    User, UserExt,
+    maybe_object_from_serializable, Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest,
+    PrebidExt, PrebidImpExt, Publisher, Regs, RequestExt, Site, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -537,8 +536,8 @@ impl PrebidAuctionProvider {
                     .iter()
                     .filter(|f| f.media_type == MediaType::Banner)
                     .map(|f| Format {
-                        w: Some(clamp_u32_to_i32(f.width)),
-                        h: Some(clamp_u32_to_i32(f.height)),
+                        w: Some(f.width),
+                        h: Some(f.height),
                         ..Default::default()
                     })
                     .collect();
@@ -764,7 +763,7 @@ impl PrebidAuctionProvider {
             device,
             regs,
             test: self.config.test_mode.then_some(1),
-            tmax: Some(clamp_u32_to_i32(self.config.timeout_ms)),
+            tmax: Some(self.config.timeout_ms),
             cur: Some(vec!["USD".to_string()]),
             ext,
             ..Default::default()

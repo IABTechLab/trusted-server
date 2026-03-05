@@ -17,8 +17,7 @@ use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{
-    clamp_u32_to_i32, maybe_object_from_serializable, OpenRtbBid, OpenRtbResponse, ResponseExt,
-    SeatBid,
+    maybe_object_from_serializable, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid,
 };
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
@@ -249,8 +248,8 @@ pub fn convert_to_openrtb_response(
             price,
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
-            w: Some(clamp_u32_to_i32(bid.width)),
-            h: Some(clamp_u32_to_i32(bid.height)),
+            w: Some(bid.width),
+            h: Some(bid.height),
             adomain: Some(bid.adomain.clone().unwrap_or_default()),
             ..Default::default()
         };
