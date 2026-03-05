@@ -6,18 +6,20 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
-/// Admin path prefix that is always protected regardless of handler configuration.
+/// Returns `true` when `path` falls under the admin namespace.
 ///
-/// Requests to paths starting with this prefix are denied with `401 Unauthorized`
-/// unless a configured handler explicitly covers them with valid credentials.
-const ADMIN_PATH_PREFIX: &str = "/admin/";
+/// Matches both the exact `/admin` path and any sub-path (`/admin/…`).
+fn is_admin_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
 
 /// Enforces Basic-auth for incoming requests.
 ///
 /// For most paths, authentication is only required when a configured handler's
-/// `path` regex matches the request path. **Admin paths** (`/admin/…`) are an
-/// exception: they are *always* gated behind authentication. If no handler
-/// covers an admin path the request is rejected outright.
+/// `path` regex matches the request path. **Admin paths** (`/admin` and
+/// `/admin/…`) are an exception: they are *always* gated behind
+/// authentication. If no handler covers an admin path the request is rejected
+/// outright.
 ///
 /// # Returns
 ///
@@ -26,7 +28,7 @@ const ADMIN_PATH_PREFIX: &str = "/admin/";
 /// * `None` — the request is allowed to proceed.
 pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
     let path = req.get_path();
-    let is_admin = path.starts_with(ADMIN_PATH_PREFIX);
+    let is_admin = is_admin_path(path);
 
     let handler = match settings.handler_for_path(path) {
         Some(h) => h,
@@ -217,5 +219,38 @@ mod tests {
         let response = enforce_basic_auth(&settings, &req)
             .expect("should challenge admin path with missing credentials");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn deny_exact_admin_path_when_no_handler_covers_it() {
+        let settings = settings_with_handlers();
+        let req = Request::new(Method::GET, "https://example.com/admin");
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should deny exact /admin path without matching handler");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should return 401 for exact /admin path"
+        );
+    }
+
+    #[test]
+    fn is_admin_path_matches_correctly() {
+        assert!(is_admin_path("/admin"), "should match exact /admin");
+        assert!(is_admin_path("/admin/"), "should match /admin/");
+        assert!(
+            is_admin_path("/admin/keys/rotate"),
+            "should match sub-paths"
+        );
+        assert!(
+            !is_admin_path("/administration"),
+            "should not match /administration"
+        );
+        assert!(
+            !is_admin_path("/administer"),
+            "should not match /administer"
+        );
+        assert!(!is_admin_path("/open"), "should not match unrelated paths");
     }
 }

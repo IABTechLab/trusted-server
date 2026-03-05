@@ -31,6 +31,14 @@ fn main() {
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
 
+    for path in settings.uncovered_admin_endpoints() {
+        println!(
+            "cargo:warning=No handler covers admin endpoint {path}. \
+             It will reject all requests with 401 Unauthorized. \
+             Add a [[handlers]] entry with a path regex matching /admin/ to enable admin access."
+        );
+    }
+
     let merged_toml =
         toml::to_string_pretty(&settings).expect("Failed to serialize settings to TOML");
 
