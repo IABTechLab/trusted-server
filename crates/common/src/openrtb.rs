@@ -78,14 +78,14 @@ mod tests {
     #[test]
     fn openrtb_response_round_trips_with_struct_literals() {
         let bid = OpenRtbBid {
-            id: "bidder-a-slot-1".to_string(),
-            impid: "slot-1".to_string(),
-            price: 1.25,
+            id: Some("bidder-a-slot-1".to_string()),
+            impid: Some("slot-1".to_string()),
+            price: Some(1.25),
             adm: Some("<div>Test Creative HTML</div>".to_string()),
             crid: Some("bidder-a-creative".to_string()),
             w: Some(300),
             h: Some(250),
-            adomain: Some(vec!["example.com".to_string()]),
+            adomain: vec!["example.com".to_string()],
             ..Default::default()
         };
 
@@ -107,8 +107,8 @@ mod tests {
         .to_ext();
 
         let response = OpenRtbResponse {
-            id: "auction-1".to_string(),
-            seatbid: Some(vec![seatbid]),
+            id: Some("auction-1".to_string()),
+            seatbid: vec![seatbid],
             ext,
             ..Default::default()
         };
