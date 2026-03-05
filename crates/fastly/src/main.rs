@@ -80,6 +80,9 @@ async fn route_request(
 
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
+        // Health check endpoint for integration tests and monitoring
+        (Method::GET, "/health") => Ok(Response::from_status(200).with_body_text_plain("ok")),
+
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&req, integration_registry)
