@@ -40,7 +40,6 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
     log::info!("Settings {settings:?}");
-    settings.warn_if_admin_unprotected();
 
     // Build the auction orchestrator once at startup
     let orchestrator = build_orchestrator(&settings);

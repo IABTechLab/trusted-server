@@ -384,25 +384,25 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
-    /// Checks whether any configured handler covers admin paths and logs a
-    /// warning if none do.
+    /// Known admin endpoint paths that are always auth-gated at runtime.
     ///
-    /// Admin endpoints (`/admin/…`) are always auth-gated at runtime, but
-    /// without a matching handler they become *unreachable* (every request
-    /// returns `401`). Calling this at startup gives operators early
-    /// visibility into the misconfiguration.
-    pub fn warn_if_admin_unprotected(&self) {
-        let admin_covered = self
-            .handlers
+    /// If no configured handler covers a path in this list, requests to that
+    /// endpoint will be rejected with `401 Unauthorized`.
+    const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
+
+    /// Returns admin endpoint paths that no configured handler covers.
+    ///
+    /// Admin endpoints are always auth-gated at runtime, but without a
+    /// matching handler they become *unreachable* (every request returns
+    /// `401`). Use this at build time to warn operators about
+    /// misconfiguration.
+    #[must_use]
+    pub fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
+        Self::ADMIN_ENDPOINTS
             .iter()
-            .any(|h| h.matches_path("/admin/keys/rotate"));
-        if !admin_covered {
-            log::warn!(
-                "No configured handler covers /admin/* paths. \
-                 Admin endpoints will reject all requests with 401 Unauthorized. \
-                 Add a handler with a path regex matching /admin/ to enable admin access."
-            );
-        }
+            .copied()
+            .filter(|path| !self.handlers.iter().any(|h| h.matches_path(path)))
+            .collect()
     }
 
     /// Retrieves the integration configuration of a specific type.
@@ -1188,6 +1188,52 @@ mod tests {
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
             "Empty allowed_context_keys should be respected (blocks all keys)"
+        );
+    }
+
+    #[test]
+    fn uncovered_admin_endpoints_returns_all_when_no_handler_covers_admin() {
+        let settings = create_test_settings();
+        let uncovered = settings.uncovered_admin_endpoints();
+        assert_eq!(
+            uncovered,
+            vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
+            "should report both admin endpoints as uncovered with default config"
+        );
+    }
+
+    #[test]
+    fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [[handlers]]
+            path = "^/admin"
+            username = "admin"
+            password = "secret"
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        let uncovered = settings.uncovered_admin_endpoints();
+        assert!(
+            uncovered.is_empty(),
+            "should report no uncovered admin endpoints when handler covers /admin"
+        );
+    }
+
+    #[test]
+    fn uncovered_admin_endpoints_detects_partial_coverage() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [[handlers]]
+            path = "^/admin/keys/rotate$"
+            username = "admin"
+            password = "secret"
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        let uncovered = settings.uncovered_admin_endpoints();
+        assert_eq!(
+            uncovered,
+            vec!["/admin/keys/deactivate"],
+            "should detect that only deactivate is uncovered"
         );
     }
 }
