@@ -1,3 +1,8 @@
+// Many items in common/environments/frameworks are defined for use by
+// Docker-dependent integration tests that only run when Docker is available.
+// The compiler sees them as unused when analysing the test binary alone.
+#![allow(dead_code, unused_imports)]
+
 mod common;
 mod environments;
 mod frameworks;
