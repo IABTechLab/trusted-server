@@ -1,32 +1,15 @@
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::auction::types::OrchestratorExt;
 
-pub type Object = trusted_server_openrtb::Object;
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
 
 pub use trusted_server_openrtb::{
-    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, User,
+    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
 };
-
-pub fn object_from_serializable<T: Serialize>(value: &T) -> Object {
-    match serde_json::to_value(value) {
-        Ok(Value::Object(map)) => map,
-        Ok(_) | Err(_) => Map::new(),
-    }
-}
-
-pub fn maybe_object_from_serializable<T: Serialize>(value: &T) -> Option<Object> {
-    let map = object_from_serializable(value);
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
-}
 
 // ============================================================================
 // Extension types (project-specific, not part of the OpenRTB spec)
@@ -112,7 +95,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ext = maybe_object_from_serializable(&ResponseExt {
+        let ext = ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: "parallel_only".to_string(),
                 providers: 2,
@@ -120,7 +103,8 @@ mod tests {
                 time_ms: 12,
                 provider_details: vec![],
             },
-        });
+        }
+        .to_ext();
 
         let response = OpenRtbResponse {
             id: "auction-1".to_string(),

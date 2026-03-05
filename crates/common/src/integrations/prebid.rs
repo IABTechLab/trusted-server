@@ -23,8 +23,8 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    maybe_object_from_serializable, Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest,
-    PrebidExt, PrebidImpExt, Publisher, Regs, RequestExt, Site, TrustedServerExt, User, UserExt,
+    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher,
+    Regs, RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -605,9 +605,10 @@ impl PrebidAuctionProvider {
                     bidfloorcur: slot.floor_price.map(|_| "USD".to_string()),
                     secure: Some(1), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
-                    ext: maybe_object_from_serializable(&ImpExt {
+                    ext: ImpExt {
                         prebid: PrebidImpExt { bidder },
-                    }),
+                    }
+                    .to_ext(),
                     ..Default::default()
                 }
             })
@@ -626,9 +627,10 @@ impl PrebidAuctionProvider {
         let user = Some(User {
             id: Some(request.user.id.clone()),
             consent: request.user.consent.clone(),
-            ext: maybe_object_from_serializable(&UserExt {
+            ext: UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
-            }),
+            }
+            .to_ext(),
             ..Default::default()
         });
 
@@ -725,7 +727,7 @@ impl PrebidAuctionProvider {
 
         let debug_enabled = self.config.debug;
 
-        let ext = maybe_object_from_serializable(&RequestExt {
+        let ext = RequestExt {
             prebid: Some(PrebidExt {
                 debug: debug_enabled.then_some(true),
                 returnallbidstatus: debug_enabled.then_some(true),
@@ -738,7 +740,8 @@ impl PrebidAuctionProvider {
                 request_scheme: Some(request_info.scheme),
                 ts,
             }),
-        });
+        }
+        .to_ext();
 
         // Extract Referer header for site.ref
         let referer = context

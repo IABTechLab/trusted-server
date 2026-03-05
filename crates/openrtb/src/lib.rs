@@ -5,6 +5,23 @@ use serde_json::{Map, Value};
 
 pub type Object = Map<String, Value>;
 
+/// Convert a serializable struct into an `Option<Object>` suitable for an
+/// `OpenRTB` `ext` field. Returns `None` when serialization produces an empty
+/// map (i.e. all fields were skipped), so that `ext` is omitted from the JSON
+/// output rather than emitting `"ext": {}`.
+pub trait ToExt {
+    fn to_ext(&self) -> Option<Object>;
+}
+
+impl<T: Serialize> ToExt for T {
+    fn to_ext(&self) -> Option<Object> {
+        match serde_json::to_value(self) {
+            Ok(Value::Object(map)) if !map.is_empty() => Some(map),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BidRequest {
     pub id: String,

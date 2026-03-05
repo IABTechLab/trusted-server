@@ -16,9 +16,7 @@ use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{
-    maybe_object_from_serializable, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid,
-};
+use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -278,7 +276,7 @@ pub fn convert_to_openrtb_response(
     let response_body = OpenRtbResponse {
         id: auction_request.id.to_string(),
         seatbid: Some(seatbids),
-        ext: maybe_object_from_serializable(&ResponseExt {
+        ext: ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),
                 providers: result.provider_responses.len(),
@@ -286,7 +284,8 @@ pub fn convert_to_openrtb_response(
                 time_ms: result.total_time_ms,
                 provider_details,
             },
-        }),
+        }
+        .to_ext(),
         ..Default::default()
     };
 
