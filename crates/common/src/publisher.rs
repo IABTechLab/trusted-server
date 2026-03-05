@@ -70,6 +70,7 @@ pub fn handle_tsjs_dynamic(
 /// Returns `Some(&'static str)` if the filename matches a known JS module ID,
 /// `None` otherwise. The caller must additionally verify that the module is
 /// both deferred and enabled via the [`IntegrationRegistry`].
+#[must_use]
 fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
     let stem = filename
         .strip_prefix("tsjs-")
