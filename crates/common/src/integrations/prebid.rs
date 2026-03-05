@@ -465,45 +465,6 @@ fn append_query_params(url: &str, params: &str) -> String {
     }
 }
 
-const REDACTED_OPENRTB_LOG_VALUE: &str = "[REDACTED]";
-
-fn redact_json_field_for_logging(payload: &mut Json, path: &[&str]) {
-    if path.is_empty() {
-        return;
-    }
-
-    let mut current = payload;
-    for segment in &path[..path.len() - 1] {
-        let Some(next) = current.get_mut(*segment) else {
-            return;
-        };
-        current = next;
-    }
-
-    if let Some(last) = path.last() {
-        if let Some(value) = current.get_mut(*last) {
-            *value = Json::String(REDACTED_OPENRTB_LOG_VALUE.to_string());
-        }
-    }
-}
-
-fn redact_openrtb_request_for_logging(openrtb: &OpenRtbRequest) -> Result<Json, serde_json::Error> {
-    let mut payload = serde_json::to_value(openrtb)?;
-
-    for path in [
-        &["user", "consent"][..],
-        &["device", "ip"][..],
-        &["device", "ipv6"][..],
-        &["device", "geo", "lat"][..],
-        &["device", "geo", "lon"][..],
-        &["site", "ref"][..],
-    ] {
-        redact_json_field_for_logging(&mut payload, path);
-    }
-
-    Ok(payload)
-}
-
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
@@ -950,11 +911,9 @@ impl AuctionProvider for PrebidAuctionProvider {
                 .map(|(s, sig, params)| (s, sig.clone(), params)),
         );
 
-        // Log the outgoing OpenRTB request for debugging with sensitive fields redacted.
+        // Log the outgoing OpenRTB request for debugging.
         if log::log_enabled!(log::Level::Debug) {
-            match redact_openrtb_request_for_logging(&openrtb)
-                .and_then(|payload| serde_json::to_string_pretty(&payload))
-            {
+            match serde_json::to_string_pretty(&openrtb) {
                 Ok(json) => log::debug!(
                     "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
                     self.config.server_url,
@@ -2027,66 +1986,6 @@ server_url = "https://prebid.example"
             site.r#ref.as_deref(),
             Some("https://google.com/search?q=test"),
             "should set site.ref from Referer header"
-        );
-    }
-
-    #[test]
-    fn redact_openrtb_request_for_logging_redacts_sensitive_fields() {
-        let provider = PrebidAuctionProvider::new(base_config());
-        let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some("BOtest-consent-string".to_string());
-        auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
-            ip: Some("203.0.113.42".to_string()),
-            geo: Some(GeoInfo {
-                city: "New York".to_string(),
-                country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
-                region: Some("NY".to_string()),
-            }),
-        });
-
-        let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Referer", "https://google.com/search?q=test");
-        let context = create_test_auction_context(&settings, &request);
-
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
-        let redacted = redact_openrtb_request_for_logging(&openrtb)
-            .expect("should serialize OpenRTB request for redaction");
-
-        assert_eq!(
-            redacted["user"]["consent"],
-            json!(REDACTED_OPENRTB_LOG_VALUE),
-            "should redact user.consent"
-        );
-        assert_eq!(
-            redacted["device"]["ip"],
-            json!(REDACTED_OPENRTB_LOG_VALUE),
-            "should redact device.ip"
-        );
-        assert_eq!(
-            redacted["device"]["geo"]["lat"],
-            json!(REDACTED_OPENRTB_LOG_VALUE),
-            "should redact device.geo.lat"
-        );
-        assert_eq!(
-            redacted["device"]["geo"]["lon"],
-            json!(REDACTED_OPENRTB_LOG_VALUE),
-            "should redact device.geo.lon"
-        );
-        assert_eq!(
-            redacted["site"]["ref"],
-            json!(REDACTED_OPENRTB_LOG_VALUE),
-            "should redact site.ref"
-        );
-        assert_eq!(
-            redacted["site"]["page"],
-            json!("https://pub.example/article"),
-            "should preserve non-sensitive fields"
         );
     }
 
