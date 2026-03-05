@@ -1,6 +1,6 @@
 # Integrations Overview
 
-Trusted Server provides built-in integrations with popular third-party services, enabling first-party data collection and privacy-preserving advertising. This page compares the most commonly used integrations.
+Trusted Server provides built-in integrations with popular third-party services, enabling first-party data collection and privacy-preserving advertising. This page provides a comparison of all available integrations.
 
 ## Quick Comparison
 
@@ -19,7 +19,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 **Key Features:**
 
-- OpenRTB 2.6 protocol conversion
+- OpenRTB 2.x protocol conversion
 - Synthetic ID injection for privacy
 - First-party creative resource proxying
 - CDN URL rewriting (7+ major SSPs)
@@ -31,11 +31,11 @@ Trusted Server provides built-in integrations with popular third-party services,
 ```toml
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.example.com/openrtb2/auction"
+server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
 bidders = ["appnexus", "rubicon"]
+auto_configure = true
 debug = false
-script_patterns = ["/prebid.js", "/prebid.min.js"]
 ```
 
 **Endpoints:**
