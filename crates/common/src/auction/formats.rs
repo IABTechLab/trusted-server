@@ -217,6 +217,34 @@ pub fn convert_to_openrtb_response(
             })
         })?;
 
+        let width = match i32::try_from(bid.width) {
+            Ok(converted) => Some(converted),
+            Err(_) => {
+                log::warn!(
+                    "Auction response: omitting bid width for auction {} slot {} bidder {} because width {} exceeds i32::MAX",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder,
+                    bid.width
+                );
+                None
+            }
+        };
+
+        let height = match i32::try_from(bid.height) {
+            Ok(converted) => Some(converted),
+            Err(_) => {
+                log::warn!(
+                    "Auction response: omitting bid height for auction {} slot {} bidder {} because height {} exceeds i32::MAX",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder,
+                    bid.height
+                );
+                None
+            }
+        };
+
         // Process creative HTML if present - rewrite URLs and return inline
         let creative_html = if let Some(ref raw_creative) = bid.creative {
             // Rewrite creative HTML with proxy URLs for first-party delivery
@@ -241,14 +269,14 @@ pub fn convert_to_openrtb_response(
         };
 
         let openrtb_bid = OpenRtbBid {
-            id: format!("{}-{}", bid.bidder, slot_id),
-            impid: slot_id.to_string(),
-            price,
+            id: Some(format!("{}-{}", bid.bidder, slot_id)),
+            impid: Some(slot_id.to_string()),
+            price: Some(price),
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
-            w: Some(bid.width),
-            h: Some(bid.height),
-            adomain: Some(bid.adomain.clone().unwrap_or_default()),
+            w: width,
+            h: height,
+            adomain: bid.adomain.clone().unwrap_or_default(),
             ..Default::default()
         };
 
@@ -274,8 +302,8 @@ pub fn convert_to_openrtb_response(
         .collect();
 
     let response_body = OpenRtbResponse {
-        id: auction_request.id.to_string(),
-        seatbid: Some(seatbids),
+        id: Some(auction_request.id.to_string()),
+        seatbid: seatbids,
         ext: ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),

@@ -465,6 +465,21 @@ fn append_query_params(url: &str, params: &str) -> String {
     }
 }
 
+fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
+    match i32::try_from(value) {
+        Ok(converted) => Some(converted),
+        Err(_) => {
+            log::warn!(
+                "prebid: omitting {}={} for {} because value exceeds i32::MAX",
+                field_name,
+                value,
+                context
+            );
+            None
+        }
+    }
+}
+
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
@@ -492,14 +507,23 @@ impl PrebidAuctionProvider {
             .slots
             .iter()
             .map(|slot| {
+                let slot_context = format!("slot '{}'", slot.id);
                 let formats = slot
                     .formats
                     .iter()
                     .filter(|f| f.media_type == MediaType::Banner)
-                    .map(|f| Format {
-                        w: Some(f.width),
-                        h: Some(f.height),
-                        ..Default::default()
+                    .filter_map(|f| {
+                        let width = to_openrtb_i32(f.width, "format.w", &slot_context);
+                        let height = to_openrtb_i32(f.height, "format.h", &slot_context);
+
+                        match (width, height) {
+                            (Some(width), Some(height)) => Some(Format {
+                                w: Some(width),
+                                h: Some(height),
+                                ..Default::default()
+                            }),
+                            _ => None,
+                        }
                     })
                     .collect();
 
@@ -554,9 +578,9 @@ impl PrebidAuctionProvider {
                 }
 
                 Imp {
-                    id: slot.id.clone(),
+                    id: Some(slot.id.clone()),
                     banner: Some(Banner {
-                        format: Some(formats),
+                        format: formats,
                         ..Default::default()
                     }),
                     bidfloor: slot.floor_price,
@@ -564,7 +588,7 @@ impl PrebidAuctionProvider {
                     // support is needed, this should come from config or the
                     // AdSlot itself.
                     bidfloorcur: slot.floor_price.map(|_| "USD".to_string()),
-                    secure: Some(1), // require HTTPS creatives
+                    secure: Some(true), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
                     ext: ImpExt {
                         prebid: PrebidImpExt { bidder },
@@ -598,7 +622,7 @@ impl PrebidAuctionProvider {
         // Extract DNT header and Accept-Language from the original request
         let dnt = context.request.get_header_str("DNT").and_then(|v| {
             if v.trim() == "1" {
-                Some(1)
+                Some(true)
             } else {
                 None
             }
@@ -658,7 +682,7 @@ impl PrebidAuctionProvider {
             .is_some_and(|v| v.trim() == "1");
 
         let regs = if has_consent || has_gpc {
-            let gdpr = if has_consent { Some(1) } else { None };
+            let gdpr = if has_consent { Some(true) } else { None };
             let us_privacy = if has_gpc {
                 Some("1YYN".to_string())
             } else {
@@ -710,8 +734,10 @@ impl PrebidAuctionProvider {
             .get_header_str(header::REFERER)
             .map(std::string::ToString::to_string);
 
+        let tmax = to_openrtb_i32(self.config.timeout_ms, "tmax", "request");
+
         OpenRtbRequest {
-            id: request.id.clone(),
+            id: Some(request.id.clone()),
             imp: imps,
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
@@ -726,9 +752,9 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
-            test: self.config.test_mode.then_some(1),
-            tmax: Some(self.config.timeout_ms),
-            cur: Some(vec!["USD".to_string()]),
+            test: self.config.test_mode.then_some(true),
+            tmax,
+            cur: vec!["USD".to_string()],
             ext,
             ..Default::default()
         }
@@ -1625,15 +1651,15 @@ server_url = "https://prebid.example"
 
         assert_eq!(
             openrtb.test,
-            Some(1),
+            Some(true),
             "should set top-level OpenRTB test field when test_mode is enabled"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         assert_eq!(
             serialized["test"],
-            json!(1),
-            "should serialize top-level test as 1 when test_mode is enabled"
+            json!(true),
+            "should serialize top-level test as true when test_mode is enabled"
         );
     }
 
@@ -1775,7 +1801,7 @@ server_url = "https://prebid.example"
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
         let imp = &openrtb.imp[0];
 
-        assert_eq!(imp.secure, Some(1), "should require HTTPS creatives");
+        assert_eq!(imp.secure, Some(true), "should require HTTPS creatives");
         assert_eq!(
             imp.tagid.as_deref(),
             Some("slot-1"),
@@ -1802,7 +1828,7 @@ server_url = "https://prebid.example"
         );
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
-            Some(1),
+            Some(true),
             "should set regs.gdpr when consent is present"
         );
     }
@@ -1877,7 +1903,7 @@ server_url = "https://prebid.example"
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
         let device = openrtb.device.as_ref().expect("should have device");
 
-        assert_eq!(device.dnt, Some(1), "should set dnt from DNT header");
+        assert_eq!(device.dnt, Some(true), "should set dnt from DNT header");
     }
 
     #[test]
@@ -1963,10 +1989,59 @@ server_url = "https://prebid.example"
             "should set tmax from config timeout_ms"
         );
         assert_eq!(
-            openrtb.cur.as_deref(),
-            Some(&["USD".to_string()][..]),
+            openrtb.cur,
+            vec!["USD".to_string()],
             "should set cur to USD"
         );
+    }
+
+    #[test]
+    fn to_openrtb_omits_tmax_when_timeout_exceeds_i32_max() {
+        let mut config = base_config();
+        config.timeout_ms = i32::MAX as u32 + 1;
+        let provider = PrebidAuctionProvider::new(config);
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.tmax, None,
+            "should omit tmax when timeout_ms exceeds i32::MAX"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_drops_banner_format_with_out_of_range_dimensions() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.slots[0].formats.push(AdFormat {
+            media_type: MediaType::Banner,
+            width: i32::MAX as u32 + 1,
+            height: 250,
+        });
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let formats = &openrtb.imp[0]
+            .banner
+            .as_ref()
+            .expect("should have banner")
+            .format;
+
+        assert_eq!(
+            formats.len(),
+            1,
+            "should keep only valid banner formats when one is out of range"
+        );
+        assert_eq!(formats[0].w, Some(300), "should preserve valid width");
+        assert_eq!(formats[0].h, Some(250), "should preserve valid height");
     }
 
     #[test]
