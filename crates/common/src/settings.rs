@@ -384,6 +384,27 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
+    /// Checks whether any configured handler covers admin paths and logs a
+    /// warning if none do.
+    ///
+    /// Admin endpoints (`/admin/…`) are always auth-gated at runtime, but
+    /// without a matching handler they become *unreachable* (every request
+    /// returns `401`). Calling this at startup gives operators early
+    /// visibility into the misconfiguration.
+    pub fn warn_if_admin_unprotected(&self) {
+        let admin_covered = self
+            .handlers
+            .iter()
+            .any(|h| h.matches_path("/admin/keys/rotate"));
+        if !admin_covered {
+            log::warn!(
+                "No configured handler covers /admin/* paths. \
+                 Admin endpoints will reject all requests with 401 Unauthorized. \
+                 Add a handler with a path regex matching /admin/ to enable admin access."
+            );
+        }
+    }
+
     /// Retrieves the integration configuration of a specific type.
     ///
     /// # Errors
