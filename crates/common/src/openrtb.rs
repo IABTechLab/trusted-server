@@ -12,12 +12,6 @@ pub use trusted_server_openrtb::{
     Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, User,
 };
 
-/// Clamp a `u32` to `i32` range (`OpenRTB` uses `i32` for pixel dimensions).
-#[must_use]
-pub fn clamp_u32_to_i32(value: u32) -> i32 {
-    value.min(i32::MAX as u32) as i32
-}
-
 pub fn object_from_serializable<T: Serialize>(value: &T) -> Object {
     match serde_json::to_value(value) {
         Ok(Value::Object(map)) => map,
