@@ -20,6 +20,12 @@
             <h2>Test Article</h2>
             <p>This is a test article for integration testing of the trusted server.</p>
 
+            <!-- Links with absolute origin URLs for attribute rewriting tests.
+                 The trusted server should rewrite these from origin host to proxy host. -->
+            <?php $origin = getenv('ORIGIN_HOST') ?: '127.0.0.1:8888'; ?>
+            <a id="origin-link" href="http://<?= $origin ?>/page">Origin Link</a>
+            <img id="origin-img" src="http://<?= $origin ?>/images/test.png" alt="test">
+
             <!-- Ad slot that should be rewritten by the trusted server -->
             <div id="ad-slot-1" data-ad-unit="/test/banner">
                 <p>Advertisement placeholder</p>
@@ -35,7 +41,7 @@
     </main>
 
     <footer>
-        <p>&copy; 2025 Test Publisher</p>
+        <p>&copy; 2026 Test Publisher</p>
     </footer>
 </body>
 </html>

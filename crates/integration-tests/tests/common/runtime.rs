@@ -39,6 +39,9 @@ pub enum TestError {
     #[display("Invalid CSS selector")]
     InvalidSelector,
 
+    #[display("Origin URL not rewritten in HTML attributes")]
+    AttributeNotRewritten,
+
     // Resource errors
     #[display("No available port found")]
     NoPortAvailable,

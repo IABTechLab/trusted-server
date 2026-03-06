@@ -44,7 +44,7 @@ jobs:
         run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
       - name: Run tests
-        run: cargo test --workspace --exclude integration-tests
+        run: cargo test --workspace
 
   test-typescript:
     name: vitest

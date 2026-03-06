@@ -1,5 +1,5 @@
 use crate::common::assertions;
-use crate::common::runtime::TestError;
+use crate::common::runtime::{TestError, origin_port};
 use error_stack::ResultExt as _;
 
 /// Standard test scenarios applicable to all frontend frameworks.
@@ -13,6 +13,12 @@ pub enum TestScenario {
 
     /// Verify `/static/tsjs=tsjs-unified.min.js` endpoint serves the JS bundle.
     ScriptServing,
+
+    /// Verify origin host URLs in `href`/`src` attributes are rewritten to the proxy host.
+    AttributeRewriting,
+
+    /// Verify `/static/tsjs=unknown.js` returns 404, not HTML or a fallback.
+    ScriptServingUnknownFile404,
 }
 
 /// Framework-specific custom scenarios that test framework-unique behaviors.
@@ -23,6 +29,13 @@ pub enum CustomScenario {
 
     /// Next.js: Server Actions POST requests pass through correctly.
     NextJsServerActions,
+
+    /// WordPress: Admin pages (`/wp-admin/`) receive script injection.
+    ///
+    /// The trusted server currently injects into ALL HTML responses
+    /// regardless of path. This test documents that behavior and guards
+    /// against unintended changes.
+    WordPressAdminInjection,
 }
 
 impl TestScenario {
@@ -50,8 +63,39 @@ impl TestScenario {
                     .change_context(TestError::ResponseParse)
                     .attach_printable(format!("framework: {framework_id}"))?;
 
-                assertions::assert_script_tag_present(&html)
+                assertions::assert_unique_script_tag(&html)
                     .attach_printable(format!("framework: {framework_id}"))?;
+
+                Ok(())
+            }
+
+            Self::AttributeRewriting => {
+                // Verify that absolute origin URLs in href/src attributes are
+                // rewritten to the proxy host. The test fixtures embed links
+                // like `http://127.0.0.1:8888/page` which the HTML processor
+                // should rewrite to `http://127.0.0.1:{proxy_port}/page`.
+                let resp = reqwest::blocking::get(base_url)
+                    .change_context(TestError::HttpRequest)
+                    .attach_printable(format!(
+                        "scenario: AttributeRewriting, framework: {framework_id}"
+                    ))?;
+
+                let html = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                let origin_host = format!("127.0.0.1:{}", origin_port());
+
+                assertions::assert_attributes_rewritten(&html, &origin_host, base_url)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                // Verify non-URL attributes like data-ad-unit are preserved unchanged
+                assertions::assert_data_ad_units_preserved(
+                    &html,
+                    &["/test/banner", "/test/sidebar"],
+                )
+                .attach_printable(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }
@@ -74,6 +118,75 @@ impl TestScenario {
                     );
                 }
 
+                // Verify content type is JavaScript
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let body = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                if !content_type.contains("javascript") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(format!(
+                            "Expected JavaScript content-type, got: {content_type}"
+                        )));
+                }
+
+                // Verify body is non-empty and contains expected bundle markers
+                if body.is_empty() {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable("Script bundle body is empty"));
+                }
+
+                // The unified bundle should contain the TSJS core initialization
+                if !body.contains("trustedserver") && !body.contains("tsjs") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(
+                            "Script bundle does not contain expected trustedserver/tsjs markers",
+                        ));
+                }
+
+                Ok(())
+            }
+
+            Self::ScriptServingUnknownFile404 => {
+                let url = format!("{base_url}/static/tsjs=unknown.js");
+
+                let resp = reqwest::blocking::get(&url)
+                    .change_context(TestError::HttpRequest)
+                    .attach_printable(format!(
+                        "scenario: ScriptServingUnknownFile404, framework: {framework_id}"
+                    ))?;
+
+                let status = resp.status().as_u16();
+
+                if status != 404 {
+                    return Err(error_stack::report!(TestError::HttpRequest)
+                        .attach_printable(format!(
+                            "Expected 404 for unknown tsjs file, got {status}"
+                        )));
+                }
+
+                // Response should not be HTML (which would indicate a fallback to origin)
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+
+                if content_type.contains("text/html") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(
+                            "Unknown tsjs file returned HTML instead of a proper 404",
+                        ));
+                }
+
                 Ok(())
             }
         }
@@ -89,7 +202,9 @@ impl CustomScenario {
     pub fn run(&self, base_url: &str, framework_id: &str) -> error_stack::Result<(), TestError> {
         match self {
             Self::NextJsRscFlight => {
-                // Verify RSC Flight format responses are not corrupted
+                // Verify RSC Flight format responses are not corrupted.
+                // When the proxy mishandles the RSC header, it returns text/html
+                // instead of the expected Flight payload — so we fail on HTML.
                 let client = reqwest::blocking::Client::new();
                 let resp = client
                     .get(base_url)
@@ -105,27 +220,41 @@ impl CustomScenario {
                     .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
+                    .unwrap_or("")
+                    .to_string();
 
-                // RSC responses should have text/x-component content type
-                // and should NOT have script injection (they're not HTML)
-                if content_type.contains("text/x-component") {
-                    let body = resp.text().change_context(TestError::ResponseParse)?;
+                let body = resp.text().change_context(TestError::ResponseParse)?;
 
-                    if body.contains("/static/tsjs=") {
-                        return Err(error_stack::report!(TestError::ScriptTagNotFound)
-                            .attach_printable(
-                                "Script tag should NOT be injected in RSC Flight responses",
-                            ));
-                    }
+                // RSC responses must NOT be HTML — that means the proxy
+                // swallowed the RSC header and treated it as a page request
+                if content_type.contains("text/html") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(format!(
+                            "RSC request returned text/html instead of Flight payload (content-type: {content_type})"
+                        )));
+                }
+
+                // If the response is a Flight payload, it must not contain injected scripts
+                if body.contains("/static/tsjs=") {
+                    return Err(error_stack::report!(TestError::ScriptTagNotFound)
+                        .attach_printable(
+                            "Script tag should NOT be injected in RSC Flight responses",
+                        ));
                 }
 
                 Ok(())
             }
 
             Self::NextJsServerActions => {
-                // Verify POST requests for server actions pass through correctly
-                let client = reqwest::blocking::Client::new();
+                // Verify POST requests pass through the proxy to the origin.
+                // The minimal Next.js app has no real server actions, so the
+                // framework returns a client or redirect response. A 5xx means
+                // the proxy itself failed rather than forwarding.
+                let client = reqwest::blocking::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .change_context(TestError::HttpRequest)?;
+
                 let resp = client
                     .post(base_url)
                     .header("Next-Action", "test-action-id")
@@ -137,17 +266,46 @@ impl CustomScenario {
                         "scenario: NextJsServerActions, framework: {framework_id}"
                     ))?;
 
-                // Server action responses should pass through without modification
-                // A 4xx is acceptable since we don't have real server actions,
-                // but a connection error would indicate the proxy is blocking POSTs
-                if resp.status().is_server_error() {
+                let status = resp.status();
+
+                // The proxy must forward the POST. We expect a non-5xx from
+                // the origin: 2xx, 3xx (redirect), or 4xx (no matching action).
+                if status.is_server_error() {
+                    let body = resp.text().unwrap_or_default();
                     return Err(
                         error_stack::report!(TestError::HttpRequest).attach_printable(format!(
-                            "Server action request failed with {}",
-                            resp.status()
+                            "POST request failed with {status}; body: {body}"
                         )),
                     );
                 }
+
+                Ok(())
+            }
+
+            Self::WordPressAdminInjection => {
+                // Verify that /wp-admin/ pages also receive script injection.
+                // The trusted server injects into ALL HTML responses regardless
+                // of path. This test documents that behavior — if admin-path
+                // exclusion is added in the future, this test should be updated
+                // to assert NO injection instead.
+                let url = format!("{base_url}/wp-admin/");
+
+                let resp = reqwest::blocking::get(&url)
+                    .change_context(TestError::HttpRequest)
+                    .attach_printable(format!(
+                        "scenario: WordPressAdminInjection, framework: {framework_id}"
+                    ))?;
+
+                let html = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                assertions::assert_script_tag_present(&html)
+                    .attach_printable(format!(
+                        "Admin page should receive injection (current behavior). \
+                         framework: {framework_id}"
+                    ))?;
 
                 Ok(())
             }

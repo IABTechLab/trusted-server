@@ -68,7 +68,11 @@ jobs:
             crates/integration-tests/fixtures/frameworks/nextjs/
 
       - name: Run integration tests
-        run: cargo test -p integration-tests --target x86_64-unknown-linux-gnu -- --include-ignored --test-threads=1
+        run: >-
+          cargo test
+          --manifest-path crates/integration-tests/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+          -- --include-ignored --test-threads=1
         env:
           WASM_BINARY_PATH: target/wasm32-wasip1/release/trusted-server-fastly.wasm
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}

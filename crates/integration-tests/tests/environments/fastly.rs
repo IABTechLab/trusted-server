@@ -31,18 +31,20 @@ impl RuntimeEnvironment for FastlyViceroy {
             .change_context(TestError::RuntimeSpawn)
             .attach_printable("Failed to spawn viceroy process")?;
 
+        // Wrap immediately so Drop::drop kills the process if readiness check fails
+        let handle = ViceroyHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
         super::wait_for_ready(&base_url, self.health_check_path())?;
 
         Ok(RuntimeProcess {
-            inner: Box::new(ViceroyHandle { child }),
+            inner: Box::new(handle),
             base_url,
         })
     }
 
     fn health_check_path(&self) -> &str {
-        "/health"
+        "/__trusted-server/health"
     }
 }
 

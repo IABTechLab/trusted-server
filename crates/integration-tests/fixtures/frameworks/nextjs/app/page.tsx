@@ -1,8 +1,22 @@
 export default function Home() {
+  // Server component — process.env is available at render time
+  const originHost = process.env.ORIGIN_HOST || "127.0.0.1:8888";
+
   return (
     <main>
       <h1>Integration Test Publisher</h1>
       <p>This is a test page for integration testing of the trusted server.</p>
+
+      {/* Links with absolute origin URLs for attribute rewriting tests.
+          The trusted server should rewrite these from origin host to proxy host. */}
+      <a id="origin-link" href={`http://${originHost}/page`}>
+        Origin Link
+      </a>
+      <img
+        id="origin-img"
+        src={`http://${originHost}/images/test.png`}
+        alt="test"
+      />
 
       {/* Ad slot that should be rewritten by the trusted server */}
       <div id="ad-slot-1" data-ad-unit="/test/banner">

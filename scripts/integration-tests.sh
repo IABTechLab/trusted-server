@@ -20,12 +20,12 @@ cd "$REPO_ROOT"
 # can proxy requests to them.
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
 
-# Detect native target
-case "$(uname -m)" in
-    arm64|aarch64) TARGET="aarch64-apple-darwin" ;;
-    x86_64)        TARGET="x86_64-unknown-linux-gnu" ;;
-    *)             echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
+# Detect native target from rustc (handles all OS + arch combinations correctly)
+TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+if [ -z "$TARGET" ]; then
+    echo "Failed to detect host target from rustc -vV" >&2
+    exit 1
+fi
 
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
@@ -44,4 +44,7 @@ echo "==> Running integration tests (target: $TARGET, origin port: $ORIGIN_PORT)
 WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-fastly.wasm" \
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
 RUST_LOG=info \
-    cargo test -p integration-tests --target "$TARGET" -- --include-ignored --test-threads=1 "$@"
+    cargo test \
+        --manifest-path crates/integration-tests/Cargo.toml \
+        --target "$TARGET" \
+        -- --include-ignored --test-threads=1 "$@"

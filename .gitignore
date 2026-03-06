@@ -2,6 +2,7 @@
 /bin
 /pkg
 /target
+/crates/integration-tests/target
 
 # env
 .env*

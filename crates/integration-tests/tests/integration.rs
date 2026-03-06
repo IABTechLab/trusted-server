@@ -108,10 +108,10 @@ fn wait_for_container(base_url: &str, health_path: &str) -> error_stack::Result<
     let url = format!("{base_url}{health_path}");
 
     for _ in 0..60 {
-        if let Ok(resp) = reqwest::blocking::get(&url) {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(resp) = reqwest::blocking::get(&url)
+            && resp.status().is_success()
+        {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
     }

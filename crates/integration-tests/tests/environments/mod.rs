@@ -50,17 +50,17 @@ pub fn wait_for_ready(base_url: &str, health_path: &str) -> error_stack::Result<
     let health_url = format!("{}{}", base_url, health_path);
 
     for _ in 0..30 {
-        if let Ok(resp) = reqwest::blocking::get(&health_url) {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(resp) = reqwest::blocking::get(&health_url)
+            && resp.status().is_success()
+        {
+            return Ok(());
         }
 
         // Fallback: try root path — a 404 means the server is responsive
-        if let Ok(resp) = reqwest::blocking::get(base_url) {
-            if resp.status().is_success() || resp.status().as_u16() == 404 {
-                return Ok(());
-            }
+        if let Ok(resp) = reqwest::blocking::get(base_url)
+            && (resp.status().is_success() || resp.status().as_u16() == 404)
+        {
+            return Ok(());
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
