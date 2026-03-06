@@ -110,34 +110,49 @@ For each changed file, evaluate:
 
 ### 5. Classify findings
 
-Assign each finding a severity. Use emojis from the project's
+Tag each finding with an emoji from the project's
 [code review emoji guide](https://github.com/erikthedeveloper/code-review-emoji-guide)
-(referenced in `CONTRIBUTING.md`):
+(referenced in `CONTRIBUTING.md`). The emoji communicates **reviewer intent** —
+whether a comment requires action, is a suggestion, or is informational.
 
-| Severity     | Emoji | Criteria                                                           |
-| ------------ | ----- | ------------------------------------------------------------------ |
-| P0 — Blocker | 🔧    | Must fix before merge: bugs, data loss, security, CI failures      |
-| P1 — High    | 🔧    | Should fix: race conditions, API design issues, missing validation |
-| P2 — Medium  | 🤔    | Recommended: inconsistencies, test gaps, dead code                 |
-| P3 — Low     | ⛏     | Nice to have: style, minor improvements, documentation             |
+#### Blocking (merge cannot proceed)
 
-Also use 👍 to highlight particularly good code or design decisions.
+| Emoji | Tag        | Use when                                                         |
+| ----- | ---------- | ---------------------------------------------------------------- |
+| 🔧    | **wrench** | A necessary change: bugs, data loss, security, missing validation, CI failures |
+| ❓    | **question** | A question that must be answered before you can complete the review |
+
+#### Non-blocking (merge can proceed)
+
+| Emoji | Tag              | Use when                                                              |
+| ----- | ---------------- | --------------------------------------------------------------------- |
+| 🤔    | **thinking**     | Thinking aloud — expressing a concern or exploring alternatives       |
+| ♻️    | **refactor**     | A concrete refactoring suggestion with enough context to act on       |
+| 🌱    | **seedling**     | A future-focused observation — not for this PR but worth considering  |
+| 📝    | **note**         | An explanatory comment or context — no action required                |
+| ⛏     | **nitpick**      | A stylistic or formatting preference — does not require changes       |
+| 🏕    | **camp site**    | An opportunity to leave the code better than you found it (boy scout rule) |
+| 📌    | **out of scope** | An important concern outside this PR's scope — needs a follow-up issue |
+| 👍    | **praise**       | Highlight particularly good code, design, or testing decisions        |
 
 ### 6. Present findings for user approval
 
 **Do not submit the review automatically.** Present all findings to the user
 organized by severity, with:
 
-- Severity and title
+- Emoji tag and title
 - File path and line number
 - Description and suggested fix
 - Whether it would be an inline comment or body-level finding
+
+Group findings into two sections: **Blocking** (🔧 / ❓) and **Non-blocking**
+(everything else). This makes it immediately clear what must be addressed.
 
 Ask the user which findings to include in the PR review. The user may:
 
 - Approve all findings
 - Exclude specific findings
-- Adjust severity levels
+- Change emoji tags
 - Edit descriptions
 - Add additional comments
 
@@ -149,10 +164,10 @@ After user approval, submit the selected findings as a formal review.
 
 #### Determine the review verdict
 
-- If any P0 findings are included: `CHANGES_REQUESTED`
-- If any P1 findings are included: `CHANGES_REQUESTED`
-- If only P2 or below: `COMMENT`
-- If no findings: `APPROVE`
+- If any 🔧 (wrench) findings are included: `REQUEST_CHANGES`
+- If any ❓ (question) findings are included: `COMMENT` (questions need answers, not change requests)
+- If only non-blocking findings (🤔 ♻️ 🌱 📝 ⛏ 🏕 📌 👍): `COMMENT`
+- If no findings (or only 👍 praise): `APPROVE`
 
 #### Build inline comments
 
@@ -165,7 +180,7 @@ comment. Use the file's **current line number** (not diff position) with the
   "path": "crates/common/src/publisher.rs",
   "line": 166,
   "side": "RIGHT",
-  "body": "🔧 **Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
+  "body": "🔧 **wrench** — Race condition: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
 }
 ````
 
@@ -179,23 +194,37 @@ concerns, architectural issues, dependency problems) in the review body:
 
 <1-2 sentence overview of the changes and overall assessment>
 
-## Findings
+## Blocking
 
-### 🔧 Blockers (P0)
-
-- **Title**: description (file:line)
-
-### 🔧 High (P1)
+### 🔧 wrench
 
 - **Title**: description (file:line)
 
-### 🤔 Medium (P2)
+### ❓ question
+
+- **Title**: description (file:line)
+
+## Non-blocking
+
+### 🤔 thinking
+
+- **Title**: description (file:line)
+
+### ♻️ refactor
+
+- **Title**: description (file:line)
+
+### 🌱 seedling / 🏕 camp site / 📌 out of scope
 
 - **Title**: description
 
-### ⛏ Low (P3)
+### ⛏ nitpick
 
 - **Title**: description
+
+### 👍 praise
+
+- **Title**: description (file:line)
 
 ## CI Status
 
@@ -204,6 +233,8 @@ concerns, architectural issues, dependency problems) in the review body:
 - rust tests: PASS/FAIL
 - js tests: PASS/FAIL
 ```
+
+Omit any section that has no findings — don't include empty headings.
 
 #### Submit the review
 
@@ -242,8 +273,8 @@ Where `comments.json` contains the array of inline comment objects.
 Output:
 
 - The review URL
-- Total findings by severity (e.g., "2 P0, 3 P1, 5 P2, 2 P3")
-- Whether the review requested changes or approved
+- Total findings by category (e.g., "2 🔧, 1 ❓, 3 🤔, 2 ⛏, 1 👍")
+- Whether the review requested changes, commented, or approved
 - Any CI failures encountered
 
 ## Rules
