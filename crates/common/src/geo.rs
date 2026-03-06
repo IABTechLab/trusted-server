@@ -102,6 +102,31 @@ impl GeoInfo {
     }
 }
 
+/// EU-27 + EEA-3 (Iceland, Liechtenstein, Norway) + UK (UK GDPR).
+///
+/// Two-letter ISO 3166-1 alpha-2 country codes for jurisdictions where GDPR
+/// or equivalent legislation applies. Used to infer GDPR applicability from
+/// IP-derived geolocation when a more authoritative signal (e.g. TCF consent
+/// string) is not yet available.
+const GDPR_COUNTRIES: &[&str] = &[
+    // EU-27
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
+    "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", // EEA (non-EU)
+    "IS", "LI", "NO", // UK GDPR
+    "GB",
+];
+
+/// Returns `true` if the given two-letter country code falls under GDPR
+/// jurisdiction (EU-27, EEA, or UK).
+///
+/// The comparison is case-insensitive. Returns `false` for empty or
+/// unrecognised codes.
+#[must_use]
+pub fn is_gdpr_country(country_code: &str) -> bool {
+    let upper = country_code.to_ascii_uppercase();
+    GDPR_COUNTRIES.contains(&upper.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +234,39 @@ mod tests {
             response.get_header(HEADER_X_GEO_CITY).is_some(),
             "should still set city header"
         );
+    }
+
+    #[test]
+    fn is_gdpr_country_detects_eu_members() {
+        assert!(is_gdpr_country("DE"), "Germany is EU");
+        assert!(is_gdpr_country("FR"), "France is EU");
+        assert!(is_gdpr_country("IT"), "Italy is EU");
+    }
+
+    #[test]
+    fn is_gdpr_country_detects_eea_and_uk() {
+        assert!(is_gdpr_country("NO"), "Norway is EEA");
+        assert!(is_gdpr_country("IS"), "Iceland is EEA");
+        assert!(is_gdpr_country("GB"), "UK has UK GDPR");
+    }
+
+    #[test]
+    fn is_gdpr_country_rejects_non_gdpr() {
+        assert!(!is_gdpr_country("US"), "US is not GDPR");
+        assert!(!is_gdpr_country("CN"), "China is not GDPR");
+        assert!(!is_gdpr_country("BR"), "Brazil is not GDPR");
+    }
+
+    #[test]
+    fn is_gdpr_country_is_case_insensitive() {
+        assert!(is_gdpr_country("de"), "lowercase should match");
+        assert!(is_gdpr_country("De"), "mixed case should match");
+    }
+
+    #[test]
+    fn is_gdpr_country_handles_empty_and_unknown() {
+        assert!(!is_gdpr_country(""), "empty string is not GDPR");
+        assert!(!is_gdpr_country("XX"), "unknown code is not GDPR");
     }
 
     #[test]

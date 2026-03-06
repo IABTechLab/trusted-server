@@ -2,7 +2,7 @@
 name = "trusted-server-openrtb"
 version = "0.1.0"
 authors = []
-edition = "2021"
+edition = "2024"
 publish = false
 license = "Apache-2.0"
 
@@ -10,7 +10,6 @@ license = "Apache-2.0"
 workspace = true
 
 [dependencies]
-prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

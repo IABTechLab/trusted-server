@@ -16,7 +16,7 @@ use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -217,33 +217,12 @@ pub fn convert_to_openrtb_response(
             })
         })?;
 
-        let width = match i32::try_from(bid.width) {
-            Ok(converted) => Some(converted),
-            Err(_) => {
-                log::warn!(
-                    "Auction response: omitting bid width for auction {} slot {} bidder {} because width {} exceeds i32::MAX",
-                    auction_request.id,
-                    slot_id,
-                    bid.bidder,
-                    bid.width
-                );
-                None
-            }
-        };
-
-        let height = match i32::try_from(bid.height) {
-            Ok(converted) => Some(converted),
-            Err(_) => {
-                log::warn!(
-                    "Auction response: omitting bid height for auction {} slot {} bidder {} because height {} exceeds i32::MAX",
-                    auction_request.id,
-                    slot_id,
-                    bid.bidder,
-                    bid.height
-                );
-                None
-            }
-        };
+        let bid_context = format!(
+            "auction {} slot {} bidder {}",
+            auction_request.id, slot_id, bid.bidder
+        );
+        let width = to_openrtb_i32(bid.width, "width", &bid_context);
+        let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
         // Process creative HTML if present - rewrite URLs and return inline
         let creative_html = if let Some(ref raw_creative) = bid.creative {

@@ -16,6 +16,7 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::geo::is_gdpr_country;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -23,8 +24,8 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher,
-    Regs, RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
+    to_openrtb_i32, Banner, Device, Format, Geo, Imp, ImpExt, OpenRtbRequest, PrebidExt,
+    PrebidImpExt, Publisher, Regs, RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -33,6 +34,17 @@ const PREBID_INTEGRATION_ID: &str = "prebid";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
 const ZONE_KEY: &str = "zone";
+
+/// Default currency for `OpenRTB` bid floors and responses.
+const DEFAULT_CURRENCY: &str = "USD";
+
+/// CCPA/US-privacy string sent when the `Sec-GPC` header signals opt-out.
+///
+/// Encodes: notice given (`1`), user opted out (`Y`), LSPA not signed (`N`).
+/// The opt-out (position 2 = `Y`) matches GPC intent. Position 3 (`N` = LSPA
+/// not applicable) is a conservative default that may not hold for all
+/// publishers — consider making this configurable per-publisher in the future.
+const GPC_US_PRIVACY: &str = "1YYN";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -465,21 +477,6 @@ fn append_query_params(url: &str, params: &str) -> String {
     }
 }
 
-fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
-    match i32::try_from(value) {
-        Ok(converted) => Some(converted),
-        Err(_) => {
-            log::warn!(
-                "prebid: omitting {}={} for {} because value exceeds i32::MAX",
-                field_name,
-                value,
-                context
-            );
-            None
-        }
-    }
-}
-
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
@@ -584,10 +581,10 @@ impl PrebidAuctionProvider {
                         ..Default::default()
                     }),
                     bidfloor: slot.floor_price,
-                    // NOTE: Currency is hardcoded to USD. If multi-currency
-                    // support is needed, this should come from config or the
-                    // AdSlot itself.
-                    bidfloorcur: slot.floor_price.map(|_| "USD".to_string()),
+                    // NOTE: Currency defaults to DEFAULT_CURRENCY. If
+                    // multi-currency support is needed, this should come from
+                    // config or the AdSlot itself.
+                    bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_string()),
                     secure: Some(true), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
                     ext: ImpExt {
@@ -632,11 +629,13 @@ impl PrebidAuctionProvider {
             .request
             .get_header_str(header::ACCEPT_LANGUAGE)
             .and_then(|v| {
-                // Extract the primary language tag (e.g., "en" from "en-US,en;q=0.9")
+                // Extract the primary ISO-639 language tag (e.g., "en" from
+                // "en-US,en;q=0.9"). Strip the region subtag so bidders get a
+                // normalised two-letter code that maximises match quality.
                 v.split(',')
                     .next()
                     .and_then(|tag| tag.split(';').next())
-                    .map(|tag| tag.trim().to_string())
+                    .map(|tag| tag.split('-').next().unwrap_or(tag).trim().to_string())
             });
 
         // Build device object with user-agent, client IP, geo, DNT, and language.
@@ -666,28 +665,40 @@ impl PrebidAuctionProvider {
             ..Default::default()
         });
 
-        // Build regs object. Set GDPR flag when consent string is present,
-        // and us_privacy when Sec-GPC header signals opt-out.
+        // Build regs object.
         //
-        // NOTE: Setting gdpr=1 whenever a TCF consent string exists is the
-        // conservative approach — it may reduce fill for non-EU traffic where
-        // a CMP sets a consent string regardless of jurisdiction. A more
-        // precise approach would derive GDPR applicability from the consent
-        // string itself (segment 0 encodes `isSubjectToGDPR`) or from user
-        // geo (EU/EEA country check).
-        let has_consent = request.user.consent.is_some();
+        // GDPR applicability is determined from the user's geo (EU/EEA/UK
+        // country check). When geo is unavailable we fall back to the
+        // conservative assumption that GDPR applies if a consent string is
+        // present. A future enhancement can parse TCF segment 0 for the
+        // authoritative `isSubjectToGDPR` signal.
+        //
+        // us_privacy is set when Sec-GPC header signals opt-out.
+        let gdpr_from_geo = request
+            .device
+            .as_ref()
+            .and_then(|d| d.geo.as_ref())
+            .map(|geo| is_gdpr_country(&geo.country));
+
+        let gdpr = match gdpr_from_geo {
+            Some(applies) => Some(applies),
+            // No geo available — conservatively assume GDPR if consent string
+            // is present (a CMP was active).
+            None => request.user.consent.as_ref().map(|_| true),
+        };
+
         let has_gpc = context
             .request
             .get_header_str("Sec-GPC")
             .is_some_and(|v| v.trim() == "1");
 
-        let regs = if has_consent || has_gpc {
-            let gdpr = if has_consent { Some(true) } else { None };
-            let us_privacy = if has_gpc {
-                Some("1YYN".to_string())
-            } else {
-                None
-            };
+        let us_privacy = if has_gpc {
+            Some(GPC_US_PRIVACY.to_string())
+        } else {
+            None
+        };
+
+        let regs = if gdpr.is_some() || us_privacy.is_some() {
             Some(Regs {
                 gdpr,
                 us_privacy,
@@ -754,7 +765,7 @@ impl PrebidAuctionProvider {
             regs,
             test: self.config.test_mode.then_some(true),
             tmax,
-            cur: vec!["USD".to_string()],
+            cur: vec![DEFAULT_CURRENCY.to_string()],
             ext,
             ..Default::default()
         }
@@ -885,7 +896,7 @@ impl PrebidAuctionProvider {
         Ok(AuctionBid {
             slot_id,
             price: Some(price), // Prebid provides decoded prices
-            currency: "USD".to_string(),
+            currency: DEFAULT_CURRENCY.to_string(),
             creative,
             adomain,
             bidder: seat.to_string(),
@@ -1601,20 +1612,14 @@ server_url = "https://prebid.example"
             "debug alone should not set top-level OpenRTB test field"
         );
 
-        let prebid_ext = openrtb
-            .ext
-            .as_ref()
-            .and_then(|ext| ext.get("prebid"))
-            .expect("should include ext.prebid");
+        let prebid_ext = get_prebid_ext(&openrtb);
         assert_eq!(
-            prebid_ext.get("debug").and_then(serde_json::Value::as_bool),
+            prebid_ext.debug,
             Some(true),
             "should include ext.prebid.debug when debug is enabled"
         );
         assert_eq!(
-            prebid_ext
-                .get("returnallbidstatus")
-                .and_then(serde_json::Value::as_bool),
+            prebid_ext.returnallbidstatus,
             Some(true),
             "should include ext.prebid.returnallbidstatus when debug is enabled"
         );
@@ -1710,19 +1715,13 @@ server_url = "https://prebid.example"
             "should omit top-level OpenRTB test field when test_mode is disabled"
         );
 
-        let prebid_ext = openrtb
-            .ext
-            .as_ref()
-            .and_then(|ext| ext.get("prebid"))
-            .expect("should include ext.prebid");
+        let prebid_ext = get_prebid_ext(&openrtb);
         assert_eq!(
-            prebid_ext.get("debug"),
-            None,
+            prebid_ext.debug, None,
             "should omit ext.prebid.debug when debug is disabled"
         );
         assert_eq!(
-            prebid_ext.get("returnallbidstatus"),
-            None,
+            prebid_ext.returnallbidstatus, None,
             "should omit ext.prebid.returnallbidstatus when debug is disabled"
         );
 
@@ -1810,10 +1809,24 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn to_openrtb_includes_consent_and_gdpr_flag() {
+    fn to_openrtb_includes_consent_and_gdpr_flag_from_geo() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        // Set device with EU geo so GDPR applies from geo check
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: Some(GeoInfo {
+                city: "Berlin".to_string(),
+                country: "DE".to_string(),
+                continent: "EU".to_string(),
+                latitude: 52.52,
+                longitude: 13.405,
+                metro_code: 0,
+                region: None,
+            }),
+        });
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
@@ -1829,14 +1842,67 @@ server_url = "https://prebid.example"
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
             Some(true),
-            "should set regs.gdpr when consent is present"
+            "should set regs.gdpr=true for EU country"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_gdpr_false_for_non_eu_country() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        // US geo — GDPR should not apply
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: Some(GeoInfo {
+                city: "New York".to_string(),
+                country: "US".to_string(),
+                continent: "NA".to_string(),
+                latitude: 40.7128,
+                longitude: -74.006,
+                metro_code: 501,
+                region: Some("NY".to_string()),
+            }),
+        });
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.regs.as_ref().and_then(|r| r.gdpr),
+            Some(false),
+            "should set regs.gdpr=false for non-EU country even with consent string"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_falls_back_to_consent_when_no_geo() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        // No device/geo
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.regs.as_ref().and_then(|r| r.gdpr),
+            Some(true),
+            "should conservatively assume GDPR when geo is absent but consent exists"
         );
     }
 
     #[test]
     fn to_openrtb_omits_regs_when_no_consent_or_gpc() {
         let provider = PrebidAuctionProvider::new(base_config());
-        let auction_request = create_test_auction_request(); // consent=None
+        let auction_request = create_test_auction_request(); // consent=None, no geo
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
@@ -1862,7 +1928,7 @@ server_url = "https://prebid.example"
 
         assert_eq!(
             regs.us_privacy.as_deref(),
-            Some("1YYN"),
+            Some(GPC_US_PRIVACY),
             "should set us_privacy from Sec-GPC: 1"
         );
     }
@@ -1926,8 +1992,8 @@ server_url = "https://prebid.example"
 
         assert_eq!(
             device.language.as_deref(),
-            Some("en-US"),
-            "should extract primary language tag"
+            Some("en"),
+            "should extract primary ISO-639 language tag (stripped of locale subtag)"
         );
     }
 
@@ -2238,6 +2304,14 @@ server_url = "https://prebid.example"
             .and_then(|p| p.get("bidder"))
             .and_then(|b| b.as_object())
             .expect("should have prebid.bidder in imp ext")
+    }
+
+    /// Typed helper to extract `ext.prebid` from an `OpenRTB` request,
+    /// deserialising into [`PrebidExt`] so test assertions catch field name
+    /// typos at compile time.
+    fn get_prebid_ext(req: &OpenRtbRequest) -> PrebidExt {
+        let ext = req.ext.as_ref().expect("should have request ext");
+        serde_json::from_value(ext["prebid"].clone()).expect("should deserialise ext.prebid")
     }
 
     // ========================================================================
