@@ -635,7 +635,13 @@ impl PrebidAuctionProvider {
                 v.split(',')
                     .next()
                     .and_then(|tag| tag.split(';').next())
-                    .map(|tag| tag.split('-').next().unwrap_or(tag).trim().to_string())
+                    .map(|tag| {
+                        tag.split('-')
+                            .next()
+                            .expect("should have at least one split segment")
+                            .trim()
+                            .to_string()
+                    })
             });
 
         // Build device object with user-agent, client IP, geo, DNT, and language.

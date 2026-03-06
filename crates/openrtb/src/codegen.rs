@@ -145,7 +145,10 @@ fn postprocess(code: &str) -> String {
             struct_ext_stack.push(brace_depth + 1);
         }
 
-        // Count braces on the current line.
+        // Count braces on the current line to track struct scope depth.
+        // NOTE: This assumes no string literals contain unbalanced braces.
+        // That holds for prost-generated output but would need revision for
+        // other inputs (e.g. code with brace-containing default values).
         for ch in trimmed.chars() {
             match ch {
                 '{' => brace_depth += 1,
