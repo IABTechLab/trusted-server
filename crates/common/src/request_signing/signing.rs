@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
+use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
 
 /// Retrieves the current active key ID from the config store.
 ///
@@ -17,7 +18,7 @@ use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 ///
 /// Returns an error if the config store cannot be accessed or the current-kid key is not found.
 pub fn get_current_key_id() -> Result<String, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new("jwks_store");
+    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     store.get("current-kid")
 }
 
@@ -119,7 +120,7 @@ impl RequestSigner {
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
     pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
-        let config_store = FastlyConfigStore::new("jwks_store");
+        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
         let key_id =
             config_store
                 .get("current-kid")
@@ -127,7 +128,7 @@ impl RequestSigner {
                     message: "Failed to get current-kid".into(),
                 })?;
 
-        let secret_store = FastlySecretStore::new("signing_keys");
+        let secret_store = FastlySecretStore::new(SIGNING_SECRET_STORE_NAME);
         let key_bytes = secret_store
             .get(&key_id)
             .attach(format!("Failed to get signing key for kid: {}", key_id))?;
@@ -177,7 +178,7 @@ pub fn verify_signature(
     signature_b64: &str,
     kid: &str,
 ) -> Result<bool, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new("jwks_store");
+    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     let jwk_json = store
         .get(kid)
         .change_context(TrustedServerError::Configuration {
