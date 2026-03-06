@@ -16,7 +16,7 @@ use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid};
+use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
 use crate::settings::Settings;
 use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
@@ -205,7 +205,7 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
-    let mut seatbids = Vec::new();
+    let mut seatbids = Vec::with_capacity(result.winning_bids.len());
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -216,6 +216,13 @@ pub fn convert_to_openrtb_response(
                 ),
             })
         })?;
+
+        let bid_context = format!(
+            "auction {} slot {} bidder {}",
+            auction_request.id, slot_id, bid.bidder
+        );
+        let width = to_openrtb_i32(bid.width, "width", &bid_context);
+        let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
         // Process creative HTML if present - rewrite URLs and return inline
         let creative_html = if let Some(ref raw_creative) = bid.creative {
@@ -241,19 +248,21 @@ pub fn convert_to_openrtb_response(
         };
 
         let openrtb_bid = OpenRtbBid {
-            id: format!("{}-{}", bid.bidder, slot_id),
-            impid: slot_id.to_string(),
-            price,
+            id: Some(format!("{}-{}", bid.bidder, slot_id)),
+            impid: Some(slot_id.to_string()),
+            price: Some(price),
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
-            w: Some(bid.width),
-            h: Some(bid.height),
-            adomain: Some(bid.adomain.clone().unwrap_or_default()),
+            w: width,
+            h: height,
+            adomain: bid.adomain.clone().unwrap_or_default(),
+            ..Default::default()
         };
 
         seatbids.push(SeatBid {
             seat: Some(bid.bidder.clone()),
             bid: vec![openrtb_bid],
+            ..Default::default()
         });
     }
 
@@ -272,9 +281,9 @@ pub fn convert_to_openrtb_response(
         .collect();
 
     let response_body = OpenRtbResponse {
-        id: auction_request.id.to_string(),
+        id: Some(auction_request.id.to_string()),
         seatbid: seatbids,
-        ext: Some(ResponseExt {
+        ext: ResponseExt {
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),
                 providers: result.provider_responses.len(),
@@ -282,7 +291,9 @@ pub fn convert_to_openrtb_response(
                 time_ms: result.total_time_ms,
                 provider_details,
             },
-        }),
+        }
+        .to_ext(),
+        ..Default::default()
     };
 
     let body_bytes =

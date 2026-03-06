@@ -1,0 +1,736 @@
+// OpenRTB 2.6 Protocol Buffer schema.
+//
+// Derived from the IAB Tech Lab OpenRTB proto (edition = "2023") and converted
+// to proto2 syntax so that prost generates `Option<T>` for every scalar field.
+//
+// Modifications from the upstream IAB proto:
+//   - Changed `edition = "2023"` to `syntax = "proto2"`.
+//   - Added `optional` keyword to all non-repeated fields.
+//   - Flattened `oneof` blocks into separate optional fields (JSON compat).
+//   - Removed `Ext` messages and `ext` fields (re-added by build.rs as
+//     `Option<serde_json::Map<String, Value>>`).
+//   - Removed InterestGroupAuction* types and google/protobuf/struct.proto
+//     import (not used).
+//   - Removed `extensions` declarations (not supported by prost).
+//
+// Copyright 2020 IAB Tech Lab — Apache License 2.0.
+
+syntax = "proto2";
+
+package com.iabtechlab.openrtb.v2;
+
+// OpenRTB 2.0: The top-level bid request object.
+message BidRequest {
+  optional string id = 1;
+  repeated Imp imp = 2;
+
+  // Distribution channel — flattened from oneof for JSON compat.
+  optional Site site = 3;
+  optional App app = 4;
+  optional Dooh dooh = 22;
+
+  optional Device device = 5;
+  optional User user = 6;
+  optional bool test = 15 [default = false];
+  optional int32 at = 7 [default = 2];
+  optional int32 tmax = 8;
+  repeated string wseat = 9;
+  repeated string bseat = 17;
+  optional bool allimps = 10 [default = false];
+  repeated string cur = 11;
+  repeated string wlang = 18;
+  repeated string wlangb = 20;
+  repeated string acat = 23;
+  repeated string bcat = 12;
+  optional int32 cattax = 21 [default = 1];
+  repeated string badv = 13;
+  repeated string bapp = 16;
+  optional Source source = 19;
+  optional Regs regs = 14;
+
+  // Source object.
+  message Source {
+    optional bool fd = 1;
+    optional string tid = 2;
+    optional string pchain = 3;
+    optional SupplyChain schain = 4;
+  }
+
+  // SupplyChain object.
+  message SupplyChain {
+    optional bool complete = 1;
+    repeated SupplyChainNode nodes = 2;
+    optional string ver = 3;
+  }
+
+  // SupplyChainNode object.
+  message SupplyChainNode {
+    optional string asi = 1;
+    optional string sid = 2;
+    optional string rid = 3;
+    optional string name = 4;
+    optional string domain = 5;
+    optional bool hp = 6;
+  }
+
+  // Imp object.
+  message Imp {
+    optional string id = 1;
+    repeated Metric metric = 17;
+    optional Banner banner = 2;
+    optional Video video = 3;
+    optional Audio audio = 15;
+    optional Native native = 13;
+    optional Pmp pmp = 11;
+    optional string displaymanager = 4;
+    optional string displaymanagerver = 5;
+    optional bool instl = 6;
+    optional string tagid = 7;
+    optional double bidfloor = 8 [default = 0];
+    optional string bidfloorcur = 9 [default = "USD"];
+    optional bool clickbrowser = 16;
+    optional bool secure = 12;
+    repeated string iframebuster = 10;
+    optional bool rwdd = 18 [default = false];
+    optional int32 ssai = 19 [default = 0];
+    optional int32 exp = 14;
+    optional Qty qty = 20;
+    optional double dt = 21;
+    optional Refresh refresh = 22;
+  }
+
+  // Metric object.
+  message Metric {
+    optional string type = 1;
+    optional double value = 2;
+    optional string vendor = 3;
+  }
+
+  // Banner object.
+  message Banner {
+    repeated Format format = 15;
+    optional int32 w = 1;
+    optional int32 h = 2;
+    repeated int32 btype = 5;
+    repeated int32 battr = 6;
+    optional int32 pos = 4;
+    repeated string mimes = 7;
+    optional bool topframe = 8;
+    repeated int32 expdir = 9;
+    repeated int32 api = 10;
+    optional string id = 3;
+    optional bool vcm = 16;
+    optional int32 wmax = 11 [deprecated = true];
+    optional int32 hmax = 12 [deprecated = true];
+    optional int32 wmin = 13 [deprecated = true];
+    optional int32 hmin = 14 [deprecated = true];
+  }
+
+  // Format object.
+  message Format {
+    optional int32 w = 1;
+    optional int32 h = 2;
+    optional int32 wratio = 3;
+    optional int32 hratio = 4;
+    optional int32 wmin = 5;
+  }
+
+  // Video object.
+  message Video {
+    repeated string mimes = 1;
+    optional int32 minduration = 3 [default = 0];
+    optional int32 maxduration = 4;
+    optional int32 startdelay = 8;
+    optional int32 maxseq = 28;
+    optional int32 poddur = 29;
+    repeated int32 protocols = 21;
+    optional int32 w = 6;
+    optional int32 h = 7;
+    optional string podid = 30;
+    optional int32 podseq = 31 [default = 0];
+    repeated int32 rqddurs = 32;
+    optional int32 placement = 26 [deprecated = true];
+    optional int32 plcmt = 35;
+    optional int32 linearity = 2;
+    optional bool skip = 23;
+    optional int32 skipmin = 24;
+    optional int32 skipafter = 25;
+    optional int32 sequence = 9 [default = 0, deprecated = true];
+    optional int32 slotinpod = 33 [default = 0];
+    optional double mincpmpersec = 34;
+    repeated int32 battr = 10;
+    optional int32 maxextended = 11;
+    optional int32 minbitrate = 12;
+    optional int32 maxbitrate = 13;
+    optional bool boxingallowed = 14 [default = true];
+    repeated int32 playbackmethod = 15;
+    optional int32 playbackend = 27;
+    repeated int32 delivery = 16;
+    optional int32 pos = 17;
+    repeated Banner companionad = 18;
+    repeated int32 api = 19;
+    repeated int32 companiontype = 20;
+    repeated int32 poddedupe = 37;
+    repeated DurFloors durfloors = 36;
+    optional int32 protocol = 5 [deprecated = true];
+
+    reserved 22;
+  }
+
+  // Audio object.
+  message Audio {
+    repeated string mimes = 1;
+    optional int32 minduration = 2 [default = 0];
+    optional int32 maxduration = 3;
+    optional int32 poddur = 25;
+    repeated int32 protocols = 4;
+    optional int32 startdelay = 5;
+    repeated int32 rqddurs = 26;
+    optional string podid = 27;
+    optional int32 podseq = 28 [default = 0];
+    optional int32 sequence = 6 [default = 0, deprecated = true];
+    optional int32 slotinpod = 29 [default = 0];
+    optional double mincpmpersec = 30;
+    repeated int32 battr = 7;
+    optional int32 maxextended = 8;
+    optional int32 minbitrate = 9;
+    optional int32 maxbitrate = 10;
+    repeated int32 delivery = 11;
+    repeated Banner companionad = 12;
+    repeated int32 api = 13;
+    repeated int32 companiontype = 20;
+    optional int32 maxseq = 21;
+    optional int32 feed = 22;
+    optional bool stitched = 23;
+    optional int32 nvol = 24;
+    repeated DurFloors durfloors = 31;
+  }
+
+  // Native object.
+  // Flattened from oneof request_oneof for JSON compat.
+  message Native {
+    optional string request = 1;
+    optional NativeRequest request_native = 50;
+    optional string ver = 2;
+    repeated int32 api = 3;
+    repeated int32 battr = 4;
+  }
+
+  // Qty object.
+  message Qty {
+    optional double multiplier = 1;
+    optional int32 sourcetype = 2;
+    optional string vendor = 3;
+  }
+
+  // Refresh object.
+  message Refresh {
+    repeated RefSettings refsettings = 1;
+    optional int32 count = 2;
+  }
+
+  // RefSettings object.
+  message RefSettings {
+    optional int32 reftype = 1 [default = 0];
+    optional int32 minint = 2;
+  }
+
+  // Pmp object.
+  message Pmp {
+    optional bool private_auction = 1 [default = false];
+    repeated Deal deals = 2;
+  }
+
+  // Deal object.
+  message Deal {
+    optional string id = 1;
+    optional double bidfloor = 2 [default = 0];
+    optional string bidfloorcur = 3 [default = "USD"];
+    optional int32 at = 6;
+    repeated string wseat = 4;
+    repeated string wadomain = 5;
+    optional int32 guar = 7 [default = 0];
+    optional double mincpmpersec = 8;
+    repeated DurFloors durfloors = 9;
+  }
+
+  // Site object.
+  message Site {
+    optional string id = 1;
+    optional string name = 2;
+    optional string domain = 3;
+    optional int32 cattax = 16 [default = 1];
+    repeated string cat = 4;
+    repeated string sectioncat = 5;
+    repeated string pagecat = 6;
+    optional string page = 7;
+    optional string ref = 9;
+    optional string search = 10;
+    optional bool mobile = 15;
+    optional bool privacypolicy = 8;
+    optional Publisher publisher = 11;
+    optional Content content = 12;
+    optional string keywords = 13;
+    repeated string kwarray = 18;
+    optional string inventorypartnerdomain = 17;
+
+    reserved 14;
+  }
+
+  // App object.
+  message App {
+    optional string id = 1;
+    optional string name = 2;
+    optional string bundle = 8;
+    optional string domain = 3;
+    optional string storeurl = 16;
+    optional int32 cattax = 17 [default = 1];
+    repeated string cat = 4;
+    repeated string sectioncat = 5;
+    repeated string pagecat = 6;
+    optional string ver = 7;
+    optional bool privacypolicy = 9;
+    optional bool paid = 10;
+    optional Publisher publisher = 11;
+    optional Content content = 12;
+    optional string keywords = 13;
+    repeated string kwarray = 19;
+    optional string inventorypartnerdomain = 18;
+
+    reserved 14;
+  }
+
+  // Dooh object.
+  message Dooh {
+    optional string id = 1;
+    optional string name = 2;
+    repeated string venuetype = 3;
+    optional int32 venuetypetax = 4 [default = 1];
+    optional Publisher publisher = 5;
+    optional string domain = 6;
+    optional string keywords = 7;
+    optional Content content = 8;
+  }
+
+  // Publisher object.
+  message Publisher {
+    optional string id = 1;
+    optional string name = 2;
+    optional int32 cattax = 5 [default = 1];
+    repeated string cat = 3;
+    optional string domain = 4;
+  }
+
+  // Content object.
+  message Content {
+    optional string id = 1;
+    optional int32 episode = 2;
+    optional string title = 3;
+    optional string series = 4;
+    optional string season = 5;
+    optional string artist = 21;
+    optional string genre = 22;
+    optional int32 gtax = 33 [default = 9];
+    repeated string genres = 35;
+    optional string album = 23;
+    optional string isrc = 24;
+    optional Producer producer = 15;
+    optional string url = 6;
+    optional int32 cattax = 27 [default = 1];
+    repeated string cat = 7;
+    optional int32 prodq = 25;
+    optional int32 context = 20;
+    optional string contentrating = 10;
+    optional string userrating = 11;
+    optional int32 qagmediarating = 17;
+    optional string keywords = 9;
+    repeated string kwarray = 32;
+    optional bool livestream = 13;
+    optional bool sourcerelationship = 14;
+    optional int32 len = 16;
+    optional string language = 19;
+    optional string langb = 29;
+    optional bool embeddable = 18;
+    repeated Data data = 28;
+    optional Network network = 30;
+    optional Channel channel = 31;
+    optional int32 videoquality = 8 [deprecated = true];
+
+    reserved 12, 26, 34;
+  }
+
+  // Producer object.
+  message Producer {
+    optional string id = 1;
+    optional string name = 2;
+    optional int32 cattax = 5 [default = 1];
+    repeated string cat = 3;
+    optional string domain = 4;
+  }
+
+  // Network object.
+  message Network {
+    optional string id = 1;
+    optional string name = 2;
+    optional string domain = 3;
+  }
+
+  // Channel object.
+  message Channel {
+    optional string id = 1;
+    optional string name = 2;
+    optional string domain = 3;
+  }
+
+  // Device object.
+  message Device {
+    optional Geo geo = 4;
+    optional bool dnt = 1;
+    optional bool lmt = 23;
+    optional string ua = 2;
+    optional UserAgent sua = 31;
+    optional string ip = 3;
+    optional string ipv6 = 9;
+    optional int32 devicetype = 18;
+    optional string make = 12;
+    optional string model = 13;
+    optional string os = 14;
+    optional string osv = 15;
+    optional string hwv = 24;
+    optional int32 w = 25;
+    optional int32 h = 26;
+    optional int32 ppi = 27;
+    optional double pxratio = 28;
+    optional bool js = 16;
+    optional bool geofetch = 29;
+    optional string flashver = 19;
+    optional string language = 11;
+    optional string langb = 32;
+    optional string carrier = 10;
+    optional string mccmnc = 30;
+    optional int32 connectiontype = 17;
+    optional string ifa = 20;
+    optional string didsha1 = 5 [deprecated = true];
+    optional string didmd5 = 6 [deprecated = true];
+    optional string dpidsha1 = 7 [deprecated = true];
+    optional string dpidmd5 = 8 [deprecated = true];
+    optional string macsha1 = 21 [deprecated = true];
+    optional string macmd5 = 22 [deprecated = true];
+  }
+
+  // Geo object.
+  message Geo {
+    optional double lat = 1;
+    optional double lon = 2;
+    optional int32 type = 9;
+    optional int32 accuracy = 11;
+    optional int32 lastfix = 12;
+    optional int32 ipservice = 13;
+    optional string country = 3;
+    optional string region = 4;
+    optional string regionfips104 = 5;
+    optional string metro = 6;
+    optional string city = 7;
+    optional string zip = 8;
+    optional int32 utcoffset = 10;
+  }
+
+  // UserAgent object (Structured UA / Client Hints).
+  message UserAgent {
+    repeated BrandVersion browsers = 1;
+    optional BrandVersion platform = 2;
+    optional bool mobile = 3;
+    optional string architecture = 4;
+    optional string bitness = 5;
+    optional string model = 6;
+    optional int32 source = 7 [default = 0];
+  }
+
+  // BrandVersion object.
+  message BrandVersion {
+    optional string brand = 1;
+    repeated string version = 2;
+  }
+
+  // User object.
+  message User {
+    optional string id = 1;
+    optional string buyeruid = 2;
+    optional int32 yob = 3 [deprecated = true];
+    optional string gender = 4 [deprecated = true];
+    optional string keywords = 5;
+    repeated string kwarray = 9;
+    optional string customdata = 6;
+    optional Geo geo = 7;
+    repeated Data data = 8;
+    optional string consent = 10;
+    repeated EID eids = 11;
+  }
+
+  // EID (Extended Identifier) object.
+  message EID {
+    optional string inserter = 3;
+    optional string source = 1;
+    optional string matcher = 4;
+    optional int32 mm = 5;
+    repeated UID uids = 2;
+
+    // UID object.
+    message UID {
+      optional string id = 1;
+      optional int32 atype = 2;
+    }
+  }
+
+  // Data object.
+  message Data {
+    optional string id = 1;
+    optional string name = 2;
+    repeated Segment segment = 3;
+  }
+
+  // Segment object.
+  message Segment {
+    optional string id = 1;
+    optional string name = 2;
+    optional string value = 3;
+  }
+
+  // Regs object.
+  message Regs {
+    optional bool coppa = 1;
+    optional bool gdpr = 4;
+    optional string us_privacy = 5;
+    optional string gpp = 2;
+    repeated int32 gpp_sid = 3;
+  }
+
+  // DurFloors object.
+  message DurFloors {
+    optional int32 mindur = 1;
+    optional int32 maxdur = 2;
+    optional double bidfloor = 3 [default = 0.0];
+  }
+}
+
+// BidResponse — top-level response object.
+message BidResponse {
+  optional string id = 1;
+  repeated SeatBid seatbid = 2;
+  optional string bidid = 3;
+  optional string cur = 4;
+  optional string customdata = 5;
+  optional int32 nbr = 6;
+
+  // SeatBid object.
+  message SeatBid {
+    repeated Bid bid = 1;
+    optional string seat = 2;
+    optional bool group = 3 [default = false];
+  }
+
+  // Bid object.
+  message Bid {
+    optional string id = 1;
+    optional string impid = 2;
+    optional double price = 3;
+    optional string nurl = 5;
+    optional string burl = 22;
+    optional string lurl = 23;
+
+    // Flattened from oneof adm_oneof for JSON compat.
+    optional string adm = 6;
+    optional NativeResponse adm_native = 50;
+
+    optional string adid = 4;
+    repeated string adomain = 7;
+    optional string bundle = 14;
+    optional string iurl = 8;
+    optional string cid = 9;
+    optional string crid = 10;
+    optional string tactic = 24;
+    optional int32 cattax = 30 [default = 1];
+    repeated string cat = 15;
+    repeated int32 attr = 11;
+    repeated int32 apis = 31;
+    optional int32 api = 18 [deprecated = true];
+    optional int32 protocol = 19;
+    optional int32 qagmediarating = 20;
+    optional string language = 25;
+    optional string langb = 29;
+    optional string dealid = 13;
+    optional int32 w = 16;
+    optional int32 h = 17;
+    optional int32 wratio = 26;
+    optional int32 hratio = 27;
+    optional int32 exp = 21;
+    optional int32 dur = 32;
+    optional int32 mtype = 33;
+    optional int32 slotinpod = 28 [default = 0];
+  }
+}
+
+// Transparency object (shared by request and response DSA).
+message Transparency {
+  optional string domain = 1;
+  repeated int32 dsaparams = 2;
+}
+
+// NativeRequest object.
+message NativeRequest {
+  optional string ver = 1;
+  optional int32 layout = 2;
+  optional int32 adunit = 3;
+  optional int32 context = 7;
+  optional int32 contextsubtype = 8;
+  optional int32 plcmttype = 9;
+  optional int32 plcmtcnt = 4 [default = 1];
+  optional int32 seq = 5 [default = 0];
+  repeated Asset assets = 6;
+  optional bool aurlsupport = 11;
+  optional bool durlsupport = 12;
+  repeated EventTrackers eventtrackers = 13;
+  optional bool privacy = 14;
+
+  // Asset object.
+  message Asset {
+    optional int32 id = 1;
+    optional bool required = 2 [default = false];
+    optional Title title = 3;
+    optional Image img = 4;
+    optional BidRequest.Video video = 5;
+    optional Data data = 6;
+  }
+
+  // Title object.
+  message Title {
+    optional int32 len = 1;
+  }
+
+  // Image object.
+  message Image {
+    optional int32 type = 1;
+    optional int32 w = 2;
+    optional int32 h = 3;
+    optional int32 wmin = 4;
+    optional int32 hmin = 5;
+    repeated string mimes = 6;
+  }
+
+  // Data object.
+  message Data {
+    optional int32 type = 1;
+    optional int32 len = 2;
+  }
+
+  // EventTrackers object.
+  message EventTrackers {
+    optional int32 event = 1;
+    repeated int32 methods = 2;
+  }
+}
+
+// NativeResponse object.
+message NativeResponse {
+  optional string ver = 1;
+  repeated Asset assets = 2;
+  optional string assetsurl = 6;
+  optional string dcourl = 7;
+  optional Link link = 3;
+  repeated string imptrackers = 4;
+  optional string jstracker = 5;
+  repeated EventTracker eventtrackers = 8;
+  optional string privacy = 9;
+
+  // Link object.
+  message Link {
+    optional string url = 1;
+    repeated string clicktrackers = 2;
+    optional string fallback = 3;
+  }
+
+  // Asset object.
+  message Asset {
+    optional int32 id = 1;
+    optional bool required = 2 [default = false];
+    optional Title title = 3;
+    optional Image img = 4;
+    optional Video video = 5;
+    optional Data data = 6;
+    optional Link link = 7;
+  }
+
+  // Title object.
+  message Title {
+    optional string text = 1;
+    optional int32 len = 2;
+  }
+
+  // Image object.
+  message Image {
+    optional int32 type = 4;
+    optional string url = 1;
+    optional int32 w = 2;
+    optional int32 h = 3;
+  }
+
+  // Data object.
+  message Data {
+    optional int32 type = 3;
+    optional int32 len = 4;
+    optional string label = 1 [deprecated = true];
+    optional string value = 2;
+  }
+
+  // Video object.
+  message Video {
+    optional string vasttag = 1;
+  }
+
+  // EventTracker object.
+  message EventTracker {
+    optional int32 event = 1;
+    optional int32 method = 2;
+    optional string url = 3;
+    optional string customdata = 4;
+  }
+}
+
+// ***** OpenRTB Core enums ****************************************************
+
+enum BannerAdType {
+  BannerAdType_UNKNOWN = 0;
+  XHTML_TEXT_AD = 1;
+  XHTML_BANNER_AD = 2;
+  JAVASCRIPT_AD = 3;
+  IFRAME = 4;
+}
+
+// ***** OpenRTB Native enums **************************************************
+
+enum LayoutId {
+  LayoutId_UNKNOWN = 0;
+  CONTENT_WALL = 1;
+  APP_WALL = 2;
+  NEWS_FEED = 3;
+  CHAT_LIST = 4;
+  CAROUSEL = 5;
+  CONTENT_STREAM = 6;
+  GRID = 7;
+}
+
+enum AdUnitId {
+  AdUnitId_UNKNOWN = 0;
+  PAID_SEARCH_UNIT = 1;
+  RECOMMENDATION_WIDGET = 2;
+  PROMOTED_LISTING = 3;
+  IAB_IN_AD_NATIVE = 4;
+  ADUNITID_CUSTOM = 5;
+}
+
+enum ContextType {
+  ContextType_UNKNOWN = 0;
+  CONTENT = 1;
+  SOCIAL = 2;
+  PRODUCT = 3;
+}
