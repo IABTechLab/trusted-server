@@ -208,10 +208,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    // Then inject the TSJS bundle — its top-level init code can now
-                    // read the config that was set by the inline scripts above.
-                    let module_ids = integrations.js_module_ids();
-                    snippet.push_str(&tsjs::tsjs_script_tag(&module_ids));
+                    // Main bundle: core + non-deferred integrations (synchronous).
+                    let immediate_ids = integrations.js_module_ids_immediate();
+                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+                    // Deferred bundles: large modules like prebid loaded after
+                    // HTML parsing completes. Empty when none are enabled.
+                    let deferred_ids = integrations.js_module_ids_deferred();
+                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
