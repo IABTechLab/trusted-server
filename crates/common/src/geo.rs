@@ -102,19 +102,27 @@ impl GeoInfo {
     }
 }
 
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 /// EU-27 + EEA-3 (Iceland, Liechtenstein, Norway) + UK (UK GDPR).
 ///
 /// Two-letter ISO 3166-1 alpha-2 country codes for jurisdictions where GDPR
 /// or equivalent legislation applies. Used to infer GDPR applicability from
 /// IP-derived geolocation when a more authoritative signal (e.g. TCF consent
 /// string) is not yet available.
-const GDPR_COUNTRIES: &[&str] = &[
-    // EU-27
-    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
-    "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", // EEA (non-EU)
-    "IS", "LI", "NO", // UK GDPR
-    "GB",
-];
+static GDPR_COUNTRIES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        // EU-27
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT",
+        "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+        // EEA (non-EU)
+        "IS", "LI", "NO", // UK GDPR
+        "GB",
+    ]
+    .into_iter()
+    .collect()
+});
 
 /// Returns `true` if the given two-letter country code falls under GDPR
 /// jurisdiction (EU-27, EEA, or UK).
@@ -124,7 +132,7 @@ const GDPR_COUNTRIES: &[&str] = &[
 #[must_use]
 pub fn is_gdpr_country(country_code: &str) -> bool {
     let upper = country_code.to_ascii_uppercase();
-    GDPR_COUNTRIES.contains(&upper.as_str())
+    GDPR_COUNTRIES.contains(upper.as_str())
 }
 
 #[cfg(test)]

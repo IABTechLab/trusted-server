@@ -38,6 +38,14 @@ pub mod bool_as_int {
         match value {
             Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
             Some(serde_json::Value::Number(n)) => Ok(Some(n.as_i64() != Some(0))),
+            // Some bidders send boolean-as-int fields as strings (e.g.
+            // `"secure": "1"` instead of `"secure": 1`). Accept the common
+            // string representations for robustness.
+            Some(serde_json::Value::String(ref s)) => match s.as_str() {
+                "1" | "true" => Ok(Some(true)),
+                "0" | "false" => Ok(Some(false)),
+                _ => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -266,11 +274,46 @@ mod tests {
     }
 
     #[test]
-    fn bool_as_int_deserializes_string_to_none() {
-        // String values like "1" are not valid boolean-as-int — should yield None.
+    fn bool_as_int_deserializes_string_one_as_true() {
         let wrapper: BoolAsIntWrapper =
             serde_json::from_str(r#"{"flag": "1"}"#).expect("should handle string");
-        assert_eq!(wrapper.flag, None, "string '1' should be treated as None");
+        assert_eq!(
+            wrapper.flag,
+            Some(true),
+            "string '1' should be treated as true"
+        );
+    }
+
+    #[test]
+    fn bool_as_int_deserializes_string_zero_as_false() {
+        let wrapper: BoolAsIntWrapper =
+            serde_json::from_str(r#"{"flag": "0"}"#).expect("should handle string");
+        assert_eq!(
+            wrapper.flag,
+            Some(false),
+            "string '0' should be treated as false"
+        );
+    }
+
+    #[test]
+    fn bool_as_int_deserializes_string_true_as_true() {
+        let wrapper: BoolAsIntWrapper =
+            serde_json::from_str(r#"{"flag": "true"}"#).expect("should handle string");
+        assert_eq!(
+            wrapper.flag,
+            Some(true),
+            "string 'true' should be treated as true"
+        );
+    }
+
+    #[test]
+    fn bool_as_int_deserializes_unknown_string_to_none() {
+        let wrapper: BoolAsIntWrapper =
+            serde_json::from_str(r#"{"flag": "yes"}"#).expect("should handle string");
+        assert_eq!(
+            wrapper.flag, None,
+            "unrecognised string should be treated as None"
+        );
     }
 
     #[test]
