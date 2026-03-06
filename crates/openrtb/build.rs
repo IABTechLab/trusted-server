@@ -139,7 +139,13 @@ fn postprocess(code: &str) -> String {
             if i + 1 < len {
                 let next_trimmed = lines[i + 1].trim();
                 let indent = leading_whitespace(lines[i + 1]);
-                if is_option_field(next_trimmed) {
+                if is_bool_prost_attr(trimmed) && is_option_bool_field(next_trimmed) {
+                    // OpenRTB JSON uses 0/1 for boolean fields, not true/false.
+                    output.push_str(&format!(
+                        "{indent}#[serde(with = \"crate::bool_as_int\", \
+                         skip_serializing_if = \"Option::is_none\")]\n"
+                    ));
+                } else if is_option_field(next_trimmed) {
                     output.push_str(&format!(
                         "{indent}#[serde(skip_serializing_if = \"Option::is_none\")]\n"
                     ));
@@ -241,4 +247,14 @@ fn is_hashmap_field(trimmed: &str) -> bool {
 /// Returns true if the line is a `#[prost(...)]` attribute.
 fn is_prost_attr(trimmed: &str) -> bool {
     trimmed.starts_with("#[prost(")
+}
+
+/// Returns true if the prost attribute declares a `bool` field.
+fn is_bool_prost_attr(trimmed: &str) -> bool {
+    trimmed.starts_with("#[prost(bool,")
+}
+
+/// Returns true if the line declares an `Option<bool>` field.
+fn is_option_bool_field(trimmed: &str) -> bool {
+    trimmed.starts_with("pub ") && trimmed.contains("::core::option::Option<bool>")
 }
