@@ -634,13 +634,32 @@ impl PrebidAuctionProvider {
         let has_data = ctx.gdpr_applies
             || ctx.raw_us_privacy.is_some()
             || ctx.raw_gpp_string.is_some()
+            || ctx.gpp_section_ids.is_some()
             || ctx.gpc;
 
         if !has_data {
             return None;
         }
 
-        let gdpr = if ctx.gdpr_applies { Some(1) } else { Some(0) };
+        // Use jurisdiction to inform the GDPR flag: if we know the user is in
+        // a GDPR jurisdiction, signal that even without a TCF string (e.g.,
+        // GPC-only requests from EU users). When jurisdiction is unknown and
+        // no TCF signal exists, omit the field rather than falsely signaling
+        // "GDPR does not apply."
+        let in_gdpr_jurisdiction = matches!(
+            ctx.jurisdiction,
+            crate::consent::jurisdiction::Jurisdiction::Gdpr
+        );
+        let gdpr = if ctx.gdpr_applies || in_gdpr_jurisdiction {
+            Some(1)
+        } else if matches!(
+            ctx.jurisdiction,
+            crate::consent::jurisdiction::Jurisdiction::Unknown
+        ) {
+            None
+        } else {
+            Some(0)
+        };
 
         // Build ext first so the dual-placement fields are cloned once from
         // ConsentContext (into ext), then once more into Regs top-level.
