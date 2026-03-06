@@ -6,40 +6,24 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
-/// Returns `true` when `path` falls under the admin namespace.
-///
-/// Matches both the exact `/admin` path and any sub-path (`/admin/…`).
-fn is_admin_path(path: &str) -> bool {
-    path == "/admin" || path.starts_with("/admin/")
-}
-
 /// Enforces Basic-auth for incoming requests.
 ///
-/// For most paths, authentication is only required when a configured handler's
-/// `path` regex matches the request path. **Admin paths** (`/admin` and
-/// `/admin/…`) are an exception: they are *always* gated behind
-/// authentication. If no handler covers an admin path the request is rejected
-/// outright.
+/// Authentication is required when a configured handler's `path` regex matches
+/// the request path. Paths not covered by any handler pass through without
+/// authentication.
+///
+/// Admin endpoints are protected by requiring a handler at build time — see
+/// [`Settings::from_toml_and_env`].
 ///
 /// # Returns
 ///
 /// * `Some(Response)` — a `401 Unauthorized` response that should be sent back
-///   to the client (auth failed or no handler covers an admin path).
+///   to the client (credentials missing or incorrect).
 /// * `None` — the request is allowed to proceed.
 pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
     let path = req.get_path();
-    let is_admin = is_admin_path(path);
 
-    let handler = match settings.handler_for_path(path) {
-        Some(h) => h,
-        // No handler covers this path. Admin paths are always denied;
-        // all other paths pass through unauthenticated.
-        None if is_admin => {
-            log::warn!("Admin path {path} requested but no handler covers it — denying access");
-            return Some(unauthorized_response());
-        }
-        None => return None,
-    };
+    let handler = settings.handler_for_path(path)?;
 
     let (username, password) = match extract_credentials(req) {
         Some(credentials) => credentials,
@@ -152,45 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn deny_admin_path_when_no_handler_covers_it() {
-        let settings = settings_with_handlers();
-        let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should deny admin path without matching handler");
-        assert_eq!(
-            response.get_status(),
-            StatusCode::UNAUTHORIZED,
-            "should return 401 for uncovered admin path"
-        );
-    }
-
-    #[test]
-    fn deny_admin_deactivate_when_no_handler_covers_it() {
-        let settings = settings_with_handlers();
-        let req = Request::new(Method::POST, "https://example.com/admin/keys/deactivate");
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should deny admin deactivate without matching handler");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    fn settings_with_admin_handler() -> Settings {
-        let config = crate_test_settings_str()
-            + r#"
-            [[handlers]]
-            path = "^/admin"
-            username = "admin"
-            password = "secret"
-            "#;
-        Settings::from_toml(&config).expect("should parse settings with admin handler")
-    }
-
-    #[test]
     fn allow_admin_path_with_valid_credentials() {
-        let settings = settings_with_admin_handler();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
-        let token = STANDARD.encode("admin:secret");
+        let token = STANDARD.encode("admin:admin-pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
         assert!(
@@ -201,7 +150,7 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
-        let settings = settings_with_admin_handler();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -213,44 +162,11 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
-        let settings = settings_with_admin_handler();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should challenge admin path with missing credentials");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn deny_exact_admin_path_when_no_handler_covers_it() {
-        let settings = settings_with_handlers();
-        let req = Request::new(Method::GET, "https://example.com/admin");
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should deny exact /admin path without matching handler");
-        assert_eq!(
-            response.get_status(),
-            StatusCode::UNAUTHORIZED,
-            "should return 401 for exact /admin path"
-        );
-    }
-
-    #[test]
-    fn is_admin_path_matches_correctly() {
-        assert!(is_admin_path("/admin"), "should match exact /admin");
-        assert!(is_admin_path("/admin/"), "should match /admin/");
-        assert!(
-            is_admin_path("/admin/keys/rotate"),
-            "should match sub-paths"
-        );
-        assert!(
-            !is_admin_path("/administration"),
-            "should not match /administration"
-        );
-        assert!(
-            !is_admin_path("/administer"),
-            "should not match /administer"
-        );
-        assert!(!is_admin_path("/open"), "should not match unrelated paths");
     }
 }

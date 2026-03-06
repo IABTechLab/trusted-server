@@ -374,6 +374,18 @@ impl Settings {
             })
         })?;
 
+        let uncovered = settings.uncovered_admin_endpoints();
+        if !uncovered.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "No handler covers admin endpoint(s): {}. \
+                     Add a [[handlers]] entry with a path regex matching /admin/ \
+                     to protect admin access.",
+                    uncovered.join(", ")
+                ),
+            }));
+        }
+
         Ok(settings)
     }
 
@@ -384,18 +396,18 @@ impl Settings {
             .find(|handler| handler.matches_path(path))
     }
 
-    /// Known admin endpoint paths that are always auth-gated at runtime.
+    /// Known admin endpoint paths that must be covered by a handler.
     ///
-    /// If no configured handler covers a path in this list, requests to that
-    /// endpoint will be rejected with `401 Unauthorized`.
+    /// [`from_toml_and_env`](Self::from_toml_and_env) rejects configurations
+    /// where any of these paths lack a matching handler, ensuring admin
+    /// endpoints are always protected by authentication.
     const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
-    /// Admin endpoints are always auth-gated at runtime, but without a
-    /// matching handler they become *unreachable* (every request returns
-    /// `401`). Use this at build time to warn operators about
-    /// misconfiguration.
+    /// Called by [`from_toml_and_env`](Self::from_toml_and_env) at build time
+    /// to enforce that every admin endpoint has a handler. An empty return
+    /// value means all admin endpoints are properly covered.
     #[must_use]
     pub fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
         Self::ADMIN_ENDPOINTS
@@ -777,22 +789,45 @@ mod tests {
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
-        let path_key = format!(
+        // Override handler 0 via env vars
+        let path_key_0 = format!(
             "{}{}HANDLERS{}0{}PATH",
             ENVIRONMENT_VARIABLE_PREFIX,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
-        let username_key = format!(
+        let username_key_0 = format!(
             "{}{}HANDLERS{}0{}USERNAME",
             ENVIRONMENT_VARIABLE_PREFIX,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
-        let password_key = format!(
+        let password_key_0 = format!(
             "{}{}HANDLERS{}0{}PASSWORD",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        // Admin handler at index 1 (required for admin endpoint coverage)
+        let path_key_1 = format!(
+            "{}{}HANDLERS{}1{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let username_key_1 = format!(
+            "{}{}HANDLERS{}1{}USERNAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let password_key_1 = format!(
+            "{}{}HANDLERS{}1{}PASSWORD",
             ENVIRONMENT_VARIABLE_PREFIX,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
@@ -803,16 +838,22 @@ mod tests {
             origin_key,
             Some("https://origin.test-publisher.com"),
             || {
-                temp_env::with_var(path_key, Some("^/env-handler"), || {
-                    temp_env::with_var(username_key, Some("env-user"), || {
-                        temp_env::with_var(password_key, Some("env-pass"), || {
-                            let settings = Settings::from_toml_and_env(&toml_str)
-                                .expect("Settings should load from env");
-                            assert_eq!(settings.handlers.len(), 1);
-                            let handler = &settings.handlers[0];
-                            assert_eq!(handler.path, "^/env-handler");
-                            assert_eq!(handler.username, "env-user");
-                            assert_eq!(handler.password, "env-pass");
+                temp_env::with_var(path_key_0, Some("^/env-handler"), || {
+                    temp_env::with_var(username_key_0, Some("env-user"), || {
+                        temp_env::with_var(password_key_0, Some("env-pass"), || {
+                            temp_env::with_var(path_key_1, Some("^/admin"), || {
+                                temp_env::with_var(username_key_1, Some("admin"), || {
+                                    temp_env::with_var(password_key_1, Some("admin-pass"), || {
+                                        let settings = Settings::from_toml_and_env(&toml_str)
+                                            .expect("Settings should load from env");
+                                        assert_eq!(settings.handlers.len(), 2);
+                                        let handler = &settings.handlers[0];
+                                        assert_eq!(handler.path, "^/env-handler");
+                                        assert_eq!(handler.username, "env-user");
+                                        assert_eq!(handler.password, "env-pass");
+                                    });
+                                });
+                            });
                         });
                     });
                 });
@@ -1191,27 +1232,49 @@ mod tests {
         );
     }
 
+    /// Helper that returns a settings TOML string WITHOUT any admin handler,
+    /// for tests that need to verify uncovered-admin-endpoint behaviour.
+    fn settings_str_without_admin_handler() -> String {
+        r#"
+            [[handlers]]
+            path = "^/secure"
+            username = "user"
+            password = "pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [synthetic]
+            counter_store = "test-counter-store"
+            opid_store = "test-opid-store"
+            secret_key = "test-secret-key"
+            template = "{{client_ip}}"
+
+            [request_signing]
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+        "#
+        .to_string()
+    }
+
     #[test]
     fn uncovered_admin_endpoints_returns_all_when_no_handler_covers_admin() {
-        let settings = create_test_settings();
+        let settings = Settings::from_toml(&settings_str_without_admin_handler())
+            .expect("should parse valid TOML");
         let uncovered = settings.uncovered_admin_endpoints();
         assert_eq!(
             uncovered,
             vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
-            "should report both admin endpoints as uncovered with default config"
+            "should report both admin endpoints as uncovered"
         );
     }
 
     #[test]
     fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [[handlers]]
-            path = "^/admin"
-            username = "admin"
-            password = "secret"
-            "#;
-        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        let settings = create_test_settings();
         let uncovered = settings.uncovered_admin_endpoints();
         assert!(
             uncovered.is_empty(),
@@ -1221,7 +1284,7 @@ mod tests {
 
     #[test]
     fn uncovered_admin_endpoints_detects_partial_coverage() {
-        let toml_str = crate_test_settings_str()
+        let toml_str = settings_str_without_admin_handler()
             + r#"
             [[handlers]]
             path = "^/admin/keys/rotate$"
@@ -1234,6 +1297,32 @@ mod tests {
             uncovered,
             vec!["/admin/keys/deactivate"],
             "should detect that only deactivate is uncovered"
+        );
+    }
+
+    #[test]
+    fn from_toml_and_env_rejects_config_without_admin_handler() {
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                let result = Settings::from_toml_and_env(&settings_str_without_admin_handler());
+                assert!(
+                    result.is_err(),
+                    "should reject configuration when admin endpoints are not covered"
+                );
+                let err = format!("{:?}", result.unwrap_err());
+                assert!(
+                    err.contains("No handler covers admin endpoint"),
+                    "error should mention uncovered admin endpoints, got: {err}"
+                );
+            },
         );
     }
 }
