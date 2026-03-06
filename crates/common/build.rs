@@ -27,7 +27,8 @@ fn main() {
     let toml_content = fs::read_to_string(init_config_path)
         .unwrap_or_else(|_| panic!("Failed to read {init_config_path:?}"));
 
-    // Merge base TOML with environment variable overrides and write output
+    // Merge base TOML with environment variable overrides and write output.
+    // This will fail if admin endpoints are not covered by a handler.
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
 
