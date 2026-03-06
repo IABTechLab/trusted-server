@@ -11,6 +11,24 @@ pub use trusted_server_openrtb::{
     Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
 };
 
+/// Convert a `u32` value to `i32` for `OpenRTB` fields, logging a warning and
+/// returning `None` if the value exceeds `i32::MAX`.
+#[must_use]
+pub fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
+    match i32::try_from(value) {
+        Ok(converted) => Some(converted),
+        Err(_) => {
+            log::warn!(
+                "openrtb: omitting {}={} for {} because value exceeds i32::MAX",
+                field_name,
+                value,
+                context
+            );
+            None
+        }
+    }
+}
+
 // ============================================================================
 // Extension types (project-specific, not part of the OpenRTB spec)
 // ============================================================================
@@ -21,6 +39,8 @@ pub struct UserExt {
     pub synthetic_fresh: Option<String>,
 }
 
+impl ToExt for UserExt {}
+
 #[derive(Debug, Serialize)]
 pub struct RequestExt {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,13 +49,15 @@ pub struct RequestExt {
     pub trusted_server: Option<TrustedServerExt>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct PrebidExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returnallbidstatus: Option<bool>,
 }
+
+impl ToExt for RequestExt {}
 
 #[derive(Debug, Serialize)]
 pub struct TrustedServerExt {
@@ -60,6 +82,8 @@ pub struct ImpExt {
     pub prebid: PrebidImpExt,
 }
 
+impl ToExt for ImpExt {}
+
 #[derive(Debug, Serialize)]
 pub struct PrebidImpExt {
     pub bidder: std::collections::HashMap<String, Value>,
@@ -69,6 +93,8 @@ pub struct PrebidImpExt {
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
 }
+
+impl ToExt for ResponseExt {}
 
 #[cfg(test)]
 mod tests {

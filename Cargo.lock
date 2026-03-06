@@ -2515,7 +2515,6 @@ dependencies = [
 name = "trusted-server-openrtb"
 version = "0.1.0"
 dependencies = [
- "prost",
  "prost-build",
  "serde",
  "serde_json",
