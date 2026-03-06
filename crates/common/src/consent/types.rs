@@ -155,6 +155,7 @@ impl ConsentContext {
     pub fn is_empty(&self) -> bool {
         self.raw_tc_string.is_none()
             && self.raw_gpp_string.is_none()
+            && self.gpp_section_ids.is_none()
             && self.raw_us_privacy.is_none()
             && self.raw_ac_string.is_none()
             && self.tcf.is_none()

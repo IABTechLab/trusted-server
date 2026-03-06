@@ -168,9 +168,8 @@ fn apply_expiration_check(ctx: &mut ConsentContext, config: &ConsentConfig) {
     );
     ctx.expired = true;
 
-    if ctx.tcf.is_some() {
-        ctx.tcf = None;
-    } else if let Some(gpp) = &mut ctx.gpp {
+    ctx.tcf = None;
+    if let Some(gpp) = &mut ctx.gpp {
         gpp.eu_tcf = None;
     }
 
@@ -194,16 +193,6 @@ fn apply_gpc_us_privacy(ctx: &mut ConsentContext, config: &ConsentConfig) {
         ctx.us_privacy = Some(usp);
         ctx.source = ConsentSource::PolicyDefault;
     }
-}
-
-/// Extracts raw consent signals and logs them (without decoding).
-///
-/// Use this when you need the raw signals but don't need decoded data.
-/// Prefer [`build_consent_context`] for the full pipeline.
-pub fn extract_and_log_consent(jar: Option<&CookieJar>, req: &Request) -> RawConsentSignals {
-    let signals = extract_consent_signals(jar, req);
-    log_consent_signals(&signals);
-    signals
 }
 
 /// Decodes a raw consent string, logging a warning on failure.
@@ -309,15 +298,15 @@ fn allows_eid_transmission(tcf: &types::TcfConsent) -> bool {
 
 /// Resolves conflicts between standalone TC and GPP EU TCF consents.
 fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfig) {
-    let Some(standalone_tcf) = ctx.tcf.clone() else {
+    let Some(standalone_tcf) = ctx.tcf.as_ref() else {
         return;
     };
-    let Some(gpp_tcf) = ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()).cloned() else {
+    let Some(gpp_tcf) = ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()) else {
         return;
     };
 
-    let standalone_allows = allows_eid_transmission(&standalone_tcf);
-    let gpp_allows = allows_eid_transmission(&gpp_tcf);
+    let standalone_allows = allows_eid_transmission(standalone_tcf);
+    let gpp_allows = allows_eid_transmission(gpp_tcf);
 
     if standalone_allows == gpp_allows {
         return;
@@ -327,8 +316,8 @@ fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfi
         ConflictMode::Restrictive => !gpp_allows,
         ConflictMode::Permissive => gpp_allows,
         ConflictMode::Newest => select_newest_signal(
-            &standalone_tcf,
-            &gpp_tcf,
+            standalone_tcf,
+            gpp_tcf,
             config.conflict_resolution.freshness_threshold_days,
         )
         .unwrap_or(!gpp_allows),
@@ -340,7 +329,12 @@ fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfi
         config.conflict_resolution.mode
     );
 
-    ctx.tcf = Some(if select_gpp { gpp_tcf } else { standalone_tcf });
+    // Clone only the winner after the decision is made.
+    ctx.tcf = Some(if select_gpp {
+        gpp_tcf.clone()
+    } else {
+        return; // Standalone is already in ctx.tcf — nothing to do.
+    });
 }
 
 /// Returns whether GPP should win under the `newest` strategy.
@@ -371,11 +365,10 @@ fn select_newest_signal(
 
 /// Returns the current time in deciseconds since the Unix epoch.
 pub(crate) fn now_deciseconds() -> u64 {
-    SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 100
+        .unwrap_or_default();
+    dur.as_secs() * 10 + u64::from(dur.subsec_millis()) / 100
 }
 
 /// Returns the age of a TCF consent string in days.
