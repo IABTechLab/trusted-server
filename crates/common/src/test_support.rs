@@ -10,6 +10,11 @@ pub mod tests {
             username = "user"
             password = "pass"
 
+            [[handlers]]
+            path = "^/admin"
+            username = "admin"
+            password = "admin-pass"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
