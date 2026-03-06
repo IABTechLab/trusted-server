@@ -68,7 +68,7 @@ pub trait ToExt: Serialize {
     }
 }
 
-// Include the prost-generated (and post-processed) types.
+// Generated from proto/openrtb.proto. Regenerate with `./crates/openrtb/generate.sh`.
 // Suppress clippy on generated code — doc comments and method signatures come
 // from prost codegen and are not worth hand-editing.
 #[allow(
@@ -78,9 +78,7 @@ pub trait ToExt: Serialize {
     clippy::return_self_not_must_use,
     clippy::struct_excessive_bools
 )]
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/com.iabtechlab.openrtb.v2.rs"));
-}
+mod generated;
 
 // Re-export nested types at crate root for flat, ergonomic access.
 // These correspond to the top-level OpenRTB 2.6 objects that are nested inside

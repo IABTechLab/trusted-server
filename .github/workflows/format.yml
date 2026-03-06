@@ -32,11 +32,6 @@ jobs:
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
