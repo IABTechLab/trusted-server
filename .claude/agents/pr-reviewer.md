@@ -117,23 +117,23 @@ whether a comment requires action, is a suggestion, or is informational.
 
 #### Blocking (merge cannot proceed)
 
-| Emoji | Tag        | Use when                                                         |
-| ----- | ---------- | ---------------------------------------------------------------- |
-| 🔧    | **wrench** | A necessary change: bugs, data loss, security, missing validation, CI failures |
-| ❓    | **question** | A question that must be answered before you can complete the review |
+| Emoji | Tag          | Use when                                                                       |
+| ----- | ------------ | ------------------------------------------------------------------------------ |
+| 🔧    | **wrench**   | A necessary change: bugs, data loss, security, missing validation, CI failures |
+| ❓    | **question** | A question that must be answered before you can complete the review            |
 
 #### Non-blocking (merge can proceed)
 
-| Emoji | Tag              | Use when                                                              |
-| ----- | ---------------- | --------------------------------------------------------------------- |
-| 🤔    | **thinking**     | Thinking aloud — expressing a concern or exploring alternatives       |
-| ♻️    | **refactor**     | A concrete refactoring suggestion with enough context to act on       |
-| 🌱    | **seedling**     | A future-focused observation — not for this PR but worth considering  |
-| 📝    | **note**         | An explanatory comment or context — no action required                |
-| ⛏     | **nitpick**      | A stylistic or formatting preference — does not require changes       |
+| Emoji | Tag              | Use when                                                                   |
+| ----- | ---------------- | -------------------------------------------------------------------------- |
+| 🤔    | **thinking**     | Thinking aloud — expressing a concern or exploring alternatives            |
+| ♻️    | **refactor**     | A concrete refactoring suggestion with enough context to act on            |
+| 🌱    | **seedling**     | A future-focused observation — not for this PR but worth considering       |
+| 📝    | **note**         | An explanatory comment or context — no action required                     |
+| ⛏     | **nitpick**      | A stylistic or formatting preference — does not require changes            |
 | 🏕    | **camp site**    | An opportunity to leave the code better than you found it (boy scout rule) |
-| 📌    | **out of scope** | An important concern outside this PR's scope — needs a follow-up issue |
-| 👍    | **praise**       | Highlight particularly good code, design, or testing decisions        |
+| 📌    | **out of scope** | An important concern outside this PR's scope — needs a follow-up issue     |
+| 👍    | **praise**       | Highlight particularly good code, design, or testing decisions             |
 
 ### 6. Present findings for user approval
 
