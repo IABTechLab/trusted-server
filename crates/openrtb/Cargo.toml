@@ -12,6 +12,3 @@ workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[build-dependencies]
-prost-build = { workspace = true }
