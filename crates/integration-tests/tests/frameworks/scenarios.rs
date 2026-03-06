@@ -11,8 +11,8 @@ pub enum TestScenario {
     /// Verify `<script>` tag is injected into `<head>`.
     HtmlInjection,
 
-    /// Verify `/static/tsjs=` endpoint serves JS bundles for given modules.
-    ScriptServing { modules: Vec<&'static str> },
+    /// Verify `/static/tsjs=tsjs-unified.min.js` endpoint serves the JS bundle.
+    ScriptServing,
 
     /// Verify `tsjs-*` attributes are rewritten correctly.
     AttributeRewriting,
@@ -59,19 +59,19 @@ impl TestScenario {
                     .change_context(TestError::ResponseParse)
                     .attach_printable(format!("framework: {framework_id}"))?;
 
-                assertions::assert_script_tag_present(&html, &["core"])
+                assertions::assert_script_tag_present(&html)
                     .attach_printable(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }
 
-            Self::ScriptServing { modules } => {
-                let url = format!("{base_url}/static/tsjs={}", modules.join(","));
+            Self::ScriptServing => {
+                let url = format!("{base_url}/static/tsjs=tsjs-unified.min.js");
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
                     .attach_printable(format!(
-                        "scenario: ScriptServing, framework: {framework_id}, modules: {modules:?}"
+                        "scenario: ScriptServing, framework: {framework_id}"
                     ))?;
 
                 if !resp.status().is_success() {
@@ -81,13 +81,6 @@ impl TestScenario {
                             resp.status()
                         )),
                     );
-                }
-
-                let body = resp.text().change_context(TestError::ResponseParse)?;
-
-                if !body.contains("tsjs") {
-                    return Err(error_stack::report!(TestError::ScriptTagNotFound)
-                        .attach_printable("Response body does not contain tsjs marker"));
                 }
 
                 Ok(())

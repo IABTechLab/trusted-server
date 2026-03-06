@@ -6,18 +6,21 @@ permissions:
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/integration-tests/**"
-      - "crates/common/**"
-      - "crates/fastly/**"
-      - ".github/workflows/integration-tests.yml"
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+
+env:
+  ORIGIN_PORT: 8888
 
 jobs:
   integration-tests:
     name: integration tests
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +53,9 @@ jobs:
 
       - name: Build WASM binary
         run: cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: "http://127.0.0.1:${{ env.ORIGIN_PORT }}"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
 
       - name: Build WordPress test container
         run: |
@@ -62,7 +68,8 @@ jobs:
             crates/integration-tests/fixtures/frameworks/nextjs/
 
       - name: Run integration tests
-        run: cargo test -p integration-tests --target x86_64-unknown-linux-gnu
+        run: cargo test -p integration-tests --target x86_64-unknown-linux-gnu -- --include-ignored --test-threads=1
         env:
           WASM_BINARY_PATH: target/wasm32-wasip1/release/trusted-server-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           RUST_LOG: info

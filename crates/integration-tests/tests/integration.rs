@@ -7,8 +7,7 @@ mod common;
 mod environments;
 mod frameworks;
 
-use common::config::RuntimeConfigBuilder;
-use common::runtime::{TestError, wasm_binary_path};
+use common::runtime::{TestError, origin_port, wasm_binary_path};
 use environments::RUNTIME_ENVIRONMENTS;
 use error_stack::ResultExt as _;
 use frameworks::{FRAMEWORKS, FrontendFramework};
@@ -18,8 +17,10 @@ use testcontainers::runners::SyncRunner as _;
 /// Test all combinations: frameworks x runtimes (matrix testing).
 ///
 /// Iterates every registered runtime and framework, running all standard
-/// and custom scenarios for each combination.
+/// and custom scenarios for each combination. Uses `--test-threads=1`
+/// because all containers share the same fixed origin port.
 #[test]
+#[ignore = "requires Docker, Viceroy, and pre-built WASM binary"]
 fn test_all_combinations() {
     for runtime_factory in RUNTIME_ENVIRONMENTS {
         let runtime = runtime_factory();
@@ -39,12 +40,11 @@ fn test_all_combinations() {
 ///
 /// # Steps
 ///
-/// 1. Start the frontend container (Docker via testcontainers)
-/// 2. Generate platform-specific configuration pointing at the container
-/// 3. Spawn the runtime process (e.g. Viceroy)
-/// 4. Run standard scenarios (HTML injection, script serving, etc.)
-/// 5. Run framework-specific custom scenarios
-/// 6. Cleanup is automatic via [`Drop`] on both container and runtime
+/// 1. Start the frontend container mapped to the fixed origin port
+/// 2. Spawn the runtime process (e.g. Viceroy) with the pre-built WASM binary
+/// 3. Run standard scenarios (HTML injection, script serving, etc.)
+/// 4. Run framework-specific custom scenarios
+/// 5. Cleanup is automatic via [`Drop`] on both container and runtime
 ///
 /// # Errors
 ///
@@ -56,44 +56,30 @@ fn test_combination(
 ) -> error_stack::Result<(), TestError> {
     let runtime_id = runtime.id();
     let framework_id = framework.id();
+    let port = origin_port();
 
-    // 1. Start frontend container
-    let image = framework
-        .build_container()
-        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
-
-    let container = image
+    // 1. Start frontend container mapped to the fixed origin port
+    let container = framework
+        .build_container(port)
+        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?
         .start()
         .change_context(TestError::ContainerStart {
             reason: format!("framework: {framework_id}"),
         })
         .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
 
-    let host_port = container
-        .get_host_port_ipv4(framework.container_port())
-        .change_context(TestError::ContainerStart {
-            reason: format!("could not get host port for framework: {framework_id}"),
-        })?;
-
-    let origin_url = format!("http://127.0.0.1:{host_port}");
+    let origin_url = format!("http://127.0.0.1:{port}");
 
     // Wait for container to be ready
     wait_for_container(&origin_url, framework.health_check_path())?;
 
-    // 2. Generate platform-specific config
-    let config = RuntimeConfigBuilder::new(runtime.config_template())
-        .with_origin_url(origin_url)
-        .with_integrations(vec!["prebid", "lockr"])
-        .with_wasm_path(wasm_binary_path())
-        .build()
-        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
-
-    // 3. Spawn runtime process
+    // 2. Spawn runtime process with the pre-built WASM binary
+    let wasm_path = wasm_binary_path();
     let process = runtime
-        .spawn(&config)
+        .spawn(&wasm_path)
         .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
 
-    // 4. Run standard scenarios
+    // 3. Run standard scenarios
     for scenario in framework.standard_scenarios() {
         scenario
             .run(&process.base_url, framework_id)
@@ -102,7 +88,7 @@ fn test_combination(
             ))?;
     }
 
-    // 5. Run custom scenarios
+    // 4. Run custom scenarios
     for scenario in framework.custom_scenarios() {
         scenario
             .run(&process.base_url, framework_id)
@@ -110,6 +96,9 @@ fn test_combination(
                 "runtime: {runtime_id}, framework: {framework_id}, custom scenario: {scenario:?}"
             ))?;
     }
+
+    // Explicitly drop container to free the origin port for the next test
+    drop(container);
 
     Ok(())
 }
@@ -134,6 +123,7 @@ fn wait_for_container(base_url: &str, health_path: &str) -> error_stack::Result<
 // Individual test functions for faster iteration during development.
 
 #[test]
+#[ignore = "requires Docker, Viceroy, and pre-built WASM binary"]
 fn test_wordpress_fastly() {
     let runtime = environments::fastly::FastlyViceroy;
     let framework = frameworks::wordpress::WordPress;
@@ -141,6 +131,7 @@ fn test_wordpress_fastly() {
 }
 
 #[test]
+#[ignore = "requires Docker, Viceroy, and pre-built WASM binary"]
 fn test_nextjs_fastly() {
     let runtime = environments::fastly::FastlyViceroy;
     let framework = frameworks::nextjs::NextJs;

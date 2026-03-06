@@ -7,37 +7,20 @@ fn parse_selector(selector: &str) -> Result<Selector, TestError> {
     Selector::parse(selector).map_err(|_| error_stack::report!(TestError::InvalidSelector))
 }
 
-/// Assert that HTML contains a script tag with expected tsjs module reference.
+/// Assert that HTML contains the trustedserver-js script tag.
 ///
-/// Looks for `<script src="/static/tsjs=core,prebid,...">` and verifies
-/// all expected modules are present in the URL.
+/// Looks for `<script src="/static/tsjs=...">` injected by the trusted-server
+/// HTML processor. The URL format is `/static/tsjs=tsjs-unified.min.js?v={hash}`.
 ///
 /// # Errors
 ///
 /// Returns [`TestError::ScriptTagNotFound`] if no matching script tag exists.
-/// Returns [`TestError::MissingModule`] if an expected module ID is absent.
-pub fn assert_script_tag_present(html: &str, expected_modules: &[&str]) -> Result<(), TestError> {
+pub fn assert_script_tag_present(html: &str) -> Result<(), TestError> {
     let document = Html::parse_document(html);
     let selector = parse_selector("script[src*='/static/tsjs=']")?;
 
-    for element in document.select(&selector) {
-        if let Some(src) = element.value().attr("src") {
-            // Extract module IDs from URL path segment
-            // Expected format: /static/tsjs=core,prebid,lockr
-            if let Some(query_part) = src.split("tsjs=").nth(1) {
-                let modules: Vec<&str> = query_part.split(',').collect();
-
-                for expected in expected_modules {
-                    if !modules.contains(expected) {
-                        return Err(error_stack::report!(TestError::MissingModule {
-                            module: (*expected).to_string()
-                        }));
-                    }
-                }
-
-                return Ok(());
-            }
-        }
+    if document.select(&selector).next().is_some() {
+        return Ok(());
     }
 
     Err(error_stack::report!(TestError::ScriptTagNotFound))
@@ -167,38 +150,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn script_tag_present_with_expected_modules() {
+    fn script_tag_present_with_unified_url() {
         let html = r#"
             <!DOCTYPE html>
             <html>
             <head>
-                <script src="/static/tsjs=core,prebid,lockr"></script>
+                <script src="/static/tsjs=tsjs-unified.min.js?v=abc123" id="trustedserver-js"></script>
             </head>
             <body></body>
             </html>
         "#;
 
-        assert_script_tag_present(html, &["core", "prebid"])
-            .expect("should find script tag with expected modules");
-    }
-
-    #[test]
-    fn script_tag_present_fails_on_missing_module() {
-        let html = r#"
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <script src="/static/tsjs=core,prebid"></script>
-            </head>
-            <body></body>
-            </html>
-        "#;
-
-        let result = assert_script_tag_present(html, &["core", "lockr"]);
-        assert!(
-            result.is_err(),
-            "should fail when expected module is missing"
-        );
+        assert_script_tag_present(html).expect("should find trustedserver-js script tag");
     }
 
     #[test]
@@ -208,8 +171,27 @@ mod tests {
             <html><head></head><body></body></html>
         "#;
 
-        let result = assert_script_tag_present(html, &["core"]);
+        let result = assert_script_tag_present(html);
         assert!(result.is_err(), "should fail when no script tag exists");
+    }
+
+    #[test]
+    fn script_tag_present_fails_when_wrong_script() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <script src="/some/other/script.js"></script>
+            </head>
+            <body></body>
+            </html>
+        "#;
+
+        let result = assert_script_tag_present(html);
+        assert!(
+            result.is_err(),
+            "should fail when script tag is not tsjs"
+        );
     }
 
     #[test]

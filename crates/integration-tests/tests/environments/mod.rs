@@ -18,8 +18,6 @@ type RuntimeFactory = fn() -> Box<dyn RuntimeEnvironment>;
 /// 3. Add factory closure here
 pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[
     || Box::new(fastly::FastlyViceroy),
-    // Future: Add Cloudflare, Fermyon Spin, etc.
-    // || Box::new(cloudflare::CloudflareWrangler),
 ];
 
 /// Find an available TCP port for the runtime to bind to.

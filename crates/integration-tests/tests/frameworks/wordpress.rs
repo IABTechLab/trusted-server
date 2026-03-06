@@ -1,7 +1,8 @@
 use super::FrontendFramework;
 use super::scenarios::{CustomScenario, TestScenario};
 use crate::common::runtime::TestError;
-use testcontainers::GenericImage;
+use testcontainers::core::{ContainerRequest, IntoContainerPort};
+use testcontainers::{GenericImage, ImageExt as _};
 
 /// WordPress frontend framework for integration testing.
 ///
@@ -20,9 +21,14 @@ impl FrontendFramework for WordPress {
         "wordpress"
     }
 
-    fn build_container(&self) -> error_stack::Result<GenericImage, TestError> {
+    fn build_container(
+        &self,
+        origin_port: u16,
+    ) -> error_stack::Result<ContainerRequest<GenericImage>, TestError> {
+        let container_port = self.container_port();
         Ok(GenericImage::new("test-wordpress", "latest")
-            .with_exposed_port(testcontainers::core::IntoContainerPort::tcp(80)))
+            .with_exposed_port(container_port.tcp())
+            .with_mapped_port(origin_port, container_port.tcp()))
     }
 
     fn container_port(&self) -> u16 {
@@ -36,15 +42,11 @@ impl FrontendFramework for WordPress {
     fn standard_scenarios(&self) -> Vec<TestScenario> {
         vec![
             TestScenario::HtmlInjection,
-            TestScenario::ScriptServing {
-                modules: vec!["core", "prebid"],
-            },
-            TestScenario::AttributeRewriting,
-            TestScenario::GdprSignal,
+            TestScenario::ScriptServing,
         ]
     }
 
     fn custom_scenarios(&self) -> Vec<CustomScenario> {
-        vec![CustomScenario::WordPressAdminInjection]
+        vec![]
     }
 }

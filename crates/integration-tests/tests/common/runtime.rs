@@ -1,7 +1,6 @@
 use error_stack::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 /// Test error types (platform-agnostic)
 #[derive(Debug, derive_more::Display)]
@@ -37,9 +36,6 @@ pub enum TestError {
     #[display("Script tag not found in HTML")]
     ScriptTagNotFound,
 
-    #[display("Missing module: {module}")]
-    MissingModule { module: String },
-
     #[display("Invalid CSS selector")]
     InvalidSelector,
 
@@ -52,54 +48,12 @@ pub enum TestError {
     #[display("GDPR signal missing from response")]
     GdprSignalMissing,
 
-    // Configuration errors
-    #[display("Config parse error")]
-    ConfigParse,
-
-    #[display("Config write error")]
-    ConfigWrite,
-
-    #[display("Config serialization error")]
-    ConfigSerialize,
-
     // Resource errors
-    #[display("WASM binary not found")]
-    WasmBinaryNotFound,
-
     #[display("No available port found")]
     NoPortAvailable,
 }
 
 impl core::error::Error for TestError {}
-
-/// Configuration for runtime environments.
-///
-/// Holds the temp file so the config is not deleted while the runtime is alive.
-pub struct RuntimeConfig {
-    /// Handle to the temp config file — dropped when `RuntimeConfig` is dropped.
-    _config_file: NamedTempFile,
-    wasm_path: PathBuf,
-}
-
-impl RuntimeConfig {
-    /// Create a new runtime configuration from a temp file and WASM binary path.
-    pub fn new(config_file: NamedTempFile, wasm_path: PathBuf) -> Self {
-        Self {
-            _config_file: config_file,
-            wasm_path,
-        }
-    }
-
-    /// Path to the generated config file on disk.
-    pub fn config_path(&self) -> &Path {
-        self._config_file.path()
-    }
-
-    /// Path to the WASM binary.
-    pub fn wasm_path(&self) -> &Path {
-        &self.wasm_path
-    }
-}
 
 /// Platform-agnostic process handle
 pub struct RuntimeProcess {
@@ -113,16 +67,23 @@ pub trait RuntimeProcessHandle: Send + Sync {
     fn wait(&mut self) -> Result<(), TestError>;
 }
 
-/// Trait defining how to run the trusted-server on different platforms
+/// Trait defining how to run the trusted-server on different platforms.
+///
+/// The application configuration (origin URL, integrations, etc.) is baked
+/// into the WASM binary at build time via `build.rs`. The runtime environment
+/// only needs the WASM binary path and its own platform-specific config
+/// (e.g. Viceroy's `fastly.toml` for KV stores and secret stores).
 pub trait RuntimeEnvironment: Send + Sync {
     /// Platform identifier (e.g., "fastly", "cloudflare")
     fn id(&self) -> &'static str;
 
-    /// Spawn runtime with platform-specific configuration
-    fn spawn(&self, config: &RuntimeConfig) -> Result<RuntimeProcess, TestError>;
-
-    /// Platform-specific configuration template
-    fn config_template(&self) -> &str;
+    /// Spawn runtime with the given WASM binary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::RuntimeSpawn`] if the process cannot be started.
+    /// Returns [`TestError::RuntimeNotReady`] if the health check times out.
+    fn spawn(&self, wasm_path: &Path) -> Result<RuntimeProcess, TestError>;
 
     /// Health check endpoint (may differ by platform)
     fn health_check_path(&self) -> &str {
@@ -135,7 +96,7 @@ pub trait RuntimeEnvironment: Send + Sync {
     }
 }
 
-/// Get path to WASM binary, respecting environment variable
+/// Get path to WASM binary, respecting environment variable.
 pub fn wasm_binary_path() -> PathBuf {
     std::env::var("WASM_BINARY_PATH")
         .map(PathBuf::from)
@@ -143,4 +104,15 @@ pub fn wasm_binary_path() -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/wasm32-wasip1/release/trusted-server-fastly.wasm")
         })
+}
+
+/// Get the fixed origin port used for Docker container port mapping.
+///
+/// This must match the port baked into the WASM binary via
+/// `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL` at build time.
+pub fn origin_port() -> u16 {
+    std::env::var("INTEGRATION_ORIGIN_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8888)
 }

@@ -1,14 +1,14 @@
-use crate::common::runtime::{
-    RuntimeConfig, RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError,
-};
+use crate::common::runtime::{RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError};
 use error_stack::ResultExt as _;
-use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Child, Command};
 
 /// Fastly Compute runtime using Viceroy local simulator.
 ///
-/// Spawns a `viceroy` child process with the WASM binary and a generated
-/// `fastly.toml` config. Dynamic port allocation allows parallel test execution.
+/// Spawns a `viceroy` child process with the WASM binary and the
+/// Viceroy-specific `fastly.toml` config (KV stores, secrets).
+/// The application config (origin URL, integrations) is baked into
+/// the WASM binary at build time.
 pub struct FastlyViceroy;
 
 impl RuntimeEnvironment for FastlyViceroy {
@@ -16,21 +16,17 @@ impl RuntimeEnvironment for FastlyViceroy {
         "fastly"
     }
 
-    fn spawn(&self, config: &RuntimeConfig) -> error_stack::Result<RuntimeProcess, TestError> {
+    fn spawn(&self, wasm_path: &Path) -> error_stack::Result<RuntimeProcess, TestError> {
         let port = super::find_available_port()?;
 
-        // Viceroy requires a fastly.toml for local_server config (KV stores, secrets).
-        // The app config (trusted-server.toml) is read by the WASM binary itself via
-        // environment variable or compiled-in path.
         let viceroy_config = self.viceroy_config_path();
 
         let child = Command::new("viceroy")
-            .arg(config.wasm_path())
+            .arg(wasm_path)
             .arg("-C")
             .arg(&viceroy_config)
             .arg("--addr")
             .arg(format!("127.0.0.1:{port}"))
-            .env("TRUSTED_SERVER_CONFIG", config.config_path())
             .spawn()
             .change_context(TestError::RuntimeSpawn)
             .attach_printable("Failed to spawn viceroy process")?;
@@ -45,16 +41,8 @@ impl RuntimeEnvironment for FastlyViceroy {
         })
     }
 
-    fn config_template(&self) -> &str {
-        include_str!("../../fixtures/configs/fastly-template.toml")
-    }
-
     fn health_check_path(&self) -> &str {
         "/health"
-    }
-
-    fn env_vars(&self) -> HashMap<String, String> {
-        HashMap::new()
     }
 }
 

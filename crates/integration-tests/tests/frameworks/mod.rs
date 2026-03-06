@@ -4,6 +4,7 @@ pub mod wordpress;
 
 use crate::common::runtime::TestError;
 use scenarios::{CustomScenario, TestScenario};
+use testcontainers::core::ContainerRequest;
 use testcontainers::GenericImage;
 
 /// Trait defining how to test a frontend framework.
@@ -21,12 +22,18 @@ pub trait FrontendFramework: Send + Sync {
     /// Framework identifier (e.g. "wordpress", "nextjs").
     fn id(&self) -> &'static str;
 
-    /// Build a Docker container image for this framework.
+    /// Build a Docker container request mapped to the given origin port.
+    ///
+    /// The `origin_port` is the fixed host port that the WASM binary
+    /// expects the origin to be running on (baked in at build time).
     ///
     /// # Errors
     ///
     /// Returns [`TestError::ContainerStart`] if the image cannot be created.
-    fn build_container(&self) -> error_stack::Result<GenericImage, TestError>;
+    fn build_container(
+        &self,
+        origin_port: u16,
+    ) -> error_stack::Result<ContainerRequest<GenericImage>, TestError>;
 
     /// Port the framework serves on inside the container.
     fn container_port(&self) -> u16;
