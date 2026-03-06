@@ -4,8 +4,8 @@ pub mod wordpress;
 
 use crate::common::runtime::TestError;
 use scenarios::{CustomScenario, TestScenario};
-use testcontainers::core::ContainerRequest;
 use testcontainers::GenericImage;
+use testcontainers::core::ContainerRequest;
 
 /// Trait defining how to test a frontend framework.
 ///

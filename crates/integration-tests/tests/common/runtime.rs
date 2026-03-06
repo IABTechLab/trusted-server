@@ -39,15 +39,6 @@ pub enum TestError {
     #[display("Invalid CSS selector")]
     InvalidSelector,
 
-    #[display("Element not found")]
-    ElementNotFound,
-
-    #[display("Attribute not rewritten")]
-    AttributeNotRewritten,
-
-    #[display("GDPR signal missing from response")]
-    GdprSignalMissing,
-
     // Resource errors
     #[display("No available port found")]
     NoPortAvailable,

@@ -8,25 +8,16 @@ use error_stack::ResultExt as _;
 /// regardless of the underlying framework serving HTML.
 #[derive(Debug, Clone)]
 pub enum TestScenario {
-    /// Verify `<script>` tag is injected into `<head>`.
+    /// Verify `<script>` tag is injected into the HTML response.
     HtmlInjection,
 
     /// Verify `/static/tsjs=tsjs-unified.min.js` endpoint serves the JS bundle.
     ScriptServing,
-
-    /// Verify `tsjs-*` attributes are rewritten correctly.
-    AttributeRewriting,
-
-    /// Verify GDPR consent signals propagate through the response.
-    GdprSignal,
 }
 
 /// Framework-specific custom scenarios that test framework-unique behaviors.
 #[derive(Debug, Clone)]
 pub enum CustomScenario {
-    /// WordPress: script injection does not break admin pages.
-    WordPressAdminInjection,
-
     /// Next.js: React Server Components Flight format is preserved.
     NextJsRscFlight,
 
@@ -85,40 +76,6 @@ impl TestScenario {
 
                 Ok(())
             }
-
-            Self::AttributeRewriting => {
-                let resp = reqwest::blocking::get(base_url)
-                    .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
-                        "scenario: AttributeRewriting, framework: {framework_id}"
-                    ))?;
-
-                let html = resp.text().change_context(TestError::ResponseParse)?;
-
-                // Check for elements with data-ad-unit that should have tsjs- prefixed attributes
-                assertions::assert_attribute_rewritten(
-                    &html,
-                    "[data-ad-unit]",
-                    "data-ad-unit",
-                    "tsjs-",
-                )
-                .attach_printable(format!("framework: {framework_id}"))?;
-
-                Ok(())
-            }
-
-            Self::GdprSignal => {
-                let resp = reqwest::blocking::get(base_url)
-                    .change_context(TestError::HttpRequest)
-                    .attach_printable(format!("scenario: GdprSignal, framework: {framework_id}"))?;
-
-                let body = resp.text().change_context(TestError::ResponseParse)?;
-
-                assertions::assert_gdpr_signal_in_body(&body)
-                    .attach_printable(format!("framework: {framework_id}"))?;
-
-                Ok(())
-            }
         }
     }
 }
@@ -131,28 +88,6 @@ impl CustomScenario {
     /// Returns a [`TestError`] variant depending on which assertion fails.
     pub fn run(&self, base_url: &str, framework_id: &str) -> error_stack::Result<(), TestError> {
         match self {
-            Self::WordPressAdminInjection => {
-                // Verify that WordPress admin pages (/wp-admin/) do not get script injection
-                let url = format!("{base_url}/wp-admin/");
-                let resp = reqwest::blocking::get(&url)
-                    .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
-                        "scenario: WordPressAdminInjection, framework: {framework_id}"
-                    ))?;
-
-                let html = resp.text().change_context(TestError::ResponseParse)?;
-
-                // Admin pages should NOT have tsjs script injected
-                if html.contains("/static/tsjs=") {
-                    return Err(error_stack::report!(TestError::ScriptTagNotFound)
-                        .attach_printable(
-                            "Script tag should NOT be injected on WordPress admin pages",
-                        ));
-                }
-
-                Ok(())
-            }
-
             Self::NextJsRscFlight => {
                 // Verify RSC Flight format responses are not corrupted
                 let client = reqwest::blocking::Client::new();
@@ -203,8 +138,8 @@ impl CustomScenario {
                     ))?;
 
                 // Server action responses should pass through without modification
-                // A 4xx or 5xx error is acceptable here since we don't have real server actions,
-                // but a connection error would indicate the proxy is blocking POST requests
+                // A 4xx is acceptable since we don't have real server actions,
+                // but a connection error would indicate the proxy is blocking POSTs
                 if resp.status().is_server_error() {
                     return Err(
                         error_stack::report!(TestError::HttpRequest).attach_printable(format!(

@@ -39,10 +39,7 @@ impl FrontendFramework for NextJs {
     }
 
     fn standard_scenarios(&self) -> Vec<TestScenario> {
-        vec![
-            TestScenario::HtmlInjection,
-            TestScenario::ScriptServing,
-        ]
+        vec![TestScenario::HtmlInjection, TestScenario::ScriptServing]
     }
 
     fn custom_scenarios(&self) -> Vec<CustomScenario> {

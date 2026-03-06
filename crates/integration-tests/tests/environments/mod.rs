@@ -16,9 +16,7 @@ type RuntimeFactory = fn() -> Box<dyn RuntimeEnvironment>;
 /// 1. Create `tests/environments/<platform>.rs`
 /// 2. Implement [`RuntimeEnvironment`] trait
 /// 3. Add factory closure here
-pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[
-    || Box::new(fastly::FastlyViceroy),
-];
+pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[|| Box::new(fastly::FastlyViceroy)];
 
 /// Find an available TCP port for the runtime to bind to.
 ///

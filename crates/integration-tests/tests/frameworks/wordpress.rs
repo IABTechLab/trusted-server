@@ -40,13 +40,6 @@ impl FrontendFramework for WordPress {
     }
 
     fn standard_scenarios(&self) -> Vec<TestScenario> {
-        vec![
-            TestScenario::HtmlInjection,
-            TestScenario::ScriptServing,
-        ]
-    }
-
-    fn custom_scenarios(&self) -> Vec<CustomScenario> {
-        vec![]
+        vec![TestScenario::HtmlInjection, TestScenario::ScriptServing]
     }
 }
