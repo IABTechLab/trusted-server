@@ -3,6 +3,11 @@ path = "^/secure"
 username = "user"
 password = "pass"
 
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "changeme"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
