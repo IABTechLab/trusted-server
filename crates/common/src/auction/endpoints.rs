@@ -9,6 +9,7 @@ use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::settings::Settings;
+use crate::synthetic::get_or_generate_synthetic_id;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::types::AuctionContext;
@@ -44,6 +45,14 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    // Generate synthetic ID early so the consent pipeline can use it for
+    // KV Store fallback/write operations.
+    let synthetic_id = get_or_generate_synthetic_id(settings, &req).change_context(
+        TrustedServerError::Auction {
+            message: "Failed to generate synthetic ID".to_string(),
+        },
+    )?;
+
     // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = GeoInfo::from_request(&req);
@@ -52,11 +61,12 @@ pub async fn handle_auction(
         req: &req,
         config: &settings.consent,
         geo: geo.as_ref(),
-        synthetic_id: None, // Auction requests don't carry a Synthetic ID yet.
+        synthetic_id: Some(synthetic_id.as_str()),
     });
 
     // Convert tsjs request format to auction request
-    let auction_request = convert_tsjs_to_auction_request(&body, settings, &req, consent_context)?;
+    let auction_request =
+        convert_tsjs_to_auction_request(&body, settings, &req, consent_context, &synthetic_id)?;
 
     // Create auction context
     let context = AuctionContext {

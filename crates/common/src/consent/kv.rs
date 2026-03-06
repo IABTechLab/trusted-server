@@ -181,6 +181,18 @@ pub fn consent_fingerprint(ctx: &ConsentContext) -> String {
     hash_optional(&mut hasher, ctx.raw_ac_string.as_deref());
     hasher.update(if ctx.gpc { b"1" } else { b"0" });
 
+    // Include GPP section IDs so SID-only changes trigger a KV write.
+    if let Some(sids) = &ctx.gpp_section_ids {
+        let mut sorted = sids.clone();
+        sorted.sort_unstable();
+        for sid in &sorted {
+            hasher.update(sid.to_string().as_bytes());
+            hasher.update(b"\xFF");
+        }
+    } else {
+        hasher.update(b"\x00");
+    }
+
     let result = hasher.finalize();
     hex::encode(&result[..8]) // 16 hex chars = 8 bytes = 64 bits
 }

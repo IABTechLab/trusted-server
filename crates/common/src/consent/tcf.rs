@@ -45,6 +45,12 @@ use error_stack::Report;
 
 use super::types::{ConsentDecodeError, TcfConsent};
 
+/// Maximum length of a raw TC String before decoding.
+///
+/// Real TC Strings are typically under 1 KB. This limit prevents malicious
+/// cookies from triggering large heap allocations during base64 decoding.
+const MAX_TC_STRING_LEN: usize = 4096;
+
 /// Decodes a TC String v2 into a [`TcfConsent`] struct.
 ///
 /// Only the core segment is decoded. Additional segments (separated by `.`)
@@ -52,9 +58,19 @@ use super::types::{ConsentDecodeError, TcfConsent};
 ///
 /// # Errors
 ///
-/// - [`ConsentDecodeError::InvalidTcString`] if base64 decoding fails, the
-///   version is not 2, or the bitfield is too short.
+/// - [`ConsentDecodeError::InvalidTcString`] if the string exceeds
+///   [`MAX_TC_STRING_LEN`], base64 decoding fails, the version is not 2, or
+///   the bitfield is too short.
 pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDecodeError>> {
+    if tc_string.len() > MAX_TC_STRING_LEN {
+        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+            reason: format!(
+                "TC string too long: {} bytes, max {MAX_TC_STRING_LEN}",
+                tc_string.len()
+            ),
+        }));
+    }
+
     // TC String may have multiple segments separated by '.'
     // The first segment is always the core segment.
     let core_segment = tc_string.split('.').next().unwrap_or(tc_string);
