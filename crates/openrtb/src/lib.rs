@@ -10,6 +10,39 @@ use serde_json::{Map, Value};
 /// Convenience alias for a JSON object used in `OpenRTB` `ext` fields.
 pub type Object = Map<String, Value>;
 
+/// Serde helper that serializes `Option<bool>` as `Option<i32>` (`1`/`0`).
+///
+/// The `OpenRTB` JSON spec represents boolean-like fields as integers (`0`/`1`),
+/// but the IAB proto file defines them as `bool`. This module bridges the gap
+/// so that the Rust types use `bool` while the JSON wire format uses integers.
+/// Deserialization accepts both forms for robustness.
+#[allow(clippy::missing_errors_doc)]
+pub mod bool_as_int {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<bool>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(true) => serializer.serialize_some(&1i32),
+            Some(false) => serializer.serialize_some(&0i32),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<bool>, D::Error> {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        match value {
+            Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
+            Some(serde_json::Value::Number(n)) => Ok(Some(n.as_i64() != Some(0))),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// Convert a serializable struct into an `Option<Object>` suitable for an
 /// `OpenRTB` `ext` field. Returns `None` when serialization produces an empty
 /// map (i.e. all fields were skipped), so that `ext` is omitted from the JSON
@@ -133,7 +166,7 @@ mod tests {
             "regs": {
                 "gpp": "DBABMA~CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA",
                 "gpp_sid": [7],
-                "gdpr": true
+                "gdpr": 1
             },
             "acat": ["IAB1"]
         });

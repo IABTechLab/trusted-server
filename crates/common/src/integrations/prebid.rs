@@ -1658,8 +1658,8 @@ server_url = "https://prebid.example"
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         assert_eq!(
             serialized["test"],
-            json!(true),
-            "should serialize top-level test as true when test_mode is enabled"
+            json!(1),
+            "should serialize top-level test as 1 when test_mode is enabled"
         );
     }
 
