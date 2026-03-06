@@ -10,6 +10,9 @@ use jose_jwk::Jwk;
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyApiClient, FastlyConfigStore};
+use crate::request_signing::JWKS_CONFIG_STORE_NAME;
+#[allow(unused_imports)]
+use crate::request_signing::SIGNING_SECRET_STORE_NAME;
 
 use super::Keypair;
 
@@ -22,14 +25,22 @@ pub struct KeyRotationResult {
 }
 
 pub struct KeyRotationManager {
+    /// Edge-side config store for reading JWKS (uses store name).
     config_store: FastlyConfigStore,
+    /// Management API client for writing to stores (uses store IDs).
     api_client: FastlyApiClient,
+    /// Fastly API store ID for config store writes.
     config_store_id: String,
+    /// Fastly API store ID for secret store writes.
     secret_store_id: String,
 }
 
 impl KeyRotationManager {
     /// Creates a new key rotation manager.
+    ///
+    /// The `config_store_id` and `secret_store_id` are Fastly management API
+    /// identifiers used for write operations. Edge reads use the store names
+    /// defined in [`JWKS_CONFIG_STORE_NAME`] and [`SIGNING_SECRET_STORE_NAME`].
     ///
     /// # Errors
     ///
@@ -41,7 +52,7 @@ impl KeyRotationManager {
         let config_store_id = config_store_id.into();
         let secret_store_id = secret_store_id.into();
 
-        let config_store = FastlyConfigStore::new("jwks_store");
+        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
         let api_client = FastlyApiClient::new()?;
 
         Ok(Self {
