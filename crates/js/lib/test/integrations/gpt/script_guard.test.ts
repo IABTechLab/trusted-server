@@ -15,13 +15,13 @@ describe('GPT script guard', () => {
   let originalInsertBefore: typeof Element.prototype.insertBefore;
 
   beforeEach(() => {
+    resetGuardState();
     originalDocumentWrite = document.write;
     originalDocumentWriteln = document.writeln;
     originalSetAttribute = HTMLScriptElement.prototype.setAttribute;
     originalCreateElement = document.createElement;
     originalAppendChild = Element.prototype.appendChild;
     originalInsertBefore = Element.prototype.insertBefore;
-    resetGuardState();
   });
 
   afterEach(() => {
@@ -30,8 +30,6 @@ describe('GPT script guard', () => {
     document.writeln = originalDocumentWriteln;
     HTMLScriptElement.prototype.setAttribute = originalSetAttribute;
     document.createElement = originalCreateElement;
-    Element.prototype.appendChild = originalAppendChild;
-    Element.prototype.insertBefore = originalInsertBefore;
   });
 
   it('restores patched globals on reset', () => {
@@ -72,14 +70,14 @@ describe('GPT script guard', () => {
     installGptGuard();
 
     document.write(
-      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar"></script>'
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar"></script>'
     );
 
     expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
     const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
     expect(writtenHtml).toContain(window.location.host);
     expect(writtenHtml).toContain(
-      '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar'
+      '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar'
     );
   });
 
@@ -116,10 +114,10 @@ describe('GPT script guard', () => {
 
       const script = document.createElement('script');
       script.src =
-        'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js';
+        'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js';
 
       expect(script.getAttribute('src')).toContain(
-        '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js'
+        '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js'
       );
     } finally {
       descriptorSpy.mockRestore();
@@ -147,12 +145,12 @@ describe('GPT script guard', () => {
     const script = document.createElement('script');
 
     script.src =
-      'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar';
+      'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar';
     container.appendChild(script);
 
     expect(script.src).toContain(window.location.host);
     expect(script.src).toContain(
-      '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar'
+      '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar'
     );
   });
 });

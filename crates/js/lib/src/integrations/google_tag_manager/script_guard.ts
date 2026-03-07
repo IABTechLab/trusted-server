@@ -102,7 +102,8 @@ function rewriteGtmUrl(originalUrl: string): string {
 }
 
 const guard = createScriptGuard({
-  name: 'GTM',
+  displayName: 'GTM',
+  id: 'google_tag_manager',
   isTargetUrl: isGtmUrl,
   rewriteUrl: rewriteGtmUrl,
 });

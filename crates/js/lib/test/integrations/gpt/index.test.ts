@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
 
-// We import installGptShim dynamically to avoid the auto-init side effect.
-// Tests call installGptShim() explicitly after setting up the environment.
+// We import installGptShim dynamically so each test can control whether the
+// GPT enable flag is present before module evaluation.
 
 type GptWindow = Window & {
   googletag?: {
@@ -200,6 +200,16 @@ describe('GPT shim – runtime gating', () => {
     await import('../../../src/integrations/gpt/index');
 
     expect(typeof (window as Record<string, unknown>).__tsjs_installGptShim).toBe('function');
+  });
+
+  it('auto-installs the shim when the enable flag is set before import', async () => {
+    vi.resetModules();
+    win.__tsjs_gpt_enabled = true;
+
+    await import('../../../src/integrations/gpt/index');
+
+    expect(isGuardInstalled()).toBe(true);
+    expect(win.googletag).toBeDefined();
   });
 
   it('does not install the shim when only imported (no explicit activation)', async () => {

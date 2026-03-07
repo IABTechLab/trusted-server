@@ -1,4 +1,9 @@
 import { log } from '../../core/log';
+import {
+  DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
+  type DomInsertionCandidate,
+  registerDomInsertionHandler,
+} from '../../shared/dom_insertion_dispatcher';
 
 /**
  * GPT Script Interception Guard
@@ -29,8 +34,9 @@ import { log } from '../../core/log';
  * 4. **`document.createElement` patch** — tags every newly created
  *    `<script>` element with a per-instance `src` descriptor as a
  *    fallback when the prototype descriptor cannot be installed.
- * 5. **DOM insertion patches** on `appendChild` / `insertBefore` — catches
- *    scripts and `<link rel="preload">` elements at insertion time.
+ * 5. **Shared DOM insertion dispatcher** — catches scripts and
+ *    `<link rel="preload">` elements at insertion time without stacking
+ *    multiple prototype wrappers across integrations.
  * 6. **`MutationObserver`** — catches elements added to the DOM via
  *    `innerHTML`, `.append()`, etc., or attribute mutations on existing
  *    elements.
@@ -110,9 +116,8 @@ let nativeSrcGet: ((this: HTMLScriptElement) => string) | undefined;
 let nativeSrcDescriptor: PropertyDescriptor | undefined;
 let nativeSetAttribute: typeof HTMLScriptElement.prototype.setAttribute | undefined;
 let nativeCreateElement: typeof document.createElement | undefined;
-let nativeAppendChild: typeof Element.prototype.appendChild | undefined;
-let nativeInsertBefore: typeof Element.prototype.insertBefore | undefined;
 let mutationObserver: MutationObserver | undefined;
+let unregisterDomInsertionHandler: (() => void) | undefined;
 
 // ---------------------------------------------------------------------------
 // Tracking — prevent double-rewriting
@@ -157,33 +162,37 @@ function maybeRewrite(url: string): { url: string; didRewrite: boolean } {
 /**
  * Attempt to rewrite a script element's src if it points at a GPT domain.
  */
-function rewriteScriptSrc(element: HTMLScriptElement, rawUrl: string): void {
+function rewriteScriptSrc(element: HTMLScriptElement, rawUrl: string): boolean {
   const { url: finalUrl, didRewrite } = maybeRewrite(rawUrl);
-  if (!didRewrite) return;
-  if (alreadyRewritten(element, finalUrl)) return;
+  if (!didRewrite || alreadyRewritten(element, finalUrl)) {
+    return false;
+  }
 
   log.info(`${LOG_PREFIX}: rewriting script src`, { original: rawUrl, rewritten: finalUrl });
   rewritten.set(element, finalUrl);
   applySrc(element, finalUrl);
+  return true;
 }
 
 /**
  * Attempt to rewrite a link element's href if it's a preload/prefetch for
  * a GPT-domain script.
  */
-function rewriteLinkHref(element: HTMLLinkElement): void {
-  const rel = element.getAttribute('rel');
-  if (rel !== 'preload' && rel !== 'prefetch') return;
-  if (element.getAttribute('as') !== 'script') return;
+function rewriteLinkHref(
+  element: HTMLLinkElement,
+  href = element.href || element.getAttribute('href') || '',
+  rel = element.getAttribute('rel')
+): boolean {
+  if (rel !== 'preload' && rel !== 'prefetch') return false;
+  if (element.getAttribute('as') !== 'script') return false;
 
-  const href = element.href || element.getAttribute('href') || '';
   const { url: finalUrl, didRewrite } = maybeRewrite(href);
-  if (!didRewrite) return;
-  if (alreadyRewritten(element, finalUrl)) return;
+  if (!didRewrite || alreadyRewritten(element, finalUrl)) return false;
 
   log.info(`${LOG_PREFIX}: rewriting ${rel} link`, { original: href, rewritten: finalUrl });
   rewritten.set(element, finalUrl);
   element.href = finalUrl;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,45 +417,31 @@ function installCreateElementPatch(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 5: DOM insertion patches (appendChild / insertBefore)
+// Layer 5: shared DOM insertion dispatcher
 // ---------------------------------------------------------------------------
 
 /**
  * Check a node at insertion time and rewrite if it's a GPT script or
  * preload link.
  */
-function checkNodeAtInsertion(node: Node): void {
-  if (!(node instanceof HTMLElement)) return;
-
-  if (node.tagName === 'SCRIPT') {
-    const src = (node as HTMLScriptElement).src || node.getAttribute('src') || '';
-    if (src) rewriteScriptSrc(node as HTMLScriptElement, src);
-  } else if (node.tagName === 'LINK') {
-    rewriteLinkHref(node as HTMLLinkElement);
+function checkNodeAtInsertion(candidate: DomInsertionCandidate): boolean {
+  if (candidate.kind === 'script') {
+    return rewriteScriptSrc(candidate.element, candidate.url);
   }
+
+  return rewriteLinkHref(candidate.element, candidate.url, candidate.rel);
 }
 
-function installDomInsertionPatches(): void {
+function installDomInsertionDispatcher(): void {
   if (typeof Element === 'undefined') return;
 
-  nativeAppendChild = Element.prototype.appendChild;
-  nativeInsertBefore = Element.prototype.insertBefore;
+  unregisterDomInsertionHandler = registerDomInsertionHandler({
+    handle: checkNodeAtInsertion,
+    id: 'gpt',
+    priority: DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
+  });
 
-  Element.prototype.appendChild = function <T extends Node>(this: Element, node: T): T {
-    checkNodeAtInsertion(node);
-    return nativeAppendChild!.call(this, node) as T;
-  };
-
-  Element.prototype.insertBefore = function <T extends Node>(
-    this: Element,
-    node: T,
-    reference: Node | null
-  ): T {
-    checkNodeAtInsertion(node);
-    return nativeInsertBefore!.call(this, node, reference) as T;
-  };
-
-  log.info(`${LOG_PREFIX}: DOM insertion patches installed`);
+  log.info(`${LOG_PREFIX}: DOM insertion dispatcher registered`);
 }
 
 // ---------------------------------------------------------------------------
@@ -545,7 +540,7 @@ export function installGptGuard(): void {
   installCreateElementPatch();
 
   // Layer 5: intercept appendChild / insertBefore (scripts + link preloads)
-  installDomInsertionPatches();
+  installDomInsertionDispatcher();
 
   // Layer 6: catch anything else via MutationObserver
   installMutationObserver();
@@ -593,13 +588,9 @@ export function resetGuardState(): void {
     }
   }
 
-  if (typeof Element !== 'undefined') {
-    if (nativeAppendChild) {
-      Element.prototype.appendChild = nativeAppendChild;
-    }
-    if (nativeInsertBefore) {
-      Element.prototype.insertBefore = nativeInsertBefore;
-    }
+  if (unregisterDomInsertionHandler) {
+    unregisterDomInsertionHandler();
+    unregisterDomInsertionHandler = undefined;
   }
 
   nativeDocWrite = undefined;
@@ -609,8 +600,6 @@ export function resetGuardState(): void {
   nativeSrcDescriptor = undefined;
   nativeSetAttribute = undefined;
   nativeCreateElement = undefined;
-  nativeAppendChild = undefined;
-  nativeInsertBefore = undefined;
 
   rewritten = new WeakMap<HTMLScriptElement | HTMLLinkElement, string>();
   instancePatched = new WeakSet<HTMLScriptElement>();
