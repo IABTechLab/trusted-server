@@ -53,6 +53,8 @@ impl FrontendFramework for NextJs {
         vec![
             CustomScenario::NextJsRscFlight,
             CustomScenario::NextJsServerActions,
+            CustomScenario::NextJsApiRoute,
+            CustomScenario::NextJsFormAction,
         ]
     }
 }

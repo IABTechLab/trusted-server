@@ -1,5 +1,5 @@
-# Minimal Next.js container for integration testing.
-# Builds a standalone Next.js 14 app with test pages containing ad slots.
+# Next.js container for integration testing.
+# Builds a standalone Next.js 14 app with pages, API routes, forms, and ad slots.
 #
 # Build:
 #   docker build -t test-nextjs:latest \

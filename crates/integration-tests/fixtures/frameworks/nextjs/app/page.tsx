@@ -18,16 +18,18 @@ export default function Home() {
         alt="test"
       />
 
-      {/* Ad slot that should be rewritten by the trusted server */}
+      {/* Ad slots with both data-ad-unit (preserved) and URL attributes (rewritten).
+          This tests that URL rewriting works inside ad markup, not just outside it. */}
       <div id="ad-slot-1" data-ad-unit="/test/banner">
-        <p>Advertisement placeholder</p>
+        <a href={`http://${originHost}/ad/banner-landing`}>Banner ad</a>
+        <img src={`http://${originHost}/ad/banner.png`} alt="banner" />
       </div>
 
       <p>More page content follows the ad slot.</p>
 
       {/* Second ad slot */}
       <div id="ad-slot-2" data-ad-unit="/test/sidebar">
-        <p>Sidebar advertisement placeholder</p>
+        <a href={`http://${originHost}/ad/sidebar-landing`}>Sidebar ad</a>
       </div>
     </main>
   );

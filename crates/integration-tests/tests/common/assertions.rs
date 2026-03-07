@@ -113,6 +113,60 @@ pub fn assert_attributes_rewritten(
     Ok(())
 }
 
+/// Assert that URL attributes inside ad-slot elements are rewritten.
+///
+/// Specifically checks that `href`/`src` attributes on elements *within*
+/// `[data-ad-unit]` containers have been rewritten from origin to proxy host.
+/// This catches regressions limited to ad markup that a page-wide scan might miss.
+///
+/// # Errors
+///
+/// Returns [`TestError::AttributeNotRewritten`] if origin URLs remain inside
+/// ad slots or if no rewritten proxy URLs are found inside ad slots.
+pub fn assert_ad_slot_urls_rewritten(
+    html: &str,
+    origin_host: &str,
+    proxy_base_url: &str,
+) -> Result<(), TestError> {
+    let document = Html::parse_document(html);
+
+    let proxy_host = proxy_base_url
+        .strip_prefix("http://")
+        .or_else(|| proxy_base_url.strip_prefix("https://"))
+        .unwrap_or(proxy_base_url);
+
+    // Select elements with href/src that are descendants of [data-ad-unit]
+    let ad_link_selector = parse_selector("[data-ad-unit] [href], [data-ad-unit] [src]")?;
+    let mut found_proxy_url = false;
+
+    for element in document.select(&ad_link_selector) {
+        for attr in ["href", "src"] {
+            if let Some(value) = element.value().attr(attr) {
+                if value.contains(origin_host) {
+                    return Err(error_stack::report!(TestError::AttributeNotRewritten)
+                        .attach_printable(format!(
+                            "Origin host still present inside ad slot: {attr}=\"{value}\""
+                        )));
+                }
+                if value.contains(proxy_host) {
+                    found_proxy_url = true;
+                }
+            }
+        }
+    }
+
+    if !found_proxy_url {
+        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
+            format!(
+                "No URL attributes inside ad slots rewritten to proxy host ({proxy_host}). \
+                 Ensure ad-slot fixtures contain href/src with origin host"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Assert that `data-ad-unit` attribute values are preserved unchanged.
 ///
 /// The trusted-server rewrites URL-bearing attributes (`href`, `src`) but must
@@ -145,6 +199,56 @@ pub fn assert_data_ad_units_preserved(html: &str, expected_units: &[&str]) -> Re
                      Found units: {found_units:?}"
                 )));
         }
+    }
+
+    Ok(())
+}
+
+/// Assert that a form's `action` attribute has been rewritten from origin to proxy.
+///
+/// Finds a `<form>` matching the given CSS selector and verifies its `action`
+/// attribute no longer contains the origin host and instead points to the proxy.
+///
+/// # Errors
+///
+/// Returns [`TestError::AttributeNotRewritten`] if the form is not found, has
+/// no `action`, or the `action` still contains the origin host.
+pub fn assert_form_action_rewritten(
+    html: &str,
+    form_selector: &str,
+    origin_host: &str,
+    proxy_base_url: &str,
+) -> Result<(), TestError> {
+    let document = Html::parse_document(html);
+    let selector = parse_selector(form_selector)?;
+
+    let proxy_host = proxy_base_url
+        .strip_prefix("http://")
+        .or_else(|| proxy_base_url.strip_prefix("https://"))
+        .unwrap_or(proxy_base_url);
+
+    let form = document.select(&selector).next().ok_or_else(|| {
+        error_stack::report!(TestError::AttributeNotRewritten)
+            .attach_printable(format!("No form matching '{form_selector}' found in HTML"))
+    })?;
+
+    let action = form.value().attr("action").ok_or_else(|| {
+        error_stack::report!(TestError::AttributeNotRewritten)
+            .attach_printable(format!("Form '{form_selector}' has no action attribute"))
+    })?;
+
+    if action.contains(origin_host) {
+        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
+            format!("Form action still contains origin host: action=\"{action}\""),
+        ));
+    }
+
+    if !action.contains(proxy_host) {
+        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
+            format!(
+                "Form action not rewritten to proxy host ({proxy_host}): action=\"{action}\""
+            ),
+        ));
     }
 
     Ok(())
@@ -236,6 +340,66 @@ mod tests {
     }
 
     #[test]
+    fn ad_slot_urls_rewritten_passes() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <div data-ad-unit="/test/banner">
+                    <a href="http://127.0.0.1:9999/ad/banner-landing">Banner</a>
+                    <img src="http://127.0.0.1:9999/ad/banner.png">
+                </div>
+            </body>
+            </html>
+        "#;
+
+        assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999")
+            .expect("should detect rewritten URLs inside ad slots");
+    }
+
+    #[test]
+    fn ad_slot_urls_rewritten_fails_when_origin_remains() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <div data-ad-unit="/test/banner">
+                    <a href="http://127.0.0.1:8888/ad/banner-landing">Banner</a>
+                </div>
+            </body>
+            </html>
+        "#;
+
+        let result =
+            assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
+        assert!(
+            result.is_err(),
+            "should fail when origin host remains inside ad slot"
+        );
+    }
+
+    #[test]
+    fn ad_slot_urls_rewritten_fails_when_no_urls_in_slots() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <div data-ad-unit="/test/banner">
+                    <p>No links here</p>
+                </div>
+            </body>
+            </html>
+        "#;
+
+        let result =
+            assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
+        assert!(
+            result.is_err(),
+            "should fail when no URL attributes exist inside ad slots"
+        );
+    }
+
+    #[test]
     fn unique_script_tag_passes_with_exactly_one() {
         let html = r#"
             <!DOCTYPE html>
@@ -323,6 +487,64 @@ mod tests {
 
         let result = assert_data_ad_units_preserved(html, &["/test/banner", "/test/sidebar"]);
         assert!(result.is_err(), "should fail when expected ad unit is missing");
+    }
+
+    #[test]
+    fn form_action_rewritten_passes() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <form id="contact-form" action="http://127.0.0.1:9999/api/contact" method="POST">
+                    <input name="name" />
+                </form>
+            </body>
+            </html>
+        "#;
+
+        assert_form_action_rewritten(html, "form#contact-form", "127.0.0.1:8888", "http://127.0.0.1:9999")
+            .expect("should detect rewritten form action");
+    }
+
+    #[test]
+    fn form_action_rewritten_fails_when_origin_remains() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <form id="contact-form" action="http://127.0.0.1:8888/api/contact" method="POST">
+                    <input name="name" />
+                </form>
+            </body>
+            </html>
+        "#;
+
+        let result = assert_form_action_rewritten(
+            html,
+            "form#contact-form",
+            "127.0.0.1:8888",
+            "http://127.0.0.1:9999",
+        );
+        assert!(
+            result.is_err(),
+            "should fail when origin host remains in form action"
+        );
+    }
+
+    #[test]
+    fn form_action_rewritten_fails_when_no_form() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html><body><p>No form here</p></body></html>
+        "#;
+
+        let result = assert_form_action_rewritten(
+            html,
+            "form#contact-form",
+            "127.0.0.1:8888",
+            "http://127.0.0.1:9999",
+        );
+        assert!(result.is_err(), "should fail when form is not found");
     }
 
     #[test]

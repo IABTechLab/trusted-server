@@ -1,15 +1,19 @@
 # Integration Tests
 
 End-to-end tests that verify the trusted server against real frontend
-containers using [Testcontainers](https://testcontainers.com/).
+containers using [Testcontainers](https://testcontainers.com/) and
+[Playwright](https://playwright.dev/).
 
 ## Prerequisites
 
 - **Docker** — running and accessible
 - **Viceroy** — Fastly local simulator (`cargo install viceroy`)
 - **wasm32-wasip1 target** — `rustup target add wasm32-wasip1`
+- **Node.js** (LTS) — for browser tests only
 
 ## Quick start
+
+### HTTP-level tests
 
 ```bash
 ./scripts/integration-tests.sh
@@ -22,11 +26,29 @@ This script handles everything:
 2. Builds the WordPress and Next.js Docker images
 3. Runs all integration tests sequentially
 
+### Browser tests
+
+```bash
+./scripts/integration-tests-browser.sh
+```
+
+This script:
+
+1. Builds the WASM binary and Docker images (same as above)
+2. Installs Playwright and Chromium
+3. Runs browser tests for Next.js and WordPress sequentially
+
 ### Run a single test
 
 ```bash
+# HTTP-level
 ./scripts/integration-tests.sh test_wordpress_fastly
 ./scripts/integration-tests.sh test_nextjs_fastly
+
+# Browser — single framework
+cd crates/integration-tests/browser
+TEST_FRAMEWORK=nextjs npx playwright test
+TEST_FRAMEWORK=wordpress npx playwright test
 ```
 
 ### Verbose output
@@ -59,20 +81,46 @@ docker build -t test-nextjs:latest \
 
 ## Test scenarios
 
-### Standard (all frameworks)
+### HTTP-level — standard (all frameworks)
 
 | Scenario | What it tests |
 |---|---|
-| `HtmlInjection` | `<script src="/static/tsjs=...">` is present in proxied HTML |
+| `HtmlInjection` | Exactly one `<script id="trustedserver-js" src="/static/tsjs=...">` in proxied HTML |
 | `ScriptServing` | `/static/tsjs=tsjs-unified.min.js` returns JavaScript with bundle markers |
-| `AttributeRewriting` | `href`/`src` URLs with origin host are rewritten to proxy host |
+| `AttributeRewriting` | `href`/`src` URLs with origin host are rewritten to proxy host (including inside ad slots) |
+| `ScriptServingUnknownFile404` | Unknown `/static/tsjs=...` paths return 404, not HTML fallback |
 
-### Next.js custom
+### HTTP-level — Next.js custom
 
 | Scenario | What it tests |
 |---|---|
 | `NextJsRscFlight` | RSC Flight responses are not corrupted (no HTML, no script injection) |
-| `NextJsServerActions` | POST requests pass through the proxy to the origin |
+| `NextJsServerActions` | POST requests pass through proxy; unknown actions return 404 |
+
+### HTTP-level — WordPress custom
+
+| Scenario | What it tests |
+|---|---|
+| `WordPressAdminInjection` | `/wp-admin/` pages receive script injection (documents current behavior) |
+
+### Browser-level — shared (all frameworks)
+
+| Spec | What it tests |
+|---|---|
+| `script-injection` | `script#trustedserver-js` present in live DOM, no console errors |
+| `script-bundle` | JS bundle loads with 200, no parse/runtime errors, correct content type |
+
+### Browser-level — Next.js
+
+| Spec | What it tests |
+|---|---|
+| `navigation` | Client-side (SPA) navigation preserves script injection, back button works |
+
+### Browser-level — WordPress
+
+| Spec | What it tests |
+|---|---|
+| `admin-injection` | `/wp-admin/` has script tag in live DOM |
 
 ## Architecture
 
@@ -90,6 +138,18 @@ tests/
     scenarios.rs       # Standard and custom test scenarios
     wordpress.rs       # WordPress container config
     nextjs.rs          # Next.js container config
+browser/
+  playwright.config.ts # Playwright configuration (chromium, workers: 1)
+  global-setup.ts      # Starts Docker container + Viceroy before tests
+  global-teardown.ts   # Stops container + Viceroy after tests
+  helpers/
+    infra.ts           # Docker + Viceroy spawn/kill logic
+    wait-for-ready.ts  # Health check polling
+    state.ts           # Reads shared state file between setup/tests/teardown
+  tests/
+    shared/            # Tests that run for all frameworks
+    nextjs/            # Next.js-specific browser tests
+    wordpress/         # WordPress-specific browser tests
 fixtures/
   configs/
     viceroy-template.toml  # Viceroy local_server config (KV stores, secrets)
@@ -105,12 +165,11 @@ fixtures/
 2. The WASM binary is pre-built with `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL`
    pointing to `http://127.0.0.1:8888` so the proxy knows where to forward
 3. Viceroy spawns with the WASM binary on a random port
-4. HTTP requests go to Viceroy (proxy) which forwards to the Docker container
-   (origin) and processes the response
-5. Assertions verify the proxied response has script injection, URL rewriting,
-   etc.
+4. **HTTP tests**: reqwest sends requests to Viceroy and asserts on responses
+5. **Browser tests**: Playwright opens Chromium pointing at Viceroy and verifies
+   script injection, bundle loading, and client-side navigation in a real browser
 
-### Why `--test-threads=1`
+### Why `--test-threads=1` / `workers: 1`
 
 All tests share the same fixed origin port (8888). The trusted server config is
 baked into the WASM binary at compile time with this port, so only one Docker
@@ -125,12 +184,21 @@ triggered by:
 - PR approval
 - Manual dispatch
 
-They are **not** part of `cargo test --workspace` because the crate requires a
-native target while the workspace default is `wasm32-wasip1`.
+Two jobs run in parallel:
 
-## Not tested (out of scope)
+1. **integration-tests** — HTTP-level tests (Rust + testcontainers)
+2. **browser-tests** — Playwright tests (Node.js + Chromium)
+
+They are **not** part of `cargo test --workspace` because the integration-tests
+crate requires a native target while the workspace default is `wasm32-wasip1`.
+
+## Known gaps
 
 - **GDPR consent propagation** — the consent field exists in `AuctionRequest`
   but is not yet populated or forwarded. Requires implementation first.
-- **Client-side navigation** — requires a real browser (Playwright/Selenium).
-  HTTP-level tests cannot verify JavaScript execution or route transitions.
+- **Next.js integration features** — the WASM binary is built without
+  `integrations.nextjs` enabled, so Next.js-specific rewriters/post-processors
+  are not exercised. RSC Flight/Server Actions tests are compatibility smoke
+  tests only.
+- **GTM integration** — not enabled in test config. Has unit coverage in
+  `google_tag_manager.rs`.

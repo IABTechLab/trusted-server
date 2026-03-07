@@ -26,16 +26,18 @@
             <a id="origin-link" href="http://<?= $origin ?>/page">Origin Link</a>
             <img id="origin-img" src="http://<?= $origin ?>/images/test.png" alt="test">
 
-            <!-- Ad slot that should be rewritten by the trusted server -->
+            <!-- Ad slots with both data-ad-unit (preserved) and URL attributes (rewritten).
+                 This tests that URL rewriting works inside ad markup, not just outside it. -->
             <div id="ad-slot-1" data-ad-unit="/test/banner">
-                <p>Advertisement placeholder</p>
+                <a href="http://<?= $origin ?>/ad/banner-landing">Banner ad</a>
+                <img src="http://<?= $origin ?>/ad/banner.png" alt="banner">
             </div>
 
             <p>More article content follows the ad slot.</p>
 
             <!-- Second ad slot -->
             <div id="ad-slot-2" data-ad-unit="/test/sidebar">
-                <p>Sidebar advertisement placeholder</p>
+                <a href="http://<?= $origin ?>/ad/sidebar-landing">Sidebar ad</a>
             </div>
         </article>
     </main>

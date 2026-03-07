@@ -30,6 +30,12 @@ pub enum CustomScenario {
     /// Next.js: Server Actions POST requests pass through correctly.
     NextJsServerActions,
 
+    /// Next.js: API routes return JSON without HTML injection.
+    NextJsApiRoute,
+
+    /// Next.js: Form action URLs are rewritten from origin to proxy.
+    NextJsFormAction,
+
     /// WordPress: Admin pages (`/wp-admin/`) receive script injection.
     ///
     /// The trusted server currently injects into ALL HTML responses
@@ -88,6 +94,10 @@ impl TestScenario {
                 let origin_host = format!("127.0.0.1:{}", origin_port());
 
                 assertions::assert_attributes_rewritten(&html, &origin_host, base_url)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                // Verify URL attributes inside ad-slot elements are also rewritten
+                assertions::assert_ad_slot_urls_rewritten(&html, &origin_host, base_url)
                     .attach_printable(format!("framework: {framework_id}"))?;
 
                 // Verify non-URL attributes like data-ad-unit are preserved unchanged
@@ -247,9 +257,10 @@ impl CustomScenario {
 
             Self::NextJsServerActions => {
                 // Verify POST requests pass through the proxy to the origin.
-                // The minimal Next.js app has no real server actions, so the
-                // framework returns a client or redirect response. A 5xx means
-                // the proxy itself failed rather than forwarding.
+                // The minimal Next.js app has no real server actions, so
+                // Next.js returns 404 for the unknown action ID. This proves
+                // the proxy forwarded the POST to the origin rather than
+                // rejecting or mishandling it.
                 let client = reqwest::blocking::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
@@ -266,18 +277,126 @@ impl CustomScenario {
                         "scenario: NextJsServerActions, framework: {framework_id}"
                     ))?;
 
-                let status = resp.status();
+                let status = resp.status().as_u16();
+                let body = resp.text().unwrap_or_default();
 
-                // The proxy must forward the POST. We expect a non-5xx from
-                // the origin: 2xx, 3xx (redirect), or 4xx (no matching action).
-                if status.is_server_error() {
-                    let body = resp.text().unwrap_or_default();
+                // Next.js returns 404 for unknown server action IDs.
+                // With App Router client components in the layout, Next.js
+                // may return a "soft 404" (HTTP 200 with a not-found page).
+                // Accept 200, 404, or 405 — all prove the proxy forwarded
+                // the POST to the origin rather than rejecting it.
+                match status {
+                    404 | 405 => {}
+                    200 => {
+                        // Soft 404: verify the body is a Next.js not-found page
+                        assert!(
+                            body.contains("404") || body.contains("not found")
+                                || body.contains("Not Found"),
+                            "should contain 404 indicator in soft-404 response body"
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            error_stack::report!(TestError::HttpRequest).attach_printable(
+                                format!(
+                                    "Expected 200/404/405 for unknown server action, got {status}; body: {body}"
+                                ),
+                            ),
+                        );
+                    }
+                }
+
+                Ok(())
+            }
+
+            Self::NextJsApiRoute => {
+                // Verify API routes return JSON without HTML injection.
+                // The proxy should pass JSON responses through unchanged.
+                let url = format!("{base_url}/api/hello");
+
+                let resp = reqwest::blocking::get(&url)
+                    .change_context(TestError::HttpRequest)
+                    .attach_printable(format!(
+                        "scenario: NextJsApiRoute, framework: {framework_id}"
+                    ))?;
+
+                let status = resp.status().as_u16();
+                if status != 200 {
                     return Err(
                         error_stack::report!(TestError::HttpRequest).attach_printable(format!(
-                            "POST request failed with {status}; body: {body}"
+                            "Expected 200 for API route, got {status}"
                         )),
                     );
                 }
+
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                if !content_type.contains("application/json") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(format!(
+                            "Expected application/json content-type, got: {content_type}"
+                        )));
+                }
+
+                let body = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                // JSON responses must not contain HTML injection
+                if body.contains("<script") || body.contains("/static/tsjs=") {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(
+                            "API route response contains script injection — JSON should pass through unchanged",
+                        ));
+                }
+
+                // Verify it's valid JSON with expected structure
+                let json: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|e| {
+                        error_stack::report!(TestError::ResponseParse)
+                            .attach_printable(format!("API response is not valid JSON: {e}"))
+                    })?;
+
+                if json.get("message").is_none() {
+                    return Err(error_stack::report!(TestError::ResponseParse)
+                        .attach_printable(
+                            "API response missing expected 'message' field",
+                        ));
+                }
+
+                Ok(())
+            }
+
+            Self::NextJsFormAction => {
+                // Verify form action URLs are rewritten from origin to proxy.
+                let url = format!("{base_url}/contact");
+
+                let resp = reqwest::blocking::get(&url)
+                    .change_context(TestError::HttpRequest)
+                    .attach_printable(format!(
+                        "scenario: NextJsFormAction, framework: {framework_id}"
+                    ))?;
+
+                let html = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach_printable(format!("framework: {framework_id}"))?;
+
+                let origin_host = format!("127.0.0.1:{}", origin_port());
+
+                assertions::assert_form_action_rewritten(
+                    &html,
+                    "form#contact-form",
+                    &origin_host,
+                    base_url,
+                )
+                .attach_printable(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }

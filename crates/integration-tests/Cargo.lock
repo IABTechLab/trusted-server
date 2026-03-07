@@ -1133,6 +1133,7 @@ dependencies = [
  "log",
  "reqwest",
  "scraper",
+ "serde_json",
  "testcontainers",
 ]
 
