@@ -1,3 +1,5 @@
+import RouteScript from "../components/RouteScript";
+
 export default function Dashboard() {
   const originHost = process.env.ORIGIN_HOST || "127.0.0.1:8888";
 
@@ -25,6 +27,8 @@ export default function Dashboard() {
         <a href={`http://${originHost}/ad/dashboard-landing`}>Dashboard ad</a>
         <img src={`http://${originHost}/ad/leaderboard.png`} alt="leaderboard" />
       </div>
+
+      <RouteScript marker="dashboard" />
     </main>
   );
 }

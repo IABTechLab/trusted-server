@@ -85,6 +85,46 @@ test.describe("Next.js client-side navigation", () => {
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
   });
 
+  test("deferred route script executes after SPA transition to dashboard", async ({
+    page,
+  }) => {
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await waitForHydration(page);
+
+    // No route script marker on home page
+    const before = await page.evaluate(
+      () => (window as any).__routeScriptExecuted,
+    );
+    expect(before).toBeUndefined();
+
+    // Track document requests to prove this is a true SPA transition
+    const documentRequests: string[] = [];
+    page.on("request", (req) => {
+      if (req.resourceType() === "document") {
+        documentRequests.push(req.url());
+      }
+    });
+
+    // SPA navigate to dashboard
+    await page.click('#site-nav a[href="/dashboard"]');
+    await page.waitForURL("**/dashboard", { waitUntil: "domcontentloaded" });
+
+    // Wait for the deferred script to execute
+    await page.waitForFunction(
+      () => (window as any).__routeScriptExecuted === "dashboard",
+      { timeout: 5_000 },
+    );
+
+    // Script executed exactly once
+    const count = await page.evaluate(
+      () => (window as any).__routeScriptExecutionCount,
+    );
+    expect(count).toBe(1);
+
+    // Prove this was an SPA transition, not a full reload
+    expect(documentRequests).toEqual([]);
+  });
+
   test("about page has script injection via direct navigation", async ({
     page,
   }) => {
