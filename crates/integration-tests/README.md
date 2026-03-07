@@ -64,7 +64,7 @@ Two test images are built from fixtures in `fixtures/frameworks/`:
 | Image | Dockerfile | Description |
 |---|---|---|
 | `test-wordpress:latest` | `fixtures/frameworks/wordpress/Dockerfile` | PHP built-in server with a minimal test theme |
-| `test-nextjs:latest` | `fixtures/frameworks/nextjs/Dockerfile` | Next.js 14 standalone app with test pages |
+| `test-nextjs:latest` | `fixtures/frameworks/nextjs/Dockerfile` | Next.js 14 standalone app with 4 pages, API routes, forms, shared navigation, and deferred scripts |
 
 Both images include test fixtures with absolute origin URLs (`ORIGIN_HOST` env
 var) so the trusted server's URL rewriting can be verified.
@@ -95,7 +95,9 @@ docker build -t test-nextjs:latest \
 | Scenario | What it tests |
 |---|---|
 | `NextJsRscFlight` | RSC Flight responses are not corrupted (no HTML, no script injection) |
-| `NextJsServerActions` | POST requests pass through proxy; unknown actions return 404 |
+| `NextJsServerActions` | POST requests pass through proxy; unknown actions return 404/soft-404 |
+| `NextJsApiRoute` | API routes (`/api/hello`) return JSON without HTML injection |
+| `NextJsFormAction` | `<form action>` URLs rewritten from origin host to proxy host |
 
 ### HTTP-level — WordPress custom
 
@@ -114,7 +116,9 @@ docker build -t test-nextjs:latest \
 
 | Spec | What it tests |
 |---|---|
-| `navigation` | Client-side (SPA) navigation preserves script injection, back button works |
+| `navigation` | 4-page SPA navigation chain preserves injection without full reload, back button works, deferred route script executes after SPA transition |
+| `api-passthrough` | API routes return JSON without script injection (`/api/hello`, `/api/data`) |
+| `form-rewriting` | `<form action>` URL rewritten from origin to proxy on `/contact` page |
 
 ### Browser-level — WordPress
 
