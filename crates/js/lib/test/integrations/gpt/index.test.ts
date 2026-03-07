@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
-
 // We import installGptShim dynamically so each test can control whether the
 // GPT enable flag is present before module evaluation.
+
+async function importGuardModule() {
+  return import('../../../src/integrations/gpt/script_guard');
+}
 
 type GptWindow = Window & {
   googletag?: {
@@ -21,7 +23,8 @@ describe('GPT shim – patchCommandQueue', () => {
 
   beforeEach(async () => {
     // Reset any prior state
-    resetGuardState();
+    const guard = await importGuardModule();
+    guard.resetGuardState();
     win = window as GptWindow;
     delete win.googletag;
 
@@ -31,8 +34,9 @@ describe('GPT shim – patchCommandQueue', () => {
     installGptShim = mod.installGptShim;
   });
 
-  afterEach(() => {
-    resetGuardState();
+  afterEach(async () => {
+    const guard = await importGuardModule();
+    guard.resetGuardState();
     delete (window as GptWindow).googletag;
   });
 
@@ -169,21 +173,24 @@ describe('GPT shim – runtime gating', () => {
 
   let win: GatedWindow;
 
-  beforeEach(() => {
-    resetGuardState();
+  beforeEach(async () => {
+    const guard = await importGuardModule();
+    guard.resetGuardState();
     win = window as GatedWindow;
     delete win.googletag;
     delete win.__tsjs_gpt_enabled;
   });
 
-  afterEach(() => {
-    resetGuardState();
+  afterEach(async () => {
+    const guard = await importGuardModule();
+    guard.resetGuardState();
     delete (window as GatedWindow).googletag;
     delete (window as GatedWindow).__tsjs_gpt_enabled;
     delete (window as Record<string, unknown>).__tsjs_installGptShim;
   });
 
   it('installs the shim when activation function is called (simulates server inline script)', async () => {
+    const guard = await importGuardModule();
     const { installGptShim } = await import('../../../src/integrations/gpt/index');
 
     // Simulate what the server-injected inline script does:
@@ -191,7 +198,7 @@ describe('GPT shim – runtime gating', () => {
     win.__tsjs_gpt_enabled = true;
     installGptShim();
 
-    expect(isGuardInstalled()).toBe(true);
+    expect(guard.isGuardInstalled()).toBe(true);
     expect(win.googletag).toBeDefined();
   });
 
@@ -206,9 +213,10 @@ describe('GPT shim – runtime gating', () => {
     vi.resetModules();
     win.__tsjs_gpt_enabled = true;
 
+    const guard = await importGuardModule();
     await import('../../../src/integrations/gpt/index');
 
-    expect(isGuardInstalled()).toBe(true);
+    expect(guard.isGuardInstalled()).toBe(true);
     expect(win.googletag).toBeDefined();
   });
 
@@ -216,13 +224,14 @@ describe('GPT shim – runtime gating', () => {
     // Reset modules so the next dynamic import re-evaluates the module.
     vi.resetModules();
 
+    const guard = await importGuardModule();
     // Import a fresh copy — the module should register the activation
     // function on `window` but NOT call `installGptShim()` on its own.
     await import('../../../src/integrations/gpt/index');
 
     // Assert immediately — the guard must not be installed because the
     // module only registers `__tsjs_installGptShim`, it does not auto-init.
-    expect(isGuardInstalled()).toBe(false);
+    expect(guard.isGuardInstalled()).toBe(false);
     expect(win.googletag).toBeUndefined();
   });
 });
