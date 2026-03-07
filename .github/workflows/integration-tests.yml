@@ -1,0 +1,179 @@
+name: "Integration Tests"
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+
+env:
+  ORIGIN_PORT: 8888
+
+jobs:
+  integration-tests:
+    name: integration tests
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Get Viceroy cache key
+        id: viceroy-rev
+        run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+      - name: Cache Viceroy binary
+        id: cache-viceroy
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/viceroy
+          key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+
+      - name: Install Viceroy
+        if: steps.cache-viceroy.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/fastly/Viceroy viceroy
+
+      - name: Build WASM binary
+        run: cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: "http://127.0.0.1:${{ env.ORIGIN_PORT }}"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+
+      - name: Build WordPress test container
+        run: |
+          docker build -t test-wordpress:latest \
+            crates/integration-tests/fixtures/frameworks/wordpress/
+
+      - name: Build Next.js test container
+        run: |
+          docker build -t test-nextjs:latest \
+            crates/integration-tests/fixtures/frameworks/nextjs/
+
+      - name: Run integration tests
+        run: >-
+          cargo test
+          --manifest-path crates/integration-tests/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+          -- --include-ignored --test-threads=1
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
+  browser-tests:
+    name: browser integration tests
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Get Viceroy cache key
+        id: viceroy-rev
+        run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+      - name: Cache Viceroy binary
+        id: cache-viceroy
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/viceroy
+          key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+
+      - name: Install Viceroy
+        if: steps.cache-viceroy.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/fastly/Viceroy viceroy
+
+      - name: Build WASM binary
+        run: cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: "http://127.0.0.1:${{ env.ORIGIN_PORT }}"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+
+      - name: Build WordPress test container
+        run: |
+          docker build -t test-wordpress:latest \
+            crates/integration-tests/fixtures/frameworks/wordpress/
+
+      - name: Build Next.js test container
+        run: |
+          docker build -t test-nextjs:latest \
+            crates/integration-tests/fixtures/frameworks/nextjs/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Playwright
+        working-directory: crates/integration-tests/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run browser tests (Next.js)
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: nextjs
+        run: npx playwright test
+
+      - name: Run browser tests (WordPress)
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: wordpress
+        run: npx playwright test
+
+      - name: Upload Playwright HTML report
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: crates/integration-tests/browser/playwright-report/
+          retention-days: 7
+
+      - name: Upload Playwright traces and screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          path: crates/integration-tests/browser/test-results/
+          retention-days: 7
