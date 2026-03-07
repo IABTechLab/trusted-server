@@ -1,14 +1,224 @@
 // Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
 // and inject creatives into sandboxed iframes.
+import createDOMPurify, {
+  type DOMPurify as DOMPurifyInstance,
+  type RemovedAttribute,
+  type RemovedElement,
+} from 'dompurify';
+
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
+const DANGEROUS_TAG_NAMES = new Set([
+  'base',
+  'embed',
+  'form',
+  'iframe',
+  'link',
+  'meta',
+  'object',
+  'script',
+]);
+const URI_ATTRIBUTE_NAMES = new Set([
+  'action',
+  'background',
+  'formaction',
+  'href',
+  'poster',
+  'src',
+  'srcdoc',
+  'xlink:href',
+]);
+const DANGEROUS_URI_VALUE_PATTERN = /^\s*(?:javascript:|vbscript:|data\s*:\s*text\/html\b)/i;
+const DANGEROUS_STYLE_PATTERN = /\bexpression\s*\(|\burl\s*\(\s*['"]?\s*javascript:/i;
+const CREATIVE_SANDBOX_TOKENS = [
+  'allow-forms',
+  'allow-popups',
+  'allow-popups-to-escape-sandbox',
+  'allow-top-navigation-by-user-activation',
+] as const;
+
+export type CreativeSanitizationRejectionReason =
+  | 'empty-after-sanitize'
+  | 'invalid-creative-html'
+  | 'removed-dangerous-content'
+  | 'sanitizer-unavailable';
+
+export type AcceptedCreativeHtml = {
+  kind: 'accepted';
+  originalLength: number;
+  sanitizedHtml: string;
+  sanitizedLength: number;
+  removedCount: number;
+};
+
+export type RejectedCreativeHtml = {
+  kind: 'rejected';
+  originalLength: number;
+  sanitizedLength: number;
+  removedCount: number;
+  rejectionReason: CreativeSanitizationRejectionReason;
+};
+
+export type SanitizeCreativeHtmlResult = AcceptedCreativeHtml | RejectedCreativeHtml;
+
+let creativeSanitizer: DOMPurifyInstance | null | undefined;
+
 function normalizeId(raw: string): string {
   const s = String(raw ?? '').trim();
   return s.startsWith('#') ? s.slice(1) : s;
+}
+
+function getCreativeSanitizer(): DOMPurifyInstance | null {
+  if (creativeSanitizer !== undefined) {
+    return creativeSanitizer;
+  }
+
+  if (typeof window === 'undefined') {
+    creativeSanitizer = null;
+    return creativeSanitizer;
+  }
+
+  try {
+    creativeSanitizer = createDOMPurify(window);
+  } catch (err) {
+    log.warn('sanitizeCreativeHtml: failed to initialize DOMPurify', err);
+    creativeSanitizer = null;
+  }
+
+  return creativeSanitizer;
+}
+
+function isDangerousRemoval(
+  removedItem: RemovedAttribute | RemovedElement
+): removedItem is RemovedAttribute | RemovedElement {
+  if ('element' in removedItem) {
+    const tagName = removedItem.element.nodeName.toLowerCase();
+    return DANGEROUS_TAG_NAMES.has(tagName);
+  }
+
+  const attrName = removedItem.attribute?.name.toLowerCase() ?? '';
+  const attrValue = removedItem.attribute?.value ?? '';
+
+  if (attrName.startsWith('on')) {
+    return true;
+  }
+
+  if (URI_ATTRIBUTE_NAMES.has(attrName)) {
+    return true;
+  }
+
+  if (attrName === 'style' && DANGEROUS_STYLE_PATTERN.test(attrValue)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasDangerousMarkup(candidateHtml: string): boolean {
+  const fragment = document.createElement('template');
+  fragment.innerHTML = candidateHtml;
+
+  for (const element of fragment.content.querySelectorAll('*')) {
+    const tagName = element.nodeName.toLowerCase();
+    if (DANGEROUS_TAG_NAMES.has(tagName)) {
+      return true;
+    }
+
+    if (tagName === 'style' && DANGEROUS_STYLE_PATTERN.test(element.textContent ?? '')) {
+      return true;
+    }
+
+    for (const attrName of element.getAttributeNames()) {
+      const normalizedAttrName = attrName.toLowerCase();
+      const attrValue = element.getAttribute(attrName) ?? '';
+
+      if (normalizedAttrName.startsWith('on')) {
+        return true;
+      }
+
+      if (
+        URI_ATTRIBUTE_NAMES.has(normalizedAttrName) &&
+        DANGEROUS_URI_VALUE_PATTERN.test(attrValue)
+      ) {
+        return true;
+      }
+
+      if (normalizedAttrName === 'style' && DANGEROUS_STYLE_PATTERN.test(attrValue)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// Sanitize the untrusted creative fragment before it is embedded into the trusted iframe shell.
+export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
+  if (typeof creativeHtml !== 'string') {
+    return {
+      kind: 'rejected',
+      originalLength: 0,
+      sanitizedLength: 0,
+      removedCount: 0,
+      rejectionReason: 'invalid-creative-html',
+    };
+  }
+
+  const originalLength = creativeHtml.length;
+  const sanitizer = getCreativeSanitizer();
+
+  if (!sanitizer || !sanitizer.isSupported) {
+    return {
+      kind: 'rejected',
+      originalLength,
+      sanitizedLength: 0,
+      removedCount: 0,
+      rejectionReason: 'sanitizer-unavailable',
+    };
+  }
+
+  const originalHadDangerousMarkup = hasDangerousMarkup(creativeHtml);
+  const sanitizedHtml = sanitizer.sanitize(creativeHtml, {
+    RETURN_TRUSTED_TYPE: false,
+  });
+  const removedItems = [...sanitizer.removed];
+  const sanitizedLength = sanitizedHtml.length;
+
+  if (
+    originalHadDangerousMarkup ||
+    removedItems.some(isDangerousRemoval) ||
+    hasDangerousMarkup(sanitizedHtml)
+  ) {
+    return {
+      kind: 'rejected',
+      originalLength,
+      sanitizedLength,
+      removedCount: removedItems.length,
+      rejectionReason: 'removed-dangerous-content',
+    };
+  }
+
+  if (sanitizedHtml.trim().length === 0) {
+    return {
+      kind: 'rejected',
+      originalLength,
+      sanitizedLength,
+      removedCount: removedItems.length,
+      rejectionReason: 'empty-after-sanitize',
+    };
+  }
+
+  return {
+    kind: 'accepted',
+    originalLength,
+    sanitizedHtml,
+    sanitizedLength,
+    removedCount: removedItems.length,
+  };
 }
 
 // Locate an ad slot element by id, tolerating funky selectors provided by tag managers.
@@ -85,7 +295,7 @@ export function renderAllAdUnits(): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-// Construct a sandboxed iframe sized for the ad so we can render arbitrary HTML.
+// Construct a sandboxed iframe sized for sanitized, non-executable creative HTML.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}
@@ -101,16 +311,14 @@ export function createAdIframe(
   iframe.setAttribute('aria-label', 'Advertisement');
   // Sandbox permissions for creatives
   try {
-    iframe.sandbox.add(
-      'allow-forms',
-      'allow-popups',
-      'allow-popups-to-escape-sandbox',
-      'allow-same-origin',
-      'allow-scripts',
-      'allow-top-navigation-by-user-activation'
-    );
+    if (iframe.sandbox && typeof iframe.sandbox.add === 'function') {
+      iframe.sandbox.add(...CREATIVE_SANDBOX_TOKENS);
+    } else {
+      iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
+    }
   } catch (err) {
     log.debug('createAdIframe: sandbox add failed', err);
+    iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
   }
   // Sizing + style
   const w = Math.max(0, Number(opts.width ?? 0) | 0);
@@ -129,7 +337,7 @@ export function createAdIframe(
   return iframe;
 }
 
-// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
+// Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
   return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', NORMALIZE_CSS).replace(
     '%CREATIVE_HTML%',
