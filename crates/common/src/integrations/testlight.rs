@@ -95,27 +95,36 @@ impl TestlightIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<TestlightIntegration>> {
-    let config = match settings.integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load Testlight integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<TestlightIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID)?
+    else {
+        return Ok(None);
     };
 
-    Some(TestlightIntegration::new(config))
+    Ok(Some(TestlightIntegration::new(config)))
 }
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+
+/// Register the Testlight integration when enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Testlight integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(TESTLIGHT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -253,7 +262,9 @@ mod tests {
     fn build_requires_config() {
         let settings = create_test_settings();
         assert!(
-            build(&settings).is_none(),
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
             "Should not build without integration config"
         );
     }
@@ -327,7 +338,9 @@ mod tests {
             )
             .expect("should insert integration config");
 
-        let integration = build(&settings).expect("Integration should build with config");
+        let integration = build(&settings)
+            .expect("should evaluate integration build")
+            .expect("Integration should build with config");
         let routes = integration.routes();
         assert!(
             routes.iter().any(|route| route.method == Method::POST

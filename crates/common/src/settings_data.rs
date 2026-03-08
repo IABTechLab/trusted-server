@@ -34,6 +34,8 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
+    settings.prepare_runtime()?;
+
     if settings.synthetic.secret_key == "secret-key" {
         return Err(Report::new(TrustedServerError::InsecureSecretKey));
     }

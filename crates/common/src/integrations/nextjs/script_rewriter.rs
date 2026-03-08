@@ -1,7 +1,10 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
+use error_stack::Report;
 use regex::{escape, Regex};
 
+use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
@@ -10,11 +13,17 @@ use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
 
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
+    rewriter: UrlRewriter,
 }
 
 impl NextJsNextDataRewriter {
-    pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
-        Self { config }
+    pub(super) fn new(
+        config: Arc<NextJsIntegrationConfig>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            rewriter: UrlRewriter::new(&config.rewrite_attributes)?,
+            config,
+        })
     }
 
     fn rewrite_structured(
@@ -29,14 +38,13 @@ impl NextJsNextDataRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        let rewriter = UrlRewriter::new(
+        if let Some(rewritten) = rewrite_nextjs_values_with_rewriter(
+            content,
+            &self.rewriter,
             ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
-            &self.config.rewrite_attributes,
-        );
-
-        if let Some(rewritten) = rewrite_nextjs_values_with_rewriter(content, &rewriter) {
+        ) {
             ScriptRewriteAction::replace(rewritten)
         } else {
             ScriptRewriteAction::keep()
@@ -62,8 +70,14 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
     }
 }
 
-fn rewrite_nextjs_values_with_rewriter(content: &str, rewriter: &UrlRewriter) -> Option<String> {
-    rewriter.rewrite_embedded(content)
+fn rewrite_nextjs_values_with_rewriter(
+    content: &str,
+    rewriter: &UrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> Option<String> {
+    rewriter.rewrite_embedded(content, origin_host, request_host, request_scheme)
 }
 
 #[cfg(test)]
@@ -78,9 +92,15 @@ fn rewrite_nextjs_values(
         return None;
     }
 
-    let rewriter = UrlRewriter::new(origin_host, request_host, request_scheme, attributes);
+    let rewriter = UrlRewriter::new(attributes).expect("should build Next.js URL rewriter");
 
-    rewrite_nextjs_values_with_rewriter(content, &rewriter)
+    rewrite_nextjs_values_with_rewriter(
+        content,
+        &rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+    )
 }
 
 /// Rewrites URLs in structured Next.js JSON payloads (e.g., `__NEXT_DATA__`).
@@ -88,28 +108,15 @@ fn rewrite_nextjs_values(
 /// This rewriter uses combined regex patterns to find and replace URLs
 /// in JSON content. It handles full URLs, protocol-relative URLs, and bare hostnames.
 /// Patterns for all attributes are combined with alternation for efficiency.
+#[derive(Clone)]
 struct UrlRewriter {
-    #[cfg_attr(not(test), allow(dead_code))]
-    origin_host: String,
-    request_host: String,
-    request_scheme: String,
-    /// Single regex matching URL patterns for all attributes
-    embedded_pattern: Option<Regex>,
-    /// Single regex matching bare hostname patterns for all attributes
-    bare_host_pattern: Option<Regex>,
+    /// Single regex matching value patterns for all configured attributes.
+    value_pattern: Option<Regex>,
 }
 
 impl UrlRewriter {
-    fn new(
-        origin_host: &str,
-        request_host: &str,
-        request_scheme: &str,
-        attributes: &[String],
-    ) -> Self {
-        let escaped_origin = escape(origin_host);
-
-        // Build a single regex with alternation for all attributes
-        let embedded_pattern = if attributes.is_empty() {
+    fn new(attributes: &[String]) -> Result<Self, Report<TrustedServerError>> {
+        let value_pattern = if attributes.is_empty() {
             None
         } else {
             let attr_alternation = attributes
@@ -118,116 +125,90 @@ impl UrlRewriter {
                 .collect::<Vec<_>>()
                 .join("|");
             let pattern = format!(
-                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?:\\*")(?P<scheme>https?://|//){origin}(?P<path>[^"\\]*)(?P<quote>\\*")"#,
+                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?:\\*")(?P<value>[^"\\]*)(?P<quote>\\*")"#,
                 attrs = attr_alternation,
-                origin = escaped_origin,
             );
-            Some(Regex::new(&pattern).expect("valid Next.js rewrite regex"))
+            Some(Regex::new(&pattern).map_err(|err| {
+                super::configuration_error(format!(
+                    "failed to compile __NEXT_DATA__ URL rewrite regex for attributes {:?}: {err}",
+                    attributes
+                ))
+            })?)
         };
 
-        let bare_host_pattern = if attributes.is_empty() {
-            None
-        } else {
-            let attr_alternation = attributes
-                .iter()
-                .map(|attr| escape(attr))
-                .collect::<Vec<_>>()
-                .join("|");
-            let pattern = format!(
-                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?:\\*"){origin}(?P<suffix>\\*")"#,
-                attrs = attr_alternation,
-                origin = escaped_origin,
-            );
-            Some(Regex::new(&pattern).expect("valid Next.js bare host rewrite regex"))
-        };
-
-        Self {
-            origin_host: origin_host.to_string(),
-            request_host: request_host.to_string(),
-            request_scheme: request_scheme.to_string(),
-            embedded_pattern,
-            bare_host_pattern,
-        }
+        Ok(Self { value_pattern })
     }
 
-    #[cfg(test)]
-    fn rewrite_url_value(&self, url: &str) -> Option<String> {
+    fn rewrite_url_value(
+        &self,
+        origin_host: &str,
+        url: &str,
+        request_host: &str,
+        request_scheme: &str,
+    ) -> Option<String> {
+        fn strip_origin_host_with_boundary<'a>(
+            value: &'a str,
+            origin_host: &str,
+        ) -> Option<&'a str> {
+            let suffix = value.strip_prefix(origin_host)?;
+            let boundary_ok = suffix.is_empty()
+                || matches!(
+                    suffix.as_bytes().first(),
+                    Some(b'/') | Some(b'?') | Some(b'#')
+                );
+            boundary_ok.then_some(suffix)
+        }
+
         if let Some(rest) = url.strip_prefix("https://") {
-            if rest.starts_with(&self.origin_host) {
-                let path = &rest[self.origin_host.len()..];
-                return Some(format!(
-                    "{}://{}{}",
-                    self.request_scheme, self.request_host, path
-                ));
+            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+                return Some(format!("{request_scheme}://{request_host}{path}"));
             }
         } else if let Some(rest) = url.strip_prefix("http://") {
-            if rest.starts_with(&self.origin_host) {
-                let path = &rest[self.origin_host.len()..];
-                return Some(format!(
-                    "{}://{}{}",
-                    self.request_scheme, self.request_host, path
-                ));
+            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+                return Some(format!("{request_scheme}://{request_host}{path}"));
             }
         } else if let Some(rest) = url.strip_prefix("//") {
-            if rest.starts_with(&self.origin_host) {
-                let path = &rest[self.origin_host.len()..];
-                return Some(format!("//{}{}", self.request_host, path));
+            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+                return Some(format!("//{request_host}{path}"));
             }
-        } else if url == self.origin_host {
-            return Some(self.request_host.clone());
-        } else if url.starts_with(&self.origin_host) {
-            let path = &url[self.origin_host.len()..];
-            return Some(format!("{}{}", self.request_host, path));
+        } else if url == origin_host {
+            return Some(request_host.to_string());
+        } else if let Some(path) = strip_origin_host_with_boundary(url, origin_host) {
+            return Some(format!("{request_host}{path}"));
         }
         None
     }
 
-    fn rewrite_embedded(&self, input: &str) -> Option<String> {
-        let mut result = input.to_string();
-        let mut changed = false;
+    fn rewrite_embedded(
+        &self,
+        input: &str,
+        origin_host: &str,
+        request_host: &str,
+        request_scheme: &str,
+    ) -> Option<String> {
+        let Some(regex) = &self.value_pattern else {
+            return None;
+        };
+        let changed = Cell::new(false);
+        let next_value = regex.replace_all(input, |caps: &regex::Captures<'_>| {
+            let prefix = &caps["prefix"];
+            let value = &caps["value"];
+            let quote = &caps["quote"];
 
-        if let Some(regex) = &self.embedded_pattern {
-            let request_host = &self.request_host;
-            let request_scheme = &self.request_scheme;
-
-            let next_value = regex.replace_all(&result, |caps: &regex::Captures<'_>| {
-                let prefix = &caps["prefix"];
-                let scheme = &caps["scheme"];
-                let path = &caps["path"];
-                let quote = &caps["quote"];
-
-                let new_url = if scheme == "//" {
-                    format!("//{}{}", request_host, path)
-                } else {
-                    format!("{}://{}{}", request_scheme, request_host, path)
-                };
-
+            if let Some(new_url) =
+                self.rewrite_url_value(origin_host, value, request_host, request_scheme)
+            {
+                changed.set(true);
                 format!("{prefix}{new_url}{quote}")
-            });
-
-            if next_value != result {
-                changed = true;
-                result = next_value.into_owned();
+            } else {
+                caps.get(0)
+                    .expect("should capture matched attribute value")
+                    .as_str()
+                    .to_string()
             }
-        }
+        });
 
-        if let Some(regex) = &self.bare_host_pattern {
-            let request_host = &self.request_host;
-
-            let next_value = regex.replace_all(&result, |caps: &regex::Captures<'_>| {
-                let prefix = &caps["prefix"];
-                let suffix = &caps["suffix"];
-
-                format!("{prefix}{request_host}{suffix}")
-            });
-
-            if next_value != result {
-                changed = true;
-                result = next_value.into_owned();
-            }
-        }
-
-        changed.then_some(result)
+        changed.get().then(|| next_value.into_owned())
     }
 }
 
@@ -262,7 +243,8 @@ mod tests {
     #[test]
     fn structured_rewriter_updates_next_data_payload() {
         let payload = r#"{"props":{"pageProps":{"primary":{"href":"https://origin.example.com/reviews"},"secondary":{"href":"http://origin.example.com/sign-in"},"fallbackHref":"http://origin.example.com/legacy","protoRelative":"//origin.example.com/assets/logo.png"}}}"#;
-        let rewriter = NextJsNextDataRewriter::new(test_config());
+        let rewriter = NextJsNextDataRewriter::new(test_config())
+            .expect("should build Next.js structured rewriter");
         let document_state = IntegrationDocumentState::default();
         let result = rewriter.rewrite(payload, &ctx("script#__NEXT_DATA__", &document_state));
 
@@ -410,16 +392,45 @@ mod tests {
 
     #[test]
     fn url_rewriter_rewrites_url() {
-        let rewriter = UrlRewriter::new(
-            "origin.example.com",
-            "proxy.example.com",
-            "http",
-            &["url".into()],
-        );
+        let rewriter = UrlRewriter::new(&["url".into()]).expect("should build URL rewriter");
 
         let new_url = rewriter
-            .rewrite_url_value("https://origin.example.com/news")
+            .rewrite_url_value(
+                "origin.example.com",
+                "https://origin.example.com/news",
+                "proxy.example.com",
+                "http",
+            )
             .expect("URL should be rewritten");
         assert_eq!(new_url, "http://proxy.example.com/news");
+    }
+
+    #[test]
+    fn url_rewriter_does_not_rewrite_partial_hostname_matches() {
+        let rewriter = UrlRewriter::new(&["url".into(), "siteProductionDomain".into()])
+            .expect("should build URL rewriter");
+        let input = r#"{"url":"https://origin.example.com.evil/news","siteProductionDomain":"origin.example.com.evil"}"#;
+
+        let rewritten =
+            rewriter.rewrite_embedded(input, "origin.example.com", "proxy.example.com", "https");
+
+        assert!(
+            rewritten.is_none(),
+            "should not rewrite partial hostname matches"
+        );
+    }
+
+    #[test]
+    fn url_rewriter_supports_regex_metacharacters_in_literals() {
+        let rewriter = UrlRewriter::new(&["href(".into(), "u|rl".into()])
+            .expect("should build URL rewriter with metacharacters");
+        let input = r#"{"href(":"https://origin.(example).com/news","u|rl":"//origin.(example).com/assets/logo.png"}"#;
+
+        let rewritten = rewriter
+            .rewrite_embedded(input, "origin.(example).com", "proxy.example.com", "https")
+            .expect("should rewrite metacharacter-heavy literals");
+
+        assert!(rewritten.contains("https://proxy.example.com/news"));
+        assert!(rewritten.contains("//proxy.example.com/assets/logo.png"));
     }
 }

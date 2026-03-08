@@ -1,5 +1,8 @@
 //! Integration module registry and sample implementations.
 
+use error_stack::Report;
+
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -23,7 +26,8 @@ pub use registry::{
     IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
-type IntegrationBuilder = fn(&Settings) -> Option<IntegrationRegistration>;
+type IntegrationBuilder =
+    fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[

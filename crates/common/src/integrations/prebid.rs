@@ -38,6 +38,7 @@ const ZONE_KEY: &str = "zone";
 pub struct PrebidIntegrationConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[validate(url)]
     pub server_url: String,
     /// Prebid Server account ID, injected into the client-side bundle via
     /// `window.__tsjs_prebid.accountId` so publishers don't need to configure
@@ -206,31 +207,38 @@ impl PrebidIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
-    let config = settings
-        .integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)
-        .ok()
-        .flatten()?;
-    if !config.enabled {
-        return None;
-    }
-    if config.server_url.trim().is_empty() {
-        log::warn!("Prebid integration disabled: prebid.server_url missing");
-        return None;
-    }
-    Some(PrebidIntegration::new(config))
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<PrebidIntegration>>, Report<TrustedServerError>> {
+    let Some(config) =
+        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(PrebidIntegration::new(config)))
 }
 
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+/// Register the Prebid integration when enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Prebid integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -958,8 +966,14 @@ impl AuctionProvider for PrebidAuctionProvider {
 ///
 /// This function checks the settings for Prebid configuration and returns
 /// the provider if enabled.
-#[must_use]
-pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+///
+/// # Errors
+///
+/// Returns an error when the Prebid provider is enabled with invalid
+/// configuration.
+pub fn register_auction_provider(
+    settings: &Settings,
+) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
     match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
@@ -980,11 +994,11 @@ pub fn register_auction_provider(settings: &Settings) -> Vec<Arc<dyn AuctionProv
             log::info!("Prebid auction provider not registered: integration not found or disabled");
         }
         Err(e) => {
-            log::error!("Prebid auction provider not registered: config error: {e:?}");
+            return Err(e);
         }
     }
 
-    providers
+    Ok(providers)
 }
 
 #[cfg(test)]

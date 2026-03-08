@@ -153,28 +153,36 @@ impl DidomiIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<DidomiIntegration>> {
-    let config = match settings.integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
-    {
-        Ok(Some(config)) => Arc::new(config),
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load Didomi integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<DidomiIntegration>>, Report<TrustedServerError>> {
+    let Some(config) =
+        settings.integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)?
+    else {
+        return Ok(None);
     };
-    Some(DidomiIntegration::new(config))
+
+    Ok(Some(DidomiIntegration::new(Arc::new(config))))
 }
 
 /// Register the Didomi consent notice integration when enabled.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+///
+/// # Errors
+///
+/// Returns an error when the Didomi integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(DIDOMI_INTEGRATION_ID)
             .with_proxy(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]

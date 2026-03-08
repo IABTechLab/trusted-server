@@ -1,23 +1,40 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use error_stack::Report;
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
-pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
-    let handler = settings.handler_for_path(req.get_path())?;
+/// Enforce HTTP basic auth for the matched handler, if any.
+///
+/// Returns `Ok(None)` when the request does not target a protected handler or
+/// when the supplied credentials are valid. Returns `Ok(Some(Response))` with
+/// the auth challenge when credentials are missing or invalid.
+///
+/// # Errors
+///
+/// Returns an error when handler configuration is invalid, such as an
+/// un-compilable path regex.
+pub fn enforce_basic_auth(
+    settings: &Settings,
+    req: &Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let Some(handler) = settings.handler_for_path(req.get_path())? else {
+        return Ok(None);
+    };
 
     let (username, password) = match extract_credentials(req) {
         Some(credentials) => credentials,
-        None => return Some(unauthorized_response()),
+        None => return Ok(Some(unauthorized_response())),
     };
 
     if username == handler.username && password == handler.password {
-        None
+        Ok(None)
     } else {
-        Some(unauthorized_response())
+        Ok(Some(unauthorized_response()))
     }
 }
 
@@ -72,7 +89,9 @@ mod tests {
         let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/open");
 
-        assert!(enforce_basic_auth(&settings, &req).is_none());
+        assert!(enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .is_none());
     }
 
     #[test]
@@ -80,7 +99,9 @@ mod tests {
         let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/secure");
 
-        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
         let realm = response
             .get_header(header::WWW_AUTHENTICATE)
@@ -95,7 +116,9 @@ mod tests {
         let token = STANDARD.encode("user:pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
-        assert!(enforce_basic_auth(&settings, &req).is_none());
+        assert!(enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .is_none());
     }
 
     #[test]
@@ -105,7 +128,9 @@ mod tests {
         let token = STANDARD.encode("user:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -115,7 +140,23 @@ mod tests {
         let mut req = Request::new(Method::GET, "https://example.com/secure");
         req.set_header(header::AUTHORIZATION, "Bearer token");
 
-        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn returns_error_for_invalid_handler_regex_without_panicking() {
+        let config = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
+        let settings = Settings::from_toml(&config).expect("should parse invalid regex TOML");
+        let req = Request::new(Method::GET, "https://example.com/secure");
+
+        let err = enforce_basic_auth(&settings, &req).expect_err("should return config error");
+        assert!(
+            err.to_string()
+                .contains("Handler path regex `(` failed to compile"),
+            "should describe the invalid handler regex"
+        );
     }
 }

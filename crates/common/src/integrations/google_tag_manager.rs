@@ -315,29 +315,37 @@ impl GoogleTagManagerIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
-    let config = match settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load GTM integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<GoogleTagManagerIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)?
+    else {
+        return Ok(None);
     };
 
-    Some(GoogleTagManagerIntegration::new(config))
+    Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+/// Register the Google Tag Manager integration when enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager integration is enabled with
+/// invalid configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(GTM_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_script_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
