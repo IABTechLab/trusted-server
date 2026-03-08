@@ -9,6 +9,7 @@ use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
+use super::shared::strip_origin_host_with_optional_port;
 use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
 
 pub(super) struct NextJsNextDataRewriter {
@@ -125,7 +126,7 @@ impl UrlRewriter {
                 .collect::<Vec<_>>()
                 .join("|");
             let pattern = format!(
-                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?:\\*")(?P<value>[^"\\]*)(?P<quote>\\*")"#,
+                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?\s*:\s*\\*")(?P<value>[^"\\]*)(?P<quote>\\*")"#,
                 attrs = attr_alternation,
             );
             Some(Regex::new(&pattern).map_err(|err| {
@@ -146,34 +147,21 @@ impl UrlRewriter {
         request_host: &str,
         request_scheme: &str,
     ) -> Option<String> {
-        fn strip_origin_host_with_boundary<'a>(
-            value: &'a str,
-            origin_host: &str,
-        ) -> Option<&'a str> {
-            let suffix = value.strip_prefix(origin_host)?;
-            let boundary_ok = suffix.is_empty()
-                || matches!(
-                    suffix.as_bytes().first(),
-                    Some(b'/') | Some(b'?') | Some(b'#')
-                );
-            boundary_ok.then_some(suffix)
-        }
-
         if let Some(rest) = url.strip_prefix("https://") {
-            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+            if let Some(path) = strip_origin_host_with_optional_port(rest, origin_host) {
                 return Some(format!("{request_scheme}://{request_host}{path}"));
             }
         } else if let Some(rest) = url.strip_prefix("http://") {
-            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+            if let Some(path) = strip_origin_host_with_optional_port(rest, origin_host) {
                 return Some(format!("{request_scheme}://{request_host}{path}"));
             }
         } else if let Some(rest) = url.strip_prefix("//") {
-            if let Some(path) = strip_origin_host_with_boundary(rest, origin_host) {
+            if let Some(path) = strip_origin_host_with_optional_port(rest, origin_host) {
                 return Some(format!("//{request_host}{path}"));
             }
         } else if url == origin_host {
             return Some(request_host.to_string());
-        } else if let Some(path) = strip_origin_host_with_boundary(url, origin_host) {
+        } else if let Some(path) = strip_origin_host_with_optional_port(url, origin_host) {
             return Some(format!("{request_host}{path}"));
         }
         None
@@ -272,6 +260,51 @@ mod tests {
         .expect("should rewrite protocol relative link");
 
         assert!(rewritten.contains("ts.example.com") && rewritten.contains("/image.png"));
+    }
+
+    #[test]
+    fn rewrite_helper_handles_whitespace_around_colons() {
+        let content = r#"{
+            "props": {
+                "pageProps": {
+                    "siteProductionDomain": "origin.example.com",
+                    "siteBaseUrl": "https://origin.example.com",
+                    "href": "https://origin.example.com/reviews"
+                }
+            }
+        }"#;
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &[
+                "href".into(),
+                "siteBaseUrl".into(),
+                "siteProductionDomain".into(),
+            ],
+        )
+        .expect("should rewrite pretty-printed JSON values");
+
+        assert!(rewritten.contains(r#""siteProductionDomain": "ts.example.com""#));
+        assert!(rewritten.contains(r#""siteBaseUrl": "https://ts.example.com""#));
+        assert!(rewritten.contains(r#""href": "https://ts.example.com/reviews""#));
+    }
+
+    #[test]
+    fn rewrite_helper_rewrites_explicit_port_urls() {
+        let content = r#"{"props":{"pageProps":{"url":"https://origin.example.com:8443/news","link":"//origin.example.com:9443/image.png"}}}"#;
+        let rewritten = rewrite_nextjs_values(
+            content,
+            "origin.example.com",
+            "ts.example.com",
+            "https",
+            &["url".into(), "link".into()],
+        )
+        .expect("should rewrite explicit port URLs");
+
+        assert!(rewritten.contains("https://ts.example.com:8443/news"));
+        assert!(rewritten.contains("//ts.example.com:9443/image.png"));
     }
 
     #[test]
@@ -418,6 +451,21 @@ mod tests {
             rewritten.is_none(),
             "should not rewrite partial hostname matches"
         );
+    }
+
+    #[test]
+    fn url_rewriter_rewrites_explicit_port_url() {
+        let rewriter = UrlRewriter::new(&["url".into()]).expect("should build URL rewriter");
+
+        let new_url = rewriter
+            .rewrite_url_value(
+                "origin.example.com",
+                "https://origin.example.com:8443/news",
+                "proxy.example.com",
+                "http",
+            )
+            .expect("URL with explicit port should be rewritten");
+        assert_eq!(new_url, "http://proxy.example.com:8443/news");
     }
 
     #[test]

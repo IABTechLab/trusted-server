@@ -204,6 +204,99 @@ mod tests {
     }
 
     #[test]
+    fn html_processor_rewrites_next_data_fixture_like_payload() {
+        let html = r#"<html><body>
+            <script id="__NEXT_DATA__" type="application/json">
+                {
+                    "props": {
+                        "pageProps": {
+                            "siteProductionDomain": "origin.example.com",
+                            "siteBaseUrl": "https://origin.example.com",
+                            "navigation": {
+                                "href": "https://origin.example.com:8443/reviews",
+                                "link": "//origin.example.com:9443/assets/logo.png"
+                            },
+                            "article": {
+                                "url": "https://origin.example.com/news"
+                            },
+                            "canonicalUrl": "https://origin.example.com/should-stay",
+                            "metadata": {
+                                "ogUrl": "https://origin.example.com/should-stay-too"
+                            }
+                        }
+                    }
+                }
+            </script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": [
+                        "href",
+                        "link",
+                        "siteBaseUrl",
+                        "siteProductionDomain",
+                        "url"
+                    ],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains(r#""siteProductionDomain": "test.example.com""#),
+            "should rewrite siteProductionDomain in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""siteBaseUrl": "https://test.example.com""#),
+            "should rewrite siteBaseUrl in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""href": "https://test.example.com:8443/reviews""#),
+            "should preserve explicit ports while rewriting href in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""link": "//test.example.com:9443/assets/logo.png""#),
+            "should preserve explicit ports while rewriting protocol-relative links in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""url": "https://test.example.com/news""#),
+            "should rewrite url fields in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""canonicalUrl": "https://origin.example.com/should-stay""#),
+            "should leave non-configured fields untouched in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""ogUrl": "https://origin.example.com/should-stay-too""#),
+            "should leave nested non-configured fields untouched in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            !processed.contains(r#""siteProductionDomain": "origin.example.com""#),
+            "should not leave the origin host in rewritten __NEXT_DATA__ fields. Output: {processed}"
+        );
+    }
+
+    #[test]
     fn html_processor_rewrites_rsc_stream_payload_with_length_preservation() {
         // RSC payloads (self.__next_f.push) are rewritten via post-processing.
         // The streaming phase skips RSC push scripts, and the HTML post-processor handles them

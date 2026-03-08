@@ -15,6 +15,13 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
 
+/// Encodings supported by the publisher response rewrite pipeline.
+const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
+
+fn restrict_accept_encoding(req: &mut Request) {
+    req.set_header(header::ACCEPT_ENCODING, SUPPORTED_ENCODINGS);
+}
+
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
 /// Concatenates core + enabled integration JS modules at runtime based on the
@@ -218,6 +225,8 @@ pub fn handle_publisher_request(
         backend_name,
         settings.publisher.origin_url
     );
+    // Only advertise encodings the rewrite pipeline can decode and re-encode.
+    restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
     let mut response = req
@@ -312,7 +321,7 @@ mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::{Method, StatusCode};
+    use fastly::http::{header, Method, StatusCode};
 
     #[test]
     fn test_content_type_detection() {
@@ -424,6 +433,20 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn publisher_proxy_limits_accept_encoding_to_supported_values() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some(SUPPORTED_ENCODINGS),
+            "publisher fallback should only advertise encodings the rewrite pipeline supports"
+        );
     }
 
     #[test]

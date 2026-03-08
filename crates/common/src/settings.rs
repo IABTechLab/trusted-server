@@ -1152,6 +1152,30 @@ mod tests {
     }
 
     #[test]
+    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": false,
+                    "server_url": "not a url",
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("disabled prebid config should be ignored");
+        assert!(config.is_none(), "disabled prebid config should be skipped");
+        IntegrationRegistry::new(&settings)
+            .expect("disabled default-enabled prebid config should not fail registry startup");
+        build_orchestrator(&settings)
+            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
     fn enabled_invalid_integration_fails_registry_startup() {
         let mut settings = create_test_settings();
         settings

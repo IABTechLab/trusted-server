@@ -54,6 +54,48 @@ pub(crate) fn find_rsc_push_payload_range(script: &str) -> Option<(usize, usize)
     None
 }
 
+/// Strip an origin host from the start of an authority/value while preserving an
+/// optional explicit port and requiring a safe hostname boundary.
+///
+/// Examples:
+/// - `origin.example.com/path` -> `Some("/path")`
+/// - `origin.example.com:8443/path` -> `Some(":8443/path")`
+/// - `origin.example.com.evil/path` -> `None`
+pub(crate) fn strip_origin_host_with_optional_port<'a>(
+    value: &'a str,
+    origin_host: &str,
+) -> Option<&'a str> {
+    let suffix = value.strip_prefix(origin_host)?;
+    if suffix.is_empty() {
+        return Some(suffix);
+    }
+
+    if matches!(
+        suffix.as_bytes().first(),
+        Some(b'/') | Some(b'?') | Some(b'#')
+    ) {
+        return Some(suffix);
+    }
+
+    let port_and_rest = suffix.strip_prefix(':')?;
+    let port_len = port_and_rest.bytes().take_while(u8::is_ascii_digit).count();
+    if port_len == 0 {
+        return None;
+    }
+
+    let rest = &port_and_rest[port_len..];
+    if rest.is_empty()
+        || matches!(
+            rest.as_bytes().first(),
+            Some(b'/') | Some(b'?') | Some(b'#')
+        )
+    {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
 // =============================================================================
 // URL Rewriting
 // =============================================================================
@@ -98,19 +140,20 @@ impl RscUrlRewriter {
         // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
         let replaced = RSC_URL_PATTERN.replace_all(input, |caps: &regex::Captures<'_>| {
             let host = caps.name("host").map_or("", |m| m.as_str());
-            if host != self.origin_host {
+            let Some(host_suffix) = strip_origin_host_with_optional_port(host, &self.origin_host)
+            else {
                 return caps
                     .get(0)
                     .expect("should capture the matched RSC URL")
                     .as_str()
                     .to_string();
-            }
+            };
 
             let slashes = caps.get(3).map_or("//", |m| m.as_str());
             if caps.get(1).is_some() {
-                format!("{request_scheme}:{slashes}{request_host}")
+                format!("{request_scheme}:{slashes}{request_host}{host_suffix}")
             } else {
-                format!("{slashes}{request_host}")
+                format!("{slashes}{request_host}{host_suffix}")
             }
         });
 
@@ -222,6 +265,17 @@ mod tests {
     }
 
     #[test]
+    fn rsc_url_rewriter_rewrites_explicit_port_urls() {
+        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let input = r#"{"url":"https://origin.example.com:8443/path","asset":"//origin.example.com:9443/file.js"}"#;
+        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        assert_eq!(
+            result,
+            r#"{"url":"https://proxy.example.com:8443/path","asset":"//proxy.example.com:9443/file.js"}"#
+        );
+    }
+
+    #[test]
     fn rsc_url_rewriter_does_not_rewrite_partial_hostname() {
         let rewriter = RscUrlRewriter::new("example.com");
         let input = r#"{"domain":"subexample.com"}"#;
@@ -246,5 +300,34 @@ mod tests {
         let input = r#"{"url":"https://origin.(example).com/path"}"#;
         let result = rewriter.rewrite(input, "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"https://proxy.example.com/path"}"#);
+    }
+
+    #[test]
+    fn strip_origin_host_with_optional_port_enforces_boundaries() {
+        assert_eq!(
+            strip_origin_host_with_optional_port(
+                "origin.example.com:8443/path",
+                "origin.example.com"
+            ),
+            Some(":8443/path")
+        );
+        assert_eq!(
+            strip_origin_host_with_optional_port("origin.example.com/path", "origin.example.com"),
+            Some("/path")
+        );
+        assert_eq!(
+            strip_origin_host_with_optional_port(
+                "origin.example.com.evil/path",
+                "origin.example.com"
+            ),
+            None
+        );
+        assert_eq!(
+            strip_origin_host_with_optional_port(
+                "origin.example.com:not-a-port/path",
+                "origin.example.com"
+            ),
+            None
+        );
     }
 }
