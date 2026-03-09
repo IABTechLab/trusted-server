@@ -13,6 +13,7 @@ export interface RequestAdsOptions {
 
 type RenderCreativeInlineOptions = {
   slotId: string;
+  // Accept unknown input here because bidder JSON is untrusted at runtime.
   creativeHtml: unknown;
   creativeWidth?: number;
   creativeHeight?: number;
@@ -91,7 +92,7 @@ function renderCreativeInline({
   }
 
   try {
-    // Clear previous content
+    // Clear the slot before render so rejected creatives fail closed with no stale markup left behind.
     container.innerHTML = '';
 
     const sanitization = sanitizeCreativeHtml(creativeHtml);

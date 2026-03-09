@@ -35,6 +35,14 @@ describe('render', () => {
     expect(sandbox).not.toContain('allow-scripts');
   });
 
+  it('preserves dollar sequences when building the creative document', async () => {
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const creativeHtml = "<div>$& $$ $1 $` $'</div>";
+    const documentHtml = buildCreativeDocument(creativeHtml);
+
+    expect(documentHtml).toContain(creativeHtml);
+  });
+
   it('accepts safe static markup during sanitization', async () => {
     const { sanitizeCreativeHtml } = await import('../../src/core/render');
     const sanitization = sanitizeCreativeHtml(

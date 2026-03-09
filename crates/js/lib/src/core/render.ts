@@ -92,9 +92,7 @@ function getCreativeSanitizer(): DOMPurifyInstance | null {
   return creativeSanitizer;
 }
 
-function isDangerousRemoval(
-  removedItem: RemovedAttribute | RemovedElement
-): removedItem is RemovedAttribute | RemovedElement {
+function isDangerousRemoval(removedItem: RemovedAttribute | RemovedElement): boolean {
   if ('element' in removedItem) {
     const tagName = removedItem.element.nodeName.toLowerCase();
     return DANGEROUS_TAG_NAMES.has(tagName);
@@ -120,6 +118,7 @@ function isDangerousRemoval(
 
 function hasDangerousMarkup(candidateHtml: string): boolean {
   const fragment = document.createElement('template');
+  // The HTML parser normalizes entity-encoded attribute values before we inspect them.
   fragment.innerHTML = candidateHtml;
 
   for (const element of fragment.content.querySelectorAll('*')) {
@@ -181,18 +180,14 @@ export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtm
     };
   }
 
-  const originalHadDangerousMarkup = hasDangerousMarkup(creativeHtml);
   const sanitizedHtml = sanitizer.sanitize(creativeHtml, {
+    // Keep the result as a plain string because iframe.srcdoc expects string HTML.
     RETURN_TRUSTED_TYPE: false,
   });
   const removedItems = [...sanitizer.removed];
   const sanitizedLength = sanitizedHtml.length;
 
-  if (
-    originalHadDangerousMarkup ||
-    removedItems.some(isDangerousRemoval) ||
-    hasDangerousMarkup(sanitizedHtml)
-  ) {
+  if (removedItems.some(isDangerousRemoval) || hasDangerousMarkup(sanitizedHtml)) {
     return {
       kind: 'rejected',
       originalLength,
@@ -339,8 +334,8 @@ export function createAdIframe(
 
 // Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
-  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', NORMALIZE_CSS).replace(
+  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS).replace(
     '%CREATIVE_HTML%',
-    creativeHtml
+    () => creativeHtml
   );
 }
