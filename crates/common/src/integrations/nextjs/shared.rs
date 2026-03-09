@@ -7,6 +7,9 @@ use regex::Regex;
 
 use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 
+// These are static code-defined literals, not config-derived patterns, so they
+// intentionally remain lazy statics instead of participating in
+// `Settings::prepare_runtime`.
 /// RSC push script call pattern for extracting payload string boundaries.
 pub(crate) static RSC_PUSH_CALL_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(

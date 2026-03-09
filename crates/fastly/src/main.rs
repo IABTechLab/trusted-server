@@ -75,6 +75,9 @@ async fn route_request(
     // Extract geo info before auth check or routing consumes the request
     let geo_info = GeoInfo::from_request(&req);
 
+    // `get_settings()` should already have rejected invalid handler regexes.
+    // Keep this fallback so manually-constructed or otherwise unprepared
+    // settings still become an error response instead of panicking.
     if let Some(mut response) = enforce_basic_auth(settings, &req).unwrap_or_else(|e| {
         log::error!("Failed to evaluate basic auth: {:?}", e);
         Some(to_error_response(&e))
