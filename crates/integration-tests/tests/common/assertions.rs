@@ -1,10 +1,10 @@
-use super::runtime::TestError;
-use error_stack::Result;
+use super::runtime::{TestError, TestResult};
+use error_stack::Report;
 use scraper::{Html, Selector};
 
 /// Parse a CSS selector, mapping the error to [`TestError::InvalidSelector`]
-fn parse_selector(selector: &str) -> Result<Selector, TestError> {
-    Selector::parse(selector).map_err(|_| error_stack::report!(TestError::InvalidSelector))
+fn parse_selector(selector: &str) -> TestResult<Selector> {
+    Selector::parse(selector).map_err(|_| Report::new(TestError::InvalidSelector))
 }
 
 /// Assert that HTML contains the trustedserver-js script tag.
@@ -15,7 +15,7 @@ fn parse_selector(selector: &str) -> Result<Selector, TestError> {
 /// # Errors
 ///
 /// Returns [`TestError::ScriptTagNotFound`] if no matching script tag exists.
-pub fn assert_script_tag_present(html: &str) -> Result<(), TestError> {
+pub fn assert_script_tag_present(html: &str) -> TestResult<()> {
     let document = Html::parse_document(html);
     let selector = parse_selector("script[src*='/static/tsjs=']")?;
 
@@ -23,7 +23,7 @@ pub fn assert_script_tag_present(html: &str) -> Result<(), TestError> {
         return Ok(());
     }
 
-    Err(error_stack::report!(TestError::ScriptTagNotFound))
+    Err(Report::new(TestError::ScriptTagNotFound))
 }
 
 /// Assert that exactly one `<script id="trustedserver-js">` exists in the HTML.
@@ -36,21 +36,21 @@ pub fn assert_script_tag_present(html: &str) -> Result<(), TestError> {
 ///
 /// Returns [`TestError::ScriptTagNotFound`] if zero or more than one matching
 /// script tag is found.
-pub fn assert_unique_script_tag(html: &str) -> Result<(), TestError> {
+pub fn assert_unique_script_tag(html: &str) -> TestResult<()> {
     let document = Html::parse_document(html);
     let selector = parse_selector("script#trustedserver-js[src*='/static/tsjs=']")?;
 
     let count = document.select(&selector).count();
 
     if count == 0 {
-        return Err(error_stack::report!(TestError::ScriptTagNotFound)
-            .attach_printable("No script#trustedserver-js[src*='/static/tsjs='] found"));
+        return Err(Report::new(TestError::ScriptTagNotFound)
+            .attach("No script#trustedserver-js[src*='/static/tsjs='] found"));
     }
 
     if count > 1 {
-        return Err(error_stack::report!(TestError::ScriptTagNotFound).attach_printable(
-            format!("Expected exactly 1 script#trustedserver-js, found {count}"),
-        ));
+        return Err(Report::new(TestError::ScriptTagNotFound).attach(format!(
+            "Expected exactly 1 script#trustedserver-js, found {count}"
+        )));
     }
 
     Ok(())
@@ -70,7 +70,7 @@ pub fn assert_attributes_rewritten(
     html: &str,
     origin_host: &str,
     proxy_base_url: &str,
-) -> Result<(), TestError> {
+) -> TestResult<()> {
     let document = Html::parse_document(html);
 
     // Extract proxy host from base_url (e.g. "http://127.0.0.1:12345" -> "127.0.0.1:12345")
@@ -88,10 +88,8 @@ pub fn assert_attributes_rewritten(
             if let Some(value) = element.value().attr(attr) {
                 // Origin host should NOT appear in any attribute
                 if value.contains(origin_host) {
-                    return Err(error_stack::report!(TestError::AttributeNotRewritten)
-                        .attach_printable(format!(
-                            "Origin host still present in {attr}=\"{value}\""
-                        )));
+                    return Err(Report::new(TestError::AttributeNotRewritten)
+                        .attach(format!("Origin host still present in {attr}=\"{value}\"")));
                 }
 
                 // Track whether we find at least one rewritten proxy URL
@@ -103,11 +101,12 @@ pub fn assert_attributes_rewritten(
     }
 
     if !found_proxy_url {
-        return Err(error_stack::report!(TestError::AttributeNotRewritten)
-            .attach_printable(format!(
+        return Err(
+            Report::new(TestError::AttributeNotRewritten).attach(format!(
                 "No attributes rewritten to proxy host ({proxy_host}). \
                  Check that the origin HTML contains absolute URLs with {origin_host}"
-            )));
+            )),
+        );
     }
 
     Ok(())
@@ -127,7 +126,7 @@ pub fn assert_ad_slot_urls_rewritten(
     html: &str,
     origin_host: &str,
     proxy_base_url: &str,
-) -> Result<(), TestError> {
+) -> TestResult<()> {
     let document = Html::parse_document(html);
 
     let proxy_host = proxy_base_url
@@ -143,10 +142,11 @@ pub fn assert_ad_slot_urls_rewritten(
         for attr in ["href", "src"] {
             if let Some(value) = element.value().attr(attr) {
                 if value.contains(origin_host) {
-                    return Err(error_stack::report!(TestError::AttributeNotRewritten)
-                        .attach_printable(format!(
+                    return Err(
+                        Report::new(TestError::AttributeNotRewritten).attach(format!(
                             "Origin host still present inside ad slot: {attr}=\"{value}\""
-                        )));
+                        )),
+                    );
                 }
                 if value.contains(proxy_host) {
                     found_proxy_url = true;
@@ -156,12 +156,12 @@ pub fn assert_ad_slot_urls_rewritten(
     }
 
     if !found_proxy_url {
-        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
-            format!(
+        return Err(
+            Report::new(TestError::AttributeNotRewritten).attach(format!(
                 "No URL attributes inside ad slots rewritten to proxy host ({proxy_host}). \
                  Ensure ad-slot fixtures contain href/src with origin host"
-            ),
-        ));
+            )),
+        );
     }
 
     Ok(())
@@ -182,7 +182,7 @@ pub fn assert_ad_slot_urls_rewritten(
 ///
 /// Returns [`TestError::AttributeNotRewritten`] if any expected `data-ad-unit`
 /// value is missing from the proxied HTML.
-pub fn assert_data_ad_units_preserved(html: &str, expected_units: &[&str]) -> Result<(), TestError> {
+pub fn assert_data_ad_units_preserved(html: &str, expected_units: &[&str]) -> TestResult<()> {
     let document = Html::parse_document(html);
     let selector = parse_selector("[data-ad-unit]")?;
 
@@ -193,11 +193,12 @@ pub fn assert_data_ad_units_preserved(html: &str, expected_units: &[&str]) -> Re
 
     for expected in expected_units {
         if !found_units.iter().any(|u| u == expected) {
-            return Err(error_stack::report!(TestError::AttributeNotRewritten)
-                .attach_printable(format!(
+            return Err(
+                Report::new(TestError::AttributeNotRewritten).attach(format!(
                     "data-ad-unit=\"{expected}\" not found in proxied HTML. \
                      Found units: {found_units:?}"
-                )));
+                )),
+            );
         }
     }
 
@@ -218,7 +219,7 @@ pub fn assert_form_action_rewritten(
     form_selector: &str,
     origin_host: &str,
     proxy_base_url: &str,
-) -> Result<(), TestError> {
+) -> TestResult<()> {
     let document = Html::parse_document(html);
     let selector = parse_selector(form_selector)?;
 
@@ -228,27 +229,29 @@ pub fn assert_form_action_rewritten(
         .unwrap_or(proxy_base_url);
 
     let form = document.select(&selector).next().ok_or_else(|| {
-        error_stack::report!(TestError::AttributeNotRewritten)
-            .attach_printable(format!("No form matching '{form_selector}' found in HTML"))
+        Report::new(TestError::AttributeNotRewritten)
+            .attach(format!("No form matching '{form_selector}' found in HTML"))
     })?;
 
     let action = form.value().attr("action").ok_or_else(|| {
-        error_stack::report!(TestError::AttributeNotRewritten)
-            .attach_printable(format!("Form '{form_selector}' has no action attribute"))
+        Report::new(TestError::AttributeNotRewritten)
+            .attach(format!("Form '{form_selector}' has no action attribute"))
     })?;
 
     if action.contains(origin_host) {
-        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
-            format!("Form action still contains origin host: action=\"{action}\""),
-        ));
+        return Err(
+            Report::new(TestError::AttributeNotRewritten).attach(format!(
+                "Form action still contains origin host: action=\"{action}\""
+            )),
+        );
     }
 
     if !action.contains(proxy_host) {
-        return Err(error_stack::report!(TestError::AttributeNotRewritten).attach_printable(
-            format!(
+        return Err(
+            Report::new(TestError::AttributeNotRewritten).attach(format!(
                 "Form action not rewritten to proxy host ({proxy_host}): action=\"{action}\""
-            ),
-        ));
+            )),
+        );
     }
 
     Ok(())
@@ -370,8 +373,7 @@ mod tests {
             </html>
         "#;
 
-        let result =
-            assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
+        let result = assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
         assert!(
             result.is_err(),
             "should fail when origin host remains inside ad slot"
@@ -391,8 +393,7 @@ mod tests {
             </html>
         "#;
 
-        let result =
-            assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
+        let result = assert_ad_slot_urls_rewritten(html, "127.0.0.1:8888", "http://127.0.0.1:9999");
         assert!(
             result.is_err(),
             "should fail when no URL attributes exist inside ad slots"
@@ -422,7 +423,10 @@ mod tests {
         "#;
 
         let result = assert_unique_script_tag(html);
-        assert!(result.is_err(), "should fail when no trustedserver-js exists");
+        assert!(
+            result.is_err(),
+            "should fail when no trustedserver-js exists"
+        );
     }
 
     #[test]
@@ -439,7 +443,10 @@ mod tests {
         "#;
 
         let result = assert_unique_script_tag(html);
-        assert!(result.is_err(), "should fail when multiple trustedserver-js exist");
+        assert!(
+            result.is_err(),
+            "should fail when multiple trustedserver-js exist"
+        );
     }
 
     #[test]
@@ -486,7 +493,10 @@ mod tests {
         "#;
 
         let result = assert_data_ad_units_preserved(html, &["/test/banner", "/test/sidebar"]);
-        assert!(result.is_err(), "should fail when expected ad unit is missing");
+        assert!(
+            result.is_err(),
+            "should fail when expected ad unit is missing"
+        );
     }
 
     #[test]
@@ -502,8 +512,13 @@ mod tests {
             </html>
         "#;
 
-        assert_form_action_rewritten(html, "form#contact-form", "127.0.0.1:8888", "http://127.0.0.1:9999")
-            .expect("should detect rewritten form action");
+        assert_form_action_rewritten(
+            html,
+            "form#contact-form",
+            "127.0.0.1:8888",
+            "http://127.0.0.1:9999",
+        )
+        .expect("should detect rewritten form action");
     }
 
     #[test]

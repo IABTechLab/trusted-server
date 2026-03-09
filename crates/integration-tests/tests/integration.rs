@@ -9,7 +9,7 @@ mod frameworks;
 
 use common::runtime::{TestError, origin_port, wasm_binary_path};
 use environments::RUNTIME_ENVIRONMENTS;
-use error_stack::ResultExt as _;
+use error_stack::{Report, ResultExt as _};
 use frameworks::{FRAMEWORKS, FrontendFramework};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
@@ -62,7 +62,7 @@ fn test_all_combinations() {
 fn test_combination(
     runtime: &dyn common::runtime::RuntimeEnvironment,
     framework: &dyn FrontendFramework,
-) -> error_stack::Result<(), TestError> {
+) -> common::runtime::TestResult<()> {
     init_logger();
     let runtime_id = runtime.id();
     let framework_id = framework.id();
@@ -71,12 +71,12 @@ fn test_combination(
     // 1. Start frontend container mapped to the fixed origin port
     let container = framework
         .build_container(port)
-        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?
+        .attach(format!("runtime: {runtime_id}, framework: {framework_id}"))?
         .start()
         .change_context(TestError::ContainerStart {
             reason: format!("framework: {framework_id}"),
         })
-        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
+        .attach(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
 
     let origin_url = format!("http://127.0.0.1:{port}");
 
@@ -87,13 +87,13 @@ fn test_combination(
     let wasm_path = wasm_binary_path();
     let process = runtime
         .spawn(&wasm_path)
-        .attach_printable(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
+        .attach(format!("runtime: {runtime_id}, framework: {framework_id}"))?;
 
     // 3. Run standard scenarios
     for scenario in framework.standard_scenarios() {
         scenario
             .run(&process.base_url, framework_id)
-            .attach_printable(format!(
+            .attach(format!(
                 "runtime: {runtime_id}, framework: {framework_id}, scenario: {scenario:?}"
             ))?;
     }
@@ -102,7 +102,7 @@ fn test_combination(
     for scenario in framework.custom_scenarios() {
         scenario
             .run(&process.base_url, framework_id)
-            .attach_printable(format!(
+            .attach(format!(
                 "runtime: {runtime_id}, framework: {framework_id}, custom scenario: {scenario:?}"
             ))?;
     }
@@ -126,7 +126,7 @@ fn test_combination(
 ///
 /// Returns [`TestError::ContainerTimeout`] if the health endpoint does not
 /// respond with a success status within the timeout.
-fn wait_for_container(base_url: &str, health_path: &str) -> error_stack::Result<(), TestError> {
+fn wait_for_container(base_url: &str, health_path: &str) -> common::runtime::TestResult<()> {
     let url = format!("{base_url}{health_path}");
 
     for _ in 0..60 {
@@ -138,8 +138,8 @@ fn wait_for_container(base_url: &str, health_path: &str) -> error_stack::Result<
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    Err(error_stack::report!(TestError::ContainerTimeout)
-        .attach_printable(format!("Container at {base_url} not ready after 30s")))
+    Err(Report::new(TestError::ContainerTimeout)
+        .attach(format!("Container at {base_url} not ready after 30s")))
 }
 
 // Individual test functions for faster iteration during development.

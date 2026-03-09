@@ -2,7 +2,7 @@ pub mod nextjs;
 pub mod scenarios;
 pub mod wordpress;
 
-use crate::common::runtime::TestError;
+use crate::common::runtime::TestResult;
 use scenarios::{CustomScenario, TestScenario};
 use testcontainers::GenericImage;
 use testcontainers::core::ContainerRequest;
@@ -30,10 +30,7 @@ pub trait FrontendFramework: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TestError::ContainerStart`] if the image cannot be created.
-    fn build_container(
-        &self,
-        origin_port: u16,
-    ) -> error_stack::Result<ContainerRequest<GenericImage>, TestError>;
+    fn build_container(&self, origin_port: u16) -> TestResult<ContainerRequest<GenericImage>>;
 
     /// Port the framework serves on inside the container.
     fn container_port(&self) -> u16;

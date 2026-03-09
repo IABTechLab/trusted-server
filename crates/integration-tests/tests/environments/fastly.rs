@@ -1,4 +1,6 @@
-use crate::common::runtime::{RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError};
+use crate::common::runtime::{
+    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
+};
 use error_stack::ResultExt as _;
 use std::path::Path;
 use std::process::{Child, Command};
@@ -16,7 +18,7 @@ impl RuntimeEnvironment for FastlyViceroy {
         "fastly"
     }
 
-    fn spawn(&self, wasm_path: &Path) -> error_stack::Result<RuntimeProcess, TestError> {
+    fn spawn(&self, wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port()?;
 
         let viceroy_config = self.viceroy_config_path();
@@ -29,7 +31,7 @@ impl RuntimeEnvironment for FastlyViceroy {
             .arg(format!("127.0.0.1:{port}"))
             .spawn()
             .change_context(TestError::RuntimeSpawn)
-            .attach_printable("Failed to spawn viceroy process")?;
+            .attach("Failed to spawn viceroy process")?;
 
         // Wrap immediately so Drop::drop kills the process if readiness check fails
         let handle = ViceroyHandle { child };
@@ -68,19 +70,19 @@ struct ViceroyHandle {
 }
 
 impl RuntimeProcessHandle for ViceroyHandle {
-    fn kill(&mut self) -> error_stack::Result<(), TestError> {
+    fn kill(&mut self) -> TestResult<()> {
         self.child
             .kill()
             .change_context(TestError::RuntimeKill)
-            .attach_printable("Failed to kill viceroy process")?;
+            .attach("Failed to kill viceroy process")?;
         Ok(())
     }
 
-    fn wait(&mut self) -> error_stack::Result<(), TestError> {
+    fn wait(&mut self) -> TestResult<()> {
         self.child
             .wait()
             .change_context(TestError::RuntimeWait)
-            .attach_printable("Failed to wait on viceroy process")?;
+            .attach("Failed to wait on viceroy process")?;
         Ok(())
     }
 }

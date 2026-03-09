@@ -1,6 +1,6 @@
 use super::FrontendFramework;
 use super::scenarios::{CustomScenario, TestScenario};
-use crate::common::runtime::TestError;
+use crate::common::runtime::TestResult;
 use testcontainers::core::{ContainerRequest, IntoContainerPort};
 use testcontainers::{GenericImage, ImageExt as _};
 
@@ -21,10 +21,7 @@ impl FrontendFramework for WordPress {
         "wordpress"
     }
 
-    fn build_container(
-        &self,
-        origin_port: u16,
-    ) -> error_stack::Result<ContainerRequest<GenericImage>, TestError> {
+    fn build_container(&self, origin_port: u16) -> TestResult<ContainerRequest<GenericImage>> {
         let container_port = self.container_port();
         let origin_host = format!("127.0.0.1:{origin_port}");
         Ok(GenericImage::new("test-wordpress", "latest")

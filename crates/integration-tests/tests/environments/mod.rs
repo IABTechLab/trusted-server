@@ -1,6 +1,7 @@
 pub mod fastly;
 
-use crate::common::runtime::{RuntimeEnvironment, TestError};
+use crate::common::runtime::{RuntimeEnvironment, TestError, TestResult};
+use error_stack::Report;
 
 /// Runtime factory function type — avoids trait object static initialization issues.
 type RuntimeFactory = fn() -> Box<dyn RuntimeEnvironment>;
@@ -26,13 +27,13 @@ pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[|| Box::new(fastly::Fastl
 /// # Errors
 ///
 /// Returns [`TestError::NoPortAvailable`] if no port can be allocated.
-pub fn find_available_port() -> error_stack::Result<u16, TestError> {
+pub fn find_available_port() -> TestResult<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|_| error_stack::report!(TestError::NoPortAvailable))?;
+        .map_err(|_| Report::new(TestError::NoPortAvailable))?;
 
     let port = listener
         .local_addr()
-        .map_err(|_| error_stack::report!(TestError::NoPortAvailable))?
+        .map_err(|_| Report::new(TestError::NoPortAvailable))?
         .port();
 
     Ok(port)
@@ -46,7 +47,7 @@ pub fn find_available_port() -> error_stack::Result<u16, TestError> {
 /// # Errors
 ///
 /// Returns [`TestError::RuntimeNotReady`] if the runtime does not respond within timeout.
-pub fn wait_for_ready(base_url: &str, health_path: &str) -> error_stack::Result<(), TestError> {
+pub fn wait_for_ready(base_url: &str, health_path: &str) -> TestResult<()> {
     let health_url = format!("{}{}", base_url, health_path);
 
     for _ in 0..30 {
@@ -66,5 +67,5 @@ pub fn wait_for_ready(base_url: &str, health_path: &str) -> error_stack::Result<
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    Err(error_stack::report!(TestError::RuntimeNotReady))
+    Err(Report::new(TestError::RuntimeNotReady))
 }

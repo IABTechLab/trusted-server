@@ -1,4 +1,4 @@
-use error_stack::Result;
+use error_stack::Report;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,9 @@ pub enum TestError {
 
 impl core::error::Error for TestError {}
 
+/// Result type used across integration tests.
+pub type TestResult<T> = core::result::Result<T, Report<TestError>>;
+
 /// Platform-agnostic process handle
 pub struct RuntimeProcess {
     pub inner: Box<dyn RuntimeProcessHandle>,
@@ -60,8 +63,8 @@ pub struct RuntimeProcess {
 
 /// Trait for runtime process lifecycle management
 pub trait RuntimeProcessHandle: Send + Sync {
-    fn kill(&mut self) -> Result<(), TestError>;
-    fn wait(&mut self) -> Result<(), TestError>;
+    fn kill(&mut self) -> TestResult<()>;
+    fn wait(&mut self) -> TestResult<()>;
 }
 
 /// Trait defining how to run the trusted-server on different platforms.
@@ -80,7 +83,7 @@ pub trait RuntimeEnvironment: Send + Sync {
     ///
     /// Returns [`TestError::RuntimeSpawn`] if the process cannot be started.
     /// Returns [`TestError::RuntimeNotReady`] if the health check times out.
-    fn spawn(&self, wasm_path: &Path) -> Result<RuntimeProcess, TestError>;
+    fn spawn(&self, wasm_path: &Path) -> TestResult<RuntimeProcess>;
 
     /// Health check endpoint (may differ by platform)
     fn health_check_path(&self) -> &str {

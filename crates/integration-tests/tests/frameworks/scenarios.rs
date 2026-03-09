@@ -1,5 +1,6 @@
 use crate::common::assertions;
-use crate::common::runtime::{TestError, origin_port};
+use crate::common::runtime::{TestError, TestResult, origin_port};
+use error_stack::Report;
 use error_stack::ResultExt as _;
 
 /// Standard test scenarios applicable to all frontend frameworks.
@@ -55,22 +56,22 @@ impl TestScenario {
     /// # Errors
     ///
     /// Returns a [`TestError`] variant depending on which assertion fails.
-    pub fn run(&self, base_url: &str, framework_id: &str) -> error_stack::Result<(), TestError> {
+    pub fn run(&self, base_url: &str, framework_id: &str) -> TestResult<()> {
         match self {
             Self::HtmlInjection => {
                 let resp = reqwest::blocking::get(base_url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: HtmlInjection, framework: {framework_id}"
                     ))?;
 
                 let html = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 assertions::assert_unique_script_tag(&html)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }
@@ -82,30 +83,30 @@ impl TestScenario {
                 // should rewrite to `http://127.0.0.1:{proxy_port}/page`.
                 let resp = reqwest::blocking::get(base_url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: AttributeRewriting, framework: {framework_id}"
                     ))?;
 
                 let html = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 let origin_host = format!("127.0.0.1:{}", origin_port());
 
                 assertions::assert_attributes_rewritten(&html, &origin_host, base_url)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 // Verify URL attributes inside ad-slot elements are also rewritten
                 assertions::assert_ad_slot_urls_rewritten(&html, &origin_host, base_url)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 // Verify non-URL attributes like data-ad-unit are preserved unchanged
                 assertions::assert_data_ad_units_preserved(
                     &html,
                     &["/test/banner", "/test/sidebar"],
                 )
-                .attach_printable(format!("framework: {framework_id}"))?;
+                .attach(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }
@@ -115,17 +116,15 @@ impl TestScenario {
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: ScriptServing, framework: {framework_id}"
                     ))?;
 
                 if !resp.status().is_success() {
-                    return Err(
-                        error_stack::report!(TestError::HttpRequest).attach_printable(format!(
-                            "Script serving returned {}, expected 2xx",
-                            resp.status()
-                        )),
-                    );
+                    return Err(Report::new(TestError::HttpRequest).attach(format!(
+                        "Script serving returned {}, expected 2xx",
+                        resp.status()
+                    )));
                 }
 
                 // Verify content type is JavaScript
@@ -139,27 +138,26 @@ impl TestScenario {
                 let body = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 if !content_type.contains("javascript") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(format!(
-                            "Expected JavaScript content-type, got: {content_type}"
-                        )));
+                    return Err(Report::new(TestError::ResponseParse).attach(format!(
+                        "Expected JavaScript content-type, got: {content_type}"
+                    )));
                 }
 
                 // Verify body is non-empty and contains expected bundle markers
                 if body.is_empty() {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable("Script bundle body is empty"));
+                    return Err(
+                        Report::new(TestError::ResponseParse).attach("Script bundle body is empty")
+                    );
                 }
 
                 // The unified bundle should contain the TSJS core initialization
                 if !body.contains("trustedserver") && !body.contains("tsjs") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(
-                            "Script bundle does not contain expected trustedserver/tsjs markers",
-                        ));
+                    return Err(Report::new(TestError::ResponseParse).attach(
+                        "Script bundle does not contain expected trustedserver/tsjs markers",
+                    ));
                 }
 
                 Ok(())
@@ -170,17 +168,15 @@ impl TestScenario {
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: ScriptServingUnknownFile404, framework: {framework_id}"
                     ))?;
 
                 let status = resp.status().as_u16();
 
                 if status != 404 {
-                    return Err(error_stack::report!(TestError::HttpRequest)
-                        .attach_printable(format!(
-                            "Expected 404 for unknown tsjs file, got {status}"
-                        )));
+                    return Err(Report::new(TestError::HttpRequest)
+                        .attach(format!("Expected 404 for unknown tsjs file, got {status}")));
                 }
 
                 // Response should not be HTML (which would indicate a fallback to origin)
@@ -191,10 +187,8 @@ impl TestScenario {
                     .unwrap_or("");
 
                 if content_type.contains("text/html") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(
-                            "Unknown tsjs file returned HTML instead of a proper 404",
-                        ));
+                    return Err(Report::new(TestError::ResponseParse)
+                        .attach("Unknown tsjs file returned HTML instead of a proper 404"));
                 }
 
                 Ok(())
@@ -209,7 +203,7 @@ impl CustomScenario {
     /// # Errors
     ///
     /// Returns a [`TestError`] variant depending on which assertion fails.
-    pub fn run(&self, base_url: &str, framework_id: &str) -> error_stack::Result<(), TestError> {
+    pub fn run(&self, base_url: &str, framework_id: &str) -> TestResult<()> {
         match self {
             Self::NextJsRscFlight => {
                 // Verify RSC Flight format responses are not corrupted.
@@ -222,7 +216,7 @@ impl CustomScenario {
                     .header("Next-Router-State-Tree", "%5B%22%22%5D")
                     .send()
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: NextJsRscFlight, framework: {framework_id}"
                     ))?;
 
@@ -238,18 +232,15 @@ impl CustomScenario {
                 // RSC responses must NOT be HTML — that means the proxy
                 // swallowed the RSC header and treated it as a page request
                 if content_type.contains("text/html") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(format!(
+                    return Err(Report::new(TestError::ResponseParse).attach(format!(
                             "RSC request returned text/html instead of Flight payload (content-type: {content_type})"
                         )));
                 }
 
                 // If the response is a Flight payload, it must not contain injected scripts
                 if body.contains("/static/tsjs=") {
-                    return Err(error_stack::report!(TestError::ScriptTagNotFound)
-                        .attach_printable(
-                            "Script tag should NOT be injected in RSC Flight responses",
-                        ));
+                    return Err(Report::new(TestError::ScriptTagNotFound)
+                        .attach("Script tag should NOT be injected in RSC Flight responses"));
                 }
 
                 Ok(())
@@ -273,7 +264,7 @@ impl CustomScenario {
                     .body("[]")
                     .send()
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: NextJsServerActions, framework: {framework_id}"
                     ))?;
 
@@ -293,16 +284,15 @@ impl CustomScenario {
                             && !body.contains("not found")
                             && !body.contains("Not Found")
                         {
-                            return Err(error_stack::report!(TestError::UnexpectedContent)
-                                .attach_printable(format!(
-                                    "Soft-404 body should contain a 404 indicator; \
+                            return Err(Report::new(TestError::UnexpectedContent).attach(format!(
+                                "Soft-404 body should contain a 404 indicator; \
                                      framework: {framework_id}, body: {body}"
-                                )));
+                            )));
                         }
                     }
                     _ => {
                         return Err(
-                            error_stack::report!(TestError::HttpRequest).attach_printable(
+                            Report::new(TestError::HttpRequest).attach(
                                 format!(
                                     "Expected 200/404/405 for unknown server action, got {status}; body: {body}"
                                 ),
@@ -321,17 +311,14 @@ impl CustomScenario {
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: NextJsApiRoute, framework: {framework_id}"
                     ))?;
 
                 let status = resp.status().as_u16();
                 if status != 200 {
-                    return Err(
-                        error_stack::report!(TestError::HttpRequest).attach_printable(format!(
-                            "Expected 200 for API route, got {status}"
-                        )),
-                    );
+                    return Err(Report::new(TestError::HttpRequest)
+                        .attach(format!("Expected 200 for API route, got {status}")));
                 }
 
                 let content_type = resp
@@ -342,37 +329,32 @@ impl CustomScenario {
                     .to_string();
 
                 if !content_type.contains("application/json") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(format!(
-                            "Expected application/json content-type, got: {content_type}"
-                        )));
+                    return Err(Report::new(TestError::ResponseParse).attach(format!(
+                        "Expected application/json content-type, got: {content_type}"
+                    )));
                 }
 
                 let body = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 // JSON responses must not contain HTML injection
                 if body.contains("<script") || body.contains("/static/tsjs=") {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(
+                    return Err(Report::new(TestError::ResponseParse).attach(
                             "API route response contains script injection — JSON should pass through unchanged",
                         ));
                 }
 
                 // Verify it's valid JSON with expected structure
-                let json: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| {
-                        error_stack::report!(TestError::ResponseParse)
-                            .attach_printable(format!("API response is not valid JSON: {e}"))
-                    })?;
+                let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                    Report::new(TestError::ResponseParse)
+                        .attach(format!("API response is not valid JSON: {e}"))
+                })?;
 
                 if json.get("message").is_none() {
-                    return Err(error_stack::report!(TestError::ResponseParse)
-                        .attach_printable(
-                            "API response missing expected 'message' field",
-                        ));
+                    return Err(Report::new(TestError::ResponseParse)
+                        .attach("API response missing expected 'message' field"));
                 }
 
                 Ok(())
@@ -384,14 +366,14 @@ impl CustomScenario {
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: NextJsFormAction, framework: {framework_id}"
                     ))?;
 
                 let html = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
                 let origin_host = format!("127.0.0.1:{}", origin_port());
 
@@ -401,7 +383,7 @@ impl CustomScenario {
                     &origin_host,
                     base_url,
                 )
-                .attach_printable(format!("framework: {framework_id}"))?;
+                .attach(format!("framework: {framework_id}"))?;
 
                 Ok(())
             }
@@ -416,20 +398,19 @@ impl CustomScenario {
 
                 let resp = reqwest::blocking::get(&url)
                     .change_context(TestError::HttpRequest)
-                    .attach_printable(format!(
+                    .attach(format!(
                         "scenario: WordPressAdminInjection, framework: {framework_id}"
                     ))?;
 
                 let html = resp
                     .text()
                     .change_context(TestError::ResponseParse)
-                    .attach_printable(format!("framework: {framework_id}"))?;
+                    .attach(format!("framework: {framework_id}"))?;
 
-                assertions::assert_script_tag_present(&html)
-                    .attach_printable(format!(
-                        "Admin page should receive injection (current behavior). \
+                assertions::assert_script_tag_present(&html).attach(format!(
+                    "Admin page should receive injection (current behavior). \
                          framework: {framework_id}"
-                    ))?;
+                ))?;
 
                 Ok(())
             }
