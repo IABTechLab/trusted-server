@@ -23,8 +23,7 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
-[response_headers]
-Content-Security-Policy="default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval' blob:; style-src * 'unsafe-inline'; img-src * data: blob:; font-src * data:; frame-src *; connect-src *;"
+# [response_headers]
 # X-Custom-Header = "custom header value"
 #
 # Or via environment variable (JSON preserves header name casing and hyphens):
