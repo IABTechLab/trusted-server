@@ -364,6 +364,29 @@ pub fn save_consent_to_kv(
         }
     }
 }
+
+/// Deletes a consent entry from the KV Store for a given Synthetic ID.
+///
+/// Used when a user revokes consent — the existing SSC cookie is being
+/// expired, so the persisted consent data must also be removed.
+///
+/// Errors are logged but never propagated — KV Store failures must not
+/// break the request pipeline.
+pub fn delete_consent_from_kv(store_name: &str, synthetic_id: &str) {
+    let Some(store) = open_store(store_name) else {
+        return;
+    };
+
+    match store.delete(synthetic_id) {
+        Ok(()) => {
+            log::info!("Deleted consent KV entry for '{synthetic_id}' (consent revoked)");
+        }
+        Err(e) => {
+            log::warn!("Failed to delete consent KV entry for '{synthetic_id}': {e}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
