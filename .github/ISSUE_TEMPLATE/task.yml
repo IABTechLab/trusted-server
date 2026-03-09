@@ -14,38 +14,3 @@ body:
       description: What needs to be done and why?
     validations:
       required: true
-
-  - type: textarea
-    id: done-criteria
-    attributes:
-      label: Done when
-      description: How do we know this task is complete?
-      placeholder: |
-        - [ ] Criterion 1
-        - [ ] Criterion 2
-    validations:
-      required: true
-
-  - type: dropdown
-    id: scope
-    attributes:
-      label: Affected area
-      description: Which part of the project would this touch?
-      multiple: true
-      options:
-        - Core (synthetic IDs, cookies, GDPR)
-        - Integrations (prebid, lockr, permutive, etc.)
-        - HTML processing / JS injection
-        - Ad serving (Equativ)
-        - Fastly runtime
-        - JS build pipeline
-        - Documentation
-        - CI / Tooling
-    validations:
-      required: true
-
-  - type: textarea
-    id: context
-    attributes:
-      label: Additional context
-      description: Related issues, dependencies, or notes.
