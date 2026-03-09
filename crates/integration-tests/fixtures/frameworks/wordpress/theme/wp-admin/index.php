@@ -7,7 +7,7 @@
 <body class="wp-admin">
     <div id="wpwrap">
         <h1>Dashboard</h1>
-        <p>WordPress admin area — scripts should NOT be injected here.</p>
+        <p>WordPress admin area — scripts ARE injected here (current behavior — update this if admin exclusion is added).</p>
     </div>
 </body>
 </html>

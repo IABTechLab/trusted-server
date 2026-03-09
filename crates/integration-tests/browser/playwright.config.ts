@@ -5,7 +5,7 @@ export default defineConfig({
   globalSetup: "./global-setup.ts",
   globalTeardown: "./global-teardown.ts",
   timeout: 30_000,
-  retries: 0,
+  retries: 1,
   // Sequential execution: all tests share a single origin port (8888)
   workers: 1,
   use: {

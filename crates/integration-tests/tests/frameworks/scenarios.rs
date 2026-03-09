@@ -289,11 +289,16 @@ impl CustomScenario {
                     404 | 405 => {}
                     200 => {
                         // Soft 404: verify the body is a Next.js not-found page
-                        assert!(
-                            body.contains("404") || body.contains("not found")
-                                || body.contains("Not Found"),
-                            "should contain 404 indicator in soft-404 response body"
-                        );
+                        if !body.contains("404")
+                            && !body.contains("not found")
+                            && !body.contains("Not Found")
+                        {
+                            return Err(error_stack::report!(TestError::UnexpectedContent)
+                                .attach_printable(format!(
+                                    "Soft-404 body should contain a 404 indicator; \
+                                     framework: {framework_id}, body: {body}"
+                                )));
+                        }
                     }
                     _ => {
                         return Err(

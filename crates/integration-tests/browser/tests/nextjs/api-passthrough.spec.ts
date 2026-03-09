@@ -18,12 +18,12 @@ test.describe("Next.js API route passthrough", () => {
     const contentType = resp.headers()["content-type"] || "";
     expect(contentType).toContain("application/json");
 
-    const body = await resp.json();
+    const text = await resp.text();
+    const body = JSON.parse(text);
     expect(body.message).toBe("Hello from the API!");
     expect(body.status).toBe("success");
 
     // JSON must not contain HTML injection
-    const text = await (await request.get("/api/hello")).text();
     expect(text).not.toContain("<script");
     expect(text).not.toContain("/static/tsjs=");
   });

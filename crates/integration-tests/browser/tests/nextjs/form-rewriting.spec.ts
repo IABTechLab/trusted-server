@@ -20,8 +20,9 @@ test.describe("Next.js form action rewriting", () => {
     const action = await form.getAttribute("action");
     expect(action).toBeTruthy();
 
-    // Origin host (port 8888) should be rewritten to proxy host
-    expect(action).not.toContain("127.0.0.1:8888");
+    // Origin host should be rewritten to proxy host
+    const originPort = process.env.INTEGRATION_ORIGIN_PORT || "8888";
+    expect(action).not.toContain(`127.0.0.1:${originPort}`);
     // The path should be preserved
     expect(action).toContain("/api/contact");
   });

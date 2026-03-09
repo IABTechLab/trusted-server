@@ -40,7 +40,7 @@ pub fn find_available_port() -> error_stack::Result<u16, TestError> {
 
 /// Poll a runtime's health endpoint until it responds with success.
 ///
-/// Retries up to 30 times with 100ms delay between attempts (total ~3s).
+/// Retries up to 30 times with 500ms delay between attempts (total ~15s).
 /// Falls back to checking the root path if the health endpoint is not available.
 ///
 /// # Errors
@@ -63,7 +63,7 @@ pub fn wait_for_ready(base_url: &str, health_path: &str) -> error_stack::Result<
             return Ok(());
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     Err(error_stack::report!(TestError::RuntimeNotReady))

@@ -14,6 +14,14 @@ use frameworks::{FRAMEWORKS, FrontendFramework};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
 
+/// Initialize the logger once for the test binary.
+///
+/// Called at the start of each test function. `try_init` is used so that
+/// repeated calls (one per test) are harmless — only the first succeeds.
+fn init_logger() {
+    let _ = env_logger::try_init();
+}
+
 /// Test all combinations: frameworks x runtimes (matrix testing).
 ///
 /// Iterates every registered runtime and framework, running all standard
@@ -22,6 +30,7 @@ use testcontainers::runners::SyncRunner as _;
 #[test]
 #[ignore = "requires Docker, Viceroy, and pre-built WASM binary"]
 fn test_all_combinations() {
+    init_logger();
     for runtime_factory in RUNTIME_ENVIRONMENTS {
         let runtime = runtime_factory();
         log::info!("Testing runtime: {}", runtime.id());
@@ -54,6 +63,7 @@ fn test_combination(
     runtime: &dyn common::runtime::RuntimeEnvironment,
     framework: &dyn FrontendFramework,
 ) -> error_stack::Result<(), TestError> {
+    init_logger();
     let runtime_id = runtime.id();
     let framework_id = framework.id();
     let port = origin_port();
@@ -103,7 +113,19 @@ fn test_combination(
     Ok(())
 }
 
-/// Wait for a container's health check endpoint to respond.
+/// Wait for a Docker container's health endpoint to respond successfully.
+///
+/// Retries up to 60 times with 500ms delay (total ~30s). Uses a longer
+/// budget than `wait_for_ready` because container cold-starts
+/// include image pull, filesystem setup, and application init time.
+///
+/// Unlike `wait_for_ready`, this function does not fall back to the root path —
+/// containers are expected to expose a reliable health endpoint.
+///
+/// # Errors
+///
+/// Returns [`TestError::ContainerTimeout`] if the health endpoint does not
+/// respond with a success status within the timeout.
 fn wait_for_container(base_url: &str, health_path: &str) -> error_stack::Result<(), TestError> {
     let url = format!("{base_url}{health_path}");
 
