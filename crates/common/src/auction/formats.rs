@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
-use crate::auction::types::OrchestratorExt;
 use crate::consent::ConsentContext;
 use crate::creative;
 use crate::error::TrustedServerError;

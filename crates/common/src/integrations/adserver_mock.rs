@@ -707,6 +707,7 @@ mod tests {
             endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
+            context_query_params: BTreeMap::new(),
         };
 
         let provider = AdServerMockProvider::new(config);
