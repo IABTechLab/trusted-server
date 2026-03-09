@@ -11,8 +11,6 @@ use jose_jwk::Jwk;
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyApiClient, FastlyConfigStore};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
-#[allow(unused_imports)]
-use crate::request_signing::SIGNING_SECRET_STORE_NAME;
 
 use super::Keypair;
 
@@ -40,7 +38,7 @@ impl KeyRotationManager {
     ///
     /// The `config_store_id` and `secret_store_id` are Fastly management API
     /// identifiers used for write operations. Edge reads use the store names
-    /// defined in [`JWKS_CONFIG_STORE_NAME`] and [`SIGNING_SECRET_STORE_NAME`].
+    /// defined in [`JWKS_CONFIG_STORE_NAME`] and [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
     ///
     /// # Errors
     ///
@@ -229,11 +227,11 @@ mod tests {
 
     #[test]
     fn test_key_rotation_manager_creation() {
-        let result = KeyRotationManager::new("jwks_store", "signing_keys");
+        let result = KeyRotationManager::new("test-config-store-id", "test-secret-store-id");
         match result {
             Ok(manager) => {
-                assert_eq!(manager.config_store_id, "jwks_store");
-                assert_eq!(manager.secret_store_id, "signing_keys");
+                assert_eq!(manager.config_store_id, "test-config-store-id");
+                assert_eq!(manager.secret_store_id, "test-secret-store-id");
             }
             Err(e) => {
                 println!("Expected error in test environment: {}", e);
@@ -243,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_list_active_keys() {
-        let result = KeyRotationManager::new("jwks_store", "signing_keys");
+        let result = KeyRotationManager::new("test-config-store-id", "test-secret-store-id");
         if let Ok(manager) = result {
             match manager.list_active_keys() {
                 Ok(keys) => {
