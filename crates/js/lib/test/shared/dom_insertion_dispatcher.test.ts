@@ -35,6 +35,7 @@ function resetAllScriptGuards(): void {
 }
 
 describe('DOM insertion dispatcher', () => {
+  const dispatcherKey = Symbol.for('trusted-server.domInsertionDispatcher');
   let originalAppendChild: typeof Element.prototype.appendChild;
   let originalInsertBefore: typeof Element.prototype.insertBefore;
 
@@ -273,6 +274,34 @@ describe('DOM insertion dispatcher', () => {
 
     unregisterThrowing();
     unregisterSecond();
+  });
+
+  it('replaces stale global dispatcher state when the version changes', () => {
+    const globalObject = globalThis as Record<PropertyKey, unknown>;
+    globalObject[dispatcherKey] = {
+      handlers: new Map(),
+      nextSequence: 0,
+      orderedHandlers: [],
+      version: 0,
+    };
+
+    const unregister = registerDomInsertionHandler({
+      handle: () => true,
+      id: 'alpha',
+      priority: 100,
+    });
+
+    const state = globalObject[dispatcherKey] as {
+      handlers: Map<number, unknown>;
+      version: number;
+    };
+
+    expect(state.version).toBe(1);
+    expect(state.handlers.size).toBe(1);
+    expect(Element.prototype.appendChild).not.toBe(originalAppendChild);
+    expect(Element.prototype.insertBefore).not.toBe(originalInsertBefore);
+
+    unregister();
   });
 
   it('leaves no prototype residue across repeated install and reset cycles', () => {

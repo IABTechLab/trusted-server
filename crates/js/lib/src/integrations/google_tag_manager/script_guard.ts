@@ -1,3 +1,4 @@
+import { log } from '../../core/log';
 import { createBeaconGuard } from '../../shared/beacon_guard';
 import { createScriptGuard } from '../../shared/script_guard';
 
@@ -82,12 +83,15 @@ function extractGtmPath(url: string): string {
     return parsed.pathname + parsed.search;
   } catch (error) {
     // Fallback: extract path after the domain using regex
-    console.warn('[GTM Guard] URL parsing failed for:', url, 'Error:', error);
+    log.warn('[GTM Guard] URL parsing failed; falling back to regex extraction', {
+      error,
+      url,
+    });
     const match = url.match(
       /(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(\/[^'"\s]*)/i
     );
     if (!match || !match[1]) {
-      console.warn('[GTM Guard] Fallback regex failed, using default path /gtm.js');
+      log.warn('[GTM Guard] Fallback regex failed; using default path /gtm.js', { url });
       return '/gtm.js';
     }
     return match[1];

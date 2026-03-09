@@ -144,18 +144,7 @@ impl GptIntegration {
         )
     }
 
-    async fn proxy_gpt_asset(
-        &self,
-        settings: &Settings,
-        req: Request,
-        target_url: &str,
-        context: &str,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let config = Self::build_proxy_config(target_url, &req);
-        let mut response = proxy_request(settings, req, config)
-            .await
-            .change_context(Self::error(context))?;
-
+    fn finalize_gpt_asset_response(&self, mut response: Response) -> Response {
         response.set_header("X-GPT-Proxy", "true");
 
         if response.get_status().is_success() {
@@ -165,7 +154,24 @@ impl GptIntegration {
             );
         }
 
-        Ok(response)
+        response
+    }
+
+    async fn proxy_gpt_asset(
+        &self,
+        settings: &Settings,
+        req: Request,
+        target_url: &str,
+        context: &str,
+    ) -> Result<Response, Report<TrustedServerError>> {
+        let config = Self::build_proxy_config(target_url, &req);
+        let response = proxy_request(settings, req, config)
+            .await
+            .change_context(Self::error(context))?;
+
+        // Preserve upstream non-2xx statuses so GPT failures remain visible to
+        // callers. Only successful responses receive a cache directive.
+        Ok(self.finalize_gpt_asset_response(response))
     }
 
     /// Check if a URL points at Google's GPT bootstrap script (`gpt.js`).
@@ -636,6 +642,52 @@ mod tests {
             accept_encoding,
             Some(""),
             "should avoid advertising encodings the client did not request"
+        );
+    }
+
+    #[test]
+    fn finalize_gpt_asset_response_adds_proxy_headers_only_for_successes() {
+        let integration = GptIntegration::new(test_config());
+        let response = Response::from_status(fastly::http::StatusCode::OK);
+        let response = integration.finalize_gpt_asset_response(response);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should preserve successful upstream statuses"
+        );
+        assert_eq!(
+            response.get_header_str("X-GPT-Proxy"),
+            Some("true"),
+            "should tag proxied GPT responses"
+        );
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("public, max-age=3600"),
+            "should add cache headers for successful GPT asset responses"
+        );
+    }
+
+    #[test]
+    fn finalize_gpt_asset_response_preserves_non_success_statuses_without_cache_headers() {
+        let integration = GptIntegration::new(test_config());
+        let response = Response::from_status(fastly::http::StatusCode::SERVICE_UNAVAILABLE);
+        let response = integration.finalize_gpt_asset_response(response);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            "should preserve upstream non-success statuses for callers"
+        );
+        assert_eq!(
+            response.get_header_str("X-GPT-Proxy"),
+            Some("true"),
+            "should still identify non-success GPT responses as proxied"
+        );
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            None,
+            "should not cache upstream non-success GPT responses"
         );
     }
 

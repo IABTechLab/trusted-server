@@ -4,6 +4,7 @@ type AppendChildMethod = typeof Element.prototype.appendChild;
 type InsertBeforeMethod = typeof Element.prototype.insertBefore;
 
 const DOM_INSERTION_DISPATCHER_KEY = Symbol.for('trusted-server.domInsertionDispatcher');
+const DOM_INSERTION_DISPATCHER_STATE_VERSION = 1;
 
 export const DEFAULT_DOM_INSERTION_HANDLER_PRIORITY = 100;
 
@@ -23,6 +24,13 @@ export interface DomInsertionLinkCandidate {
 export type DomInsertionCandidate = DomInsertionScriptCandidate | DomInsertionLinkCandidate;
 
 export interface DomInsertionHandler {
+  /**
+   * Process a normalized DOM insertion candidate.
+   *
+   * Return `true` when the handler consumed or rewrote the candidate and no
+   * subsequent handlers should run. Return `false` to leave the candidate
+   * available for later handlers.
+   */
   handle: (candidate: DomInsertionCandidate) => boolean;
   id: string;
   priority: number;
@@ -40,6 +48,7 @@ interface DomInsertionDispatcherState {
   insertBeforeWrapper?: InsertBeforeMethod;
   nextSequence: number;
   orderedHandlers: RegisteredDomInsertionHandler[];
+  version: number;
 }
 
 function compareHandlers(
@@ -61,14 +70,29 @@ function getDispatcherState(): DomInsertionDispatcherState {
   const globalObject = globalThis as Record<PropertyKey, unknown>;
   const existingState = globalObject[DOM_INSERTION_DISPATCHER_KEY];
 
-  if (existingState) {
+  if (
+    existingState &&
+    typeof existingState === 'object' &&
+    (existingState as { version?: unknown }).version === DOM_INSERTION_DISPATCHER_STATE_VERSION
+  ) {
     return existingState as DomInsertionDispatcherState;
+  }
+
+  if (existingState) {
+    log.warn('DOM insertion dispatcher: replacing stale global state', {
+      expectedVersion: DOM_INSERTION_DISPATCHER_STATE_VERSION,
+      foundVersion:
+        typeof existingState === 'object' && existingState !== null
+          ? (existingState as { version?: unknown }).version
+          : undefined,
+    });
   }
 
   const state: DomInsertionDispatcherState = {
     handlers: new Map<number, RegisteredDomInsertionHandler>(),
     nextSequence: 0,
     orderedHandlers: [],
+    version: DOM_INSERTION_DISPATCHER_STATE_VERSION,
   };
 
   globalObject[DOM_INSERTION_DISPATCHER_KEY] = state;
