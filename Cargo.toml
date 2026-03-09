@@ -80,4 +80,4 @@ urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
 which = "8"
-criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

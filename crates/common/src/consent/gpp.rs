@@ -25,6 +25,13 @@ use error_stack::Report;
 
 use super::types::{ConsentDecodeError, GppConsent, TcfConsent};
 
+/// Maximum length of a raw GPP string before parsing.
+///
+/// GPP strings are typically larger than standalone TC strings because they
+/// encode multiple sections. This limit prevents malicious cookies from
+/// triggering large allocations in the `iab_gpp` parser.
+const MAX_GPP_STRING_LEN: usize = 8192;
+
 /// Decodes a GPP string into a [`GppConsent`] struct.
 ///
 /// Parses the raw `__gpp` cookie value, extracts section IDs, and optionally
@@ -36,8 +43,18 @@ use super::types::{ConsentDecodeError, GppConsent, TcfConsent};
 ///
 /// # Errors
 ///
-/// - [`ConsentDecodeError::InvalidGppString`] if the `iab_gpp` parser fails.
+/// - [`ConsentDecodeError::InvalidGppString`] if the string exceeds
+///   [`MAX_GPP_STRING_LEN`] or the `iab_gpp` parser fails.
 pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentDecodeError>> {
+    if gpp_string.len() > MAX_GPP_STRING_LEN {
+        return Err(Report::new(ConsentDecodeError::InvalidGppString {
+            reason: format!(
+                "GPP string too long: {} bytes, max {MAX_GPP_STRING_LEN}",
+                gpp_string.len()
+            ),
+        }));
+    }
+
     let parsed = iab_gpp::v1::GPPString::parse_str(gpp_string).map_err(|e| {
         Report::new(ConsentDecodeError::InvalidGppString {
             reason: format!("{e}"),
@@ -167,6 +184,16 @@ mod tests {
     fn rejects_empty_string() {
         let result = decode_gpp_string("");
         assert!(result.is_err(), "should reject empty GPP string");
+    }
+
+    #[test]
+    fn rejects_oversized_gpp_string() {
+        let oversized = "D".repeat(MAX_GPP_STRING_LEN + 1);
+        let result = decode_gpp_string(&oversized);
+        assert!(
+            result.is_err(),
+            "should reject GPP string exceeding max length"
+        );
     }
 
     #[test]
