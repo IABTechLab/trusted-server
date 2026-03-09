@@ -38,7 +38,7 @@ pub struct LockrConfig {
     #[validate(length(min = 1))]
     pub app_id: String,
 
-    /// Base URL for Lockr API (default: <https://identity.lockr.kr>)
+    /// Base URL for Lockr API (default: <https://identity.loc.kr>)
     #[serde(default = "default_api_endpoint")]
     #[validate(url)]
     pub api_endpoint: String,
@@ -56,6 +56,11 @@ pub struct LockrConfig {
     /// Whether to rewrite Lockr SDK URLs in HTML
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
+
+    /// Deprecated — the trust-server SDK handles host routing natively.
+    /// Kept for backwards compatibility so existing configs don't cause parse errors.
+    #[serde(default)]
+    pub rewrite_sdk_host: Option<bool>,
 
     /// Override the Origin header sent to Lockr API.
     /// Use this when running locally or from a domain not registered with Lockr.
@@ -91,10 +96,9 @@ impl LockrIntegration {
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
-        lower.contains("aim.loc.kr")
-            || (lower.contains("identity.loc.kr")
-                && lower.contains("identity-lockr")
-                && lower.ends_with(".js"))
+        (lower.contains("aim.loc.kr") || lower.contains("identity.loc.kr"))
+            && lower.contains("identity-lockr")
+            && lower.ends_with(".js")
     }
 
     /// Handle SDK serving — fetch from Lockr CDN and serve through first-party domain.
@@ -149,11 +153,12 @@ impl LockrIntegration {
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-Lockr-SDK-Proxy", "true")
+            .with_header("X-Lockr-SDK-Mode", "trust-server")
             .with_header("X-SDK-Source", sdk_url)
             .with_body(sdk_body))
     }
 
-    /// Handle API proxy — forward requests to identity.lockr.kr.
+    /// Handle API proxy — forward requests to identity.loc.kr.
     async fn handle_api_proxy(
         &self,
         _settings: &Settings,
@@ -256,6 +261,12 @@ fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
 #[must_use]
 pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
     let integration = build(settings)?;
+    if integration.config.rewrite_sdk_host.is_some() {
+        log::warn!(
+            "lockr: `rewrite_sdk_host` is deprecated and ignored; \
+             the trust-server SDK handles host routing natively"
+        );
+    }
     log::info!(
         "Registering Lockr integration (rewrite_sdk={})",
         integration.config.rewrite_sdk
@@ -318,14 +329,7 @@ impl IntegrationAttributeRewriter for LockrIntegration {
             return AttributeRewriteAction::Keep;
         }
 
-        let is_lockr = self.is_lockr_sdk_url(attr_value);
-        log::debug!(
-            "[lockr] Rewrite check: value={:?}, is_lockr_sdk={}",
-            attr_value,
-            is_lockr
-        );
-
-        if is_lockr {
+        if self.is_lockr_sdk_url(attr_value) {
             let replacement = format!(
                 "{}://{}/integrations/lockr/sdk",
                 ctx.request_scheme, ctx.request_host
@@ -343,7 +347,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_api_endpoint() -> String {
-    "https://identity.lockr.kr".to_string()
+    "https://identity.loc.kr".to_string()
 }
 
 fn default_sdk_url() -> String {
@@ -370,6 +374,7 @@ mod tests {
             sdk_url: default_sdk_url(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
+            rewrite_sdk_host: None,
             origin_override: None,
         }
     }
@@ -392,8 +397,30 @@ mod tests {
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-trust-server.js"));
         assert!(integration.is_lockr_sdk_url("https://identity.loc.kr/identity-lockr-v2.0.js"));
 
+        // Should not match non-SDK resources on Lockr domains
+        assert!(
+            !integration.is_lockr_sdk_url("https://aim.loc.kr/pixel.gif"),
+            "should not match non-JS assets on aim.loc.kr"
+        );
+        assert!(
+            !integration.is_lockr_sdk_url("https://aim.loc.kr/styles.css"),
+            "should not match CSS files on aim.loc.kr"
+        );
+
         // Should not match other URLs
-        assert!(!integration.is_lockr_sdk_url("https://example.com/script.js"));
+        assert!(
+            !integration.is_lockr_sdk_url("https://example.com/script.js"),
+            "should not match unrelated domains"
+        );
+    }
+
+    #[test]
+    fn test_default_sdk_url_uses_trust_server() {
+        let url = default_sdk_url();
+        assert!(
+            url.contains("trust-server"),
+            "should use the trust-server SDK variant by default"
+        );
     }
 
     #[test]
