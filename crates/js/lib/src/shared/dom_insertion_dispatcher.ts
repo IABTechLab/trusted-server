@@ -82,7 +82,7 @@ function getDispatcherState(): DomInsertionDispatcherState {
     log.warn('DOM insertion dispatcher: replacing stale global state', {
       expectedVersion: DOM_INSERTION_DISPATCHER_STATE_VERSION,
       foundVersion:
-        typeof existingState === 'object' && existingState !== null
+        typeof existingState === 'object'
           ? (existingState as { version?: unknown }).version
           : undefined,
     });
