@@ -1,3 +1,6 @@
+// Build script includes source modules (`error`, `auction_config_types`, etc.)
+// for compile-time config validation. Not all items from those modules are used
+// in the build context, so `dead_code` is expected.
 #![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
 #[path = "src/error.rs"]

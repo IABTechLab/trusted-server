@@ -369,7 +369,7 @@ fn select_newest_signal(
 pub(crate) fn now_deciseconds() -> u64 {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("should have system time after Unix epoch");
     dur.as_secs() * 10 + u64::from(dur.subsec_millis()) / 100
 }
 
@@ -421,6 +421,10 @@ pub fn build_us_privacy_from_gpc(config: &ConsentConfig) -> Option<types::UsPriv
 ///
 /// Returns [`None`] if consent is missing or insufficient, stripping all EIDs
 /// from the outgoing bid request.
+///
+/// **Note:** This function is implemented and tested but not yet wired into
+/// the bid request path. It will be connected when identity provider
+/// integration populates EIDs (see `prebid.rs` where `eids: None`).
 #[must_use]
 pub fn gate_eids_by_consent<T>(
     eids: Option<Vec<T>>,

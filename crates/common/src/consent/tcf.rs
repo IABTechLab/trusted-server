@@ -51,6 +51,14 @@ use super::types::{ConsentDecodeError, TcfConsent};
 /// cookies from triggering large heap allocations during base64 decoding.
 const MAX_TC_STRING_LEN: usize = 4096;
 
+/// Maximum vendor ID we will process from a TC String.
+///
+/// The IAB vendor list currently has ~1 200 entries. This cap prevents
+/// malicious range-encoded entries (e.g. `start=1, end=65535`) from
+/// expanding into enormous `Vec`s. Vendors beyond this limit are silently
+/// ignored.
+const MAX_VENDOR_ID: u16 = 10_000;
+
 /// Decodes a TC String v2 into a [`TcfConsent`] struct.
 ///
 /// Only the core segment is decoded. Additional segments (separated by `.`)
@@ -172,7 +180,8 @@ fn decode_vendor_section(
         return Ok(Vec::new());
     }
 
-    let max_vendor_id = reader.read_u16(offset, 16);
+    let raw_max_vendor_id = reader.read_u16(offset, 16);
+    let max_vendor_id = raw_max_vendor_id.min(MAX_VENDOR_ID);
     let is_range = reader.read_bool(offset + 16);
 
     if !is_range {
@@ -215,7 +224,13 @@ fn decode_vendor_section(
                 let start = reader.read_u16(pos, 16);
                 let end = reader.read_u16(pos + 16, 16);
                 pos += 32;
-                for id in start..=end {
+
+                // Silently clamp to MAX_VENDOR_ID to prevent amplification
+                // from malicious range entries.
+                if start == 0 || start > end {
+                    continue;
+                }
+                for id in start..=end.min(MAX_VENDOR_ID) {
                     vendors.push(id);
                 }
             } else {
@@ -225,7 +240,9 @@ fn decode_vendor_section(
                 }
                 let id = reader.read_u16(pos, 16);
                 pos += 16;
-                vendors.push(id);
+                if id > 0 && id <= MAX_VENDOR_ID {
+                    vendors.push(id);
+                }
             }
         }
         Ok(vendors)
@@ -447,6 +464,89 @@ mod tests {
 
         let result = decode_tc_string(&encoded).expect("should decode language");
         assert_eq!(result.consent_language, "FR");
+    }
+
+    #[test]
+    fn clamps_range_encoded_vendors_to_max() {
+        // Build a TC String with range encoding where end > MAX_VENDOR_ID.
+        // The decoder should silently clamp to MAX_VENDOR_ID.
+        let core_bits: usize = 213;
+        // Vendor section: maxVendorId(16) + isRange(1) + numEntries(12)
+        //   + entry: isRange(1) + start(16) + end(16) = 262 bits
+        let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
+        let total_bytes = total_bits.div_ceil(8);
+        let mut buf = vec![0u8; total_bytes];
+        let mut writer = BitWriter::new(&mut buf);
+
+        // Write minimal core fields (version=2, rest zeroed/defaults)
+        writer.write(0, 6, 2); // version
+        writer.write(6, 36, 0); // created
+        writer.write(42, 36, 0); // lastUpdated
+        writer.write(78, 12, 1); // cmpId
+        writer.write(90, 12, 1); // cmpVersion
+        writer.write(102, 6, 0); // consentScreen
+        writer.write(108, 6, 4); // language E
+        writer.write(114, 6, 13); // language N
+        writer.write(120, 12, 1); // vendorListVersion
+        writer.write(132, 6, 2); // policyVersion
+        writer.write(201, 6, 4); // publisherCC E
+        writer.write(207, 6, 13); // publisherCC N
+
+        // Vendor consent section: range encoding with start=9990, end=65535
+        writer.write(213, 16, 65535); // maxVendorId = 65535
+        writer.write_bool(229, true); // isRangeEncoding = true
+        writer.write(230, 12, 1); // numEntries = 1
+        writer.write_bool(242, true); // entry is a range
+        writer.write(243, 16, 9990); // startVendorId
+        writer.write(259, 16, 65535); // endVendorId
+
+        let encoded = URL_SAFE_NO_PAD.encode(&buf);
+        let result = decode_tc_string(&encoded).expect("should decode with clamped vendors");
+
+        // Should contain vendors 9990..=10000 (clamped from 9990..=65535)
+        assert_eq!(result.vendor_consents.len(), 11);
+        assert_eq!(
+            *result.vendor_consents.first().expect("should have first"),
+            9990
+        );
+        assert_eq!(
+            *result.vendor_consents.last().expect("should have last"),
+            10_000
+        );
+    }
+
+    #[test]
+    fn skips_invalid_range_start_gt_end() {
+        // Range entry where start > end should be silently skipped.
+        let core_bits: usize = 213;
+        let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
+        let total_bytes = total_bits.div_ceil(8);
+        let mut buf = vec![0u8; total_bytes];
+        let mut writer = BitWriter::new(&mut buf);
+
+        writer.write(0, 6, 2);
+        writer.write(78, 12, 1);
+        writer.write(90, 12, 1);
+        writer.write(108, 6, 4);
+        writer.write(114, 6, 13);
+        writer.write(120, 12, 1);
+        writer.write(132, 6, 2);
+        writer.write(201, 6, 4);
+        writer.write(207, 6, 13);
+
+        writer.write(213, 16, 100); // maxVendorId
+        writer.write_bool(229, true); // isRangeEncoding
+        writer.write(230, 12, 1); // numEntries = 1
+        writer.write_bool(242, true); // entry is a range
+        writer.write(243, 16, 50); // startVendorId = 50
+        writer.write(259, 16, 10); // endVendorId = 10 (invalid: start > end)
+
+        let encoded = URL_SAFE_NO_PAD.encode(&buf);
+        let result = decode_tc_string(&encoded).expect("should decode with skipped range");
+        assert!(
+            result.vendor_consents.is_empty(),
+            "should skip range where start > end"
+        );
     }
 
     // -----------------------------------------------------------------------
