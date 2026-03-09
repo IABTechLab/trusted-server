@@ -35,7 +35,9 @@ pub mod types;
 pub mod us_privacy;
 
 pub use extraction::extract_consent_signals;
-pub use types::{ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent};
+pub use types::{
+    ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
+};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -450,6 +452,44 @@ pub fn gate_eids_by_consent<T>(
 }
 
 // ---------------------------------------------------------------------------
+// SSC consent gating
+// ---------------------------------------------------------------------------
+
+/// Determines whether SSC (Synthetic Session Cookie) creation is permitted
+/// based on the user's consent and detected jurisdiction.
+///
+/// The decision follows the jurisdiction's consent model:
+///
+/// - **GDPR (EU/UK)**: opt-in required — TCF Purpose 1 (store/access
+///   information on a device) must be explicitly consented. If no TCF data is
+///   available under GDPR, consent is assumed absent and SSC is blocked.
+/// - **US state privacy**: opt-out model — SSC is allowed unless the user has
+///   explicitly opted out via the US Privacy string or Global Privacy Control.
+/// - **Non-regulated / Unknown**: SSC is allowed (no consent requirement).
+#[must_use]
+pub fn allows_ssc_creation(ctx: &ConsentContext) -> bool {
+    match &ctx.jurisdiction {
+        jurisdiction::Jurisdiction::Gdpr => {
+            // EU/UK: explicit opt-in required (TCF Purpose 1 = store/access device).
+            match effective_tcf(ctx) {
+                Some(tcf) => tcf.has_storage_consent(),
+                None => false,
+            }
+        }
+        jurisdiction::Jurisdiction::UsState(_) => {
+            // US: opt-out model — allow unless user explicitly opted out.
+            if let Some(usp) = &ctx.us_privacy {
+                usp.opt_out_sale != PrivacyFlag::Yes
+            } else {
+                // No US Privacy string — fall back to GPC signal.
+                !ctx.gpc
+            }
+        }
+        jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KV Store integration helpers
 // ---------------------------------------------------------------------------
 
@@ -564,10 +604,14 @@ mod tests {
     use fastly::Request;
 
     use super::{
-        apply_expiration_check, apply_tcf_conflict_resolution, build_consent_context,
-        build_context_from_signals, should_try_kv_fallback, ConsentPipelineInput,
+        allows_ssc_creation, apply_expiration_check, apply_tcf_conflict_resolution,
+        build_consent_context, build_context_from_signals, should_try_kv_fallback,
+        ConsentPipelineInput,
     };
-    use crate::consent::types::{ConsentContext, GppConsent, RawConsentSignals, TcfConsent};
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::{
+        ConsentContext, GppConsent, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
+    };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
 
@@ -810,6 +854,223 @@ mod tests {
         assert!(
             ctx.gdpr_applies,
             "should keep gdpr_applies true when raw EU TCF signal is still present"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // allows_ssc_creation tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: builds a TCF consent with configurable Purpose 1 (storage).
+    fn make_tcf_with_storage(has_storage: bool) -> TcfConsent {
+        TcfConsent {
+            version: 2,
+            cmp_id: 1,
+            cmp_version: 1,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 1,
+            tcf_policy_version: 4,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents: vec![
+                has_storage,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ],
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    #[test]
+    fn ssc_allowed_gdpr_with_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(make_tcf_with_storage(true)),
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "GDPR + TCF Purpose 1 consented should allow SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_blocked_gdpr_without_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(make_tcf_with_storage(false)),
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ssc_creation(&ctx),
+            "GDPR + TCF Purpose 1 not consented should block SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_blocked_gdpr_no_tcf_data() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: None,
+            gpp: None,
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ssc_creation(&ctx),
+            "GDPR with no TCF data should block SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_allowed_gdpr_via_gpp_embedded_tcf() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: None,
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: Some(make_tcf_with_storage(true)),
+            }),
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "GDPR + GPP embedded TCF with P1 consent should allow SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_allowed_us_state_no_optout() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::No,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "US state + no opt-out should allow SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_blocked_us_state_opted_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::Yes,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ssc_creation(&ctx),
+            "US state + opt-out should block SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_blocked_us_state_gpc_implies_optout() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: None,
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ssc_creation(&ctx),
+            "US state + GPC=true with no US Privacy string should block SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_allowed_us_state_no_signals() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: None,
+            gpc: false,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "US state + no opt-out signals should allow SSC (opt-out model)"
+        );
+    }
+
+    #[test]
+    fn ssc_allowed_non_regulated() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "non-regulated jurisdiction should always allow SSC"
+        );
+    }
+
+    #[test]
+    fn ssc_allowed_unknown_jurisdiction() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Unknown,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "unknown jurisdiction should allow SSC (no geo data available)"
+        );
+    }
+
+    #[test]
+    fn ssc_us_privacy_not_applicable_allows_ssc() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("VA".to_owned()),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::NotApplicable,
+                opt_out_sale: PrivacyFlag::NotApplicable,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ssc_creation(&ctx),
+            "US Privacy with opt_out=N/A should allow SSC"
         );
     }
 }

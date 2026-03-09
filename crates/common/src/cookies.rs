@@ -153,6 +153,18 @@ pub fn set_synthetic_cookie(
     );
 }
 
+/// Expires the synthetic ID cookie by setting `Max-Age=0`.
+///
+/// Used when a user revokes consent — the browser will delete the cookie
+/// on receipt of this header.
+pub fn expire_synthetic_cookie(settings: &Settings, response: &mut fastly::Response) {
+    let cookie = format!(
+        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain,
+    );
+    response.append_header(header::SET_COOKIE, cookie);
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::tests::create_test_settings;
