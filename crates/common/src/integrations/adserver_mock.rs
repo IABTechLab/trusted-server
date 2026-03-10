@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{build_url_with_context_params, ContextQueryParams};
@@ -306,15 +307,18 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to set mediation request body".to_string(),
             })?;
 
-        // Send async
-        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
-            TrustedServerError::Auction {
-                message: format!(
-                    "Failed to resolve backend for mediation endpoint: {}",
-                    self.config.endpoint
-                ),
-            },
-        )?;
+        // Send async with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for mediation endpoint: {}",
+                self.config.endpoint
+            ),
+        })?;
 
         let pending = req
             .send_async(backend_name)

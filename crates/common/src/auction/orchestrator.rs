@@ -4,7 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::request::{select, PendingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
 
@@ -93,6 +93,7 @@ impl AuctionOrchestrator {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
+        let mediation_start = Instant::now();
         let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
@@ -105,11 +106,16 @@ impl AuctionOrchestrator {
                 mediator.provider_name()
             );
 
-            // Create a context with provider responses for the mediator
+            // Give the mediator only the remaining time from the auction
+            // deadline, not the full timeout — the bidding phase already
+            // consumed part of it.
+            let elapsed_ms = mediation_start.elapsed().as_millis() as u32;
+            let remaining_ms = context.timeout_ms.saturating_sub(elapsed_ms);
+
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                timeout_ms: context.timeout_ms,
+                timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
             };
 
@@ -211,6 +217,9 @@ impl AuctionOrchestrator {
             provider_names.len()
         );
 
+        // Track auction start time for deadline enforcement
+        let auction_start = Instant::now();
+
         // Phase 1: Launch all requests concurrently and build mapping
         // Maps backend_name -> (provider_name, start_time, provider)
         let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
@@ -275,12 +284,16 @@ impl AuctionOrchestrator {
             }
         }
 
+        let deadline = Duration::from_millis(u64::from(context.timeout_ms));
         log::info!(
-            "Launched {} concurrent requests, waiting for responses using select...",
-            pending_requests.len()
+            "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
+            pending_requests.len(),
+            context.timeout_ms
         );
 
-        // Phase 2: Wait for responses using select() to process as they become ready
+        // Phase 2: Wait for responses using select() to process as they become ready.
+        // Enforce the auction deadline: after each select() returns, check
+        // elapsed time and drop remaining requests if the timeout is exceeded.
         let mut responses = Vec::new();
         let mut remaining = pending_requests;
 
@@ -331,6 +344,18 @@ impl AuctionOrchestrator {
                     // provider failed since the PendingRequest is consumed
                     log::warn!("A provider request failed: {:?}", e);
                 }
+            }
+
+            // Check auction deadline after processing each response.
+            // Remaining PendingRequests are dropped, which abandons the
+            // in-flight HTTP calls on the Fastly host.
+            if auction_start.elapsed() >= deadline && !remaining.is_empty() {
+                log::warn!(
+                    "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
+                    context.timeout_ms,
+                    remaining.len()
+                );
+                break;
             }
         }
 

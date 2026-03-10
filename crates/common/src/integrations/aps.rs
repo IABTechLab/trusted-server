@@ -8,6 +8,7 @@ use fastly::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
+use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -424,7 +425,7 @@ impl AuctionProvider for ApsAuctionProvider {
     fn request_bids(
         &self,
         request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
+        context: &AuctionContext<'_>,
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!(
             "APS: requesting bids for {} slots (pub_id: {})",
@@ -452,15 +453,18 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to set APS request body".to_string(),
             })?;
 
-        // Send request asynchronously
-        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
-            TrustedServerError::Auction {
-                message: format!(
-                    "Failed to resolve backend for APS endpoint: {}",
-                    self.config.endpoint
-                ),
-            },
-        )?;
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for APS endpoint: {}",
+                self.config.endpoint
+            ),
+        })?;
 
         let pending =
             aps_req
