@@ -85,6 +85,22 @@ describe('auction/buildAdRequest', () => {
     expect(result.adUnits[0].mediaTypes).toEqual({});
   });
 
+  it('includes eids in request when provided', () => {
+    const eids = [{ source: 'adserver.org', uids: [{ id: 'tdid-123', atype: 1 }] }];
+    const result = buildAdRequest([], eids);
+    expect(result.eids).toEqual(eids);
+  });
+
+  it('omits eids field when empty array provided', () => {
+    const result = buildAdRequest([], []);
+    expect(result.eids).toBeUndefined();
+  });
+
+  it('omits eids field when not provided', () => {
+    const result = buildAdRequest([]);
+    expect(result.eids).toBeUndefined();
+  });
+
   it('deduplicates by code/adUnitCode', () => {
     const units = [
       { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } }, bids: [{ bidder: 'a' }] },

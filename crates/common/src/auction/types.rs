@@ -66,7 +66,7 @@ pub struct PublisherInfo {
 }
 
 /// Privacy-preserving user information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserInfo {
     /// Synthetic/hashed user ID
     pub id: String,
@@ -74,6 +74,10 @@ pub struct UserInfo {
     pub fresh_id: String,
     /// GDPR consent string if applicable
     pub consent: Option<String>,
+    /// Extended IDs (EIDs) from client-side user ID modules (e.g. TDID, Criteo ID).
+    /// Forwarded as-is to `OpenRTB` `user.eids` for SSP user matching.
+    #[serde(default)]
+    pub eids: Vec<serde_json::Value>,
 }
 
 /// Device information from request.

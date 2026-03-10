@@ -17,10 +17,24 @@ export interface AdRequestUnit {
   bids: Array<{ bidder: string; params: Record<string, unknown> }>;
 }
 
+/** A single UID entry within an Extended ID source. */
+export interface EidUid {
+  id: string;
+  atype?: number;
+}
+
+/** OpenRTB Extended ID entry from a Prebid.js User ID module. */
+export interface Eid {
+  source: string;
+  uids: EidUid[];
+}
+
 /** The payload POSTed to the /auction orchestrator. */
 export interface AdRequest {
   adUnits: AdRequestUnit[];
   config?: Record<string, unknown>;
+  /** Extended IDs from client-side User ID modules (e.g. TDID, Criteo ID). */
+  eids?: Eid[];
 }
 
 /** A parsed bid from an OpenRTB seatbid response. */
@@ -54,7 +68,7 @@ export interface AuctionBid {
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAdRequest(units: any[]): AdRequest {
+export function buildAdRequest(units: any[], eids?: Eid[]): AdRequest {
   const unitMap = new Map<string, AdRequestUnit>();
 
   for (const u of units) {
@@ -87,7 +101,11 @@ export function buildAdRequest(units: any[]): AdRequest {
     }
   }
 
-  return { adUnits: [...unitMap.values()] };
+  const request: AdRequest = { adUnits: [...unitMap.values()] };
+  if (eids && eids.length > 0) {
+    request.eids = eids;
+  }
+  return request;
 }
 
 // ---------------------------------------------------------------------------

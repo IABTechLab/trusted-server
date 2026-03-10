@@ -19,6 +19,7 @@ import 'prebid.js/modules/consentManagementUsp.js';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid } from '../../core/auction';
+import type { Eid } from '../../core/auction';
 
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
@@ -124,6 +125,7 @@ type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  userIdAsEids?: Eid[];
 };
 type TrustedServerRequest = {
   method: 'POST';
@@ -167,7 +169,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      const payload = buildAdRequest(validBidRequests);
+      // Extract EIDs from Prebid.js User ID modules — same across all bid requests.
+      const eids: Eid[] = validBidRequests[0]?.userIdAsEids ?? [];
+      const payload = buildAdRequest(validBidRequests, eids);
       return {
         method: 'POST',
         url: auctionEndpoint,

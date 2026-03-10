@@ -32,6 +32,9 @@ pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     #[allow(dead_code)]
     pub config: Option<JsonValue>,
+    /// Extended IDs forwarded from client-side Prebid.js User ID modules.
+    #[serde(default)]
+    pub eids: Vec<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +149,7 @@ pub fn convert_tsjs_to_auction_request(
             id: synthetic_id,
             fresh_id,
             consent: None,
+            eids: body.eids.clone(),
         },
         device,
         site: Some(SiteInfo {

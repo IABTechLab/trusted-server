@@ -56,6 +56,8 @@ pub struct User {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<UserExt>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub eids: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Default)]

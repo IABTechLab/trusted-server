@@ -566,11 +566,18 @@ impl PrebidAuctionProvider {
         });
 
         // Build user object
+        if !request.user.eids.is_empty() {
+            log::debug!(
+                "Prebid: forwarding {} user EID(s) to PBS",
+                request.user.eids.len()
+            );
+        }
         let user = Some(User {
             id: Some(request.user.id.clone()),
             ext: Some(UserExt {
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
             }),
+            eids: request.user.eids.clone(),
         });
 
         // Build device object with user-agent and geo if available
@@ -1477,6 +1484,7 @@ server_url = "https://prebid.example"
                 id: "synth-123".to_string(),
                 fresh_id: "fresh-456".to_string(),
                 consent: None,
+                ..Default::default()
             },
             device: Some(DeviceInfo {
                 user_agent: Some("test-agent".to_string()),
@@ -1687,6 +1695,47 @@ server_url = "https://prebid.example"
         assert_eq!(
             kargo["extra"], "keep_me",
             "non-overridden fields should be preserved"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_forwards_user_eids() {
+        let mut request = make_auction_request(vec![make_slot(
+            "slot-1",
+            HashMap::from([("exampleBidder".to_string(), json!({}))]),
+        )]);
+        request.user.eids = vec![json!({
+            "source": "adserver.org",
+            "uids": [{"id": "test-tdid-123", "atype": 1}]
+        })];
+
+        let ortb = call_to_openrtb(base_config(), &request);
+
+        let user = ortb.user.expect("should have user");
+        assert_eq!(user.eids.len(), 1, "should forward one EID");
+        assert_eq!(
+            user.eids[0]["source"], "adserver.org",
+            "should preserve EID source"
+        );
+        assert_eq!(
+            user.eids[0]["uids"][0]["id"], "test-tdid-123",
+            "should preserve EID uid"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_eids_when_empty() {
+        let request = make_auction_request(vec![make_slot(
+            "slot-1",
+            HashMap::from([("exampleBidder".to_string(), json!({}))]),
+        )]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+
+        let user = ortb.user.expect("should have user");
+        assert!(
+            user.eids.is_empty(),
+            "should not include eids when none provided"
         );
     }
 
