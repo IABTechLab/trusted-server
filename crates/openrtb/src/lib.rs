@@ -37,7 +37,10 @@ pub mod bool_as_int {
         let value = Option::<serde_json::Value>::deserialize(deserializer)?;
         match value {
             Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
-            Some(serde_json::Value::Number(n)) => Ok(Some(n.as_i64() != Some(0))),
+            Some(serde_json::Value::Number(n)) => Ok(Some(
+                n.as_i64()
+                    .map_or_else(|| n.as_f64().is_some_and(|f| f != 0.0), |i| i != 0),
+            )),
             // Some bidders send boolean-as-int fields as strings (e.g.
             // `"secure": "1"` instead of `"secure": 1`). Accept the common
             // string representations for robustness.
@@ -343,6 +346,28 @@ mod tests {
         assert!(
             json.get("flag").is_none(),
             "None should be omitted via skip_serializing_if"
+        );
+    }
+
+    #[test]
+    fn bool_as_int_deserializes_float_zero_as_false() {
+        let wrapper: BoolAsIntWrapper =
+            serde_json::from_str(r#"{"flag": 0.0}"#).expect("should handle float zero");
+        assert_eq!(
+            wrapper.flag,
+            Some(false),
+            "0.0 should be treated as false, not true"
+        );
+    }
+
+    #[test]
+    fn bool_as_int_deserializes_float_one_as_true() {
+        let wrapper: BoolAsIntWrapper =
+            serde_json::from_str(r#"{"flag": 1.0}"#).expect("should handle float one");
+        assert_eq!(
+            wrapper.flag,
+            Some(true),
+            "1.0 (non-zero) should be treated as true"
         );
     }
 }

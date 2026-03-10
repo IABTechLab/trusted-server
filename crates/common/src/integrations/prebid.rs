@@ -40,10 +40,10 @@ const DEFAULT_CURRENCY: &str = "USD";
 
 /// CCPA/US-privacy string sent when the `Sec-GPC` header signals opt-out.
 ///
-/// Encodes: notice given (`1`), user opted out (`Y`), LSPA not signed (`N`).
-/// The opt-out (position 2 = `Y`) matches GPC intent. Position 3 (`N` = LSPA
-/// not applicable) is a conservative default that may not hold for all
-/// publishers — consider making this configurable per-publisher in the future.
+/// Encodes: version `1`, notice given (`Y`), user opted out (`Y`), LSPA not
+/// signed (`N`). The opt-out (position 2 = `Y`) matches GPC intent. Position 3
+/// (`N` = LSPA not applicable) is a conservative default that may not hold for
+/// all publishers — consider making this configurable per-publisher in the future.
 const GPC_US_PRIVACY: &str = "1YYN";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -503,9 +503,9 @@ impl PrebidAuctionProvider {
         let imps = request
             .slots
             .iter()
-            .map(|slot| {
+            .filter_map(|slot| {
                 let slot_context = format!("slot '{}'", slot.id);
-                let formats = slot
+                let formats: Vec<_> = slot
                     .formats
                     .iter()
                     .filter(|f| f.media_type == MediaType::Banner)
@@ -523,6 +523,14 @@ impl PrebidAuctionProvider {
                         }
                     })
                     .collect();
+
+                if formats.is_empty() {
+                    log::warn!(
+                        "prebid: dropping imp '{}' — no valid banner formats after filtering",
+                        slot.id
+                    );
+                    return None;
+                }
 
                 // Extract zone from trustedServer params (sent by the JS
                 // adapter from `mediaTypes.banner.name`, e.g. "header", "fixed_bottom").
@@ -574,7 +582,7 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                Imp {
+                Some(Imp {
                     id: Some(slot.id.clone()),
                     banner: Some(Banner {
                         format: formats,
@@ -592,7 +600,7 @@ impl PrebidAuctionProvider {
                     }
                     .to_ext(),
                     ..Default::default()
-                }
+                })
             })
             .collect();
 
@@ -642,6 +650,7 @@ impl PrebidAuctionProvider {
                             .trim()
                             .to_string()
                     })
+                    .filter(|s| !s.is_empty())
             });
 
         // Build device object with user-agent, client IP, geo, DNT, and language.
@@ -687,7 +696,12 @@ impl PrebidAuctionProvider {
             .map(|geo| is_gdpr_country(&geo.country));
 
         let gdpr = match gdpr_from_geo {
-            Some(applies) => Some(applies),
+            Some(true) => Some(true),
+            // Geo says non-GDPR, but a consent string is present — the CMP is
+            // the stronger signal (VPN, carrier IP, geo-DB drift can all cause
+            // false negatives).
+            Some(false) if request.user.consent.is_some() => Some(true),
+            Some(false) => Some(false),
             // No geo available — conservatively assume GDPR if consent string
             // is present (a CMP was active).
             None => request.user.consent.as_ref().map(|_| true),
@@ -1853,11 +1867,47 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn to_openrtb_sets_gdpr_false_for_non_eu_country() {
+    fn to_openrtb_sets_gdpr_true_for_non_eu_country_with_consent() {
+        // When geo says non-GDPR but a consent string is present, the consent
+        // string is the stronger signal (VPN / carrier IP / geo-DB drift can
+        // cause false negatives).
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some("BOtest-consent-string".to_string());
-        // US geo — GDPR should not apply
+        // US geo — but consent string overrides
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: Some(GeoInfo {
+                city: "New York".to_string(),
+                country: "US".to_string(),
+                continent: "NA".to_string(),
+                latitude: 40.7128,
+                longitude: -74.006,
+                metro_code: 501,
+                region: Some("NY".to_string()),
+            }),
+        });
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert_eq!(
+            openrtb.regs.as_ref().and_then(|r| r.gdpr),
+            Some(true),
+            "should set regs.gdpr=true when consent string present, even for non-EU geo"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_gdpr_false_for_non_eu_country_without_consent() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.consent = None;
+        // US geo, no consent string — GDPR should not apply
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
             ip: None,
@@ -1881,7 +1931,7 @@ server_url = "https://prebid.example"
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
             Some(false),
-            "should set regs.gdpr=false for non-EU country even with consent string"
+            "should set regs.gdpr=false for non-EU country without consent string"
         );
     }
 
@@ -2000,6 +2050,60 @@ server_url = "https://prebid.example"
             device.language.as_deref(),
             Some("en"),
             "should extract primary ISO-639 language tag (stripped of locale subtag)"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_language_for_empty_accept_language() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: None,
+        });
+
+        let settings = make_settings();
+        let mut request = Request::get("https://pub.example/auction");
+        request.set_header("Accept-Language", "");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let device = openrtb.device.as_ref().expect("should have device");
+
+        assert_eq!(
+            device.language, None,
+            "empty Accept-Language header should not produce Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_drops_imp_with_no_valid_banner_formats() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        // Set dimensions that overflow i32 — they will be filtered out,
+        // leaving an empty format list.
+        auction_request.slots = vec![AdSlot {
+            id: "oversized-slot".to_string(),
+            formats: vec![AdFormat {
+                media_type: MediaType::Banner,
+                width: i32::MAX as u32 + 1,
+                height: 250,
+            }],
+            floor_price: None,
+            targeting: HashMap::new(),
+            bidders: HashMap::new(),
+        }];
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        assert!(
+            openrtb.imp.is_empty(),
+            "imp with no valid banner formats should be dropped entirely"
         );
     }
 
