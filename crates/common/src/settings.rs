@@ -334,6 +334,18 @@ impl Settings {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
+        let uncovered = settings.uncovered_admin_endpoints();
+        if !uncovered.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "No handler covers admin endpoint(s): {}. \
+                     Add a [[handlers]] entry with a path regex matching /admin/ \
+                     to protect admin access.",
+                    uncovered.join(", ")
+                ),
+            }));
+        }
+
         Ok(settings)
     }
 
@@ -401,7 +413,9 @@ impl Settings {
     /// [`from_toml_and_env`](Self::from_toml_and_env) rejects configurations
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
-    const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
+    /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
+    /// admin routes to `crates/fastly/src/main.rs`.
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -409,7 +423,7 @@ impl Settings {
     /// to enforce that every admin endpoint has a handler. An empty return
     /// value means all admin endpoints are properly covered.
     #[must_use]
-    pub fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
+    pub(crate) fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
         Self::ADMIN_ENDPOINTS
             .iter()
             .copied()
@@ -834,29 +848,24 @@ mod tests {
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
+        temp_env::with_vars(
+            [
+                (origin_key, Some("https://origin.test-publisher.com")),
+                (path_key_0, Some("^/env-handler")),
+                (username_key_0, Some("env-user")),
+                (password_key_0, Some("env-pass")),
+                (path_key_1, Some("^/admin")),
+                (username_key_1, Some("admin")),
+                (password_key_1, Some("admin-pass")),
+            ],
             || {
-                temp_env::with_var(path_key_0, Some("^/env-handler"), || {
-                    temp_env::with_var(username_key_0, Some("env-user"), || {
-                        temp_env::with_var(password_key_0, Some("env-pass"), || {
-                            temp_env::with_var(path_key_1, Some("^/admin"), || {
-                                temp_env::with_var(username_key_1, Some("admin"), || {
-                                    temp_env::with_var(password_key_1, Some("admin-pass"), || {
-                                        let settings = Settings::from_toml_and_env(&toml_str)
-                                            .expect("Settings should load from env");
-                                        assert_eq!(settings.handlers.len(), 2);
-                                        let handler = &settings.handlers[0];
-                                        assert_eq!(handler.path, "^/env-handler");
-                                        assert_eq!(handler.username, "env-user");
-                                        assert_eq!(handler.password, "env-pass");
-                                    });
-                                });
-                            });
-                        });
-                    });
-                });
+                let settings =
+                    Settings::from_toml_and_env(&toml_str).expect("Settings should load from env");
+                assert_eq!(settings.handlers.len(), 2);
+                let handler = &settings.handlers[0];
+                assert_eq!(handler.path, "^/env-handler");
+                assert_eq!(handler.username, "env-user");
+                assert_eq!(handler.password, "env-pass");
             },
         );
     }
@@ -1262,8 +1271,10 @@ mod tests {
 
     #[test]
     fn uncovered_admin_endpoints_returns_all_when_no_handler_covers_admin() {
-        let settings = Settings::from_toml(&settings_str_without_admin_handler())
-            .expect("should parse valid TOML");
+        // Deserialize directly to bypass from_toml's admin validation,
+        // since this test exercises uncovered_admin_endpoints itself.
+        let settings: Settings =
+            toml::from_str(&settings_str_without_admin_handler()).expect("should deserialize TOML");
         let uncovered = settings.uncovered_admin_endpoints();
         assert_eq!(
             uncovered,
@@ -1291,7 +1302,9 @@ mod tests {
             username = "admin"
             password = "secret"
             "#;
-        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+        // Deserialize directly to bypass from_toml's admin validation,
+        // since this test exercises uncovered_admin_endpoints itself.
+        let settings: Settings = toml::from_str(&toml_str).expect("should deserialize TOML");
         let uncovered = settings.uncovered_admin_endpoints();
         assert_eq!(
             uncovered,
@@ -1324,5 +1337,64 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_config_without_admin_handler() {
+        let result = Settings::from_toml(&settings_str_without_admin_handler());
+        assert!(
+            result.is_err(),
+            "should reject configuration when admin endpoints are not covered"
+        );
+        let err = format!("{:?}", result.expect_err("should be an error"));
+        assert!(
+            err.contains("No handler covers admin endpoint"),
+            "error should mention uncovered admin endpoints, got: {err}"
+        );
+    }
+
+    /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
+    /// admin route table in `crates/fastly/src/main.rs`.
+    ///
+    /// If this test fails, a route was added or removed in the Fastly
+    /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
+    #[test]
+    fn admin_endpoints_match_fastly_router() {
+        let router_source = include_str!("../../fastly/src/main.rs");
+
+        for endpoint in Settings::ADMIN_ENDPOINTS {
+            assert!(
+                router_source.contains(endpoint),
+                "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
+                 crates/fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
+                 add the route back to the router"
+            );
+        }
+
+        // Also verify we haven't missed any admin routes in the router.
+        // Scan for path literals under "/admin/" in match arms.
+        let admin_routes_in_router: Vec<&str> = router_source
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                // Match arms look like: (Method::POST, "/admin/...") => ...
+                if trimmed.starts_with('(') && trimmed.contains("\"/admin/") {
+                    let start = trimmed.find("\"/admin/")?;
+                    let rest = &trimmed[start + 1..];
+                    let end = rest.find('"')?;
+                    Some(&rest[..end])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for route in &admin_routes_in_router {
+            assert!(
+                Settings::ADMIN_ENDPOINTS.contains(route),
+                "Router has admin route \"{route}\" that is missing from \
+                 Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
+            );
+        }
     }
 }
