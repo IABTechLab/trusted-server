@@ -951,7 +951,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.server_url, true).ok()
+        BackendConfig::backend_name_for_url(&self.config.server_url, true).ok()
     }
 }
 

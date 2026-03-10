@@ -522,7 +522,7 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.endpoint, true).ok()
+        BackendConfig::backend_name_for_url(&self.config.endpoint, true).ok()
     }
 }
 

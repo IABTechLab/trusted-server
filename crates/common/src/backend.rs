@@ -90,17 +90,11 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
-    /// Ensure a dynamic backend exists for this configuration and return its name.
+    /// Compute the deterministic backend name without registering anything.
     ///
-    /// The backend name is derived from the scheme, host, port, certificate
-    /// setting, and first-byte timeout to avoid collisions. If a backend with
-    /// the derived name already exists, this function logs and reuses it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the host is empty or if backend creation fails
-    /// (except for `NameInUse` which reuses the existing backend).
-    pub fn ensure(self) -> Result<String, Report<TrustedServerError>> {
+    /// The name encodes scheme, host, port, and certificate setting so that
+    /// backends with different configurations never collide.
+    fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "missing host".to_string(),
@@ -111,27 +105,36 @@ impl<'a> BackendConfig<'a> {
             .port
             .unwrap_or_else(|| default_port_for_scheme(self.scheme));
 
-        let host_with_port = format!("{}:{}", self.host, target_port);
-
-        // Include cert setting and non-default timeout in name to avoid reusing
-        // a backend configured with different settings.
         let name_base = format!("{}_{}_{}", self.scheme, self.host, target_port);
         let cert_suffix = if self.certificate_check {
             ""
         } else {
             "_nocert"
         };
-        let timeout_suffix = if self.first_byte_timeout != DEFAULT_FIRST_BYTE_TIMEOUT {
-            format!("_t{}ms", self.first_byte_timeout.as_millis())
-        } else {
-            String::new()
-        };
         let backend_name = format!(
-            "backend_{}{}{}",
+            "backend_{}{}",
             name_base.replace(['.', ':'], "_"),
-            cert_suffix,
-            timeout_suffix
+            cert_suffix
         );
+
+        Ok((backend_name, target_port))
+    }
+
+    /// Ensure a dynamic backend exists for this configuration and return its name.
+    ///
+    /// The backend name is derived from the scheme, host, port, and certificate
+    /// setting to avoid collisions. **Note:** `first_byte_timeout` is *not*
+    /// part of the name, so backends for the same origin share a single
+    /// registration (first-registration-wins for timeout and other settings).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host is empty or if backend creation fails
+    /// (except for `NameInUse` which reuses the existing backend).
+    pub fn ensure(self) -> Result<String, Report<TrustedServerError>> {
+        let (backend_name, target_port) = self.compute_name()?;
+
+        let host_with_port = format!("{}:{}", self.host, target_port);
 
         let host_header = compute_host_header(self.scheme, self.host, target_port);
 
@@ -186,7 +189,8 @@ impl<'a> BackendConfig<'a> {
     /// Parse an origin URL and ensure a dynamic backend exists for it.
     ///
     /// This is a convenience constructor that parses the URL, extracts scheme,
-    /// host, and port, then calls [`ensure`](Self::ensure).
+    /// host, and port, then calls [`ensure`](Self::ensure) with the default
+    /// 15 s first-byte timeout.
     ///
     /// # Errors
     ///
@@ -196,30 +200,19 @@ impl<'a> BackendConfig<'a> {
         origin_url: &str,
         certificate_check: bool,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", origin_url),
-        })?;
-
-        let scheme = parsed_url.scheme();
-        let host = parsed_url.host_str().ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "Missing host in origin_url".to_string(),
-            })
-        })?;
-        let port = parsed_url.port();
-
-        BackendConfig::new(scheme, host)
-            .port(port)
-            .certificate_check(certificate_check)
-            .ensure()
+        Self::from_url_with_first_byte_timeout(
+            origin_url,
+            certificate_check,
+            DEFAULT_FIRST_BYTE_TIMEOUT,
+        )
     }
 
     /// Parse an origin URL and ensure a dynamic backend with a custom
     /// first-byte timeout.
     ///
-    /// Behaves like [`from_url`](Self::from_url) but overrides the default 15 s
-    /// first-byte timeout. Use this for latency-sensitive paths (e.g. auction
-    /// bid requests) where the caller has a tighter deadline.
+    /// For latency-sensitive paths (e.g. auction bid requests) callers should
+    /// pass the remaining auction budget so that individual requests don't hang
+    /// longer than the overall deadline allows.
     ///
     /// # Errors
     ///
@@ -247,6 +240,40 @@ impl<'a> BackendConfig<'a> {
             .certificate_check(certificate_check)
             .first_byte_timeout(first_byte_timeout)
             .ensure()
+    }
+
+    /// Compute the backend name that [`from_url`](Self::from_url) would produce
+    /// for the given URL, **without** registering a backend.
+    ///
+    /// This is useful when callers need the name for mapping purposes (e.g. the
+    /// auction orchestrator correlating responses to providers) but want the
+    /// actual registration to happen later with specific settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL cannot be parsed or lacks a host.
+    pub fn backend_name_for_url(
+        origin_url: &str,
+        certificate_check: bool,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("Invalid origin_url: {}", origin_url),
+        })?;
+
+        let scheme = parsed_url.scheme();
+        let host = parsed_url.host_str().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "Missing host in origin_url".to_string(),
+            })
+        })?;
+        let port = parsed_url.port();
+
+        let (name, _) = BackendConfig::new(scheme, host)
+            .port(port)
+            .certificate_check(certificate_check)
+            .compute_name()?;
+
+        Ok(name)
     }
 }
 

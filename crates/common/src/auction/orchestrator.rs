@@ -12,6 +12,15 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
+/// Compute the remaining time budget from a deadline.
+///
+/// Returns the number of milliseconds left before `timeout_ms` is exceeded,
+/// measured from `start`. Returns `0` when the deadline has already passed.
+#[inline]
+fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
+    timeout_ms.saturating_sub(start.elapsed().as_millis() as u32)
+}
+
 /// Manages auction execution across multiple providers.
 pub struct AuctionOrchestrator {
     config: AuctionConfig,
@@ -109,8 +118,22 @@ impl AuctionOrchestrator {
             // Give the mediator only the remaining time from the auction
             // deadline, not the full timeout — the bidding phase already
             // consumed part of it.
-            let elapsed_ms = mediation_start.elapsed().as_millis() as u32;
-            let remaining_ms = context.timeout_ms.saturating_sub(elapsed_ms);
+            let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
+
+            if remaining_ms == 0 {
+                log::warn!(
+                    "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
+                    context.timeout_ms
+                );
+                let winning = self.select_winning_bids(&provider_responses, &floor_prices);
+                return Ok(OrchestrationResult {
+                    provider_responses,
+                    mediator_response: None,
+                    winning_bids: winning,
+                    total_time_ms: 0,
+                    metadata: HashMap::new(),
+                });
+            }
 
             let mediator_context = AuctionContext {
                 settings: context.settings,
@@ -255,14 +278,26 @@ impl AuctionOrchestrator {
                 }
             };
 
+            // Give each provider only the remaining time from the auction
+            // deadline so that its backend first_byte_timeout doesn't extend
+            // past the overall budget.
+            let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
+            let provider_context = AuctionContext {
+                settings: context.settings,
+                request: context.request,
+                timeout_ms: remaining_ms,
+                provider_responses: context.provider_responses,
+            };
+
             log::info!(
-                "Launching bid request to: {} (backend: {})",
+                "Launching bid request to: {} (backend: {}, budget: {}ms)",
                 provider.provider_name(),
-                backend_name
+                backend_name,
+                remaining_ms
             );
 
             let start_time = Instant::now();
-            match provider.request_bids(request, context) {
+            match provider.request_bids(request, &provider_context) {
                 Ok(pending) => {
                     backend_to_provider.insert(
                         backend_name,
@@ -653,14 +688,14 @@ mod tests {
         );
     }
 
-    // TODO: Re-enable these tests after implementing mock provider support for send_async()
-    // Mock providers currently don't work with concurrent requests because they can't
-    // create PendingRequest without real backends configured in Fastly.
+    // TODO: Re-enable provider integration tests after implementing mock support
+    // for send_async(). Mock providers can't create PendingRequest without real
+    // Fastly backends.
     //
-    // Options to fix:
-    // 1. Configure dummy backends in fastly.toml for testing
-    // 2. Refactor mock providers to use a different pattern
-    // 3. Create a test-only mock backend server
+    // Untested timeout enforcement paths (require real backends):
+    // - Deadline check in select() loop (drops remaining requests)
+    // - Mediator skip when remaining_ms == 0 (bidding exhausts budget)
+    // - Provider context receives reduced timeout_ms per remaining budget
 
     #[tokio::test]
     async fn test_no_providers_configured() {
@@ -702,6 +737,41 @@ mod tests {
         };
         let orchestrator = AuctionOrchestrator::new(config);
         assert!(!orchestrator.is_enabled());
+    }
+
+    #[test]
+    fn remaining_budget_returns_full_timeout_immediately() {
+        let start = std::time::Instant::now();
+        let result = super::remaining_budget_ms(start, 2000);
+        // Should be very close to 2000 (allow a few ms for test execution)
+        assert!(
+            result >= 1990,
+            "should return ~full timeout immediately, got {result}"
+        );
+    }
+
+    #[test]
+    fn remaining_budget_saturates_at_zero() {
+        // Create an instant in the past by sleeping briefly with a tiny timeout
+        let start = std::time::Instant::now();
+        // Use a timeout of 0 — elapsed will always exceed it
+        let result = super::remaining_budget_ms(start, 0);
+        assert_eq!(result, 0, "should return 0 when timeout is 0");
+    }
+
+    #[test]
+    fn remaining_budget_decreases_over_time() {
+        let start = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let result = super::remaining_budget_ms(start, 2000);
+        assert!(
+            result < 2000,
+            "should be less than full timeout after sleeping"
+        );
+        assert!(
+            result > 1900,
+            "should still have most of the budget, got {result}"
+        );
     }
 
     #[test]
