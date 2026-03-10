@@ -621,6 +621,20 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_missing_required_fields() {
+        let re = Regex::new(r"origin_url = .*").expect("regex should compile");
+
+        let toml_str = crate_test_settings_str();
+        let toml_str = re.replace(&toml_str, "");
+
+        let settings = Settings::from_toml(&toml_str);
+        assert!(
+            settings.is_err(),
+            "Should fail when required fields are missing"
+        );
+    }
+
+    #[test]
     fn is_placeholder_secret_key_rejects_all_known_placeholders() {
         for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
             assert!(
