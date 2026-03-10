@@ -64,10 +64,12 @@ mod tests {
     fn rejects_default_placeholder_secrets() {
         // The embedded trusted-server.toml ships with placeholder secrets.
         // get_settings() must reject them so a deployment using defaults fails fast.
-        let result = get_settings();
+        let err = get_settings()
+            .expect_err("should reject settings that contain placeholder secret values");
+        let root = err.current_context();
         assert!(
-            result.is_err(),
-            "should reject settings that contain placeholder secret values"
+            matches!(root, TrustedServerError::InsecureDefault { .. }),
+            "should be InsecureDefault error, got: {root}"
         );
     }
 }

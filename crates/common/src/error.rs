@@ -35,7 +35,7 @@ pub enum TrustedServerError {
 
     /// A configuration secret is still set to a known placeholder value.
     #[display(
-        "Configuration field '{field}' is set to a known placeholder value — this is insecure"
+        "Configuration field '{field}' is set to a known placeholder value - this is insecure"
     )]
     InsecureDefault { field: String },
 
