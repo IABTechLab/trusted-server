@@ -158,7 +158,7 @@ impl LockrIntegration {
             .with_body(sdk_body))
     }
 
-    /// Handle API proxy — forward requests to identity.loc.kr.
+    /// Handle API proxy — forward requests to the configured Lockr API endpoint.
     async fn handle_api_proxy(
         &self,
         _settings: &Settings,
@@ -325,7 +325,6 @@ impl IntegrationAttributeRewriter for LockrIntegration {
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_sdk {
-            log::debug!("[lockr] Rewrite skipped, rewrite_sdk is disabled");
             return AttributeRewriteAction::Keep;
         }
 
@@ -334,7 +333,7 @@ impl IntegrationAttributeRewriter for LockrIntegration {
                 "{}://{}/integrations/lockr/sdk",
                 ctx.request_scheme, ctx.request_host
             );
-            log::debug!("[lockr] Rewriting SDK URL to {}", replacement);
+            log::debug!("Rewriting Lockr SDK URL to {}", replacement);
             AttributeRewriteAction::Replace(replacement)
         } else {
             AttributeRewriteAction::Keep
@@ -405,6 +404,10 @@ mod tests {
         assert!(
             !integration.is_lockr_sdk_url("https://aim.loc.kr/styles.css"),
             "should not match CSS files on aim.loc.kr"
+        );
+        assert!(
+            !integration.is_lockr_sdk_url("https://identity.loc.kr/some-other-script.js"),
+            "should not match non-SDK JS files on identity.loc.kr"
         );
 
         // Should not match other URLs
