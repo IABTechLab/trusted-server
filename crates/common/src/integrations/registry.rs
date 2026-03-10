@@ -390,6 +390,7 @@ pub trait IntegrationHeadInjector: Send + Sync {
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
+    pub js_deferred: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -413,6 +414,7 @@ impl IntegrationRegistrationBuilder {
         Self {
             registration: IntegrationRegistration {
                 integration_id,
+                js_deferred: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -458,6 +460,14 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Mark this integration's JS module for deferred loading via
+    /// `<script defer>` instead of the main synchronous bundle.
+    #[must_use]
+    pub fn with_deferred_js(mut self) -> Self {
+        self.registration.js_deferred = true;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -476,6 +486,7 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    deferred_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -495,6 +506,7 @@ impl Default for IntegrationRegistryInner {
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
+            deferred_js_ids: Vec::new(),
         }
     }
 }
@@ -600,6 +612,9 @@ impl IntegrationRegistry {
                 inner
                     .head_injectors
                     .extend(registration.head_injectors.into_iter());
+                if registration.js_deferred {
+                    inner.deferred_js_ids.push(registration.integration_id);
+                }
             }
         }
 
@@ -789,6 +804,30 @@ impl IntegrationRegistry {
         ids
     }
 
+    /// Return JS module IDs for the main (synchronous) bundle, excluding
+    /// modules registered with [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js).
+    #[must_use]
+    pub fn js_module_ids_immediate(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| !self.inner.deferred_js_ids.contains(id))
+            .collect()
+    }
+
+    /// Return JS module IDs that should be loaded with `<script defer>`.
+    ///
+    /// Only includes modules registered with
+    /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
+    /// that are actually enabled. Returns an empty vec when no deferred
+    /// integrations are configured.
+    #[must_use]
+    pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| self.inner.deferred_js_ids.contains(id))
+            .collect()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn from_rewriters(
@@ -807,6 +846,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -830,6 +870,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -885,6 +926,7 @@ impl IntegrationRegistry {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -1336,6 +1378,103 @@ mod tests {
         assert!(
             response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
             "POST response should have x-synthetic-id header"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_immediate_excludes_prebid() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let immediate = registry.js_module_ids_immediate();
+        let deferred = registry.js_module_ids_deferred();
+
+        assert!(
+            all.contains(&"prebid"),
+            "should include prebid in full list"
+        );
+        assert!(
+            !immediate.contains(&"prebid"),
+            "should not include prebid in immediate IDs"
+        );
+        assert!(
+            deferred.contains(&"prebid"),
+            "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_deferred_empty_when_prebid_disabled() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": false,
+                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        let deferred = registry.js_module_ids_deferred();
+        assert!(
+            deferred.is_empty(),
+            "should have no deferred IDs when prebid is disabled"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_split_is_exhaustive() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let mut recombined = registry.js_module_ids_immediate();
+        recombined.extend(registry.js_module_ids_deferred());
+        recombined.sort();
+
+        let mut all_sorted = all;
+        all_sorted.sort();
+
+        assert_eq!(
+            recombined, all_sorted,
+            "should reconstruct full module list from immediate + deferred"
         );
     }
 }
