@@ -828,9 +828,9 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
 
         // Log the outgoing OpenRTB request for debugging
-        if log::log_enabled!(log::Level::Debug) {
+        if log::log_enabled!(log::Level::Trace) {
             match serde_json::to_string_pretty(&openrtb) {
-                Ok(json) => log::debug!(
+                Ok(json) => log::trace!(
                     "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
                     self.config.server_url,
                     json
@@ -891,9 +891,9 @@ impl AuctionProvider for PrebidAuctionProvider {
 
         // Log the full response body when debug is enabled to surface
         // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
-        if self.config.debug && log::log_enabled!(log::Level::Debug) {
+        if self.config.debug && log::log_enabled!(log::Level::Trace) {
             match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::debug!("Prebid OpenRTB response:\n{json}"),
+                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
                 Err(e) => {
                     log::warn!("Prebid: failed to serialize response for logging: {e}");
                 }

@@ -441,7 +441,7 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to serialize APS bid request".to_string(),
             })?;
 
-        log::debug!("APS: sending bid request: {:?}", aps_json);
+        log::trace!("APS: sending bid request: {:?}", aps_json);
 
         // Create HTTP POST request
         let mut aps_req = Request::new(Method::POST, &self.config.endpoint);
@@ -490,7 +490,7 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to parse APS response JSON".to_string(),
             })?;
 
-        log::debug!("APS: received response: {:?}", response_json);
+        log::trace!("APS: received response: {:?}", response_json);
 
         // Transform to unified format
         let auction_response = self.parse_aps_response(&response_json, response_time_ms);

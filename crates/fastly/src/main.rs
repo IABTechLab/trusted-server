@@ -39,7 +39,7 @@ fn main(req: Request) -> Result<Response, Error> {
             return Ok(to_error_response(&e));
         }
     };
-    log::info!("Settings {settings:?}");
+    log::debug!("Settings {settings:?}");
 
     // Build the auction orchestrator once at startup
     let orchestrator = build_orchestrator(&settings);
@@ -174,7 +174,7 @@ fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
         .echo_stdout(true)
-        .max_level(log::LevelFilter::Debug)
+        .max_level(log::LevelFilter::Info)
         .build()
         .expect("Failed to build Logger");
 
