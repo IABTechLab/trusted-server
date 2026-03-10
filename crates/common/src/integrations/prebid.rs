@@ -1081,6 +1081,11 @@ mod tests {
 
     /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
     const TOML_BASE: &str = r#"
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "admin-pass"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"

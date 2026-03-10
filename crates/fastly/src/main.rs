@@ -94,6 +94,7 @@ async fn route_request(
         (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
 
         // Key rotation admin endpoints
+        // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/common/src/settings.rs
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
 
