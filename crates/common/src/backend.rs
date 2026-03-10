@@ -33,6 +33,9 @@ fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
     }
 }
 
+/// Default first-byte timeout for backends (15 seconds).
+const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Configuration for creating a dynamic Fastly backend.
 ///
 /// Uses the builder pattern so that new options can be added without changing
@@ -42,12 +45,14 @@ pub struct BackendConfig<'a> {
     host: &'a str,
     port: Option<u16>,
     certificate_check: bool,
+    first_byte_timeout: Duration,
 }
 
 impl<'a> BackendConfig<'a> {
     /// Create a new configuration with required fields and safe defaults.
     ///
     /// `certificate_check` defaults to `true`.
+    /// `first_byte_timeout` defaults to 15 seconds.
     #[must_use]
     pub fn new(scheme: &'a str, host: &'a str) -> Self {
         Self {
@@ -55,6 +60,7 @@ impl<'a> BackendConfig<'a> {
             host,
             port: None,
             certificate_check: true,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         }
     }
 
@@ -73,11 +79,22 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set the maximum time to wait for the first byte of the response.
+    ///
+    /// Defaults to 15 seconds. For latency-sensitive paths like auction
+    /// requests, callers should set a tighter timeout derived from the
+    /// auction deadline.
+    #[must_use]
+    pub fn first_byte_timeout(mut self, timeout: Duration) -> Self {
+        self.first_byte_timeout = timeout;
+        self
+    }
+
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
-    /// The backend name is derived from the scheme, host, port, and certificate
-    /// setting to avoid collisions. If a backend with the derived name already
-    /// exists, this function logs and reuses it.
+    /// The backend name is derived from the scheme, host, port, certificate
+    /// setting, and first-byte timeout to avoid collisions. If a backend with
+    /// the derived name already exists, this function logs and reuses it.
     ///
     /// # Errors
     ///
@@ -96,17 +113,24 @@ impl<'a> BackendConfig<'a> {
 
         let host_with_port = format!("{}:{}", self.host, target_port);
 
-        // Include cert setting in name to avoid reusing a backend with different cert settings
+        // Include cert setting and non-default timeout in name to avoid reusing
+        // a backend configured with different settings.
         let name_base = format!("{}_{}_{}", self.scheme, self.host, target_port);
         let cert_suffix = if self.certificate_check {
             ""
         } else {
             "_nocert"
         };
+        let timeout_suffix = if self.first_byte_timeout != DEFAULT_FIRST_BYTE_TIMEOUT {
+            format!("_t{}ms", self.first_byte_timeout.as_millis())
+        } else {
+            String::new()
+        };
         let backend_name = format!(
-            "backend_{}{}",
+            "backend_{}{}{}",
             name_base.replace(['.', ':'], "_"),
-            cert_suffix
+            cert_suffix,
+            timeout_suffix
         );
 
         let host_header = compute_host_header(self.scheme, self.host, target_port);
@@ -115,7 +139,7 @@ impl<'a> BackendConfig<'a> {
         let mut builder = Backend::builder(&backend_name, &host_with_port)
             .override_host(&host_header)
             .connect_timeout(Duration::from_secs(1))
-            .first_byte_timeout(Duration::from_secs(15))
+            .first_byte_timeout(self.first_byte_timeout)
             .between_bytes_timeout(Duration::from_secs(10));
         if self.scheme.eq_ignore_ascii_case("https") {
             builder = builder.enable_ssl().sni_hostname(self.host);
@@ -187,6 +211,41 @@ impl<'a> BackendConfig<'a> {
         BackendConfig::new(scheme, host)
             .port(port)
             .certificate_check(certificate_check)
+            .ensure()
+    }
+
+    /// Parse an origin URL and ensure a dynamic backend with a custom
+    /// first-byte timeout.
+    ///
+    /// Behaves like [`from_url`](Self::from_url) but overrides the default 15 s
+    /// first-byte timeout. Use this for latency-sensitive paths (e.g. auction
+    /// bid requests) where the caller has a tighter deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL cannot be parsed or lacks a host, or if
+    /// backend creation fails.
+    pub fn from_url_with_first_byte_timeout(
+        origin_url: &str,
+        certificate_check: bool,
+        first_byte_timeout: Duration,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("Invalid origin_url: {}", origin_url),
+        })?;
+
+        let scheme = parsed_url.scheme();
+        let host = parsed_url.host_str().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "Missing host in origin_url".to_string(),
+            })
+        })?;
+        let port = parsed_url.port();
+
+        BackendConfig::new(scheme, host)
+            .port(port)
+            .certificate_check(certificate_check)
+            .first_byte_timeout(first_byte_timeout)
             .ensure()
     }
 }
