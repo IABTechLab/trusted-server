@@ -237,6 +237,7 @@ pub fn register(
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
+            .with_deferred_js()
             .build(),
     ))
 }
@@ -328,7 +329,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             .replace("</", "<\\/");
 
         vec![format!(
-            r#"<script>window.__tsjs_prebid={config_json};</script>"#
+            r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
         )]
     }
 }
@@ -1246,12 +1247,16 @@ template = "{{client_ip}}:{{user_agent}}"
             "Unified bundle should be injected"
         );
         assert!(
-            !processed.contains("prebid.min.js"),
-            "Prebid script should be removed when auto-config is enabled"
+            !processed.contains("cdn.prebid.org/prebid.min.js"),
+            "Publisher prebid script should be removed when auto-config is enabled"
         );
         assert!(
             !processed.contains("cdn.prebid.org/prebid.js"),
             "Prebid preload should be removed when auto-config is enabled"
+        );
+        assert!(
+            processed.contains("tsjs-prebid.min.js"),
+            "Deferred prebid bundle should be injected"
         );
     }
 
