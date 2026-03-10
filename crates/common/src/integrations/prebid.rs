@@ -986,7 +986,7 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.server_url, true)
+        BackendConfig::backend_name_for_url(&self.config.server_url, true)
             .inspect_err(|e| {
                 log::error!(
                     "Failed to create backend for Prebid server URL '{}': {e:?}",
