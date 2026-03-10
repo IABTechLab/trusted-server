@@ -149,7 +149,7 @@ pub fn handle_rotate_key(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
+        Some(setting) => (&setting.config_store_id, setting.secret_store_id.expose()),
         None => {
             return Err(TrustedServerError::Configuration {
                 message: "Missing signing storage configuration.".to_string(),
@@ -253,7 +253,7 @@ pub fn handle_deactivate_key(
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
+        Some(setting) => (&setting.config_store_id, setting.secret_store_id.expose()),
         None => {
             return Err(TrustedServerError::Configuration {
                 message: "Missing signing storage configuration.".to_string(),
