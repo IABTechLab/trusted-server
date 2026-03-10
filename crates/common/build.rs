@@ -27,7 +27,12 @@ fn main() {
     let toml_content = fs::read_to_string(init_config_path)
         .unwrap_or_else(|_| panic!("Failed to read {init_config_path:?}"));
 
-    // Merge base TOML with environment variable overrides and write output
+    // Merge base TOML with environment variable overrides and write output.
+    // Note: placeholder secret rejection is intentionally NOT done here.
+    // The base trusted-server.toml ships with placeholder secrets that
+    // production deployments override via TRUSTED_SERVER__* env vars at
+    // build time. Runtime startup (get_settings) rejects any remaining
+    // placeholders so a misconfigured deployment fails fast.
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
 

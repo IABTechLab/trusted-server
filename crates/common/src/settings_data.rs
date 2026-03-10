@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::settings::Settings;
+use crate::settings::{Publisher, Settings, Synthetic};
 
 pub use crate::auction_config_types::AuctionConfig;
 
@@ -34,8 +34,17 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    if settings.synthetic.secret_key == "secret-key" {
-        return Err(Report::new(TrustedServerError::InsecureSecretKey));
+    // Reject known placeholder values for secrets that feed into cryptographic operations.
+    if Synthetic::is_placeholder_secret_key(&settings.synthetic.secret_key) {
+        return Err(Report::new(TrustedServerError::InsecureDefault {
+            field: "synthetic.secret_key".to_string(),
+        }));
+    }
+
+    if Publisher::is_placeholder_proxy_secret(&settings.publisher.proxy_secret) {
+        return Err(Report::new(TrustedServerError::InsecureDefault {
+            field: "publisher.proxy_secret".to_string(),
+        }));
     }
 
     if !settings.proxy.certificate_check {
@@ -52,19 +61,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_settings() {
-        // Test that Settings::new() loads successfully
-        let settings = get_settings();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
-
-        let settings = settings.expect("should load settings from embedded TOML");
-        // Verify basic structure is loaded
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
+    fn rejects_default_placeholder_secrets() {
+        // The embedded trusted-server.toml ships with placeholder secrets.
+        // get_settings() must reject them so a deployment using defaults fails fast.
+        let result = get_settings();
+        assert!(
+            result.is_err(),
+            "should reject settings that contain placeholder secret values"
+        );
     }
 }
