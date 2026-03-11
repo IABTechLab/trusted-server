@@ -60,11 +60,11 @@ pub trait AuctionProvider: Send + Sync {
 
     /// Return the backend name used by this provider for request routing.
     ///
-    /// This is used by the orchestrator to correlate responses with providers
-    /// when using `select()` to wait for multiple concurrent requests.
-    /// The backend name should match what `BackendConfig::from_url()` returns
-    /// for this provider's endpoint.
-    fn backend_name(&self) -> Option<String> {
+    /// `timeout_ms` is the effective timeout that will be used when the backend
+    /// is registered in [`request_bids`](Self::request_bids).  It must be
+    /// forwarded to [`BackendConfig::backend_name_for_url()`] so the predicted
+    /// name matches the actual registration (the timeout is part of the name).
+    fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
         None
     }
 }
