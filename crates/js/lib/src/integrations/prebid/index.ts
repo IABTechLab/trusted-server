@@ -306,10 +306,17 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // build time. Without the adapter the bidder is silently dropped from both
   // server-side and client-side auctions.
   for (const bidder of clientSideBidders) {
-    if (!adapterManager.getBidAdapter(bidder)) {
+    try {
+      if (!adapterManager.getBidAdapter(bidder)) {
+        log.error(
+          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
+            `Add it to TSJS_PREBID_ADAPTERS at build time.`
+        );
+      }
+    } catch {
       log.error(
         `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-          `Add it to TSJS_PREBID_ADAPTERS at build time.`,
+          `Add it to TSJS_PREBID_ADAPTERS at build time.`
       );
     }
   }
