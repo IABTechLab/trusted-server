@@ -9,7 +9,7 @@ export default defineConfig({
       // Map the specifier to the actual dist file.
       'prebid.js/src/adapterManager.js': path.resolve(
         __dirname,
-        'node_modules/prebid.js/dist/src/src/adapterManager.js',
+        'node_modules/prebid.js/dist/src/src/adapterManager.js'
       ),
     },
   },

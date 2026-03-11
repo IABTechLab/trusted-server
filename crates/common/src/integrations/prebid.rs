@@ -69,18 +69,6 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
-    /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
-    /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
-    /// — a non-standard Prebid.js field used as a temporary workaround),
-    /// and the value is a JSON object shallow-merged into that bidder's params.
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// [integrations.prebid.bid_param_zone_overrides.kargo]
-    /// header       = {placementId = "_s2sHeaderId"}
-    /// in_content   = {placementId = "_s2sContentId"}
-    /// fixed_bottom = {placementId = "_s2sBottomId"}
-    /// ```
     /// Bidders that should run client-side in the browser via native Prebid.js
     /// adapters instead of being routed through the server-side auction.
     ///
@@ -93,6 +81,18 @@ pub struct PrebidIntegrationConfig {
     /// manages both lists explicitly.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
+    /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
+    /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
+    /// — a non-standard Prebid.js field used as a temporary workaround),
+    /// and the value is a JSON object shallow-merged into that bidder's params.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bid_param_zone_overrides.kargo]
+    /// header       = {placementId = "_s2sHeaderId"}
+    /// in_content   = {placementId = "_s2sContentId"}
+    /// fixed_bottom = {placementId = "_s2sBottomId"}
+    /// ```
     #[serde(default)]
     pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
 }

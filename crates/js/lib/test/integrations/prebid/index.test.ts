@@ -751,7 +751,7 @@ describe('prebid/client-side bidders', () => {
   it('logs error when a client-side bidder has no adapter loaded', () => {
     // rubicon is registered, but openx is not
     mockGetBidAdapter.mockImplementation((bidder: string) =>
-      bidder === 'rubicon' ? {} : undefined,
+      bidder === 'rubicon' ? {} : undefined
     );
     (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
 
@@ -769,16 +769,15 @@ describe('prebid/client-side bidders', () => {
     const errorCalls = errorSpy.mock.calls;
     const hasOpenxError = errorCalls.some((args) =>
       args.some(
-        (a) => typeof a === 'string' && a.includes('client-side bidder "openx" has no adapter loaded'),
-      ),
+        (a) =>
+          typeof a === 'string' && a.includes('client-side bidder "openx" has no adapter loaded')
+      )
     );
     expect(hasOpenxError).toBe(true);
 
     // Should NOT log an error for the registered adapter
     const hasRubiconError = errorCalls.some((args) =>
-      args.some(
-        (a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'),
-      ),
+      args.some((a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'))
     );
     expect(hasRubiconError).toBe(false);
 
@@ -794,9 +793,7 @@ describe('prebid/client-side bidders', () => {
     installPrebidNpm();
 
     const hasAdapterError = errorSpy.mock.calls.some((args) =>
-      args.some(
-        (a) => typeof a === 'string' && a.includes('has no adapter loaded'),
-      ),
+      args.some((a) => typeof a === 'string' && a.includes('has no adapter loaded'))
     );
     expect(hasAdapterError).toBe(false);
 
