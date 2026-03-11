@@ -81,6 +81,21 @@ pub struct PrebidIntegrationConfig {
     /// in_content   = {placementId = "_s2sContentId"}
     /// fixed_bottom = {placementId = "_s2sBottomId"}
     /// ```
+    /// Bidders that should run client-side in the browser via native Prebid.js
+    /// adapters instead of being routed through the server-side auction.
+    ///
+    /// These bidders are **not** absorbed into the `trustedServer` adapter and
+    /// remain as standalone bids in each ad unit.  The corresponding Prebid.js
+    /// adapter modules must be statically imported in the JS bundle so they are
+    /// available at runtime.
+    ///
+    /// This list is independent of [`bidders`](Self::bidders) — the operator
+    /// manages both lists explicitly.
+    #[serde(
+        default,
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub client_side_bidders: Vec<String>,
     #[serde(default)]
     pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
 }
@@ -306,6 +321,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: u32,
             debug: bool,
             bidders: &'a [String],
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            client_side_bidders: &'a [String],
         }
 
         let payload = InjectedPrebidClientConfig {
@@ -313,6 +330,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: self.config.timeout_ms,
             debug: self.config.debug,
             bidders: &self.config.bidders,
+            client_side_bidders: &self.config.client_side_bidders,
         };
 
         // Escape `</` to prevent breaking out of the script tag.
@@ -1022,6 +1040,7 @@ mod tests {
             test_mode: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::new(),
         }
     }
@@ -1473,6 +1492,48 @@ server_url = "https://prebid.example"
         assert!(
             script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
             "should escape closing script tags inside JSON values: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_client_side_bidders_when_empty() {
+        let integration = PrebidIntegration::new(base_config());
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            !script.contains("clientSideBidders"),
+            "should omit clientSideBidders when empty: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_client_side_bidders_when_configured() {
+        let mut config = base_config();
+        config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
+            "should include clientSideBidders array: {}",
             script
         );
     }

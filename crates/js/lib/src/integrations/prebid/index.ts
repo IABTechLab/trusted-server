@@ -16,6 +16,12 @@ import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 
+// Client-side bid adapters — imported statically so they self-register with
+// prebid.js. When a bidder is listed in `client_side_bidders` in
+// trusted-server.toml, the requestBids shim leaves its bids untouched and
+// the corresponding adapter here handles them natively in the browser.
+import 'prebid.js/modules/rubiconBidAdapter.js';
+
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid } from '../../core/auction';
@@ -43,6 +49,8 @@ interface InjectedPrebidConfig {
   timeout?: number;
   debug?: boolean;
   bidders?: string[];
+  /** Bidders that run client-side via native Prebid.js adapters. */
+  clientSideBidders?: string[];
 }
 
 /** Read server-injected config from window.__tsjs_prebid, if present. */
@@ -195,8 +203,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
 
+  // Bidders that should run client-side via their native Prebid.js adapters.
+  // Read once from the server-injected config.
+  const clientSideBidders = new Set(injected?.clientSideBidders ?? []);
+  if (clientSideBidders.size > 0) {
+    log.info('[tsjs-prebid] client-side bidders:', [...clientSideBidders]);
+  }
+
   // Shim requestBids to inject the trustedServer bidder into every ad unit
-  // so all bids flow through the /auction orchestrator.
+  // so server-side bids flow through the /auction orchestrator while
+  // client-side bidders are left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
 
@@ -211,9 +227,14 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       }
 
       // Preserve per-bidder params for server-side expansion.
+      // Skip client-side bidders — they remain as standalone bids and run
+      // via their native Prebid.js adapters in the browser.
       const bidderParams: Record<string, Record<string, unknown>> = {};
       for (const bid of unit.bids) {
         if (!bid?.bidder || bid.bidder === ADAPTER_CODE) {
+          continue;
+        }
+        if (clientSideBidders.has(bid.bidder)) {
           continue;
         }
         bidderParams[bid.bidder] = bid.params ?? {};
