@@ -15,6 +15,12 @@ import pbjs from 'prebid.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
+import 'prebid.js/modules/userId.js';
+import 'prebid.js/modules/criteoIdSystem.js';
+import 'prebid.js/modules/id5IdSystem.js';
+import 'prebid.js/modules/sharedIdSystem.js';
+import 'prebid.js/modules/uid2IdSystem.js';
+import 'prebid.js/modules/unifiedIdSystem.js';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -127,6 +133,9 @@ type TrustedServerBidRequest = {
   bidId?: string;
   userIdAsEids?: Eid[];
 };
+type PbjsWithUserIds = typeof pbjs & {
+  getUserIdsAsEids?: () => Eid[] | undefined;
+};
 type TrustedServerRequest = {
   method: 'POST';
   url: string;
@@ -135,6 +144,26 @@ type TrustedServerRequest = {
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
 };
+
+/**
+ * Collect EIDs from Prebid bid requests, falling back to the global
+ * `pbjs.getUserIdsAsEids()` helper when the per-request copy is absent.
+ */
+export function collectRequestEids(validBidRequests: TrustedServerBidRequest[]): Eid[] {
+  for (const bidRequest of validBidRequests) {
+    const requestEids = bidRequest.userIdAsEids;
+    if (Array.isArray(requestEids) && requestEids.length > 0) {
+      return requestEids;
+    }
+  }
+
+  const fallbackEids = (pbjs as PbjsWithUserIds).getUserIdsAsEids?.();
+  if (Array.isArray(fallbackEids) && fallbackEids.length > 0) {
+    return fallbackEids;
+  }
+
+  return [];
+}
 
 /**
  * Install the Prebid integration.
@@ -169,8 +198,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      // Extract EIDs from Prebid.js User ID modules — same across all bid requests.
-      const eids: Eid[] = validBidRequests[0]?.userIdAsEids ?? [];
+      const eids = collectRequestEids(validBidRequests);
       const payload = buildAdRequest(validBidRequests, eids);
       return {
         method: 'POST',

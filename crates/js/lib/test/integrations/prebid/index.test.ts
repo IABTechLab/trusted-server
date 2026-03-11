@@ -1,27 +1,36 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
-const { mockSetConfig, mockProcessQueue, mockRequestBids, mockRegisterBidAdapter, mockPbjs } =
-  vi.hoisted(() => {
-    const mockSetConfig = vi.fn();
-    const mockProcessQueue = vi.fn();
-    const mockRequestBids = vi.fn();
-    const mockRegisterBidAdapter = vi.fn();
-    const mockPbjs = {
-      setConfig: mockSetConfig,
-      processQueue: mockProcessQueue,
-      requestBids: mockRequestBids,
-      registerBidAdapter: mockRegisterBidAdapter,
-      adUnits: [] as any[],
-    };
-    return {
-      mockSetConfig,
-      mockProcessQueue,
-      mockRequestBids,
-      mockRegisterBidAdapter,
-      mockPbjs,
-    };
-  });
+const {
+  mockSetConfig,
+  mockProcessQueue,
+  mockRequestBids,
+  mockRegisterBidAdapter,
+  mockGetUserIdsAsEids,
+  mockPbjs,
+} = vi.hoisted(() => {
+  const mockSetConfig = vi.fn();
+  const mockProcessQueue = vi.fn();
+  const mockRequestBids = vi.fn();
+  const mockRegisterBidAdapter = vi.fn();
+  const mockGetUserIdsAsEids = vi.fn();
+  const mockPbjs = {
+    setConfig: mockSetConfig,
+    processQueue: mockProcessQueue,
+    requestBids: mockRequestBids,
+    registerBidAdapter: mockRegisterBidAdapter,
+    getUserIdsAsEids: mockGetUserIdsAsEids,
+    adUnits: [] as any[],
+  };
+  return {
+    mockSetConfig,
+    mockProcessQueue,
+    mockRequestBids,
+    mockRegisterBidAdapter,
+    mockGetUserIdsAsEids,
+    mockPbjs,
+  };
+});
 
 // Mock prebid.js before importing the module under test.
 // The real prebid.js cannot run in jsdom, so we provide a minimal stub.
@@ -31,14 +40,22 @@ vi.mock('prebid.js', () => ({ default: mockPbjs }));
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
+vi.mock('prebid.js/modules/userId.js', () => ({}));
+vi.mock('prebid.js/modules/criteoIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/id5IdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/sharedIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/uid2IdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/unifiedIdSystem.js', () => ({}));
 
 import {
   collectBidders,
   getInjectedConfig,
   auctionBidsToPrebidBids,
+  collectRequestEids,
   installPrebidNpm,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
+import type { Eid } from '../../../src/core/auction';
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -173,9 +190,46 @@ describe('prebid/auctionBidsToPrebidBids', () => {
   });
 });
 
+describe('prebid/collectRequestEids', () => {
+  beforeEach(() => {
+    mockGetUserIdsAsEids.mockReset();
+  });
+
+  it('returns EIDs from the first bid request that has them', () => {
+    const eids: Eid[] = [
+      {
+        source: 'adserver.org',
+        uids: [{ id: 'tdid-123', atype: 1 }],
+      },
+    ];
+
+    expect(
+      collectRequestEids([
+        { adUnitCode: 'slot-a' },
+        { adUnitCode: 'slot-b', userIdAsEids: eids },
+      ])
+    ).toEqual(eids);
+    expect(mockGetUserIdsAsEids).not.toHaveBeenCalled();
+  });
+
+  it('falls back to pbjs.getUserIdsAsEids when bid requests have none', () => {
+    const eids: Eid[] = [
+      {
+        source: 'id5-sync.com',
+        uids: [{ id: 'id5-123', atype: 1 }],
+      },
+    ];
+    mockGetUserIdsAsEids.mockReturnValue(eids);
+
+    expect(collectRequestEids([{ adUnitCode: 'slot-a' }])).toEqual(eids);
+    expect(mockGetUserIdsAsEids).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('prebid/installPrebidNpm', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetUserIdsAsEids.mockReset();
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
@@ -258,6 +312,7 @@ describe('prebid/installPrebidNpm', () => {
       const payload = JSON.parse(result.data);
       expect(payload.adUnits).toHaveLength(1);
       expect(payload.adUnits[0].code).toBe('div-gpt-1');
+      expect(payload.eids).toBeUndefined();
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -274,6 +329,28 @@ describe('prebid/installPrebidNpm', () => {
       ]);
 
       expect(result.url).toBe('/custom/auction');
+    });
+
+    it('buildRequests forwards EIDs from pbjs when bid requests omit them', () => {
+      const spec = getAdapterSpec();
+      const eids: Eid[] = [
+        {
+          source: 'adserver.org',
+          uids: [{ id: 'tdid-456', atype: 1 }],
+        },
+      ];
+      mockGetUserIdsAsEids.mockReturnValue(eids);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.eids).toEqual(eids);
     });
 
     it('interpretResponse parses seatbid and returns Prebid bids', () => {
