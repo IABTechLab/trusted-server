@@ -193,11 +193,12 @@ impl Synthetic {
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the secret key is empty or `"secret_key"` (the placeholder).
+    /// Returns a validation error if the secret key is empty, or one of the
+    /// placeholder values (`"secret_key"`, `"secret-key"`).
     pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
         match secret_key.expose().as_str() {
-            "" => Err(ValidationError::new("Secret key must not be empty")),
-            "secret_key" => Err(ValidationError::new("Secret key is not valid")),
+            "" => Err(ValidationError::new("empty_secret_key")),
+            "secret_key" | "secret-key" => Err(ValidationError::new("placeholder_secret_key")),
             _ => Ok(()),
         }
     }

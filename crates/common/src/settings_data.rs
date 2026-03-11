@@ -34,10 +34,6 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    if settings.synthetic.secret_key.expose() == "secret-key" {
-        return Err(Report::new(TrustedServerError::InsecureSecretKey));
-    }
-
     if !settings.proxy.certificate_check {
         log::warn!(
             "INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified"

@@ -1,3 +1,6 @@
+// NOTE: This file is also included in build.rs via #[path].
+// It must remain self-contained (no `crate::` imports).
+
 //! A wrapper type that redacts sensitive values in [`Debug`] and [`Display`] output.
 //!
 //! Use [`Redacted`] for secrets, passwords, API keys, and other sensitive values

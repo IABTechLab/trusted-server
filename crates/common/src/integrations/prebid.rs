@@ -876,12 +876,17 @@ impl AuctionProvider for PrebidAuctionProvider {
         let body_bytes = response.take_body_bytes();
 
         if !response.get_status().is_success() {
-            let body_preview = String::from_utf8_lossy(&body_bytes);
             log::warn!(
-                "Prebid returned non-success status: {} — body: {}",
+                "Prebid returned non-success status: {}",
                 response.get_status(),
-                &body_preview[..body_preview.floor_char_boundary(1000)]
             );
+            if log::log_enabled!(log::Level::Trace) {
+                let body_preview = String::from_utf8_lossy(&body_bytes);
+                log::trace!(
+                    "Prebid error response body: {}",
+                    &body_preview[..body_preview.floor_char_boundary(1000)]
+                );
+            }
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
 
