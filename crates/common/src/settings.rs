@@ -223,10 +223,10 @@ impl Synthetic {
     pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
         let value = secret_key.expose().as_str();
         if value.is_empty() {
-            return Err(ValidationError::new("Secret key must not be empty"));
+            return Err(ValidationError::new("empty_secret_key"));
         }
         if Self::is_placeholder_secret_key(value) {
-            return Err(ValidationError::new("Secret key is not valid"));
+            return Err(ValidationError::new("placeholder_secret_key"));
         }
         Ok(())
     }

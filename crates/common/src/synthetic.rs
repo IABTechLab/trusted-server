@@ -96,7 +96,7 @@ pub fn generate_synthetic_id(
             message: "Failed to render synthetic ID template".to_string(),
         })?;
 
-    log::debug!("Input string for fresh ID: {} {}", input_string, data);
+    log::trace!("Input string for fresh ID: {} {}", input_string, data);
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.expose().as_bytes())
         .change_context(TrustedServerError::SyntheticId {
@@ -263,7 +263,7 @@ mod tests {
 
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
-        log::info!("Generated synthetic ID: {}", synthetic_id);
+        log::debug!("Generated synthetic ID: {}", synthetic_id);
         assert!(
             is_synthetic_id_format(&synthetic_id),
             "should match synthetic ID format"
