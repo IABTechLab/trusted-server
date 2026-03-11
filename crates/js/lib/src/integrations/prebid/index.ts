@@ -12,15 +12,18 @@
 // bids flow through the orchestrator.
 
 import pbjs from 'prebid.js';
+import adapterManager from 'prebid.js/src/adapterManager.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 
-// Client-side bid adapters — imported statically so they self-register with
-// prebid.js. When a bidder is listed in `client_side_bidders` in
-// trusted-server.toml, the requestBids shim leaves its bids untouched and
-// the corresponding adapter here handles them natively in the browser.
-import 'prebid.js/modules/rubiconBidAdapter.js';
+// Client-side bid adapters — self-register with prebid.js on import.
+// The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
+// build time. See _adapters.generated.ts (written by build-all.mjs).
+// When a bidder is listed in `client_side_bidders` in trusted-server.toml,
+// the requestBids shim leaves its bids untouched and the corresponding
+// adapter handles them natively in the browser.
+import './_adapters.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -296,6 +299,20 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // processQueue() must be called after all modules are loaded when using
   // prebid.js via NPM.
   pbjs.processQueue();
+
+  // Validate that every client-side bidder has its adapter registered.
+  // Adapters self-register on import, so a missing adapter means the bidder
+  // was listed in client_side_bidders but not in TSJS_PREBID_ADAPTERS at
+  // build time. Without the adapter the bidder is silently dropped from both
+  // server-side and client-side auctions.
+  for (const bidder of clientSideBidders) {
+    if (!adapterManager.getBidAdapter(bidder)) {
+      log.error(
+        `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
+          `Add it to TSJS_PREBID_ADAPTERS at build time.`,
+      );
+    }
+  }
 
   log.info('[tsjs-prebid] prebid initialized with trustedServer adapter');
 

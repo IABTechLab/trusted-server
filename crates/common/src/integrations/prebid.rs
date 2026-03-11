@@ -91,10 +91,7 @@ pub struct PrebidIntegrationConfig {
     ///
     /// This list is independent of [`bidders`](Self::bidders) — the operator
     /// manages both lists explicitly.
-    #[serde(
-        default,
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
-    )]
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
     #[serde(default)]
     pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
@@ -233,6 +230,20 @@ fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
         log::warn!("Prebid integration disabled: prebid.server_url missing");
         return None;
     }
+
+    // Warn about bidders that appear in both lists — this is likely a config
+    // mistake. A bidder should be in either `bidders` (server-side) or
+    // `client_side_bidders` (browser-side), not both.
+    for bidder in &config.client_side_bidders {
+        if config.bidders.iter().any(|b| b == bidder) {
+            log::warn!(
+                "prebid: bidder \"{}\" is in both bidders and client_side_bidders — \
+                 it will run server-side AND be left for client-side, which is likely unintended",
+                bidder
+            );
+        }
+    }
+
     Some(PrebidIntegration::new(config))
 }
 

@@ -1,37 +1,53 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
-const { mockSetConfig, mockProcessQueue, mockRequestBids, mockRegisterBidAdapter, mockPbjs } =
-  vi.hoisted(() => {
-    const mockSetConfig = vi.fn();
-    const mockProcessQueue = vi.fn();
-    const mockRequestBids = vi.fn();
-    const mockRegisterBidAdapter = vi.fn();
-    const mockPbjs = {
-      setConfig: mockSetConfig,
-      processQueue: mockProcessQueue,
-      requestBids: mockRequestBids,
-      registerBidAdapter: mockRegisterBidAdapter,
-      adUnits: [] as any[],
-    };
-    return {
-      mockSetConfig,
-      mockProcessQueue,
-      mockRequestBids,
-      mockRegisterBidAdapter,
-      mockPbjs,
-    };
-  });
+const {
+  mockSetConfig,
+  mockProcessQueue,
+  mockRequestBids,
+  mockRegisterBidAdapter,
+  mockPbjs,
+  mockGetBidAdapter,
+  mockAdapterManager,
+} = vi.hoisted(() => {
+  const mockSetConfig = vi.fn();
+  const mockProcessQueue = vi.fn();
+  const mockRequestBids = vi.fn();
+  const mockRegisterBidAdapter = vi.fn();
+  const mockGetBidAdapter = vi.fn();
+  const mockPbjs = {
+    setConfig: mockSetConfig,
+    processQueue: mockProcessQueue,
+    requestBids: mockRequestBids,
+    registerBidAdapter: mockRegisterBidAdapter,
+    adUnits: [] as any[],
+  };
+  const mockAdapterManager = {
+    getBidAdapter: mockGetBidAdapter,
+  };
+  return {
+    mockSetConfig,
+    mockProcessQueue,
+    mockRequestBids,
+    mockRegisterBidAdapter,
+    mockPbjs,
+    mockGetBidAdapter,
+    mockAdapterManager,
+  };
+});
 
 // Mock prebid.js before importing the module under test.
 // The real prebid.js cannot run in jsdom, so we provide a minimal stub.
 vi.mock('prebid.js', () => ({ default: mockPbjs }));
+vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager }));
 
 // Side-effect imports are no-ops in tests
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
-vi.mock('prebid.js/modules/rubiconBidAdapter.js', () => ({}));
+
+// Mock the build-generated adapter imports (no-op in tests)
+vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
 
 import {
   collectBidders,
@@ -586,6 +602,8 @@ describe('prebid/client-side bidders', () => {
     vi.clearAllMocks();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    // By default, pretend all adapters are registered
+    mockGetBidAdapter.mockReturnValue({});
     delete (window as any).__tsjs_prebid;
   });
 
@@ -728,5 +746,60 @@ describe('prebid/client-side bidders', () => {
     const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     expect(tsBid).toBeDefined();
     expect(tsBid.params.bidderParams).toEqual({});
+  });
+
+  it('logs error when a client-side bidder has no adapter loaded', () => {
+    // rubicon is registered, but openx is not
+    mockGetBidAdapter.mockImplementation((bidder: string) =>
+      bidder === 'rubicon' ? {} : undefined,
+    );
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    // Should have been called to check both bidders
+    expect(mockGetBidAdapter).toHaveBeenCalledWith('rubicon');
+    expect(mockGetBidAdapter).toHaveBeenCalledWith('openx');
+
+    // Should log an error for the missing adapter.
+    // log.error() uses styled console output: console.error('%c[tsjs]%c ...:', style, reset, ...args)
+    // so the actual message is the 4th argument.
+    const errorCalls = errorSpy.mock.calls;
+    const hasOpenxError = errorCalls.some((args) =>
+      args.some(
+        (a) => typeof a === 'string' && a.includes('client-side bidder "openx" has no adapter loaded'),
+      ),
+    );
+    expect(hasOpenxError).toBe(true);
+
+    // Should NOT log an error for the registered adapter
+    const hasRubiconError = errorCalls.some((args) =>
+      args.some(
+        (a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'),
+      ),
+    );
+    expect(hasRubiconError).toBe(false);
+
+    errorSpy.mockRestore();
+  });
+
+  it('does not log errors when all client-side bidders have adapters', () => {
+    mockGetBidAdapter.mockReturnValue({});
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some(
+        (a) => typeof a === 'string' && a.includes('has no adapter loaded'),
+      ),
+    );
+    expect(hasAdapterError).toBe(false);
+
+    errorSpy.mockRestore();
   });
 });
