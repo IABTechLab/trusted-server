@@ -12,6 +12,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -30,7 +31,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     pub config: Option<JsonValue>,
     /// Extended IDs forwarded from client-side Prebid.js User ID modules.
     #[serde(default)]
@@ -138,6 +138,40 @@ pub fn convert_tsjs_to_auction_request(
         geo: GeoInfo::from_request(req),
     });
 
+    // Forward allowed config entries from the JS request into the context map.
+    // Only keys listed in `auction.allowed_context_keys` are accepted;
+    // unrecognised keys are silently dropped to prevent injection of
+    // arbitrary data by a malicious client payload.
+    let mut context = HashMap::new();
+    if let Some(ref config) = body.config {
+        if let Some(obj) = config.as_object() {
+            for (key, value) in obj {
+                if settings.auction.allowed_context_keys.contains(key) {
+                    match serde_json::from_value::<ContextValue>(value.clone()) {
+                        Ok(cv) => {
+                            context.insert(key.clone(), cv);
+                        }
+                        Err(_) => {
+                            log::debug!(
+                                "Auction context: dropping key '{}' with unsupported type",
+                                key
+                            );
+                        }
+                    }
+                } else {
+                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                }
+            }
+            if !context.is_empty() {
+                log::debug!(
+                    "Auction request context: {} entries ({})",
+                    context.len(),
+                    context.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
+
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
         slots,
@@ -156,7 +190,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
-        context: HashMap::new(),
+        context,
     })
 }
 

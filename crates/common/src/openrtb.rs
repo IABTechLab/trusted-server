@@ -19,6 +19,8 @@ pub struct OpenRtbRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub regs: Option<Regs>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<RequestExt>,
 }
 
@@ -71,6 +73,8 @@ pub struct Device {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ua: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo: Option<Geo>,
 }
 
@@ -111,6 +115,8 @@ pub struct RequestExt {
 pub struct PrebidExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returnallbidstatus: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Default)]
