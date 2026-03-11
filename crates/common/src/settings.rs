@@ -249,7 +249,7 @@ impl Rewrite {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Handler {
-    #[validate(length(min = 1), custom(function = validate_path))]
+    #[validate(length(min = 1))]
     pub path: String,
     #[validate(length(min = 1))]
     pub username: String,
@@ -468,19 +468,6 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
         return Err(err);
     }
     Ok(())
-}
-
-fn validate_path(value: &str) -> Result<(), ValidationError> {
-    // This intentionally compiles separately from `Handler::compiled_regex()`.
-    // Validation needs a field-level `ValidationError` during parse/build time,
-    // while the handler caches the runtime regex/result in its `OnceLock`.
-    Regex::new(value).map(|_| ()).map_err(|err| {
-        let mut validation_error = ValidationError::new("invalid_regex");
-        validation_error.add_param("value".into(), &value);
-        validation_error.add_param("message".into(), &err.to_string());
-        validation_error.message = Some("handler path regex failed to compile".into());
-        validation_error
-    })
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.

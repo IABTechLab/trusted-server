@@ -17,9 +17,72 @@ use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Encodings supported by the publisher response rewrite pipeline.
 const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
+const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
 fn restrict_accept_encoding(req: &mut Request) {
-    req.set_header(header::ACCEPT_ENCODING, SUPPORTED_ENCODINGS);
+    let accept_encoding = select_supported_accept_encoding(
+        req.get_header(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+    );
+    req.set_header(header::ACCEPT_ENCODING, accept_encoding);
+}
+
+fn select_supported_accept_encoding(client_accept_encoding: Option<&str>) -> String {
+    let Some(client_accept_encoding) = client_accept_encoding else {
+        return SUPPORTED_ENCODINGS.to_string();
+    };
+
+    let supported_subset = SUPPORTED_ENCODING_VALUES
+        .into_iter()
+        .filter(|encoding| client_accepts_content_encoding(client_accept_encoding, encoding))
+        .collect::<Vec<_>>();
+
+    if supported_subset.is_empty() {
+        return "identity".to_string();
+    }
+
+    supported_subset.join(", ")
+}
+
+fn client_accepts_content_encoding(header_value: &str, encoding: &str) -> bool {
+    accept_encoding_qvalue(header_value, encoding)
+        .or_else(|| accept_encoding_qvalue(header_value, "*"))
+        .is_some_and(|qvalue| qvalue > 0.0)
+}
+
+fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
+    let mut matched_qvalue = None;
+
+    for item in header_value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        let mut parts = item.split(';');
+        let Some(token) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if !token.eq_ignore_ascii_case(target) {
+            continue;
+        }
+
+        let mut qvalue = 1.0;
+        for parameter in parts {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                if let Ok(parsed_qvalue) = value.trim().parse::<f32>() {
+                    qvalue = parsed_qvalue;
+                }
+            }
+        }
+
+        matched_qvalue = Some(qvalue);
+    }
+
+    matched_qvalue
 }
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
@@ -479,6 +542,48 @@ mod tests {
             req.get_header_str(header::ACCEPT_ENCODING),
             Some(SUPPORTED_ENCODINGS),
             "publisher fallback should only advertise encodings the rewrite pipeline supports"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_preserves_identity_only_accept_encoding() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "identity");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("identity"),
+            "publisher fallback should preserve identity-only clients"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_respects_supported_client_subset() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "br, gzip;q=0, zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("br"),
+            "publisher fallback should only advertise the supported encodings the client accepts"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_falls_back_to_identity_for_unsupported_client_encodings() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("identity"),
+            "publisher fallback should request identity when the client only accepts unsupported encodings"
         );
     }
 

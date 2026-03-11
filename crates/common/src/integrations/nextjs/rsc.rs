@@ -280,6 +280,7 @@ fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
 pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     content: &str,
     rewriter: &RscUrlRewriter,
+    origin_host: &str,
     request_host: &str,
     request_scheme: &str,
 ) -> String {
@@ -291,7 +292,7 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     };
 
     if chunks.is_empty() {
-        return rewriter.rewrite_to_string(content, request_host, request_scheme);
+        return rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
     }
 
     let mut result = String::with_capacity(content.len());
@@ -301,13 +302,13 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
         let before = &content[last_end..chunk.match_start];
         result.push_str(
             rewriter
-                .rewrite(before, request_host, request_scheme)
+                .rewrite(before, origin_host, request_host, request_scheme)
                 .as_ref(),
         );
 
         let chunk_content = &content[chunk.header_end..chunk.content_end];
         let rewritten_content =
-            rewriter.rewrite_to_string(chunk_content, request_host, request_scheme);
+            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
 
         let new_length = calculate_unescaped_byte_length(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
@@ -324,7 +325,7 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     let remaining = &content[last_end..];
     result.push_str(
         rewriter
-            .rewrite(remaining, request_host, request_scheme)
+            .rewrite(remaining, origin_host, request_host, request_scheme)
             .as_ref(),
     );
 
@@ -349,11 +350,12 @@ pub fn rewrite_rsc_scripts_combined(
     request_host: &str,
     request_scheme: &str,
 ) -> Vec<String> {
-    let rewriter = RscUrlRewriter::new(origin_host);
+    let rewriter = RscUrlRewriter::new();
 
     rewrite_rsc_scripts_combined_with_limit(
         payloads,
         &rewriter,
+        origin_host,
         request_host,
         request_scheme,
         DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
@@ -392,6 +394,7 @@ fn payload_contains_incomplete_tchunk(payload: &str) -> bool {
 pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     payloads: &[&str],
     rewriter: &RscUrlRewriter,
+    origin_host: &str,
     request_host: &str,
     request_scheme: &str,
     max_combined_payload_bytes: usize,
@@ -401,7 +404,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     }
 
     // Early exit if no payload contains the origin host - avoids regex compilation
-    if !payloads.iter().any(|p| p.contains(rewriter.origin_host())) {
+    if !payloads.iter().any(|p| p.contains(origin_host)) {
         return payloads.iter().map(|p| (*p).to_string()).collect();
     }
 
@@ -409,6 +412,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
         return vec![rewrite_rsc_tchunks_with_rewriter(
             payloads[0],
             rewriter,
+            origin_host,
             request_host,
             request_scheme,
         )];
@@ -446,7 +450,15 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
 
         return payloads
             .iter()
-            .map(|p| rewrite_rsc_tchunks_with_rewriter(p, rewriter, request_host, request_scheme))
+            .map(|p| {
+                rewrite_rsc_tchunks_with_rewriter(
+                    p,
+                    rewriter,
+                    origin_host,
+                    request_host,
+                    request_scheme,
+                )
+            })
             .collect();
     }
 
@@ -466,7 +478,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     if chunks.is_empty() {
         return payloads
             .iter()
-            .map(|p| rewriter.rewrite_to_string(p, request_host, request_scheme))
+            .map(|p| rewriter.rewrite_to_string(p, origin_host, request_host, request_scheme))
             .collect();
     }
 
@@ -477,13 +489,13 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
         let before = &combined[last_end..chunk.match_start];
         result.push_str(
             rewriter
-                .rewrite(before, request_host, request_scheme)
+                .rewrite(before, origin_host, request_host, request_scheme)
                 .as_ref(),
         );
 
         let chunk_content = &combined[chunk.header_end..chunk.content_end];
         let rewritten_content =
-            rewriter.rewrite_to_string(chunk_content, request_host, request_scheme);
+            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
 
         let new_length = calculate_unescaped_byte_length_skip_markers(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
@@ -500,7 +512,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     let remaining = &combined[last_end..];
     result.push_str(
         rewriter
-            .rewrite(remaining, request_host, request_scheme)
+            .rewrite(remaining, origin_host, request_host, request_scheme)
             .as_ref(),
     );
 
@@ -514,9 +526,14 @@ mod tests {
     #[test]
     fn tchunk_length_recalculation() {
         let content = r#"1a:T29,{"url":"https://origin.example.com/path"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let result =
-            rewrite_rsc_tchunks_with_rewriter(content, &rewriter, "test.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
 
         assert!(
             result.contains("test.example.com"),
@@ -532,9 +549,14 @@ mod tests {
     #[test]
     fn tchunk_length_recalculation_with_length_increase() {
         let content = r#"1a:T1c,{"url":"https://short.io/x"}"#;
-        let rewriter = RscUrlRewriter::new("short.io");
-        let result =
-            rewrite_rsc_tchunks_with_rewriter(content, &rewriter, "test.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "short.io",
+            "test.example.com",
+            "https",
+        );
 
         assert!(
             result.contains("test.example.com"),
@@ -562,9 +584,14 @@ mod tests {
     #[test]
     fn multiple_tchunks() {
         let content = r#"1a:T1c,{"url":"https://short.io/x"}\n1b:T1c,{"url":"https://short.io/y"}"#;
-        let rewriter = RscUrlRewriter::new("short.io");
-        let result =
-            rewrite_rsc_tchunks_with_rewriter(content, &rewriter, "test.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "short.io",
+            "test.example.com",
+            "https",
+        );
 
         assert!(
             result.contains("test.example.com"),
@@ -641,8 +668,9 @@ mod tests {
     #[test]
     fn preserves_protocol_relative_urls() {
         let input = r#"{"url":"//origin.example.com/path"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let rewritten = rewriter.rewrite_to_string(input, "proxy.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
 
         assert!(
             rewritten.contains(r#""url":"//proxy.example.com/path""#),
@@ -653,8 +681,9 @@ mod tests {
     #[test]
     fn rewrites_bare_host_occurrences() {
         let input = r#"{"siteProductionDomain":"origin.example.com"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let rewritten = rewriter.rewrite_to_string(input, "proxy.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
 
         assert!(
             rewritten.contains(r#""siteProductionDomain":"proxy.example.com""#),
@@ -665,8 +694,9 @@ mod tests {
     #[test]
     fn bare_host_rewrite_respects_hostname_boundaries() {
         let input = r#"{"sub":"cdn.origin.example.com","prefix":"notorigin.example.com","suffix":"origin.example.com.uk","path":"origin.example.com/news","exact":"origin.example.com"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let rewritten = rewriter.rewrite_to_string(input, "proxy.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
 
         assert!(
             rewritten.contains(r#""sub":"cdn.origin.example.com""#),
@@ -774,7 +804,8 @@ mod tests {
         let payloads: Vec<&str> = vec![script0, script1];
         let results = rewrite_rsc_scripts_combined_with_limit(
             &payloads,
-            &RscUrlRewriter::new("origin.example.com"),
+            &RscUrlRewriter::new(),
+            "origin.example.com",
             "test.example.com",
             "https",
             1,
@@ -799,7 +830,8 @@ mod tests {
         let payloads: Vec<&str> = vec![script0, script1];
         let results = rewrite_rsc_scripts_combined_with_limit(
             &payloads,
-            &RscUrlRewriter::new("origin.example.com"),
+            &RscUrlRewriter::new(),
+            "origin.example.com",
             "test.example.com",
             "https",
             1,
@@ -831,9 +863,14 @@ mod tests {
     #[test]
     fn invalid_or_unreasonable_tchunk_length_skips_rewriting() {
         let content = r#"1a:T10000000,{"url":"https://origin.example.com/path"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let result =
-            rewrite_rsc_tchunks_with_rewriter(content, &rewriter, "test.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
 
         assert_eq!(
             result, content,
@@ -844,9 +881,14 @@ mod tests {
     #[test]
     fn incomplete_tchunk_skips_rewriting() {
         let content = r#"1a:Tff,{"url":"https://origin.example.com/path"}"#;
-        let rewriter = RscUrlRewriter::new("origin.example.com");
-        let result =
-            rewrite_rsc_tchunks_with_rewriter(content, &rewriter, "test.example.com", "https");
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
 
         assert_eq!(
             result, content,

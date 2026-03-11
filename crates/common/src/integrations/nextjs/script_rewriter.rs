@@ -39,9 +39,8 @@ impl NextJsNextDataRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        if let Some(rewritten) = rewrite_nextjs_values_with_rewriter(
+        if let Some(rewritten) = self.rewriter.rewrite_embedded(
             content,
-            &self.rewriter,
             ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
@@ -71,16 +70,6 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
     }
 }
 
-fn rewrite_nextjs_values_with_rewriter(
-    content: &str,
-    rewriter: &UrlRewriter,
-    origin_host: &str,
-    request_host: &str,
-    request_scheme: &str,
-) -> Option<String> {
-    rewriter.rewrite_embedded(content, origin_host, request_host, request_scheme)
-}
-
 #[cfg(test)]
 fn rewrite_nextjs_values(
     content: &str,
@@ -93,15 +82,9 @@ fn rewrite_nextjs_values(
         return None;
     }
 
-    let rewriter = UrlRewriter::new(attributes).expect("should build Next.js URL rewriter");
-
-    rewrite_nextjs_values_with_rewriter(
-        content,
-        &rewriter,
-        origin_host,
-        request_host,
-        request_scheme,
-    )
+    UrlRewriter::new(attributes)
+        .expect("should build Next.js URL rewriter")
+        .rewrite_embedded(content, origin_host, request_host, request_scheme)
 }
 
 /// Rewrites URLs in structured Next.js JSON payloads (e.g., `__NEXT_DATA__`).
@@ -177,6 +160,9 @@ impl UrlRewriter {
         let Some(regex) = &self.value_pattern else {
             return None;
         };
+        if origin_host.is_empty() || !input.contains(origin_host) {
+            return None;
+        }
         let changed = Cell::new(false);
         let next_value = regex.replace_all(input, |caps: &regex::Captures<'_>| {
             let prefix = &caps["prefix"];

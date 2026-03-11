@@ -60,6 +60,10 @@ pub(crate) fn find_rsc_push_payload_range(script: &str) -> Option<(usize, usize)
 /// Strip an origin host from the start of an authority/value while preserving an
 /// optional explicit port and requiring a safe hostname boundary.
 ///
+/// This helper currently matches hostname-style origins only. Bracketed IPv6
+/// authorities are not normalized here, so IPv6 origin rewriting remains
+/// unsupported until the caller can provide a bracketed authority consistently.
+///
 /// Examples:
 /// - `origin.example.com/path` -> `Some("/path")`
 /// - `origin.example.com:8443/path` -> `Some(":8443/path")`
@@ -114,37 +118,29 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
 /// Use this for RSC T-chunk content where any origin URL should be rewritten.
 /// For attribute-specific rewriting (e.g., only rewrite `"href"` values), use
 /// the `UrlRewriter` in `script_rewriter.rs` instead.
-#[derive(Clone)]
-pub(crate) struct RscUrlRewriter {
-    origin_host: String,
-}
+#[derive(Clone, Default)]
+pub(crate) struct RscUrlRewriter;
 
 impl RscUrlRewriter {
-    pub(crate) fn origin_host(&self) -> &str {
-        &self.origin_host
-    }
-
-    pub(crate) fn new(origin_host: &str) -> Self {
-        Self {
-            origin_host: origin_host.to_string(),
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) fn rewrite<'a>(
         &self,
         input: &'a str,
+        origin_host: &str,
         request_host: &str,
         request_scheme: &str,
     ) -> Cow<'a, str> {
-        if !input.contains(&self.origin_host) {
+        if origin_host.is_empty() || !input.contains(origin_host) {
             return Cow::Borrowed(input);
         }
 
         // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
         let replaced = RSC_URL_PATTERN.replace_all(input, |caps: &regex::Captures<'_>| {
             let host = caps.name("host").map_or("", |m| m.as_str());
-            let Some(host_suffix) = strip_origin_host_with_optional_port(host, &self.origin_host)
-            else {
+            let Some(host_suffix) = strip_origin_host_with_optional_port(host, origin_host) else {
                 return caps
                     .get(0)
                     .expect("should capture the matched RSC URL")
@@ -168,11 +164,11 @@ impl RscUrlRewriter {
             Cow::Owned(s) => s.as_str(),
         };
 
-        if !text.contains(&self.origin_host) {
+        if !text.contains(origin_host) {
             return replaced;
         }
 
-        rewrite_bare_host_at_boundaries(text, &self.origin_host, request_host)
+        rewrite_bare_host_at_boundaries(text, origin_host, request_host)
             .map(Cow::Owned)
             .unwrap_or(replaced)
     }
@@ -180,10 +176,11 @@ impl RscUrlRewriter {
     pub(crate) fn rewrite_to_string(
         &self,
         input: &str,
+        origin_host: &str,
         request_host: &str,
         request_scheme: &str,
     ) -> String {
-        self.rewrite(input, request_host, request_scheme)
+        self.rewrite(input, origin_host, request_host, request_scheme)
             .into_owned()
     }
 }
@@ -229,49 +226,49 @@ mod tests {
 
     #[test]
     fn rsc_url_rewriter_rewrites_https_url() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"https://origin.example.com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"https://proxy.example.com/path"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_rewrites_http_url() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"http://origin.example.com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "http");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "http");
         assert_eq!(result, r#"{"url":"http://proxy.example.com/path"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_rewrites_protocol_relative_url() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"//origin.example.com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"//proxy.example.com/path"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_rewrites_escaped_slashes() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"\/\/origin.example.com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"\/\/proxy.example.com/path"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_rewrites_bare_host() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"siteProductionDomain":"origin.example.com"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"siteProductionDomain":"proxy.example.com"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_rewrites_explicit_port_urls() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"https://origin.example.com:8443/path","asset":"//origin.example.com:9443/file.js"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         assert_eq!(
             result,
             r#"{"url":"https://proxy.example.com:8443/path","asset":"//proxy.example.com:9443/file.js"}"#
@@ -280,18 +277,18 @@ mod tests {
 
     #[test]
     fn rsc_url_rewriter_does_not_rewrite_partial_hostname() {
-        let rewriter = RscUrlRewriter::new("example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"domain":"subexample.com"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "example.com", "proxy.example.com", "https");
         // Should not rewrite because "example.com" is not a standalone host here
         assert_eq!(result, r#"{"domain":"subexample.com"}"#);
     }
 
     #[test]
     fn rsc_url_rewriter_no_change_when_origin_not_present() {
-        let rewriter = RscUrlRewriter::new("origin.example.com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"https://other.example.com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.example.com", "proxy.example.com", "https");
         // Should return borrowed reference (no allocation)
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, input);
@@ -299,9 +296,9 @@ mod tests {
 
     #[test]
     fn rsc_url_rewriter_supports_regex_metacharacters_in_origin_literal() {
-        let rewriter = RscUrlRewriter::new("origin.(example).com");
+        let rewriter = RscUrlRewriter::new();
         let input = r#"{"url":"https://origin.(example).com/path"}"#;
-        let result = rewriter.rewrite(input, "proxy.example.com", "https");
+        let result = rewriter.rewrite(input, "origin.(example).com", "proxy.example.com", "https");
         assert_eq!(result, r#"{"url":"https://proxy.example.com/path"}"#);
     }
 
@@ -330,6 +327,14 @@ mod tests {
                 "origin.example.com:not-a-port/path",
                 "origin.example.com"
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_origin_host_with_optional_port_does_not_match_bracketed_ipv6_authority() {
+        assert_eq!(
+            strip_origin_host_with_optional_port("[2001:db8::1]/path", "2001:db8::1"),
             None
         );
     }

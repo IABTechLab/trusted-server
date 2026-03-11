@@ -91,10 +91,11 @@ impl NextJsHtmlPostProcessor {
         payloads: Vec<String>,
     ) -> bool {
         let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
-        let rsc_rewriter = RscUrlRewriter::new(ctx.origin_host);
+        let rsc_rewriter = RscUrlRewriter::new();
         let mut rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payload_refs.as_slice(),
             &rsc_rewriter,
+            ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
             self.config.max_combined_payload_bytes,
@@ -454,11 +455,12 @@ fn post_process_rsc_html_in_place_with_limit(
             );
         }
 
-        let rewriter = RscUrlRewriter::new(origin_host);
+        let rewriter = RscUrlRewriter::new();
 
         let rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payloads.as_slice(),
             &rewriter,
+            origin_host,
             request_host,
             request_scheme,
             max_combined_payload_bytes,
