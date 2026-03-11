@@ -23,16 +23,15 @@ pub struct Publisher {
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
+    #[validate(length(min = 1))]
     pub proxy_secret: String,
 }
 
 impl Publisher {
     /// Known placeholder values that must not be used in production.
-    #[allow(dead_code)]
     pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
 
     /// Returns `true` if `proxy_secret` matches a known placeholder value.
-    #[allow(dead_code)]
     #[must_use]
     pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
         Self::PROXY_SECRET_PLACEHOLDERS.contains(&proxy_secret)
@@ -199,11 +198,9 @@ pub struct Synthetic {
 
 impl Synthetic {
     /// Known placeholder values that must not be used in production.
-    #[allow(dead_code)]
     pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
 
     /// Returns `true` if `secret_key` matches a known placeholder value.
-    #[allow(dead_code)]
     #[must_use]
     pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
         Self::SECRET_KEY_PLACEHOLDERS.contains(&secret_key)
@@ -385,6 +382,33 @@ impl Settings {
         })?;
 
         Ok(settings)
+    }
+
+    /// Checks all secret fields for known placeholder values and returns an
+    /// error listing every offending field.  This centralises the placeholder
+    /// policy so callers don't need to know which fields are secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
+    /// fields still contain a placeholder value.
+    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut insecure_fields: Vec<&str> = Vec::new();
+
+        if Synthetic::is_placeholder_secret_key(&self.synthetic.secret_key) {
+            insecure_fields.push("synthetic.secret_key");
+        }
+        if Publisher::is_placeholder_proxy_secret(&self.publisher.proxy_secret) {
+            insecure_fields.push("publisher.proxy_secret");
+        }
+
+        if insecure_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::InsecureDefault {
+                field: insecure_fields.join(", "),
+            }))
+        }
     }
 
     #[must_use]
