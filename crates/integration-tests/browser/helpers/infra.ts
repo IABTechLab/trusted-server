@@ -1,4 +1,4 @@
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { waitForReady } from "./wait-for-ready.js";
 
@@ -44,13 +44,18 @@ export async function startContainer(framework: string): Promise<string> {
     );
   }
 
-  const containerId = execSync(
+  const containerId = execFileSync(
+    "docker",
     [
-      "docker run -d --rm",
-      `-p ${ORIGIN_PORT}:${config.port}`,
-      `-e ORIGIN_HOST=127.0.0.1:${ORIGIN_PORT}`,
+      "run",
+      "-d",
+      "--rm",
+      "-p",
+      `${ORIGIN_PORT}:${config.port}`,
+      "-e",
+      `ORIGIN_HOST=127.0.0.1:${ORIGIN_PORT}`,
       config.image,
-    ].join(" "),
+    ],
     { encoding: "utf-8" },
   ).trim();
 
@@ -68,7 +73,7 @@ export async function startContainer(framework: string): Promise<string> {
 /** Stop a Docker container by ID. */
 export function stopContainer(containerId: string): void {
   try {
-    execSync(`docker stop ${containerId}`, { timeout: 10_000 });
+    execFileSync("docker", ["stop", containerId], { timeout: 10_000 });
   } catch {
     // Container may have already stopped (--rm flag)
   }
@@ -108,7 +113,7 @@ export async function startViceroy(
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    await waitForReady(baseUrl, "/__trusted-server/health");
+    await waitForReady(baseUrl, "/");
   } catch (err) {
     // Viceroy spawned but never became ready — kill it before propagating.
     if (child.pid) stopViceroy(child.pid);

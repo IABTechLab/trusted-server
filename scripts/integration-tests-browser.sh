@@ -18,6 +18,15 @@ cd "$REPO_ROOT"
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
 BROWSER_DIR="crates/integration-tests/browser"
+NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
+
+if [ -z "$NODE_VERSION" ]; then
+    echo "Failed to detect Node.js version from .tool-versions" >&2
+    exit 1
+fi
+
+echo "==> Validating shared integration-test dependency versions..."
+./scripts/check-integration-dependency-versions.sh
 
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
@@ -31,7 +40,9 @@ docker build -t test-wordpress:latest \
     crates/integration-tests/fixtures/frameworks/wordpress/
 
 echo "==> Building Next.js test container..."
-docker build -t test-nextjs:latest \
+docker build \
+    --build-arg NODE_VERSION="$NODE_VERSION" \
+    -t test-nextjs:latest \
     crates/integration-tests/fixtures/frameworks/nextjs/
 
 # --- Install Playwright ---
@@ -46,11 +57,18 @@ export INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT"
 export VICEROY_CONFIG_PATH="$REPO_ROOT/crates/integration-tests/fixtures/configs/viceroy-template.toml"
 
 # Cleanup trap: stop any leftover containers on failure
+stop_matching_containers() {
+    local image="$1"
+    local ids
+    ids="$(docker ps -q --filter "ancestor=$image" 2>/dev/null || true)"
+    if [ -n "$ids" ]; then
+        printf '%s\n' "$ids" | xargs docker stop 2>/dev/null || true
+    fi
+}
+
 cleanup() {
-    docker ps -q \
-        --filter ancestor=test-nextjs:latest \
-        --filter ancestor=test-wordpress:latest \
-        2>/dev/null | xargs -r docker stop 2>/dev/null || true
+    stop_matching_containers test-nextjs:latest
+    stop_matching_containers test-wordpress:latest
 }
 trap cleanup EXIT
 

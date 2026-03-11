@@ -75,7 +75,9 @@ var) so the trusted server's URL rewriting can be verified.
 docker build -t test-wordpress:latest \
   crates/integration-tests/fixtures/frameworks/wordpress/
 
-docker build -t test-nextjs:latest \
+docker build \
+  --build-arg NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')" \
+  -t test-nextjs:latest \
   crates/integration-tests/fixtures/frameworks/nextjs/
 ```
 
@@ -195,6 +197,21 @@ Two jobs run in parallel:
 
 They are **not** part of `cargo test --workspace` because the integration-tests
 crate requires a native target while the workspace default is `wasm32-wasip1`.
+
+## Dependency maintenance
+
+`crates/integration-tests` is intentionally excluded from the workspace, so it
+keeps its own `Cargo.lock`.
+
+Shared direct dependency versions are checked in CI by
+`scripts/check-integration-dependency-versions.sh`. When updating a dependency
+that exists in both manifests:
+
+1. Update the version in both `Cargo.toml` files.
+2. Regenerate the nested lockfile with
+   `cargo generate-lockfile --manifest-path crates/integration-tests/Cargo.toml`.
+3. Ensure the workspace and integration-test lockfiles resolve the same version
+   for that shared dependency.
 
 ## Known gaps
 

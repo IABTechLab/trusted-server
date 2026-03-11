@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { readState } from "../../helpers/state.js";
+import { readState, runtimeUrl } from "../../helpers/state.js";
 
 test.beforeEach(async ({}, testInfo) => {
   const state = readState();
@@ -29,7 +29,7 @@ test.describe("Next.js client-side navigation", () => {
     const jsErrors: string[] = [];
     page.on("pageerror", (error) => jsErrors.push(error.message));
 
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
     // Script present on initial load
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
@@ -69,7 +69,7 @@ test.describe("Next.js client-side navigation", () => {
   });
 
   test("navigating back preserves script injection", async ({ page }) => {
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
 
     // Wait for hydration before navigating
@@ -88,7 +88,7 @@ test.describe("Next.js client-side navigation", () => {
   test("deferred route script executes after SPA transition to dashboard", async ({
     page,
   }) => {
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
     await waitForHydration(page);
 
     // No route script marker on home page
@@ -128,7 +128,7 @@ test.describe("Next.js client-side navigation", () => {
   test("about page has script injection via direct navigation", async ({
     page,
   }) => {
-    await page.goto("/about", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/about"), { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
 
     const src = await page

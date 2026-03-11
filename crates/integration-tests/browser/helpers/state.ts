@@ -14,3 +14,8 @@ const STATE_FILE = resolve(__dirname, "../.browser-test-state.json");
 export function readState(): TestState {
   return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
 }
+
+/** Resolve an absolute runtime URL from the current browser test state. */
+export function runtimeUrl(path: string): string {
+  return new URL(path, readState().baseUrl).toString();
+}

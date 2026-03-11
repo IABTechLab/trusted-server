@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { readState } from "../../helpers/state.js";
+import { readState, runtimeUrl } from "../../helpers/state.js";
 
 test.beforeEach(async ({}, testInfo) => {
   const state = readState();
@@ -12,7 +12,7 @@ test.describe("Next.js API route passthrough", () => {
   test("API route returns JSON without script injection", async ({
     request,
   }) => {
-    const resp = await request.get("/api/hello");
+    const resp = await request.get(runtimeUrl("/api/hello"));
     expect(resp.status()).toBe(200);
 
     const contentType = resp.headers()["content-type"] || "";
@@ -29,7 +29,7 @@ test.describe("Next.js API route passthrough", () => {
   });
 
   test("data API route returns structured JSON", async ({ request }) => {
-    const resp = await request.get("/api/data");
+    const resp = await request.get(runtimeUrl("/api/data"));
     expect(resp.status()).toBe(200);
 
     const body = await resp.json();

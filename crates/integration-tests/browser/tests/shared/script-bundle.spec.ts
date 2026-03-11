@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { runtimeUrl } from "../../helpers/state.js";
 
 test.describe("Script bundle", () => {
   test("JS bundle loads with 200 and executes without parse errors", async ({
@@ -17,7 +18,7 @@ test.describe("Script bundle", () => {
     const jsErrors: string[] = [];
     page.on("pageerror", (error) => jsErrors.push(error.message));
 
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
     // Wait for the bundle response specifically (up to 10s)
     if (bundleResponses.length === 0) {
@@ -43,7 +44,7 @@ test.describe("Script bundle", () => {
       { timeout: 10_000 },
     );
 
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
     const bundleResp = await bundlePromise;
     bundleContentType = bundleResp.headers()["content-type"] || "";

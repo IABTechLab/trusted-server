@@ -1,8 +1,9 @@
 import { test, expect } from "@playwright/test";
+import { runtimeUrl } from "../../helpers/state.js";
 
 test.describe("Script injection", () => {
   test("injected script tag is present in the live DOM", async ({ page }) => {
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
     const scriptTag = page.locator("script#trustedserver-js");
     await expect(scriptTag).toHaveCount(1);
 
@@ -12,14 +13,17 @@ test.describe("Script injection", () => {
 
   test("no unexpected console errors on page load", async ({ page }) => {
     const errors: string[] = [];
+    let lastConsoleActivityAt = Date.now();
     page.on("console", (msg) => {
+      lastConsoleActivityAt = Date.now();
       if (msg.type() === "error") errors.push(msg.text());
     });
 
-    await page.goto("/", { waitUntil: "domcontentloaded" });
-
-    // Give scripts a moment to execute and log errors
-    await page.waitForTimeout(2000);
+    await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
+    await expect.poll(
+      () => Date.now() - lastConsoleActivityAt,
+      { timeout: 5_000 },
+    ).toBeGreaterThanOrEqual(500);
 
     // Suppress benign errors:
     // - favicon: not served by test containers

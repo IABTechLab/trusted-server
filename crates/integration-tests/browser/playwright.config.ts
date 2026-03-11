@@ -9,7 +9,6 @@ export default defineConfig({
   // Sequential execution: all tests share a single origin port (8888)
   workers: 1,
   use: {
-    baseURL: process.env.VICEROY_BASE_URL || "http://127.0.0.1:7878",
     headless: true,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",

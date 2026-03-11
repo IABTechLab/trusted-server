@@ -29,7 +29,10 @@ pub trait FrontendFramework: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ContainerStart`] if the image cannot be created.
+    /// Returns [`TestError::ContainerStart`] when an implementation needs to
+    /// validate or derive container configuration before startup. The in-tree
+    /// frameworks currently return `Ok(...)`, but the trait remains fallible so
+    /// future builders can fail with context instead of panicking.
     fn build_container(&self, origin_port: u16) -> TestResult<ContainerRequest<GenericImage>>;
 
     /// Port the framework serves on inside the container.

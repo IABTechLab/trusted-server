@@ -49,9 +49,6 @@ async function globalSetup(): Promise<void> {
 
     console.log(`[global-setup] Viceroy ready at ${viceroy.baseUrl}`);
 
-    // Expose the base URL so playwright.config.ts picks it up via env var
-    process.env.VICEROY_BASE_URL = viceroy.baseUrl;
-
     // Write complete state for tests and teardown
     writeState({
       baseUrl: viceroy.baseUrl,

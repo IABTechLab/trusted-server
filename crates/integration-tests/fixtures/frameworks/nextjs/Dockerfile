@@ -6,15 +6,20 @@
 #     crates/integration-tests/fixtures/frameworks/nextjs/
 #
 # Run manually:
+#   docker build \
+#     --build-arg NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')" \
+#     -t test-nextjs:latest \
+#     crates/integration-tests/fixtures/frameworks/nextjs/
 #   docker run -p 3000:3000 test-nextjs:latest
 
 # --- Build stage ---
-FROM node:20-alpine AS builder
+ARG NODE_VERSION
+FROM node:${NODE_VERSION}-alpine AS builder
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY next.config.mjs ./
 COPY app/ ./app/
@@ -22,7 +27,7 @@ COPY app/ ./app/
 RUN npm run build
 
 # --- Runtime stage ---
-FROM node:20-alpine AS runner
+FROM node:${NODE_VERSION}-alpine AS runner
 
 WORKDIR /app
 

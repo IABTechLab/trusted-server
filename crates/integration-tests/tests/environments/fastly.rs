@@ -2,8 +2,9 @@ use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
 };
 use error_stack::ResultExt as _;
+use std::io::{BufRead as _, BufReader};
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 
 /// Fastly Compute runtime using Viceroy local simulator.
 ///
@@ -23,15 +24,28 @@ impl RuntimeEnvironment for FastlyViceroy {
 
         let viceroy_config = self.viceroy_config_path();
 
-        let child = Command::new("viceroy")
+        let mut child = Command::new("viceroy")
             .arg(wasm_path)
             .arg("-C")
             .arg(&viceroy_config)
             .arg("--addr")
             .arg(format!("127.0.0.1:{port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .change_context(TestError::RuntimeSpawn)
             .attach("Failed to spawn viceroy process")?;
+
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        log::debug!("viceroy: {line}");
+                    }
+                }
+            });
+        }
 
         // Wrap immediately so Drop::drop kills the process if readiness check fails
         let handle = ViceroyHandle { child };
@@ -46,7 +60,7 @@ impl RuntimeEnvironment for FastlyViceroy {
     }
 
     fn health_check_path(&self) -> &str {
-        "/__trusted-server/health"
+        "/"
     }
 }
 

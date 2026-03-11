@@ -7,6 +7,8 @@
     [local_server.backends]
 
     [local_server.kv_stores]
+        # These inline placeholders satisfy Viceroy's local KV configuration
+        # requirements without exercising KV-backed application behavior.
         [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"

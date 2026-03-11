@@ -1,15 +1,16 @@
-// Many items in common/environments/frameworks are defined for use by
-// Docker-dependent integration tests that only run when Docker is available.
-// The compiler sees them as unused when analysing the test binary alone.
-#![allow(dead_code, unused_imports)]
-
+// These modules are shared by ignored Docker-backed tests and unit tests
+// inside the same integration test target, so some items are intentionally
+// unused in a plain `cargo test` compile.
+#[allow(dead_code, unused_imports)]
 mod common;
+#[allow(dead_code, unused_imports)]
 mod environments;
+#[allow(dead_code, unused_imports)]
 mod frameworks;
 
 use common::runtime::{TestError, origin_port, wasm_binary_path};
-use environments::RUNTIME_ENVIRONMENTS;
-use error_stack::{Report, ResultExt as _};
+use environments::{RUNTIME_ENVIRONMENTS, ReadyCheckOptions, wait_for_http_ready};
+use error_stack::ResultExt as _;
 use frameworks::{FRAMEWORKS, FrontendFramework};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
@@ -81,7 +82,17 @@ fn test_combination(
     let origin_url = format!("http://127.0.0.1:{port}");
 
     // Wait for container to be ready
-    wait_for_container(&origin_url, framework.health_check_path())?;
+    wait_for_http_ready(
+        &origin_url,
+        framework.health_check_path(),
+        ReadyCheckOptions {
+            max_attempts: 60,
+            interval: Duration::from_millis(500),
+            fallback_to_root: false,
+            timeout_error: TestError::ContainerTimeout,
+            timeout_message: format!("Container at {origin_url} not ready after 30s"),
+        },
+    )?;
 
     // 2. Spawn runtime process with the pre-built WASM binary
     let wasm_path = wasm_binary_path();
@@ -112,36 +123,6 @@ fn test_combination(
 
     Ok(())
 }
-
-/// Wait for a Docker container's health endpoint to respond successfully.
-///
-/// Retries up to 60 times with 500ms delay (total ~30s). Uses a longer
-/// budget than `wait_for_ready` because container cold-starts
-/// include image pull, filesystem setup, and application init time.
-///
-/// Unlike `wait_for_ready`, this function does not fall back to the root path —
-/// containers are expected to expose a reliable health endpoint.
-///
-/// # Errors
-///
-/// Returns [`TestError::ContainerTimeout`] if the health endpoint does not
-/// respond with a success status within the timeout.
-fn wait_for_container(base_url: &str, health_path: &str) -> common::runtime::TestResult<()> {
-    let url = format!("{base_url}{health_path}");
-
-    for _ in 0..60 {
-        if let Ok(resp) = reqwest::blocking::get(&url)
-            && resp.status().is_success()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    Err(Report::new(TestError::ContainerTimeout)
-        .attach(format!("Container at {base_url} not ready after 30s")))
-}
-
 // Individual test functions for faster iteration during development.
 
 #[test]

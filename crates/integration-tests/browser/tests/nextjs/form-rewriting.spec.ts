@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { readState } from "../../helpers/state.js";
+import { readState, runtimeUrl } from "../../helpers/state.js";
 
 test.beforeEach(async ({}, testInfo) => {
   const state = readState();
@@ -12,7 +12,7 @@ test.describe("Next.js form action rewriting", () => {
   test("form action URL is rewritten from origin to proxy", async ({
     page,
   }) => {
-    await page.goto("/contact", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/contact"), { waitUntil: "domcontentloaded" });
 
     const form = page.locator("form#contact-form");
     await expect(form).toHaveCount(1);
@@ -28,7 +28,7 @@ test.describe("Next.js form action rewriting", () => {
   });
 
   test("contact page has script injection", async ({ page }) => {
-    await page.goto("/contact", { waitUntil: "domcontentloaded" });
+    await page.goto(runtimeUrl("/contact"), { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
   });
 });

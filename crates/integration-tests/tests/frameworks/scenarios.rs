@@ -269,7 +269,12 @@ impl CustomScenario {
                     ))?;
 
                 let status = resp.status().as_u16();
-                let body = resp.text().unwrap_or_default();
+                let body = resp
+                    .text()
+                    .change_context(TestError::ResponseParse)
+                    .attach(format!(
+                        "scenario: NextJsServerActions, framework: {framework_id}"
+                    ))?;
 
                 // Next.js returns 404 for unknown server action IDs.
                 // With App Router client components in the layout, Next.js
