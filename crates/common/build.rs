@@ -6,6 +6,9 @@ mod error;
 #[path = "src/auction_config_types.rs"]
 mod auction_config_types;
 
+#[path = "src/redacted.rs"]
+mod redacted;
+
 #[path = "src/settings.rs"]
 mod settings;
 

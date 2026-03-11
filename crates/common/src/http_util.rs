@@ -222,13 +222,13 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
 #[must_use]
 pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     // Derive a 32-byte key via SHA-256(secret)
-    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
+    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
 
     // Deterministic 24-byte nonce derived from secret and plaintext (stable tokens)
     let mut hasher = Sha256::new();
     hasher.update(b"ts-proxy-x1");
-    hasher.update(settings.publisher.proxy_secret.as_bytes());
+    hasher.update(settings.publisher.proxy_secret.expose().as_bytes());
     hasher.update(plaintext_url.as_bytes());
     let nonce_full = hasher.finalize();
     let mut nonce = [0u8; 24];
@@ -260,7 +260,7 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
     let nonce = XNonce::from_slice(nonce_bytes);
     let ciphertext = &data[2 + 24..];
 
-    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
+    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
     cipher
         .decrypt(nonce, ciphertext)
@@ -278,7 +278,7 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
 pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ts-proxy-v2");
-    hasher.update(settings.publisher.proxy_secret.as_bytes());
+    hasher.update(settings.publisher.proxy_secret.expose().as_bytes());
     hasher.update(clear_url.as_bytes());
     let digest = hasher.finalize();
     URL_SAFE_NO_PAD.encode(digest)

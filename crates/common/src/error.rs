@@ -33,11 +33,6 @@ pub enum TrustedServerError {
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
-    /// The synthetic secret key is using the insecure default value.
-
-    #[display("Synthetic secret key is set to the default value - this is insecure")]
-    InsecureSecretKey,
-
     /// Invalid UTF-8 data encountered.
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
@@ -98,7 +93,6 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
-            Self::InsecureSecretKey => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,

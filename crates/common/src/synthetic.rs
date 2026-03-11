@@ -96,9 +96,9 @@ pub fn generate_synthetic_id(
             message: "Failed to render synthetic ID template".to_string(),
         })?;
 
-    log::info!("Input string for fresh ID: {} {}", input_string, data);
+    log::trace!("Input string for fresh ID: {} {}", input_string, data);
 
-    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
+    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.expose().as_bytes())
         .change_context(TrustedServerError::SyntheticId {
             message: "Failed to create HMAC instance".to_string(),
         })?;
@@ -109,7 +109,7 @@ pub fn generate_synthetic_id(
     let random_suffix = generate_random_suffix(6);
     let synthetic_id = format!("{}.{}", hmac_hash, random_suffix);
 
-    log::info!("Generated fresh ID: {}", synthetic_id);
+    log::debug!("Generated fresh ID: {}", synthetic_id);
 
     Ok(synthetic_id)
 }
@@ -132,7 +132,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         .and_then(|h| h.to_str().ok())
     {
         let id = synthetic_id.to_string();
-        log::info!("Using existing Synthetic ID from header: {}", id);
+        log::debug!("Using existing Synthetic ID from header: {}", id);
         return Ok(Some(id));
     }
 
@@ -140,7 +140,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
                 let id = cookie.value().to_string();
-                log::info!("Using existing Trusted Server ID from cookie: {}", id);
+                log::debug!("Using existing Trusted Server ID from cookie: {}", id);
                 return Ok(Some(id));
             }
         }
@@ -173,7 +173,7 @@ pub fn get_or_generate_synthetic_id(
 
     // If no existing Synthetic ID found, generate a fresh one
     let synthetic_id = generate_synthetic_id(settings, req)?;
-    log::info!("No existing synthetic_id, generated: {}", synthetic_id);
+    log::debug!("No existing synthetic_id, generated: {}", synthetic_id);
     Ok(synthetic_id)
 }
 
@@ -263,7 +263,7 @@ mod tests {
 
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
-        log::info!("Generated synthetic ID: {}", synthetic_id);
+        log::debug!("Generated synthetic ID: {}", synthetic_id);
         assert!(
             is_synthetic_id_format(&synthetic_id),
             "should match synthetic ID format"

@@ -829,9 +829,9 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
 
         // Log the outgoing OpenRTB request for debugging
-        if log::log_enabled!(log::Level::Debug) {
+        if log::log_enabled!(log::Level::Trace) {
             match serde_json::to_string_pretty(&openrtb) {
-                Ok(json) => log::debug!(
+                Ok(json) => log::trace!(
                     "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
                     self.config.server_url,
                     json
@@ -876,12 +876,17 @@ impl AuctionProvider for PrebidAuctionProvider {
         let body_bytes = response.take_body_bytes();
 
         if !response.get_status().is_success() {
-            let body_preview = String::from_utf8_lossy(&body_bytes);
             log::warn!(
-                "Prebid returned non-success status: {} — body: {}",
+                "Prebid returned non-success status: {}",
                 response.get_status(),
-                &body_preview[..body_preview.floor_char_boundary(1000)]
             );
+            if log::log_enabled!(log::Level::Trace) {
+                let body_preview = String::from_utf8_lossy(&body_bytes);
+                log::trace!(
+                    "Prebid error response body: {}",
+                    &body_preview[..body_preview.floor_char_boundary(1000)]
+                );
+            }
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
 
@@ -892,9 +897,9 @@ impl AuctionProvider for PrebidAuctionProvider {
 
         // Log the full response body when debug is enabled to surface
         // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
-        if self.config.debug && log::log_enabled!(log::Level::Debug) {
+        if self.config.debug && log::log_enabled!(log::Level::Trace) {
             match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::debug!("Prebid OpenRTB response:\n{json}"),
+                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
                 Err(e) => {
                     log::warn!("Prebid: failed to serialize response for logging: {e}");
                 }

@@ -281,7 +281,7 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to build mediation request".to_string(),
             })?;
 
-        log::debug!("AdServer Mock: mediation request: {:?}", mediation_req);
+        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
 
         // Build endpoint URL with context-driven query parameters
         let endpoint_url = self.build_endpoint_url(request);
@@ -344,7 +344,7 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to parse mediation response".to_string(),
             })?;
 
-        log::debug!("AdServer Mock response: {:?}", response_json);
+        log::trace!("AdServer Mock response: {:?}", response_json);
 
         let auction_response = self.parse_mediation_response(&response_json, response_time_ms);
 
