@@ -40,11 +40,16 @@ secret_store_id = "<fastly-secret-store-id>"
 enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
-bidders = ["kargo", "rubicon", "appnexus", "openx"]
+bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
 # debug_query_params = ""
 # script_patterns = ["/prebid.js"]
+
+# Bidders that run client-side via native Prebid.js adapters instead of
+# being routed through the server-side auction. Their adapter modules must
+# be statically imported in the JS bundle.
+client_side_bidders = ["rubicon"]
 
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
