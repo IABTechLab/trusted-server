@@ -18,7 +18,8 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 /// measured from `start`. Returns `0` when the deadline has already passed.
 #[inline]
 fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
-    timeout_ms.saturating_sub(start.elapsed().as_millis() as u32)
+    let elapsed = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+    timeout_ms.saturating_sub(elapsed)
 }
 
 /// Manages auction execution across multiple providers.
@@ -266,8 +267,26 @@ impl AuctionOrchestrator {
                 continue;
             }
 
-            // Get the backend name for this provider to map responses back
-            let backend_name = match provider.backend_name() {
+            // Give each provider only the remaining time from the auction
+            // deadline so that its backend first_byte_timeout doesn't extend
+            // past the overall budget. Also respect the provider's own
+            // configured timeout when it is tighter than the remaining budget.
+            let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
+            let effective_timeout = remaining_ms.min(provider.timeout_ms());
+
+            if effective_timeout == 0 {
+                log::warn!(
+                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
+                    context.timeout_ms,
+                    provider.provider_name()
+                );
+                continue;
+            }
+
+            // Get the backend name for this provider to map responses back.
+            // Must be computed after effective_timeout since the timeout is
+            // part of the backend name.
+            let backend_name = match provider.backend_name(effective_timeout) {
                 Some(name) => name,
                 None => {
                     log::warn!(
@@ -278,14 +297,10 @@ impl AuctionOrchestrator {
                 }
             };
 
-            // Give each provider only the remaining time from the auction
-            // deadline so that its backend first_byte_timeout doesn't extend
-            // past the overall budget.
-            let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                timeout_ms: remaining_ms,
+                timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
             };
 
@@ -293,7 +308,7 @@ impl AuctionOrchestrator {
                 "Launching bid request to: {} (backend: {}, budget: {}ms)",
                 provider.provider_name(),
                 backend_name,
-                remaining_ms
+                effective_timeout
             );
 
             let start_time = Instant::now();
@@ -329,6 +344,11 @@ impl AuctionOrchestrator {
         // Phase 2: Wait for responses using select() to process as they become ready.
         // Enforce the auction deadline: after each select() returns, check
         // elapsed time and drop remaining requests if the timeout is exceeded.
+        //
+        // NOTE: `select()` blocks until at least one backend responds (or its
+        // transport timeout fires). Hard deadline enforcement therefore depends
+        // on every backend's `first_byte_timeout` being set to at most the
+        // remaining auction budget — which Phase 1 above guarantees.
         let mut responses = Vec::new();
         let mut remaining = pending_requests;
 
@@ -695,7 +715,13 @@ mod tests {
     // Untested timeout enforcement paths (require real backends):
     // - Deadline check in select() loop (drops remaining requests)
     // - Mediator skip when remaining_ms == 0 (bidding exhausts budget)
+    // - Provider skip when effective_timeout == 0 (budget exhausted before launch)
     // - Provider context receives reduced timeout_ms per remaining budget
+    //
+    // Follow-up: introduce a thin abstraction over `select()` (e.g. a trait)
+    // so the deadline/drop logic can be unit-tested with mock futures instead
+    // of requiring real Fastly backends.  An `#[ignore]` integration test
+    // exercising the full path via Viceroy would also catch regressions.
 
     #[tokio::test]
     async fn test_no_providers_configured() {

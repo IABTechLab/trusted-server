@@ -92,8 +92,11 @@ impl<'a> BackendConfig<'a> {
 
     /// Compute the deterministic backend name without registering anything.
     ///
-    /// The name encodes scheme, host, port, and certificate setting so that
-    /// backends with different configurations never collide.
+    /// The name encodes scheme, host, port, certificate setting, and
+    /// first-byte timeout so that backends with different configurations
+    /// never collide.  Including the timeout prevents "first-registration-wins"
+    /// poisoning where a later request for the same origin with a tighter
+    /// timeout would silently inherit the original registration's value.
     fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
@@ -111,10 +114,12 @@ impl<'a> BackendConfig<'a> {
         } else {
             "_nocert"
         };
+        let timeout_ms = self.first_byte_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}",
+            "backend_{}{}_t{}",
             name_base.replace(['.', ':'], "_"),
-            cert_suffix
+            cert_suffix,
+            timeout_ms
         );
 
         Ok((backend_name, target_port))
@@ -122,10 +127,10 @@ impl<'a> BackendConfig<'a> {
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
-    /// The backend name is derived from the scheme, host, port, and certificate
-    /// setting to avoid collisions. **Note:** `first_byte_timeout` is *not*
-    /// part of the name, so backends for the same origin share a single
-    /// registration (first-registration-wins for timeout and other settings).
+    /// The backend name is derived from the scheme, host, port, certificate
+    /// setting, and `first_byte_timeout` to avoid collisions.  Different
+    /// timeout values produce different backend registrations so that a
+    /// tight deadline cannot be silently widened by an earlier registration.
     ///
     /// # Errors
     ///
@@ -186,6 +191,33 @@ impl<'a> BackendConfig<'a> {
         }
     }
 
+    /// Parse an origin URL into its (scheme, host, port) components.
+    ///
+    /// Centralises URL parsing so that [`from_url`](Self::from_url),
+    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout),
+    /// and [`backend_name_for_url`](Self::backend_name_for_url) share one
+    /// code-path.
+    fn parse_origin(
+        origin_url: &str,
+    ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
+        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("Invalid origin_url: {}", origin_url),
+        })?;
+
+        let scheme = parsed_url.scheme().to_owned();
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::Proxy {
+                    message: "Missing host in origin_url".to_string(),
+                })
+            })?
+            .to_owned();
+        let port = parsed_url.port();
+
+        Ok((scheme, host, port))
+    }
+
     /// Parse an origin URL and ensure a dynamic backend exists for it.
     ///
     /// This is a convenience constructor that parses the URL, extracts scheme,
@@ -223,31 +255,26 @@ impl<'a> BackendConfig<'a> {
         certificate_check: bool,
         first_byte_timeout: Duration,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", origin_url),
-        })?;
+        let (scheme, host, port) = Self::parse_origin(origin_url)?;
 
-        let scheme = parsed_url.scheme();
-        let host = parsed_url.host_str().ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "Missing host in origin_url".to_string(),
-            })
-        })?;
-        let port = parsed_url.port();
-
-        BackendConfig::new(scheme, host)
+        BackendConfig::new(&scheme, &host)
             .port(port)
             .certificate_check(certificate_check)
             .first_byte_timeout(first_byte_timeout)
             .ensure()
     }
 
-    /// Compute the backend name that [`from_url`](Self::from_url) would produce
-    /// for the given URL, **without** registering a backend.
+    /// Compute the backend name that
+    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
+    /// would produce for the given URL and timeout, **without** registering a
+    /// backend.
     ///
     /// This is useful when callers need the name for mapping purposes (e.g. the
     /// auction orchestrator correlating responses to providers) but want the
     /// actual registration to happen later with specific settings.
+    ///
+    /// The `first_byte_timeout` must match the value that will be used at
+    /// registration time so that the predicted name is correct.
     ///
     /// # Errors
     ///
@@ -255,22 +282,14 @@ impl<'a> BackendConfig<'a> {
     pub fn backend_name_for_url(
         origin_url: &str,
         certificate_check: bool,
+        first_byte_timeout: Duration,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", origin_url),
-        })?;
+        let (scheme, host, port) = Self::parse_origin(origin_url)?;
 
-        let scheme = parsed_url.scheme();
-        let host = parsed_url.host_str().ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "Missing host in origin_url".to_string(),
-            })
-        })?;
-        let port = parsed_url.port();
-
-        let (name, _) = BackendConfig::new(scheme, host)
+        let (name, _) = BackendConfig::new(&scheme, &host)
             .port(port)
             .certificate_check(certificate_check)
+            .first_byte_timeout(first_byte_timeout)
             .compute_name()?;
 
         Ok(name)
@@ -328,7 +347,7 @@ mod tests {
         let name = BackendConfig::new("https", "origin.example.com")
             .ensure()
             .expect("should create backend for valid HTTPS origin");
-        assert_eq!(name, "backend_https_origin_example_com_443");
+        assert_eq!(name, "backend_https_origin_example_com_443_t15000");
     }
 
     #[test]
@@ -337,7 +356,7 @@ mod tests {
             .certificate_check(false)
             .ensure()
             .expect("should create backend with cert check disabled");
-        assert_eq!(name, "backend_https_origin_example_com_443_nocert");
+        assert_eq!(name, "backend_https_origin_example_com_443_nocert_t15000");
     }
 
     #[test]
@@ -346,11 +365,7 @@ mod tests {
             .port(Some(8080))
             .ensure()
             .expect("should create backend for HTTP origin with explicit port");
-        assert_eq!(name, "backend_http_api_test-site_org_8080");
-        assert!(
-            name.ends_with("_8080"),
-            "should sanitize ':' to '_' in backend name"
-        );
+        assert_eq!(name, "backend_http_api_test-site_org_8080_t15000");
     }
 
     #[test]
@@ -358,7 +373,7 @@ mod tests {
         let name = BackendConfig::new("http", "example.org")
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
-        assert_eq!(name, "backend_http_example_org_80");
+        assert_eq!(name, "backend_http_example_org_80_t15000");
     }
 
     #[test]
@@ -384,6 +399,32 @@ mod tests {
         assert_eq!(
             first, second,
             "should return same backend name on repeat call"
+        );
+    }
+
+    #[test]
+    fn different_timeouts_produce_different_names() {
+        use std::time::Duration;
+
+        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+            .first_byte_timeout(Duration::from_millis(2000))
+            .compute_name()
+            .expect("should compute name with 2000ms timeout");
+        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+            .first_byte_timeout(Duration::from_millis(500))
+            .compute_name()
+            .expect("should compute name with 500ms timeout");
+        assert_ne!(
+            name_a, name_b,
+            "backends with different timeouts should have different names"
+        );
+        assert!(
+            name_a.ends_with("_t2000"),
+            "name should include timeout suffix"
+        );
+        assert!(
+            name_b.ends_with("_t500"),
+            "name should include timeout suffix"
         );
     }
 }

@@ -521,8 +521,13 @@ impl AuctionProvider for ApsAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self) -> Option<String> {
-        BackendConfig::backend_name_for_url(&self.config.endpoint, true).ok()
+    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
+        BackendConfig::backend_name_for_url(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .ok()
     }
 }
 
