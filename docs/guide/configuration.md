@@ -92,7 +92,8 @@ secret_store_id = "01GYYY"
 enabled = true
 server_url = "https://prebid-server.com/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["kargo", "rubicon", "appnexus"]
+bidders = ["kargo", "appnexus", "openx"]
+client_side_bidders = ["rubicon"]
 ```
 
 ## Detailed Reference
@@ -744,6 +745,7 @@ apply when the integration section exists in `trusted-server.toml`.
 | `debug`              | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses) |
 | `test_mode`          | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                          |
 | `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging                                                                  |
+| `client_side_bidders`| Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                |
 
 **Example**:
@@ -753,9 +755,12 @@ apply when the integration section exists in `trusted-server.toml`.
 enabled = true
 server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["kargo", "rubicon", "appnexus", "openx"]
+bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
+
+# Bidders that run client-side via native Prebid.js adapters
+client_side_bidders = ["rubicon"]
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
@@ -767,7 +772,8 @@ script_patterns = ["/prebid.js", "/prebid.min.js"]
 TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,appnexus,openx
+TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=rubicon
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG_QUERY_PARAMS=debug=1

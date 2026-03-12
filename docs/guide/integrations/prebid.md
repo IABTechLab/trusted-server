@@ -19,9 +19,13 @@ Prebid is the leading open-source header bidding solution that allows publishers
 enabled = true
 server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["kargo", "rubicon", "appnexus"]
+bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
+
+# Bidders that run client-side via native Prebid.js adapters instead of
+# being routed through the server-side auction.
+client_side_bidders = ["rubicon"]
 
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
@@ -44,7 +48,8 @@ in_content   = {placementId = "_s2sContentPlacement"}
 | `debug`                    | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)             |
 | `test_mode`                | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand |
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                        |
-| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                      |
+| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders) |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                |
 
 ## Debug Mode
 
@@ -178,6 +183,46 @@ the outgoing bidder params become:
 
 For an unrecognised zone (e.g., `sidebar`), the incoming params are left unchanged.
 
+## Client-Side Bidders
+
+Some Prebid.js bid adapters do not work well through Prebid Server (e.g. Magnite/Rubicon). The `client_side_bidders` config field lets you keep these bidders running natively in the browser while routing all other bidders through the server-side auction.
+
+### How it works
+
+1. The server injects the `clientSideBidders` list into the page via `window.__tsjs_prebid`.
+2. When `pbjs.requestBids()` is called, the TSJS shim checks each bid against the list.
+3. **Client-side bidders** are left as standalone bids — their native Prebid.js adapters handle them in the browser.
+4. **All other bidders** are absorbed into the `trustedServer` adapter and routed through the `/auction` orchestrator to Prebid Server.
+5. Both sets of bids compete in the same Prebid.js auction.
+
+### Configuration
+
+```toml
+[integrations.prebid]
+bidders = ["kargo", "appnexus", "openx"]    # server-side via PBS
+client_side_bidders = ["rubicon"]             # native browser adapters
+```
+
+The two lists are independent — the operator manages both explicitly. If a bidder appears in both lists, a warning is logged at startup (the bidder will run in both paths, which is likely unintended).
+
+### Build-time adapter selection
+
+Client-side bidders need their Prebid.js adapter modules bundled in the JS output. This is controlled by the `TSJS_PREBID_ADAPTERS` environment variable at build time:
+
+```bash
+# Default: only rubicon
+TSJS_PREBID_ADAPTERS=rubicon
+
+# Multiple adapters
+TSJS_PREBID_ADAPTERS=rubicon,appnexus,openx
+```
+
+The build script (`build-all.mjs`) validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js` and generates `_adapters.generated.ts` with the appropriate imports. At runtime, TSJS also validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
+
+::: warning
+Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a rebuild with the adapter included in `TSJS_PREBID_ADAPTERS`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
+:::
+
 ## Endpoints
 
 ### GET /first-party/ad
@@ -220,7 +265,7 @@ Replace client-side Prebid.js entirely with server-side auctions for maximum per
 
 ### Hybrid Client + Server
 
-Use server-side for primary demand, client-side for niche bidders.
+Use server-side for primary demand and `client_side_bidders` for adapters that don't work well with Prebid Server (e.g. Magnite/Rubicon). See [Client-Side Bidders](#client-side-bidders) for configuration details.
 
 ### Mobile-First Monetization
 
