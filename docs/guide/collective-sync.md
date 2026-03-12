@@ -74,12 +74,12 @@ Each SSC ID maps to a compact JSON record optimized for fast reads:
 }
 ```
 
-| Field | Type     | Description                        |
-| ----- | -------- | ---------------------------------- |
-| `sid` | string   | Full SSC ID (`64hex.6alnum`)       |
-| `seg` | string[] | Audience segments                  |
-| `lst` | integer  | Last seen timestamp (Unix epoch)   |
-| `src` | string[] | Contributing publisher domains     |
+| Field | Type     | Description                      |
+| ----- | -------- | -------------------------------- |
+| `sid` | string   | Full SSC ID (`64hex.6alnum`)     |
+| `seg` | string[] | Audience segments                |
+| `lst` | integer  | Last seen timestamp (Unix epoch) |
+| `src` | string[] | Contributing publisher domains   |
 
 ### Object Store Record (Source of Truth)
 
