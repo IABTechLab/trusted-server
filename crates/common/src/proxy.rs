@@ -12,8 +12,8 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::ssc::get_ssc_id;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
-use crate::synthetic::get_synthetic_id;
 
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
@@ -36,8 +36,8 @@ pub struct ProxyRequestConfig<'a> {
     pub target_url: &'a str,
     /// Whether redirects should be followed automatically.
     pub follow_redirects: bool,
-    /// Whether to append the caller's synthetic ID as a query param.
-    pub forward_synthetic_id: bool,
+    /// Whether to append the caller's SSC ID as a query param.
+    pub forward_ssc_id: bool,
     /// Optional body to send to the origin.
     pub body: Option<Vec<u8>>,
     /// Additional headers to forward to the origin.
@@ -47,13 +47,13 @@ pub struct ProxyRequestConfig<'a> {
 }
 
 impl<'a> ProxyRequestConfig<'a> {
-    /// Build a proxy configuration that follows redirects and forwards the synthetic ID.
+    /// Build a proxy configuration that follows redirects and forwards the SSC ID.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
             target_url,
             follow_redirects: true,
-            forward_synthetic_id: true,
+            forward_ssc_id: true,
             body: None,
             headers: Vec::new(),
             stream_passthrough: false,
@@ -380,7 +380,7 @@ fn finalize_response(
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
-/// the caller's synthetic ID as a `synthetic_id` query parameter to the target URL.
+/// the caller's SSC ID as a `ts-ssc` query parameter to the target URL.
 /// Optional bodies/headers can be supplied via [`ProxyRequestConfig`].
 ///
 /// # Errors
@@ -395,7 +395,7 @@ pub async fn proxy_request(
     let ProxyRequestConfig {
         target_url,
         follow_redirects,
-        forward_synthetic_id,
+        forward_ssc_id,
         body,
         headers,
         stream_passthrough,
@@ -407,8 +407,8 @@ pub async fn proxy_request(
         })
     })?;
 
-    if forward_synthetic_id {
-        append_synthetic_id(&req, &mut target_url_parsed);
+    if forward_ssc_id {
+        append_ssc_id(&req, &mut target_url_parsed);
     }
 
     proxy_with_redirects(
@@ -423,23 +423,23 @@ pub async fn proxy_request(
     .await
 }
 
-fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
-    let synthetic_id_param = match get_synthetic_id(req) {
+fn append_ssc_id(req: &Request, target_url_parsed: &mut url::Url) {
+    let ssc_id_param = match get_ssc_id(req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
+            log::warn!("failed to extract SSC ID for forwarding: {:?}", e);
             None
         }
     };
 
-    if let Some(synthetic_id) = synthetic_id_param {
+    if let Some(ssc_id) = ssc_id_param {
         let mut pairs: Vec<(String, String)> = target_url_parsed
             .query_pairs()
-            .filter(|(k, _)| k.as_ref() != "synthetic_id")
+            .filter(|(k, _)| k.as_ref() != "ts-ssc")
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
 
-        pairs.push(("synthetic_id".to_string(), synthetic_id));
+        pairs.push(("ts-ssc".to_string(), ssc_id));
 
         target_url_parsed.set_query(None);
         if !pairs.is_empty() {
@@ -452,11 +452,11 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
         }
 
         log::debug!(
-            "forwarding synthetic_id to origin url {}",
+            "forwarding SSC ID to origin url {}",
             target_url_parsed.as_str()
         );
     } else {
-        log::debug!("no synthetic_id to forward to origin");
+        log::debug!("no SSC ID to forward to origin");
     }
 }
 
@@ -611,7 +611,7 @@ pub async fn handle_first_party_proxy(
         ProxyRequestConfig {
             target_url: &target_url,
             follow_redirects: true,
-            forward_synthetic_id: true,
+            forward_ssc_id: true,
             body: None,
             headers: Vec::new(),
             stream_passthrough: false,
@@ -640,24 +640,24 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
-    let synthetic_id = match get_synthetic_id(&req) {
+    let ssc_id = match get_ssc_id(&req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
+            log::warn!("failed to extract SSC ID for forwarding: {:?}", e);
             None
         }
     };
 
     let mut redirect_target = full_for_token.clone();
-    if let Some(ref synthetic_id_value) = synthetic_id {
+    if let Some(ref ssc_id_value) = ssc_id {
         match url::Url::parse(&redirect_target) {
             Ok(mut url) => {
                 let mut pairs: Vec<(String, String)> = url
                     .query_pairs()
-                    .filter(|(k, _)| k.as_ref() != "synthetic_id")
+                    .filter(|(k, _)| k.as_ref() != "ts-ssc")
                     .map(|(k, v)| (k.into_owned(), v.into_owned()))
                     .collect();
-                pairs.push(("synthetic_id".to_string(), synthetic_id_value.clone()));
+                pairs.push(("ts-ssc".to_string(), ssc_id_value.clone()));
 
                 url.set_query(None);
                 if !pairs.is_empty() {
@@ -670,14 +670,11 @@ pub async fn handle_first_party_click(
                 }
 
                 let final_target = url.to_string();
-                log::debug!("forwarding synthetic_id to target url {}", final_target);
+                log::debug!("forwarding SSC ID to target url {}", final_target);
                 redirect_target = final_target;
             }
             Err(e) => {
-                log::warn!(
-                    "failed to parse target url for synthetic forwarding: {:?}",
-                    e
-                );
+                log::warn!("failed to parse target url for SSC ID forwarding: {:?}", e);
             }
         }
     }
@@ -692,13 +689,13 @@ pub async fn handle_first_party_click(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
-        "redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
+        "redirect tsurl={} params_present={} target={} referer={} ua={} ssc_id={}",
         tsurl,
         had_params,
         redirect_target,
         referer,
         ua,
-        synthetic_id.as_deref().unwrap_or("")
+        ssc_id.as_deref().unwrap_or("")
     );
 
     // 302 redirect to target URL
@@ -1199,10 +1196,7 @@ mod tests {
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
-        assert!(
-            cfg.forward_synthetic_id,
-            "should forward synthetic id by default"
-        );
+        assert!(cfg.forward_ssc_id, "should forward SSC ID by default");
         assert_eq!(cfg.body.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(cfg.headers.len(), 1, "should include custom header");
         assert!(
@@ -1276,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn click_appends_synthetic_id_when_present() {
+    async fn click_appends_ssc_id_when_present() {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/a.png";
         let params = "foo=1";
@@ -1291,7 +1285,7 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, "synthetic-123");
+        req.set_header(crate::constants::HEADER_X_TS_SSC, "ssc-123");
 
         let resp = handle_first_party_click(&settings, req)
             .await
@@ -1307,10 +1301,7 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(
-            pairs.remove("synthetic_id").as_deref(),
-            Some("synthetic-123")
-        );
+        assert_eq!(pairs.remove("ts-ssc").as_deref(), Some("ssc-123"));
         assert!(pairs.is_empty());
     }
 

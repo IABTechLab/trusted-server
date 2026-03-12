@@ -8,7 +8,7 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
 
 - **Privacy Control** - All resources load through your domain
 - **First-Party Context** - Cookies and storage use your domain
-- **Synthetic ID Integration** - Automatic ID forwarding to trackers
+- **SSC ID Integration** - Automatic ID forwarding to trackers
 - **Security** - Validated, signed URLs prevent tampering
 - **GDPR Compliance** - Controlled data sharing
 
@@ -955,4 +955,4 @@ Track these metrics:
 - Learn about [First-Party Proxy](/guide/first-party-proxy) for URL handling
 - Review [Integration Guide](/guide/integration-guide) for custom rewriters
 - Set up [Configuration](/guide/configuration) for your creatives
-- Explore [Synthetic IDs](/guide/synthetic-ids) for identity management
+- Explore [Server Side Cookies](/guide/synthetic-ids) for identity management

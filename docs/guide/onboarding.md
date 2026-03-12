@@ -40,7 +40,7 @@ Welcome to the Trusted Server project! This guide keeps internal onboarding note
 | `crates/fastly/src/main.rs`                  | Request routing entry point      |
 | `crates/common/src/publisher.rs`             | Publisher origin handling        |
 | `crates/common/src/proxy.rs`                 | First-party proxy implementation |
-| `crates/common/src/synthetic.rs`             | Synthetic ID generation          |
+| `crates/common/src/ssc.rs`                   | SSC ID generation                |
 | `crates/common/src/integrations/registry.rs` | Integration module pattern       |
 | `trusted-server.toml`                        | Application configuration        |
 
@@ -146,7 +146,7 @@ Use this checklist to track your onboarding progress:
 
 - [ ] Read through `main.rs` to understand request routing
 - [ ] Trace a request through `publisher.rs` and `proxy.rs`
-- [ ] Understand synthetic ID generation in `synthetic.rs`
+- [ ] Understand SSC ID generation in `ssc.rs`
 - [ ] Review an existing integration (e.g., `prebid.rs`)
 
 ### Documentation & Contribution

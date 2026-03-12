@@ -67,7 +67,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  4. Generate User IDs (mod.rs:206-214)                               │
-│     - Create/retrieve synthetic ID (persistent)                      │
+│     - Create/retrieve SSC ID (persistent)                            │
 │     - Generate fresh ID (per-request)                                │
 └──────────────────────────────────────────────────────────────────────┘
                               │

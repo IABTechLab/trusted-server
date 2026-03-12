@@ -72,7 +72,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 #### Technical Tasks
 
 - [ ] Instrument proxy request handlers to emit domain call events
-- [ ] Add session/page_id correlation (via synthetic ID or request header)
+- [ ] Add session/page_id correlation (via SSC ID or request header)
 - [ ] Create domain allowlist configuration in settings.toml
 - [ ] Emit `unauthorized_domain` alert event when unknown domain called
 - [ ] Track request timing (DNS, connect, TTFB, total)
@@ -84,7 +84,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
   "event_type": "domain_call",
   "timestamp": "2026-01-24T09:45:00Z",
   "page_id": "uuid",
-  "synthetic_id": "abc123",
+  "ssc_id": "abc123",
   "domain": "ads.example.com",
   "full_url": "https://ads.example.com/bid?id=123",
   "request_type": "xhr",

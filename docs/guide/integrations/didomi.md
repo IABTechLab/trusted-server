@@ -132,7 +132,7 @@ Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
 
 Didomi consent status is checked before:
 
-- Generating synthetic IDs
+- Generating SSC IDs
 - Syncing with identity partners (Lockr)
 - Activating tracking pixels
 - Sharing data with third parties

@@ -25,15 +25,15 @@ pub mod tests {
             enabled = false
             rewrite_attributes = ["href", "link", "url"]
 
-            [synthetic] 
+            [ssc]
             counter_store = "test-counter-store"
             opid_store = "test-opid-store"
             secret_key = "test-secret-key"
-            template = "{{client_ip}}:{{user_agent}}:{{first_party_id}}:{{auth_user_id}}:{{publisher_domain}}:{{accept_language}}"
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
-            "#.to_string()
+            "#
+        .to_string()
     }
 
     #[must_use]

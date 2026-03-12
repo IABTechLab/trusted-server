@@ -576,7 +576,7 @@ impl PrebidAuctionProvider {
         let user = Some(User {
             id: Some(request.user.id.clone()),
             ext: Some(UserExt {
-                synthetic_fresh: Some(request.user.fresh_id.clone()),
+                ssc_fresh: Some(request.user.fresh_id.clone()),
             }),
         });
 
@@ -1080,7 +1080,7 @@ mod tests {
         )
     }
 
-    /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
+    /// Shared TOML prefix for config-parsing tests (publisher + ssc sections).
     const TOML_BASE: &str = r#"
 [publisher]
 domain = "test-publisher.com"
@@ -1088,11 +1088,10 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
+[ssc]
 counter_store = "test-counter-store"
 opid_store = "test-opid-store"
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section

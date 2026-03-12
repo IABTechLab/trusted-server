@@ -10,7 +10,7 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Problem**: Safari and Firefox block third-party cookies, fragmenting user identity and reducing addressable inventory CPMs by 30-50%.
 
-**Solution**: Trusted Server's synthetic ID system maintains user recognition across cookieless browsers through first-party identifiers.
+**Solution**: Trusted Server's Server Side Cookie (SSC) system maintains user recognition across cookieless browsers through first-party identifiers.
 
 **Business Impact**:
 
@@ -258,7 +258,7 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Vendor Consolidation**:
 
-- Identity vendors: 3 → 1 (Lockr + synthetic IDs)
+- Identity vendors: 3 → 1 (Lockr + SSC IDs)
 - Ad tech vendors: 5 → 2 (Prebid + Trusted Server)
 - CMP vendors: Integrated (Didomi first-party)
 - Analytics: Built-in observability

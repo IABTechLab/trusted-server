@@ -18,7 +18,7 @@ import { installGptGuard } from './script_guard';
  *     signals before the real GPT processes the command.
  *
  * Future enhancements (driven by config or tsjs API):
- *   - Inject synthetic ID as page-level key-value targeting.
+ *   - Inject SSC ID as page-level key-value targeting.
  *   - Gate ad requests on consent status.
  *   - Rewrite ad-unit paths for A/B testing.
  */
@@ -80,7 +80,7 @@ function ensureGoogleTagStub(win: GptWindow): Partial<GoogleTag> {
  * Wrap a queued GPT callback to add instrumentation and future hook points.
  *
  * Today the wrapper only logs; as the integration matures it will inject
- * synthetic ID targeting and consent gates.
+ * SSC ID targeting and consent gates.
  */
 function wrapCommand(fn: () => void): () => void {
   return () => {

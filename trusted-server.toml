@@ -9,17 +9,10 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
-[synthetic]
+[ssc]
 counter_store = "counter_store"
 opid_store = "opid_store"
 secret_key = "trusted-server"
-# Possible values
-#   - "client_ip"
-#   - "user_agent"
-#   - "accept_language"
-#   - "accept_encoding"
-#   - "random_uuid"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex

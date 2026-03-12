@@ -1,6 +1,6 @@
 # Collective Sync Architecture
 
-Trusted Server supports cross-publisher data sharing through a **Collective Sync** model. Publishers who share the same synthetic ID secret key can synchronize user data across their properties, enabling privacy-preserving audience insights without third-party cookies.
+Trusted Server supports cross-publisher data sharing through a **Collective Sync** model. Publishers who share the same SSC secret key can synchronize user data across their properties, enabling privacy-preserving audience insights without third-party cookies.
 
 ## Overview
 
@@ -13,7 +13,7 @@ sequenceDiagram
     participant Partner as Partner TS Instance
 
     Browser->>TS: Page request
-    TS->>KV: Lookup synthetic_id
+    TS->>KV: Lookup ts-ssc
     alt Cache hit
         KV-->>TS: Return user data
     else Cache miss
@@ -63,7 +63,7 @@ kv_store = "collective_store"
 
 ### KV Store Record
 
-Each synthetic ID maps to a compact JSON record optimized for fast reads:
+Each SSC ID maps to a compact JSON record optimized for fast reads:
 
 ```json
 {
@@ -76,7 +76,7 @@ Each synthetic ID maps to a compact JSON record optimized for fast reads:
 
 | Field | Type     | Description                        |
 | ----- | -------- | ---------------------------------- |
-| `sid` | string   | Full synthetic ID (`64hex.6alnum`) |
+| `sid` | string   | Full SSC ID (`64hex.6alnum`)       |
 | `seg` | string[] | Audience segments                  |
 | `lst` | integer  | Last seen timestamp (Unix epoch)   |
 | `src` | string[] | Contributing publisher domains     |
@@ -87,7 +87,7 @@ The Object Store maintains a richer record with full history:
 
 ```json
 {
-  "synthetic_id": "0f99d7dc...a98e.45np22",
+  "ssc_id": "0f99d7dc...a98e.45np22",
   "hmac_base": "0f99d7dc...a98e",
   "random_suffix": "45np22",
   "segments": ["auto-intender", "sports-fan"],
@@ -115,8 +115,8 @@ Authorization: Bearer <collective-token>
 Response (NDJSON stream for large datasets):
 
 ```json
-{"synthetic_id": "abc123.x1y2z3", "segments": [...], "last_seen": "..."}
-{"synthetic_id": "def456.a1b2c3", "segments": [...], "last_seen": "..."}
+{"ssc_id": "abc123.x1y2z3", "segments": [...], "last_seen": "..."}
+{"ssc_id": "def456.a1b2c3", "segments": [...], "last_seen": "..."}
 ```
 
 ### Incremental Updates
@@ -133,7 +133,7 @@ Response includes only records modified after the `since` timestamp:
 ```json
 {
   "records": [
-    {"synthetic_id": "abc123.x1y2z3", "segments": [...], "last_seen": "..."}
+    {"ssc_id": "abc123.x1y2z3", "segments": [...], "last_seen": "..."}
   ],
   "next_cursor": "1706475000",
   "has_more": false
@@ -152,7 +152,7 @@ Content-Type: application/json
 {
   "records": [
     {
-      "synthetic_id": "abc123.x1y2z3",
+      "ssc_id": "abc123.x1y2z3",
       "segments": ["new-segment"],
       "source_domain": "pub-a.com"
     }
@@ -162,7 +162,7 @@ Content-Type: application/json
 
 The sync endpoint handles:
 
-- Deduplication by synthetic_id
+- Deduplication by ssc_id
 - Segment merging (union of all observed segments)
 - Source tracking (which publishers contributed data)
 - Version increment for conflict resolution
@@ -173,8 +173,8 @@ The sync endpoint handles:
 
 ```
 1. Browser request arrives at edge
-2. Extract/generate synthetic_id
-3. KV Store lookup by synthetic_id
+2. Extract/generate SSC ID
+3. KV Store lookup by SSC ID
 4. If hit: return cached segments
 5. If miss: fetch from Object Store, populate KV, return
 ```
@@ -191,7 +191,7 @@ The sync endpoint handles:
 
 ## Privacy Considerations
 
-- **No PII**: Synthetic IDs contain no personally identifiable information
+- **No PII**: SSC IDs contain no personally identifiable information
 - **Consent-gated**: Only users with GDPR consent are included
 - **Publisher control**: Each publisher controls what segments they share
 - **Audit trail**: Object Store maintains full history of data sources
@@ -208,6 +208,6 @@ The sync endpoint handles:
 
 ## Next Steps
 
-- [Synthetic IDs](/guide/synthetic-ids) - Understand ID generation
+- [Server Side Cookies](/guide/synthetic-ids) - Understand ID generation
 - [Configuration Reference](/guide/configuration) - Full config options
 - [GDPR Compliance](/guide/gdpr-compliance) - Privacy requirements

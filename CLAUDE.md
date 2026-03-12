@@ -6,7 +6,7 @@
 ## Project Overview
 
 Rust-based edge computing application targeting **Fastly Compute**. Handles
-privacy-preserving synthetic ID generation, ad serving with GDPR compliance,
+privacy-preserving Server Side Cookie (SSC) ID generation, ad serving with GDPR compliance,
 real-time bidding integration, and publisher-side JavaScript injection.
 
 ## Workspace Layout
@@ -366,7 +366,7 @@ both runtime behavior and build/tooling changes.
 | `crates/common/src/tsjs.rs`                  | Script tag generation with module IDs             |
 | `crates/common/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
 | `crates/common/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/common/src/synthetic.rs`             | Synthetic ID generation                           |
+| `crates/common/src/ssc.rs`                   | Server Side Cookie (SSC) ID generation            |
 | `crates/common/src/cookies.rs`               | Cookie handling                                   |
 | `crates/common/src/gdpr.rs`                  | GDPR consent management                           |
 | `crates/common/src/http_wrapper.rs`          | HTTP abstractions                                 |

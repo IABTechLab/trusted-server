@@ -69,7 +69,7 @@ proxy_secret = "change-me-to-random-string"
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `synthetic.secret_key`
+- `ssc.secret_key`
 
 ---
 
@@ -129,12 +129,12 @@ See [Configuration Reference](./configuration.md) for complete patterns.
 
 ## Runtime Errors
 
-### Synthetic ID generation failed
+### SSC ID generation failed
 
 **Error Message:**
 
 ```
-Failed to generate synthetic ID: KV store not available
+Failed to generate SSC ID: KV store not available
 ```
 
 **Cause:** KV store (counter_store or opid_store) not configured in Fastly
@@ -146,7 +146,7 @@ Failed to generate synthetic ID: KV store not available
 3. Update `trusted-server.toml`:
 
 ```toml
-[synthetic]
+[ssc]
 counter_store = "counter_store"  # Must match Fastly KV store name
 opid_store = "opid_store"
 ```

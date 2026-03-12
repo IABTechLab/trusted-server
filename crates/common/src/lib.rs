@@ -16,8 +16,7 @@
 //! - [`privacy`]: Privacy utilities and helpers
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
-//! - [`synthetic`]: Synthetic ID generation using HMAC
-//! - [`templates`]: Handlebars template handling
+//! - [`ssc`]: Server Side Cookie (SSC) ID generation using HMAC
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`why`]: Debugging and introspection utilities
 
@@ -54,8 +53,8 @@ pub mod request_signing;
 pub mod rsc_flight;
 pub mod settings;
 pub mod settings_data;
+pub mod ssc;
 pub mod streaming_processor;
 pub mod streaming_replacer;
-pub mod synthetic;
 pub mod test_support;
 pub mod tsjs;

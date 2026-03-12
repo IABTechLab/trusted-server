@@ -231,4 +231,4 @@ See [crates/common/src/integrations/google_tag_manager.rs](https://github.com/IA
 
 - Review [Prebid Integration](/guide/integrations/prebid) for header bidding.
 - Check [Configuration Guide](/guide/configuration) for other integration settings.
-- Learn more about [Synthetic IDs](/guide/synthetic-ids) which are generated alongside this integration.
+- Learn more about [Server Side Cookies](/guide/synthetic-ids) which are generated alongside this integration.

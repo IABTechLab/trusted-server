@@ -33,9 +33,8 @@ pub enum TrustedServerError {
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
-    /// The synthetic secret key is using the insecure default value.
-
-    #[display("Synthetic secret key is set to the default value - this is insecure")]
+    /// The SSC secret key is using the insecure default value.
+    #[display("SSC secret key is set to the default value - this is insecure")]
     InsecureSecretKey,
 
     /// Invalid UTF-8 data encountered.
@@ -69,13 +68,9 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
-    /// Synthetic ID generation or validation failed.
-    #[display("Synthetic ID error: {message}")]
-    SyntheticId { message: String },
-
-    /// Template rendering error.
-    #[display("Template error: {message}")]
-    Template { message: String },
+    /// SSC ID generation or validation failed.
+    #[display("SSC error: {message}")]
+    Ssc { message: String },
 }
 
 impl Error for TrustedServerError {}
@@ -105,8 +100,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
-            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Ssc { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

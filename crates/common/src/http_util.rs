@@ -474,7 +474,7 @@ mod tests {
         req.set_header("x-custom-1", "value1");
         // HeaderName is case-insensitive and always lowercase, but set_header accepts strings
         req.set_header("X-Custom-2", "value2");
-        req.set_header("x-synthetic-id", "should not copy");
+        req.set_header("x-ts-ssc", "should not copy");
         req.set_header("x-geo-country", "US");
 
         let mut target = Request::new(fastly::http::Method::GET, "https://target.com");
@@ -491,8 +491,8 @@ mod tests {
             "Should copy arbitrary X-header (case insensitive)"
         );
         assert!(
-            target.get_header("x-synthetic-id").is_none(),
-            "Should filter x-synthetic-id"
+            target.get_header("x-ts-ssc").is_none(),
+            "Should filter x-ts-ssc"
         );
         assert!(
             target.get_header("x-geo-country").is_none(),

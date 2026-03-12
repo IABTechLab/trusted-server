@@ -20,7 +20,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 **Key Features:**
 
 - OpenRTB 2.x protocol conversion
-- Synthetic ID injection for privacy
+- SSC ID injection for privacy
 - First-party creative resource proxying
 - CDN URL rewriting (7+ major SSPs)
 - GPC signal support
@@ -125,7 +125,7 @@ rewrite_sdk = true
 
 **Key Features:**
 
-- Synthetic ID injection demonstration
+- SSC ID injection demonstration
 - Flexible JSON schema (preserves unknown fields)
 - Stream passthrough mode
 - Script replacement capability
@@ -146,7 +146,7 @@ rewrite_scripts = false
 
 - `POST /integrations/testlight/auction` - Auction endpoint with ID injection
 
-**When to use:** You're developing or testing integration functionality and need a simple endpoint to validate synthetic ID injection.
+**When to use:** You're developing or testing integration functionality and need a simple endpoint to validate SSC ID injection.
 
 **Learn more:** [Testing Guide](./testing.md)
 
@@ -263,7 +263,7 @@ No. Integration configuration is read at startup. You must redeploy to change in
 
 ### Are integrations required?
 
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and first-party proxying.
+No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for SSC ID generation and first-party proxying.
 
 ### How do I add a new integration?
 
