@@ -70,13 +70,13 @@ These decisions are finalized and reflected in this plan:
 
 Follow the EdgeZero convention (`{app}-core`, `{app}-adapter-{platform}`):
 
-| Current                                   | New                                                                                           | Purpose                          |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------- |
-| `crates/common` (`trusted-server-common`) | `crates/trusted-server-core` (`trusted-server-core`)                                          | Platform-agnostic business logic |
-| `crates/fastly` (`trusted-server-fastly`) | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)                      | Fastly Compute entry point       |
-| —                                         | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)                          | Native Axum dev server           |
-| —                                         | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`)               | Cloudflare Workers entry point   |
-| `crates/js` (`trusted-server-js`)         | `crates/js` (`trusted-server-js`)                                                             | JS build (unchanged)             |
+| Current                                   | New                                                                              | Purpose                          |
+| ----------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------- |
+| `crates/common` (`trusted-server-common`) | `crates/trusted-server-core` (`trusted-server-core`)                             | Platform-agnostic business logic |
+| `crates/fastly` (`trusted-server-fastly`) | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)         | Fastly Compute entry point       |
+| —                                         | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)             | Native Axum dev server           |
+| —                                         | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`) | Cloudflare Workers entry point   |
+| `crates/js` (`trusted-server-js`)         | `crates/js` (`trusted-server-js`)                                                | JS build (unchanged)             |
 
 The rename from `common` → `trusted-server-core` and `fastly` →
 `trusted-server-adapter-fastly` happens in **PR 1** (foundation) to avoid
@@ -89,25 +89,25 @@ mid-migration confusion. All subsequent PRs use the new names.
 The trusted-server uses these Fastly-specific primitives across ~28 source
 files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`:
 
-| Primitive                              | Files Affected                                      | EdgeZero Status                                    |
-| -------------------------------------- | --------------------------------------------------- | -------------------------------------------------- |
-| `fastly::Request` / `Response`         | All (~28 files)                                     | Ready (`http` crate types)                         |
-| `fastly::Body`                         | publisher, proxy, integrations                      | Ready (`edgezero_core::Body`)                      |
-| `fastly::backend::Backend` (dynamic)   | backend.rs, all integrations                        | Backlog ([#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087)) |
-| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists)                     |
-| `select(Vec<PendingRequest>)`          | auction/orchestrator.rs                             | Backlog ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)) |
+| Primitive                              | Files Affected                                      | EdgeZero Status                                                                                                                                                                          |
+| -------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fastly::Request` / `Response`         | All (~28 files)                                     | Ready (`http` crate types)                                                                                                                                                               |
+| `fastly::Body`                         | publisher, proxy, integrations                      | Ready (`edgezero_core::Body`)                                                                                                                                                            |
+| `fastly::backend::Backend` (dynamic)   | backend.rs, all integrations                        | Backlog ([#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))                                                        |
+| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists)                                                                                                                                                           |
+| `select(Vec<PendingRequest>)`          | auction/orchestrator.rs                             | Backlog ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))                                                                                       |
 | `fastly::ConfigStore`                  | fastly_storage.rs                                   | In review ([#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058), PR [#209](https://github.com/stackpop/edgezero/pull/209)) |
-| `fastly::SecretStore`                  | fastly_storage.rs                                   | Backlog ([#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)) |
+| `fastly::SecretStore`                  | fastly_storage.rs                                   | Backlog ([#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))                                                        |
 | KV Store (counter, opid, creative)     | fastly_storage.rs                                   | In review ([#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050), PR [#165](https://github.com/stackpop/edgezero/pull/165)) |
-| `fastly::geo::geo_lookup`              | geo.rs                                              | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info) |
-| `req.get_client_ip_addr()`             | geo.rs, synthetic.rs, didomi.rs, auction/formats.rs | Backlog ([#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)) |
-| `req.get_tls_protocol()`               | http_util.rs                                        | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info) |
-| `log_fastly::Logger`                   | main.rs                                             | Ready (adapter handles logging)                    |
-| `#[fastly::main]`                      | main.rs                                             | Ready (`dispatch()`)                               |
-| `fastly::http::Url`                    | integrations/prebid.rs                              | Trivial (use `url::Url`)                           |
-| `fastly::mime`                         | request_signing/endpoints.rs                        | Trivial (use `mime` crate)                         |
-| `response.get_backend_name()`          | auction/orchestrator.rs                             | Filed as [#213](https://github.com/stackpop/edgezero/issues/213) |
-| Fastly API transport (runtime updates) | fastly_storage.rs, request_signing/rotation.rs      | Adapter-specific implementation behind abstraction |
+| `fastly::geo::geo_lookup`              | geo.rs                                              | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                             |
+| `req.get_client_ip_addr()`             | geo.rs, synthetic.rs, didomi.rs, auction/formats.rs | Backlog ([#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092))                                                                            |
+| `req.get_tls_protocol()`               | http_util.rs                                        | Covered by [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (Client Info)                                                             |
+| `log_fastly::Logger`                   | main.rs                                             | Ready (adapter handles logging)                                                                                                                                                          |
+| `#[fastly::main]`                      | main.rs                                             | Ready (`dispatch()`)                                                                                                                                                                     |
+| `fastly::http::Url`                    | integrations/prebid.rs                              | Trivial (use `url::Url`)                                                                                                                                                                 |
+| `fastly::mime`                         | request_signing/endpoints.rs                        | Trivial (use `mime` crate)                                                                                                                                                               |
+| `response.get_backend_name()`          | auction/orchestrator.rs                             | Filed as [#213](https://github.com/stackpop/edgezero/issues/213)                                                                                                                         |
+| Fastly API transport (runtime updates) | fastly_storage.rs, request_signing/rotation.rs      | Adapter-specific implementation behind abstraction                                                                                                                                       |
 
 ### Import Locations
 
@@ -115,26 +115,26 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 > `crates/trusted-server-adapter-fastly/`). Before PR 1 lands, these correspond to
 > `crates/common/` and `crates/fastly/` respectively.
 
-| Module                                         | Fastly Imports                                                                           |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `crates/trusted-server-adapter-fastly/src/main.rs`            | `fastly::{Error, Request, Response}`, `fastly::http::Method`, `log_fastly::Logger`       |
-| `crates/trusted-server-adapter-fastly/src/error.rs`           | `fastly::Response`                                                                       |
-| `crates/trusted-server-core/src/fastly_storage.rs`            | `fastly::{ConfigStore, Request, Response, SecretStore}`                                  |
-| `crates/trusted-server-core/src/backend.rs`                   | `fastly::backend::Backend`                                                               |
-| `crates/trusted-server-core/src/http_util.rs`                 | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
-| `crates/trusted-server-core/src/geo.rs`                       | `fastly::geo::geo_lookup`, `fastly::{Request, Response}`                                 |
-| `crates/trusted-server-core/src/publisher.rs`                 | `fastly::http::{header, StatusCode}`, `fastly::{Body, Request, Response}`                |
-| `crates/trusted-server-core/src/proxy.rs`                     | `fastly::http::{header, HeaderValue, Method, StatusCode}`, `fastly::{Request, Response}` |
-| `crates/trusted-server-core/src/auth.rs`                      | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
-| `crates/trusted-server-core/src/synthetic.rs`                 | `fastly::http::header`, `fastly::Request`                                                |
-| `crates/trusted-server-core/src/cookies.rs`                   | `fastly::http::header`, `fastly::Request`                                                |
-| `crates/trusted-server-core/src/auction/orchestrator.rs`      | `fastly::http::request::{select, PendingRequest}`                                        |
-| `crates/trusted-server-core/src/auction/provider.rs`          | `fastly::http::request::PendingRequest`, `fastly::Response`                              |
-| `crates/trusted-server-core/src/auction/types.rs`             | `fastly::Request`                                                                        |
-| `crates/trusted-server-core/src/auction/formats.rs`           | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
-| `crates/trusted-server-core/src/auction/endpoints.rs`         | `fastly::{Request, Response}`                                                            |
-| `crates/trusted-server-core/src/request_signing/endpoints.rs` | `fastly::{Request, Response}`, `fastly::mime`                                            |
-| `crates/trusted-server-core/src/integrations/registry.rs`     | `fastly::http::Method`, `fastly::{Request, Response}`                                    |
+| Module                                                                                 | Fastly Imports                                                                           |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `crates/trusted-server-adapter-fastly/src/main.rs`                                     | `fastly::{Error, Request, Response}`, `fastly::http::Method`, `log_fastly::Logger`       |
+| `crates/trusted-server-adapter-fastly/src/error.rs`                                    | `fastly::Response`                                                                       |
+| `crates/trusted-server-core/src/fastly_storage.rs`                                     | `fastly::{ConfigStore, Request, Response, SecretStore}`                                  |
+| `crates/trusted-server-core/src/backend.rs`                                            | `fastly::backend::Backend`                                                               |
+| `crates/trusted-server-core/src/http_util.rs`                                          | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
+| `crates/trusted-server-core/src/geo.rs`                                                | `fastly::geo::geo_lookup`, `fastly::{Request, Response}`                                 |
+| `crates/trusted-server-core/src/publisher.rs`                                          | `fastly::http::{header, StatusCode}`, `fastly::{Body, Request, Response}`                |
+| `crates/trusted-server-core/src/proxy.rs`                                              | `fastly::http::{header, HeaderValue, Method, StatusCode}`, `fastly::{Request, Response}` |
+| `crates/trusted-server-core/src/auth.rs`                                               | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
+| `crates/trusted-server-core/src/synthetic.rs`                                          | `fastly::http::header`, `fastly::Request`                                                |
+| `crates/trusted-server-core/src/cookies.rs`                                            | `fastly::http::header`, `fastly::Request`                                                |
+| `crates/trusted-server-core/src/auction/orchestrator.rs`                               | `fastly::http::request::{select, PendingRequest}`                                        |
+| `crates/trusted-server-core/src/auction/provider.rs`                                   | `fastly::http::request::PendingRequest`, `fastly::Response`                              |
+| `crates/trusted-server-core/src/auction/types.rs`                                      | `fastly::Request`                                                                        |
+| `crates/trusted-server-core/src/auction/formats.rs`                                    | `fastly::http::{header, StatusCode}`, `fastly::{Request, Response}`                      |
+| `crates/trusted-server-core/src/auction/endpoints.rs`                                  | `fastly::{Request, Response}`                                                            |
+| `crates/trusted-server-core/src/request_signing/endpoints.rs`                          | `fastly::{Request, Response}`, `fastly::mime`                                            |
+| `crates/trusted-server-core/src/integrations/registry.rs`                              | `fastly::http::Method`, `fastly::{Request, Response}`                                    |
 | All integration modules (superset — individual modules vary; not all use every import) | `fastly::http::{header, HeaderValue, Method, StatusCode}`, `fastly::{Request, Response}` |
 
 ---
@@ -145,8 +145,8 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 
 These are close to landing and unblock early migration phases.
 
-| Feature                  | Issues | PR   | Notes                                            |
-| ------------------------ | ------ | ---- | ------------------------------------------------ |
+| Feature                  | Issues                                                                                                             | PR                                                    | Notes                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ------------------------------------------------ |
 | KV Store Abstraction     | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050) | [#165](https://github.com/stackpop/edgezero/pull/165) | Covers counter_store, opid_store, creative_store |
 | Config Store Abstraction | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | [#209](https://github.com/stackpop/edgezero/pull/209) | Covers jwks_store, runtime config                |
 
@@ -319,12 +319,12 @@ to existing EdgeZero issues. Features that are core business logic (not EdgeZero
 concerns) are marked N/A. Features that were initially thought to need new
 issues have been resolved:
 
-| Feature                           | Issue                                                    | Resolution                                                                                                                             | Blocks TS PRs                                                                    |
-| --------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Geolocation Abstraction           | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `GeoLookup` included in client metadata. | PR 7 |
-| Response Backend Correlation      | [#213](https://github.com/stackpop/edgezero/issues/213)  | New task filed under [#79](https://github.com/stackpop/edgezero/issues/79). Async responses must carry an identifier for upstream correlation (`get_backend_name()` equivalent). | Swaps in after PR 6 (PR 6 uses `PlatformResponse.backend_name: Option<String>`; `Some` on Fastly, `None` on others until #213) |
-| TLS/Scheme Detection              | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `ClientInfo` includes TLS protocol and cipher info. | PR 7 |
-| Request-Signing Management Writes | N/A (core business logic)                                | Not an EdgeZero concern. Core signing code composes platform store CRUD primitives (`PlatformConfigStore`, `PlatformSecretStore`). No signing-specific trait. | PR 9 (store wiring)                                                              |
+| Feature                           | Issue                                                                                               | Resolution                                                                                                                                                                       | Blocks TS PRs                                                                                                                  |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Geolocation Abstraction           | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `GeoLookup` included in client metadata.                                        | PR 7                                                                                                                           |
+| Response Backend Correlation      | [#213](https://github.com/stackpop/edgezero/issues/213)                                             | New task filed under [#79](https://github.com/stackpop/edgezero/issues/79). Async responses must carry an identifier for upstream correlation (`get_backend_name()` equivalent). | Swaps in after PR 6 (PR 6 uses `PlatformResponse.backend_name: Option<String>`; `Some` on Fastly, `None` on others until #213) |
+| TLS/Scheme Detection              | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Already covered by Client Info epic (via [#89](https://github.com/stackpop/edgezero/issues/89)). `ClientInfo` includes TLS protocol and cipher info.                             | PR 7                                                                                                                           |
+| Request-Signing Management Writes | N/A (core business logic)                                                                           | Not an EdgeZero concern. Core signing code composes platform store CRUD primitives (`PlatformConfigStore`, `PlatformSecretStore`). No signing-specific trait.                    | PR 9 (store wiring)                                                                                                            |
 
 ### Not Required from EdgeZero
 
@@ -551,7 +551,7 @@ Changes:
      ```
      Reference coercion verifies **object safety** (traits can be used
      as `dyn`) without heap allocation — valid on all targets.
-  **What each mechanism proves:**
+     **What each mechanism proves:**
   - The static assertion (form 2) proves object safety on both host
     and wasm. It does **not** prove that any concrete impl satisfies
     `Send + Sync` — only that the trait itself permits `dyn` dispatch.
@@ -565,6 +565,7 @@ Changes:
     every async platform trait
 - Create `crates/trusted-server-core/src/platform/mod.rs` with submodules
 - Define `PlatformError` in `platform/error.rs`:
+
   ```rust
   #[derive(Debug, derive_more::Display)]
   pub enum PlatformError {
@@ -580,9 +581,11 @@ Changes:
 
   impl core::error::Error for PlatformError {}
   ```
+
   All platform trait methods return `Result<T, Report<PlatformError>>`.
   Callers use `change_context()` to map into `TrustedServerError` at
   application boundaries.
+
 - Define platform traits (signatures only, no implementations yet):
   - `PlatformConfigStore` (full CRUD):
     - `get(store: &StoreName, key) -> Result<Option<String>>`
@@ -767,7 +770,7 @@ Changes:
 - Implement `PlatformConfigStore` for Fastly — **read path only** in this PR
   (`fastly::ConfigStore::open()` / `.get()`). Write methods (`put`, `delete`)
   return `Err(Report::new(PlatformError::NotImplemented { operation:
-  "config_store write".into() }))` (not `unimplemented!()` — panics are
+"config_store write".into() }))` (not `unimplemented!()` — panics are
   not production-safe). `PlatformError` is defined in PR 2. Real write
   implementations land in PR 9. Add a test proving no runtime code path
   reaches write methods before PR 9: assert that key rotation endpoints
@@ -803,7 +806,7 @@ Changes:
   (`fastly::SecretStore::open()` / `.get()` / `.try_plaintext()`). Write
   methods (`create`, `delete`) return
   `Err(Report::new(PlatformError::NotImplemented { operation:
-  "secret_store write".into() }))` (not `unimplemented!()` — panics are
+"secret_store write".into() }))` (not `unimplemented!()` — panics are
   not production-safe). `PlatformError` is defined in PR 2. Real write
   implementations land in PR 9. Add a test proving no runtime code path
   reaches write methods before PR 9: assert that key rotation endpoints
@@ -906,6 +909,7 @@ Changes:
 - Update tests
 
 **Acceptance (one of two outcomes):**
+
 - **If platform-specific:** Add `PlatformContentRewriter` to `RuntimeServices`,
   implement for Fastly, wire at entry point — same pattern as other traits.
 - **If platform-agnostic:** Document verification that `html_processor.rs` and
@@ -948,6 +952,7 @@ Changes:
 - Update tests
 
 **Management-write credential requirements:**
+
 - Credentials for store write operations (Fastly API token, Cloudflare API
   token) must be sourced from the platform's secret store — never hardcoded
   or in environment variables accessible to application code
@@ -1053,6 +1058,7 @@ Changes:
 - Update all handler tests
 
 **Acceptance:**
+
 - All handler functions accept `http::Request` and return `http::Response`
   (or `PlatformResponse` where backend correlation is needed)
 - `PlatformResponse` now wraps `http::Response` (transition from
@@ -1072,6 +1078,7 @@ Changes:
 
 **Blocked by:** PR 12
 **Files:**
+
 - Framework: `crates/trusted-server-core/src/integrations/registry.rs`,
   `crates/trusted-server-core/src/auction/provider.rs`,
   `crates/trusted-server-core/src/auction/types.rs` (adds
@@ -1372,12 +1379,12 @@ service metrics, sampled from the same time-of-day window as the canary
 observation period (to account for traffic patterns). Source: Fastly
 real-time stats dashboard or equivalent observability pipeline.
 
-| Metric              | Threshold                    | Action if breached          |
-| ------------------- | ---------------------------- | --------------------------- |
-| Error rate (5xx)    | > 0.1% above baseline        | Immediate rollback          |
-| p95 latency         | > 15% above baseline         | Hold; rollback if no fix in 1h |
-| Auction win-rate    | > 1% delta from baseline     | Hold; investigate           |
-| Timeout rate        | > 2× baseline                | Immediate rollback          |
+| Metric           | Threshold                | Action if breached             |
+| ---------------- | ------------------------ | ------------------------------ |
+| Error rate (5xx) | > 0.1% above baseline    | Immediate rollback             |
+| p95 latency      | > 15% above baseline     | Hold; rollback if no fix in 1h |
+| Auction win-rate | > 1% delta from baseline | Hold; investigate              |
+| Timeout rate     | > 2× baseline            | Immediate rollback             |
 
 #### Rollback plan
 
@@ -1397,11 +1404,11 @@ real-time stats dashboard or equivalent observability pipeline.
 These are trusted-server-internal dependencies that are not EdgeZero features
 but are critical to the migration sequencing.
 
-| Prerequisite                    | Created In | Removed In | Purpose                                                    |
-| ------------------------------- | ---------- | ---------- | ---------------------------------------------------------- |
+| Prerequisite                                  | Created In | Removed In | Purpose                                                    |
+| --------------------------------------------- | ---------- | ---------- | ---------------------------------------------------------- |
 | Temporary compatibility adapter (`compat.rs`) | PR 11      | PR 15      | Bridges Fastly helper APIs during layered type migration   |
-| RuntimeServices struct          | PR 2       | —          | Single injection point for all platform behavior           |
-| Workspace CI enforcement        | PR 1       | —          | Ensures all crates build/test/lint together from the start |
+| RuntimeServices struct                        | PR 2       | —          | Single injection point for all platform behavior           |
+| Workspace CI enforcement                      | PR 1       | —          | Ensures all crates build/test/lint together from the start |
 
 ---
 
@@ -1456,22 +1463,22 @@ EdgeZero features **do not block** Phase 0 or Phase 1. During Phase 1, all
 trait implementations are backed by direct Fastly SDK calls. EdgeZero adapter
 implementations are swapped in when available — no application code changes.
 
-| Priority | Feature                           | EdgeZero Issues               | Status              | Swap-in Point |
-| -------- | --------------------------------- | ----------------------------- | ------------------- | ------------- |
-| P0       | KV Store                          | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050)   | In review (PR [#165](https://github.com/stackpop/edgezero/pull/165)) | After PR 5    |
-| P0       | Config Store                      | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | In review (PR [#209](https://github.com/stackpop/edgezero/pull/209)) | After PR 3    |
-| P0       | Secret Store                      | [#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067) | Backlog             | After PR 4    |
-| P0       | Dynamic Backend                   | [#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087) | Backlog             | After PR 6    |
-| P0       | Client Info (IP, TLS)             | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) | Backlog             | After PR 7    |
-| P0       | Concurrent Fan-out                | [#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148) | Backlog             | After PR 6    |
-| —        | Request-Signing Logic             | N/A (core business logic)     | Uses store CRUD     | PR 9          |
-| P1       | Content Rewriting                 | [#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117) | Backlog             | After PR 8    |
-| P1       | Cookie Support                    | [#93-95](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095) | Backlog             | PR 11         |
-| P1       | Static File ETag                  | [#104-106](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106) | Backlog             | PR 11         |
-| P1       | Response Headers                  | [#102-103](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103) | Backlog             | PR 14         |
-| P1       | Geolocation                       | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog             | After PR 7    |
-| P2       | Backend Correlation               | [#213](https://github.com/stackpop/edgezero/issues/213) (under [#79](https://github.com/stackpop/edgezero/issues/79)) | Filed               | After PR 6    |
-| P2       | TLS Detection                     | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog             | After PR 7    |
+| Priority | Feature               | EdgeZero Issues                                                                                                                                                 | Status                                                               | Swap-in Point |
+| -------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------- |
+| P0       | KV Store              | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050)                                              | In review (PR [#165](https://github.com/stackpop/edgezero/pull/165)) | After PR 5    |
+| P0       | Config Store          | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058)                                              | In review (PR [#209](https://github.com/stackpop/edgezero/pull/209)) | After PR 3    |
+| P0       | Secret Store          | [#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067)                                         | Backlog                                                              | After PR 4    |
+| P0       | Dynamic Backend       | [#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087)                                         | Backlog                                                              | After PR 6    |
+| P0       | Client Info (IP, TLS) | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)                                                             | Backlog                                                              | After PR 7    |
+| P0       | Concurrent Fan-out    | [#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)                                                                        | Backlog                                                              | After PR 6    |
+| —        | Request-Signing Logic | N/A (core business logic)                                                                                                                                       | Uses store CRUD                                                      | PR 9          |
+| P1       | Content Rewriting     | [#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117)                                                            | Backlog                                                              | After PR 8    |
+| P1       | Cookie Support        | [#93-95](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095)                                                                       | Backlog                                                              | PR 11         |
+| P1       | Static File ETag      | [#104-106](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20104%20105%20106)                                                                  | Backlog                                                              | PR 11         |
+| P1       | Response Headers      | [#102-103](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20102%20103)                                                                        | Backlog                                                              | PR 14         |
+| P1       | Geolocation           | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog                                                              | After PR 7    |
+| P2       | Backend Correlation   | [#213](https://github.com/stackpop/edgezero/issues/213) (under [#79](https://github.com/stackpop/edgezero/issues/79))                                           | Filed                                                                | After PR 6    |
+| P2       | TLS Detection         | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092) (via [#89](https://github.com/stackpop/edgezero/issues/89)) | Backlog                                                              | After PR 7    |
 
 ### Trusted-Server Issue Backlog
 
@@ -1480,25 +1487,25 @@ File issues (with TBD owners) before Phase 0 begins so the dependency
 graph is visible. Assign concrete owners during sprint planning — issues
 are not actionable until ownership is resolved.
 
-| PR   | Title                                                    | Blocked by | DoD (Definition of Done)                                                        | Owner | Labels                  | Milestone |
-| ---- | -------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------- | ----- | ----------------------- | --------- |
-| PR 1 | Rename crates and add EdgeZero workspace dependencies    | —          | All per-PR gates pass; `cargo doc` builds; CLAUDE.md updated                    | TBD   | edgezero, phase-0       | Phase 0   |
-| PR 2 | Define platform traits, PlatformError, RuntimeServices   | PR 1       | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send | TBD   | edgezero, phase-0       | Phase 0   |
-| PR 3 | Split fastly_storage.rs + config store trait (read-only) | PR 2       | File split done; read path wired; write stubs return error; per-PR gates pass   | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 4 | Secret store trait (read-only)                           | PR 3       | Read path wired; write stubs return error; per-PR gates pass                    | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 5 | KV store trait                                           | PR 3       | KV CRUD wired through RuntimeServices; per-PR gates pass                        | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 6 | Backend + HTTP client traits                             | PR 2       | PlatformResponse with backend_name; send/send_async abstracted; per-PR gates    | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 7 | Geo lookup + client info traits                          | PR 2       | client_ip, tls_protocol, tls_cipher wired; per-PR gates pass                   | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 8 | Content rewriting trait (or verification)                | PR 2       | Platform-specific or agnostic outcome documented; per-PR gates pass             | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 9 | Wire signing to store write primitives                   | PR 4       | api_client.rs deleted from core; management_api.rs in adapter; per-PR gates     | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 10| Abstract logging initialization                         | PR 2       | log-fastly in adapter only; core uses log macros; per-PR gates pass             | TBD   | edgezero, phase-1       | Phase 1   |
-| PR 11| Utility layer type migration + compat adapter            | PRs 3-10   | Utilities use http types; compat.rs created; per-PR gates pass                  | TBD   | edgezero, phase-2       | Phase 2   |
-| PR 12| Handler layer type migration                             | PR 11      | Handlers use http types; conversion boundary in adapter main.rs; per-PR gates   | TBD   | edgezero, phase-2       | Phase 2   |
-| PR 13| Integration + provider layer types + RuntimeServices     | PR 12      | All 6 sub-slice checks pass; async request_bids; per-PR gates pass             | TBD   | edgezero, phase-2       | Phase 2   |
-| PR 14| Fastly entry point switch (dual-path with flag)          | PR 13      | Both paths compile; legacy cleanup issue filed; per-PR gates pass               | TBD   | edgezero, phase-3       | Phase 3   |
-| PR 15| Remove fastly from core crate                            | PR 14      | Core has zero fastly imports; compat.rs deleted; per-PR gates pass              | TBD   | edgezero, phase-3       | Phase 3   |
-| PR 16| Axum dev server entry point                              | PR 15      | Route parity + basic-auth gate tests pass; admin key routes work; Axum CI jobs added; per-PR gates pass | TBD   | edgezero, phase-4       | Phase 4   |
-| PR 17| Cloudflare entry point                                   | PR 15      | Route parity + basic-auth gate tests pass; admin key routes work; crate host-compilable (cfg-gated shims); Cloudflare CI jobs added (native + wasm32-unknown-unknown); per-PR gates pass | TBD   | edgezero, phase-4       | Phase 4   |
-| —    | Phase 5: Verification gates                              | PRs 16-17  | Route parity all routes; cross-adapter behavior (status/body/headers/cookies/signing); admin key routes (success/auth-fail/validation-fail/storage-fail); basic-auth parity (401, WWW-Authenticate, path matching); auction async fan-out + error-correlation; HTML golden tests; p95 latency + response size regression checks pass | TBD   | edgezero, phase-5       | Phase 5   |
-| —    | Phase 5: Cutover and canary rollout                      | Phase 5: Verification gates | Config flag live; canary at 1%→10%→50%→100% with hold points; rollback tested    | TBD   | edgezero, phase-5       | Phase 5   |
-| —    | Legacy entry point cleanup (post-cutover)                | Phase 5: Cutover and canary rollout | legacy_main() and flag plumbing deleted; per-PR gates pass                       | TBD   | edgezero, post-cutover  | Phase 5   |
+| PR    | Title                                                    | Blocked by                          | DoD (Definition of Done)                                                                                                                                                                                                                                                                                                             | Owner | Labels                 | Milestone |
+| ----- | -------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- | ---------------------- | --------- |
+| PR 1  | Rename crates and add EdgeZero workspace dependencies    | —                                   | All per-PR gates pass; `cargo doc` builds; CLAUDE.md updated                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-0      | Phase 0   |
+| PR 2  | Define platform traits, PlatformError, RuntimeServices   | PR 1                                | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send                                                                                                                                                                                 | TBD   | edgezero, phase-0      | Phase 0   |
+| PR 3  | Split fastly_storage.rs + config store trait (read-only) | PR 2                                | File split done; read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 4  | Secret store trait (read-only)                           | PR 3                                | Read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 5  | KV store trait                                           | PR 3                                | KV CRUD wired through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                                                             | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 6  | Backend + HTTP client traits                             | PR 2                                | PlatformResponse with backend_name; send/send_async abstracted; per-PR gates                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 7  | Geo lookup + client info traits                          | PR 2                                | client_ip, tls_protocol, tls_cipher wired; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 8  | Content rewriting trait (or verification)                | PR 2                                | Platform-specific or agnostic outcome documented; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 9  | Wire signing to store write primitives                   | PR 4                                | api_client.rs deleted from core; management_api.rs in adapter; per-PR gates                                                                                                                                                                                                                                                          | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 10 | Abstract logging initialization                          | PR 2                                | log-fastly in adapter only; core uses log macros; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 11 | Utility layer type migration + compat adapter            | PRs 3-10                            | Utilities use http types; compat.rs created; per-PR gates pass                                                                                                                                                                                                                                                                       | TBD   | edgezero, phase-2      | Phase 2   |
+| PR 12 | Handler layer type migration                             | PR 11                               | Handlers use http types; conversion boundary in adapter main.rs; per-PR gates                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-2      | Phase 2   |
+| PR 13 | Integration + provider layer types + RuntimeServices     | PR 12                               | All 6 sub-slice checks pass; async request_bids; per-PR gates pass                                                                                                                                                                                                                                                                   | TBD   | edgezero, phase-2      | Phase 2   |
+| PR 14 | Fastly entry point switch (dual-path with flag)          | PR 13                               | Both paths compile; legacy cleanup issue filed; per-PR gates pass                                                                                                                                                                                                                                                                    | TBD   | edgezero, phase-3      | Phase 3   |
+| PR 15 | Remove fastly from core crate                            | PR 14                               | Core has zero fastly imports; compat.rs deleted; per-PR gates pass                                                                                                                                                                                                                                                                   | TBD   | edgezero, phase-3      | Phase 3   |
+| PR 16 | Axum dev server entry point                              | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; Axum CI jobs added; per-PR gates pass                                                                                                                                                                                                                              | TBD   | edgezero, phase-4      | Phase 4   |
+| PR 17 | Cloudflare entry point                                   | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; crate host-compilable (cfg-gated shims); Cloudflare CI jobs added (native + wasm32-unknown-unknown); per-PR gates pass                                                                                                                                             | TBD   | edgezero, phase-4      | Phase 4   |
+| —     | Phase 5: Verification gates                              | PRs 16-17                           | Route parity all routes; cross-adapter behavior (status/body/headers/cookies/signing); admin key routes (success/auth-fail/validation-fail/storage-fail); basic-auth parity (401, WWW-Authenticate, path matching); auction async fan-out + error-correlation; HTML golden tests; p95 latency + response size regression checks pass | TBD   | edgezero, phase-5      | Phase 5   |
+| —     | Phase 5: Cutover and canary rollout                      | Phase 5: Verification gates         | Config flag live; canary at 1%→10%→50%→100% with hold points; rollback tested                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-5      | Phase 5   |
+| —     | Legacy entry point cleanup (post-cutover)                | Phase 5: Cutover and canary rollout | legacy_main() and flag plumbing deleted; per-PR gates pass                                                                                                                                                                                                                                                                           | TBD   | edgezero, post-cutover | Phase 5   |
