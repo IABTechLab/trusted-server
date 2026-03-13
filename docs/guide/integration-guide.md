@@ -112,7 +112,7 @@ impl IntegrationProxy for MyIntegration {
         settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        // Parse/generate synthetic IDs, forward upstream, and return the response.
+        // Parse/generate SSC IDs, forward upstream, and return the response.
     }
 }
 ```
@@ -127,7 +127,7 @@ The shared context already injects Trusted Server logging, headers, and error ha
 
 #### Proxying Upstream Requests
 
-Use the shared helper in `crates/common/src/proxy.rs` to forward requests so you automatically get the same header copying, redirect handling, HTML/CSS rewrite behavior, and synthetic ID handling the first-party proxy uses:
+Use the shared helper in `crates/common/src/proxy.rs` to forward requests so you automatically get the same header copying, redirect handling, HTML/CSS rewrite behavior, and SSC ID handling the first-party proxy uses:
 
 ```rust
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -145,7 +145,7 @@ let response = proxy_request(
 .await?;
 ```
 
-Set `forward_synthetic_id` to `false` if the upstream should not receive the caller's synthetic ID (`Testlight` does this), and disable `follow_redirects` if you need to surface redirects directly to the caller.
+Set `forward_ssc_id` to `false` if the upstream should not receive the caller's SSC ID (`Testlight` does this), and disable `follow_redirects` if you need to surface redirects directly to the caller.
 
 **Streaming passthrough example:**
 
@@ -261,7 +261,7 @@ Integrations that ship additional JS (such as Testlight) typically expose a `shi
 4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and fetch HTML from your origin to confirm rewrites are applied.
 
 ::: tip Testing Strategy
-For unit tests, prefer exposing helper constructors that accept a synthetic `shim_src` so your tests can point rewriters at a deterministic URL without touching the Tsjs build artifacts.
+For unit tests, prefer exposing helper constructors that accept a stub `shim_src` so your tests can point rewriters at a deterministic URL without touching the Tsjs build artifacts.
 :::
 
 By following these steps you can ship independent integration modules that plug into the Trusted Server runtime without modifying the Fastly entrypoint or HTML processor each time.
@@ -290,7 +290,7 @@ Integrations are loaded in one of two ways:
 
 **Loading**: Deferred (`<script defer>`)
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
+**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects SSC IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
 
 **Key files**:
 
@@ -318,7 +318,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **2. Routes Owned by the Integration**
 
-`IntegrationProxy::routes` declares the `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject synthetic IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. All routes are properly namespaced under `/integrations/prebid/` to follow the integration routing pattern.
+`IntegrationProxy::routes` declares the `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject SSC IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. All routes are properly namespaced under `/integrations/prebid/` to follow the integration routing pattern.
 
 **3. HTML Rewrites Through the Registry**
 
@@ -337,7 +337,7 @@ We plan to expand integration capabilities in several areas:
 1. **Declarative Routing & Middleware** - Richer endpoints (path params, shared middleware, structured context) beyond simple method/path matching.
 2. **Granular HTML Hooks** - Ordered selectors, head/body injection points, and DOM-aware helpers so multiple integrations can safely collaborate.
 3. **Integration Manifest** - Schema describing required bundles, routes, config validation, and feature flags to keep registration data-driven.
-4. **Shared Request Utilities** - Reusable building blocks for synthetic ID injection, consent enforcement, and OpenRTB shaping.
+4. **Shared Request Utilities** - Reusable building blocks for SSC ID injection, consent enforcement, and OpenRTB shaping.
 5. **tsjs Tooling** - Auto-generated integration bundles, scaffolding for TS shims/tests, and metadata surfaced back to Rust.
 6. **Testing & Observability Hooks** - Integration-focused mocks, local harnesses, and telemetry emitters for easier validation and monitoring.
 

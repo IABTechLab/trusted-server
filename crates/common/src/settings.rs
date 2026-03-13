@@ -175,18 +175,17 @@ impl DerefMut for IntegrationSettings {
     }
 }
 
+/// Server Side Cookie (SSC) configuration.
 #[allow(unused)]
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-pub struct Synthetic {
+pub struct Ssc {
     pub counter_store: String,
     pub opid_store: String,
-    #[validate(length(min = 1), custom(function = Synthetic::validate_secret_key))]
+    #[validate(length(min = 1), custom(function = Ssc::validate_secret_key))]
     pub secret_key: String,
-    #[validate(length(min = 1))]
-    pub template: String,
 }
 
-impl Synthetic {
+impl Ssc {
     /// Validates that the secret key is not the placeholder value.
     ///
     /// # Errors
@@ -298,9 +297,9 @@ impl Default for Proxy {
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
-    #[serde(default)]
+    #[serde(default, alias = "synthetic")]
     #[validate(nested)]
-    pub synthetic: Synthetic,
+    pub ssc: Ssc,
     #[serde(default)]
     pub integrations: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -587,10 +586,9 @@ mod tests {
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
-        assert_eq!(settings.synthetic.counter_store, "test-counter-store");
-        assert_eq!(settings.synthetic.opid_store, "test-opid-store");
-        assert_eq!(settings.synthetic.secret_key, "test-secret-key");
-        assert!(settings.synthetic.template.contains("{{client_ip}}"));
+        assert_eq!(settings.ssc.counter_store, "test-counter-store");
+        assert_eq!(settings.ssc.opid_store, "test-opid-store");
+        assert_eq!(settings.ssc.secret_key, "test-secret-key");
 
         settings.validate().expect("Failed to validate settings");
     }

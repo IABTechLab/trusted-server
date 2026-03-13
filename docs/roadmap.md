@@ -110,14 +110,14 @@ Our development is focused on three key areas:
 - Zero-cold-start header bidding
 - Reduce external dependencies
 
-**Better Synthetic ID Syncing**
+**Better SSC ID Syncing**
 
 - Enhanced ID sync with downstream partners
 - Batch sync optimization
 - Partner ID mapping tables
 - Sync status monitoring
 
-**Standalone Synthetic ID Service**
+**Standalone SSC ID Service**
 
 - Dedicated ID generation microservice
 - Cross-publisher ID graph support
@@ -233,7 +233,7 @@ A comprehensive creative forensics engine for ad behavior monitoring and fraud p
 
 - SPIN + Akamai Support
 - Prebid Server Rust Port (alpha)
-- Standalone Synthetic ID Service
+- Standalone SSC ID Service
 
 ### Q3 2026
 

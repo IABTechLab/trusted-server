@@ -21,23 +21,23 @@ cargo test
 Tests are organized alongside source code in `#[cfg(test)]` modules:
 
 ```rust
-// crates/common/src/synthetic.rs
+// crates/common/src/ssc.rs
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_synthetic_id() {
+    fn test_generate_ssc_id() {
         let settings = create_test_settings();
         let req = create_test_request(vec![
             (header::USER_AGENT, "Mozilla/5.0"),
             (header::COOKIE, "pub_userid=12345"),
         ]);
 
-        let synthetic_id = generate_synthetic_id(&settings, &req)
-            .expect("should generate synthetic ID");
+        let ssc_id = generate_ssc_id(&settings, &req)
+            .expect("should generate SSC ID");
 
-        assert!(!synthetic_id.is_empty());
+        assert!(!ssc_id.is_empty());
     }
 }
 ```
@@ -51,7 +51,7 @@ mod tests {
 cargo test
 
 # Run specific test by name
-cargo test test_generate_synthetic_id
+cargo test test_generate_ssc_id
 
 # Run tests with output visible
 cargo test -- --nocapture
@@ -60,7 +60,7 @@ cargo test -- --nocapture
 cargo test -p trusted-server-common
 
 # Run tests matching a pattern
-cargo test synthetic
+cargo test ssc
 ```
 
 ### Integration Tests
@@ -86,42 +86,42 @@ curl http://localhost:7676/.well-known/trusted-server.json
 
 ## Real Test Examples
 
-### Synthetic ID Tests
+### SSC ID Tests
 
-From `crates/common/src/synthetic.rs`:
+From `crates/common/src/ssc.rs`:
 
 ```rust
 #[test]
-fn test_get_synthetic_id_with_header() {
+fn test_get_ssc_id_with_header() {
     let settings = create_test_settings();
     let req = create_test_request(vec![(
-        HEADER_X_SYNTHETIC_ID,
-        "existing_synthetic_id",
+        HEADER_X_TS_SSC,
+        "existing_ssc_id",
     )]);
 
-    let synthetic_id = get_synthetic_id(&req)
-        .expect("should get synthetic ID");
-    assert_eq!(synthetic_id, Some("existing_synthetic_id".to_string()));
+    let ssc_id = get_ssc_id(&req)
+        .expect("should get SSC ID");
+    assert_eq!(ssc_id, Some("existing_ssc_id".to_string()));
 }
 
 #[test]
-fn test_get_synthetic_id_with_cookie() {
+fn test_get_ssc_id_with_cookie() {
     let settings = create_test_settings();
     let req = create_test_request(vec![
-        (header::COOKIE, "synthetic_id=existing_cookie_id")
+        (header::COOKIE, "ts-ssc=existing_cookie_id")
     ]);
 
-    let synthetic_id = get_synthetic_id(&req)
-        .expect("should get synthetic ID");
-    assert_eq!(synthetic_id, Some("existing_cookie_id".to_string()));
+    let ssc_id = get_ssc_id(&req)
+        .expect("should get SSC ID");
+    assert_eq!(ssc_id, Some("existing_cookie_id".to_string()));
 }
 
 #[test]
-fn test_get_synthetic_id_none() {
+fn test_get_ssc_id_none() {
     let req = create_test_request(vec![]);
-    let synthetic_id = get_synthetic_id(&req)
+    let ssc_id = get_ssc_id(&req)
         .expect("should handle missing ID");
-    assert!(synthetic_id.is_none());
+    assert!(ssc_id.is_none());
 }
 ```
 
@@ -187,7 +187,7 @@ fn proxy_request_config_supports_streaming_and_headers() {
 
     assert_eq!(cfg.target_url, "https://example.com/asset");
     assert!(cfg.follow_redirects, "should follow redirects by default");
-    assert!(cfg.forward_synthetic_id, "should forward synthetic id by default");
+    assert!(cfg.forward_ssc_id, "should forward SSC ID by default");
 }
 
 #[test]
@@ -317,7 +317,7 @@ k6 run load-test.js
 ## Best Practices
 
 1. **Test all new features** - Write tests alongside new code
-2. **Use descriptive names** - `test_synthetic_id_generation_with_consent`
+2. **Use descriptive names** - `test_ssc_id_generation_with_consent`
 3. **Test edge cases** - Empty inputs, missing headers, invalid data
 4. **Keep tests fast** - Mock external dependencies
 5. **Use test helpers** - `create_test_settings()`, `create_test_request()`

@@ -26,7 +26,7 @@ Lockr is an identity resolution and privacy platform that helps publishers manag
 ┌──────────────────────────────────────────────────┐
 │  User Visit                                      │
 │  ↓                                               │
-│  Trusted Server generates Synthetic ID           │
+│  Trusted Server generates SSC ID                 │
 │  ↓                                               │
 │  Lockr Integration maps to Lockr Identity        │
 │  ↓                                               │
@@ -70,9 +70,9 @@ TRUSTED_SERVER__INTEGRATIONS__LOCKR__PROJECT_ID=your-project-id
 
 ### Identity Synchronization
 
-Lockr integration automatically syncs Trusted Server synthetic IDs with Lockr's identity vault:
+Lockr integration automatically syncs Trusted Server SSC IDs with Lockr's identity vault:
 
-1. User visits site (Trusted Server generates synthetic ID)
+1. User visits site (Trusted Server generates SSC ID)
 2. If GDPR consent granted, sync with Lockr
 3. Lockr returns unified identity
 4. Identity available for bid requests and analytics
@@ -146,11 +146,11 @@ The Lockr integration is implemented in [crates/common/src/integrations/lockr.rs
 
 - Route: `/integrations/lockr/sync`
 - Method: POST
-- Purpose: Synchronize synthetic ID with Lockr vault
+- Purpose: Synchronize SSC ID with Lockr vault
 
 **ID Mapping**:
 
-- Maps Trusted Server synthetic ID → Lockr unified ID
+- Maps Trusted Server SSC ID → Lockr unified ID
 - Cached for performance
 - Respects consent status
 
@@ -193,7 +193,7 @@ Track Lockr sync success/failure rates:
 Validate end-to-end identity flow:
 
 ```bash
-# 1. Generate synthetic ID
+# 1. Generate SSC ID
 curl https://edge.example.com/
 
 # 2. Verify Lockr sync (check logs)
@@ -261,7 +261,7 @@ curl https://edge.example.com/
 
 ## Next Steps
 
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for identity generation
+- Learn about [Server Side Cookies](/guide/synthetic-ids) for identity generation
 - Review [GDPR Compliance](/guide/gdpr-compliance) for consent management
 - Explore [Didomi Integration](/guide/integrations/didomi) for CMP integration
 - Check [Configuration Reference](/guide/configuration) for advanced options

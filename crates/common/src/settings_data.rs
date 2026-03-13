@@ -34,7 +34,7 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    if settings.synthetic.secret_key == "secret-key" {
+    if settings.ssc.secret_key == "secret-key" {
         return Err(Report::new(TrustedServerError::InsecureSecretKey));
     }
 
@@ -62,9 +62,8 @@ mod tests {
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
+        assert!(!settings.ssc.counter_store.is_empty());
+        assert!(!settings.ssc.opid_store.is_empty());
+        assert!(!settings.ssc.secret_key.is_empty());
     }
 }

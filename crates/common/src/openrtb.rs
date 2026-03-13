@@ -62,8 +62,8 @@ pub struct User {
 
 #[derive(Debug, Serialize, Default)]
 pub struct UserExt {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub synthetic_fresh: Option<String>,
+    #[serde(rename = "ssc_fresh", skip_serializing_if = "Option::is_none")]
+    pub ssc_fresh: Option<String>,
 }
 
 #[derive(Debug, Serialize, Default)]

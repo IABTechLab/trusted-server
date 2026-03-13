@@ -62,7 +62,7 @@ Trusted Server supports:
 
 Only essential data is collected:
 
-- Synthetic IDs (with consent)
+- SSC IDs (with consent)
 - Minimal request metadata
 - No PII storage
 

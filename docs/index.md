@@ -19,8 +19,8 @@ hero:
       text: View on GitHub
       link: https://github.com/IABTechLab/trusted-server 
 features:
-  - title: Synthetic ID Generation
-    details: HMAC-based synthetic IDs that preserve privacy while enabling tracking with user consent
+  - title: Server Side Cookie (SSC) Generation
+    details: HMAC-based server side cookies that preserve privacy while enabling tracking with user consent
   - title: GDPR Compliant
     details: Built-in consent management and validation to ensure compliance with privacy regulations
   - title: Edge Computing

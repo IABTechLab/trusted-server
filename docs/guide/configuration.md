@@ -23,11 +23,10 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
-[synthetic]
+[ssc]
 counter_store = "counter_store"
 opid_store = "opid_store"
 secret_key = "your-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 ### Environment Variable Overrides
@@ -40,7 +39,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
+export TRUSTED_SERVER__SSC__SECRET_KEY=your-secret
 ```
 
 ### Generate Secure Secrets
@@ -63,7 +62,7 @@ openssl rand -base64 32
 | Section             | Purpose                                      |
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
-| `[synthetic]`       | Synthetic ID generation                      |
+| `[ssc]`             | Server Side Cookie (SSC) ID generation       |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
 | `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
@@ -77,11 +76,10 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
-[synthetic]
+[ssc]
 counter_store = "counter_store"
 opid_store = "opid_store"
 secret_key = "your-hmac-secret-key"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 [request_signing]
 enabled = true
@@ -203,11 +201,11 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 #### `cookie_domain`
 
-**Purpose**: Domain scope for synthetic ID cookies.
+**Purpose**: Domain scope for SSC cookies.
 
 **Usage**:
 
-- Set on `synthetic_id` cookie
+- Set on `ts-ssc` cookie
 - Controls cookie sharing across subdomains
 
 **Format**: Domain with optional leading dot
@@ -265,43 +263,40 @@ openssl rand -base64 32
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
-## Synthetic ID Configuration
+## SSC Configuration
 
-Settings for generating privacy-preserving synthetic identifiers.
+Settings for generating privacy-preserving Server Side Cookie identifiers.
 
-### `[synthetic]`
+### `[ssc]`
 
 | Field           | Type   | Required | Description                                    |
 | --------------- | ------ | -------- | ---------------------------------------------- |
 | `counter_store` | String | Yes      | Fastly KV store name for counters              |
 | `opid_store`    | String | Yes      | Fastly KV store name for publisher ID mappings |
 | `secret_key`    | String | Yes      | HMAC secret for ID generation                  |
-| `template`      | String | Yes      | Handlebars template for ID composition         |
 
 **Example**:
 
 ```toml
-[synthetic]
+[ssc]
 counter_store = "counter_store"
 opid_store = "opid_store"
 secret_key = "your-secure-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__SYNTHETIC__COUNTER_STORE=counter_store
-TRUSTED_SERVER__SYNTHETIC__OPID_STORE=opid_store
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
-TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
+TRUSTED_SERVER__SSC__COUNTER_STORE=counter_store
+TRUSTED_SERVER__SSC__OPID_STORE=opid_store
+TRUSTED_SERVER__SSC__SECRET_KEY=your-secret
 ```
 
 ### Field Details
 
 #### `counter_store`
 
-**Purpose**: Fastly KV store for synthetic ID counters.
+**Purpose**: Fastly KV store for SSC ID counters.
 
 **Usage**:
 
@@ -331,7 +326,7 @@ fastly kv-store create --name=counter_store
 
 **Usage**:
 
-- Maps publisher IDs to synthetic IDs
+- Maps publisher IDs to SSC IDs
 - Enables first-party ID integration
 - Optional (used if publisher provides IDs)
 
@@ -346,14 +341,14 @@ fastly kv-store create --name=opid_store
 
 ```json
 {
-  "publisher-id-123": "synthetic-abc",
-  "publisher-id-456": "synthetic-def"
+  "publisher-id-123": "ssc-abc",
+  "publisher-id-456": "ssc-def"
 }
 ```
 
 #### `secret_key`
 
-**Purpose**: HMAC secret for synthetic ID base generation.
+**Purpose**: HMAC secret for SSC ID base generation.
 
 **Security**:
 
@@ -373,50 +368,6 @@ openssl rand -hex 32
 
 - Empty string
 - Exactly `"secret_key"` or `"secret-key"` (default placeholders)
-
-#### `template`
-
-**Purpose**: Handlebars template defining ID composition.
-
-**Available Variables**:
-
-| Variable          | Description                                | Example                                |
-| ----------------- | ------------------------------------------ | -------------------------------------- |
-| `client_ip`       | Client IP address (IPv6 normalized to /64) | `192.168.1.1`                          |
-| `user_agent`      | User-Agent header                          | `Mozilla/5.0...`                       |
-| `accept_language` | Accept-Language header (first token)       | `en-US`                                |
-| `accept_encoding` | Accept-Encoding header                     | `gzip, deflate`                        |
-| `random_uuid`     | Random UUID v4 per generation              | `9b1d3b94-1e26-4a5f-bc39-1e6f2b6a3a0f` |
-
-**Template Examples**:
-
-**Simple (IP + UA)**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}"
-```
-
-**With Locale + Encoding**:
-
-```toml
-template = "{{ client_ip }}:{{ accept_language }}:{{ accept_encoding }}"
-```
-
-**With Randomized Suffix Input**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}:{{ random_uuid }}"
-```
-
-**Validation**: Must be non-empty string.
-
-::: tip Template Design
-Choose template variables based on your privacy and uniqueness requirements:
-
-- **More variables** = More unique IDs, less privacy
-- **Fewer variables** = More privacy, potential collisions
-- **Include `random_uuid`** only if you want a new ID for every generation
-  :::
 
 ## Response Headers
 
@@ -917,11 +868,10 @@ Configuration is validated at startup:
 - All fields non-empty
 - `origin_url` is valid URL
 
-**Synthetic Validation**:
+**SSC Validation**:
 
 - `secret_key` ≥ 1 character
 - `secret_key` ≠ `"secret-key"`
-- `template` non-empty
 
 **Handler Validation**:
 
@@ -978,7 +928,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_secret)
+TRUSTED_SERVER__SSC__SECRET_KEY=$(cat /run/secrets/ssc_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1085,5 +1035,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-preserving identification
+- Learn about [Server Side Cookies](/guide/synthetic-ids) for privacy-preserving identification
 - Review [Integrations](/guide/integrations-overview) for partner support

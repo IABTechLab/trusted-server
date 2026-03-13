@@ -106,12 +106,12 @@ Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
-- Adds synthetic ID for privacy-safe tracking
+- Adds SSC ID for privacy-safe tracking
 - Supports banner, video, and native formats
 
-### Synthetic ID Injection
+### SSC ID Injection
 
-Automatically injects privacy-preserving synthetic ID into bid requests for user recognition without cookies.
+Automatically injects privacy-preserving SSC ID into bid requests for user recognition without cookies.
 
 ### Request Signing
 
@@ -241,7 +241,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 
 - Converts ad slots to OpenRTB `imp` objects with bidder params
 - Adds site metadata with publisher domain and page URL
-- Injects synthetic ID in the user object
+- Injects SSC ID in the user object
 - Includes device info (user-agent, client IP) and geo when available
 - Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
 - Sets the top-level `test: 1` flag when `test_mode` is enabled
@@ -261,4 +261,4 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Review [Ad Serving Guide](/guide/ad-serving) for general concepts
 - Check [OpenRTB Support](/roadmap) on the roadmap for enhancements
 - Explore [Request Signing](/guide/request-signing) for authentication
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-safe tracking
+- Learn about [Server Side Cookies](/guide/synthetic-ids) for privacy-safe tracking

@@ -13,12 +13,13 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::constants::{HEADER_X_TS_SSC, HEADER_X_TS_SSC_FRESH, HEADER_X_TS_SSC_TRUSTED_SERVER};
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid};
 use crate::settings::Settings;
-use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
+use crate::ssc::{generate_ssc_id, get_or_generate_ssc_id};
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
@@ -68,23 +69,21 @@ pub struct BannerUnit {
 /// # Errors
 ///
 /// Returns an error if:
-/// - Synthetic ID generation fails
+/// - SSC ID generation fails
 /// - Request contains invalid banner sizes (must be [width, height])
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
     req: &Request,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
-    // Generate synthetic ID
-    let synthetic_id = get_or_generate_synthetic_id(settings, req).change_context(
-        TrustedServerError::Auction {
-            message: "Failed to generate synthetic ID".to_string(),
-        },
-    )?;
-    let fresh_id =
-        generate_synthetic_id(settings, req).change_context(TrustedServerError::Auction {
-            message: "Failed to generate fresh ID".to_string(),
+    // Generate SSC ID
+    let ssc_id =
+        get_or_generate_ssc_id(settings, req).change_context(TrustedServerError::Auction {
+            message: "Failed to generate SSC ID".to_string(),
         })?;
+    let fresh_id = generate_ssc_id(settings, req).change_context(TrustedServerError::Auction {
+        message: "Failed to generate fresh SSC ID".to_string(),
+    })?;
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -177,7 +176,7 @@ pub fn convert_tsjs_to_auction_request(
             page_url: Some(format!("https://{}", settings.publisher.domain)),
         },
         user: UserInfo {
-            id: synthetic_id,
+            id: ssc_id,
             fresh_id,
             consent: None,
         },
@@ -292,8 +291,8 @@ pub fn convert_to_openrtb_response(
 
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
-        .with_header("X-Synthetic-ID", &auction_request.user.id)
-        .with_header("X-Synthetic-Fresh", &auction_request.user.fresh_id)
-        .with_header("X-Synthetic-Trusted-Server", &auction_request.user.id)
+        .with_header(HEADER_X_TS_SSC, &auction_request.user.id)
+        .with_header(HEADER_X_TS_SSC_FRESH, &auction_request.user.fresh_id)
+        .with_header(HEADER_X_TS_SSC_TRUSTED_SERVER, &auction_request.user.id)
         .with_body(body_bytes))
 }

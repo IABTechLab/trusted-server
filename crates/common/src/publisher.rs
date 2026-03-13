@@ -5,15 +5,15 @@ use fastly::{Body, Request, Response};
 use crate::backend::BackendConfig;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::set_synthetic_cookie;
+use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_TS_SSC};
+use crate::cookies::set_ssc_cookie;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
+use crate::ssc::get_or_generate_ssc_id;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
-use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
@@ -235,10 +235,10 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Generate synthetic identifiers before the request body is consumed.
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    // Generate SSC ID before the request body is consumed.
+    let ssc_id = get_or_generate_ssc_id(settings, &req)?;
 
-    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
+    log::debug!("Proxy SSC ID: {}", ssc_id);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -334,8 +334,8 @@ pub fn handle_publisher_request(
         );
     }
 
-    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-    set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+    response.set_header(HEADER_X_TS_SSC, ssc_id.as_str());
+    set_ssc_cookie(settings, &mut response, ssc_id.as_str());
 
     Ok(response)
 }

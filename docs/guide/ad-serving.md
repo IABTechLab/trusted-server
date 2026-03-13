@@ -30,7 +30,7 @@ Real-time bidding integration:
 
 1. Request validation
 2. GDPR consent check
-3. Synthetic ID generation (if consented)
+3. SSC ID generation (if consented)
 4. Ad server request
 5. Response processing
 6. Creative delivery
@@ -77,7 +77,7 @@ Creatives served directly from ad server:
 // Placeholder example
 trustedServer.trackImpression({
   adId: 'ad-123',
-  syntheticId: 'synthetic-xyz',
+  sscId: 'ssc-xyz',
   consent: true,
 })
 ```
@@ -87,7 +87,7 @@ trustedServer.trackImpression({
 Click tracking with privacy preservation:
 
 - No PII in URLs
-- Synthetic ID only (with consent)
+- SSC ID only (with consent)
 - Encrypted parameters
 
 ## Performance

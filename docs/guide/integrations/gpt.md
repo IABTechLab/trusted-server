@@ -105,7 +105,7 @@ Intercepts scripts from `securepubads.g.doubleclick.net` and rewrites them to th
 
 Takes over `googletag.cmd` so every queued callback is wrapped before GPT executes it. This enables future hook points for:
 
-- Synthetic ID injection as page-level key-value targeting
+- SSC ID injection as page-level key-value targeting
 - Consent gating of ad requests
 - Ad-unit path rewriting for A/B testing
 

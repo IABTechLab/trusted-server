@@ -120,7 +120,7 @@ Targets the Next.js data script for rewriting.
 Run your Next.js application behind Trusted Server for:
 
 - First-party asset loading
-- Synthetic ID injection
+- SSC ID injection
 - Privacy-compliant tracking
 - Ad serving integration
 

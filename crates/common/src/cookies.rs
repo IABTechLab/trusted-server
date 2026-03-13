@@ -8,7 +8,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::header;
 use fastly::Request;
 
-use crate::constants::COOKIE_SYNTHETIC_ID;
+use crate::constants::COOKIE_TS_SSC;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -59,31 +59,24 @@ pub fn handle_request_cookies(
     }
 }
 
-/// Creates a synthetic ID cookie string.
+/// Creates an SSC cookie string.
 ///
 /// Generates a properly formatted cookie with security attributes
-/// for storing the synthetic ID.
+/// for storing the SSC ID.
 #[must_use]
-pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
+pub fn create_ssc_cookie(settings: &Settings, ssc_id: &str) -> String {
     format!(
         "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+        COOKIE_TS_SSC, ssc_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
     )
 }
 
-/// Sets the synthetic ID cookie on the given response.
+/// Sets the SSC ID cookie on the given response.
 ///
 /// This helper abstracts the logic of creating the cookie string and appending
 /// the Set-Cookie header to the response.
-pub fn set_synthetic_cookie(
-    settings: &Settings,
-    response: &mut fastly::Response,
-    synthetic_id: &str,
-) {
-    response.append_header(
-        header::SET_COOKIE,
-        create_synthetic_cookie(settings, synthetic_id),
-    );
+pub fn set_ssc_cookie(settings: &Settings, response: &mut fastly::Response, ssc_id: &str) {
+    response.append_header(header::SET_COOKIE, create_ssc_cookie(settings, ssc_id));
 }
 
 #[cfg(test)]
@@ -168,23 +161,23 @@ mod tests {
     }
 
     #[test]
-    fn test_create_synthetic_cookie() {
+    fn test_create_ssc_cookie() {
         let settings = create_test_settings();
-        let result = create_synthetic_cookie(&settings, "12345");
+        let result = create_ssc_cookie(&settings, "12345");
         assert_eq!(
             result,
             format!(
                 "{}=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-                COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+                COOKIE_TS_SSC, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
             )
         );
     }
 
     #[test]
-    fn test_set_synthetic_cookie() {
+    fn test_set_ssc_cookie() {
         let settings = create_test_settings();
         let mut response = fastly::Response::new();
-        set_synthetic_cookie(&settings, &mut response, "test-id-123");
+        set_ssc_cookie(&settings, &mut response, "test-id-123");
 
         let cookie_header = response
             .get_header(header::SET_COOKIE)
@@ -193,10 +186,10 @@ mod tests {
             .to_str()
             .expect("header should be valid UTF-8");
 
-        let expected = create_synthetic_cookie(&settings, "test-id-123");
+        let expected = create_ssc_cookie(&settings, "test-id-123");
         assert_eq!(
             cookie_str, expected,
-            "Set-Cookie header should match create_synthetic_cookie output"
+            "Set-Cookie header should match create_ssc_cookie output"
         );
     }
 }
