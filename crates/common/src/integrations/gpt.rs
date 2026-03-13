@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::Validate;
 
-use crate::constants::{HEADER_ACCEPT_ENCODING, HEADER_X_FORWARDED_FOR};
+use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -125,36 +125,114 @@ impl GptIntegration {
     }
 
     fn build_proxy_config<'a>(target_url: &'a str, req: &Request) -> ProxyRequestConfig<'a> {
-        let mut config = ProxyRequestConfig::new(target_url).with_streaming();
+        let mut config = ProxyRequestConfig::new(target_url)
+            .with_streaming()
+            .without_forward_headers();
+        config.follow_redirects = false;
         config.forward_synthetic_id = false;
-        config = config.with_header(
+
+        Self::apply_request_header_allowlist(config, req)
+    }
+
+    fn apply_request_header_allowlist<'a>(
+        mut config: ProxyRequestConfig<'a>,
+        req: &Request,
+    ) -> ProxyRequestConfig<'a> {
+        for header_name in [
+            &HEADER_ACCEPT,
+            &HEADER_ACCEPT_LANGUAGE,
+            &HEADER_ACCEPT_ENCODING,
+        ] {
+            if let Some(value) = req.get_header(header_name).cloned() {
+                config = config.with_header(header_name.clone(), value);
+            }
+        }
+
+        config.with_header(
             header::USER_AGENT,
             fastly::http::HeaderValue::from_static("TrustedServer/1.0"),
-        );
-        config = config.with_header(
-            HEADER_ACCEPT_ENCODING,
-            req.get_header(HEADER_ACCEPT_ENCODING)
-                .cloned()
-                .unwrap_or_else(|| fastly::http::HeaderValue::from_static("")),
-        );
-        config = config.with_header(header::REFERER, fastly::http::HeaderValue::from_static(""));
-        config.with_header(
-            HEADER_X_FORWARDED_FOR,
-            fastly::http::HeaderValue::from_static(""),
         )
     }
 
-    fn finalize_gpt_asset_response(&self, mut response: Response) -> Response {
-        response.set_header("X-GPT-Proxy", "true");
-
+    fn ensure_successful_gpt_asset_response(
+        response: &Response,
+        context: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
         if response.get_status().is_success() {
-            response.set_header(
+            return Ok(());
+        }
+
+        let status = response.get_status();
+        log::error!(
+            "GPT proxy upstream returned status {} for {}",
+            status,
+            context
+        );
+        Err(Report::new(Self::error(format!(
+            "{context}: upstream returned {status}"
+        ))))
+    }
+
+    fn finalize_gpt_asset_response(&self, mut response: Response) -> Response {
+        let status = response.get_status();
+        let content_type = response.get_header(header::CONTENT_TYPE).cloned();
+        let content_encoding = response.get_header(header::CONTENT_ENCODING).cloned();
+        let etag = response.get_header(header::ETAG).cloned();
+        let last_modified = response.get_header(header::LAST_MODIFIED).cloned();
+        let upstream_vary = response
+            .get_header(header::VARY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.take_body();
+
+        let mut finalized = Response::from_status(status).with_body(body);
+        finalized.set_header("X-GPT-Proxy", "true");
+
+        if let Some(content_type) = content_type {
+            finalized.set_header(header::CONTENT_TYPE, content_type);
+        }
+
+        if let Some(etag) = etag {
+            finalized.set_header(header::ETAG, etag);
+        }
+
+        if let Some(last_modified) = last_modified {
+            finalized.set_header(header::LAST_MODIFIED, last_modified);
+        }
+
+        if let Some(content_encoding) = content_encoding {
+            finalized.set_header(header::CONTENT_ENCODING, content_encoding);
+            finalized.set_header(
+                header::VARY,
+                Self::vary_with_accept_encoding(upstream_vary.as_deref()),
+            );
+        }
+
+        if status.is_success() {
+            finalized.set_header(
                 header::CACHE_CONTROL,
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             );
         }
 
-        response
+        finalized
+    }
+
+    fn vary_with_accept_encoding(upstream_vary: Option<&str>) -> String {
+        match upstream_vary.map(str::trim) {
+            Some("*") => "*".to_string(),
+            Some(vary) if !vary.is_empty() => {
+                if vary
+                    .split(',')
+                    .any(|header_name| header_name.trim().eq_ignore_ascii_case("accept-encoding"))
+                {
+                    vary.to_string()
+                } else {
+                    format!("{vary}, Accept-Encoding")
+                }
+            }
+            _ => "Accept-Encoding".to_string(),
+        }
     }
 
     async fn proxy_gpt_asset(
@@ -169,8 +247,7 @@ impl GptIntegration {
             .await
             .change_context(Self::error(context))?;
 
-        // Preserve upstream non-2xx statuses so GPT failures remain visible to
-        // callers. Only successful responses receive a cache directive.
+        Self::ensure_successful_gpt_asset_response(&response, context)?;
         Ok(self.finalize_gpt_asset_response(response))
     }
 
@@ -384,6 +461,7 @@ fn default_rewrite_script() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::HEADER_X_FORWARDED_FOR;
     use crate::integrations::IntegrationDocumentState;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
@@ -545,7 +623,7 @@ mod tests {
     // -- GPT proxy configuration --
 
     #[test]
-    fn build_proxy_config_uses_streaming_without_synthetic_forwarding() {
+    fn build_proxy_config_uses_streaming_without_synthetic_forwarding_or_redirects() {
         let req = Request::new(
             Method::GET,
             "https://edge.example.com/integrations/gpt/script",
@@ -563,14 +641,20 @@ mod tests {
             !config.forward_synthetic_id,
             "should not append synthetic_id to GPT asset requests"
         );
+        assert!(
+            !config.follow_redirects,
+            "should keep GPT asset proxying on the original single-hop trust boundary"
+        );
     }
 
     #[test]
-    fn build_proxy_config_overrides_privacy_sensitive_headers() {
+    fn build_proxy_config_forwards_only_required_headers() {
         let mut req = Request::new(
             Method::GET,
             "https://edge.example.com/integrations/gpt/script",
         );
+        req.set_header(HEADER_ACCEPT, "application/javascript");
+        req.set_header(HEADER_ACCEPT_LANGUAGE, "en-US,en;q=0.9");
         req.set_header(HEADER_ACCEPT_ENCODING, "gzip");
 
         let config = GptIntegration::build_proxy_config(
@@ -578,6 +662,16 @@ mod tests {
             &req,
         );
 
+        let accept = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT)
+            .and_then(|(_, value)| value.to_str().ok());
+        let accept_language = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT_LANGUAGE)
+            .and_then(|(_, value)| value.to_str().ok());
         let user_agent = config
             .headers
             .iter()
@@ -600,19 +694,27 @@ mod tests {
             .and_then(|(_, value)| value.to_str().ok());
 
         assert_eq!(
+            accept,
+            Some("application/javascript"),
+            "should preserve Accept for upstream content negotiation"
+        );
+        assert_eq!(
+            accept_language,
+            Some("en-US,en;q=0.9"),
+            "should preserve Accept-Language for upstream locale negotiation"
+        );
+        assert_eq!(
             user_agent,
             Some("TrustedServer/1.0"),
             "should use a stable user agent for GPT upstream requests"
         );
         assert_eq!(
-            referer,
-            Some(""),
-            "should clear Referer before proxying GPT assets"
+            referer, None,
+            "should not forward Referer when proxying GPT assets"
         );
         assert_eq!(
-            x_forwarded_for,
-            Some(""),
-            "should strip X-Forwarded-For before proxying GPT assets"
+            x_forwarded_for, None,
+            "should not forward X-Forwarded-For when proxying GPT assets"
         );
         assert_eq!(
             accept_encoding,
@@ -622,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn build_proxy_config_clears_accept_encoding_when_client_omits_it() {
+    fn build_proxy_config_does_not_advertise_accept_encoding_when_client_omits_it() {
         let req = Request::new(
             Method::GET,
             "https://edge.example.com/integrations/gpt/script",
@@ -639,16 +741,24 @@ mod tests {
             .and_then(|(_, value)| value.to_str().ok());
 
         assert_eq!(
-            accept_encoding,
-            Some(""),
+            accept_encoding, None,
             "should avoid advertising encodings the client did not request"
         );
     }
 
     #[test]
-    fn finalize_gpt_asset_response_adds_proxy_headers_only_for_successes() {
+    fn finalize_gpt_asset_response_rebuilds_successful_responses_with_safe_headers() {
         let integration = GptIntegration::new(test_config());
-        let response = Response::from_status(fastly::http::StatusCode::OK);
+        let response = Response::from_status(fastly::http::StatusCode::OK)
+            .with_header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .with_header(header::ETAG, "\"gpt-etag\"")
+            .with_header(header::LAST_MODIFIED, "Thu, 13 Mar 2025 08:00:00 GMT")
+            .with_header(header::CONTENT_ENCODING, "br")
+            .with_header(header::VARY, "Origin")
+            .with_header(header::SET_COOKIE, "gpt=1; Secure");
         let response = integration.finalize_gpt_asset_response(response);
 
         assert_eq!(
@@ -662,32 +772,82 @@ mod tests {
             "should tag proxied GPT responses"
         );
         assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/javascript; charset=utf-8"),
+            "should preserve upstream content type for GPT assets"
+        );
+        assert_eq!(
+            response.get_header_str(header::ETAG),
+            Some("\"gpt-etag\""),
+            "should preserve upstream ETag validators for GPT assets"
+        );
+        assert_eq!(
+            response.get_header_str(header::LAST_MODIFIED),
+            Some("Thu, 13 Mar 2025 08:00:00 GMT"),
+            "should preserve upstream Last-Modified validators for GPT assets"
+        );
+        assert_eq!(
+            response.get_header_str(header::CONTENT_ENCODING),
+            Some("br"),
+            "should preserve upstream content encoding for GPT assets"
+        );
+        assert_eq!(
+            response.get_header_str(header::VARY),
+            Some("Origin, Accept-Encoding"),
+            "should normalize Vary when returning encoded GPT assets"
+        );
+        assert_eq!(
             response.get_header_str(header::CACHE_CONTROL),
             Some("public, max-age=3600"),
             "should add cache headers for successful GPT asset responses"
         );
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "should not project unrelated upstream headers to first-party clients"
+        );
     }
 
     #[test]
-    fn finalize_gpt_asset_response_preserves_non_success_statuses_without_cache_headers() {
-        let integration = GptIntegration::new(test_config());
+    fn ensure_successful_gpt_asset_response_rejects_non_success_statuses() {
         let response = Response::from_status(fastly::http::StatusCode::SERVICE_UNAVAILABLE);
-        let response = integration.finalize_gpt_asset_response(response);
+        let err = GptIntegration::ensure_successful_gpt_asset_response(
+            &response,
+            "Failed to fetch GPT script from https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+        )
+        .expect_err("should reject non-success GPT upstream responses");
+
+        match err.current_context() {
+            TrustedServerError::Integration {
+                integration,
+                message,
+            } => {
+                assert_eq!(
+                    integration, GPT_INTEGRATION_ID,
+                    "should classify GPT upstream failures as integration errors"
+                );
+                assert!(
+                    message.contains("upstream returned 503 Service Unavailable"),
+                    "should report the upstream failure status"
+                );
+            }
+            other => panic!("expected GPT integration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_preserves_wildcard() {
+        let vary = GptIntegration::vary_with_accept_encoding(Some("*"));
+
+        assert_eq!(vary, "*", "should preserve wildcard Vary values");
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_adds_accept_encoding_when_missing() {
+        let vary = GptIntegration::vary_with_accept_encoding(Some("Origin"));
 
         assert_eq!(
-            response.get_status(),
-            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
-            "should preserve upstream non-success statuses for callers"
-        );
-        assert_eq!(
-            response.get_header_str("X-GPT-Proxy"),
-            Some("true"),
-            "should still identify non-success GPT responses as proxied"
-        );
-        assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
-            None,
-            "should not cache upstream non-success GPT responses"
+            vary, "Origin, Accept-Encoding",
+            "should explicitly vary encoded GPT assets on Accept-Encoding"
         );
     }
 

@@ -304,6 +304,85 @@ describe('DOM insertion dispatcher', () => {
     unregister();
   });
 
+  it('replaces malformed same-version dispatcher state', () => {
+    const globalObject = globalThis as Record<PropertyKey, unknown>;
+    const staleAppendChild = vi.fn(function <T extends Node>(this: Element, node: T): T {
+      return originalAppendChild.call(this, node) as T;
+    });
+
+    Element.prototype.appendChild = staleAppendChild as typeof Element.prototype.appendChild;
+    globalObject[dispatcherKey] = {
+      appendChildWrapper: staleAppendChild,
+      baselineAppendChild: originalAppendChild,
+      handlers: [],
+      nextSequence: '0',
+      orderedHandlers: {},
+      version: 1,
+    };
+
+    const unregister = registerDomInsertionHandler({
+      handle: () => true,
+      id: 'alpha',
+      priority: 100,
+    });
+
+    const state = globalObject[dispatcherKey] as {
+      handlers: Map<number, unknown>;
+      nextSequence: number;
+      orderedHandlers: unknown[];
+      version: number;
+    };
+
+    expect(state.version).toBe(1);
+    expect(state.handlers).toBeInstanceOf(Map);
+    expect(state.nextSequence).toBe(1);
+    expect(state.orderedHandlers).toHaveLength(1);
+    expect(Element.prototype.appendChild).not.toBe(staleAppendChild);
+
+    unregister();
+  });
+
+  it('tears down stale prototype wrappers before replacing versioned state', () => {
+    const globalObject = globalThis as Record<PropertyKey, unknown>;
+    const staleAppendChild = vi.fn(function <T extends Node>(this: Element, node: T): T {
+      return originalAppendChild.call(this, node) as T;
+    });
+    const staleInsertBefore = vi.fn(function <T extends Node>(
+      this: Element,
+      node: T,
+      reference: Node | null
+    ): T {
+      return originalInsertBefore.call(this, node, reference) as T;
+    });
+
+    Element.prototype.appendChild = staleAppendChild as typeof Element.prototype.appendChild;
+    Element.prototype.insertBefore = staleInsertBefore as typeof Element.prototype.insertBefore;
+    globalObject[dispatcherKey] = {
+      appendChildWrapper: staleAppendChild,
+      baselineAppendChild: originalAppendChild,
+      baselineInsertBefore: originalInsertBefore,
+      handlers: new Map(),
+      insertBeforeWrapper: staleInsertBefore,
+      nextSequence: 0,
+      orderedHandlers: [],
+      version: 0,
+    };
+
+    const unregister = registerDomInsertionHandler({
+      handle: () => true,
+      id: 'alpha',
+      priority: 100,
+    });
+
+    expect(Element.prototype.appendChild).not.toBe(staleAppendChild);
+    expect(Element.prototype.insertBefore).not.toBe(staleInsertBefore);
+
+    unregister();
+
+    expect(Element.prototype.appendChild).toBe(originalAppendChild);
+    expect(Element.prototype.insertBefore).toBe(originalInsertBefore);
+  });
+
   it('leaves no prototype residue across repeated install and reset cycles', () => {
     const guard = createScriptGuard({
       displayName: 'Alpha',

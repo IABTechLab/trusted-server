@@ -27,9 +27,10 @@ export interface DomInsertionHandler {
   /**
    * Process a normalized DOM insertion candidate.
    *
-   * Return `true` when the handler consumed or rewrote the candidate and no
-   * subsequent handlers should run. Return `false` to leave the candidate
-   * available for later handlers.
+   * Return `true` when this handler has finished processing the candidate and
+   * no subsequent handlers should run. Return `false` to leave the candidate
+   * available for later handlers. The dispatcher still inserts the node into
+   * the DOM regardless of the return value.
    */
   handle: (candidate: DomInsertionCandidate) => boolean;
   id: string;
@@ -51,6 +52,54 @@ interface DomInsertionDispatcherState {
   version: number;
 }
 
+interface LegacyDomInsertionDispatcherState {
+  appendChildWrapper?: unknown;
+  baselineAppendChild?: unknown;
+  baselineInsertBefore?: unknown;
+  insertBeforeWrapper?: unknown;
+  version?: unknown;
+}
+
+function isOptionalFunction(
+  value: unknown
+): value is ((...args: unknown[]) => unknown) | undefined {
+  return value === undefined || typeof value === 'function';
+}
+
+function isRegisteredDomInsertionHandler(value: unknown): value is RegisteredDomInsertionHandler {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<RegisteredDomInsertionHandler>;
+  return (
+    typeof candidate.handle === 'function' &&
+    typeof candidate.id === 'string' &&
+    typeof candidate.priority === 'number' &&
+    typeof candidate.sequence === 'number'
+  );
+}
+
+function isDispatcherState(value: unknown): value is DomInsertionDispatcherState {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<DomInsertionDispatcherState>;
+  return (
+    candidate.version === DOM_INSERTION_DISPATCHER_STATE_VERSION &&
+    candidate.handlers instanceof Map &&
+    [...candidate.handlers.values()].every(isRegisteredDomInsertionHandler) &&
+    Array.isArray(candidate.orderedHandlers) &&
+    candidate.orderedHandlers.every(isRegisteredDomInsertionHandler) &&
+    typeof candidate.nextSequence === 'number' &&
+    isOptionalFunction(candidate.appendChildWrapper) &&
+    isOptionalFunction(candidate.baselineAppendChild) &&
+    isOptionalFunction(candidate.insertBeforeWrapper) &&
+    isOptionalFunction(candidate.baselineInsertBefore)
+  );
+}
+
 function compareHandlers(
   left: RegisteredDomInsertionHandler,
   right: RegisteredDomInsertionHandler
@@ -66,26 +115,56 @@ function compareHandlers(
   return left.sequence - right.sequence;
 }
 
+function getStateVersion(state: unknown): unknown {
+  return typeof state === 'object' && state !== null
+    ? (state as { version?: unknown }).version
+    : undefined;
+}
+
+function restoreStaleDispatcherMethods(existingState: unknown): void {
+  if (
+    typeof Element === 'undefined' ||
+    typeof existingState !== 'object' ||
+    existingState === null
+  ) {
+    return;
+  }
+
+  const staleState = existingState as LegacyDomInsertionDispatcherState;
+
+  if (
+    typeof staleState.appendChildWrapper === 'function' &&
+    typeof staleState.baselineAppendChild === 'function' &&
+    Element.prototype.appendChild === staleState.appendChildWrapper
+  ) {
+    Element.prototype.appendChild = staleState.baselineAppendChild as AppendChildMethod;
+  }
+
+  if (
+    typeof staleState.insertBeforeWrapper === 'function' &&
+    typeof staleState.baselineInsertBefore === 'function' &&
+    Element.prototype.insertBefore === staleState.insertBeforeWrapper
+  ) {
+    Element.prototype.insertBefore = staleState.baselineInsertBefore as InsertBeforeMethod;
+  }
+}
+
 function getDispatcherState(): DomInsertionDispatcherState {
   const globalObject = globalThis as Record<PropertyKey, unknown>;
   const existingState = globalObject[DOM_INSERTION_DISPATCHER_KEY];
+  const existingStateVersion = getStateVersion(existingState);
 
-  if (
-    existingState &&
-    typeof existingState === 'object' &&
-    (existingState as { version?: unknown }).version === DOM_INSERTION_DISPATCHER_STATE_VERSION
-  ) {
-    return existingState as DomInsertionDispatcherState;
+  if (isDispatcherState(existingState)) {
+    return existingState;
   }
 
   if (existingState) {
     log.warn('DOM insertion dispatcher: replacing stale global state', {
       expectedVersion: DOM_INSERTION_DISPATCHER_STATE_VERSION,
-      foundVersion:
-        typeof existingState === 'object'
-          ? (existingState as { version?: unknown }).version
-          : undefined,
+      foundVersion: existingStateVersion,
+      validShape: false,
     });
+    restoreStaleDispatcherMethods(existingState);
   }
 
   const state: DomInsertionDispatcherState = {
