@@ -13,6 +13,7 @@ use rand::rngs::OsRng;
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::FastlyConfigStore;
+use crate::request_signing::JWKS_CONFIG_STORE_NAME;
 
 pub struct Keypair {
     pub signing_key: SigningKey,
@@ -60,7 +61,7 @@ impl Keypair {
 ///
 /// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
 pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new("jwks_store");
+    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     let active_kids_str = store
         .get("active-kids")
         .attach("while fetching active kids list")?;

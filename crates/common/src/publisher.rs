@@ -17,9 +17,11 @@ use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
-/// Concatenates core + enabled integration JS modules at runtime based on the
-/// `IntegrationRegistry`. The URL remains `/static/tsjs=tsjs-unified(.min).js`
-/// for backward compatibility.
+/// Serves two types of bundles:
+/// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
+///   integration modules.
+/// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
+///   modules loaded with `defer` (e.g., prebid).
 ///
 /// # Errors
 ///
@@ -29,23 +31,54 @@ pub fn handle_tsjs_dynamic(
     integration_registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
-    const ALLOWED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
+    const UNIFIED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
+
     let path = req.get_path();
     if !path.starts_with(PREFIX) {
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
-    if !ALLOWED_FILENAMES.contains(&filename) {
-        return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+
+    if UNIFIED_FILENAMES.contains(&filename) {
+        // Serve core + immediate modules (excludes deferred like prebid)
+        let module_ids = integration_registry.js_module_ids_immediate();
+        let body = trusted_server_js::concatenate_modules(&module_ids);
+        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+        return Ok(resp);
     }
 
-    // Concatenate core + enabled integration modules
-    let module_ids = integration_registry.js_module_ids();
-    let body = trusted_server_js::concatenate_modules(&module_ids);
+    if let Some(module_id) = parse_deferred_module_filename(filename) {
+        // Only serve if the deferred module is actually enabled
+        let deferred_ids = integration_registry.js_module_ids_deferred();
+        if !deferred_ids.contains(&module_id) {
+            return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+        }
+        if let Some(content) = trusted_server_js::module_bundle(module_id) {
+            let mut resp =
+                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+            return Ok(resp);
+        }
+    }
 
-    let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
-    resp.set_header(HEADER_X_COMPRESS_HINT, "on");
-    Ok(resp)
+    Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"))
+}
+
+/// Extract a module ID from a deferred-module filename like `tsjs-prebid.min.js`.
+///
+/// Returns `Some(&'static str)` if the filename matches a known JS module ID,
+/// `None` otherwise. The caller must additionally verify that the module is
+/// both deferred and enabled via the [`IntegrationRegistry`].
+#[must_use]
+fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
+    let stem = filename
+        .strip_prefix("tsjs-")
+        .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
+
+    trusted_server_js::all_module_ids()
+        .into_iter()
+        .find(|&id| id == stem)
 }
 
 /// Parameters for processing response streaming
@@ -533,5 +566,106 @@ mod tests {
         assert_eq!(response.get_status(), StatusCode::OK);
     }
 
-    // Tests related to serving Prebid.js directly or intercepting its paths were removed.
+    #[test]
+    fn parse_deferred_module_filename_extracts_known_id() {
+        assert_eq!(
+            parse_deferred_module_filename("tsjs-prebid.min.js"),
+            Some("prebid"),
+            "should extract prebid from minified filename"
+        );
+        assert_eq!(
+            parse_deferred_module_filename("tsjs-prebid.js"),
+            Some("prebid"),
+            "should extract prebid from unminified filename"
+        );
+    }
+
+    #[test]
+    fn parse_deferred_module_filename_rejects_unknown_ids() {
+        assert_eq!(
+            parse_deferred_module_filename("tsjs-evil.min.js"),
+            None,
+            "should reject unknown module names"
+        );
+        assert_eq!(
+            parse_deferred_module_filename("tsjs-core.min.js"),
+            Some("core"),
+            "should accept any known module ID (deferred check happens in caller)"
+        );
+        assert_eq!(
+            parse_deferred_module_filename("prebid.min.js"),
+            None,
+            "should reject without tsjs- prefix"
+        );
+        assert_eq!(
+            parse_deferred_module_filename("tsjs-prebid.txt"),
+            None,
+            "should reject non-js extension"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_deferred_prebid_when_enabled() {
+        // Default test settings include prebid enabled
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::OK,
+            "should serve deferred prebid module when enabled"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_returns_not_found_for_disabled_deferred_module() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": false,
+                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                }),
+            )
+            .expect("should update prebid config");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::NOT_FOUND,
+            "should return 404 for disabled deferred module"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_returns_not_found_for_arbitrary_module_name() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let req = Request::new(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-evil.min.js",
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::NOT_FOUND,
+            "should reject unknown module names"
+        );
+    }
 }
