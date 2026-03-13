@@ -155,4 +155,154 @@ describe('GPT script guard', () => {
       '/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js?foo=bar'
     );
   });
+
+  // -----------------------------------------------------------------------
+  // document.write edge-cases (DOMParser-based rewriting)
+  // -----------------------------------------------------------------------
+
+  it('rewrites document.write script src with single-quoted attribute', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      "<script src='https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js'></script>"
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites document.write script src with extra whitespace around =', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script  src  =  "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js" ></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites multiple script tags in a single document.write call', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>' +
+        '<script src="https://securepubads.g.doubleclick.net/pagead/b.js"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/a.js');
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/b.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites document.writeln the same as document.write', () => {
+    const nativeWritelnSpy = vi.fn<(...args: string[]) => void>();
+    document.writeln = nativeWritelnSpy as unknown as typeof document.writeln;
+
+    installGptGuard();
+
+    document.writeln(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js"></script>'
+    );
+
+    expect(nativeWritelnSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWritelnSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('passes through HTML with no GPT domain reference unchanged', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    const html = '<script src="https://example.com/tracker.js"></script>';
+    document.write(html);
+
+    expect(nativeWriteSpy).toHaveBeenCalledWith(html);
+  });
+
+  it('rewrites protocol-relative GPT URLs in document.write', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="//securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  // -----------------------------------------------------------------------
+  // Fail-closed behaviour
+  // -----------------------------------------------------------------------
+
+  it('fails closed when DOMParser is unavailable', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — simulating an environment without DOMParser
+    delete globalThis.DOMParser;
+
+    try {
+      installGptGuard();
+
+      document.write('<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>');
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith('');
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
+
+  it('fails closed when DOMParser throws', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — injecting a broken DOMParser
+    globalThis.DOMParser = class {
+      parseFromString() {
+        throw new Error('boom');
+      }
+    };
+
+    try {
+      installGptGuard();
+
+      document.write('<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>');
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith('');
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
 });

@@ -191,42 +191,52 @@ function rewriteLinkHref(element: HTMLLinkElement): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Regex that matches `src="..."` or `src='...'` attributes inside a
- * `<script>` tag where the URL text mentions the GPT domain token. We capture:
- *   1. Everything before the URL (the `src=` prefix with quote)
- *   2. The URL itself
- *   3. Everything after the URL (the closing quote)
- *
- * This handles the HTML that GPT's `Xd` function produces, e.g.:
- *   `<script src="https://securepubads.g.doubleclick.net/pagead/…/pubads_impl.js" …></script>`
- *
- * Hostname verification still happens in [`maybeRewrite`], so URLs that merely
- * contain the token in query text are left unchanged.
- */
-const SCRIPT_SRC_RE =
-  /(<script\b[^>]*?\bsrc\s*=\s*["'])([^"']*securepubads\.g\.doubleclick\.net[^"']*)(["'])/gi;
-
-/**
  * Rewrite GPT domain URLs inside raw HTML strings passed to
  * `document.write` / `document.writeln`.
+ *
+ * Uses `DOMParser` for robust HTML parsing instead of regex so that
+ * edge-cases (unquoted attributes, unusual spacing, mixed quote styles)
+ * are handled by the browser's native parser. The raw `getAttribute`
+ * value is swapped in the original HTML string so the surrounding markup
+ * is preserved verbatim.
+ *
+ * If the GPT domain is present in the HTML but `DOMParser` is
+ * unavailable or throws, the function **fails closed** (returns an
+ * empty string) rather than passing the unproxied URL through.
  */
 function rewriteHtmlString(html: string): string {
-  SCRIPT_SRC_RE.lastIndex = 0;
-  if (!SCRIPT_SRC_RE.test(html)) return html;
-  SCRIPT_SRC_RE.lastIndex = 0;
+  if (typeof DOMParser === 'undefined') {
+    log.warn(
+      `${LOG_PREFIX}: DOMParser unavailable, blocking document.write HTML that references GPT domain`
+    );
+    return '';
+  }
 
-  return html.replace(SCRIPT_SRC_RE, (_match, prefix: string, url: string, suffix: string) => {
-    const { url: rewrittenUrl, didRewrite } = maybeRewrite(url);
-    if (!didRewrite) {
-      return `${prefix}${url}${suffix}`;
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const scripts = doc.querySelectorAll('script[src]');
+    let result = html;
+
+    for (const script of scripts) {
+      const rawSrc = script.getAttribute('src') ?? '';
+      const { url: rewrittenUrl, didRewrite } = maybeRewrite(rawSrc);
+      if (!didRewrite) continue;
+
+      log.info(`${LOG_PREFIX}: rewriting document.write script src`, {
+        original: rawSrc,
+        rewritten: rewrittenUrl,
+      });
+      result = result.replaceAll(rawSrc, rewrittenUrl);
     }
 
-    log.info(`${LOG_PREFIX}: rewriting document.write script src`, {
-      original: url,
-      rewritten: rewrittenUrl,
-    });
-    return `${prefix}${rewrittenUrl}${suffix}`;
-  });
+    return result;
+  } catch (err) {
+    log.warn(
+      `${LOG_PREFIX}: failed to parse document.write HTML containing GPT domain, blocking`,
+      err
+    );
+    return '';
+  }
 }
 
 function installDocumentWritePatch(): void {
