@@ -325,33 +325,35 @@ impl GptIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<GptIntegration>> {
-    let config = match settings.integration_config::<GptConfig>(GPT_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            log::debug!("[gpt] Integration disabled or not configured");
-            return None;
-        }
-        Err(err) => {
-            log::error!("Failed to load GPT integration config: {err:?}");
-            return None;
-        }
+fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<GptConfig>(GPT_INTEGRATION_ID)? else {
+        log::debug!("[gpt] Integration disabled or not configured");
+        return Ok(None);
     };
 
-    Some(GptIntegration::new(config))
+    Ok(Some(GptIntegration::new(config)))
 }
 
 /// Register the GPT integration.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+///
+/// # Errors
+///
+/// Returns an error when the GPT integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(GPT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -744,7 +746,9 @@ mod tests {
     fn build_requires_config() {
         let settings = create_test_settings();
         assert!(
-            build(&settings).is_none(),
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
             "should not build without integration config"
         );
     }
@@ -766,7 +770,9 @@ mod tests {
             .expect("should insert GPT config");
 
         assert!(
-            build(&settings).is_some(),
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_some(),
             "should build with valid integration config"
         );
     }
@@ -785,7 +791,9 @@ mod tests {
             .expect("should insert GPT config");
 
         assert!(
-            build(&settings).is_none(),
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
             "should not build when integration is disabled"
         );
     }

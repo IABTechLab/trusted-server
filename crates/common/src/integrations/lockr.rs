@@ -13,7 +13,7 @@
 //! The rewriting finds the obfuscated host assignment pattern in the SDK and
 //! replaces it with: `'host': '/integrations/lockr/api'`
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
@@ -33,6 +33,15 @@ use crate::integrations::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
+
+// This is a code-defined literal, not a config-derived pattern, so it can stay
+// as a shared lazy static rather than participating in startup preparation.
+static LOCKR_SDK_HOST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"'host':\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)",
+    )
+    .expect("should compile static Lockr SDK host rewrite regex")
+});
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
@@ -120,13 +129,9 @@ impl LockrIntegration {
         // Pattern matches: 'host': _0xABCDEF(0x123) + _0xABCDEF(0x456) + _0xABCDEF(0x789)
         // This is the obfuscated way Lockr constructs the API host
         // The function names and hex values change with each build, so we use regex
-        let pattern = Regex::new(
-            r"'host':\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)",
-        )
-        .change_context(Self::error("Failed to compile regex pattern"))?;
-
         // Replace with first-party API proxy endpoint
-        let rewritten = pattern.replace(&sdk_string, "'host': '/integrations/lockr/api'");
+        let rewritten =
+            LOCKR_SDK_HOST_PATTERN.replace(&sdk_string, "'host': '/integrations/lockr/api'");
 
         Ok(rewritten.as_bytes().to_vec())
     }
@@ -293,29 +298,33 @@ impl LockrIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
-    let config = match settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load Lockr integration config: {err:?}");
-            return None;
-        }
+fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)? else {
+        return Ok(None);
     };
 
-    Some(LockrIntegration::new(config))
+    Ok(Some(LockrIntegration::new(config)))
 }
 
 /// Register the Lockr integration.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+///
+/// # Errors
+///
+/// Returns an error when the Lockr integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -407,6 +416,9 @@ fn default_rewrite_sdk_host() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    use crate::test_support::tests::create_test_settings;
 
     #[test]
     fn test_lockr_sdk_url_detection() {
@@ -690,5 +702,27 @@ const identityLockr = {
 
         // When pattern doesn't match, content should be unchanged
         assert!(rewritten.contains("'host': 'https://example.com'"));
+    }
+
+    #[test]
+    fn disabled_invalid_config_does_not_error() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                LOCKR_INTEGRATION_ID,
+                &json!({
+                    "enabled": false,
+                    "app_id": "",
+                    "sdk_url": "not a url",
+                }),
+            )
+            .expect("should insert disabled invalid Lockr config");
+
+        let registration = register(&settings).expect("disabled invalid Lockr config should skip");
+        assert!(
+            registration.is_none(),
+            "disabled invalid Lockr config should not register"
+        );
     }
 }

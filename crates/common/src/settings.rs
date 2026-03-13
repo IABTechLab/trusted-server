@@ -120,6 +120,13 @@ impl IntegrationSettings {
         }
     }
 
+    fn is_explicitly_disabled(raw: &JsonValue) -> bool {
+        raw.as_object()
+            .and_then(|map| map.get("enabled"))
+            .and_then(JsonValue::as_bool)
+            == Some(false)
+    }
+
     /// Retrieves and validates a typed configuration for an integration.
     ///
     /// # Errors
@@ -136,6 +143,10 @@ impl IntegrationSettings {
             Some(value) => value,
             None => return Ok(None),
         };
+
+        if Self::is_explicitly_disabled(raw) {
+            return Ok(None);
+        }
 
         let config: T = serde_json::from_value(raw.clone()).change_context(
             TrustedServerError::Configuration {
@@ -238,7 +249,7 @@ impl Rewrite {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Handler {
-    #[validate(length(min = 1), custom(function = validate_path))]
+    #[validate(length(min = 1))]
     pub path: String,
     #[validate(length(min = 1))]
     pub username: String,
@@ -246,18 +257,41 @@ pub struct Handler {
     pub password: String,
     #[serde(skip, default)]
     #[validate(skip)]
-    regex: OnceLock<Regex>,
+    regex: OnceLock<Result<Regex, String>>,
 }
 
 impl Handler {
-    fn compiled_regex(&self) -> &Regex {
-        self.regex.get_or_init(|| {
-            Regex::new(&self.path).expect("configuration validation should ensure regex compiles")
-        })
+    fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
+        match self
+            .regex
+            .get_or_init(|| Regex::new(&self.path).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(regex),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Handler path regex `{}` failed to compile: {message}",
+                    self.path
+                ),
+            })),
+        }
     }
 
-    pub fn matches_path(&self, path: &str) -> bool {
-        self.compiled_regex().is_match(path)
+    /// Eagerly compile the handler regex to fail fast during startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the handler path regex does not compile.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        self.compiled_regex().map(|_| ())
+    }
+
+    /// Determine whether this handler applies to the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the handler path regex does not compile.
+    pub fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.compiled_regex().map(|regex| regex.is_match(path))
     }
 }
 
@@ -374,14 +408,40 @@ impl Settings {
             })
         })?;
 
+        settings.prepare_runtime()?;
+
         Ok(settings)
     }
 
-    #[must_use]
-    pub fn handler_for_path(&self, path: &str) -> Option<&Handler> {
-        self.handlers
-            .iter()
-            .find(|handler| handler.matches_path(path))
+    /// Eagerly prepare runtime-only settings artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            handler.prepare_runtime()?;
+        }
+
+        Ok(())
+    }
+
+    /// Resolve the first handler whose regex matches the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any handler regex does not compile.
+    pub fn handler_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<&Handler>, Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            if handler.matches_path(path)? {
+                return Ok(Some(handler));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Retrieves the integration configuration of a specific type.
@@ -408,15 +468,6 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
         return Err(err);
     }
     Ok(())
-}
-
-fn validate_path(value: &str) -> Result<(), ValidationError> {
-    Regex::new(value).map(|_| ()).map_err(|err| {
-        let mut validation_error = ValidationError::new("invalid_regex");
-        validation_error.add_param("value".into(), &value);
-        validation_error.add_param("message".into(), &err.to_string());
-        validation_error
-    })
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
@@ -542,9 +593,10 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
 
+    use crate::auction::build_orchestrator;
     use crate::integrations::{
-        nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
+        gpt::GptConfig, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
+        testlight::TestlightConfig, IntegrationRegistry,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
@@ -607,6 +659,21 @@ mod tests {
         assert!(
             result.is_err(),
             "origin_url ending with '/' should fail validation"
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_rejects_invalid_handler_regex() {
+        let toml_str = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
+        let err = settings
+            .prepare_runtime()
+            .expect_err("should reject invalid handler regex");
+        assert!(
+            err.to_string()
+                .contains("Handler path regex `(` failed to compile"),
+            "should describe the invalid handler regex"
         );
     }
 
@@ -794,6 +861,36 @@ mod tests {
                             assert_eq!(handler.password, "env-pass");
                         });
                     });
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn test_invalid_handler_override_fails_during_runtime_preparation() {
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let path_key = format!(
+            "{}{}HANDLERS{}0{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(path_key, Some("("), || {
+                    let _ = Settings::from_toml_and_env(&toml_str)
+                        .expect_err("should reject invalid handler regex override");
                 });
             },
         );
@@ -1021,6 +1118,142 @@ mod tests {
             .expect("integration parsing should succeed");
 
         assert!(config.is_none(), "Disabled integrations should be skipped");
+    }
+
+    #[test]
+    fn disabled_invalid_integration_skips_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &json!({
+                    "enabled": false,
+                    "script_url": "not a url",
+                }),
+            )
+            .expect("should insert GPT config");
+
+        let config = settings
+            .integration_config::<GptConfig>("gpt")
+            .expect("disabled GPT config should be ignored");
+        assert!(config.is_none(), "disabled GPT config should be skipped");
+        IntegrationRegistry::new(&settings)
+            .expect("disabled invalid integration config should not fail registry startup");
+    }
+
+    #[test]
+    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": false,
+                    "server_url": "not a url",
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("disabled prebid config should be ignored");
+        assert!(config.is_none(), "disabled prebid config should be skipped");
+        IntegrationRegistry::new(&settings)
+            .expect("disabled default-enabled prebid config should not fail registry startup");
+        build_orchestrator(&settings)
+            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
+    fn enabled_invalid_integration_fails_registry_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &json!({
+                    "enabled": true,
+                    "script_url": "not a url",
+                }),
+            )
+            .expect("should insert GPT config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("enabled invalid integration should fail registry startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Integration 'gpt'"),
+            "should identify the invalid integration config"
+        );
+    }
+
+    #[test]
+    fn disabled_invalid_provider_config_does_not_fail_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &json!({
+                    "enabled": false,
+                    "endpoint": "not a url",
+                }),
+            )
+            .expect("should insert adserver mock config");
+
+        build_orchestrator(&settings).expect("disabled invalid provider config should be ignored");
+    }
+
+    #[test]
+    fn enabled_invalid_provider_config_fails_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &json!({
+                    "enabled": true,
+                    "endpoint": "not a url",
+                }),
+            )
+            .expect("should insert adserver mock config");
+
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("enabled invalid provider config should fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Integration 'adserver_mock'"),
+            "should identify the invalid provider config"
+        );
+    }
+
+    #[test]
+    fn empty_prebid_server_url_fails_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "",
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("empty prebid server_url should fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Integration 'prebid' configuration failed validation"),
+            "should surface a validation error for prebid.server_url"
+        );
     }
 
     /// Tests the full build.rs round-trip: env vars are baked into Settings

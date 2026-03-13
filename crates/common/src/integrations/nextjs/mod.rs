@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistration;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -56,9 +58,25 @@ fn default_max_combined_payload_bytes() -> usize {
     10 * 1024 * 1024
 }
 
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let config = match build(settings) {
+pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "Integration '{NEXTJS_INTEGRATION_ID}' configuration error: {}",
+            message.into()
+        ),
+    })
+}
+
+/// Register the Next.js integration when enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Next.js integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let config = match build(settings)? {
         Some(config) => {
             log::info!(
                 "NextJS integration registered: enabled={}, rewrite_attributes={:?}, max_combined_payload_bytes={}",
@@ -70,12 +88,11 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         }
         None => {
             log::info!("NextJS integration not registered (disabled or missing config)");
-            return None;
+            return Ok(None);
         }
     };
-
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
-    let structured = Arc::new(NextJsNextDataRewriter::new(config.clone()));
+    let structured = Arc::new(NextJsNextDataRewriter::new(config.clone())?);
 
     // Insert placeholders for App Router RSC payload scripts during the initial HTML rewrite pass,
     // then substitute them during post-processing without re-parsing HTML.
@@ -89,15 +106,15 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         .with_script_rewriter(placeholders)
         .with_html_post_processor(post_processor);
 
-    Some(builder.build())
+    Ok(Some(builder.build()))
 }
 
-fn build(settings: &Settings) -> Option<Arc<NextJsIntegrationConfig>> {
-    let config = settings
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<NextJsIntegrationConfig>>, Report<TrustedServerError>> {
+    settings
         .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
-        .ok()
-        .flatten()?;
-    Some(Arc::new(config))
+        .map(|config| config.map(Arc::new))
 }
 
 #[cfg(test)]
@@ -183,6 +200,99 @@ mod tests {
         assert!(
             !processed.contains("\"href\":\"http://origin.example.com/sign-in\""),
             "should remove origin http href"
+        );
+    }
+
+    #[test]
+    fn html_processor_rewrites_next_data_fixture_like_payload() {
+        let html = r#"<html><body>
+            <script id="__NEXT_DATA__" type="application/json">
+                {
+                    "props": {
+                        "pageProps": {
+                            "siteProductionDomain": "origin.example.com",
+                            "siteBaseUrl": "https://origin.example.com",
+                            "navigation": {
+                                "href": "https://origin.example.com:8443/reviews",
+                                "link": "//origin.example.com:9443/assets/logo.png"
+                            },
+                            "article": {
+                                "url": "https://origin.example.com/news"
+                            },
+                            "canonicalUrl": "https://origin.example.com/should-stay",
+                            "metadata": {
+                                "ogUrl": "https://origin.example.com/should-stay-too"
+                            }
+                        }
+                    }
+                }
+            </script>
+        </body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": [
+                        "href",
+                        "link",
+                        "siteBaseUrl",
+                        "siteProductionDomain",
+                        "url"
+                    ],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains(r#""siteProductionDomain": "test.example.com""#),
+            "should rewrite siteProductionDomain in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""siteBaseUrl": "https://test.example.com""#),
+            "should rewrite siteBaseUrl in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""href": "https://test.example.com:8443/reviews""#),
+            "should preserve explicit ports while rewriting href in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""link": "//test.example.com:9443/assets/logo.png""#),
+            "should preserve explicit ports while rewriting protocol-relative links in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""url": "https://test.example.com/news""#),
+            "should rewrite url fields in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""canonicalUrl": "https://origin.example.com/should-stay""#),
+            "should leave non-configured fields untouched in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            processed.contains(r#""ogUrl": "https://origin.example.com/should-stay-too""#),
+            "should leave nested non-configured fields untouched in __NEXT_DATA__. Output: {processed}"
+        );
+        assert!(
+            !processed.contains(r#""siteProductionDomain": "origin.example.com""#),
+            "should not leave the origin host in rewritten __NEXT_DATA__ fields. Output: {processed}"
         );
     }
 
@@ -342,7 +452,7 @@ mod tests {
     #[test]
     fn register_respects_enabled_flag() {
         let settings = create_test_settings();
-        let registration = register(&settings);
+        let registration = register(&settings).expect("should evaluate registration");
 
         assert!(
             registration.is_none(),

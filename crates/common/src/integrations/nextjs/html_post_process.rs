@@ -11,7 +11,7 @@ use super::rsc::rewrite_rsc_scripts_combined_with_limit;
 use super::rsc_placeholders::{
     NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX, RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
 };
-use super::shared::find_rsc_push_payload_range;
+use super::shared::{find_rsc_push_payload_range, RscUrlRewriter};
 use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
 
 pub(crate) struct NextJsHtmlPostProcessor {
@@ -91,8 +91,10 @@ impl NextJsHtmlPostProcessor {
         payloads: Vec<String>,
     ) -> bool {
         let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
+        let rsc_rewriter = RscUrlRewriter::new();
         let mut rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payload_refs.as_slice(),
+            &rsc_rewriter,
             ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
@@ -453,8 +455,11 @@ fn post_process_rsc_html_in_place_with_limit(
             );
         }
 
+        let rewriter = RscUrlRewriter::new();
+
         let rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payloads.as_slice(),
+            &rewriter,
             origin_host,
             request_host,
             request_scheme,

@@ -553,7 +553,7 @@ impl IntegrationRegistry {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
-            if let Some(registration) = builder(settings) {
+            if let Some(registration) = builder(settings)? {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
                         let value = (proxy.clone(), registration.integration_id);

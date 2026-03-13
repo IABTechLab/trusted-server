@@ -78,6 +78,8 @@ For each changed file, evaluate:
 - `expect("should ...")` instead of `unwrap()` in production code
 - `error-stack` (`Report<E>`) with `derive_more::Display` for errors (not thiserror/anyhow)
 - `log` macros (not `println!`)
+- Config-derived regex/pattern compilation must not use panic-prone `expect()`/`unwrap()`; invalid enabled config should surface as startup/config errors
+- Invalid enabled integrations/providers must not be silently logged-and-disabled during startup or registration
 - `vi.hoisted()` for mock definitions in JS tests
 - Integration IDs match JS directory names
 - Colocated tests with `#[cfg(test)]`
@@ -105,6 +107,7 @@ For each changed file, evaluate:
 
 - Are new code paths tested?
 - Are edge cases covered (empty input, max values, error paths)?
+- If config-derived regex/pattern compilation changed: are invalid enabled-config startup failures and explicit `enabled = false` bypass cases both covered?
 - Rust tests: `cargo test --workspace`
 - JS tests: `npx vitest run` in `crates/js/lib/`
 

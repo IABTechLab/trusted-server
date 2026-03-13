@@ -42,7 +42,13 @@ fn main(req: Request) -> Result<Response, Error> {
     log::info!("Settings {settings:?}");
 
     // Build the auction orchestrator once at startup
-    let orchestrator = build_orchestrator(&settings);
+    let orchestrator = match build_orchestrator(&settings) {
+        Ok(orchestrator) => orchestrator,
+        Err(e) => {
+            log::error!("Failed to build auction orchestrator: {:?}", e);
+            return Ok(to_error_response(&e));
+        }
+    };
 
     let integration_registry = match IntegrationRegistry::new(&settings) {
         Ok(r) => r,
@@ -69,7 +75,13 @@ async fn route_request(
     // Extract geo info before auth check or routing consumes the request
     let geo_info = GeoInfo::from_request(&req);
 
-    if let Some(mut response) = enforce_basic_auth(settings, &req) {
+    // `get_settings()` should already have rejected invalid handler regexes.
+    // Keep this fallback so manually-constructed or otherwise unprepared
+    // settings still become an error response instead of panicking.
+    if let Some(mut response) = enforce_basic_auth(settings, &req).unwrap_or_else(|e| {
+        log::error!("Failed to evaluate basic auth: {:?}", e);
+        Some(to_error_response(&e))
+    }) {
         finalize_response(settings, geo_info.as_ref(), &mut response);
         return Ok(response);
     }

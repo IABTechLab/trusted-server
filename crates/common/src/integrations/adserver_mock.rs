@@ -34,6 +34,7 @@ pub struct AdServerMockConfig {
     pub enabled: bool,
 
     /// Mediation endpoint URL
+    #[validate(url)]
     pub endpoint: String,
 
     /// Timeout in milliseconds
@@ -379,8 +380,14 @@ impl AuctionProvider for AdServerMockProvider {
 // ============================================================================
 
 /// Auto-register ad server mock provider based on settings configuration.
-#[must_use]
-pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+///
+/// # Errors
+///
+/// Returns an error when the ad server mock provider is enabled with invalid
+/// configuration.
+pub fn register_providers(
+    settings: &Settings,
+) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
     match settings.integration_config::<AdServerMockConfig>("adserver_mock") {
@@ -395,11 +402,11 @@ pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> 
             log::debug!("AdServer Mock config found but is disabled");
         }
         Err(e) => {
-            log::error!("Failed to load AdServer Mock config: {:?}", e);
+            return Err(e);
         }
     }
 
-    providers
+    Ok(providers)
 }
 
 // ============================================================================
