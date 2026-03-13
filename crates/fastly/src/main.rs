@@ -6,7 +6,12 @@ use log_fastly::Logger;
 use trusted_server_common::auction::endpoints::handle_auction;
 use trusted_server_common::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_common::auth::enforce_basic_auth;
+use trusted_server_common::constants::{
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
+    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+};
 use trusted_server_common::error::TrustedServerError;
+use trusted_server_common::geo::GeoInfo;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -61,12 +66,11 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     req: Request,
 ) -> Result<Response, Error> {
-    log::info!(
-        "FASTLY_SERVICE_VERSION: {}",
-        ::std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
-    );
+    // Extract geo info before auth check or routing consumes the request
+    let geo_info = GeoInfo::from_request(&req);
 
-    if let Some(response) = enforce_basic_auth(settings, &req) {
+    if let Some(mut response) = enforce_basic_auth(settings, &req) {
+        finalize_response(settings, geo_info.as_ref(), &mut response);
         return Ok(response);
     }
 
@@ -77,7 +81,9 @@ async fn route_request(
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
-        (Method::GET, path) if path.starts_with("/static/tsjs=") => handle_tsjs_dynamic(&req),
+        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
+            handle_tsjs_dynamic(&req, integration_registry)
+        }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
@@ -132,11 +138,36 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
+    finalize_response(settings, geo_info.as_ref(), &mut response);
+
+    Ok(response)
+}
+
+/// Applies all standard response headers: geo, version, staging, and configured headers.
+///
+/// Called from every response path (including auth early-returns) so that all
+/// outgoing responses carry a consistent set of Trusted Server headers.
+///
+/// Header precedence (last write wins): geo headers are set first, then
+/// version/staging, then operator-configured `settings.response_headers`.
+/// This means operators can intentionally override any managed header.
+fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut Response) {
+    if let Some(geo) = geo_info {
+        geo.set_response_headers(response);
+    } else {
+        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
+    }
+
+    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        response.set_header(HEADER_X_TS_VERSION, v);
+    }
+    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+        response.set_header(HEADER_X_TS_ENV, "staging");
+    }
+
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
     }
-
-    Ok(response)
 }
 
 fn init_logger() {

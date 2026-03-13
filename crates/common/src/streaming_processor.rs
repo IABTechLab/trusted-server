@@ -224,26 +224,25 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         Ok(())
     }
 
-    /// Process gzip compressed input to uncompressed output (decompression only)
-    fn process_gzip_to_none<R: Read, W: Write>(
+    /// Decompress input, process content, and write uncompressed output.
+    fn decompress_and_process<R: Read, W: Write>(
         &mut self,
-        input: R,
+        mut decoder: R,
         mut output: W,
+        codec_name: &str,
     ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-
-        // Decompress input
-        let mut decoder = GzDecoder::new(input);
         let mut decompressed = Vec::new();
         decoder
             .read_to_end(&mut decompressed)
             .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress gzip".to_string(),
+                message: format!("Failed to decompress {codec_name}"),
             })?;
 
-        log::info!("Decompressed size: {} bytes", decompressed.len());
+        log::info!(
+            "{codec_name} decompressed size: {} bytes",
+            decompressed.len()
+        );
 
-        // Process the decompressed content
         let processed = self
             .processor
             .process_chunk(&decompressed, true)
@@ -251,9 +250,8 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 message: "Failed to process content".to_string(),
             })?;
 
-        log::info!("Processed size: {} bytes", processed.len());
+        log::info!("{codec_name} processed size: {} bytes", processed.len());
 
-        // Write uncompressed output
         output
             .write_all(&processed)
             .change_context(TrustedServerError::Proxy {
@@ -261,6 +259,17 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             })?;
 
         Ok(())
+    }
+
+    /// Process gzip compressed input to uncompressed output (decompression only)
+    fn process_gzip_to_none<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        output: W,
+    ) -> Result<(), Report<TrustedServerError>> {
+        use flate2::read::GzDecoder;
+
+        self.decompress_and_process(GzDecoder::new(input), output, "gzip")
     }
 
     /// Process deflate compressed stream
@@ -283,42 +292,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     fn process_deflate_to_none<R: Read, W: Write>(
         &mut self,
         input: R,
-        mut output: W,
+        output: W,
     ) -> Result<(), Report<TrustedServerError>> {
         use flate2::read::ZlibDecoder;
 
-        // Decompress input
-        let mut decoder = ZlibDecoder::new(input);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress deflate".to_string(),
-            })?;
-
-        log::info!(
-            "Deflate->None decompressed size: {} bytes",
-            decompressed.len()
-        );
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Deflate->None processed size: {} bytes", processed.len());
-
-        // Write uncompressed output
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
-
-        Ok(())
+        self.decompress_and_process(ZlibDecoder::new(input), output, "deflate")
     }
 
     /// Process brotli compressed stream
@@ -346,42 +324,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     fn process_brotli_to_none<R: Read, W: Write>(
         &mut self,
         input: R,
-        mut output: W,
+        output: W,
     ) -> Result<(), Report<TrustedServerError>> {
         use brotli::Decompressor;
 
-        // Decompress input
-        let mut decoder = Decompressor::new(input, 4096);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress brotli".to_string(),
-            })?;
-
-        log::info!(
-            "Brotli->None decompressed size: {} bytes",
-            decompressed.len()
-        );
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Brotli->None processed size: {} bytes", processed.len());
-
-        // Write uncompressed output
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
-
-        Ok(())
+        self.decompress_and_process(Decompressor::new(input, 4096), output, "brotli")
     }
 
     /// Generic processing through compression layers

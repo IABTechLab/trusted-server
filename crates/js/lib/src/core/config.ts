@@ -1,9 +1,13 @@
-// Global configuration storage for the tsjs runtime (mode, logging, etc.).
+// Global configuration storage for the tsjs runtime (logging, debug, etc.).
 import { log, LogLevel } from './log';
-import type { Config } from './types';
-import { RequestMode } from './types';
 
-let CONFIG: Config = { mode: RequestMode.FirstParty };
+export interface Config {
+  debug?: boolean;
+  logLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
+  [key: string]: unknown;
+}
+
+let CONFIG: Config = {};
 
 // Merge publisher-provided config and adjust the log level accordingly.
 export function setConfig(cfg: Config): void {

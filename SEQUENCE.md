@@ -129,7 +129,7 @@ sequenceDiagram
 
 ## Notes
 - TSJS
-  - Served first-party at `/static/tsjs-core.min.js` (and `/static/tsjs-ext.min.js` if prebid auto-config is enabled).
+  - Served first-party at `/static/tsjs=tsjs-unified.min.js?v=<hash>`. The server dynamically concatenates core + enabled integration modules based on config.
   - Discovers ad units and renders placeholders; either uses slot-level HTML (`/first-party/ad`) or JSON auction (`/auction`).
 - Publisher HTML Rewriting
   - Injects TSJS loader and rewrites absolute URLs from origin domain to first-party domain during streaming.

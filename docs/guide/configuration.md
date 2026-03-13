@@ -7,7 +7,7 @@ Learn how to configure Trusted Server for your deployment.
 Trusted Server uses a flexible configuration system based on:
 
 1. **TOML Files** - `trusted-server.toml` for base configuration
-2. **Environment Variables** - Runtime overrides with `TRUSTED_SERVER__` prefix
+2. **Environment Variables** - Build-time overrides with `TRUSTED_SERVER__` prefix (baked into the binary by `build.rs`)
 3. **Fastly Stores** - KV/Config/Secret stores for runtime data
 
 ## Quick Start
@@ -32,7 +32,9 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 
 ### Environment Variable Overrides
 
-Override any setting at runtime:
+Override any setting at build time. Environment variables are merged into the
+config by `build.rs` and baked into the compiled binary — they are **not** read
+at runtime.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
@@ -97,7 +99,11 @@ bidders = ["kargo", "rubicon", "appnexus"]
 
 The sections below consolidate the full configuration reference on this page.
 
-## Environment Variable Overrides
+## Environment Variable Overrides (Build-Time)
+
+Environment variables with the `TRUSTED_SERVER__` prefix are merged into the
+base TOML configuration by `build.rs` at compile time. The resulting config is
+embedded in the binary. Changing an environment variable requires a rebuild.
 
 ### Format
 
@@ -434,9 +440,15 @@ Cache-Control = "public, max-age=3600"
 
 **Environment Override**:
 
+Use a JSON object to preserve header name casing and hyphens:
+
 ```bash
-TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER="custom value"
+TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
 ```
+
+::: tip Why JSON?
+Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER` lose hyphens and casing (becoming `x_custom_header`). The JSON format preserves exact header names.
+:::
 
 **Use Cases**:
 
@@ -723,15 +735,16 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                | Type          | Default                                                                | Description                                 |
-| -------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
-| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                   |
-| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                  |
-| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds             |
-| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                     |
-| `debug`              | Boolean       | `false`                                                                | Enable debug logging                        |
-| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging   |
-| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception |
+| Field                | Type          | Default                                                                | Description                                                                                                |
+| -------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                  |
+| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                                                                                 |
+| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                            |
+| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                    |
+| `debug`              | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses) |
+| `test_mode`          | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                          |
+| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging                                                                  |
+| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                |
 
 **Example**:
 
@@ -742,6 +755,7 @@ server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
 debug = false
+# test_mode = false
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
@@ -755,6 +769,7 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
+TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG_QUERY_PARAMS=debug=1
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS='["/prebid.js","/prebid.min.js"]'
 ```
@@ -1035,6 +1050,7 @@ trusted-server.dev.toml      # Development overrides
 
 **Environment Variables Not Applied**:
 
+- Env vars are applied at **build time** only — rebuild after changing them
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm variable is exported: `echo $VARIABLE_NAME`
@@ -1045,9 +1061,9 @@ trusted-server.dev.toml      # Development overrides
 **Print Loaded Config** (test only):
 
 ```rust
-use trusted_server_common::settings::Settings;
+use trusted_server_common::settings_data::get_settings;
 
-let settings = Settings::new()?;
+let settings = get_settings()?;
 println!("{:#?}", settings);
 ```
 

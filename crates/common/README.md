@@ -38,12 +38,12 @@ Helpers:
 - `rewrite_srcset(settings, srcset) -> String` — proxy absolute candidates; preserve descriptors (`1x`, `1.5x`, `100w`)
 - `split_srcset_candidates(srcset) -> Vec<&str>` — robust splitting for commas with/without spaces; avoids splitting the first `data:` mediatype comma
 
-Static bundles (served by publisher module):
+JS bundles (served by publisher module):
 
-- Unified dynamic endpoint: `/static/tsjs=<filename>`
-  - `tsjs-core(.min).js` — core library
-  - `tsjs-ext(.min).js` — Prebid.js shim/extension
-  - `tsjs-creative(.min).js` — creative click‑guard injected into proxied creatives
+- Dynamic endpoint: `/static/tsjs=tsjs-unified.min.js?v=<hash>`
+  - At build time, each integration is compiled as a separate IIFE (`tsjs-core.js`, `tsjs-prebid.js`, `tsjs-creative.js`, etc.)
+  - At runtime, the server concatenates `tsjs-core.js` + enabled integration modules based on `IntegrationRegistry` config
+  - The URL filename is fixed for backward compatibility; the `?v=` hash changes when modules change
 
 Behavior is covered by an extensive test suite in `crates/common/src/creative.rs`.
 

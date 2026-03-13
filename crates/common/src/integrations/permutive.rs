@@ -14,6 +14,7 @@ use validator::Validate;
 
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::http_util::copy_custom_headers;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -155,10 +156,7 @@ impl PermutiveIntegration {
             )
             .with_header(
                 header::CACHE_CONTROL,
-                format!(
-                    "public, max-age={}, immutable",
-                    self.config.cache_ttl_seconds
-                ),
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
             .with_header("X-Permutive-SDK-Proxy", "true")
             .with_header("X-SDK-Source", &sdk_url)
@@ -495,15 +493,8 @@ impl PermutiveIntegration {
             }
         }
 
-        // Copy any X-* custom headers
-        for header_name in from.get_header_names() {
-            let name_str = header_name.as_str();
-            if name_str.starts_with("x-") || name_str.starts_with("X-") {
-                if let Some(value) = from.get_header(header_name) {
-                    to.set_header(header_name, value);
-                }
-            }
-        }
+        // Copy any X-* custom headers, skipping TS-internal headers
+        copy_custom_headers(from, to);
     }
 }
 

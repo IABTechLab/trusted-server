@@ -29,8 +29,3 @@ export function getAllUnits(): AdUnit[] {
 export function getUnit(code: string): AdUnit | undefined {
   return registry.get(code);
 }
-
-// Extract just the ad unit codes for quick iteration.
-export function getAllCodes(): string[] {
-  return Array.from(registry.keys());
-}

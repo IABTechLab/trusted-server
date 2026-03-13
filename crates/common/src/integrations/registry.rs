@@ -8,8 +8,11 @@ use fastly::http::Method;
 use fastly::{Request, Response};
 use matchit::Router;
 
+use crate::constants::HEADER_X_SYNTHETIC_ID;
+use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
+use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +390,7 @@ pub trait IntegrationHeadInjector: Send + Sync {
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
+    pub js_deferred: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -410,6 +414,7 @@ impl IntegrationRegistrationBuilder {
         Self {
             registration: IntegrationRegistration {
                 integration_id,
+                js_deferred: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -455,6 +460,14 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Mark this integration's JS module for deferred loading via
+    /// `<script defer>` instead of the main synchronous bundle.
+    #[must_use]
+    pub fn with_deferred_js(mut self) -> Self {
+        self.registration.js_deferred = true;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -473,6 +486,7 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    deferred_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -492,6 +506,7 @@ impl Default for IntegrationRegistryInner {
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
+            deferred_js_ids: Vec::new(),
         }
     }
 }
@@ -597,6 +612,9 @@ impl IntegrationRegistry {
                 inner
                     .head_injectors
                     .extend(registration.head_injectors.into_iter());
+                if registration.js_deferred {
+                    inner.deferred_js_ids.push(registration.integration_id);
+                }
             }
         }
 
@@ -625,16 +643,43 @@ impl IntegrationRegistry {
     }
 
     /// Dispatch a proxy request when an integration handles the path.
+    ///
+    /// This method automatically sets the `x-synthetic-id` header and
+    /// `synthetic_id` cookie on successful responses.
     #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
         path: &str,
         settings: &Settings,
-        req: Request,
+        mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
-            Some(proxy.handle(settings, req).await)
+            // Generate synthetic ID before consuming request
+            let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
+
+            // Set synthetic ID header on the request so integrations can read it
+            if let Ok(ref synthetic_id) = synthetic_id_result {
+                req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+            }
+
+            let mut result = proxy.handle(settings, req).await;
+
+            // Set synthetic ID header on successful responses
+            if let Ok(ref mut response) = result {
+                match synthetic_id_result {
+                    Ok(ref synthetic_id) => {
+                        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                        set_synthetic_cookie(settings, response, synthetic_id.as_str());
+                    }
+                    Err(ref err) => {
+                        log::warn!(
+                            "Failed to generate synthetic ID for integration response: {err:?}"
+                        );
+                    }
+                }
+            }
+            Some(result)
         } else {
             None
         }
@@ -737,6 +782,52 @@ impl IntegrationRegistry {
         map.into_values().collect()
     }
 
+    /// Return JS module IDs that should be included in the tsjs bundle.
+    ///
+    /// Always includes "creative" (JS-only, no Rust-side registration).
+    /// Excludes integrations that have no JS module (e.g., "nextjs").
+    #[must_use]
+    pub fn js_module_ids(&self) -> Vec<&'static str> {
+        // Rust-only integrations with no corresponding JS module
+        const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
+        // JS-only modules always included (no Rust-side registration)
+        const JS_ALWAYS: &[&str] = &["creative"];
+
+        let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
+
+        for meta in self.registered_integrations() {
+            if !JS_EXCLUDED.contains(&meta.id) && !ids.contains(&meta.id) {
+                ids.push(meta.id);
+            }
+        }
+
+        ids
+    }
+
+    /// Return JS module IDs for the main (synchronous) bundle, excluding
+    /// modules registered with [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js).
+    #[must_use]
+    pub fn js_module_ids_immediate(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| !self.inner.deferred_js_ids.contains(id))
+            .collect()
+    }
+
+    /// Return JS module IDs that should be loaded with `<script defer>`.
+    ///
+    /// Only includes modules registered with
+    /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
+    /// that are actually enabled. Returns an empty vec when no deferred
+    /// integrations are configured.
+    #[must_use]
+    pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .filter(|id| self.inner.deferred_js_ids.contains(id))
+            .collect()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn from_rewriters(
@@ -755,6 +846,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -778,6 +870,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -833,6 +926,7 @@ impl IntegrationRegistry {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                deferred_js_ids: Vec::new(),
             }),
         }
     }
@@ -1109,5 +1203,278 @@ mod tests {
         // Should not match other methods on same path
         assert!(!registry.has_route(&Method::GET, "/integrations/test/users"));
         assert!(!registry.has_route(&Method::POST, "/integrations/test/users"));
+    }
+
+    // Tests for synthetic ID header on proxy responses
+    use crate::constants::COOKIE_SYNTHETIC_ID;
+    use crate::test_support::tests::create_test_settings;
+    use fastly::http::header;
+
+    /// Mock proxy that returns a simple 200 OK response
+    struct SyntheticIdTestProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for SyntheticIdTestProxy {
+        fn integration_name(&self) -> &'static str {
+            "synthetic_id_test"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![
+                IntegrationEndpoint {
+                    method: Method::GET,
+                    path: "/integrations/test/synthetic".to_string(),
+                },
+                IntegrationEndpoint {
+                    method: Method::POST,
+                    path: "/integrations/test/synthetic".to_string(),
+                },
+            ]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _req: Request,
+        ) -> Result<Response, Report<TrustedServerError>> {
+            // Return a simple response without the synthetic ID header.
+            // The registry's handle_proxy should add it.
+            Ok(Response::from_status(fastly::http::StatusCode::OK).with_body("test response"))
+        }
+    }
+
+    #[test]
+    fn handle_proxy_sets_synthetic_id_header_on_response() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        // Create a request without a synthetic ID cookie
+        let req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+
+        // Call handle_proxy (uses futures executor in test environment)
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ));
+
+        // Should have matched and returned a response
+        assert!(result.is_some(), "Should find route and handle request");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "Handler should succeed");
+
+        let response = response.unwrap();
+
+        // Verify x-synthetic-id header is present
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "Response should have x-synthetic-id header"
+        );
+
+        // Verify Set-Cookie header is present (since no cookie was in request)
+        let set_cookie = response.get_header(header::SET_COOKIE);
+        assert!(
+            set_cookie.is_some(),
+            "Response should have Set-Cookie header for synthetic_id"
+        );
+
+        let cookie_value = set_cookie.unwrap().to_str().unwrap();
+        assert!(
+            cookie_value.contains(COOKIE_SYNTHETIC_ID),
+            "Set-Cookie should contain synthetic_id cookie, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn handle_proxy_always_sets_cookie() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "test",
+            ),
+        )];
+
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let mut req = Request::get("https://test.example.com/integrations/test/synthetic");
+        // Pre-existing cookie
+        req.set_header(header::COOKIE, "synthetic_id=existing_id_12345");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ))
+        .expect("should handle proxy request");
+
+        let response = result.expect("proxy handle should succeed");
+
+        // Should still have x-synthetic-id header
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "Response should still have x-synthetic-id header"
+        );
+
+        // Should ALWAYS set the cookie again (per new requirements)
+        let set_cookie = response.get_header(header::SET_COOKIE);
+
+        assert!(
+            set_cookie.is_some(),
+            "Should set Set-Cookie header even if cookie is present"
+        );
+
+        if let Some(cookie) = set_cookie {
+            let cookie_str = cookie.to_str().unwrap_or("");
+            assert!(
+                cookie_str.contains(COOKIE_SYNTHETIC_ID),
+                "Should contain synthetic_id cookie, got: {}",
+                cookie_str
+            );
+        }
+    }
+
+    #[test]
+    fn handle_proxy_works_with_post_method() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::POST,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let req = Request::post("https://test-publisher.com/integrations/test/synthetic")
+            .with_body("test body");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::POST,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ));
+
+        assert!(result.is_some(), "Should find POST route");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "Handler should succeed");
+
+        let response = response.unwrap();
+        assert!(
+            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            "POST response should have x-synthetic-id header"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_immediate_excludes_prebid() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let immediate = registry.js_module_ids_immediate();
+        let deferred = registry.js_module_ids_deferred();
+
+        assert!(
+            all.contains(&"prebid"),
+            "should include prebid in full list"
+        );
+        assert!(
+            !immediate.contains(&"prebid"),
+            "should not include prebid in immediate IDs"
+        );
+        assert!(
+            deferred.contains(&"prebid"),
+            "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_deferred_empty_when_prebid_disabled() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": false,
+                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        let deferred = registry.js_module_ids_deferred();
+        assert!(
+            deferred.is_empty(),
+            "should have no deferred IDs when prebid is disabled"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_split_is_exhaustive() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings_with_prebid = settings;
+        settings_with_prebid
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "timeout_ms": 1000,
+                    "bidders": ["mocktioneer"],
+                    "debug": false
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let registry =
+            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+
+        let all = registry.js_module_ids();
+        let mut recombined = registry.js_module_ids_immediate();
+        recombined.extend(registry.js_module_ids_deferred());
+        recombined.sort();
+
+        let mut all_sorted = all;
+        all_sorted.sort();
+
+        assert_eq!(
+            recombined, all_sorted,
+            "should reconstruct full module list from immediate + deferred"
+        );
     }
 }

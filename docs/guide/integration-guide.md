@@ -212,12 +212,12 @@ impl IntegrationScriptRewriter for MyIntegration {
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
 ::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, simply removes `prebid.js` because the unified TSJS bundle is injected automatically at the start of `<head>`.
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
 :::
 
 ### 5b. Implement Head Injection (Optional)
 
-If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts that run after the unified TSJS bundle), implement `IntegrationHeadInjector`. Snippets returned by this trait are prepended into `<head>` immediately after the TSJS bundle tag, so the `tsjs` API is available.
+If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts or global bootstraps), implement `IntegrationHeadInjector`. Snippets are prepended into `<head>` before the TSJS bundle tags, so they run first.
 
 ```rust
 impl IntegrationHeadInjector for MyIntegration {
@@ -232,7 +232,7 @@ impl IntegrationHeadInjector for MyIntegration {
 }
 ```
 
-`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated after the unified script tag and prepended together, so ordering between integrations is not guaranteed — keep snippets self-contained.
+`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained.
 
 ::: tip When to Use Head Injection
 Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
@@ -251,7 +251,7 @@ Add the module to `crates/common/src/integrations/mod.rs`'s builder list. The re
 
 Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/integrations/` (for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build` script automatically discovers every file in that directory and produces a bundle named `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
 
-Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) can simply drop the legacy tag because the unified bundle is injected automatically at the start of `<head>`.
+Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own deferred bundle automatically.
 
 ### 8. Test Locally
 
@@ -268,9 +268,16 @@ By following these steps you can ship independent integration modules that plug 
 
 ## Existing Integrations
 
-Two built-in integrations demonstrate how the framework pieces fit together:
+Two built-in integrations demonstrate how the framework pieces fit together.
+
+Integrations are loaded in one of two ways:
+
+- **Immediate** (default) — concatenated into the main `tsjs-unified.min.js` bundle, loaded synchronously at `<head>` start.
+- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Integrations opt in by calling `.with_deferred_js()` on their registration builder.
 
 ### Testlight
+
+**Loading**: Immediate
 
 **Purpose**: Sample partner stub showing request proxying, attribute rewrites, and asset injection.
 
@@ -281,12 +288,14 @@ Two built-in integrations demonstrate how the framework pieces fit together:
 
 ### Prebid
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts because the shim already ships in the unified TSJS build.
+**Loading**: Deferred (`<script defer>`)
+
+**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects synthetic IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
 
 **Key files**:
 
 - `crates/common/src/integrations/prebid.rs` - Rust implementation
-- `crates/js/lib/src/ext/prebidjs.ts` - TypeScript shim
+- `crates/js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
 
 #### Prebid Integration Details
 
@@ -313,11 +322,11 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The unified TSJS bundle is injected at the start of `<head>`, so dropping the publisher assets prevents duplicate downloads and still runs before any inline `pbjs` config.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The Prebid module is loaded as a separate `<script defer>` tag after the main TSJS bundle, so dropping the publisher assets prevents duplicate downloads. The server-injected config (`window.__tsjs_prebid`) is an inline script that runs before both bundles, ensuring configuration is available when the deferred Prebid module auto-initializes.
 
 **4. TSJS Assets & Testing**
 
-The shim implementation lives in `crates/js/lib/src/ext/prebidjs.ts`. Tests typically assert that publisher references disappear, relying on the html processor's unified bundle injection to deliver the shim.
+The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
 
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 

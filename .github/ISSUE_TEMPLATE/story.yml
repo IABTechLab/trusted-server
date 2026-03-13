@@ -1,0 +1,17 @@
+name: Story
+description: A user-facing feature or capability
+labels: ["story"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe a new feature or capability from the user's perspective.
+
+  - type: textarea
+    id: user-story
+    attributes:
+      label: User story
+      description: "As a [role], I want [goal] so that [benefit]."
+      placeholder: "As a publisher, I want ... so that ..."
+    validations:
+      required: true

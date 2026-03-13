@@ -12,7 +12,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::auction::types::OrchestratorExt;
+use crate::auction::context::ContextValue;
 use crate::creative;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -22,7 +22,8 @@ use crate::synthetic::{generate_synthetic_id, get_or_generate_synthetic_id};
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, PublisherInfo, SiteInfo, UserInfo,
+    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
+    PublisherInfo, SiteInfo, UserInfo,
 };
 
 /// Request body format for auction endpoints (tsjs/Prebid.js format).
@@ -30,7 +31,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
-    #[allow(dead_code)]
     pub config: Option<JsonValue>,
 }
 
@@ -108,7 +108,7 @@ pub fn convert_tsjs_to_auction_request(
                 }
 
                 // Extract bidder params from the bids array
-                let mut bidders = std::collections::HashMap::new();
+                let mut bidders = HashMap::new();
                 if let Some(bids) = &unit.bids {
                     for bid in bids {
                         bidders.insert(bid.bidder.clone(), bid.params.clone());
@@ -119,21 +119,55 @@ pub fn convert_tsjs_to_auction_request(
                     id: unit.code.clone(),
                     formats,
                     floor_price: None,
-                    targeting: std::collections::HashMap::new(),
+                    targeting: HashMap::new(),
                     bidders,
                 });
             }
         }
     }
 
-    // Get geo info if available
-    let device = GeoInfo::from_request(req).map(|geo| DeviceInfo {
+    // Build device info with user-agent (always) and geo (if available)
+    let device = Some(DeviceInfo {
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        geo: Some(geo),
+        geo: GeoInfo::from_request(req),
     });
+
+    // Forward allowed config entries from the JS request into the context map.
+    // Only keys listed in `auction.allowed_context_keys` are accepted;
+    // unrecognised keys are silently dropped to prevent injection of
+    // arbitrary data by a malicious client payload.
+    let mut context = HashMap::new();
+    if let Some(ref config) = body.config {
+        if let Some(obj) = config.as_object() {
+            for (key, value) in obj {
+                if settings.auction.allowed_context_keys.contains(key) {
+                    match serde_json::from_value::<ContextValue>(value.clone()) {
+                        Ok(cv) => {
+                            context.insert(key.clone(), cv);
+                        }
+                        Err(_) => {
+                            log::debug!(
+                                "Auction context: dropping key '{}' with unsupported type",
+                                key
+                            );
+                        }
+                    }
+                } else {
+                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                }
+            }
+            if !context.is_empty() {
+                log::debug!(
+                    "Auction request context: {} entries ({})",
+                    context.len(),
+                    context.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
 
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
@@ -152,7 +186,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
-        context: HashMap::new(),
+        context,
     })
 }
 
@@ -230,6 +264,13 @@ pub fn convert_to_openrtb_response(
         "parallel_only"
     };
 
+    // Build per-provider summaries from the orchestration result
+    let provider_details: Vec<ProviderSummary> = result
+        .provider_responses
+        .iter()
+        .map(ProviderSummary::from)
+        .collect();
+
     let response_body = OpenRtbResponse {
         id: auction_request.id.to_string(),
         seatbid: seatbids,
@@ -239,6 +280,7 @@ pub fn convert_to_openrtb_response(
                 providers: result.provider_responses.len(),
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
+                provider_details,
             },
         }),
     };

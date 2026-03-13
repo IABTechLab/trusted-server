@@ -6,9 +6,11 @@
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
 use error_stack::{Report, ResultExt};
+use serde::Serialize;
 
 use crate::error::TrustedServerError;
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
+use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
 
 /// Retrieves the current active key ID from the config store.
 ///
@@ -16,7 +18,7 @@ use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 ///
 /// Returns an error if the config store cannot be accessed or the current-kid key is not found.
 pub fn get_current_key_id() -> Result<String, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new("jwks_store");
+    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     store.get("current-kid")
 }
 
@@ -45,6 +47,72 @@ pub struct RequestSigner {
     pub kid: String,
 }
 
+/// Current version of the signing protocol
+pub const SIGNING_VERSION: &str = "1.1";
+
+/// Canonical payload structure for request signing.
+///
+/// Serialized as JSON to prevent signature confusion attacks that could
+/// exploit delimiter-based formats.
+#[derive(Serialize)]
+struct SigningPayload<'a> {
+    version: &'a str,
+    kid: &'a str,
+    host: &'a str,
+    scheme: &'a str,
+    id: &'a str,
+    ts: u64,
+}
+
+/// Parameters for enhanced request signing
+#[derive(Debug, Clone)]
+pub struct SigningParams {
+    pub request_id: String,
+    pub request_host: String,
+    pub request_scheme: String,
+    pub timestamp: u64,
+}
+
+impl SigningParams {
+    /// Creates a new `SigningParams` with the current timestamp in milliseconds
+    #[must_use]
+    pub fn new(request_id: String, request_host: String, request_scheme: String) -> Self {
+        Self {
+            request_id,
+            request_host,
+            request_scheme,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Builds the canonical payload string for signing.
+    ///
+    /// The payload is a JSON-serialized [`SigningPayload`] to prevent signature
+    /// confusion attacks that could exploit delimiter-based formats.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be serialized to JSON.
+    pub fn build_payload(&self, kid: &str) -> Result<String, Report<TrustedServerError>> {
+        let payload = SigningPayload {
+            version: SIGNING_VERSION,
+            kid,
+            host: &self.request_host,
+            scheme: &self.request_scheme,
+            id: &self.request_id,
+            ts: self.timestamp,
+        };
+        serde_json::to_string(&payload).map_err(|e| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Failed to serialize signing payload: {}", e),
+            })
+        })
+    }
+}
+
 impl RequestSigner {
     /// Creates a `RequestSigner` from the current key ID stored in config.
     ///
@@ -52,7 +120,7 @@ impl RequestSigner {
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
     pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
-        let config_store = FastlyConfigStore::new("jwks_store");
+        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
         let key_id =
             config_store
                 .get("current-kid")
@@ -60,7 +128,7 @@ impl RequestSigner {
                     message: "Failed to get current-kid".into(),
                 })?;
 
-        let secret_store = FastlySecretStore::new("signing_keys");
+        let secret_store = FastlySecretStore::new(SIGNING_SECRET_STORE_NAME);
         let key_bytes = secret_store
             .get(&key_id)
             .attach(format!("Failed to get signing key for kid: {}", key_id))?;
@@ -82,6 +150,22 @@ impl RequestSigner {
 
         Ok(general_purpose::URL_SAFE_NO_PAD.encode(signature_bytes))
     }
+
+    /// Signs a request using the enhanced v1.1 signing protocol.
+    ///
+    /// The signed payload is a JSON object containing version, kid, host,
+    /// scheme, id, and ts fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing fails.
+    pub fn sign_request(
+        &self,
+        params: &SigningParams,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let payload = params.build_payload(&self.kid)?;
+        self.sign(payload.as_bytes())
+    }
 }
 
 /// Verifies a signature using the public key associated with the given key ID.
@@ -94,7 +178,7 @@ pub fn verify_signature(
     signature_b64: &str,
     kid: &str,
 ) -> Result<bool, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new("jwks_store");
+    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     let jwk_json = store
         .get(kid)
         .change_context(TrustedServerError::Configuration {
@@ -233,5 +317,92 @@ mod tests {
 
         let result = verify_signature(payload, malformed_signature, &signer.kid);
         assert!(result.is_err(), "Should error for malformed signature");
+    }
+
+    #[test]
+    fn test_signing_params_build_payload() {
+        let params = SigningParams {
+            request_id: "req-123".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let payload = params
+            .build_payload("kid-abc")
+            .expect("should build payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("should be valid JSON");
+        assert_eq!(parsed["version"], SIGNING_VERSION);
+        assert_eq!(parsed["kid"], "kid-abc");
+        assert_eq!(parsed["host"], "example.com");
+        assert_eq!(parsed["scheme"], "https");
+        assert_eq!(parsed["id"], "req-123");
+        assert_eq!(parsed["ts"], 1706900000);
+    }
+
+    #[test]
+    fn test_signing_params_new_creates_timestamp() {
+        let params = SigningParams::new(
+            "req-123".to_string(),
+            "example.com".to_string(),
+            "https".to_string(),
+        );
+
+        assert_eq!(params.request_id, "req-123");
+        assert_eq!(params.request_host, "example.com");
+        assert_eq!(params.request_scheme, "https");
+        // Timestamp should be recent (within last minute), in milliseconds
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(params.timestamp <= now_ms);
+        assert!(params.timestamp >= now_ms - 60_000);
+    }
+
+    #[test]
+    fn test_sign_request_enhanced() {
+        let signer = RequestSigner::from_config().unwrap();
+        let params = SigningParams::new(
+            "auction-123".to_string(),
+            "publisher.com".to_string(),
+            "https".to_string(),
+        );
+
+        let signature = signer.sign_request(&params).unwrap();
+        assert!(!signature.is_empty());
+
+        // Verify the signature is valid by reconstructing the payload
+        let payload = params.build_payload(&signer.kid).unwrap();
+        let result = verify_signature(payload.as_bytes(), &signature, &signer.kid).unwrap();
+        assert!(result, "Enhanced signature should be valid");
+    }
+
+    #[test]
+    fn test_sign_request_different_params_different_signature() {
+        let signer = RequestSigner::from_config().unwrap();
+
+        let params1 = SigningParams {
+            request_id: "req-1".to_string(),
+            request_host: "host1.com".to_string(),
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let params2 = SigningParams {
+            request_id: "req-1".to_string(),
+            request_host: "host2.com".to_string(), // Different host
+            request_scheme: "https".to_string(),
+            timestamp: 1706900000,
+        };
+
+        let sig1 = signer.sign_request(&params1).unwrap();
+        let sig2 = signer.sign_request(&params2).unwrap();
+
+        assert_ne!(
+            sig1, sig2,
+            "Different hosts should produce different signatures"
+        );
     }
 }

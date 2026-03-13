@@ -1,0 +1,16 @@
+name: Task
+description: A technical task, chore, or internal improvement
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe a technical task that needs to be done (refactoring, CI changes, dependency updates, etc.).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What needs to be done and why?
+    validations:
+      required: true

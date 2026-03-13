@@ -155,7 +155,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 /// Gets or creates a synthetic ID from the request.
 ///
 /// Attempts to retrieve an existing synthetic ID from:
-/// 1. The `x-psid-ts` header
+/// 1. The `x-synthetic-id` header
 /// 2. The `synthetic_id` cookie
 ///
 /// If neither exists, generates a new synthetic ID.

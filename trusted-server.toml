@@ -25,6 +25,9 @@ template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_enc
 # Allows publishers to include tags such as X-Robots-Tag: noindex
 # [response_headers]
 # X-Custom-Header = "custom header value"
+#
+# Or via environment variable (JSON preserves header name casing and hyphens):
+# TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
 
 # Request Signing Configuration
 # Enable signing of OpenRTB requests and other API calls
@@ -38,10 +41,16 @@ enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "rubicon", "appnexus", "openx"]
-auto_configure = false
 debug = false
+# test_mode = false
 # debug_query_params = ""
-# script_handler = "/prebid.js"
+# script_patterns = ["/prebid.js"]
+
+# Zone-specific bid param overrides for Kargo s2s placement IDs.
+# The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
+# and includes it in the request. The server maps zone → s2s placementId here.
+[integrations.prebid.bid_param_zone_overrides.kargo]
+# header = {placementId = "_abc"}
 
 [integrations.nextjs]
 enabled = false
@@ -85,7 +94,13 @@ enabled = false
 sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
-rewrite_sdk = true 
+rewrite_sdk = true
+
+[integrations.gpt]
+enabled = false
+script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = true
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
@@ -107,6 +122,9 @@ enabled = true
 providers = ["prebid"]
 # mediator = "adserver_mock"  # will use mediator when set
 timeout_ms = 2000
+# Context keys the JS client is allowed to forward into auction requests.
+# Keys not in this list are silently dropped. An empty list blocks all keys.
+allowed_context_keys = ["permutive_segments"]
 
 [integrations.aps]
 enabled = false
@@ -114,9 +132,20 @@ pub_id = "your-aps-publisher-id"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
 timeout_ms = 1000
 
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-XXXXXX"
+# upstream_url = "https://www.googletagmanager.com"
+
 [integrations.adserver_mock]
 enabled = false
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
+
+# Map auction-request context keys to mediation URL query parameters.
+# Each key is a context key from the JS client; the value becomes the
+# query parameter name. Arrays are joined with commas.
+[integrations.adserver_mock.context_query_params]
+permutive_segments = "permutive"
 
 

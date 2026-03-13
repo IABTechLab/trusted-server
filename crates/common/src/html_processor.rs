@@ -203,13 +203,18 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
-                    // First inject the unified TSJS bundle (defines tsjs.setConfig, etc.)
-                    snippet.push_str(&tsjs::unified_script_tag());
-                    // Then add any integration-specific head inserts (e.g., mode config)
-                    // These run after the bundle so tsjs API is available
+                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
+                    // so it's available when the bundle's auto-init code reads it.
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
+                    // Main bundle: core + non-deferred integrations (synchronous).
+                    let immediate_ids = integrations.js_module_ids_immediate();
+                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+                    // Deferred bundles: large modules like prebid loaded after
+                    // HTML parsing completes. Empty when none are enabled.
+                    let deferred_ids = integrations.js_module_ids_deferred();
+                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -607,12 +612,12 @@ mod tests {
             .expect("should keep existing head content");
 
         assert!(
-            tsjs_index < head_index,
-            "should inject head snippet after tsjs tag"
+            head_index < tsjs_index,
+            "should inject config before tsjs bundle so auto-init can read it"
         );
         assert!(
-            head_index < title_index,
-            "should prepend head snippet before existing head content"
+            tsjs_index < title_index,
+            "should prepend all injected content before existing head content"
         );
     }
 
