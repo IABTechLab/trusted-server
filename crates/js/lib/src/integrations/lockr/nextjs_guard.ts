@@ -9,10 +9,10 @@ import { createScriptGuard } from '../../shared/script_guard';
  * scripts inserted via appendChild, insertBefore, or any other dynamic DOM
  * manipulation.
  *
- * Built on the shared script_guard factory which patches DOM methods to catch
- * dynamic insertions and rewrite SDK URLs to use the first-party domain proxy
- * endpoint, bypassing the need for server-side HTML rewriting in dynamic
- * client-side scenarios.
+ * Built on the shared script_guard factory, which registers with the shared
+ * DOM insertion dispatcher to catch dynamic insertions and rewrite SDK URLs to
+ * the first-party proxy endpoint without relying on server-side HTML rewriting
+ * in client-side scenarios.
  */
 
 /**
@@ -42,16 +42,17 @@ function isLockrSdkUrl(url: string): boolean {
 }
 
 const guard = createScriptGuard({
-  name: 'Lockr',
+  displayName: 'Lockr',
+  id: 'lockr',
   isTargetUrl: isLockrSdkUrl,
   proxyPath: '/integrations/lockr/sdk',
 });
 
 /**
  * Install the Lockr guard to intercept dynamic script loading.
- * Patches Element.prototype.appendChild and insertBefore to catch
- * ANY dynamically inserted Lockr SDK script elements and rewrite their URLs
- * before insertion. Works across all frameworks and vanilla JavaScript.
+ * Registers a handler with the shared DOM insertion dispatcher so dynamically
+ * inserted Lockr SDK script elements are rewritten before insertion.
+ * Works across all frameworks and vanilla JavaScript.
  */
 export const installNextJsGuard = guard.install;
 
