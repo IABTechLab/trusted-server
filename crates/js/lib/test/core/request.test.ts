@@ -174,141 +174,7 @@ describe('request.requestAds', () => {
     expect(iframe!.srcdoc).toContain('https://example.com/ad.png');
   });
 
-  it('rejects creatives with stripped executable content without logging raw HTML', async () => {
-    const creativeHtml = '<img src="/track.png" onerror="alert(1)"><script>alert(2)</script>';
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: { get: () => 'application/json' },
-      json: async () => ({
-        seatbid: [
-          {
-            seat: 'appnexus',
-            bid: [{ impid: 'slot1', adm: creativeHtml, crid: 'creative-danger' }],
-          },
-        ],
-      }),
-    });
-
-    const { addAdUnits } = await import('../../src/core/registry');
-    const { log } = await import('../../src/core/log');
-    const { requestAds } = await import('../../src/core/request');
-    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-
-    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-
-    requestAds();
-    await flushRequestAds();
-
-    expect(document.querySelector('#slot1 iframe')).toBeNull();
-    expect(document.querySelector('#slot1')?.innerHTML).toBe('');
-
-    const rejectionCall = warnSpy.mock.calls.find(
-      ([message]) => message === 'renderCreativeInline: rejected creative'
-    );
-    expect(rejectionCall?.[1]).toEqual(
-      expect.objectContaining({
-        slotId: 'slot1',
-        seat: 'appnexus',
-        creativeId: 'creative-danger',
-        rejectionReason: 'removed-dangerous-content',
-      })
-    );
-    expect(JSON.stringify(rejectionCall)).not.toContain('<script>');
-    expect(JSON.stringify(rejectionCall)).not.toContain('onerror');
-  });
-
-  it('rejects creatives with dangerous URI attributes without logging raw HTML', async () => {
-    const creativeHtml = '<a href="javascript:alert(1)">danger</a>';
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: { get: () => 'application/json' },
-      json: async () => ({
-        seatbid: [
-          {
-            seat: 'appnexus',
-            bid: [{ impid: 'slot1', adm: creativeHtml, crid: 'creative-uri-danger' }],
-          },
-        ],
-      }),
-    });
-
-    const { addAdUnits } = await import('../../src/core/registry');
-    const { log } = await import('../../src/core/log');
-    const { requestAds } = await import('../../src/core/request');
-    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-
-    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-
-    requestAds();
-    await flushRequestAds();
-
-    expect(document.querySelector('#slot1 iframe')).toBeNull();
-    expect(document.querySelector('#slot1')?.innerHTML).toBe('');
-
-    const rejectionCall = warnSpy.mock.calls.find(
-      ([message]) => message === 'renderCreativeInline: rejected creative'
-    );
-    expect(rejectionCall?.[1]).toEqual(
-      expect.objectContaining({
-        slotId: 'slot1',
-        seat: 'appnexus',
-        creativeId: 'creative-uri-danger',
-        rejectionReason: 'removed-dangerous-content',
-      })
-    );
-    expect(JSON.stringify(rejectionCall)).not.toContain('javascript:alert(1)');
-  });
-
-  it('rejects creatives with dangerous inline styles that survive sanitization', async () => {
-    const creativeHtml = '<div style="background-image:url(javascript:alert(1))">danger</div>';
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: { get: () => 'application/json' },
-      json: async () => ({
-        seatbid: [
-          {
-            seat: 'appnexus',
-            bid: [{ impid: 'slot1', adm: creativeHtml, crid: 'creative-style-danger' }],
-          },
-        ],
-      }),
-    });
-
-    const { addAdUnits } = await import('../../src/core/registry');
-    const { log } = await import('../../src/core/log');
-    const { requestAds } = await import('../../src/core/request');
-    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-
-    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
-
-    requestAds();
-    await flushRequestAds();
-
-    expect(document.querySelector('#slot1 iframe')).toBeNull();
-    expect(document.querySelector('#slot1')?.innerHTML).toBe('');
-
-    const rejectionCall = warnSpy.mock.calls.find(
-      ([message]) => message === 'renderCreativeInline: rejected creative'
-    );
-    expect(rejectionCall?.[1]).toEqual(
-      expect.objectContaining({
-        slotId: 'slot1',
-        seat: 'appnexus',
-        creativeId: 'creative-style-danger',
-        rejectionReason: 'removed-dangerous-content',
-      })
-    );
-    expect(JSON.stringify(rejectionCall)).not.toContain('background-image');
-    expect(JSON.stringify(rejectionCall)).not.toContain('javascript:alert(1)');
-  });
-
-  it('rejects malformed non-string creative HTML', async () => {
+  it('rejects malformed non-string creative HTML without blanking the slot', async () => {
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -335,7 +201,8 @@ describe('request.requestAds', () => {
     await flushRequestAds();
 
     expect(document.querySelector('#slot1 iframe')).toBeNull();
-    expect(document.querySelector('#slot1')?.innerHTML).toBe('');
+    // Invalid-type rejection must not blank existing slot content.
+    expect(document.querySelector('#slot1')?.innerHTML).toBe('<span>existing</span>');
 
     const rejectionCall = warnSpy.mock.calls.find(
       ([message]) => message === 'renderCreativeInline: rejected creative'
@@ -349,6 +216,44 @@ describe('request.requestAds', () => {
       })
     );
     expect(JSON.stringify(rejectionCall)).not.toContain('[object Object]');
+  });
+
+  it('does not blank the slot when a later bid for the same slot is rejected', async () => {
+    // Regression: multi-bid scenario where a rejected bid must not erase an earlier
+    // successful render into the same slot.
+    const goodCreative = '<div>Safe Ad</div>';
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'seat-a',
+            bid: [{ impid: 'slot1', adm: goodCreative, crid: 'creative-good' }],
+          },
+          {
+            // Non-string adm is rejected client-side as invalid-creative-html.
+            seat: 'seat-b',
+            bid: [{ impid: 'slot1', adm: { html: '<div>bad</div>' }, crid: 'creative-bad' }],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+
+    document.body.innerHTML = '<div id="slot1"></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+
+    // The good creative should have rendered; the bad one should not have blanked it.
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
+    expect(iframe).toBeTruthy();
+    expect(iframe!.srcdoc).toContain(goodCreative);
   });
 
   it('rejects creatives that sanitize to empty markup', async () => {

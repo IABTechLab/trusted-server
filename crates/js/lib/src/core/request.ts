@@ -48,16 +48,19 @@ export function requestAds(
       .then((bids) => {
         log.info('requestAds: got bids', { count: bids.length });
         for (const bid of bids) {
-          if (bid.impid) {
-            renderCreativeInline({
-              slotId: bid.impid,
-              creativeHtml: bid.adm,
-              creativeWidth: bid.width,
-              creativeHeight: bid.height,
-              seat: bid.seat,
-              creativeId: bid.creativeId,
-            });
+          if (!bid.impid) continue;
+          if (!bid.adm) {
+            log.debug('requestAds: bid has no adm, skipping', { slotId: bid.impid });
+            continue;
           }
+          renderCreativeInline({
+            slotId: bid.impid,
+            creativeHtml: bid.adm,
+            creativeWidth: bid.width,
+            creativeHeight: bid.height,
+            seat: bid.seat,
+            creativeId: bid.creativeId,
+          });
         }
         log.info('requestAds: rendered creatives from response');
       })
@@ -92,9 +95,6 @@ function renderCreativeInline({
   }
 
   try {
-    // Clear the slot before render so rejected creatives fail closed with no stale markup left behind.
-    container.innerHTML = '';
-
     const sanitization = sanitizeCreativeHtml(creativeHtml);
     if (sanitization.kind === 'rejected') {
       log.warn('renderCreativeInline: rejected creative', {
@@ -108,6 +108,9 @@ function renderCreativeInline({
       });
       return;
     }
+
+    // Clear the slot only after sanitization succeeds so rejected creatives never blank existing content.
+    container.innerHTML = '';
 
     // Determine size with fallback chain: creative size → ad unit size → 300x250
     let width: number;

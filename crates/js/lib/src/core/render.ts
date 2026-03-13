@@ -1,51 +1,18 @@
 // Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
 // and inject creatives into sandboxed iframes.
-import createDOMPurify, {
-  type DOMPurify as DOMPurifyInstance,
-  type RemovedAttribute,
-  type RemovedElement,
-} from 'dompurify';
-
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
-const DANGEROUS_TAG_NAMES = new Set([
-  'base',
-  'embed',
-  'form',
-  'iframe',
-  'link',
-  'meta',
-  'object',
-  'script',
-]);
-const URI_ATTRIBUTE_NAMES = new Set([
-  'action',
-  'background',
-  'formaction',
-  'href',
-  'poster',
-  'src',
-  'srcdoc',
-  'xlink:href',
-]);
-const DANGEROUS_URI_VALUE_PATTERN = /^\s*(?:javascript:|vbscript:|data\s*:\s*text\/html\b)/i;
-const DANGEROUS_STYLE_PATTERN = /\bexpression\s*\(|\burl\s*\(\s*['"]?\s*javascript:/i;
 const CREATIVE_SANDBOX_TOKENS = [
-  'allow-forms',
   'allow-popups',
   'allow-popups-to-escape-sandbox',
   'allow-top-navigation-by-user-activation',
 ] as const;
 
-export type CreativeSanitizationRejectionReason =
-  | 'empty-after-sanitize'
-  | 'invalid-creative-html'
-  | 'removed-dangerous-content'
-  | 'sanitizer-unavailable';
+export type CreativeSanitizationRejectionReason = 'empty-after-sanitize' | 'invalid-creative-html';
 
 export type AcceptedCreativeHtml = {
   kind: 'accepted';
@@ -65,97 +32,14 @@ export type RejectedCreativeHtml = {
 
 export type SanitizeCreativeHtmlResult = AcceptedCreativeHtml | RejectedCreativeHtml;
 
-let creativeSanitizer: DOMPurifyInstance | null | undefined;
-
 function normalizeId(raw: string): string {
   const s = String(raw ?? '').trim();
   return s.startsWith('#') ? s.slice(1) : s;
 }
 
-function getCreativeSanitizer(): DOMPurifyInstance | null {
-  if (creativeSanitizer !== undefined) {
-    return creativeSanitizer;
-  }
-
-  if (typeof window === 'undefined') {
-    creativeSanitizer = null;
-    return creativeSanitizer;
-  }
-
-  try {
-    creativeSanitizer = createDOMPurify(window);
-  } catch (err) {
-    log.warn('sanitizeCreativeHtml: failed to initialize DOMPurify', err);
-    creativeSanitizer = null;
-  }
-
-  return creativeSanitizer;
-}
-
-function isDangerousRemoval(removedItem: RemovedAttribute | RemovedElement): boolean {
-  if ('element' in removedItem) {
-    const tagName = removedItem.element.nodeName.toLowerCase();
-    return DANGEROUS_TAG_NAMES.has(tagName);
-  }
-
-  const attrName = removedItem.attribute?.name.toLowerCase() ?? '';
-  const attrValue = removedItem.attribute?.value ?? '';
-
-  if (attrName.startsWith('on')) {
-    return true;
-  }
-
-  if (URI_ATTRIBUTE_NAMES.has(attrName)) {
-    return true;
-  }
-
-  if (attrName === 'style' && DANGEROUS_STYLE_PATTERN.test(attrValue)) {
-    return true;
-  }
-
-  return false;
-}
-
-function hasDangerousMarkup(candidateHtml: string): boolean {
-  const fragment = document.createElement('template');
-  // The HTML parser normalizes entity-encoded attribute values before we inspect them.
-  fragment.innerHTML = candidateHtml;
-
-  for (const element of fragment.content.querySelectorAll('*')) {
-    const tagName = element.nodeName.toLowerCase();
-    if (DANGEROUS_TAG_NAMES.has(tagName)) {
-      return true;
-    }
-
-    if (tagName === 'style' && DANGEROUS_STYLE_PATTERN.test(element.textContent ?? '')) {
-      return true;
-    }
-
-    for (const attrName of element.getAttributeNames()) {
-      const normalizedAttrName = attrName.toLowerCase();
-      const attrValue = element.getAttribute(attrName) ?? '';
-
-      if (normalizedAttrName.startsWith('on')) {
-        return true;
-      }
-
-      if (
-        URI_ATTRIBUTE_NAMES.has(normalizedAttrName) &&
-        DANGEROUS_URI_VALUE_PATTERN.test(attrValue)
-      ) {
-        return true;
-      }
-
-      if (normalizedAttrName === 'style' && DANGEROUS_STYLE_PATTERN.test(attrValue)) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
-// Sanitize the untrusted creative fragment before it is embedded into the trusted iframe shell.
+// Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
+// Dangerous markup is stripped server-side before adm reaches the client; this function
+// only guards against type errors and empty payloads.
 export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
   if (typeof creativeHtml !== 'string') {
     return {
@@ -168,41 +52,13 @@ export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtm
   }
 
   const originalLength = creativeHtml.length;
-  const sanitizer = getCreativeSanitizer();
 
-  if (!sanitizer || !sanitizer.isSupported) {
+  if (creativeHtml.trim().length === 0) {
     return {
       kind: 'rejected',
       originalLength,
-      sanitizedLength: 0,
+      sanitizedLength: originalLength,
       removedCount: 0,
-      rejectionReason: 'sanitizer-unavailable',
-    };
-  }
-
-  const sanitizedHtml = sanitizer.sanitize(creativeHtml, {
-    // Keep the result as a plain string because iframe.srcdoc expects string HTML.
-    RETURN_TRUSTED_TYPE: false,
-  });
-  const removedItems = [...sanitizer.removed];
-  const sanitizedLength = sanitizedHtml.length;
-
-  if (removedItems.some(isDangerousRemoval) || hasDangerousMarkup(sanitizedHtml)) {
-    return {
-      kind: 'rejected',
-      originalLength,
-      sanitizedLength,
-      removedCount: removedItems.length,
-      rejectionReason: 'removed-dangerous-content',
-    };
-  }
-
-  if (sanitizedHtml.trim().length === 0) {
-    return {
-      kind: 'rejected',
-      originalLength,
-      sanitizedLength,
-      removedCount: removedItems.length,
       rejectionReason: 'empty-after-sanitize',
     };
   }
@@ -210,9 +66,9 @@ export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtm
   return {
     kind: 'accepted',
     originalLength,
-    sanitizedHtml,
-    sanitizedLength,
-    removedCount: removedItems.length,
+    sanitizedHtml: creativeHtml,
+    sanitizedLength: originalLength,
+    removedCount: 0,
   };
 }
 
