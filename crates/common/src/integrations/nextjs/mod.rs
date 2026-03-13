@@ -93,10 +93,15 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 }
 
 fn build(settings: &Settings) -> Option<Arc<NextJsIntegrationConfig>> {
-    let config = settings
-        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
-        .ok()
-        .flatten()?;
+    let config = match settings.integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+    {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(err) => {
+            log::error!("Failed to load NextJS integration config: {err:?}");
+            return None;
+        }
+    };
     Some(Arc::new(config))
 }
 

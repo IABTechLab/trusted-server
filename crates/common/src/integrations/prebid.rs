@@ -207,10 +207,15 @@ impl PrebidIntegration {
 }
 
 fn build(settings: &Settings) -> Option<Arc<PrebidIntegration>> {
-    let config = settings
-        .integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)
-        .ok()
-        .flatten()?;
+    let config = match settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)
+    {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(err) => {
+            log::error!("Failed to load Prebid integration config: {err:?}");
+            return None;
+        }
+    };
     if !config.enabled {
         return None;
     }
@@ -947,7 +952,14 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.server_url, true).ok()
+        BackendConfig::from_url(&self.config.server_url, true)
+            .inspect_err(|e| {
+                log::error!(
+                    "Failed to create backend for Prebid server URL '{}': {e:?}",
+                    self.config.server_url
+                );
+            })
+            .ok()
     }
 }
 
