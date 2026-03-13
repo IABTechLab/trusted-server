@@ -1,4 +1,5 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use super::shared::RscUrlRewriter;
@@ -7,8 +8,8 @@ use super::shared::RscUrlRewriter;
 ///
 /// This is a static code-defined literal rather than a config-derived pattern,
 /// so it intentionally stays outside startup preparation.
-static TCHUNK_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
+static TCHUNK_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
 
 /// Marker used to track script boundaries when combining RSC content.
 pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";

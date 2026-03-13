@@ -2,7 +2,8 @@
 
 use std::borrow::Cow;
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use crate::host_rewrite::rewrite_bare_host_at_boundaries;
@@ -11,7 +12,7 @@ use crate::host_rewrite::rewrite_bare_host_at_boundaries;
 // intentionally remain lazy statics instead of participating in
 // `Settings::prepare_runtime`.
 /// RSC push script call pattern for extracting payload string boundaries.
-pub(crate) static RSC_PUSH_CALL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)(?:(?:self|window)\.__next_f\.push|\(\s*(?:self|window)\.__next_f\s*=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.push)\(\[\s*1\s*,\s*(['"])"#,
     )
@@ -19,7 +20,7 @@ pub(crate) static RSC_PUSH_CALL_PATTERN: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Generic URL pattern for RSC payload rewriting.
-pub(crate) static RSC_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+pub(crate) static RSC_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>\[[^\]]+\](?::\d+)?|[^/"'\\\s?#<>,)]+)"#,
     )

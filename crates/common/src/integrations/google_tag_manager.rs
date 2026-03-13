@@ -12,13 +12,12 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
@@ -43,7 +42,7 @@ enum PayloadSizeError {
 
 /// Regex pattern for validating GTM container IDs.
 /// Format: GTM-XXXXXX where X is alphanumeric.
-static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static GTM_CONTAINER_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^GTM-[A-Z0-9]{4,20}$").expect("GTM container ID regex should compile")
 });
 
@@ -72,7 +71,7 @@ static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// on subdomains (e.g., `www.googletagmanager.com.evil.com`).
 ///
 /// The replacement target is `/integrations/google_tag_manager` + the captured delimiter.
-static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static GTM_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:https?:)?//(?:www\.(googletagmanager|google-analytics)\.com|analytics\.google\.com)([/"])"#)
         .expect("GTM URL regex should compile")
 });

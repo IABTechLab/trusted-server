@@ -13,13 +13,12 @@
 //! The rewriting finds the obfuscated host assignment pattern in the SDK and
 //! replaces it with: `'host': '/integrations/lockr/api'`
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
@@ -37,7 +36,7 @@ const LOCKR_INTEGRATION_ID: &str = "lockr";
 
 // This is a code-defined literal, not a config-derived pattern, so it can stay
 // as a shared lazy static rather than participating in startup preparation.
-static LOCKR_SDK_HOST_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static LOCKR_SDK_HOST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"'host':\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)\s*\+\s*_0x[a-f0-9]+\(0x[a-f0-9]+\)",
     )

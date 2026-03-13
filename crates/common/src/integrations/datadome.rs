@@ -55,13 +55,12 @@
 //!   `<script src="https://publisher.com/integrations/datadome/tags.js">`
 //! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
@@ -93,7 +92,7 @@ const DATADOME_INTEGRATION_ID: &str = "datadome";
 /// - `'//js.datadome.co/js/check'`
 /// - `"api-js.datadome.co/js/check"`
 /// - `"js.datadome.co"`
-static DATADOME_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
         .expect("DataDome URL rewrite regex should compile")
 });
