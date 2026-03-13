@@ -6,9 +6,70 @@ import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
+const CREATIVE_SANDBOX_TOKENS = [
+  'allow-popups',
+  'allow-popups-to-escape-sandbox',
+  'allow-top-navigation-by-user-activation',
+] as const;
+
+export type CreativeSanitizationRejectionReason = 'empty-after-sanitize' | 'invalid-creative-html';
+
+export type AcceptedCreativeHtml = {
+  kind: 'accepted';
+  originalLength: number;
+  sanitizedHtml: string;
+  sanitizedLength: number;
+  removedCount: number;
+};
+
+export type RejectedCreativeHtml = {
+  kind: 'rejected';
+  originalLength: number;
+  sanitizedLength: number;
+  removedCount: number;
+  rejectionReason: CreativeSanitizationRejectionReason;
+};
+
+export type SanitizeCreativeHtmlResult = AcceptedCreativeHtml | RejectedCreativeHtml;
+
 function normalizeId(raw: string): string {
   const s = String(raw ?? '').trim();
   return s.startsWith('#') ? s.slice(1) : s;
+}
+
+// Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
+// Dangerous markup is stripped server-side before adm reaches the client; this function
+// only guards against type errors and empty payloads.
+export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
+  if (typeof creativeHtml !== 'string') {
+    return {
+      kind: 'rejected',
+      originalLength: 0,
+      sanitizedLength: 0,
+      removedCount: 0,
+      rejectionReason: 'invalid-creative-html',
+    };
+  }
+
+  const originalLength = creativeHtml.length;
+
+  if (creativeHtml.trim().length === 0) {
+    return {
+      kind: 'rejected',
+      originalLength,
+      sanitizedLength: originalLength,
+      removedCount: 0,
+      rejectionReason: 'empty-after-sanitize',
+    };
+  }
+
+  return {
+    kind: 'accepted',
+    originalLength,
+    sanitizedHtml: creativeHtml,
+    sanitizedLength: originalLength,
+    removedCount: 0,
+  };
 }
 
 // Locate an ad slot element by id, tolerating funky selectors provided by tag managers.
@@ -85,7 +146,7 @@ export function renderAllAdUnits(): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-// Construct a sandboxed iframe sized for the ad so we can render arbitrary HTML.
+// Construct a sandboxed iframe sized for sanitized, non-executable creative HTML.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}
@@ -101,16 +162,14 @@ export function createAdIframe(
   iframe.setAttribute('aria-label', 'Advertisement');
   // Sandbox permissions for creatives
   try {
-    iframe.sandbox.add(
-      'allow-forms',
-      'allow-popups',
-      'allow-popups-to-escape-sandbox',
-      'allow-same-origin',
-      'allow-scripts',
-      'allow-top-navigation-by-user-activation'
-    );
+    if (iframe.sandbox && typeof iframe.sandbox.add === 'function') {
+      iframe.sandbox.add(...CREATIVE_SANDBOX_TOKENS);
+    } else {
+      iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
+    }
   } catch (err) {
     log.debug('createAdIframe: sandbox add failed', err);
+    iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
   }
   // Sizing + style
   const w = Math.max(0, Number(opts.width ?? 0) | 0);
@@ -129,10 +188,10 @@ export function createAdIframe(
   return iframe;
 }
 
-// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
+// Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
-  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', NORMALIZE_CSS).replace(
+  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS).replace(
     '%CREATIVE_HTML%',
-    creativeHtml
+    () => creativeHtml
   );
 }

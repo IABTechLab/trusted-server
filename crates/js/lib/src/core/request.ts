@@ -2,7 +2,7 @@
 import { log } from './log';
 import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
-import { createAdIframe, findSlot, buildCreativeDocument } from './render';
+import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
 import { buildAdRequest, sendAuction } from './auction';
 
 export type RequestAdsCallback = () => void;
@@ -10,6 +10,16 @@ export interface RequestAdsOptions {
   bidsBackHandler?: RequestAdsCallback;
   timeout?: number;
 }
+
+type RenderCreativeInlineOptions = {
+  slotId: string;
+  // Accept unknown input here because bidder JSON is untrusted at runtime.
+  creativeHtml: unknown;
+  creativeWidth?: number;
+  creativeHeight?: number;
+  seat: string;
+  creativeId: string;
+};
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
@@ -38,9 +48,19 @@ export function requestAds(
       .then((bids) => {
         log.info('requestAds: got bids', { count: bids.length });
         for (const bid of bids) {
-          if (bid.impid && bid.adm) {
-            renderCreativeInline(bid.impid, bid.adm, bid.width, bid.height);
+          if (!bid.impid) continue;
+          if (!bid.adm) {
+            log.debug('requestAds: bid has no adm, skipping', { slotId: bid.impid });
+            continue;
           }
+          renderCreativeInline({
+            slotId: bid.impid,
+            creativeHtml: bid.adm,
+            creativeWidth: bid.width,
+            creativeHeight: bid.height,
+            seat: bid.seat,
+            creativeId: bid.creativeId,
+          });
         }
         log.info('requestAds: rendered creatives from response');
       })
@@ -59,21 +79,37 @@ export function requestAds(
   }
 }
 
-// Render a creative by writing HTML directly into a sandboxed iframe.
-function renderCreativeInline(
-  slotId: string,
-  creativeHtml: string,
-  creativeWidth?: number,
-  creativeHeight?: number
-): void {
+// Render a creative by writing sanitized, non-executable HTML into a sandboxed iframe.
+function renderCreativeInline({
+  slotId,
+  creativeHtml,
+  creativeWidth,
+  creativeHeight,
+  seat,
+  creativeId,
+}: RenderCreativeInlineOptions): void {
   const container = findSlot(slotId) as HTMLElement | null;
   if (!container) {
-    log.warn('renderCreativeInline: slot not found; skipping render', { slotId });
+    log.warn('renderCreativeInline: slot not found; skipping render', { slotId, seat, creativeId });
     return;
   }
 
   try {
-    // Clear previous content
+    const sanitization = sanitizeCreativeHtml(creativeHtml);
+    if (sanitization.kind === 'rejected') {
+      log.warn('renderCreativeInline: rejected creative', {
+        slotId,
+        seat,
+        creativeId,
+        originalLength: sanitization.originalLength,
+        sanitizedLength: sanitization.sanitizedLength,
+        removedCount: sanitization.removedCount,
+        rejectionReason: sanitization.rejectionReason,
+      });
+      return;
+    }
+
+    // Clear the slot only after sanitization succeeds so rejected creatives never blank existing content.
     container.innerHTML = '';
 
     // Determine size with fallback chain: creative size → ad unit size → 300x250
@@ -99,15 +135,19 @@ function renderCreativeInline(
       height,
     });
 
-    iframe.srcdoc = buildCreativeDocument(creativeHtml);
+    iframe.srcdoc = buildCreativeDocument(sanitization.sanitizedHtml);
 
     log.info('renderCreativeInline: rendered', {
       slotId,
+      seat,
+      creativeId,
       width,
       height,
-      htmlLength: creativeHtml.length,
+      originalLength: sanitization.originalLength,
+      sanitizedLength: sanitization.sanitizedLength,
+      removedCount: sanitization.removedCount,
     });
   } catch (err) {
-    log.warn('renderCreativeInline: failed', { slotId, err });
+    log.warn('renderCreativeInline: failed', { slotId, seat, creativeId, err });
   }
 }
