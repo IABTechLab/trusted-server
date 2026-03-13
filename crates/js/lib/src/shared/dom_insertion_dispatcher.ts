@@ -60,6 +60,10 @@ interface LegacyDomInsertionDispatcherState {
   version?: unknown;
 }
 
+function isNonNullObject(value: unknown): value is Record<PropertyKey, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 function isOptionalFunction(
   value: unknown
 ): value is ((...args: unknown[]) => unknown) | undefined {
@@ -67,7 +71,7 @@ function isOptionalFunction(
 }
 
 function isRegisteredDomInsertionHandler(value: unknown): value is RegisteredDomInsertionHandler {
-  if (typeof value !== 'object' || value === null) {
+  if (!isNonNullObject(value)) {
     return false;
   }
 
@@ -81,7 +85,7 @@ function isRegisteredDomInsertionHandler(value: unknown): value is RegisteredDom
 }
 
 function isDispatcherState(value: unknown): value is DomInsertionDispatcherState {
-  if (typeof value !== 'object' || value === null) {
+  if (!isNonNullObject(value)) {
     return false;
   }
 
@@ -116,17 +120,11 @@ function compareHandlers(
 }
 
 function getStateVersion(state: unknown): unknown {
-  return typeof state === 'object' && state !== null
-    ? (state as { version?: unknown }).version
-    : undefined;
+  return isNonNullObject(state) ? state.version : undefined;
 }
 
 function restoreStaleDispatcherMethods(existingState: unknown): void {
-  if (
-    typeof Element === 'undefined' ||
-    typeof existingState !== 'object' ||
-    existingState === null
-  ) {
+  if (typeof Element === 'undefined' || !isNonNullObject(existingState)) {
     return;
   }
 
