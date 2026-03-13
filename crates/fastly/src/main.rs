@@ -176,7 +176,7 @@ fn init_logger() {
         .echo_stdout(true)
         .max_level(log::LevelFilter::Debug)
         .build()
-        .expect("Failed to build Logger");
+        .expect("should build Logger");
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -194,5 +194,5 @@ fn init_logger() {
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
-        .expect("Failed to initialize logger");
+        .expect("should initialize logger");
 }

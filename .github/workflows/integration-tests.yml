@@ -1,0 +1,93 @@
+name: "Integration Tests"
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ORIGIN_PORT: 8888
+
+jobs:
+  integration-tests:
+    name: integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up shared integration test environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+
+      - name: Run integration tests
+        run: >-
+          cargo test
+          --manifest-path crates/integration-tests/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+          -- --include-ignored --skip test_wordpress_fastly --skip test_nextjs_fastly --test-threads=1
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
+  browser-tests:
+    name: browser integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up shared integration test environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install Playwright
+        working-directory: crates/integration-tests/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run browser tests (Next.js)
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: nextjs
+        run: npx playwright test
+
+      - name: Run browser tests (WordPress)
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: wordpress
+        run: npx playwright test
+
+      - name: Upload Playwright HTML report
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: crates/integration-tests/browser/playwright-report/
+          retention-days: 7
+
+      - name: Upload Playwright traces and screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          path: crates/integration-tests/browser/test-results/
+          retention-days: 7
