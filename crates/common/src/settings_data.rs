@@ -34,9 +34,8 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    if settings.synthetic.secret_key == "secret-key" {
-        return Err(Report::new(TrustedServerError::InsecureSecretKey));
-    }
+    // Reject known placeholder values for secrets that feed into cryptographic operations.
+    settings.reject_placeholder_secrets()?;
 
     if !settings.proxy.certificate_check {
         log::warn!(
@@ -49,22 +48,80 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::error::TrustedServerError;
+    use crate::settings::Settings;
+    use crate::test_support::tests::crate_test_settings_str;
+
+    /// Builds a TOML string with the given secret values swapped in.
+    fn toml_with_secrets(secret_key: &str, proxy_secret: &str) -> String {
+        crate_test_settings_str()
+            .replace(
+                r#"secret_key = "test-secret-key""#,
+                &format!(r#"secret_key = "{secret_key}""#),
+            )
+            .replace(
+                r#"proxy_secret = "unit-test-proxy-secret""#,
+                &format!(r#"proxy_secret = "{proxy_secret}""#),
+            )
+    }
 
     #[test]
-    fn test_get_settings() {
-        // Test that Settings::new() loads successfully
-        let settings = get_settings();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
+    fn rejects_placeholder_secret_key() {
+        let toml = toml_with_secrets("secret-key", "real-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder secret_key");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("synthetic.secret_key")),
+            "error should mention synthetic.secret_key, got: {root}"
+        );
+    }
 
-        let settings = settings.expect("should load settings from embedded TOML");
-        // Verify basic structure is loaded
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.is_empty());
-        assert!(!settings.synthetic.template.is_empty());
+    #[test]
+    fn rejects_placeholder_proxy_secret() {
+        let toml = toml_with_secrets("real-secret-key", "change-me-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder proxy_secret");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("publisher.proxy_secret")),
+            "error should mention publisher.proxy_secret, got: {root}"
+        );
+    }
+
+    #[test]
+    fn rejects_both_placeholders_in_single_error() {
+        let toml = toml_with_secrets("secret_key", "change-me-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject both placeholder secrets");
+        let root = err.current_context();
+        match root {
+            TrustedServerError::InsecureDefault { field } => {
+                assert!(
+                    field.contains("synthetic.secret_key"),
+                    "error should mention synthetic.secret_key, got: {field}"
+                );
+                assert!(
+                    field.contains("publisher.proxy_secret"),
+                    "error should mention publisher.proxy_secret, got: {field}"
+                );
+            }
+            other => panic!("expected InsecureDefault, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_placeholder_secrets() {
+        let toml = toml_with_secrets("production-secret-key", "production-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        settings
+            .reject_placeholder_secrets()
+            .expect("non-placeholder secrets should pass validation");
     }
 }

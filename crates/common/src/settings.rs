@@ -23,10 +23,20 @@ pub struct Publisher {
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
+    #[validate(length(min = 1))]
     pub proxy_secret: String,
 }
 
 impl Publisher {
+    /// Known placeholder values that must not be used in production.
+    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
+
+    /// Returns `true` if `proxy_secret` matches a known placeholder value.
+    #[must_use]
+    pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
+        Self::PROXY_SECRET_PLACEHOLDERS.contains(&proxy_secret)
+    }
+
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -180,23 +190,20 @@ impl DerefMut for IntegrationSettings {
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
-    #[validate(length(min = 1), custom(function = Synthetic::validate_secret_key))]
+    #[validate(length(min = 1))]
     pub secret_key: String,
     #[validate(length(min = 1))]
     pub template: String,
 }
 
 impl Synthetic {
-    /// Validates that the secret key is not the placeholder value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error if the secret key is `"secret_key"` (the placeholder).
-    pub fn validate_secret_key(secret_key: &str) -> Result<(), ValidationError> {
-        match secret_key {
-            "secret_key" => Err(ValidationError::new("Secret key is not valid")),
-            _ => Ok(()),
-        }
+    /// Known placeholder values that must not be used in production.
+    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+
+    /// Returns `true` if `secret_key` matches a known placeholder value.
+    #[must_use]
+    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
+        Self::SECRET_KEY_PLACEHOLDERS.contains(&secret_key)
     }
 }
 
@@ -375,6 +382,33 @@ impl Settings {
         })?;
 
         Ok(settings)
+    }
+
+    /// Checks all secret fields for known placeholder values and returns an
+    /// error listing every offending field.  This centralises the placeholder
+    /// policy so callers don't need to know which fields are secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
+    /// fields still contain a placeholder value.
+    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut insecure_fields: Vec<&str> = Vec::new();
+
+        if Synthetic::is_placeholder_secret_key(&self.synthetic.secret_key) {
+            insecure_fields.push("synthetic.secret_key");
+        }
+        if Publisher::is_placeholder_proxy_secret(&self.publisher.proxy_secret) {
+            insecure_fields.push("publisher.proxy_secret");
+        }
+
+        if insecure_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::InsecureDefault {
+                field: insecure_fields.join(", "),
+            }))
+        }
     }
 
     #[must_use]
@@ -613,6 +647,7 @@ mod tests {
     #[test]
     fn test_settings_missing_required_fields() {
         let re = Regex::new(r"origin_url = .*").expect("regex should compile");
+
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -620,6 +655,42 @@ mod tests {
         assert!(
             settings.is_err(),
             "Should fail when required fields are missing"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
+        for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
+            assert!(
+                Synthetic::is_placeholder_secret_key(placeholder),
+                "should detect placeholder secret_key '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_secret_key_accepts_non_placeholder() {
+        assert!(
+            !Synthetic::is_placeholder_secret_key("test-secret-key"),
+            "should accept non-placeholder secret_key"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_rejects_all_known_placeholders() {
+        for placeholder in Publisher::PROXY_SECRET_PLACEHOLDERS {
+            assert!(
+                Publisher::is_placeholder_proxy_secret(placeholder),
+                "should detect placeholder proxy_secret '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_proxy_secret("unit-test-proxy-secret"),
+            "should accept non-placeholder proxy_secret"
         );
     }
 
