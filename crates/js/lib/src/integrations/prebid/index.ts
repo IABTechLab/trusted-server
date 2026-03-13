@@ -12,9 +12,18 @@
 // bids flow through the orchestrator.
 
 import pbjs from 'prebid.js';
+import adapterManager from 'prebid.js/src/adapterManager.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
+
+// Client-side bid adapters — self-register with prebid.js on import.
+// The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
+// build time. See _adapters.generated.ts (written by build-all.mjs).
+// When a bidder is listed in `client_side_bidders` in trusted-server.toml,
+// the requestBids shim leaves its bids untouched and the corresponding
+// adapter handles them natively in the browser.
+import './_adapters.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -43,6 +52,8 @@ interface InjectedPrebidConfig {
   timeout?: number;
   debug?: boolean;
   bidders?: string[];
+  /** Bidders that run client-side via native Prebid.js adapters. */
+  clientSideBidders?: string[];
 }
 
 /** Read server-injected config from window.__tsjs_prebid, if present. */
@@ -195,8 +206,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
 
+  // Bidders that should run client-side via their native Prebid.js adapters.
+  // Read once from the server-injected config.
+  const clientSideBidders = new Set(injected?.clientSideBidders ?? []);
+  if (clientSideBidders.size > 0) {
+    log.info('[tsjs-prebid] client-side bidders:', [...clientSideBidders]);
+  }
+
   // Shim requestBids to inject the trustedServer bidder into every ad unit
-  // so all bids flow through the /auction orchestrator.
+  // so server-side bids flow through the /auction orchestrator while
+  // client-side bidders are left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
 
@@ -211,9 +230,14 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       }
 
       // Preserve per-bidder params for server-side expansion.
+      // Skip client-side bidders — they remain as standalone bids and run
+      // via their native Prebid.js adapters in the browser.
       const bidderParams: Record<string, Record<string, unknown>> = {};
       for (const bid of unit.bids) {
         if (!bid?.bidder || bid.bidder === ADAPTER_CODE) {
+          continue;
+        }
+        if (clientSideBidders.has(bid.bidder)) {
           continue;
         }
         bidderParams[bid.bidder] = bid.params ?? {};
@@ -275,6 +299,27 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // processQueue() must be called after all modules are loaded when using
   // prebid.js via NPM.
   pbjs.processQueue();
+
+  // Validate that every client-side bidder has its adapter registered.
+  // Adapters self-register on import, so a missing adapter means the bidder
+  // was listed in client_side_bidders but not in TSJS_PREBID_ADAPTERS at
+  // build time. Without the adapter the bidder is silently dropped from both
+  // server-side and client-side auctions.
+  for (const bidder of clientSideBidders) {
+    try {
+      if (!adapterManager.getBidAdapter(bidder)) {
+        log.error(
+          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
+            `Add it to TSJS_PREBID_ADAPTERS at build time.`
+        );
+      }
+    } catch {
+      log.error(
+        `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
+          `Add it to TSJS_PREBID_ADAPTERS at build time.`
+      );
+    }
+  }
 
   log.info('[tsjs-prebid] prebid initialized with trustedServer adapter');
 
