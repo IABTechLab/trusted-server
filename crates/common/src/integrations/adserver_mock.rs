@@ -200,6 +200,17 @@ impl AdServerMockProvider {
             json!(null)
         };
 
+        // Build consent summary from ConsentContext
+        let consent_json = request.user.consent.as_ref().map(|ctx| {
+            json!({
+                "gdpr": if ctx.gdpr_applies { 1 } else { 0 },
+                "consent": ctx.raw_tc_string,
+                "us_privacy": ctx.raw_us_privacy,
+                "gpp": ctx.raw_gpp_string,
+                "gpp_sid": ctx.gpp_section_ids,
+            })
+        });
+
         // Build full mediation request
         Ok(json!({
             "id": request.id,
@@ -207,6 +218,7 @@ impl AdServerMockProvider {
             "ext": {
                 "bidder_responses": bidder_responses_json,
                 "config": config_json,
+                "consent": consent_json,
             },
         }))
     }
@@ -684,6 +696,58 @@ mod tests {
         assert!(provider.supports_media_type(&MediaType::Banner));
         assert!(!provider.supports_media_type(&MediaType::Video));
         assert!(!provider.supports_media_type(&MediaType::Native));
+    }
+
+    #[test]
+    fn test_mediation_request_includes_consent() {
+        use crate::consent::ConsentContext;
+
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+            context_query_params: BTreeMap::new(),
+        };
+
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOEFEAyO".to_string()),
+            gdpr_applies: true,
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
+            gpp_section_ids: Some(vec![2, 6]),
+            ..Default::default()
+        });
+
+        let mediation_req = provider
+            .build_mediation_request(&request, &[])
+            .expect("should build request");
+
+        let consent = &mediation_req["ext"]["consent"];
+        assert_eq!(consent["gdpr"], 1);
+        assert_eq!(consent["consent"], "BOEFEAyO");
+        assert_eq!(consent["us_privacy"], "1YNN");
+        assert_eq!(consent["gpp"], "DBACNYA~CPXxRfAPXxRfA");
+        assert_eq!(consent["gpp_sid"], json!([2, 6]));
+    }
+
+    #[test]
+    fn test_mediation_request_no_consent() {
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+        let request = create_test_auction_request(); // consent is None
+
+        let mediation_req = provider
+            .build_mediation_request(&request, &[])
+            .expect("should build request");
+
+        assert!(
+            mediation_req["ext"]["consent"].is_null(),
+            "consent should be null when no consent context"
+        );
     }
 
     #[test]

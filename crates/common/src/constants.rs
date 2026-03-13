@@ -59,3 +59,12 @@ pub const INTERNAL_HEADERS: &[&str] = &[
     "x-compress-hint",
     "x-debug-fastly-pop",
 ];
+
+// Consent-related cookie names
+pub const COOKIE_EUCONSENT_V2: &str = "euconsent-v2";
+pub const COOKIE_GPP: &str = "__gpp";
+pub const COOKIE_GPP_SID: &str = "__gpp_sid";
+pub const COOKIE_US_PRIVACY: &str = "us_privacy";
+
+// Consent-related header names
+pub const HEADER_SEC_GPC: HeaderName = HeaderName::from_static("sec-gpc");

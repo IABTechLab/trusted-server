@@ -3,11 +3,11 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
-use crate::http_util::{serve_static_with_etag, RequestInfo};
-
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::set_synthetic_cookie;
+use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipelineInput};
+use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
+use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthetic_cookie};
 use crate::error::TrustedServerError;
+use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
@@ -235,10 +235,41 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
+    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
+    let cookie_jar = handle_request_cookies(&req)?;
+
+    // Capture the current SSC cookie value for revocation handling.
+    // This must come from the cookie itself (not the x-synthetic-id header)
+    // to ensure KV deletion targets the same identifier being revoked.
+    let existing_ssc_cookie = cookie_jar
+        .as_ref()
+        .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
+        .map(|cookie| cookie.value().to_owned());
+
     // Generate synthetic identifiers before the request body is consumed.
+    // Always generated for internal use (KV lookups, logging) even when
+    // consent is absent — the cookie is only *set* when consent allows it.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
-    log::debug!("Proxy synthetic IDs - trusted: {}", synthetic_id);
+    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
+    // from the incoming request. The ConsentContext carries both raw strings
+    // (for OpenRTB forwarding) and decoded data (for enforcement).
+    // When a consent_store is configured, this also persists consent to KV
+    // and falls back to stored consent when cookies are absent.
+    let geo = crate::geo::GeoInfo::from_request(&req);
+    let consent_context = build_consent_context(&ConsentPipelineInput {
+        jar: cookie_jar.as_ref(),
+        req: &req,
+        config: &settings.consent,
+        geo: geo.as_ref(),
+        synthetic_id: Some(synthetic_id.as_str()),
+    });
+    let ssc_allowed = allows_ssc_creation(&consent_context);
+    log::debug!(
+        "Proxy synthetic IDs - trusted: {}, ssc_allowed: {}",
+        synthetic_id,
+        ssc_allowed,
+    );
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -334,8 +365,29 @@ pub fn handle_publisher_request(
         );
     }
 
-    response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-    set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+    // Consent-gated SSC creation:
+    // - Consent given → set synthetic ID header + cookie.
+    // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
+    // - Consent absent + no cookie → do nothing.
+    if ssc_allowed {
+        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+        set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+    } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
+        log::info!(
+            "SSC revoked for '{}': consent withdrawn (jurisdiction={})",
+            cookie_synthetic_id,
+            consent_context.jurisdiction,
+        );
+        expire_synthetic_cookie(settings, &mut response);
+        if let Some(store_name) = &settings.consent.consent_store {
+            crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+        }
+    } else {
+        log::debug!(
+            "SSC skipped: no consent and no existing cookie (jurisdiction={})",
+            consent_context.jurisdiction,
+        );
+    }
 
     Ok(response)
 }
@@ -457,6 +509,33 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn revocation_targets_cookie_synthetic_id_not_header() {
+        let settings = create_test_settings();
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header("x-synthetic-id", "header_id");
+        req.set_header("cookie", "synthetic_id=cookie_id; other=value");
+
+        let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
+        let existing_ssc_cookie = cookie_jar
+            .as_ref()
+            .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
+            .map(|cookie| cookie.value().to_owned());
+
+        let resolved_synthetic_id =
+            get_or_generate_synthetic_id(&settings, &req).expect("should resolve synthetic id");
+
+        assert_eq!(
+            existing_ssc_cookie.as_deref(),
+            Some("cookie_id"),
+            "should read revocation target from cookie value"
+        );
+        assert_eq!(
+            resolved_synthetic_id, "header_id",
+            "should still resolve request synthetic ID from header precedence"
+        );
     }
 
     #[test]

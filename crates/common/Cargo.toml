@@ -29,6 +29,7 @@ handlebars = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
+iab_gpp = { workspace = true }
 jose-jwk = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
@@ -67,5 +68,10 @@ validator = { workspace = true }
 default = []
 
 [dev-dependencies]
+criterion = { workspace = true }
 temp-env = { workspace = true }
 tokio-test = { workspace = true }
+
+[[bench]]
+name = "consent_decode"
+harness = false

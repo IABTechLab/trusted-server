@@ -102,6 +102,32 @@ script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
 
+# Consent forwarding configuration
+# Controls how Trusted Server interprets and forwards privacy consent signals.
+# All values shown below are the defaults — uncomment to override.
+# [consent]
+# mode = "interpreter"          # "interpreter" (decode + forward) or "proxy" (raw passthrough)
+# check_expiration = true       # Check TCF consent freshness
+# max_consent_age_days = 395    # Max age before consent is treated as expired (~13 months)
+
+# [consent.gdpr]
+# applies_in = ["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","LI","NO","GB"]
+
+# [consent.us_states]
+# privacy_states = ["CA","VA","CO","CT","UT","MT","OR","TX","FL","DE","IA","NE","NH","NJ","TN","MN","MD","IN","KY","RI"]
+
+# [consent.us_privacy_defaults]
+# notice_given = true           # Has publisher actually shown CCPA notice?
+# lspa_covered = false          # Is publisher subject to LSPA?
+# gpc_implies_optout = true     # Should Sec-GPC: 1 trigger opt-out?
+
+# [consent.conflict_resolution]
+# mode = "restrictive"          # "restrictive" | "newest" | "permissive"
+# freshness_threshold_days = 30
+
+# KV Store consent persistence (requires a KV store named "consent_store" in fastly.toml)
+# consent_store = "consent_store"
+
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
 # Domains to exclude from first-party rewriting (supports wildcards like "*.example.com")
