@@ -7,8 +7,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  pull_request_review:
-    types: [submitted]
   workflow_dispatch:
 
 env:
@@ -18,11 +16,6 @@ jobs:
   integration-tests:
     name: integration tests
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
     steps:
       - uses: actions/checkout@v4
 
@@ -45,11 +38,6 @@ jobs:
   browser-tests:
     name: browser integration tests
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
     steps:
       - uses: actions/checkout@v4
 
