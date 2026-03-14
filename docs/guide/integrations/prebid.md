@@ -100,14 +100,14 @@ Move header bidding to the server for:
 - Reduced client-side latency
 - Improved user experience
 
-### OpenRTB 2.x Support
+### OpenRTB 2.6 Support
 
 Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
 - Adds synthetic ID for privacy-safe tracking
-- Supports banner, video, and native formats
+- Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
 ### Synthetic ID Injection
 
