@@ -4,8 +4,6 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +14,7 @@ jobs:
   integration-tests:
     name: integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +37,7 @@ jobs:
   browser-tests:
     name: browser integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +67,16 @@ jobs:
           TEST_FRAMEWORK: nextjs
         run: npx playwright test
 
+      - name: Upload Playwright report (Next.js)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-nextjs
+          path: crates/integration-tests/browser/playwright-report/
+          retention-days: 7
+
       - name: Run browser tests (WordPress)
+        if: always()
         working-directory: crates/integration-tests/browser
         env:
           WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-fastly.wasm
@@ -76,11 +85,11 @@ jobs:
           TEST_FRAMEWORK: wordpress
         run: npx playwright test
 
-      - name: Upload Playwright HTML report
+      - name: Upload Playwright report (WordPress)
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
-          name: playwright-report
+          name: playwright-report-wordpress
           path: crates/integration-tests/browser/playwright-report/
           retention-days: 7
 

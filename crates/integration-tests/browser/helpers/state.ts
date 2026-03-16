@@ -8,11 +8,19 @@ export interface TestState {
   framework: string;
 }
 
+const KNOWN_FRAMEWORKS = ["nextjs", "wordpress"] as const;
+
 const STATE_FILE = resolve(__dirname, "../.browser-test-state.json");
 
 /** Read the state written by global-setup.ts. */
 export function readState(): TestState {
-  return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
+  const state: TestState = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
+  if (!KNOWN_FRAMEWORKS.includes(state.framework as (typeof KNOWN_FRAMEWORKS)[number])) {
+    throw new Error(
+      `Unknown framework "${state.framework}" in state file. Expected one of: ${KNOWN_FRAMEWORKS.join(", ")}`,
+    );
+  }
+  return state;
 }
 
 /** Resolve an absolute runtime URL from the current browser test state. */

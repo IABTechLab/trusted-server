@@ -239,7 +239,7 @@ impl CustomScenario {
 
                 // If the response is a Flight payload, it must not contain injected scripts
                 if body.contains("/static/tsjs=") {
-                    return Err(Report::new(TestError::ScriptTagNotFound)
+                    return Err(Report::new(TestError::UnexpectedScriptInjection)
                         .attach("Script tag should NOT be injected in RSC Flight responses"));
                 }
 

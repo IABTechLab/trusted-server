@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import { createServer } from "node:net";
 import { waitForReady } from "./wait-for-ready.js";
 
@@ -116,17 +117,25 @@ export async function startViceroy(
     await waitForReady(baseUrl, "/");
   } catch (err) {
     // Viceroy spawned but never became ready — kill it before propagating.
-    if (child.pid) stopViceroy(child.pid);
+    if (child.pid) await stopViceroy(child.pid);
     throw err;
   }
 
   return { process: child, baseUrl };
 }
 
-/** Kill a Viceroy process. */
-export function stopViceroy(pid: number): void {
+/**
+ * Kill a Viceroy process and wait for it to exit.
+ *
+ * Sends SIGTERM and waits 500 ms for the process to release its port.
+ * Without this delay, back-to-back framework runs can fail because the old
+ * Viceroy process still holds the port when the next one tries to bind.
+ */
+export async function stopViceroy(pid: number): Promise<void> {
   try {
     process.kill(pid, "SIGTERM");
+    // Wait for the OS to reclaim the port before the next run starts.
+    await setTimeoutPromise(500);
   } catch {
     // Already exited
   }

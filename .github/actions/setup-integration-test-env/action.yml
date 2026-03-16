@@ -35,22 +35,17 @@ runs:
         target: wasm32-wasip1
         cache-shared-key: cargo-${{ runner.os }}
 
-    - name: Get Viceroy cache key
-      id: viceroy-rev
-      shell: bash
-      run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
-
     - name: Cache Viceroy binary
       id: cache-viceroy
       uses: actions/cache@v4
       with:
         path: ~/.cargo/bin/viceroy
-        key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+        key: viceroy-${{ runner.os }}-v0.16.4
 
     - name: Install Viceroy
       if: steps.cache-viceroy.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install --git https://github.com/fastly/Viceroy viceroy
+      run: cargo install --git https://github.com/fastly/Viceroy --tag v0.16.4 viceroy
 
     - name: Build WASM binary
       shell: bash

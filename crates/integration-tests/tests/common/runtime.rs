@@ -36,6 +36,9 @@ pub enum TestError {
     #[display("Script tag not found in HTML")]
     ScriptTagNotFound,
 
+    #[display("Script tag was injected when it should not have been")]
+    UnexpectedScriptInjection,
+
     #[display("Response body did not match expected content")]
     UnexpectedContent,
 

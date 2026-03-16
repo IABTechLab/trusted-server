@@ -59,7 +59,7 @@ async function globalSetup(): Promise<void> {
   } catch (err) {
     // Clean up any resources that were started before re-throwing
     console.error("[global-setup] Setup failed, cleaning up...");
-    if (viceroyPid) stopViceroy(viceroyPid);
+    if (viceroyPid) await stopViceroy(viceroyPid);
     if (containerId) stopContainer(containerId);
 
     // Remove partial state file since we cleaned up manually

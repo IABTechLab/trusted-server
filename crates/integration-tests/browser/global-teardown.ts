@@ -15,7 +15,7 @@ async function globalTeardown(): Promise<void> {
 
   if (state.viceroyPid) {
     console.log(`[global-teardown] Stopping Viceroy (pid: ${state.viceroyPid})`);
-    stopViceroy(state.viceroyPid);
+    await stopViceroy(state.viceroyPid);
   }
 
   if (state.containerId) {
