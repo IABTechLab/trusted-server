@@ -3,6 +3,7 @@ use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::settings::Settings;
@@ -287,7 +288,8 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 /// Verify a `tstoken` for the given clear-text URL.
 #[must_use]
 pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
-    sign_clear_url(settings, clear_url) == token
+    let expected = sign_clear_url(settings, clear_url);
+    expected.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
 /// Compute tstoken for the new proxy scheme: SHA-256 of the encrypted full URL (including query).
@@ -352,6 +354,33 @@ mod tests {
             "https://cdn.example/a.png?x=2",
             &t1
         ));
+    }
+
+    #[test]
+    fn verify_clear_url_rejects_tampered_token() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let url = "https://cdn.example/a.png?x=1";
+        let valid_token = sign_clear_url(&settings, url);
+
+        // Flip one bit in the first byte — same URL, same length, wrong bytes
+        let mut tampered = valid_token.into_bytes();
+        tampered[0] ^= 0x01;
+        let tampered =
+            String::from_utf8(tampered).expect("should be valid utf8 after single-bit flip");
+
+        assert!(
+            !verify_clear_url_signature(&settings, url, &tampered),
+            "should reject token with tampered bytes"
+        );
+    }
+
+    #[test]
+    fn verify_clear_url_rejects_empty_token() {
+        let settings = crate::test_support::tests::create_test_settings();
+        assert!(
+            !verify_clear_url_signature(&settings, "https://cdn.example/a.png", ""),
+            "should reject empty token"
+        );
     }
 
     // RequestInfo tests

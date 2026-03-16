@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
+use subtle::ConstantTimeEq;
 
 use crate::settings::Settings;
 
@@ -14,9 +15,14 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
         None => return Some(unauthorized_response()),
     };
 
-    if username == handler.username && password == handler.password {
+    // Use bitwise & (not &&) so both sides always evaluate — eliminates the
+    // username-existence oracle that short-circuit evaluation would create.
+    let username_ok = username.as_bytes().ct_eq(handler.username.as_bytes());
+    let password_ok = password.as_bytes().ct_eq(handler.password.as_bytes());
+    if (username_ok & password_ok).into() {
         None
     } else {
+        log::warn!("Basic auth failed for path: {}", req.get_path());
         Some(unauthorized_response())
     }
 }
@@ -107,6 +113,37 @@ mod tests {
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn challenge_when_username_wrong_password_correct() {
+        // Validates that both fields are always evaluated — no short-circuit username oracle.
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("wrong-user:pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should reject wrong username even with correct password"
+        );
+    }
+
+    #[test]
+    fn challenge_when_username_correct_password_wrong() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("user:wrong-pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should reject correct username with wrong password"
+        );
     }
 
     #[test]

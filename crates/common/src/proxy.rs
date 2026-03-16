@@ -4,6 +4,7 @@ use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -1052,7 +1053,8 @@ fn reconstruct_and_validate_signed_target(
     };
 
     let expected = compute_encrypted_sha256_token(settings, &full_for_token);
-    if expected != sig {
+    let valid: bool = expected.as_bytes().ct_eq(sig.as_bytes()).into();
+    if !valid {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tstoken".to_string(),
         }));
@@ -1236,6 +1238,29 @@ mod tests {
             reconstruct_and_validate_signed_target(&settings, &url)
                 .expect_err("expected expiration failure");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rejects_tampered_tstoken() {
+        let settings = create_test_settings();
+        let tsurl = "https://cdn.example/asset.js";
+        let tsurl_encoded =
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>();
+        // Syntactically valid base64url token of the right length, but not the correct signature
+        let bad_token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let url = format!(
+            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+            tsurl_encoded, bad_token
+        );
+
+        let err: Report<TrustedServerError> =
+            reconstruct_and_validate_signed_target(&settings, &url)
+                .expect_err("should reject tampered token");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_GATEWAY,
+            "should return 502 for invalid tstoken"
+        );
     }
 
     #[tokio::test]
