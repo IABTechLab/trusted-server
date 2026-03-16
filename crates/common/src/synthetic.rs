@@ -263,7 +263,7 @@ mod tests {
 
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
-        log::debug!("Generated synthetic ID: {}", synthetic_id);
+        log::trace!("Generated synthetic ID: {}", synthetic_id);
         assert!(
             is_synthetic_id_format(&synthetic_id),
             "should match synthetic ID format"

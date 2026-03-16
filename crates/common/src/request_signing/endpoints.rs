@@ -437,12 +437,13 @@ mod tests {
                 let body = resp.take_body_str();
                 let response: RotateKeyResponse =
                     serde_json::from_str(&body).expect("should deserialize rotate response");
-                println!(
+                log::debug!(
                     "Rotation response: success={}, message={}",
-                    response.success, response.message
+                    response.success,
+                    response.message
                 );
             }
-            Err(e) => println!("Expected error in test environment: {}", e),
+            Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
     }
 
@@ -464,12 +465,13 @@ mod tests {
                 let body = resp.take_body_str();
                 let response: RotateKeyResponse =
                     serde_json::from_str(&body).expect("should deserialize rotate response");
-                println!(
+                log::debug!(
                     "Custom KID rotation: success={}, new_kid={}",
-                    response.success, response.new_kid
+                    response.success,
+                    response.new_kid
                 );
             }
-            Err(e) => println!("Expected error in test environment: {}", e),
+            Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
     }
 
@@ -503,12 +505,13 @@ mod tests {
                 let body = resp.take_body_str();
                 let response: DeactivateKeyResponse =
                     serde_json::from_str(&body).expect("should deserialize deactivate response");
-                println!(
+                log::debug!(
                     "Deactivate response: success={}, message={}",
-                    response.success, response.message
+                    response.success,
+                    response.message
                 );
             }
-            Err(e) => println!("Expected error in test environment: {}", e),
+            Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
     }
 
@@ -532,12 +535,13 @@ mod tests {
                 let body = resp.take_body_str();
                 let response: DeactivateKeyResponse =
                     serde_json::from_str(&body).expect("should deserialize deactivate response");
-                println!(
+                log::debug!(
                     "Delete response: success={}, deleted={}",
-                    response.success, response.deleted
+                    response.success,
+                    response.deleted
                 );
             }
-            Err(e) => println!("Expected error in test environment: {}", e),
+            Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
     }
 
@@ -594,7 +598,7 @@ mod tests {
                 assert!(discovery.get("endpoints").is_none());
                 assert!(discovery.get("capabilities").is_none());
             }
-            Err(e) => println!("Expected error in test environment: {}", e),
+            Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
     }
 }
