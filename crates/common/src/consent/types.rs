@@ -243,12 +243,20 @@ impl TcfConsent {
     }
 
     /// Checks whether a specific vendor has been granted consent.
+    ///
+    /// Uses linear search over the vendor ID list, which is adequate for
+    /// current usage patterns. Consider switching to a `HashSet<u16>` or
+    /// sorted vec with binary search if this lands on a hot path (e.g.
+    /// per-EID vendor gating).
     #[must_use]
     pub fn has_vendor_consent(&self, vendor_id: u16) -> bool {
         self.vendor_consents.contains(&vendor_id)
     }
 
     /// Checks whether a specific vendor has established legitimate interest.
+    ///
+    /// See [`has_vendor_consent`](Self::has_vendor_consent) for performance
+    /// notes on the linear search.
     #[must_use]
     pub fn has_vendor_li(&self, vendor_id: u16) -> bool {
         self.vendor_legitimate_interests.contains(&vendor_id)

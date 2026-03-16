@@ -121,10 +121,16 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
     let cmp_version = reader.read_u16(90, 12);
     let consent_screen = reader.read_u8(102, 6);
 
-    // Consent language: two 6-bit values, each offset by 'A' (65)
+    // Consent language: two 6-bit values, each offset by 'A' (65).
+    // Valid range is 0–25 (maps to A–Z per ISO 639-1).
     let lang_a = reader.read_u8(108, 6);
     let lang_b = reader.read_u8(114, 6);
-    let consent_language = format!("{}{}", char::from(b'A' + lang_a), char::from(b'A' + lang_b),);
+    if lang_a > 25 || lang_b > 25 {
+        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+            reason: format!("invalid consent language values: ({lang_a}, {lang_b}), expected 0-25"),
+        }));
+    }
+    let consent_language = format!("{}{}", char::from(b'A' + lang_a), char::from(b'A' + lang_b));
 
     let vendor_list_version = reader.read_u16(120, 12);
     let tcf_policy_version = reader.read_u8(132, 6);
@@ -258,6 +264,9 @@ fn vendor_section_end_offset(
         return Ok(offset);
     }
 
+    // Intentionally uncapped: we need the raw max_vendor_id to compute the
+    // true end-of-section offset in the bitstream, even though
+    // `decode_vendor_section` caps at MAX_VENDOR_ID for allocation safety.
     let max_vendor_id = reader.read_u16(offset, 16);
     let is_range = reader.read_bool(offset + 16);
 
@@ -513,6 +522,20 @@ mod tests {
             *result.vendor_consents.last().expect("should have last"),
             10_000
         );
+    }
+
+    #[test]
+    fn rejects_invalid_consent_language() {
+        // Language values above 25 are invalid (only A-Z / 0-25 are valid).
+        let mut bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &[]);
+        // Set lang_a to 30 (invalid: exceeds 25) at bit offset 108, 6 bits.
+        // We need to overwrite bits 108..114 with value 30.
+        let mut writer = BitWriter::new(&mut bytes);
+        writer.write(108, 6, 30);
+
+        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        let result = decode_tc_string(&encoded);
+        assert!(result.is_err(), "should reject consent language value > 25");
     }
 
     #[test]

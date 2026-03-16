@@ -322,6 +322,8 @@ fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfi
             gpp_tcf,
             config.conflict_resolution.freshness_threshold_days,
         )
+        // When both signals are within the freshness threshold, fall back
+        // to the restrictive choice (prefer whichever denies consent).
         .unwrap_or(!gpp_allows),
     };
 
@@ -619,48 +621,66 @@ mod tests {
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
 
-    fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {
-        TcfConsent {
-            version: 2,
-            cmp_id: 1,
-            cmp_version: 1,
-            consent_screen: 0,
-            consent_language: "EN".to_owned(),
-            vendor_list_version: 1,
-            tcf_policy_version: 4,
-            created_ds: last_updated_ds,
-            last_updated_ds,
-            purpose_consents: vec![
-                true,
-                false,
-                false,
-                allows_eids,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-            ],
-            purpose_legitimate_interests: vec![false; 24],
-            vendor_consents: Vec::new(),
-            vendor_legitimate_interests: Vec::new(),
-            special_feature_opt_ins: vec![false; 12],
+    /// Builder for [`TcfConsent`] test fixtures with sensible defaults.
+    ///
+    /// All purposes default to `false`, timestamps to `0`, and vendor lists
+    /// to empty. Callers set only the fields relevant to their test.
+    struct TcfBuilder {
+        last_updated_ds: u64,
+        purpose_consents: [bool; 24],
+    }
+
+    impl TcfBuilder {
+        fn new() -> Self {
+            Self {
+                last_updated_ds: 0,
+                purpose_consents: [false; 24],
+            }
         }
+
+        /// Sets Purpose 1 (store/access information on a device).
+        fn with_storage(mut self, consented: bool) -> Self {
+            self.purpose_consents[0] = consented;
+            self
+        }
+
+        /// Sets Purpose 4 (personalized ads / EID transmission).
+        fn with_personalized_ads(mut self, consented: bool) -> Self {
+            self.purpose_consents[3] = consented;
+            self
+        }
+
+        fn with_last_updated(mut self, ds: u64) -> Self {
+            self.last_updated_ds = ds;
+            self
+        }
+
+        fn build(self) -> TcfConsent {
+            TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: self.last_updated_ds,
+                last_updated_ds: self.last_updated_ds,
+                purpose_consents: self.purpose_consents.to_vec(),
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }
+        }
+    }
+
+    fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {
+        TcfBuilder::new()
+            .with_storage(true)
+            .with_personalized_ads(allows_eids)
+            .with_last_updated(last_updated_ds)
+            .build()
     }
 
     fn make_conflicting_context(
@@ -867,47 +887,7 @@ mod tests {
 
     /// Helper: builds a TCF consent with configurable Purpose 1 (storage).
     fn make_tcf_with_storage(has_storage: bool) -> TcfConsent {
-        TcfConsent {
-            version: 2,
-            cmp_id: 1,
-            cmp_version: 1,
-            consent_screen: 0,
-            consent_language: "EN".to_owned(),
-            vendor_list_version: 1,
-            tcf_policy_version: 4,
-            created_ds: 0,
-            last_updated_ds: 0,
-            purpose_consents: vec![
-                has_storage,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-            ],
-            purpose_legitimate_interests: vec![false; 24],
-            vendor_consents: Vec::new(),
-            vendor_legitimate_interests: Vec::new(),
-            special_feature_opt_ins: vec![false; 12],
-        }
+        TcfBuilder::new().with_storage(has_storage).build()
     }
 
     #[test]
