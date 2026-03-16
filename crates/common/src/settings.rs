@@ -334,17 +334,7 @@ impl Settings {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
-        let uncovered = settings.uncovered_admin_endpoints();
-        if !uncovered.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "No handler covers admin endpoint(s): {}. \
-                     Add a [[handlers]] entry with a path regex matching /admin/ \
-                     to protect admin access.",
-                    uncovered.join(", ")
-                ),
-            }));
-        }
+        settings.validate_admin_coverage()?;
 
         Ok(settings)
     }
@@ -386,17 +376,7 @@ impl Settings {
             })
         })?;
 
-        let uncovered = settings.uncovered_admin_endpoints();
-        if !uncovered.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "No handler covers admin endpoint(s): {}. \
-                     Add a [[handlers]] entry with a path regex matching /admin/ \
-                     to protect admin access.",
-                    uncovered.join(", ")
-                ),
-            }));
-        }
+        settings.validate_admin_coverage()?;
 
         Ok(settings)
     }
@@ -429,6 +409,27 @@ impl Settings {
             .copied()
             .filter(|path| !self.handlers.iter().any(|h| h.matches_path(path)))
             .collect()
+    }
+
+    /// Validates that every admin endpoint is covered by at least one handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] listing any uncovered
+    /// admin endpoints.
+    fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
+        let uncovered = self.uncovered_admin_endpoints();
+        if uncovered.is_empty() {
+            return Ok(());
+        }
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "No handler covers admin endpoint(s): {}. \
+                 Add a [[handlers]] entry with a path regex matching /admin/ \
+                 to protect admin access.",
+                uncovered.join(", ")
+            ),
+        }))
     }
 
     /// Retrieves the integration configuration of a specific type.
@@ -1372,7 +1373,9 @@ mod tests {
         }
 
         // Also verify we haven't missed any admin routes in the router.
-        // Scan for path literals under "/admin/" in match arms.
+        // Best-effort: only detects string-literal routes in standard match-arm
+        // format. If you define admin routes differently (e.g. via constants or
+        // non-standard formatting), add them to ADMIN_ENDPOINTS manually.
         let admin_routes_in_router: Vec<&str> = router_source
             .lines()
             .filter_map(|line| {
