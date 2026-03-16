@@ -30,7 +30,7 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
         None => return Some(unauthorized_response()),
     };
 
-    if *handler.username.expose() == username && *handler.password.expose() == password {
+    if handler.username == username && handler.password == password {
         None
     } else {
         Some(unauthorized_response())

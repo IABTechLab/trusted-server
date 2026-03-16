@@ -298,7 +298,7 @@ pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
     pub config_store_id: String,
-    pub secret_store_id: Redacted<String>,
+    pub secret_store_id: String,
 }
 
 fn default_request_signing_enabled() -> bool {

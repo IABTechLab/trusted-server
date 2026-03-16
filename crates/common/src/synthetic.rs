@@ -109,7 +109,7 @@ pub fn generate_synthetic_id(
     let random_suffix = generate_random_suffix(6);
     let synthetic_id = format!("{}.{}", hmac_hash, random_suffix);
 
-    log::debug!("Generated fresh ID: {}", synthetic_id);
+    log::trace!("Generated fresh ID: {}", synthetic_id);
 
     Ok(synthetic_id)
 }
@@ -132,7 +132,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         .and_then(|h| h.to_str().ok())
     {
         let id = synthetic_id.to_string();
-        log::debug!("Using existing Synthetic ID from header: {}", id);
+        log::trace!("Using existing Synthetic ID from header: {}", id);
         return Ok(Some(id));
     }
 
@@ -140,7 +140,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
                 let id = cookie.value().to_string();
-                log::debug!("Using existing Trusted Server ID from cookie: {}", id);
+                log::trace!("Using existing Trusted Server ID from cookie: {}", id);
                 return Ok(Some(id));
             }
         }
@@ -173,7 +173,7 @@ pub fn get_or_generate_synthetic_id(
 
     // If no existing Synthetic ID found, generate a fresh one
     let synthetic_id = generate_synthetic_id(settings, req)?;
-    log::debug!("No existing synthetic_id, generated: {}", synthetic_id);
+    log::trace!("No existing synthetic_id, generated: {}", synthetic_id);
     Ok(synthetic_id)
 }
 

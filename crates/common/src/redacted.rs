@@ -62,6 +62,18 @@ impl<T> fmt::Display for Redacted<T> {
     }
 }
 
+impl<T: PartialEq> PartialEq for Redacted<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T: PartialEq> PartialEq<T> for Redacted<T> {
+    fn eq(&self, other: &T) -> bool {
+        self.0 == *other
+    }
+}
+
 impl From<String> for Redacted<String> {
     fn from(value: String) -> Self {
         Self(value)
@@ -138,6 +150,28 @@ mod tests {
             "serialize-me",
             "should deserialize transparently"
         );
+    }
+
+    #[test]
+    fn partial_eq_with_inner_type() {
+        let secret = Redacted::new("my-secret".to_string());
+        assert!(
+            secret == "my-secret".to_string(),
+            "should equal the inner value"
+        );
+        assert!(
+            secret != "other".to_string(),
+            "should not equal a different value"
+        );
+    }
+
+    #[test]
+    fn partial_eq_between_redacted() {
+        let a = Redacted::new("same".to_string());
+        let b = Redacted::new("same".to_string());
+        let c = Redacted::new("different".to_string());
+        assert!(a == b, "should equal when inner values match");
+        assert!(a != c, "should not equal when inner values differ");
     }
 
     #[test]
