@@ -736,17 +736,17 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                | Type          | Default                                                                | Description                                                                                                |
-| -------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                  |
-| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                                                                                 |
-| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                            |
-| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                    |
-| `debug`              | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses) |
-| `test_mode`          | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                          |
-| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging                                                                  |
-| `client_side_bidders`| Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
-| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                |
+| Field                 | Type          | Default                                                                | Description                                                                                                                                           |
+| --------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`             | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
+| `server_url`          | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
+| `timeout_ms`          | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
+| `bidders`             | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
+| `debug`               | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
+| `test_mode`           | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
+| `debug_query_params`  | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
+| `client_side_bidders` | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
+| `script_patterns`     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
 **Example**:
 
