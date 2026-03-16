@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -889,8 +890,12 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to set request body".to_string(),
             })?;
 
-        // Send request asynchronously
-        let backend_name = BackendConfig::from_url(&self.config.server_url, true)?;
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.server_url,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -980,15 +985,19 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.server_url, true)
-            .inspect_err(|e| {
-                log::error!(
-                    "Failed to create backend for Prebid server URL '{}': {e:?}",
-                    self.config.server_url
-                );
-            })
-            .ok()
+    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
+        BackendConfig::backend_name_for_url(
+            &self.config.server_url,
+            true,
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .inspect_err(|e| {
+            log::error!(
+                "Failed to create backend for Prebid server URL '{}': {e:?}",
+                self.config.server_url
+            );
+        })
+        .ok()
     }
 }
 
