@@ -303,4 +303,46 @@ describe('GPT script guard', () => {
       globalThis.DOMParser = originalDOMParser;
     }
   });
+
+  it('passes non-GPT HTML through unchanged when DOMParser is unavailable', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — simulating an environment without DOMParser
+    delete globalThis.DOMParser;
+
+    try {
+      installGptGuard();
+
+      const html = '<p>Hello, world!</p>';
+      document.write(html);
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith(html);
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // HTML-entity-encoded URLs
+  // -----------------------------------------------------------------------
+
+  it('rewrites GPT URLs that contain HTML-escaped entities like &amp;', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?x=1&amp;y=2"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
 });

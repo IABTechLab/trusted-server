@@ -204,16 +204,25 @@ function rewriteLinkHref(
  * `document.write` / `document.writeln`.
  *
  * Uses `DOMParser` for robust HTML parsing instead of regex so that
- * edge-cases (unquoted attributes, unusual spacing, mixed quote styles)
- * are handled by the browser's native parser. The raw `getAttribute`
- * value is swapped in the original HTML string so the surrounding markup
- * is preserved verbatim.
+ * edge-cases (unquoted attributes, unusual spacing, mixed quote styles,
+ * HTML-entity-encoded query parameters) are handled by the browser's
+ * native parser. GPT script `src` attributes are mutated in the parsed
+ * DOM and the result is serialized back to HTML.
  *
  * If the GPT domain is present in the HTML but `DOMParser` is
  * unavailable or throws, the function **fails closed** (returns an
  * empty string) rather than passing the unproxied URL through.
+ *
+ * Non-GPT HTML is always passed through unchanged regardless of
+ * `DOMParser` availability.
  */
 function rewriteHtmlString(html: string): string {
+  // Fast-path: if the HTML does not reference the GPT domain at all,
+  // pass it through unchanged.  This avoids unnecessary DOMParser
+  // overhead and, critically, prevents non-GPT document.write calls
+  // from being silently dropped when DOMParser is unavailable.
+  if (!html.includes(GPT_DOMAIN)) return html;
+
   if (typeof DOMParser === 'undefined') {
     log.warn(
       `${LOG_PREFIX}: DOMParser unavailable, blocking document.write HTML that references GPT domain`
@@ -224,7 +233,7 @@ function rewriteHtmlString(html: string): string {
   try {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const scripts = doc.querySelectorAll('script[src]');
-    let result = html;
+    let didRewriteAny = false;
 
     for (const script of scripts) {
       const rawSrc = script.getAttribute('src') ?? '';
@@ -235,10 +244,17 @@ function rewriteHtmlString(html: string): string {
         original: rawSrc,
         rewritten: rewrittenUrl,
       });
-      result = result.replaceAll(rawSrc, rewrittenUrl);
+      // Mutate the parsed DOM so that HTML-entity-encoded attribute
+      // values (e.g. `&amp;`) are handled correctly.  Serializing the
+      // DOM back to HTML avoids the mismatch between decoded
+      // `getAttribute()` values and the raw HTML string.
+      script.setAttribute('src', rewrittenUrl);
+      didRewriteAny = true;
     }
 
-    return result;
+    // DOMParser wraps input in <html><head>…</head><body>…</body></html>.
+    // Bare <script> tags land in <head>, so we serialize from both.
+    return didRewriteAny ? (doc.head?.innerHTML ?? '') + (doc.body?.innerHTML ?? '') : html;
   } catch (err) {
     log.warn(
       `${LOG_PREFIX}: failed to parse document.write HTML containing GPT domain, blocking`,
