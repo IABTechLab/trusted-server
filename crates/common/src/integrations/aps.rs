@@ -518,7 +518,14 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.endpoint, true).ok()
+        BackendConfig::from_url(&self.config.endpoint, true)
+            .inspect_err(|e| {
+                log::error!(
+                    "Failed to create backend for APS endpoint '{}': {e:?}",
+                    self.config.endpoint
+                );
+            })
+            .ok()
     }
 }
 
