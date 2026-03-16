@@ -305,7 +305,7 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
 
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
 ///
-/// Inputs larger than this are returned unchanged with a warning to avoid unbounded
+/// Inputs larger than this are rejected (empty string returned) to prevent unbounded
 /// allocations on the hot path. Fastly Compute enforces upstream request-body limits,
 /// but this guard protects internal callers too.
 const MAX_CREATIVE_SIZE: usize = 1024 * 1024; // 1 MiB
@@ -320,7 +320,7 @@ fn is_safe_data_uri(lower: &str) -> bool {
         .trim_start_matches("data:")
         .split([';', ','])
         .next()
-        .unwrap_or("");
+        .expect("should have at least one split segment");
     matches!(
         mime,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif"
@@ -330,7 +330,7 @@ fn is_safe_data_uri(lower: &str) -> bool {
 /// Strip dangerous elements and attributes from ad creative HTML.
 ///
 /// Removes elements that can execute code or exfiltrate data (`script`, `iframe`,
-/// `object`, `embed`, `base`, `meta`, `form`, `link`) and strips `on*` event-handler
+/// `object`, `embed`, `base`, `meta`, `form`, `link`, `style`) and strips `on*` event-handler
 /// attributes and dangerous URI schemes from all remaining elements:
 /// - `javascript:`, `vbscript:`
 /// - `data:` URIs except the safe raster image subtypes (`image/png`, `image/jpeg`,
@@ -342,17 +342,17 @@ fn is_safe_data_uri(lower: &str) -> bool {
 /// This runs as the first pass in the creative pipeline, before URL rewriting, so the
 /// rewriter only ever sees clean markup.
 ///
-/// Inputs larger than [`MAX_CREATIVE_SIZE`] are returned unchanged with a warning.
-/// On parse errors the original markup is also returned unchanged with a warning.
+/// Inputs larger than [`MAX_CREATIVE_SIZE`] are rejected (empty string returned) with a warning.
+/// On parse errors the markup is also rejected (empty string returned) with a warning.
 #[must_use]
 pub fn sanitize_creative_html(markup: &str) -> String {
     if markup.len() > MAX_CREATIVE_SIZE {
         log::warn!(
-            "sanitize_creative_html: creative too large ({} bytes > {} byte limit); returning unchanged",
+            "sanitize_creative_html: creative too large ({} bytes > {} byte limit); rejecting",
             markup.len(),
             MAX_CREATIVE_SIZE
         );
-        return markup.to_owned();
+        return String::new();
     }
 
     let mut out = Vec::with_capacity(markup.len());
@@ -393,6 +393,13 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                     el.remove();
                     Ok(())
                 }),
+                // <style> blocks can carry CSS expressions, @import for external
+                // resource loading, and url() data exfiltration — strip them for
+                // consistency with <link> (external stylesheets) treatment.
+                element!("style", |el| {
+                    el.remove();
+                    Ok(())
+                }),
                 // Strip event-handler attributes and dangerous URI scheme values from
                 // every element. Note: lol_html calls this handler for the opening tag of
                 // each element including those already marked for removal above (e.g.
@@ -413,6 +420,8 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                     for attr_name in &[
                         "href",
                         "src",
+                        // data-src is used by lazy-loading libraries; treat like src.
+                        "data-src",
                         "action",
                         "formaction",
                         "background",
@@ -430,6 +439,26 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                             {
                                 el.remove_attribute(attr_name);
                             }
+                        }
+                    }
+
+                    // srcset is a comma-separated list of "url [descriptor]" entries.
+                    // Check each URL individually so a dangerous URI anywhere in the list
+                    // is caught, not just one at the start of the attribute string.
+                    if let Some(val) = el.get_attribute("srcset") {
+                        let is_dangerous = val.split(',').any(|entry| {
+                            let url = entry
+                                .trim()
+                                .split_ascii_whitespace()
+                                .next()
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            url.starts_with("javascript:")
+                                || url.starts_with("vbscript:")
+                                || (url.starts_with("data:") && !is_safe_data_uri(&url))
+                        });
+                        if is_dangerous {
+                            el.remove_attribute("srcset");
                         }
                     }
 
@@ -458,13 +487,19 @@ pub fn sanitize_creative_html(markup: &str) -> String {
     );
 
     // Short-circuit: do not call end() after a failed write(), as lol_html's
-    // rewriter is in an error state and may produce garbage output.
+    // rewriter is in an error state and may produce garbage output. Fail closed —
+    // return empty string so the caller rejects the creative rather than serving
+    // unsanitized markup.
     if rewriter.write(markup.as_bytes()).is_err() || rewriter.end().is_err() {
-        log::warn!("sanitize_creative_html: html parse error; returning markup unchanged");
-        return markup.to_owned();
+        log::warn!("sanitize_creative_html: html parse error; rejecting markup");
+        return String::new();
     }
 
-    String::from_utf8(out).unwrap_or_else(|_| markup.to_string())
+    // lol_html always emits valid UTF-8 when given valid UTF-8 input (Rust &str
+    // is always valid UTF-8), so this error path is unreachable in practice.
+    // Return empty string rather than the original markup so the caller fails
+    // closed if lol_html ever produces unexpected non-UTF-8 output.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// Rewrite ad creative HTML to first-party endpoints.
@@ -1541,6 +1576,66 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_dangerous_data_src_attribute() {
+        // data-src is used by lazy-loaders; dangerous URI schemes must be stripped.
+        let html = r#"<img data-src="javascript:alert(1)" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: in data-src"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_srcset_leading_entry() {
+        // A javascript: URI at the start of srcset must be stripped.
+        let html =
+            r#"<img srcset="javascript:alert(1) 1x, https://cdn.example/img.png 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("srcset"),
+            "should remove srcset with leading dangerous URL"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: from srcset"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_srcset_non_leading_entry() {
+        // A javascript: URI that is NOT the first entry must also be stripped.
+        // This was the gap in the previous starts_with-only check.
+        let html =
+            r#"<img srcset="https://cdn.example/small.png 1x, javascript:alert(1) 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("srcset"),
+            "should remove srcset with non-leading dangerous URL"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: from non-leading srcset entry"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_srcset() {
+        // A fully safe srcset must be preserved.
+        let html = r#"<img srcset="https://cdn.example/small.png 1x, https://cdn.example/large.png 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(out.contains("srcset"), "should preserve safe srcset");
+        assert!(
+            out.contains("small.png"),
+            "should preserve first srcset URL"
+        );
+        assert!(
+            out.contains("large.png"),
+            "should preserve second srcset URL"
+        );
+    }
+
+    #[test]
     fn sanitize_strips_dangerous_inline_style() {
         let html = r#"<div style="background:expression(alert(1))">ad</div>"#;
         let out = sanitize_creative_html(html);
@@ -1590,6 +1685,28 @@ mod tests {
         let html = r#"<link rel="stylesheet" href="https://evil.example/evil.css">"#;
         let out = sanitize_creative_html(html);
         assert!(!out.contains("<link"), "should remove link element");
+    }
+
+    #[test]
+    fn sanitize_removes_style_element() {
+        // <style> blocks can carry CSS expressions, @import, and url() payloads.
+        // Treated the same as <link>: stripped entirely.
+        let html = r#"<div>ad</div><style>div { background: expression(alert(1)) }</style>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<style"), "should remove style element");
+        assert!(
+            !out.contains("expression("),
+            "should remove style element content"
+        );
+        assert!(out.contains("ad"), "should preserve safe content");
+    }
+
+    #[test]
+    fn sanitize_removes_style_element_with_at_import() {
+        let html = r#"<p>ad</p><style>@import url("https://evil.example/exfil.css")</style>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<style"), "should remove style element");
+        assert!(!out.contains("@import"), "should remove @import content");
     }
 
     #[test]
@@ -1716,10 +1833,10 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_returns_unchanged_when_over_size_limit() {
-        // Inputs exceeding MAX_CREATIVE_SIZE must be returned as-is without processing.
+    fn sanitize_returns_empty_string_when_over_size_limit() {
+        // Inputs exceeding MAX_CREATIVE_SIZE must be rejected (fail closed).
         let large = "A".repeat(super::MAX_CREATIVE_SIZE + 1);
         let out = sanitize_creative_html(&large);
-        assert_eq!(out, large, "should return oversized input unchanged");
+        assert_eq!(out, "", "should reject oversized input with empty string");
     }
 }

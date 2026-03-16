@@ -39,7 +39,9 @@ function normalizeId(raw: string): string {
 
 // Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
 // Dangerous markup is stripped server-side before adm reaches the client; this function
-// only guards against type errors and empty payloads.
+// only guards against type errors and empty payloads. As a result, sanitizedLength always
+// equals originalLength and removedCount is always 0 for accepted creatives — these fields
+// exist for structural consistency with the shared result type but carry no signal here.
 export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
   if (typeof creativeHtml !== 'string') {
     return {
