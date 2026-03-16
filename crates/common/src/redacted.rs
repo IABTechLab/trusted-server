@@ -31,7 +31,7 @@ pub struct Redacted<T>(T);
 
 impl<T> Redacted<T> {
     /// Creates a new [`Redacted`] value.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by the library crate but not by build.rs which includes this file via #[path]
     pub fn new(value: T) -> Self {
         Self(value)
     }
