@@ -364,11 +364,12 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let settings: Self =
+        let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
+        settings.consent.validate();
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -404,6 +405,7 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+        settings.consent.validate();
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {

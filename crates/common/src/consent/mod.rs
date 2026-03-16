@@ -333,12 +333,10 @@ fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfi
         config.conflict_resolution.mode
     );
 
-    // Clone only the winner after the decision is made.
-    ctx.tcf = Some(if select_gpp {
-        gpp_tcf.clone()
-    } else {
-        return; // Standalone is already in ctx.tcf — nothing to do.
-    });
+    // Overwrite only when GPP wins; standalone is already in ctx.tcf.
+    if select_gpp {
+        ctx.tcf = Some(gpp_tcf.clone());
+    }
 }
 
 /// Returns whether GPP should win under the `newest` strategy.
@@ -403,6 +401,13 @@ pub fn build_us_privacy_from_gpc(config: &ConsentConfig) -> Option<types::UsPriv
     let defaults = &config.us_privacy_defaults;
     if !defaults.gpc_implies_optout {
         return None;
+    }
+
+    if defaults.notice_given {
+        log::warn!(
+            "GPC-constructed US Privacy string asserts notice_given=true; \
+             verify that the publisher's privacy notice satisfies this claim"
+        );
     }
 
     Some(types::UsPrivacy {

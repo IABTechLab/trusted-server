@@ -244,6 +244,10 @@ fn open_store(store_name: &str) -> Option<fastly::kv_store::KVStore> {
 ///
 /// Returns `true` when the stored metadata fingerprint equals `new_fp`,
 /// meaning no write is needed.
+///
+/// Entries written by older code versions may lack metadata, in which case
+/// this returns `false` and the entry will be unconditionally re-written
+/// with the current fingerprint (self-healing migration).
 fn fingerprint_unchanged(
     store: &fastly::kv_store::KVStore,
     synthetic_id: &str,

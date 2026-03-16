@@ -51,7 +51,10 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jur
         None => return Jurisdiction::Unknown,
     };
 
-    // Check GDPR countries first (EU/EEA/UK).
+    // Check GDPR countries first (EU/EEA/UK). This ordering also resolves
+    // the `DE` code collision: ISO 3166-1 `DE` is Germany (GDPR), while
+    // US-Delaware uses ISO 3166-2 `US-DE`. The US state check below only
+    // triggers when `country == "US"`, so there is no actual ambiguity.
     if config
         .gdpr
         .applies_in

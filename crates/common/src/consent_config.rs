@@ -13,6 +13,10 @@ const MAX_CONSENT_AGE_DAYS: u32 = 395;
 const FRESHNESS_THRESHOLD_DAYS: u32 = 30;
 
 /// EU member states (27) + EEA non-EU (3) + UK GDPR (1).
+///
+/// Switzerland (`CH`) is intentionally excluded: the Swiss FADP mirrors GDPR
+/// but is a separate legal regime. Publishers operating in Switzerland can add
+/// `CH` to `consent.gdpr.applies_in` in their configuration.
 const GDPR_COUNTRIES: &[&str] = &[
     "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
     "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS", "LI", "NO", "GB",
@@ -46,7 +50,8 @@ pub struct ConsentConfig {
 
     /// Maximum consent age in days before it is considered expired.
     ///
-    /// TCF spec recommends 13 months (≈395 days).
+    /// TCF spec recommends 13 months (≈395 days). Valid range: 1–3650.
+    /// Values outside this range are clamped during [`validate`](Self::validate).
     #[serde(default = "default_max_consent_age_days")]
     pub max_consent_age_days: u32,
 
@@ -88,6 +93,22 @@ impl Default for ConsentConfig {
             us_privacy_defaults: UsPrivacyDefaultsConfig::default(),
             conflict_resolution: ConflictResolutionConfig::default(),
             consent_store: None,
+        }
+    }
+}
+
+impl ConsentConfig {
+    /// Clamps configuration values to valid ranges and logs warnings.
+    ///
+    /// Call after deserialization to catch out-of-range values early.
+    pub fn validate(&mut self) {
+        let clamped = self.max_consent_age_days.clamp(1, 3650);
+        if clamped != self.max_consent_age_days {
+            log::warn!(
+                "max_consent_age_days={} is outside the valid range 1–3650; clamped to {clamped}",
+                self.max_consent_age_days
+            );
+            self.max_consent_age_days = clamped;
         }
     }
 }

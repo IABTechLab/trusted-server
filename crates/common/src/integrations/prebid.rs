@@ -301,6 +301,8 @@ impl IntegrationProxy for PrebidIntegration {
         // Patterns can be exact paths (e.g., "/prebid.min.js") or use matchit wildcards
         // (e.g., "/static/prebid/{*rest}")
         for pattern in &self.config.script_patterns {
+            // Intentional leak: runs once at startup and patterns are small.
+            // `IntegrationEndpoint` requires `&'static str`.
             let static_path: &'static str = Box::leak(pattern.clone().into_boxed_str());
             routes.push(IntegrationEndpoint::get(static_path));
         }
@@ -938,20 +940,25 @@ impl PrebidAuctionProvider {
             Some(0)
         };
 
-        // Build ext first so the dual-placement fields are cloned once from
-        // ConsentContext (into ext), then once more into Regs top-level.
+        // Dual-placement: OpenRTB 2.6 top-level fields AND `regs.ext` for
+        // backward compatibility with older exchanges. Extract top-level
+        // values first, then clone once into the ext to avoid extra copies.
+        let us_privacy = ctx.raw_us_privacy.clone();
+        let gpp = ctx.raw_gpp_string.clone();
+        let gpp_sid = ctx.gpp_section_ids.clone();
+
         let ext = RegsExt {
             gdpr,
-            us_privacy: ctx.raw_us_privacy.clone(),
-            gpp: ctx.raw_gpp_string.clone(),
-            gpp_sid: ctx.gpp_section_ids.clone(),
+            us_privacy: us_privacy.clone(),
+            gpp: gpp.clone(),
+            gpp_sid: gpp_sid.clone(),
         };
 
         Some(Regs {
-            gdpr: ext.gdpr,
-            us_privacy: ext.us_privacy.clone(),
-            gpp: ext.gpp.clone(),
-            gpp_sid: ext.gpp_sid.clone(),
+            gdpr,
+            us_privacy,
+            gpp,
+            gpp_sid,
             ext: Some(ext),
         })
     }

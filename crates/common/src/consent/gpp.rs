@@ -62,6 +62,9 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     })?;
 
     // Extract section IDs as u16 values.
+    // Safety: `SectionId` is a C-like enum with discriminants 1–23 (GPP spec v1).
+    // The `iab_gpp` crate stores them internally as `BTreeSet<u16>`, so every
+    // variant is guaranteed to fit in u16.
     let section_ids: Vec<u16> = parsed.section_ids().map(|id| *id as u16).collect();
 
     // Attempt to extract and decode the EU TCF v2.2 section.
