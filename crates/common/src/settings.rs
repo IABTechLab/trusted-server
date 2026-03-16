@@ -280,6 +280,17 @@ pub struct Proxy {
     /// Set to false for local development with self-signed certificates.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
+    /// Permitted redirect target domains for the first-party proxy.
+    ///
+    /// Supports exact hostname match (`"example.com"`) and subdomain wildcard
+    /// prefix (`"*.example.com"`, which also matches the apex `example.com`).
+    /// Matching is case-insensitive.
+    ///
+    /// When empty (the default), redirect destinations are not restricted.
+    /// Configure this in production to prevent SSRF via redirect chains
+    /// initiated by signed first-party proxy URLs.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub allowed_domains: Vec<String>,
 }
 
 fn default_certificate_check() -> bool {
@@ -290,6 +301,7 @@ impl Default for Proxy {
     fn default() -> Self {
         Self {
             certificate_check: default_certificate_check(),
+            allowed_domains: Vec::new(),
         }
     }
 }

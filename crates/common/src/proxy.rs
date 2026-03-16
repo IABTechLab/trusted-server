@@ -460,6 +460,27 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
     }
 }
 
+/// Returns `true` if `host` is permitted by `pattern`.
+///
+/// - `"example.com"` matches exactly `example.com`.
+/// - `"*.example.com"` matches `example.com` and any subdomain at any depth.
+///
+/// Comparison is case-insensitive. The wildcard check requires a dot boundary,
+/// so `"*.example.com"` does **not** match `"evil-example.com"`.
+fn is_host_allowed(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host == suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|rest| rest.ends_with('.'))
+    } else {
+        host == pattern
+    }
+}
+
 async fn proxy_with_redirects(
     settings: &Settings,
     req: &Request,
@@ -561,6 +582,25 @@ async fn proxy_with_redirects(
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
+        }
+
+        if !settings.proxy.allowed_domains.is_empty() {
+            let next_host = next_url.host_str().unwrap_or("");
+            let allowed = settings
+                .proxy
+                .allowed_domains
+                .iter()
+                .any(|p| is_host_allowed(next_host, p));
+
+            if !allowed {
+                log::warn!(
+                    "redirect to `{}` blocked: host not in proxy allowed_domains",
+                    next_host
+                );
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("redirect to `{next_host}` is not permitted"),
+                }));
+            }
         }
 
         log::info!(
@@ -1086,7 +1126,7 @@ fn reconstruct_and_validate_signed_target(
 mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
-        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
         reconstruct_and_validate_signed_target, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -1795,6 +1835,128 @@ mod tests {
             body.contains("/first-party/proxy?tsurl="),
             "HTML should be rewritten: {}",
             body
+        );
+    }
+
+    // --- is_host_allowed ---
+
+    #[test]
+    fn exact_match() {
+        assert!(
+            is_host_allowed("example.com", "example.com"),
+            "should match exact domain"
+        );
+    }
+
+    #[test]
+    fn exact_no_match() {
+        assert!(
+            !is_host_allowed("other.com", "example.com"),
+            "should not match different domain"
+        );
+    }
+
+    #[test]
+    fn wildcard_subdomain() {
+        assert!(
+            is_host_allowed("ad.example.com", "*.example.com"),
+            "should match direct subdomain"
+        );
+    }
+
+    #[test]
+    fn wildcard_deep_subdomain() {
+        assert!(
+            is_host_allowed("a.b.example.com", "*.example.com"),
+            "should match deep subdomain"
+        );
+    }
+
+    #[test]
+    fn wildcard_apex_match() {
+        assert!(
+            is_host_allowed("example.com", "*.example.com"),
+            "wildcard should also match apex domain"
+        );
+    }
+
+    #[test]
+    fn wildcard_no_boundary_bypass() {
+        assert!(
+            !is_host_allowed("evil-example.com", "*.example.com"),
+            "should not match host that lacks dot boundary"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_host() {
+        assert!(
+            is_host_allowed("AD.EXAMPLE.COM", "*.example.com"),
+            "should match uppercase host"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_pattern() {
+        assert!(
+            is_host_allowed("ad.example.com", "*.EXAMPLE.COM"),
+            "should match uppercase pattern"
+        );
+    }
+
+    // --- redirect allowlist enforcement (logic tests via is_host_allowed) ---
+
+    #[test]
+    fn redirect_allowed_exact() {
+        let allowed = ["ad.example.com".to_string()];
+        assert!(
+            allowed.iter().any(|p| is_host_allowed("ad.example.com", p)),
+            "should permit exact-match host"
+        );
+    }
+
+    #[test]
+    fn redirect_allowed_wildcard() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            allowed
+                .iter()
+                .any(|p| is_host_allowed("sub.example.com", p)),
+            "should permit wildcard-matched host"
+        );
+    }
+
+    #[test]
+    fn redirect_blocked() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            !allowed.iter().any(|p| is_host_allowed("evil.com", p)),
+            "should block host not in allowlist"
+        );
+    }
+
+    #[test]
+    fn redirect_empty_allowlist_permits_any() {
+        // The guard at proxy_with_redirects checks `!allowed_domains.is_empty()`
+        // before calling is_host_allowed, so no host is ever blocked when the
+        // list is empty. Verify the combined condition is false for any host.
+        let allowed: [String; 0] = [];
+        let would_block =
+            !allowed.is_empty() && !allowed.iter().any(|p| is_host_allowed("evil.com", p));
+        assert!(
+            !would_block,
+            "empty allowlist should not block any redirect host"
+        );
+    }
+
+    #[test]
+    fn redirect_bypass_attempt() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            !allowed
+                .iter()
+                .any(|p| is_host_allowed("evil-example.com", p)),
+            "should block dot-boundary bypass attempt"
         );
     }
 }
