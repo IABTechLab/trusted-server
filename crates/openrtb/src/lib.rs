@@ -47,7 +47,12 @@ pub mod bool_as_int {
             Some(serde_json::Value::String(ref s)) => match s.as_str() {
                 "1" | "true" => Ok(Some(true)),
                 "0" | "false" => Ok(Some(false)),
-                _ => Ok(None),
+                other => {
+                    log::warn!(
+                        "bool_as_int: unrecognized string value \"{other}\", treating as None"
+                    );
+                    Ok(None)
+                }
             },
             _ => Ok(None),
         }
@@ -197,6 +202,10 @@ mod tests {
         assert_eq!(
             serialized["regs"]["gpp_sid"], payload["regs"]["gpp_sid"],
             "should preserve regs.gpp_sid"
+        );
+        assert_eq!(
+            serialized["regs"]["gdpr"], payload["regs"]["gdpr"],
+            "should preserve regs.gdpr"
         );
         assert_eq!(
             serialized["acat"], payload["acat"],

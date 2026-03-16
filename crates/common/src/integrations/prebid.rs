@@ -364,7 +364,10 @@ impl IntegrationHeadInjector for PrebidIntegration {
 
         // Escape `</` to prevent breaking out of the script tag.
         let config_json = serde_json::to_string(&payload)
-            .unwrap_or_else(|_| "{}".to_string())
+            .unwrap_or_else(|e| {
+                log::warn!("Prebid: failed to serialize client config: {e}");
+                "{}".to_string()
+            })
             .replace("</", "<\\/");
 
         vec![format!(
@@ -693,28 +696,46 @@ impl PrebidAuctionProvider {
         // Forwarding the real client IP is critical: without it PBS infers the
         // IP from the incoming connection (a data-center / edge IP), causing
         // bidders like PubMatic to filter the traffic as non-human.
-        let device = request.device.as_ref().map(|d| Device {
-            ua: d.user_agent.clone(),
-            ip: d.ip.clone(),
-            geo: d.geo.as_ref().map(|geo| Geo {
-                country: Some(geo.country.clone()),
-                city: Some(geo.city.clone()),
-                region: geo.region.clone(),
-                lat: Some(geo.latitude),
-                lon: Some(geo.longitude),
-                // DMA/metro code: convert i64 to string for OpenRTB
-                metro: if geo.metro_code > 0 {
-                    Some(geo.metro_code.to_string())
+        //
+        // When `request.device` is `None` we still construct a minimal `Device`
+        // if DNT or language were extracted from HTTP headers, so those signals
+        // are never silently discarded.
+        let device = request
+            .device
+            .as_ref()
+            .map(|d| Device {
+                ua: d.user_agent.clone(),
+                ip: d.ip.clone(),
+                geo: d.geo.as_ref().map(|geo| Geo {
+                    country: Some(geo.country.clone()),
+                    city: Some(geo.city.clone()),
+                    region: geo.region.clone(),
+                    lat: Some(geo.latitude),
+                    lon: Some(geo.longitude),
+                    // DMA/metro code: convert i64 to string for OpenRTB
+                    metro: if geo.metro_code > 0 {
+                        Some(geo.metro_code.to_string())
+                    } else {
+                        None
+                    },
+                    r#type: Some(2),
+                    ..Default::default()
+                }),
+                dnt,
+                language: language.clone(),
+                ..Default::default()
+            })
+            .or_else(|| {
+                if dnt.is_some() || language.is_some() {
+                    Some(Device {
+                        dnt,
+                        language,
+                        ..Default::default()
+                    })
                 } else {
                     None
-                },
-                r#type: Some(2),
-                ..Default::default()
-            }),
-            dnt,
-            language,
-            ..Default::default()
-        });
+                }
+            });
 
         // Build regs object.
         //
@@ -754,6 +775,11 @@ impl PrebidAuctionProvider {
             None
         };
 
+        // `us_privacy` is placed at the top-level `regs.us_privacy` field per
+        // OpenRTB 2.6. Prebid Server v2+ and all major SSP adapters read this
+        // location. The legacy `regs.ext.us_privacy` placement (USP 1.0) is
+        // not duplicated here — if an older adapter requires it, PBS will
+        // copy the value downstream.
         let regs = if gdpr.is_some() || us_privacy.is_some() {
             Some(Regs {
                 gdpr,
@@ -840,8 +866,17 @@ impl PrebidAuctionProvider {
 
                 if let Some(bid_array) = seatbid.get("bid").and_then(|v| v.as_array()) {
                     for bid_obj in bid_array {
-                        if let Ok(bid) = self.parse_bid(bid_obj, seat) {
-                            bids.push(bid);
+                        match self.parse_bid(bid_obj, seat) {
+                            Ok(bid) => bids.push(bid),
+                            Err(()) => {
+                                let impid = bid_obj
+                                    .get("impid")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("<missing>");
+                                log::warn!(
+                                    "Prebid: failed to parse bid from seat '{seat}' for imp '{impid}'"
+                                );
+                            }
                         }
                     }
                 }
@@ -924,11 +959,13 @@ impl PrebidAuctionProvider {
         let width = bid_obj
             .get("w")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(300) as u32;
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
         let height = bid_obj
             .get("h")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(250) as u32;
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
 
         let nurl = bid_obj
             .get("nurl")
@@ -1003,6 +1040,16 @@ impl AuctionProvider for PrebidAuctionProvider {
                 .as_ref()
                 .map(|(s, sig, params)| (s, sig.clone(), params)),
         );
+
+        // An empty `imp` array violates the OpenRTB spec and wastes a network
+        // round-trip. This can happen when all slots are non-Banner or all
+        // banner dimensions overflow `i32::MAX`.
+        if openrtb.imp.is_empty() {
+            log::info!("Prebid: skipping request — no valid impressions after filtering");
+            return Err(Report::new(TrustedServerError::Prebid {
+                message: "No valid impressions after filtering".to_string(),
+            }));
+        }
 
         // Log the outgoing OpenRTB request for debugging.
         if log::log_enabled!(log::Level::Debug) {

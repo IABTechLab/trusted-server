@@ -1,22 +1,16 @@
 # trusted-server-openrtb
 
-OpenRTB 2.6 data model generated from the [IAB Tech Lab protobuf schema](https://github.com/nicoboss/openrtb/blob/master/proto/openrtb.proto). Types are used exclusively with JSON serde — protobuf binary encoding is stripped at build time.
-
-## Build dependency
-
-This crate requires `protoc` at compile time (invoked by `prost-build`):
-
-```sh
-# macOS
-brew install protobuf
-
-# Debian / Ubuntu
-apt install protobuf-compiler
-```
+OpenRTB 2.6 data model generated from the [IAB Tech Lab protobuf schema](https://github.com/nicoboss/openrtb/blob/master/proto/openrtb.proto). Types are used exclusively with JSON serde — protobuf binary encoding is stripped during code generation.
 
 ## How types are generated
 
-The `build.rs` pipeline has three phases:
+Generated code is checked into `src/generated.rs` so the crate has **no build-time dependency on `protoc`**. To regenerate after proto changes, use the separate `openrtb-codegen` crate:
+
+```sh
+cd crates/openrtb-codegen && ./generate.sh
+```
+
+The `generate.sh` / `openrtb-codegen` pipeline has three phases:
 
 1. **Proto compilation** — `prost-build` compiles `proto/openrtb.proto` into Rust structs.
 2. **Strip protobuf concerns** — `prost::Message` derives and `#[prost(...)]` attributes are removed since we only use JSON encoding.
@@ -24,7 +18,7 @@ The `build.rs` pipeline has three phases:
 
 ### Proto modifications from upstream
 
-The IAB proto uses `edition = "2023"` which generates non-optional scalars. The local copy converts to `proto2` with explicit `optional` on every field so prost generates `Option<T>`, matching OpenRTB's "omit if not set" semantics. `Ext` messages are removed from the proto and re-injected by the build script as `Option<serde_json::Map>`. See the header comment in `proto/openrtb.proto` for the full list of changes.
+The IAB proto uses `edition = "2023"` which generates non-optional scalars. The local copy converts to `proto2` with explicit `optional` on every field so prost generates `Option<T>`, matching OpenRTB's "omit if not set" semantics. `Ext` messages are removed from the proto and re-injected by the codegen postprocessor as `Option<serde_json::Map>`. See the header comment in `proto/openrtb.proto` for the full list of changes.
 
 ## Crate API
 
@@ -40,7 +34,7 @@ Serde helper module that transparently converts `Option<bool>` to/from `0`/`1` i
 
 ### `ToExt`
 
-Trait for converting any `Serialize` type into an `Option<Map<String, Value>>` suitable for an `ext` field. Returns `None` for empty maps so `ext` is omitted from JSON output rather than serialized as `"ext": {}`.
+Trait for converting a `Serialize` type into an `Option<Map<String, Value>>` suitable for an `ext` field. Returns `None` for empty maps so `ext` is omitted from JSON output rather than serialized as `"ext": {}`. Only implemented on specific ext structs (not a blanket impl).
 
 ```rust
 use trusted_server_openrtb::ToExt;
