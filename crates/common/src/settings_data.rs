@@ -53,8 +53,14 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     /// Builds a TOML string with the given secret values swapped in.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replacement patterns no longer match the test TOML,
+    /// which would cause the substitution to silently no-op.
     fn toml_with_secrets(secret_key: &str, proxy_secret: &str) -> String {
-        crate_test_settings_str()
+        let original = crate_test_settings_str();
+        let result = original
             .replace(
                 r#"secret_key = "test-secret-key""#,
                 &format!(r#"secret_key = "{secret_key}""#),
@@ -62,7 +68,12 @@ mod tests {
             .replace(
                 r#"proxy_secret = "unit-test-proxy-secret""#,
                 &format!(r#"proxy_secret = "{proxy_secret}""#),
-            )
+            );
+        assert_ne!(
+            result, original,
+            "should have replaced at least one secret value"
+        );
+        result
     }
 
     #[test]
@@ -123,5 +134,21 @@ mod tests {
         settings
             .reject_placeholder_secrets()
             .expect("non-placeholder secrets should pass validation");
+    }
+
+    /// Smoke-test the full `get_settings()` pipeline (embedded bytes → UTF-8 →
+    /// parse → validate → placeholder check).  The build-time TOML ships with
+    /// placeholder secrets, so the expected outcome is an [`InsecureDefault`]
+    /// error — but reaching that error proves every earlier stage succeeded.
+    #[test]
+    fn get_settings_rejects_embedded_placeholder_secrets() {
+        let err = super::get_settings().expect_err("should reject embedded placeholder secrets");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::InsecureDefault { .. }
+            ),
+            "should fail with InsecureDefault, got: {err}"
+        );
     }
 }

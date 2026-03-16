@@ -31,10 +31,13 @@ impl Publisher {
     /// Known placeholder values that must not be used in production.
     pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
 
-    /// Returns `true` if `proxy_secret` matches a known placeholder value.
+    /// Returns `true` if `proxy_secret` matches a known placeholder value
+    /// (case-insensitive).
     #[must_use]
     pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
-        Self::PROXY_SECRET_PLACEHOLDERS.contains(&proxy_secret)
+        Self::PROXY_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(proxy_secret))
     }
 
     /// Extracts the host (including port if present) from the `origin_url`.
@@ -200,10 +203,13 @@ impl Synthetic {
     /// Known placeholder values that must not be used in production.
     pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
 
-    /// Returns `true` if `secret_key` matches a known placeholder value.
+    /// Returns `true` if `secret_key` matches a known placeholder value
+    /// (case-insensitive).
     #[must_use]
     pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
-        Self::SECRET_KEY_PLACEHOLDERS.contains(&secret_key)
+        Self::SECRET_KEY_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(secret_key))
     }
 }
 
@@ -389,7 +395,7 @@ impl Settings {
     }
 
     /// Checks all secret fields for known placeholder values and returns an
-    /// error listing every offending field.  This centralises the placeholder
+    /// error listing every offending field. This centralises the placeholder
     /// policy so callers don't need to know which fields are secrets.
     ///
     /// # Errors
