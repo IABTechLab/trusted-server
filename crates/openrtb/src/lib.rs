@@ -1,8 +1,9 @@
 //! `OpenRTB` 2.6 request and response data model.
 //!
 //! Types are generated from the IAB `OpenRTB` proto file via `prost-build`, then
-//! post-processed to add serde JSON support and `ext` fields. See `build.rs`
-//! for the generation pipeline.
+//! post-processed to add serde JSON support and `ext` fields. See
+//! `crates/openrtb/generate.sh` and the `openrtb-codegen` crate for the
+//! generation pipeline.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -130,7 +131,7 @@ pub use generated::bid_request::eid::Uid;
 pub use generated::bid_response::{Bid, SeatBid};
 
 // Codegen module — included here only for testing; the same source is
-// `include!`'d by build.rs for the actual code generation.
+// `include!`'d by `openrtb-codegen/src/main.rs` for the actual code generation.
 #[cfg(test)]
 mod codegen;
 

@@ -38,7 +38,6 @@ const EXT_STRUCTS: &[&str] = &[
     "BidResponse",
     "SeatBid",
     "Bid",
-    "Transparency",
 ];
 
 /// Post-process prost-generated Rust code.

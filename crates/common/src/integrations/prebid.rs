@@ -712,7 +712,10 @@ impl PrebidAuctionProvider {
                     region: geo.region.clone(),
                     lat: Some(geo.latitude),
                     lon: Some(geo.longitude),
-                    // DMA/metro code: convert i64 to string for OpenRTB
+                    // DMA/metro code: convert i64 to string for OpenRTB.
+                    // Fastly returns 0 for "no metro code"; negative values
+                    // are not realistic for DMA codes so the > 0 guard is
+                    // sufficient.
                     metro: if geo.metro_code > 0 {
                         Some(geo.metro_code.to_string())
                     } else {
@@ -722,6 +725,8 @@ impl PrebidAuctionProvider {
                     ..Default::default()
                 }),
                 dnt,
+                // Clone needed: `language` is also used in the `or_else`
+                // fallback below when `request.device` is `None`.
                 language: language.clone(),
                 ..Default::default()
             })
