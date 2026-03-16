@@ -1,6 +1,6 @@
 import { log } from '../../core/log';
 
-import { installNextJsGuard } from './nextjs_guard';
+import { installLockrGuard } from './script_guard';
 
 // Type definition for Lockr global
 declare const identityLockr: IdentityLockr | undefined;
@@ -101,7 +101,7 @@ function waitForLockrSDK(callback: () => void, maxAttempts = 50) {
 }
 
 if (typeof window !== 'undefined') {
-  installNextJsGuard();
+  installLockrGuard();
 
   waitForLockrSDK(() => installLockrShim());
 }

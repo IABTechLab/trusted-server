@@ -13,9 +13,9 @@ import {
   resetGuardState as resetGtmGuardState,
 } from '../../src/integrations/google_tag_manager/script_guard';
 import {
-  installNextJsGuard,
+  installLockrGuard,
   resetGuardState as resetLockrGuardState,
-} from '../../src/integrations/lockr/nextjs_guard';
+} from '../../src/integrations/lockr/script_guard';
 import {
   installPermutiveGuard,
   resetGuardState as resetPermutiveGuardState,
@@ -54,7 +54,7 @@ describe('DOM insertion dispatcher', () => {
   });
 
   it('installs a single shared prototype patch across integrations', () => {
-    installNextJsGuard();
+    installLockrGuard();
 
     const sharedAppendChild = Element.prototype.appendChild;
     const sharedInsertBefore = Element.prototype.insertBefore;
