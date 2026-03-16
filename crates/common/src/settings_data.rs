@@ -60,18 +60,21 @@ mod tests {
     /// which would cause the substitution to silently no-op.
     fn toml_with_secrets(secret_key: &str, proxy_secret: &str) -> String {
         let original = crate_test_settings_str();
-        let result = original
-            .replace(
-                r#"secret_key = "test-secret-key""#,
-                &format!(r#"secret_key = "{secret_key}""#),
-            )
-            .replace(
-                r#"proxy_secret = "unit-test-proxy-secret""#,
-                &format!(r#"proxy_secret = "{proxy_secret}""#),
-            );
+        let after_secret_key = original.replace(
+            r#"secret_key = "test-secret-key""#,
+            &format!(r#"secret_key = "{secret_key}""#),
+        );
         assert_ne!(
-            result, original,
-            "should have replaced at least one secret value"
+            after_secret_key, original,
+            "should have replaced secret_key value"
+        );
+        let result = after_secret_key.replace(
+            r#"proxy_secret = "unit-test-proxy-secret""#,
+            &format!(r#"proxy_secret = "{proxy_secret}""#),
+        );
+        assert_ne!(
+            result, after_secret_key,
+            "should have replaced proxy_secret value"
         );
         result
     }

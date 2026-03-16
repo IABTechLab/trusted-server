@@ -723,6 +723,18 @@ mod tests {
     }
 
     #[test]
+    fn is_placeholder_secret_key_is_case_insensitive() {
+        assert!(
+            Synthetic::is_placeholder_secret_key("SECRET-KEY"),
+            "should detect case-insensitive placeholder secret_key"
+        );
+        assert!(
+            Synthetic::is_placeholder_secret_key("Trusted-Server"),
+            "should detect mixed-case placeholder secret_key"
+        );
+    }
+
+    #[test]
     fn is_placeholder_secret_key_accepts_non_placeholder() {
         assert!(
             !Synthetic::is_placeholder_secret_key("test-secret-key"),
@@ -738,6 +750,14 @@ mod tests {
                 "should detect placeholder proxy_secret '{placeholder}'"
             );
         }
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_is_case_insensitive() {
+        assert!(
+            Publisher::is_placeholder_proxy_secret("CHANGE-ME-PROXY-SECRET"),
+            "should detect case-insensitive placeholder proxy_secret"
+        );
     }
 
     #[test]
