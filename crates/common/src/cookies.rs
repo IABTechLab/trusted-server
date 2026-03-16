@@ -61,12 +61,27 @@ pub fn handle_request_cookies(
 
 /// Creates a synthetic ID cookie string.
 ///
-/// Generates a properly formatted cookie with security attributes
-/// for storing the synthetic ID.
+/// Generates a `Set-Cookie` header value with the following security attributes:
+/// - `Secure`: transmitted over HTTPS only.
+/// - `HttpOnly`: inaccessible to JavaScript (`document.cookie`), blocking XSS exfiltration.
+///   Safe to set because integrations receive the synthetic ID via the `x-synthetic-id`
+///   response header instead of reading it from the cookie directly.
+/// - `SameSite=Lax`: sent on same-site requests and top-level cross-site navigations.
+///   `Strict` is intentionally avoided — it would suppress the cookie on the first
+///   request when a user arrives from an external page, breaking first-visit attribution.
+/// - `Max-Age`: 1 year retention.
 #[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
+    debug_assert!(
+        !synthetic_id.contains([';', '=', '\n', '\r']),
+        "synthetic_id value should not contain cookie metacharacters"
+    );
+    debug_assert!(
+        !settings.publisher.cookie_domain.contains([';', '\n', '\r']),
+        "cookie_domain should not contain cookie metacharacters"
+    );
     format!(
-        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        "{}={}; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
         COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
     )
 }
@@ -174,7 +189,7 @@ mod tests {
         assert_eq!(
             result,
             format!(
-                "{}=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                "{}=12345; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
                 COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
             )
         );
