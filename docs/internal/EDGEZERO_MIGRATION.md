@@ -94,7 +94,7 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 | `fastly::Request` / `Response`         | All (~28 files)                                     | Ready (`http` crate types)                                                                                                                                                               |
 | `fastly::Body`                         | publisher, proxy, integrations                      | Ready (`edgezero_core::Body`)                                                                                                                                                            |
 | `fastly::backend::Backend` (dynamic)   | backend.rs, all integrations                        | Backlog ([#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087))                                                        |
-| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists)                                                                                                                                                           |
+| `req.send()` / `req.send_async()`      | proxy.rs, all integrations                          | Partial (`ProxyClient` exists — needs generalization to `HttpClient`, see PR 2 notes)                                                                                                    |
 | `select(Vec<PendingRequest>)`          | auction/orchestrator.rs                             | Backlog ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148))                                                                                       |
 | `fastly::ConfigStore`                  | fastly_storage.rs                                   | In review ([#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058), PR [#209](https://github.com/stackpop/edgezero/pull/209)) |
 | `fastly::SecretStore`                  | fastly_storage.rs                                   | Backlog ([#59-67](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2059%2060%2061%2062%2063%2064%2065%2066%2067))                                                        |
@@ -449,6 +449,7 @@ graph TD
     subgraph "Phase 2: Layered Type Migration (sequential)"
         PR11["PR 11: Utility layer types + compatibility adapter"]
         PR12["PR 12: Handler layer types"]
+        PR12_5["PR 12.5: Thread RuntimeServices into integrations"]
         PR13["PR 13: Integration + provider layer types"]
     end
 
@@ -461,7 +462,8 @@ graph TD
     PR9 --> PR11
     PR10 --> PR11
     PR11 --> PR12
-    PR12 --> PR13
+    PR12 --> PR12_5
+    PR12_5 --> PR13
 
     subgraph "Phase 3: Entry Point + Cleanup (sequential)"
         PR14["PR 14: Entry point switch"]
@@ -521,8 +523,9 @@ Changes:
   `cargo build --package trusted-server-adapter-fastly --target wasm32-wasip1`
   all pass
 
-Risk: Dependency conflicts between `fastly` crate and EdgeZero's re-export of
-the `http` crate — verify version compatibility.
+Verify: `http` crate version compatibility between `fastly = "0.11.12"` and
+EdgeZero — both use `http` 1.x, so this is expected compatible. Confirm
+during PR 1 implementation; no mitigation needed unless versions diverge.
 
 #### PR 2 — Define platform trait interfaces and RuntimeServices
 
@@ -631,6 +634,20 @@ Changes:
       (fetch). On Fastly wasm, the adapter wraps synchronous SDK calls
       in trivially-completing futures. This avoids runtime friction on
       async platforms without penalizing Fastly's synchronous model
+    - **Relationship to EdgeZero `ProxyClient`:** EdgeZero already has
+      `ProxyClient` with `send(ProxyRequest) -> Result<ProxyResponse>`.
+      `PlatformHttpClient` serves an overlapping purpose with a superset
+      API (sync send, async fan-out via `send_async` + `select`, backend
+      correlation, WASM-compatible). These must not coexist as parallel
+      abstractions. **Action:** File an EdgeZero issue to generalize
+      `ProxyClient` into an `HttpClient` trait that supports both
+      synchronous proxy-style sends and the async fan-out pattern.
+      `PlatformHttpClient`'s trait design should align with whatever the
+      generalized EdgeZero trait looks like. During Phase 1, the
+      trusted-server defines its own `PlatformHttpClient` backed by
+      Fastly SDK calls; when EdgeZero's generalized `HttpClient` lands,
+      swap to implementing that trait instead. Track this as an EdgeZero
+      backlog item blocking the final adapter swap-in for PR 6
   - `PlatformResponse` wraps `fastly::Response` (in Phase 1) with an
     optional `backend_name: Option<String>` for upstream correlation
     (maps to `get_backend_name()` on Fastly; `None` until EdgeZero #213
@@ -640,9 +657,24 @@ Changes:
     `PlatformResponse` switches to wrapping `http::Response` as part
     of the handler-layer type migration
   - `PlatformGeo` — `lookup(ip) -> Result<GeoInfo>`
-  - `PlatformClientInfo` — `client_ip(req) -> Option<IpAddr>`,
-    `tls_protocol(req) -> Option<String>`,
-    `tls_cipher(req) -> Option<String>`
+  - `ClientInfo` — a plain data struct, not a trait. Extracted once at the
+    entry point from the platform request (before dispatching to handlers)
+    and stored in `RuntimeServices`. Handlers read it from there — no
+    request parameter needed. This follows the existing `GeoInfo::from_request()`
+    pattern (extracted once in `route_request()`, passed through handlers):
+    ```rust
+    pub struct ClientInfo {
+        pub client_ip: Option<IpAddr>,
+        pub tls_protocol: Option<String>,
+        pub tls_cipher: Option<String>,
+    }
+    ```
+    Each adapter constructs `ClientInfo` from its platform request at the
+    entry point:
+    - **Fastly:** `req.get_client_ip_addr()`, `req.get_tls_protocol()`,
+      `req.get_tls_cipher_openssl_name()`
+    - **Cloudflare:** `CF-Connecting-IP` header, `cf` object TLS fields
+    - **Axum:** connection info, `X-Forwarded-For` header
   - Store write methods exist so core signing code can do key rotation
     without a signing-specific trait. Each adapter implements full CRUD
     for its platform (Fastly: reads via runtime SDK, writes via management
@@ -656,7 +688,7 @@ Changes:
       pub backend: Box<dyn PlatformBackend + Send + Sync>,
       pub http_client: Box<dyn PlatformHttpClient + Send + Sync>,
       pub geo: Box<dyn PlatformGeo + Send + Sync>,
-      pub client_info: Box<dyn PlatformClientInfo + Send + Sync>,
+      pub client_info: ClientInfo,
   }
   ```
 - `RuntimeServices` is constructed in the entry point and threaded through
@@ -866,6 +898,11 @@ Changes:
   each integration. Plan review time accordingly.
 - This is the largest Phase 1 PR — consider splitting backend and HTTP client
   if review size is a concern
+- **EdgeZero dependency:** Before this PR merges, file an EdgeZero issue to
+  generalize `ProxyClient` into an `HttpClient` trait (see PR 2 notes on
+  the relationship). The trusted-server `PlatformHttpClient` Fastly impl
+  works independently until the generalized EdgeZero trait lands, at which
+  point the Fastly impl swaps to implementing the EdgeZero trait
 - Update tests
 
 #### PR 7 — Extract geo lookup and client info behind traits
@@ -878,15 +915,27 @@ Changes:
 Changes:
 
 - Implement `PlatformGeo` for Fastly using `fastly::geo::geo_lookup()`
-- Implement `PlatformClientInfo` for Fastly using
-  `req.get_client_ip_addr()`, `req.get_tls_protocol()`,
-  `req.get_tls_cipher_openssl_name()`
-- Replace direct geo/client-info calls in core with calls through
+- Populate `ClientInfo` struct from the Fastly request at the entry point
+  (`req.get_client_ip_addr()`, `req.get_tls_protocol()`,
+  `req.get_tls_cipher_openssl_name()`) and store it in `RuntimeServices`.
+  This follows the extract-once-at-entry pattern — `ClientInfo` is a plain
+  data struct, not a trait (see PR 2). Handlers read
+  `RuntimeServices::client_info` instead of calling Fastly SDK methods on
+  the request. This eliminates redundant per-call-site extraction (currently
+  `get_client_ip_addr()` is called 4+ times in the auction flow alone)
+- Replace direct geo/client-info calls in core with reads from
   `RuntimeServices::geo` and `RuntimeServices::client_info`
 - Update `integrations/didomi.rs` — calls `original_req.get_client_ip_addr()`
-  directly (line 106); switch to `RuntimeServices::client_info`
+  directly (line 106); switch to `services.client_info.client_ip`
 - Update `auction/formats.rs` — calls `req.get_client_ip_addr()` directly
-  (line 134); switch to `RuntimeServices::client_info`
+  (line 134); switch to `services.client_info.client_ip`
+- Update `http_util.rs` `detect_request_scheme()` — calls
+  `req.get_tls_protocol()` and `req.get_tls_cipher_openssl_name()` (lines
+  134, 140); switch to `services.client_info.tls_protocol` /
+  `services.client_info.tls_cipher`
+- Update `synthetic.rs` `generate_synthetic_id()` — calls
+  `req.get_client_ip_addr()` (line 71); switch to
+  `services.client_info.client_ip`
 - Update tests
 
 #### PR 8 — Extract content rewriting behind trait
@@ -1063,7 +1112,10 @@ Changes:
   (or `PlatformResponse` where backend correlation is needed)
 - `PlatformResponse` now wraps `http::Response` (transition from
   `fastly::Response` wrapper completed in this PR — verify no
-  `.into_inner()` calls return `fastly::Response`)
+  `.into_inner()` calls return `fastly::Response`). **Expected churn:**
+  all existing `.into_inner()` call sites will break when the inner type
+  switches from `fastly::Response` to `http::Response` — the compiler
+  catches these, so enumerate and fix them as part of this PR's scope
 - `fastly` type usage remains in two places after this PR:
   1. Entry point conversion boundary in adapter crate (`fastly::Request` →
      `http::Request` at top, `http::Response` → `fastly::Response` at
@@ -1074,20 +1126,66 @@ Changes:
 - `compat.rs` shim surface area is reduced — only entry-point-level and
   integration-boundary conversions remain
 
-#### PR 13 — Migrate integration and provider layer types (all integrations)
+#### PR 12.5 — Thread RuntimeServices into integration and provider entry points
 
 **Blocked by:** PR 12
 **Files:**
 
 - Framework: `crates/trusted-server-core/src/integrations/registry.rs`,
   `crates/trusted-server-core/src/auction/provider.rs`,
-  `crates/trusted-server-core/src/auction/types.rs` (adds
-  `&RuntimeServices` to `AuctionContext`)
-- Callers (signature changes propagate here):
-  `crates/trusted-server-core/src/auction/orchestrator.rs` (calls
-  `request_bids`, `run_auction`),
-  `crates/trusted-server-adapter-fastly/src/main.rs` (calls
-  `handle_proxy`, threads `&RuntimeServices`)
+  `crates/trusted-server-core/src/auction/types.rs`
+- Callers: `crates/trusted-server-core/src/auction/orchestrator.rs`,
+  `crates/trusted-server-adapter-fastly/src/main.rs`
+- All 8 proxy integration modules + 2 test impls in `registry.rs`
+- All 3 auction provider implementations (`prebid.rs`, `aps.rs`,
+  `adserver_mock.rs`)
+
+**Purpose:** This is a pure signature-change PR that splits the
+"RuntimeServices plumbing" concern out of PR 13, halving PR 13's scope.
+It adds `&RuntimeServices` to integration and provider entry points
+**without changing any types** — Fastly types remain in place. This
+compiles independently because adding a parameter to trait methods +
+implementations is a mechanical change that the compiler enforces.
+
+Changes:
+
+- Add `services: &RuntimeServices` parameter to:
+  - `IntegrationProxy::handle(&self, settings, req)` →
+    `handle(&self, settings, services: &RuntimeServices, req)`
+  - `IntegrationRegistry::handle_proxy(method, path, settings, req)` →
+    `handle_proxy(method, path, settings, services: &RuntimeServices, req)`
+  - `AuctionContext` struct — add `pub services: &'a RuntimeServices`
+    field (it already holds `&Settings` and `&Request`; adding services
+    follows the same struct-based pattern)
+- Update all 8 production `IntegrationProxy` implementations to accept the
+  new parameter (implementations do not yet use `services` — they still call
+  Fastly SDK directly; usage migrates in PR 13)
+- Update 2 test impls in `registry.rs`
+- Update all 3 `AuctionProvider` implementations to receive `services` via
+  `AuctionContext` (not yet used — same rationale)
+- Thread `&RuntimeServices` from handler-layer callers:
+  - `proxy.rs` → `handle_proxy()`
+  - `auction/orchestrator.rs` → `run_auction()` / `run_providers_parallel()`
+  - `main.rs` → `route_request()` dispatch
+- No type changes, no behavior changes, no `send()` / `send_async()`
+  migration — purely additive parameter plumbing
+- Update tests to pass `RuntimeServices` through
+
+**Acceptance:**
+
+- All integration and provider trait methods accept `&RuntimeServices`
+- All callers thread `RuntimeServices` through
+- No Fastly type changes — `fastly::Request` / `fastly::Response` still
+  appear in integration and provider signatures
+- All per-PR build gates pass
+
+#### PR 13 — Migrate integration and provider layer types (all integrations)
+
+**Blocked by:** PR 12.5
+**Files:**
+
+- Framework: `crates/trusted-server-core/src/integrations/registry.rs`,
+  `crates/trusted-server-core/src/auction/provider.rs`
 - Proxy integrations: `lockr.rs`, `permutive.rs`, `didomi.rs`, `prebid.rs`,
   `datadome.rs`, `testlight.rs`, `google_tag_manager.rs`, `gpt.rs`
 - Provider-backed integrations: `aps.rs`, `adserver_mock.rs`, `prebid.rs`
@@ -1096,31 +1194,22 @@ Changes:
   (`mod.rs`, `rsc.rs`, `html_post_process.rs`, `script_rewriter.rs`,
   `shared.rs`, `rsc_placeholders.rs`) — note: there is no `nextjs.rs` file
 
+**Scope reduction from PR 12.5:** RuntimeServices plumbing is already done.
+This PR focuses on the two remaining concerns: (a) `fastly::Request/Response`
+→ `http` type migration across all 8+2 impls, and (b) `send()`/`send_async()`
+migration to `RuntimeServices::http_client`.
+
 Changes:
 
-- **Thread `RuntimeServices` through integration entry points** — current
-  signatures do not carry runtime services. Required signature changes:
-  - `IntegrationProxy::handle(&self, settings, req)` →
-    `handle(&self, settings, services: &RuntimeServices, req)`
-  - `IntegrationRegistry::handle_proxy(method, path, settings, req)` →
-    `handle_proxy(method, path, settings, services: &RuntimeServices, req)`
-  - `AuctionProvider::request_bids(&self, request, context)` — make
-    `async` and add `services: &RuntimeServices` to `AuctionContext`
-    (it already holds `&Settings` and `&Request`; adding services keeps
-    the struct-based pattern). Must be async because it calls
-    `services.http_client.send_async()` which is now an async method.
-    On Fastly, the async call completes trivially (wraps sync SDK);
-    on Axum/Cloudflare it is genuinely async
-  - All callers in handler layer (already migrated to `http` types in
-    PR 12) thread `&RuntimeServices` through — this is the same injection
-    pattern used for utility functions in Phase 1
 - Switch `IntegrationProxy` trait from `fastly::{Request, Response}` to `http`
   types — **all 8 production implementations must update in this PR** (plus
-  2 test impls in `registry.rs`)
+  2 test impls in `registry.rs`). `&RuntimeServices` parameter already
+  present from PR 12.5
 - Switch `AuctionProvider` trait from `fastly::Response` and
   `fastly::http::request::PendingRequest` to `http` / EdgeZero equivalents.
   `request_bids` becomes `async fn` (required because it calls
-  `PlatformHttpClient::send_async` which is async). `parse_response` takes
+  `services.http_client.send_async()` which is async — `services` already
+  available via `AuctionContext` from PR 12.5). `parse_response` takes
   `PlatformResponse` instead of `fastly::Response`. Implementations in
   `prebid.rs`, `aps.rs`, and `adserver_mock.rs` must also update
 - Switch `IntegrationRegistration` routing from `fastly::http::Method` to
@@ -1129,10 +1218,10 @@ Changes:
 - Each integration's proxy implementation updated to use `http` types
 - Switch `prebid.rs` from `fastly::http::Url` to `url::Url` (trivial — same
   underlying type, just a re-export)
-- Integration modules (`prebid.rs`, `aps.rs`, `adserver_mock.rs`) still call
-  Fastly `send()` / `send_async()` directly (deferred from PR 6 — see scope
-  boundary note). This PR migrates those calls to
-  `RuntimeServices::http_client` alongside the type migration
+- Integration modules (`prebid.rs`, `aps.rs`, `adserver_mock.rs`) now use
+  `services.http_client.send_async()` / `services.http_client.send()`
+  instead of Fastly SDK `send()` / `send_async()` directly (deferred from
+  PR 6 — see scope boundary note)
 - `nextjs` is a directory (`nextjs/mod.rs`, `rsc.rs`, `html_post_process.rs`,
   `script_rewriter.rs`, `shared.rs`, `rsc_placeholders.rs`) — only `mod.rs`
   has Fastly imports; submodules have zero Fastly dependencies and likely need
@@ -1140,27 +1229,24 @@ Changes:
 - JS module system unchanged (already abstracted)
 - `creative` has no Rust integration registration (JS-only integration), and
   the `creative.rs` utility module has no Fastly dependencies — no changes needed
-- This is the largest single PR — justified because `IntegrationProxy` and
-  `AuctionProvider` trait coupling makes splitting impossible
+- Still the largest PR in the migration, but significantly smaller than the
+  original PR 13 scope since RuntimeServices plumbing landed in PR 12.5
 - Update all integration and auction provider tests
 
 **Sub-slice acceptance checklist** (review each independently within the PR):
 
-1. **RuntimeServices plumbing** — `IntegrationProxy::handle`,
-   `IntegrationRegistry::handle_proxy`, and `AuctionContext` all carry
-   `&RuntimeServices`; all callers in handler layer thread it through
-2. **Trait signatures** — `IntegrationProxy` and `AuctionProvider` use `http`
+1. **Trait signatures** — `IntegrationProxy` and `AuctionProvider` use `http`
    types; `AuctionProvider::request_bids` is `async fn`;
    `AuctionProvider::parse_response` takes `PlatformResponse`;
    all 8 production + 2 test impls compile
-3. **send/send_async migration** — `prebid.rs`, `aps.rs`, `adserver_mock.rs`
-   call `RuntimeServices::http_client` instead of Fastly SDK; no direct
+2. **send/send_async migration** — `prebid.rs`, `aps.rs`, `adserver_mock.rs`
+   call `services.http_client` instead of Fastly SDK; no direct
    `fastly::Request::send` / `send_async` remains in any integration module
-4. **Routing types** — `IntegrationRegistration` and `route_request()` use
+3. **Routing types** — `IntegrationRegistration` and `route_request()` use
    `http::Method`; dispatch logic unchanged
-5. **NextJS verification** — confirm submodules (`rsc.rs`, `html_post_process.rs`,
+4. **NextJS verification** — confirm submodules (`rsc.rs`, `html_post_process.rs`,
    etc.) need zero changes; only `mod.rs` updated
-6. **Test parity** — every integration and auction provider test updated; no
+5. **Test parity** — every integration and auction provider test updated; no
    `fastly::*` test fixtures remain in integration test modules
 
 ---
@@ -1235,12 +1321,18 @@ Changes:
 
 - Remove `fastly` from `crates/trusted-server-core/Cargo.toml` dependencies
 - Remove `log-fastly` if not already removed in PR 10
+- Remove `tokio` from `crates/trusted-server-core/Cargo.toml` dependencies
+  (`tokio = { workspace = true }` on line 43). Core targeting
+  `wasm32-wasip1` and `wasm32-unknown-unknown` must not depend on tokio.
+  Audit test code that uses `#[tokio::test]` — replace with a
+  wasm-compatible test harness or move those tests to adapter crates
+  where tokio is available
 - Delete `compat.rs` (temporary compatibility adapter — no longer needed)
 - Verify no remaining `fastly_storage` references — PR 3 already split the
   file into `storage/` submodules; clean up any stale re-exports or module
   declarations
 - Verify `cargo build` — core now depends only on `edgezero-core` and
-  standard crates
+  standard crates (no `fastly`, no `log-fastly`, no `tokio`)
 - **This is the milestone PR** — after this, `crates/trusted-server-core` is fully
   platform-agnostic
 
@@ -1303,6 +1395,13 @@ Changes:
   `cargo build --package trusted-server-adapter-cloudflare --target wasm32-unknown-unknown`
   gate. The crate must remain host-compilable (use `cfg`-gated entrypoint
   shims where Workers-specific bindings are unavailable on native)
+- **`std::time::Instant` cleanup:** `auction/orchestrator.rs` uses
+  `std::time::Instant` (line 7) for deadline tracking. This works on
+  `wasm32-wasip1` (Fastly) via WASI clock support but **panics on
+  `wasm32-unknown-unknown`** (Cloudflare). Replace with `web-time::Instant`
+  (which EdgeZero already uses) or a similar cross-platform time crate.
+  Also audit `proxy.rs` for `std::time::SystemTime` usage (line 6).
+  Add `web-time` to workspace dependencies in this PR
 - Update `CLAUDE.md`: add Cloudflare build/deploy commands, update
   workspace layout
 - Update root `Cargo.toml` workspace members
@@ -1417,9 +1516,10 @@ but are critical to the migration sequencing.
 PRs 1-2 start immediately (no EdgeZero features needed). Phase 1 has a
 sequential chain — PR 3 → PR 4 → PR 9 — due to shared files
 (`fastly_storage.rs`, `request_signing/*`). PRs 6-8 and 10 run **in parallel**
-alongside this chain once PR 2 lands. Phase 2 (11-13) is sequential but each PR
-is focused. EdgeZero features do not block any Phase 0 or Phase 1 work; they are
-swapped in later.
+alongside this chain once PR 2 lands. Phase 2 (11-12.5-13) is sequential but
+each PR is focused — PR 12.5 is a pure RuntimeServices plumbing PR that splits
+the parameter-threading concern from PR 13's type migration. EdgeZero features
+do not block any Phase 0 or Phase 1 work; they are swapped in later.
 
 ```
 Week 1-2:   TS PRs 1-2 (crate rename + RuntimeServices traits)
@@ -1438,8 +1538,10 @@ Week 6-7:   TS PR 11 (utility layer type migration + compatibility adapter)
             EZ: Build Concurrent Fan-out ([#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)),
                 Content Rewriting ([#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117))
 
-Week 8:     TS PR 13 (integration + provider types, RuntimeServices
-            threading, send/send_async migration — largest PR)
+Week 8:     TS PR 12.5 (thread RuntimeServices into integration/provider
+            entry points — pure signature changes, no type migration)
+            TS PR 13 (integration + provider type migration,
+            send/send_async migration — largest PR, but reduced scope)
 
 Week 9:     TS PRs 14-15 (entry point switch, remove fastly from core
             + delete compatibility adapter)
@@ -1456,6 +1558,13 @@ Week 11:    Phase 5 verification
 > the sequential chain PR 3 → PR 4 → PR 9. PRs 6-8 and 10 are unaffected
 > (they depend only on PR 2). Build in 1 week buffer between phases for review
 > cycles and unexpected complexity.
+>
+> **Week 3-4 parallelism note:** PRs 3, 6, 7, 8, 10 all touch `main.rs` for
+> RuntimeServices wiring, and the entry-point merge rule (one author owns
+> `main.rs` changes per merge window) serializes them. The recommended merge
+> order — PR 6 first, then PRs 7, 8, 10 rebasing sequentially — means
+> PRs 7/8/10 may realistically slip to week 5 depending on review velocity.
+> Plan accordingly.
 
 ### EdgeZero Feature Tracker
 
@@ -1471,6 +1580,7 @@ implementations are swapped in when available — no application code changes.
 | P0       | Dynamic Backend       | [#79-87](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2079%2080%2081%2082%2083%2084%2085%2086%2087)                                         | Backlog                                                              | After PR 6    |
 | P0       | Client Info (IP, TLS) | [#88-92](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2088%2089%2090%2091%2092)                                                             | Backlog                                                              | After PR 7    |
 | P0       | Concurrent Fan-out    | [#147-148](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20147%20148)                                                                        | Backlog                                                              | After PR 6    |
+| P0       | ProxyClient → HttpClient generalization | TBD (file before PR 6 merges)                                                                                                            | Not filed — file to generalize `ProxyClient` into `HttpClient` supporting sync send + async fan-out | After PR 6    |
 | —        | Request-Signing Logic | N/A (core business logic)                                                                                                                                       | Uses store CRUD                                                      | PR 9          |
 | P1       | Content Rewriting     | [#114-117](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%20114%20115%20116%20117)                                                            | Backlog                                                              | After PR 8    |
 | P1       | Cookie Support        | [#93-95](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2093%2094%2095)                                                                       | Backlog                                                              | PR 11         |
@@ -1490,20 +1600,21 @@ are not actionable until ownership is resolved.
 | PR    | Title                                                    | Blocked by                          | DoD (Definition of Done)                                                                                                                                                                                                                                                                                                             | Owner | Labels                 | Milestone |
 | ----- | -------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- | ---------------------- | --------- |
 | PR 1  | Rename crates and add EdgeZero workspace dependencies    | —                                   | All per-PR gates pass; `cargo doc` builds; CLAUDE.md updated                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-0      | Phase 0   |
-| PR 2  | Define platform traits, PlatformError, RuntimeServices   | PR 1                                | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send                                                                                                                                                                                 | TBD   | edgezero, phase-0      | Phase 0   |
+| PR 2  | Define platform traits, ClientInfo, PlatformError, RuntimeServices | PR 1                          | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send; ClientInfo struct defined                                                                                                                                                        | TBD   | edgezero, phase-0      | Phase 0   |
 | PR 3  | Split fastly_storage.rs + config store trait (read-only) | PR 2                                | File split done; read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 4  | Secret store trait (read-only)                           | PR 3                                | Read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 5  | KV store trait                                           | PR 3                                | KV CRUD wired through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                                                             | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 6  | Backend + HTTP client traits                             | PR 2                                | PlatformResponse with backend_name; send/send_async abstracted; per-PR gates                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 7  | Geo lookup + client info traits                          | PR 2                                | client_ip, tls_protocol, tls_cipher wired; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
+| PR 7  | Geo lookup + client info (extract-once)                  | PR 2                                | ClientInfo populated at entry; geo/client-info reads go through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                    | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 8  | Content rewriting trait (or verification)                | PR 2                                | Platform-specific or agnostic outcome documented; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 9  | Wire signing to store write primitives                   | PR 4                                | api_client.rs deleted from core; management_api.rs in adapter; per-PR gates                                                                                                                                                                                                                                                          | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 10 | Abstract logging initialization                          | PR 2                                | log-fastly in adapter only; core uses log macros; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
 | PR 11 | Utility layer type migration + compat adapter            | PRs 3-10                            | Utilities use http types; compat.rs created; per-PR gates pass                                                                                                                                                                                                                                                                       | TBD   | edgezero, phase-2      | Phase 2   |
 | PR 12 | Handler layer type migration                             | PR 11                               | Handlers use http types; conversion boundary in adapter main.rs; per-PR gates                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-2      | Phase 2   |
-| PR 13 | Integration + provider layer types + RuntimeServices     | PR 12                               | All 6 sub-slice checks pass; async request_bids; per-PR gates pass                                                                                                                                                                                                                                                                   | TBD   | edgezero, phase-2      | Phase 2   |
+| PR 12.5 | Thread RuntimeServices into integrations/providers     | PR 12                               | All integration + provider traits accept &RuntimeServices; all callers thread it; no type changes; per-PR gates pass                                                                                                                                                                                                                 | TBD   | edgezero, phase-2      | Phase 2   |
+| PR 13 | Integration + provider layer type migration              | PR 12.5                             | All 5 sub-slice checks pass; async request_bids; send/send_async migrated; per-PR gates pass                                                                                                                                                                                                                                         | TBD   | edgezero, phase-2      | Phase 2   |
 | PR 14 | Fastly entry point switch (dual-path with flag)          | PR 13                               | Both paths compile; legacy cleanup issue filed; per-PR gates pass                                                                                                                                                                                                                                                                    | TBD   | edgezero, phase-3      | Phase 3   |
-| PR 15 | Remove fastly from core crate                            | PR 14                               | Core has zero fastly imports; compat.rs deleted; per-PR gates pass                                                                                                                                                                                                                                                                   | TBD   | edgezero, phase-3      | Phase 3   |
+| PR 15 | Remove fastly from core crate                            | PR 14                               | Core has zero fastly/tokio imports; compat.rs deleted; tokio removed from core Cargo.toml; per-PR gates pass                                                                                                                                                                                                                         | TBD   | edgezero, phase-3      | Phase 3   |
 | PR 16 | Axum dev server entry point                              | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; Axum CI jobs added; per-PR gates pass                                                                                                                                                                                                                              | TBD   | edgezero, phase-4      | Phase 4   |
 | PR 17 | Cloudflare entry point                                   | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; crate host-compilable (cfg-gated shims); Cloudflare CI jobs added (native + wasm32-unknown-unknown); per-PR gates pass                                                                                                                                             | TBD   | edgezero, phase-4      | Phase 4   |
 | —     | Phase 5: Verification gates                              | PRs 16-17                           | Route parity all routes; cross-adapter behavior (status/body/headers/cookies/signing); admin key routes (success/auth-fail/validation-fail/storage-fail); basic-auth parity (401, WWW-Authenticate, path matching); auction async fan-out + error-correlation; HTML golden tests; p95 latency + response size regression checks pass | TBD   | edgezero, phase-5      | Phase 5   |
