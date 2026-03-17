@@ -21,6 +21,11 @@
             key = "placeholder"
             data = "placeholder"
 
+    # These are generated test-only key pairs, not production credentials.
+    # The Ed25519 private key (data) and its matching public key (x in jwks_store below)
+    # exist solely for signing and verifying tokens in the integration test environment.
+    # They were generated specifically for testing and are safe to commit — they
+    # have never been used in any production or staging environment.
     [local_server.secret_stores]
         [[local_server.secret_stores.signing_keys]]
             key = "ts-2025-10-A"

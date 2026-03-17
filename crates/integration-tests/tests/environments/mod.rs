@@ -34,6 +34,16 @@ pub(crate) struct ReadyCheckOptions {
 /// Binds to port 0, which asks the OS to assign a random available port,
 /// then immediately closes the listener and returns the assigned port.
 ///
+/// # Known limitation — TOCTOU race
+///
+/// There is an inherent time-of-check/time-of-use (TOCTOU) race between
+/// closing the probe listener here and the caller binding the port. Another
+/// process can claim the port in that window. In practice the window is
+/// negligible — integration tests run with `--test-threads=1` and no other
+/// test process competes for ports — but a flake is theoretically possible
+/// on heavily loaded CI runners. If the spawn call returns an address-in-use
+/// error, the caller should retry with a freshly allocated port.
+///
 /// # Errors
 ///
 /// Returns [`TestError::NoPortAvailable`] if no port can be allocated.

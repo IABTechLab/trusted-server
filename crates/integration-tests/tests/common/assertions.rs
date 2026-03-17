@@ -7,6 +7,25 @@ fn parse_selector(selector: &str) -> TestResult<Selector> {
     Selector::parse(selector).map_err(|_| Report::new(TestError::InvalidSelector))
 }
 
+/// Extract the host (and port) from an absolute URL.
+///
+/// Strips the `http://` or `https://` scheme prefix and returns the
+/// `host:port` string used for URL matching in assertion helpers.
+///
+/// # Panics
+///
+/// Panics if `url` does not begin with `http://` or `https://`. This is a
+/// programming error — all proxy URLs passed to these assertion helpers must
+/// be absolute HTTP URLs (e.g. `"http://127.0.0.1:12345"`). A missing or
+/// unrecognized scheme indicates misconfigured test code, not a test
+/// assertion failure, so the panic surfaces the problem immediately rather
+/// than producing a confusing downstream assertion error.
+fn extract_host(url: &str) -> &str {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .expect("should have absolute URL with http:// or https:// scheme")
+}
+
 /// Assert that HTML contains the trustedserver-js script tag.
 ///
 /// Looks for `<script src="/static/tsjs=...">` injected by the trusted-server
@@ -74,10 +93,7 @@ pub fn assert_attributes_rewritten(
     let document = Html::parse_document(html);
 
     // Extract proxy host from base_url (e.g. "http://127.0.0.1:12345" -> "127.0.0.1:12345")
-    let proxy_host = proxy_base_url
-        .strip_prefix("http://")
-        .or_else(|| proxy_base_url.strip_prefix("https://"))
-        .unwrap_or(proxy_base_url);
+    let proxy_host = extract_host(proxy_base_url);
 
     // Check all elements with href or src attributes
     let all_selector = parse_selector("[href], [src]")?;
@@ -129,10 +145,7 @@ pub fn assert_ad_slot_urls_rewritten(
 ) -> TestResult<()> {
     let document = Html::parse_document(html);
 
-    let proxy_host = proxy_base_url
-        .strip_prefix("http://")
-        .or_else(|| proxy_base_url.strip_prefix("https://"))
-        .unwrap_or(proxy_base_url);
+    let proxy_host = extract_host(proxy_base_url);
 
     // Select elements with href/src that are descendants of [data-ad-unit]
     let ad_link_selector = parse_selector("[data-ad-unit] [href], [data-ad-unit] [src]")?;
@@ -223,10 +236,7 @@ pub fn assert_form_action_rewritten(
     let document = Html::parse_document(html);
     let selector = parse_selector(form_selector)?;
 
-    let proxy_host = proxy_base_url
-        .strip_prefix("http://")
-        .or_else(|| proxy_base_url.strip_prefix("https://"))
-        .unwrap_or(proxy_base_url);
+    let proxy_host = extract_host(proxy_base_url);
 
     let form = document.select(&selector).next().ok_or_else(|| {
         Report::new(TestError::AttributeNotRewritten)
@@ -260,6 +270,36 @@ pub fn assert_form_action_rewritten(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_host_strips_http_scheme() {
+        assert_eq!(
+            extract_host("http://127.0.0.1:9999"),
+            "127.0.0.1:9999",
+            "should strip http:// prefix"
+        );
+    }
+
+    #[test]
+    fn extract_host_strips_https_scheme() {
+        assert_eq!(
+            extract_host("https://example.com:443"),
+            "example.com:443",
+            "should strip https:// prefix"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "should have absolute URL with http:// or https:// scheme")]
+    fn extract_host_panics_on_relative_url() {
+        extract_host("127.0.0.1:9999");
+    }
+
+    #[test]
+    #[should_panic(expected = "should have absolute URL with http:// or https:// scheme")]
+    fn extract_host_panics_on_bare_host() {
+        extract_host("localhost");
+    }
 
     #[test]
     fn script_tag_present_with_unified_url() {

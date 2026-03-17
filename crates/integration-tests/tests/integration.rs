@@ -1,11 +1,5 @@
-// These modules are shared by ignored Docker-backed tests and unit tests
-// inside the same integration test target, so some items are intentionally
-// unused in a plain `cargo test` compile.
-#[allow(dead_code, unused_imports)]
 mod common;
-#[allow(dead_code, unused_imports)]
 mod environments;
-#[allow(dead_code, unused_imports)]
 mod frameworks;
 
 use common::runtime::{TestError, origin_port, wasm_binary_path};

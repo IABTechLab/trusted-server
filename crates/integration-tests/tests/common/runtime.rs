@@ -12,9 +12,13 @@ pub enum TestError {
     #[display("Runtime not ready after timeout")]
     RuntimeNotReady,
 
+    // Used by RuntimeProcessHandle::kill / wait, called only from Docker-backed tests.
+    #[allow(dead_code)]
     #[display("Failed to kill runtime process")]
     RuntimeKill,
 
+    // Paired with RuntimeKill — same reasoning above applies.
+    #[allow(dead_code)]
     #[display("Failed to wait for runtime process")]
     RuntimeWait,
 
@@ -60,13 +64,19 @@ pub type TestResult<T> = core::result::Result<T, Report<TestError>>;
 
 /// Platform-agnostic process handle
 pub struct RuntimeProcess {
+    // Held for its Drop impl — the handle kills the child process on cleanup.
+    #[allow(dead_code)]
     pub inner: Box<dyn RuntimeProcessHandle>,
     pub base_url: String,
 }
 
 /// Trait for runtime process lifecycle management
 pub trait RuntimeProcessHandle: Send + Sync {
+    // Defined for explicit process management; the current in-tree Drop impl
+    // calls the concrete child methods directly and does not go through this trait.
+    #[allow(dead_code)]
     fn kill(&mut self) -> TestResult<()>;
+    #[allow(dead_code)]
     fn wait(&mut self) -> TestResult<()>;
 }
 
@@ -94,6 +104,8 @@ pub trait RuntimeEnvironment: Send + Sync {
     }
 
     /// Platform-specific environment variables
+    // Provided for future runtime implementations; not yet called in-tree.
+    #[allow(dead_code)]
     fn env_vars(&self) -> HashMap<String, String> {
         HashMap::new()
     }

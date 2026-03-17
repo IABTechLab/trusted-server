@@ -125,18 +125,48 @@ export async function startViceroy(
 }
 
 /**
- * Kill a Viceroy process and wait for it to exit.
+ * Kill a Viceroy process and wait for it to fully exit.
  *
- * Sends SIGTERM and waits 500 ms for the process to release its port.
- * Without this delay, back-to-back framework runs can fail because the old
- * Viceroy process still holds the port when the next one tries to bind.
+ * Sends SIGTERM then polls with a zero-signal probe until the process is gone,
+ * escalating to SIGKILL if it has not exited within 5 seconds. Polling rather
+ * than a blind sleep avoids both premature port-reuse races (too short) and
+ * unnecessary CI delays (too long).
+ *
+ * `process.kill(pid, 0)` does not send a signal — it only checks whether the
+ * process exists. It throws `ESRCH` once the OS has reaped the process.
  */
 export async function stopViceroy(pid: number): Promise<void> {
   try {
     process.kill(pid, "SIGTERM");
-    // Wait for the OS to reclaim the port before the next run starts.
-    await setTimeoutPromise(500);
   } catch {
-    // Already exited
+    // Process already exited before we could signal it
+    return;
+  }
+
+  // Poll until the process exits or the 5-second deadline is reached.
+  const DEADLINE_MS = 5_000;
+  const POLL_INTERVAL_MS = 50;
+  const deadline = Date.now() + DEADLINE_MS;
+
+  while (Date.now() < deadline) {
+    await setTimeoutPromise(POLL_INTERVAL_MS);
+    try {
+      process.kill(pid, 0);
+      // Process is still alive — keep polling
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code === "ESRCH") {
+        // Process has exited and the port is released
+        return;
+      }
+      // EPERM or other unexpected error — do not treat as clean exit
+      throw err;
+    }
+  }
+
+  // SIGTERM did not finish within the deadline — escalate to SIGKILL
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Process exited between the last poll and the SIGKILL attempt
   }
 }

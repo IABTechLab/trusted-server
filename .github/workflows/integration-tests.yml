@@ -5,6 +5,7 @@ permissions:
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 env:
@@ -65,6 +66,7 @@ jobs:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
           TEST_FRAMEWORK: nextjs
+          PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
         run: npx playwright test
 
       - name: Upload Playwright report (Next.js)
@@ -72,7 +74,7 @@ jobs:
         if: always()
         with:
           name: playwright-report-nextjs
-          path: crates/integration-tests/browser/playwright-report/
+          path: crates/integration-tests/browser/playwright-report-nextjs/
           retention-days: 7
 
       - name: Run browser tests (WordPress)
@@ -83,6 +85,7 @@ jobs:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
           TEST_FRAMEWORK: wordpress
+          PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
         run: npx playwright test
 
       - name: Upload Playwright report (WordPress)
@@ -90,7 +93,7 @@ jobs:
         if: always()
         with:
           name: playwright-report-wordpress
-          path: crates/integration-tests/browser/playwright-report/
+          path: crates/integration-tests/browser/playwright-report-wordpress/
           retention-days: 7
 
       - name: Upload Playwright traces and screenshots
