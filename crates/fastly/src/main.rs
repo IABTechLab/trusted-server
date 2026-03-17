@@ -12,6 +12,7 @@ use trusted_server_common::constants::{
 };
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::geo::GeoInfo;
+use trusted_server_common::http_util::sanitize_forwarded_headers;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -64,8 +65,13 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Error> {
+    // Strip client-spoofable forwarded headers at the edge.
+    // On Fastly this service IS the first proxy — these headers from
+    // clients are untrusted and can hijack URL rewriting (see #409).
+    sanitize_forwarded_headers(&mut req);
+
     // Extract geo info before auth check or routing consumes the request
     let geo_info = GeoInfo::from_request(&req);
 
