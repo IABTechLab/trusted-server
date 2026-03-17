@@ -1,36 +1,53 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
-const { mockSetConfig, mockProcessQueue, mockRequestBids, mockRegisterBidAdapter, mockPbjs } =
-  vi.hoisted(() => {
-    const mockSetConfig = vi.fn();
-    const mockProcessQueue = vi.fn();
-    const mockRequestBids = vi.fn();
-    const mockRegisterBidAdapter = vi.fn();
-    const mockPbjs = {
-      setConfig: mockSetConfig,
-      processQueue: mockProcessQueue,
-      requestBids: mockRequestBids,
-      registerBidAdapter: mockRegisterBidAdapter,
-      adUnits: [] as any[],
-    };
-    return {
-      mockSetConfig,
-      mockProcessQueue,
-      mockRequestBids,
-      mockRegisterBidAdapter,
-      mockPbjs,
-    };
-  });
+const {
+  mockSetConfig,
+  mockProcessQueue,
+  mockRequestBids,
+  mockRegisterBidAdapter,
+  mockPbjs,
+  mockGetBidAdapter,
+  mockAdapterManager,
+} = vi.hoisted(() => {
+  const mockSetConfig = vi.fn();
+  const mockProcessQueue = vi.fn();
+  const mockRequestBids = vi.fn();
+  const mockRegisterBidAdapter = vi.fn();
+  const mockGetBidAdapter = vi.fn();
+  const mockPbjs = {
+    setConfig: mockSetConfig,
+    processQueue: mockProcessQueue,
+    requestBids: mockRequestBids,
+    registerBidAdapter: mockRegisterBidAdapter,
+    adUnits: [] as any[],
+  };
+  const mockAdapterManager = {
+    getBidAdapter: mockGetBidAdapter,
+  };
+  return {
+    mockSetConfig,
+    mockProcessQueue,
+    mockRequestBids,
+    mockRegisterBidAdapter,
+    mockPbjs,
+    mockGetBidAdapter,
+    mockAdapterManager,
+  };
+});
 
 // Mock prebid.js before importing the module under test.
 // The real prebid.js cannot run in jsdom, so we provide a minimal stub.
 vi.mock('prebid.js', () => ({ default: mockPbjs }));
+vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager }));
 
 // Side-effect imports are no-ops in tests
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
+
+// Mock the build-generated adapter imports (no-op in tests)
+vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
 
 import {
   collectBidders,
@@ -577,5 +594,209 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
 
     expect(mockSetConfig).toHaveBeenCalledWith(expect.objectContaining({ debug: false }));
     expect(mockProcessQueue).toHaveBeenCalled();
+  });
+});
+
+describe('prebid/client-side bidders', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.adUnits = [];
+    // By default, pretend all adapters are registered
+    mockGetBidAdapter.mockReturnValue({});
+    delete (window as any).__tsjs_prebid;
+  });
+
+  afterEach(() => {
+    delete (window as any).__tsjs_prebid;
+  });
+
+  it('excludes client-side bidders from trustedServer bidderParams', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 123 } },
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+          { bidder: 'kargo', params: { placementId: 'k1' } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+    expect(tsBid).toBeDefined();
+    // rubicon should NOT be in bidderParams — it runs client-side
+    expect(tsBid.params.bidderParams).toEqual({
+      appnexus: { placementId: 123 },
+      kargo: { placementId: 'k1' },
+    });
+  });
+
+  it('preserves client-side bidder bids as standalone entries', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 123 } },
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    // rubicon bid should remain untouched as a standalone entry
+    const rubiconBid = adUnits[0].bids.find((b: any) => b.bidder === 'rubicon') as any;
+    expect(rubiconBid).toBeDefined();
+    expect(rubiconBid.params).toEqual({ accountId: 'abc' });
+  });
+
+  it('handles multiple client-side bidders', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
+
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 123 } },
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+          { bidder: 'openx', params: { unit: '456' } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+    // Only appnexus should be in bidderParams
+    expect(tsBid.params.bidderParams).toEqual({
+      appnexus: { placementId: 123 },
+    });
+
+    // Both client-side bidders should remain
+    expect(adUnits[0].bids.find((b: any) => b.bidder === 'rubicon')).toBeDefined();
+    expect(adUnits[0].bids.find((b: any) => b.bidder === 'openx')).toBeDefined();
+  });
+
+  it('behaves normally when no client-side bidders are configured', () => {
+    // No __tsjs_prebid at all — all bidders go server-side
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 123 } },
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+    expect(tsBid.params.bidderParams).toEqual({
+      appnexus: { placementId: 123 },
+      rubicon: { accountId: 'abc' },
+    });
+  });
+
+  it('behaves normally when client-side bidders list is empty', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: [] };
+
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 123 } },
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+    expect(tsBid.params.bidderParams).toEqual({
+      appnexus: { placementId: 123 },
+      rubicon: { accountId: 'abc' },
+    });
+  });
+
+  it('still injects trustedServer when all bidders are client-side', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon', 'appnexus'] };
+
+    const pbjs = installPrebidNpm();
+
+    const adUnits = [
+      {
+        bids: [
+          { bidder: 'rubicon', params: { accountId: 'abc' } },
+          { bidder: 'appnexus', params: { placementId: 123 } },
+        ],
+      },
+    ];
+    pbjs.requestBids({ adUnits } as any);
+
+    // trustedServer should still be present (even with empty bidderParams)
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+    expect(tsBid).toBeDefined();
+    expect(tsBid.params.bidderParams).toEqual({});
+  });
+
+  it('logs error when a client-side bidder has no adapter loaded', () => {
+    // rubicon is registered, but openx is not
+    mockGetBidAdapter.mockImplementation((bidder: string) =>
+      bidder === 'rubicon' ? {} : undefined
+    );
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    // Should have been called to check both bidders
+    expect(mockGetBidAdapter).toHaveBeenCalledWith('rubicon');
+    expect(mockGetBidAdapter).toHaveBeenCalledWith('openx');
+
+    // Should log an error for the missing adapter.
+    // log.error() uses styled console output: console.error('%c[tsjs]%c ...:', style, reset, ...args)
+    // so the actual message is the 4th argument.
+    const errorCalls = errorSpy.mock.calls;
+    const hasOpenxError = errorCalls.some((args) =>
+      args.some(
+        (a) =>
+          typeof a === 'string' && a.includes('client-side bidder "openx" has no adapter loaded')
+      )
+    );
+    expect(hasOpenxError).toBe(true);
+
+    // Should NOT log an error for the registered adapter
+    const hasRubiconError = errorCalls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'))
+    );
+    expect(hasRubiconError).toBe(false);
+
+    errorSpy.mockRestore();
+  });
+
+  it('does not log errors when all client-side bidders have adapters', () => {
+    mockGetBidAdapter.mockReturnValue({});
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('has no adapter loaded'))
+    );
+    expect(hasAdapterError).toBe(false);
+
+    errorSpy.mockRestore();
   });
 });
