@@ -306,6 +306,23 @@ impl Default for Proxy {
     }
 }
 
+impl Proxy {
+    /// Normalizes [`allowed_domains`] in place.
+    ///
+    /// Each entry is trimmed of surrounding whitespace and lowercased.
+    /// Empty entries (including those that were only whitespace) are removed.
+    /// This prevents blank patterns from making the list non-empty while
+    /// still never matching any host, which would silently block all redirects.
+    fn normalize(&mut self) {
+        self.allowed_domains = self
+            .allowed_domains
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -341,10 +358,12 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let settings: Self =
+        let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
+
+        settings.proxy.normalize();
 
         Ok(settings)
     }
@@ -379,6 +398,7 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+        settings.proxy.normalize();
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
@@ -1179,6 +1199,106 @@ mod tests {
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
             "Empty allowed_context_keys should be respected (blocks all keys)"
+        );
+    }
+
+    // --- Proxy::normalize ---
+
+    #[test]
+    fn proxy_normalize_trims_and_lowercases() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![
+                "  AD.EXAMPLE.COM  ".to_string(),
+                "*.Example.Org".to_string(),
+            ],
+        };
+        proxy.normalize();
+        assert_eq!(
+            proxy.allowed_domains,
+            vec!["ad.example.com".to_string(), "*.example.org".to_string()],
+            "should trim and lowercase each entry"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_drops_empty_and_whitespace_entries() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![
+                "example.com".to_string(),
+                "   ".to_string(),
+                "".to_string(),
+                "cdn.example.com".to_string(),
+            ],
+        };
+        proxy.normalize();
+        assert_eq!(
+            proxy.allowed_domains,
+            vec!["example.com".to_string(), "cdn.example.com".to_string()],
+            "should drop blank and whitespace-only entries"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_all_blank_yields_empty_list() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec!["  ".to_string(), "\t".to_string()],
+        };
+        proxy.normalize();
+        assert!(
+            proxy.allowed_domains.is_empty(),
+            "all-blank list should normalize to empty (open mode)"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_applied_by_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+            allowed_domains = ["  AD.EXAMPLE.COM  ", "  ", "*.CDN.Example.Com"]
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
+        assert_eq!(
+            settings.proxy.allowed_domains,
+            vec![
+                "ad.example.com".to_string(),
+                "*.cdn.example.com".to_string()
+            ],
+            "from_toml should normalize allowed_domains"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_applied_by_from_toml_and_env() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+            allowed_domains = ["  AD.EXAMPLE.COM  ", "  ", "*.CDN.Example.Com"]
+            "#;
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                let settings =
+                    Settings::from_toml_and_env(&toml_str).expect("should parse TOML with env");
+                assert_eq!(
+                    settings.proxy.allowed_domains,
+                    vec![
+                        "ad.example.com".to_string(),
+                        "*.cdn.example.com".to_string()
+                    ],
+                    "from_toml_and_env should normalize allowed_domains"
+                );
+            },
         );
     }
 }

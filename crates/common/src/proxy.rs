@@ -460,6 +460,14 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
     }
 }
 
+/// Returns `true` when a redirect to `host` should be followed.
+///
+/// When `allowed_domains` is empty every host is permitted (open mode).
+/// When non-empty the host must match at least one pattern via [`is_host_allowed`].
+fn redirect_is_permitted(allowed_domains: &[String], host: &str) -> bool {
+    allowed_domains.is_empty() || allowed_domains.iter().any(|p| is_host_allowed(host, p))
+}
+
 /// Returns `true` if `host` is permitted by `pattern`.
 ///
 /// - `"example.com"` matches exactly `example.com`.
@@ -584,23 +592,15 @@ async fn proxy_with_redirects(
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
-        if !settings.proxy.allowed_domains.is_empty() {
-            let next_host = next_url.host_str().unwrap_or("");
-            let allowed = settings
-                .proxy
-                .allowed_domains
-                .iter()
-                .any(|p| is_host_allowed(next_host, p));
-
-            if !allowed {
-                log::warn!(
-                    "redirect to `{}` blocked: host not in proxy allowed_domains",
-                    next_host
-                );
-                return Err(Report::new(TrustedServerError::Proxy {
-                    message: format!("redirect to `{next_host}` is not permitted"),
-                }));
-            }
+        let next_host = next_url.host_str().unwrap_or("");
+        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+            log::warn!(
+                "redirect to `{}` blocked: host not in proxy allowed_domains",
+                next_host
+            );
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!("redirect to `{next_host}` is not permitted"),
+            }));
         }
 
         log::info!(
@@ -1127,7 +1127,8 @@ mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        reconstruct_and_validate_signed_target, ProxyRequestConfig, SUPPORTED_ENCODINGS,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
+        SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -1957,6 +1958,57 @@ mod tests {
                 .iter()
                 .any(|p| is_host_allowed("evil-example.com", p)),
             "should block dot-boundary bypass attempt"
+        );
+    }
+
+    // --- redirect_is_permitted (full guard: empty-list bypass + is_host_allowed) ---
+
+    #[test]
+    fn redirect_chain_allowed_when_host_matches_allowlist() {
+        let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
+        assert!(
+            redirect_is_permitted(&allowed, "ad.example.com"),
+            "should permit redirect to exact-match host"
+        );
+        assert!(
+            redirect_is_permitted(&allowed, "cdn.example.com"),
+            "should permit redirect to second allowed host"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_allowed_when_host_matches_wildcard() {
+        let allowed = vec!["*.example.com".to_string()];
+        assert!(
+            redirect_is_permitted(&allowed, "sub.example.com"),
+            "should permit redirect to wildcard-matched subdomain"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_blocked_when_host_not_in_allowlist() {
+        let allowed = vec!["ad.example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, "evil.com"),
+            "should block redirect to host not in allowlist"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_allowed_when_allowlist_is_empty() {
+        let allowed: Vec<String> = vec![];
+        assert!(
+            redirect_is_permitted(&allowed, "any-host.com"),
+            "should allow any redirect when allowlist is empty (open mode)"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_blocked_when_host_is_empty() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, ""),
+            "should block redirect with empty host when allowlist is non-empty"
         );
     }
 }
