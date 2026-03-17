@@ -1,12 +1,19 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
-use subtle::ConstantTimeEq;
+use subtle::ConstantTimeEq as _;
 
 use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
+/// Enforce HTTP Basic Authentication for paths that require credentials.
+///
+/// Returns `None` if the request is authorized (or the path has no handler),
+/// `Some(401 response)` otherwise. Uses constant-time comparison for both
+/// username and password, and evaluates both regardless of individual match
+/// results to prevent timing oracles.
+#[must_use]
 pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
     let handler = settings.handler_for_path(req.get_path())?;
 

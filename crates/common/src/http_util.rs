@@ -3,7 +3,7 @@ use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::settings::Settings;
@@ -286,10 +286,14 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 }
 
 /// Verify a `tstoken` for the given clear-text URL.
+///
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+/// Length is not secret (always 43 bytes for base64url-encoded SHA-256),
+/// but we check explicitly to document the invariant.
 #[must_use]
 pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
     let expected = sign_clear_url(settings, clear_url);
-    expected.as_bytes().ct_eq(token.as_bytes()).into()
+    expected.len() == token.len() && bool::from(expected.as_bytes().ct_eq(token.as_bytes()))
 }
 
 /// Compute tstoken for the new proxy scheme: SHA-256 of the encrypted full URL (including query).
