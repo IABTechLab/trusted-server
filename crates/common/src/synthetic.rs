@@ -439,6 +439,24 @@ mod tests {
     }
 
     #[test]
+    fn test_get_synthetic_id_header_takes_precedence_over_cookie() {
+        let cookie_id = "b2a1c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0b1a2.Zx98y7";
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
+            (
+                header::COOKIE,
+                &format!("{}={}", COOKIE_SYNTHETIC_ID, cookie_id),
+            ),
+        ]);
+        let result = get_synthetic_id(&req).expect("should succeed");
+        assert_eq!(
+            result,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should prefer header over cookie"
+        );
+    }
+
+    #[test]
     fn test_get_synthetic_id_none() {
         let req = create_test_request(vec![]);
         let synthetic_id = get_synthetic_id(&req).expect("should handle missing ID");
