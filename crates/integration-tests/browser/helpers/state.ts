@@ -11,6 +11,7 @@ export interface TestState {
 const KNOWN_FRAMEWORKS = ["nextjs", "wordpress"] as const;
 
 const STATE_FILE = resolve(__dirname, "../.browser-test-state.json");
+let cachedState: TestState | undefined;
 
 /** Read the state written by global-setup.ts. */
 export function readState(): TestState {
@@ -23,7 +24,12 @@ export function readState(): TestState {
   return state;
 }
 
+/** Read the state once and reuse it for the rest of the test process. */
+function getCachedState(): TestState {
+  return (cachedState ??= readState());
+}
+
 /** Resolve an absolute runtime URL from the current browser test state. */
 export function runtimeUrl(path: string): string {
-  return new URL(path, readState().baseUrl).toString();
+  return new URL(path, getCachedState().baseUrl).toString();
 }

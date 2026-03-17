@@ -1,8 +1,8 @@
 /**
  * Poll a URL until it returns a successful response.
  *
- * Mirrors the Rust `wait_for_ready` implementation in
- * `tests/environments/mod.rs` — 30 attempts with 500ms intervals.
+ * Uses the same timing as the Rust readiness polling: 30 attempts with
+ * 500ms intervals.
  */
 export async function waitForReady(
   baseUrl: string,

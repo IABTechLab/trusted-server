@@ -53,8 +53,9 @@ pub fn assert_script_tag_present(html: &str) -> TestResult<()> {
 ///
 /// # Errors
 ///
-/// Returns [`TestError::ScriptTagNotFound`] if zero or more than one matching
-/// script tag is found.
+/// Returns [`TestError::ScriptTagNotFound`] if no matching script tag is found.
+/// Returns [`TestError::DuplicateScriptTag`] if more than one matching script
+/// tag is found.
 pub fn assert_unique_script_tag(html: &str) -> TestResult<()> {
     let document = Html::parse_document(html);
     let selector = parse_selector("script#trustedserver-js[src*='/static/tsjs=']")?;
@@ -67,7 +68,7 @@ pub fn assert_unique_script_tag(html: &str) -> TestResult<()> {
     }
 
     if count > 1 {
-        return Err(Report::new(TestError::ScriptTagNotFound).attach(format!(
+        return Err(Report::new(TestError::DuplicateScriptTag).attach(format!(
             "Expected exactly 1 script#trustedserver-js, found {count}"
         )));
     }

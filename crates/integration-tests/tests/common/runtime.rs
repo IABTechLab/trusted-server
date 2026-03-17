@@ -12,16 +12,6 @@ pub enum TestError {
     #[display("Runtime not ready after timeout")]
     RuntimeNotReady,
 
-    // Used by RuntimeProcessHandle::kill / wait, called only from Docker-backed tests.
-    #[allow(dead_code)]
-    #[display("Failed to kill runtime process")]
-    RuntimeKill,
-
-    // Paired with RuntimeKill — same reasoning above applies.
-    #[allow(dead_code)]
-    #[display("Failed to wait for runtime process")]
-    RuntimeWait,
-
     // Container errors
     #[display("Container failed to start: {reason}")]
     ContainerStart { reason: String },
@@ -39,6 +29,9 @@ pub enum TestError {
     // Assertion errors
     #[display("Script tag not found in HTML")]
     ScriptTagNotFound,
+
+    #[display("Duplicate trustedserver-js script tags found in HTML")]
+    DuplicateScriptTag,
 
     #[display("Script tag was injected when it should not have been")]
     UnexpectedScriptInjection,
@@ -70,15 +63,11 @@ pub struct RuntimeProcess {
     pub base_url: String,
 }
 
-/// Trait for runtime process lifecycle management
-pub trait RuntimeProcessHandle: Send + Sync {
-    // Defined for explicit process management; the current in-tree Drop impl
-    // calls the concrete child methods directly and does not go through this trait.
-    #[allow(dead_code)]
-    fn kill(&mut self) -> TestResult<()>;
-    #[allow(dead_code)]
-    fn wait(&mut self) -> TestResult<()>;
-}
+/// Marker trait for type-erased runtime handles stored in [`RuntimeProcess`].
+///
+/// Concrete handle types own their cleanup through [`Drop`]; this trait exists
+/// so tests can hold platform-specific processes behind a single boxed type.
+pub trait RuntimeProcessHandle: Send + Sync {}
 
 /// Trait defining how to run the trusted-server on different platforms.
 ///
@@ -126,8 +115,10 @@ pub fn wasm_binary_path() -> PathBuf {
 /// This must match the port baked into the WASM binary via
 /// `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL` at build time.
 pub fn origin_port() -> u16 {
-    std::env::var("INTEGRATION_ORIGIN_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8888)
+    match std::env::var("INTEGRATION_ORIGIN_PORT") {
+        Ok(value) => value
+            .parse()
+            .expect("should parse INTEGRATION_ORIGIN_PORT as u16"),
+        Err(_) => 8888,
+    }
 }

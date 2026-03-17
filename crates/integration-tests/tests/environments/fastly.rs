@@ -51,16 +51,14 @@ impl RuntimeEnvironment for FastlyViceroy {
         let handle = ViceroyHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        super::wait_for_ready(&base_url, self.health_check_path())?;
+        // Fastly exposes a dedicated `/health` route, so root fallback only
+        // adds redundant requests while the runtime is still starting up.
+        super::wait_for_ready(&base_url, self.health_check_path(), false)?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
             base_url,
         })
-    }
-
-    fn health_check_path(&self) -> &str {
-        "/"
     }
 }
 
@@ -83,23 +81,7 @@ struct ViceroyHandle {
     child: Child,
 }
 
-impl RuntimeProcessHandle for ViceroyHandle {
-    fn kill(&mut self) -> TestResult<()> {
-        self.child
-            .kill()
-            .change_context(TestError::RuntimeKill)
-            .attach("Failed to kill viceroy process")?;
-        Ok(())
-    }
-
-    fn wait(&mut self) -> TestResult<()> {
-        self.child
-            .wait()
-            .change_context(TestError::RuntimeWait)
-            .attach("Failed to wait on viceroy process")?;
-        Ok(())
-    }
-}
+impl RuntimeProcessHandle for ViceroyHandle {}
 
 impl Drop for ViceroyHandle {
     fn drop(&mut self) {

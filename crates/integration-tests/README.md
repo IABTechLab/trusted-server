@@ -186,14 +186,14 @@ container can be bound to it at a time.
 Integration tests run in a separate workflow (`.github/workflows/integration-tests.yml`)
 triggered by:
 
-- Push to `main`
-- PR approval
+- Pull request opened, updated, or reopened
 - Manual dispatch
 
-Two jobs run in parallel:
+Three jobs run in sequence then parallel:
 
-1. **integration-tests** — HTTP-level tests (Rust + testcontainers)
-2. **browser-tests** — Playwright tests (Node.js + Chromium)
+1. **prepare-artifacts** — builds the WASM binary and Docker images once
+2. **integration-tests** — HTTP-level tests (Rust + testcontainers), runs after `prepare-artifacts`
+3. **browser-tests** — Playwright tests (Node.js + Chromium), runs after `prepare-artifacts` in parallel with `integration-tests`
 
 They are **not** part of `cargo test --workspace` because the integration-tests
 crate requires a native target while the workspace default is `wasm32-wasip1`.

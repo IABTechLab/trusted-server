@@ -62,19 +62,25 @@ pub fn find_available_port() -> TestResult<u16> {
 /// Poll a runtime's health endpoint until it responds with success.
 ///
 /// Retries up to 30 times with 500ms delay between attempts (total ~15s).
-/// Falls back to checking the root path if the health endpoint is not available.
+///
+/// # Arguments
+///
+/// * `base_url` - Runtime base URL, such as `http://127.0.0.1:7676`.
+/// * `health_path` - Path to poll for readiness, such as `/health`.
+/// * `fallback_to_root` - Whether a successful or 404 response from `/`
+///   should also count as ready when the dedicated health endpoint is absent.
 ///
 /// # Errors
 ///
 /// Returns [`TestError::RuntimeNotReady`] if the runtime does not respond within timeout.
-pub fn wait_for_ready(base_url: &str, health_path: &str) -> TestResult<()> {
+pub fn wait_for_ready(base_url: &str, health_path: &str, fallback_to_root: bool) -> TestResult<()> {
     wait_for_http_ready(
         base_url,
         health_path,
         ReadyCheckOptions {
             max_attempts: 30,
             interval: Duration::from_millis(500),
-            fallback_to_root: true,
+            fallback_to_root,
             timeout_error: TestError::RuntimeNotReady,
             timeout_message: format!("Runtime at {base_url} not ready after 15s"),
         },
@@ -105,6 +111,7 @@ pub(crate) fn wait_for_http_ready(
         }
 
         if options.fallback_to_root
+            && health_path != "/"
             && let Ok(resp) = reqwest::blocking::get(base_url)
             && (resp.status().is_success() || resp.status().as_u16() == 404)
         {
