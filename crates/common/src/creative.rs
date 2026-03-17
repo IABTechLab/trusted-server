@@ -330,7 +330,7 @@ fn is_safe_data_uri(lower: &str) -> bool {
 /// Strip dangerous elements and attributes from ad creative HTML.
 ///
 /// Removes elements that can execute code or exfiltrate data (`script`, `iframe`,
-/// `object`, `embed`, `base`, `meta`, `form`, `link`, `style`) and strips `on*` event-handler
+/// `object`, `embed`, `base`, `meta`, `form`, `link`, `style`, `noscript`) and strips `on*` event-handler
 /// attributes and dangerous URI schemes from all remaining elements:
 /// - `javascript:`, `vbscript:`
 /// - `data:` URIs except the safe raster image subtypes (`image/png`, `image/jpeg`,
@@ -400,6 +400,13 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                     el.remove();
                     Ok(())
                 }),
+                // <noscript> content is rendered by browsers when scripts are disabled,
+                // which is always the case inside a sandbox without allow-scripts.
+                // Strip it as defense-in-depth against parser differential attacks.
+                element!("noscript", |el| {
+                    el.remove();
+                    Ok(())
+                }),
                 // Strip event-handler attributes and dangerous URI scheme values from
                 // every element. Note: lol_html calls this handler for the opening tag of
                 // each element including those already marked for removal above (e.g.
@@ -445,6 +452,10 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                     // srcset is a comma-separated list of "url [descriptor]" entries.
                     // Check each URL individually so a dangerous URI anywhere in the list
                     // is caught, not just one at the start of the attribute string.
+                    // Intentionally fail-closed: if any entry is dangerous, the entire
+                    // srcset attribute is removed rather than filtering individual entries.
+                    // A mixed safe/dangerous srcset is a strong indicator of a malicious
+                    // creative, so dropping the whole attribute is the correct response.
                     if let Some(val) = el.get_attribute("srcset") {
                         let is_dangerous = val.split(',').any(|entry| {
                             let url = entry
