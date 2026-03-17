@@ -60,6 +60,7 @@ pub fn handle_request_cookies(
 }
 
 /// Returns `true` if every byte in `value` is a valid RFC 6265 `cookie-octet`.
+/// An empty string is always rejected.
 ///
 /// RFC 6265 restricts cookie values to printable US-ASCII excluding whitespace,
 /// double-quote, comma, semicolon, and backslash. Rejecting these characters
@@ -68,6 +69,7 @@ pub fn handle_request_cookies(
 ///
 /// Non-ASCII characters (multi-byte UTF-8) are always rejected because their
 /// byte values exceed `0x7E`.
+#[must_use]
 fn is_safe_cookie_value(value: &str) -> bool {
     // RFC 6265 §4.1.1 cookie-octet:
     //   0x21        — '!'
@@ -76,11 +78,13 @@ fn is_safe_cookie_value(value: &str) -> bool {
     //   0x3C–0x5B  — '<' through '['   (excludes 0x3B semicolon)
     //   0x5D–0x7E  — ']' through '~'   (excludes 0x5C backslash, 0x7F DEL)
     // All control characters (0x00–0x20) and non-ASCII (0x80+) are also excluded.
-    value
-        .bytes()
-        .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
 }
 
+/// Formats the `Set-Cookie` header value for the synthetic ID cookie.
 fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
     format!(
         "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
@@ -103,7 +107,8 @@ pub fn set_synthetic_cookie(
 ) {
     if !is_safe_cookie_value(synthetic_id) {
         log::warn!(
-            "Rejecting synthetic_id for Set-Cookie: contains characters illegal in a cookie value"
+            "Rejecting synthetic_id for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
+            synthetic_id.len()
         );
         return;
     }
@@ -250,6 +255,11 @@ mod tests {
             response.get_header(header::SET_COOKIE).is_none(),
             "Set-Cookie should not be set when value contains whitespace"
         );
+    }
+
+    #[test]
+    fn test_is_safe_cookie_value_rejects_empty_string() {
+        assert!(!is_safe_cookie_value(""), "should reject empty string");
     }
 
     #[test]
