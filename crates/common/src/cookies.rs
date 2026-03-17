@@ -70,19 +70,29 @@ pub fn handle_request_cookies(
 ///   `Strict` is intentionally avoided — it would suppress the cookie on the first
 ///   request when a user arrives from an external page, breaking first-visit attribution.
 /// - `Max-Age`: 1 year retention.
+///
+/// # Panics
+///
+/// Panics if `cookie_domain` in settings contains cookie metacharacters (`;`, `\n`, `\r`).
+/// This indicates a configuration error and is enforced in all build profiles.
 #[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
-    debug_assert!(
-        !synthetic_id.contains([';', '=', '\n', '\r']),
-        "synthetic_id value should not contain cookie metacharacters"
-    );
-    debug_assert!(
+    // Sanitize synthetic_id at runtime: strip cookie metacharacters to prevent
+    // header injection when the ID originates from untrusted input (e.g., the
+    // x-synthetic-id request header or an inbound cookie).
+    let safe_id: String = synthetic_id
+        .chars()
+        .filter(|c| !matches!(c, ';' | '=' | '\n' | '\r'))
+        .collect();
+    // `=` is excluded from the domain check: it only has special meaning in the
+    // name=value pair, not within an attribute like Domain.
+    assert!(
         !settings.publisher.cookie_domain.contains([';', '\n', '\r']),
         "cookie_domain should not contain cookie metacharacters"
     );
     format!(
         "{}={}; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
-        COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+        COOKIE_SYNTHETIC_ID, safe_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
     )
 }
 
@@ -192,6 +202,22 @@ mod tests {
                 "{}=12345; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
                 COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
             )
+        );
+    }
+
+    #[test]
+    fn test_create_synthetic_cookie_sanitizes_metacharacters_in_id() {
+        let settings = create_test_settings();
+        let result = create_synthetic_cookie(&settings, "evil;injected\r\nfoo=bar");
+        // Extract the value portion anchored to the cookie name constant to
+        // avoid false positives from metacharacters in cookie attributes.
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(
+            value, "evilinjectedfoobar",
+            "should strip metacharacters and preserve safe chars"
         );
     }
 
