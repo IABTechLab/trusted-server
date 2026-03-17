@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::sync::Arc;
 
 use error_stack::Report;
@@ -163,7 +162,6 @@ impl UrlRewriter {
         if origin_host.is_empty() || !input.contains(origin_host) {
             return None;
         }
-        let changed = Cell::new(false);
         let next_value = regex.replace_all(input, |caps: &regex::Captures<'_>| {
             let prefix = &caps["prefix"];
             let value = &caps["value"];
@@ -172,7 +170,6 @@ impl UrlRewriter {
             if let Some(new_url) =
                 self.rewrite_url_value(origin_host, value, request_host, request_scheme)
             {
-                changed.set(true);
                 format!("{prefix}{new_url}{quote}")
             } else {
                 caps.get(0)
@@ -182,7 +179,7 @@ impl UrlRewriter {
             }
         });
 
-        changed.get().then(|| next_value.into_owned())
+        (next_value.as_ref() != input).then(|| next_value.into_owned())
     }
 }
 
