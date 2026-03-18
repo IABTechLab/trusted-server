@@ -71,25 +71,44 @@ pub fn handle_request_cookies(
 ///   request when a user arrives from an external page, breaking first-visit attribution.
 /// - `Max-Age`: 1 year retention.
 ///
-/// # Panics
+/// The `synthetic_id` is sanitized via an allowlist before embedding in the cookie value.
+/// Only ASCII alphanumeric characters and `.`, `-`, `_` are permitted — matching the
+/// known synthetic ID format (`{64-char-hex}.{6-char-alphanumeric}`). Any stripped
+/// characters are logged as a warning so header/cookie mismatches can be detected.
 ///
-/// Panics if `cookie_domain` in settings contains cookie metacharacters (`;`, `\n`, `\r`).
-/// This indicates a configuration error and is enforced in all build profiles.
+/// The `cookie_domain` is validated at config load time via [`validator::Validate`] on
+/// [`crate::settings::Publisher`]; bad config fails at startup, not per-request.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use trusted_server_common::cookies::create_synthetic_cookie;
+/// # use trusted_server_common::settings::Settings;
+/// // `settings` is loaded at startup via `Settings::from_toml_and_env`.
+/// # fn example(settings: &Settings) {
+/// let cookie = create_synthetic_cookie(settings, "abc123.xk92ab");
+/// assert!(cookie.contains("HttpOnly"));
+/// assert!(cookie.contains("Secure"));
+/// # }
+/// ```
 #[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
-    // Sanitize synthetic_id at runtime: strip cookie metacharacters to prevent
-    // header injection when the ID originates from untrusted input (e.g., the
-    // x-synthetic-id request header or an inbound cookie).
+    // Sanitize synthetic_id at runtime using an allowlist: only ASCII alphanumeric
+    // and `.`, `-`, `_` are permitted. This is stricter than a denylist and covers
+    // NUL bytes, spaces, tabs, and other control characters that a denylist would miss.
+    // Synthetic IDs originating from the x-synthetic-id request header are untrusted.
     let safe_id: String = synthetic_id
         .chars()
-        .filter(|c| !matches!(c, ';' | '=' | '\n' | '\r'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         .collect();
-    // `=` is excluded from the domain check: it only has special meaning in the
-    // name=value pair, not within an attribute like Domain.
-    assert!(
-        !settings.publisher.cookie_domain.contains([';', '\n', '\r']),
-        "cookie_domain should not contain cookie metacharacters"
-    );
+    if safe_id.len() != synthetic_id.len() {
+        log::warn!(
+            "Stripped disallowed characters from synthetic_id before setting cookie (len {} -> {}); \
+             the x-synthetic-id response header may differ from the cookie value",
+            synthetic_id.len(),
+            safe_id.len(),
+        );
+    }
     format!(
         "{}={}; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
         COOKIE_SYNTHETIC_ID, safe_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
@@ -206,19 +225,34 @@ mod tests {
     }
 
     #[test]
-    fn test_create_synthetic_cookie_sanitizes_metacharacters_in_id() {
+    fn test_create_synthetic_cookie_sanitizes_disallowed_chars_in_id() {
         let settings = create_test_settings();
-        let result = create_synthetic_cookie(&settings, "evil;injected\r\nfoo=bar");
+        // Allowlist permits only ASCII alphanumeric, '.', '-', '_'.
+        // ';', '=', '\r', '\n', spaces, NUL bytes, and other control chars are all stripped.
+        let result = create_synthetic_cookie(&settings, "evil;injected\r\nfoo=bar\0baz");
         // Extract the value portion anchored to the cookie name constant to
-        // avoid false positives from metacharacters in cookie attributes.
+        // avoid false positives from disallowed chars in cookie attributes.
         let value = result
             .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
             .and_then(|s| s.split_once(';').map(|(v, _)| v))
             .expect("should have cookie value portion");
         assert_eq!(
-            value, "evilinjectedfoobar",
-            "should strip metacharacters and preserve safe chars"
+            value, "evilinjectedfoobarbaz",
+            "should strip disallowed characters and preserve safe chars"
         );
+    }
+
+    #[test]
+    fn test_create_synthetic_cookie_preserves_well_formed_id() {
+        let settings = create_test_settings();
+        // A well-formed ID should pass through the allowlist unmodified.
+        let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
+        let result = create_synthetic_cookie(&settings, id);
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(value, id, "should not modify a well-formed synthetic ID");
     }
 
     #[test]
