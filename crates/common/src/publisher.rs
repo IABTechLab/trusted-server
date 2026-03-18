@@ -221,7 +221,7 @@ pub fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    // Extract request host and scheme from headers (supports X-Forwarded-Host/Proto for chained proxies)
+    // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
     let request_info = RequestInfo::from_request(&req);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;

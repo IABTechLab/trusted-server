@@ -9,8 +9,9 @@ import { createScriptGuard } from '../../shared/script_guard';
  * scripts inserted via appendChild, insertBefore, or any other dynamic DOM
  * manipulation.
  *
- * Built on the shared script_guard factory with custom URL rewriting to preserve
- * the original path from the DataDome URL (e.g., /tags.js, /js/check).
+ * Built on the shared script_guard factory, which registers with the shared
+ * DOM insertion dispatcher and preserves the original DataDome path
+ * (e.g., /tags.js, /js/check).
  */
 
 /** Regex to match js.datadome.co as a domain in URLs */
@@ -63,16 +64,17 @@ function rewriteDataDomeUrl(originalUrl: string): string {
 }
 
 const guard = createScriptGuard({
-  name: 'DataDome',
+  displayName: 'DataDome',
+  id: 'datadome',
   isTargetUrl: isDataDomeSdkUrl,
   rewriteUrl: rewriteDataDomeUrl,
 });
 
 /**
  * Install the DataDome guard to intercept dynamic script loading.
- * Patches Element.prototype.appendChild and insertBefore to catch
- * ANY dynamically inserted DataDome SDK script elements and rewrite their URLs
- * before insertion. Works across all frameworks and vanilla JavaScript.
+ * Registers a handler with the shared DOM insertion dispatcher so dynamically
+ * inserted DataDome SDK script elements are rewritten before insertion.
+ * Works across all frameworks and vanilla JavaScript.
  */
 export const installDataDomeGuard = guard.install;
 
