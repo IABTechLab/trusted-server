@@ -13,20 +13,16 @@ describe('DataDome SDK Script Interception Guard', () => {
   let originalInsertBefore: typeof Element.prototype.insertBefore;
 
   beforeEach(() => {
-    // Store original methods
+    // Reset guard state before each test.
+    resetGuardState();
+
+    // Store original methods after reset so assertions see the true baseline.
     originalAppendChild = Element.prototype.appendChild;
     originalInsertBefore = Element.prototype.insertBefore;
-
-    // Reset guard state before each test
-    resetGuardState();
   });
 
   afterEach(() => {
-    // Restore original methods
-    Element.prototype.appendChild = originalAppendChild;
-    Element.prototype.insertBefore = originalInsertBefore;
-
-    // Reset guard state after each test
+    // Reset guard state after each test.
     resetGuardState();
   });
 
@@ -135,6 +131,15 @@ describe('DataDome SDK Script Interception Guard', () => {
       installDataDomeGuard();
 
       expect(Element.prototype.insertBefore).not.toBe(originalInsertBefore);
+    });
+
+    it('should restore the original prototype methods on reset', () => {
+      installDataDomeGuard();
+
+      resetGuardState();
+
+      expect(Element.prototype.appendChild).toBe(originalAppendChild);
+      expect(Element.prototype.insertBefore).toBe(originalInsertBefore);
     });
   });
 

@@ -17,14 +17,12 @@ describe('GTM Script Interception Guard', () => {
   let originalInsertBefore: typeof Element.prototype.insertBefore;
 
   beforeEach(() => {
+    resetGuardState();
     originalAppendChild = Element.prototype.appendChild;
     originalInsertBefore = Element.prototype.insertBefore;
-    resetGuardState();
   });
 
   afterEach(() => {
-    Element.prototype.appendChild = originalAppendChild;
-    Element.prototype.insertBefore = originalInsertBefore;
     resetGuardState();
   });
 
@@ -159,6 +157,15 @@ describe('GTM Script Interception Guard', () => {
     it('should patch Element.prototype.insertBefore', () => {
       installGtmGuard();
       expect(Element.prototype.insertBefore).not.toBe(originalInsertBefore);
+    });
+
+    it('should restore the original prototype methods on reset', () => {
+      installGtmGuard();
+
+      resetGuardState();
+
+      expect(Element.prototype.appendChild).toBe(originalAppendChild);
+      expect(Element.prototype.insertBefore).toBe(originalInsertBefore);
     });
   });
 
