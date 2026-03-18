@@ -9,7 +9,7 @@
 //! - [`constants`]: Application-wide constants and configuration values
 //! - [`cookies`]: Cookie parsing and generation utilities
 //! - [`error`]: Error types and error handling utilities
-//! - [`gdpr`]: GDPR consent management and TCF string parsing
+//! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
 //! - [`prebid`]: Prebid integration and real-time bidding support
@@ -36,6 +36,8 @@ pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
 pub mod backend;
+pub mod consent;
+pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;

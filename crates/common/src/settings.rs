@@ -10,6 +10,7 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 
@@ -347,6 +348,8 @@ pub struct Settings {
     #[serde(default)]
     pub auction: AuctionConfig,
     #[serde(default)]
+    pub consent: ConsentConfig,
+    #[serde(default)]
     pub proxy: Proxy,
 }
 
@@ -361,11 +364,12 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let settings: Self =
+        let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
+        settings.consent.validate();
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -401,6 +405,7 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+        settings.consent.validate();
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {

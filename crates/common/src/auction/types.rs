@@ -73,8 +73,14 @@ pub struct UserInfo {
     pub id: String,
     /// Fresh ID for this session
     pub fresh_id: String,
-    /// GDPR consent string if applicable
-    pub consent: Option<String>,
+    /// Decoded consent context for this request.
+    ///
+    /// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded
+    /// structured data (for TS-level enforcement and observability).
+    /// Skipped during serde since it is populated at runtime from request
+    /// cookies/headers, not from stored data.
+    #[serde(skip)]
+    pub consent: Option<crate::consent::ConsentContext>,
 }
 
 /// Device information from request.
