@@ -214,19 +214,19 @@ impl Synthetic {
             .any(|p| p.eq_ignore_ascii_case(secret_key))
     }
 
-    /// Validates that the secret key is not empty or a placeholder value.
+    /// Validates that the secret key is not empty.
+    ///
+    /// Placeholder detection is intentionally **not** performed here because
+    /// this validator runs at build time (via `from_toml_and_env`) when the
+    /// config legitimately contains placeholder values. Placeholder rejection
+    /// happens at runtime via [`Settings::reject_placeholder_secrets`].
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the secret key is empty or matches a
-    /// known placeholder.
+    /// Returns a validation error if the secret key is empty.
     pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
-        let value = secret_key.expose().as_str();
-        if value.is_empty() {
+        if secret_key.expose().is_empty() {
             return Err(ValidationError::new("empty_secret_key"));
-        }
-        if Self::is_placeholder_secret_key(value) {
-            return Err(ValidationError::new("placeholder_secret_key"));
         }
         Ok(())
     }
