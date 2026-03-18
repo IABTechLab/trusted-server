@@ -33,6 +33,12 @@ use crate::error::to_error_response;
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
 
+    // Keep the health probe independent from settings loading and routing so
+    // readiness checks still get a cheap liveness response during startup.
+    if req.get_method() == Method::GET && req.get_path() == "/health" {
+        return Ok(Response::from_status(200).with_body_text_plain("ok"));
+    }
+
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
@@ -183,7 +189,7 @@ fn init_logger() {
         .echo_stdout(true)
         .max_level(log::LevelFilter::Debug)
         .build()
-        .expect("Failed to build Logger");
+        .expect("should build Logger");
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -201,5 +207,5 @@ fn init_logger() {
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
-        .expect("Failed to initialize logger");
+        .expect("should initialize logger");
 }
