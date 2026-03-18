@@ -1,0 +1,169 @@
+name: "Integration Tests"
+
+permissions:
+  contents: read
+
+on:
+  # Intentionally PR-only plus manual dispatch. Direct pushes to `main` are
+  # expected to arrive through PR merges, which already run this workflow.
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+env:
+  ORIGIN_PORT: 8888
+  ARTIFACTS_DIR: /tmp/integration-test-artifacts
+  WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-fastly.wasm
+  DOCKER_ARTIFACT_PATH: /tmp/integration-test-artifacts/docker/test-images.tar
+
+jobs:
+  prepare-artifacts:
+    name: prepare integration artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up shared integration build environment
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "false"
+
+      - name: Package integration test artifacts
+        run: |
+          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")"
+          cp target/wasm32-wasip1/release/trusted-server-fastly.wasm "$WASM_ARTIFACT_PATH"
+          docker save \
+            --output "$DOCKER_ARTIFACT_PATH" \
+            test-wordpress:latest test-nextjs:latest
+
+      - name: Upload integration test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+          retention-days: 1
+
+  integration-tests:
+    name: integration tests
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up integration test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          check-dependency-versions: "false"
+          install-viceroy: "true"
+          build-wasm: "false"
+          build-test-images: "false"
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Load integration test Docker images
+        run: docker load --input "$DOCKER_ARTIFACT_PATH"
+
+      - name: Run integration tests
+        run: >-
+          cargo test
+          --manifest-path crates/integration-tests/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+          -- --include-ignored --skip test_wordpress_fastly --skip test_nextjs_fastly --test-threads=1
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
+  browser-tests:
+    name: browser integration tests
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up browser test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          check-dependency-versions: "false"
+          install-viceroy: "true"
+          build-wasm: "false"
+          build-test-images: "false"
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Load integration test Docker images
+        run: docker load --input "$DOCKER_ARTIFACT_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: crates/integration-tests/browser/package-lock.json
+
+      - name: Install Playwright
+        working-directory: crates/integration-tests/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run browser tests (Next.js)
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: nextjs
+          PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
+        run: npx playwright test
+
+      - name: Upload Playwright report (Next.js)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-nextjs
+          path: crates/integration-tests/browser/playwright-report-nextjs/
+          retention-days: 7
+
+      - name: Run browser tests (WordPress)
+        if: always()
+        working-directory: crates/integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template.toml
+          TEST_FRAMEWORK: wordpress
+          PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
+        run: npx playwright test
+
+      - name: Upload Playwright report (WordPress)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-wordpress
+          path: crates/integration-tests/browser/playwright-report-wordpress/
+          retention-days: 7
+
+      - name: Upload Playwright traces and screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          path: crates/integration-tests/browser/test-results/
+          retention-days: 7

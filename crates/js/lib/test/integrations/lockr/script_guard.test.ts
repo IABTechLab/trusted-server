@@ -1,46 +1,42 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  installNextJsGuard,
+  installLockrGuard,
   isGuardInstalled,
   resetGuardState,
-} from '../../../src/integrations/lockr/nextjs_guard';
+} from '../../../src/integrations/lockr/script_guard';
 
 describe('Lockr SDK Script Interception Guard', () => {
   let originalAppendChild: typeof Element.prototype.appendChild;
   let originalInsertBefore: typeof Element.prototype.insertBefore;
 
   beforeEach(() => {
-    // Store original methods
+    // Reset guard state before each test.
+    resetGuardState();
+
+    // Store original methods after reset so assertions see the true baseline.
     originalAppendChild = Element.prototype.appendChild;
     originalInsertBefore = Element.prototype.insertBefore;
-
-    // Reset guard state before each test
-    resetGuardState();
   });
 
   afterEach(() => {
-    // Restore original methods
-    Element.prototype.appendChild = originalAppendChild;
-    Element.prototype.insertBefore = originalInsertBefore;
-
-    // Reset guard state after each test
+    // Reset guard state after each test.
     resetGuardState();
   });
 
-  describe('installNextJsGuard', () => {
+  describe('installLockrGuard', () => {
     it('should install the guard successfully', () => {
       expect(isGuardInstalled()).toBe(false);
 
-      installNextJsGuard();
+      installLockrGuard();
 
       expect(isGuardInstalled()).toBe(true);
     });
 
     it('should not install twice', () => {
-      installNextJsGuard();
+      installLockrGuard();
       const firstInstall = Element.prototype.appendChild;
 
-      installNextJsGuard();
+      installLockrGuard();
       const secondInstall = Element.prototype.appendChild;
 
       // Should be the same reference (no double patching)
@@ -48,21 +44,30 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should patch Element.prototype.appendChild', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       expect(Element.prototype.appendChild).not.toBe(originalAppendChild);
     });
 
     it('should patch Element.prototype.insertBefore', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       expect(Element.prototype.insertBefore).not.toBe(originalInsertBefore);
+    });
+
+    it('should restore the original prototype methods on reset', () => {
+      installLockrGuard();
+
+      resetGuardState();
+
+      expect(Element.prototype.appendChild).toBe(originalAppendChild);
+      expect(Element.prototype.insertBefore).toBe(originalInsertBefore);
     });
   });
 
   describe('appendChild interception', () => {
     it('should rewrite Lockr SDK URL from aim.loc.kr', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -75,7 +80,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should rewrite Lockr SDK URL from identity.loc.kr', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -88,7 +93,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should use location.host for rewritten URL', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -101,7 +106,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not rewrite non-Lockr scripts', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -113,7 +118,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should rewrite Lockr scripts regardless of data-nscript attribute', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -127,7 +132,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should rewrite Lockr scripts with ANY data-nscript value', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -141,7 +146,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should rewrite plain scripts without any framework attributes', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -155,7 +160,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not affect non-script elements', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const img = document.createElement('img');
@@ -167,7 +172,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should handle scripts with setAttribute instead of property', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -179,7 +184,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should work with vanilla JavaScript script insertion', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -197,7 +202,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
   describe('insertBefore interception', () => {
     it('should rewrite Lockr SDK URL', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const reference = document.createElement('div');
@@ -213,7 +218,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not rewrite non-Lockr scripts', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const reference = document.createElement('div');
@@ -228,7 +233,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should work with null reference node', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -242,7 +247,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
   describe('URL detection', () => {
     it('should detect aim.loc.kr URLs', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -255,7 +260,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should detect identity.loc.kr with identity-lockr URLs', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -268,7 +273,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should handle case-insensitive URLs', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -281,7 +286,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not match identity.loc.kr without identity-lockr', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -294,7 +299,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not match identity.loc.kr with identity-lockr but wrong extension', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -309,7 +314,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
   describe('link preload interception', () => {
     it('should rewrite Lockr SDK preload link from aim.loc.kr', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -324,7 +329,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should rewrite Lockr SDK preload link from identity.loc.kr', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -339,7 +344,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should use location.host for rewritten preload URL', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -354,7 +359,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not rewrite preload links without as="script"', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -368,7 +373,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not rewrite links without rel="preload"', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -382,7 +387,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not rewrite non-Lockr preload links', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -396,7 +401,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should work with insertBefore for preload links', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const reference = document.createElement('div');
@@ -413,7 +418,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should handle preload link with setAttribute instead of property', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -427,7 +432,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should preserve other link attributes', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
@@ -448,7 +453,7 @@ describe('Lockr SDK Script Interception Guard', () => {
 
   describe('integration scenarios', () => {
     it('should handle multiple script insertions', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
 
@@ -466,7 +471,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should preserve other script attributes', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -485,7 +490,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should work with scripts created and inserted immediately', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const script = document.createElement('script');
@@ -498,7 +503,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should handle both script and preload link together', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
 
@@ -519,7 +524,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should handle both script and preload link together', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
 
@@ -543,7 +548,7 @@ describe('Lockr SDK Script Interception Guard', () => {
     });
 
     it('should not affect non-preload links', () => {
-      installNextJsGuard();
+      installLockrGuard();
 
       const container = document.createElement('div');
       const link = document.createElement('link');
