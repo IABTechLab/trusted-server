@@ -64,6 +64,7 @@ openssl rand -base64 32
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
 | `[synthetic]`       | Synthetic ID generation                      |
+| `[proxy]`           | Proxy SSRF allowlist                         |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
 | `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
@@ -717,6 +718,79 @@ exclude_domains = ["*.publisher.com"]  # Skip unnecessary proxying
 ```
 
 See [Creative Processing](/guide/creative-processing#exclude-domains) for details.
+
+## Proxy Configuration
+
+Controls first-party proxy security settings.
+
+### `[proxy]`
+
+| Field             | Type          | Required           | Description                                            |
+| ----------------- | ------------- | ------------------ | ------------------------------------------------------ |
+| `allowed_domains` | Array[String] | No (default: `[]`) | Redirect destinations the proxy is permitted to follow |
+
+**Example**:
+
+```toml
+[proxy]
+allowed_domains = [
+  "tracker.com",         # Exact match
+  "*.adserver.com",      # Wildcard: adserver.com and all subdomains
+  "*.trusted-cdn.net",
+]
+```
+
+**Environment Override**:
+
+```bash
+# JSON array
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.com","*.adserver.com"]'
+
+# Indexed
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.adserver.com"
+
+# Comma-separated
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
+```
+
+### Field Details
+
+#### `allowed_domains`
+
+**Purpose**: Allowlist of redirect destinations the proxy is permitted to follow.
+
+**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy` or `/first-party/click`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
+
+**Default — open mode**: When `allowed_domains` is absent or empty, every redirect destination is allowed. This default is intentional for zero-config development but should not be used in production.
+
+**Pattern Matching**:
+
+| Pattern         | Matches                                             | Does not match     |
+| --------------- | --------------------------------------------------- | ------------------ |
+| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
+| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+
+- `"example.com"` — exact match only.
+- `"*.example.com"` — matches the base domain and any subdomain at any depth.
+- Matching is case-insensitive; entries are normalized to lowercase at startup.
+- Blank entries are ignored.
+- The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
+
+::: danger Production Recommendation
+Always configure `allowed_domains` in production. Without an explicit allowlist, a signed proxy URL can be used to follow redirects to arbitrary hosts, creating an SSRF risk.
+
+```toml
+[proxy]
+allowed_domains = [
+  "*.your-ad-network.com",
+  "tracker.your-partner.com",
+]
+```
+
+:::
+
+See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage details.
 
 ## Integration Configurations
 

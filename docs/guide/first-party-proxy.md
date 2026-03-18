@@ -425,6 +425,47 @@ proxy_secret = "your-secure-random-secret"
 cookie_domain = ".publisher.com"  # For synthetic_id cookies
 ```
 
+### Proxy Allowlist
+
+Restrict which domains the proxy may redirect to via the `[proxy]` section:
+
+```toml
+[proxy]
+allowed_domains = [
+  "tracker.com",           # Exact match
+  "*.adserver.com",        # Wildcard: adserver.com and all subdomains
+  "*.trusted-cdn.net",
+]
+```
+
+**Semantics**: When a proxied request receives an HTTP redirect (301/302/303/307/308), the redirect target host is checked against `allowed_domains`. If the host does not match any pattern the redirect is blocked and a 403 error is returned.
+
+**Wildcard matching**:
+
+| Pattern         | Matches                                             | Does not match     |
+| --------------- | --------------------------------------------------- | ------------------ |
+| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
+| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+
+- The `*` prefix matches the base domain and any subdomain at any depth.
+- Matching is case-insensitive; entries are normalized to lowercase on startup.
+- The wildcard requires a dot boundary — `*.example.com` will **not** match `evil-example.com`.
+
+**Default behavior**: When `allowed_domains` is omitted (or set to an empty list) every redirect destination is permitted. This default is intentional for zero-config development but should not be used in production.
+
+::: danger Production Recommendation
+Always set `allowed_domains` explicitly in production deployments. Without an allowlist, a signed proxy URL that follows redirects could be used to reach internal or unintended hosts (SSRF).
+
+```toml
+[proxy]
+allowed_domains = [
+  "*.your-ad-network.com",
+  "tracker.your-partner.com",
+]
+```
+
+:::
+
 ### URL Rewrite Exclusions
 
 Exclude specific domains from rewriting:
