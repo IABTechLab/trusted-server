@@ -20,16 +20,25 @@ const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
 fn restrict_accept_encoding(req: &mut Request) {
-    let accept_encoding = select_supported_accept_encoding(
-        req.get_header(header::ACCEPT_ENCODING)
-            .and_then(|value| value.to_str().ok()),
+    // If the client sent no Accept-Encoding, leave the request unchanged so the
+    // origin responds without compression. Adding encodings here would cause the
+    // origin to compress its response even though the client never asked for it,
+    // and the client would then receive content it cannot decode.
+    let Some(current) = req
+        .get_header(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    req.set_header(
+        header::ACCEPT_ENCODING,
+        select_supported_accept_encoding(Some(current)),
     );
-    req.set_header(header::ACCEPT_ENCODING, accept_encoding);
 }
 
 fn select_supported_accept_encoding(client_accept_encoding: Option<&str>) -> String {
     let Some(client_accept_encoding) = client_accept_encoding else {
-        return SUPPORTED_ENCODINGS.to_string();
+        return "identity".to_string();
     };
 
     let supported_subset = SUPPORTED_ENCODING_VALUES
@@ -529,6 +538,20 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn publisher_proxy_does_not_add_accept_encoding_when_absent() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        // No Accept-Encoding header set by the client.
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            None,
+            "publisher proxy should not inject Accept-Encoding when the client sent none"
+        );
     }
 
     #[test]
