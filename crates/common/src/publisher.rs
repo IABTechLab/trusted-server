@@ -15,8 +15,6 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
 
-/// Encodings supported by the publisher response rewrite pipeline.
-const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
 fn restrict_accept_encoding(req: &mut Request) {
@@ -563,7 +561,7 @@ mod tests {
 
         assert_eq!(
             req.get_header_str(header::ACCEPT_ENCODING),
-            Some(SUPPORTED_ENCODINGS),
+            Some("gzip, deflate, br"),
             "publisher fallback should only advertise encodings the rewrite pipeline supports"
         );
     }
