@@ -1,0 +1,13 @@
+{
+  "name": "integration-tests-browser",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "npx playwright test",
+    "test:nextjs": "TEST_FRAMEWORK=nextjs npx playwright test",
+    "test:wordpress": "TEST_FRAMEWORK=wordpress npx playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
