@@ -13,8 +13,8 @@ real-time bidding integration, and publisher-side JavaScript injection.
 
 ```
 crates/
-  common/        # Core library — shared logic, integrations, HTML processing
-  fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
+  trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
+  trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   js/            # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -42,7 +42,7 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 cargo build
 
 # Production build for Fastly
-cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 # Run locally with Fastly simulator
 fastly compute serve
@@ -61,7 +61,7 @@ cargo test --workspace
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Check compilation
 cargo check
@@ -268,7 +268,7 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets --all-features -- -D warnings`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace`
 4. JS build and test (`cd crates/js/lib && npx vitest run`)
 5. JS format (`cd crates/js/lib && npm run format`)
@@ -362,14 +362,14 @@ both runtime behavior and build/tooling changes.
 
 | File                                         | Purpose                                           |
 | -------------------------------------------- | ------------------------------------------------- |
-| `crates/common/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/common/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/common/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/common/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/common/src/synthetic.rs`             | Synthetic ID generation                           |
-| `crates/common/src/cookies.rs`               | Cookie handling                                   |
-| `crates/common/src/gdpr.rs`                  | GDPR consent management                           |
-| `crates/common/src/http_wrapper.rs`          | HTTP abstractions                                 |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| `crates/trusted-server-core/src/synthetic.rs`             | Synthetic ID generation                           |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
+| `crates/trusted-server-core/src/gdpr.rs`                  | GDPR consent management                           |
+| `crates/trusted-server-core/src/http_wrapper.rs`          | HTTP abstractions                                 |
 | `crates/js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
 | `crates/js/src/bundle.rs`                    | Module map, concatenation, hashing                |
 

@@ -52,7 +52,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  2. Route Matching (crates/fastly/src/main.rs:84)                    │
+│  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs:84)                    │
 │     - Pattern: (Method::POST, "/auction")                            │
 │     - Handler: handle_auction(settings, &orchestrator, &storage, req)│
 └──────────────────────────────────────────────────────────────────────┘
@@ -252,7 +252,7 @@ Note that creative HTML is rewritten to use the first-party proxy (`/first-party
 
 ### Auction-Related Routes
 
-The trusted-server handles several types of routes defined in `crates/fastly/src/main.rs`:
+The trusted-server handles several types of routes defined in `crates/trusted-server-adapter-fastly/src/main.rs`:
 
 | Route                     | Method | Handler                        | Purpose                                          | Line |
 |---------------------------|--------|--------------------------------|--------------------------------------------------|------|

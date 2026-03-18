@@ -71,7 +71,7 @@ runs:
       env:
         TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:${{ inputs.origin-port }}
         TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
-      run: cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+      run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
     - name: Build WordPress test container
       if: ${{ inputs.build-test-images == 'true' }}

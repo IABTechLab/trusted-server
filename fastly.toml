@@ -6,12 +6,12 @@ cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
 description = "EdgePubs - Trusted Server"
 language = "rust"
 manifest_version = 3
-name = "trusted-server-fastly"
+name = "trusted-server-adapter-fastly"
 service_id = "dysUw6h73VzeomD61eal85"
 
 [scripts]
 build = """
-    cargo build --bin trusted-server-fastly --release --target wasm32-wasip1 --color always
+    cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 --color always
 """
 
 # Direct integrations will be initialized as dynamic backends and don't need to be declared here.

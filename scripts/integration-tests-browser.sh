@@ -32,7 +32,7 @@ echo "==> Validating shared integration-test dependency versions..."
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
-    cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 # --- Build Docker images ---
 echo "==> Building WordPress test container..."
@@ -52,7 +52,7 @@ npm ci
 npx playwright install chromium
 
 # --- Export env vars for global-setup.ts ---
-export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-fastly.wasm"
+export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
 export INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT"
 export VICEROY_CONFIG_PATH="$REPO_ROOT/crates/integration-tests/fixtures/configs/viceroy-template.toml"
 

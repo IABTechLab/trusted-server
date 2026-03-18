@@ -70,8 +70,8 @@ For each changed file, evaluate:
 #### WASM compatibility
 
 - Target is `wasm32-wasip1` — no std::net, std::thread, or OS-specific APIs
-- No Tokio or runtime-specific deps in `crates/common`
-- Fastly-specific APIs only in `crates/fastly`
+- No Tokio or runtime-specific deps in `crates/trusted-server-core`
+- Fastly-specific APIs only in `crates/trusted-server-adapter-fastly`
 
 #### Convention compliance (from CLAUDE.md)
 
@@ -177,7 +177,7 @@ comment. Use the file's **current line number** (not diff position) with the
 
 ````json
 {
-  "path": "crates/common/src/publisher.rs",
+  "path": "crates/trusted-server-core/src/publisher.rs",
   "line": 166,
   "side": "RIGHT",
   "body": "🔧 **wrench** — Race condition: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
@@ -288,6 +288,6 @@ Output:
 - Do not include any byline, "Generated with" footer, `Co-Authored-By`
   trailer, or self-referential titles (e.g., "Staff Engineer Review") in
   review comments or the review body.
-- If the diff is very large (>50 files), prioritize `crates/common/` changes
+- If the diff is very large (>50 files), prioritize `crates/trusted-server-core/` changes
   and new files over mechanical changes (Cargo.lock, generated code).
 - Never submit a review without explicit user approval of the findings.

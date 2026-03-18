@@ -4,7 +4,7 @@
 
 use error_stack::Report;
 use fastly::Response;
-use trusted_server_common::error::{IntoHttpResponse, TrustedServerError};
+use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 
 /// Converts a [`TrustedServerError`] into an HTTP error response.
 pub fn to_error_response(report: &Report<TrustedServerError>) -> Response {

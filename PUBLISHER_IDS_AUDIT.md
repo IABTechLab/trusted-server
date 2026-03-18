@@ -26,7 +26,7 @@ This document lists all publisher-specific IDs and configurations found in the c
 
 ## Hardcoded in Source Code
 
-### /Users/jevans/trusted-server/crates/common/src/gam.rs
+### /Users/jevans/trusted-server/crates/trusted-server-core/src/gam.rs
 
 **Permutive Segment Data (lines 295 and 486):**
 ```rust
@@ -35,7 +35,7 @@ This document lists all publisher-specific IDs and configurations found in the c
 
 This large string contains Permutive segment IDs that appear to be captured from a specific test publisher's live traffic.
 
-### /Users/jevans/trusted-server/crates/common/src/prebid.rs
+### /Users/jevans/trusted-server/crates/trusted-server-core/src/prebid.rs
 
 **Equativ Integration:**
 - `"pageId": 2040327` (matches config)
@@ -72,6 +72,6 @@ This large string contains Permutive segment IDs that appear to be captured from
 ## Files to Update
 
 - `trusted-server.toml` - Add permutive segments configuration
-- `crates/common/src/gam.rs` - Remove hardcoded segments (lines 295, 486)
-- `crates/common/src/prebid.rs` - Use configuration for Equativ IDs
+- `crates/trusted-server-core/src/gam.rs` - Remove hardcoded segments (lines 295, 486)
+- `crates/trusted-server-core/src/prebid.rs` - Use configuration for Equativ IDs
 - Test files - Use environment-agnostic test data

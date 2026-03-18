@@ -273,7 +273,7 @@ Optimize mobile ad serving with reduced JavaScript overhead.
 
 ## Implementation
 
-See [crates/common/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/prebid.rs) for full implementation.
+See [crates/trusted-server-core/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs) for full implementation.
 
 ### Key Components
 

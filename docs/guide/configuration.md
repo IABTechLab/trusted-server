@@ -1067,7 +1067,7 @@ trusted-server.dev.toml      # Development overrides
 **Print Loaded Config** (test only):
 
 ```rust
-use trusted_server_common::settings_data::get_settings;
+use trusted_server_core::settings_data::get_settings;
 
 let settings = get_settings()?;
 println!("{:#?}", settings);
