@@ -4,12 +4,14 @@ members = [
     "crates/common",
     "crates/fastly",
     "crates/js",
+    "crates/openrtb",
 ]
 # integration-tests is intentionally excluded from workspace members because it
 # requires a native target (testcontainers, reqwest) while the workspace default
 # is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
 exclude = [
     "crates/integration-tests",
+    "crates/openrtb-codegen",
 ]
 
 default-members = [
