@@ -6,8 +6,24 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
+/// Enforces Basic-auth for incoming requests.
+///
+/// Authentication is required when a configured handler's `path` regex matches
+/// the request path. Paths not covered by any handler pass through without
+/// authentication.
+///
+/// Admin endpoints are protected by requiring a handler at build time — see
+/// [`Settings::from_toml_and_env`].
+///
+/// # Returns
+///
+/// * `Some(Response)` — a `401 Unauthorized` response that should be sent back
+///   to the client (credentials missing or incorrect).
+/// * `None` — the request is allowed to proceed.
 pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response> {
-    let handler = settings.handler_for_path(req.get_path())?;
+    let path = req.get_path();
+
+    let handler = settings.handler_for_path(path)?;
 
     let (username, password) = match extract_credentials(req) {
         Some(credentials) => credentials,
@@ -116,6 +132,41 @@ mod tests {
         req.set_header(header::AUTHORIZATION, "Bearer token");
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn allow_admin_path_with_valid_credentials() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let token = STANDARD.encode("admin:admin-pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        assert!(
+            enforce_basic_auth(&settings, &req).is_none(),
+            "should allow admin path with correct credentials"
+        );
+    }
+
+    #[test]
+    fn challenge_admin_path_with_wrong_credentials() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let token = STANDARD.encode("admin:wrong");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should challenge admin path with wrong credentials");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn challenge_admin_path_with_missing_credentials() {
+        let settings = settings_with_handlers();
+        let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should challenge admin path with missing credentials");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
     }
 }

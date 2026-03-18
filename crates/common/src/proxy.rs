@@ -42,6 +42,8 @@ pub struct ProxyRequestConfig<'a> {
     pub body: Option<Vec<u8>>,
     /// Additional headers to forward to the origin.
     pub headers: Vec<(header::HeaderName, HeaderValue)>,
+    /// Whether to forward the helper's curated request-header set.
+    pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
 }
@@ -56,6 +58,7 @@ impl<'a> ProxyRequestConfig<'a> {
             forward_synthetic_id: true,
             body: None,
             headers: Vec::new(),
+            copy_request_headers: true,
             stream_passthrough: false,
         }
     }
@@ -71,6 +74,13 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_header(mut self, name: header::HeaderName, value: HeaderValue) -> Self {
         self.headers.push((name, value));
+        self
+    }
+
+    /// Disable forwarding of the helper's curated request-header set.
+    #[must_use]
+    pub fn without_forward_headers(mut self) -> Self {
+        self.copy_request_headers = false;
         self
     }
 
@@ -377,6 +387,11 @@ fn finalize_response(
     }
 }
 
+struct ProxyRequestHeaders<'a> {
+    additional_headers: &'a [(header::HeaderName, HeaderValue)],
+    copy_request_headers: bool,
+}
+
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
@@ -398,6 +413,7 @@ pub async fn proxy_request(
         forward_synthetic_id,
         body,
         headers,
+        copy_request_headers,
         stream_passthrough,
     } = config;
 
@@ -417,7 +433,10 @@ pub async fn proxy_request(
         target_url_parsed,
         follow_redirects,
         body.as_deref(),
-        &headers,
+        ProxyRequestHeaders {
+            additional_headers: &headers,
+            copy_request_headers,
+        },
         stream_passthrough,
     )
     .await
@@ -466,7 +485,7 @@ async fn proxy_with_redirects(
     target_url_parsed: url::Url,
     follow_redirects: bool,
     body: Option<&[u8]>,
-    headers: &[(header::HeaderName, HeaderValue)],
+    request_headers: ProxyRequestHeaders<'_>,
     stream_passthrough: bool,
 ) -> Result<Response, Report<TrustedServerError>> {
     const MAX_REDIRECTS: usize = 4;
@@ -501,12 +520,14 @@ async fn proxy_with_redirects(
             .ensure()?;
 
         let mut proxy_req = Request::new(current_method.clone(), &current_url);
-        copy_proxy_forward_headers(req, &mut proxy_req);
+        if request_headers.copy_request_headers {
+            copy_proxy_forward_headers(req, &mut proxy_req);
+        }
         if let Some(body_bytes) = body {
             proxy_req.set_body(body_bytes.to_vec());
         }
 
-        for (name, value) in headers {
+        for (name, value) in request_headers.additional_headers {
             proxy_req.set_header(name.clone(), value.clone());
         }
 
@@ -614,6 +635,7 @@ pub async fn handle_first_party_proxy(
             forward_synthetic_id: true,
             body: None,
             headers: Vec::new(),
+            copy_request_headers: true,
             stream_passthrough: false,
         },
     )
@@ -1195,6 +1217,7 @@ mod tests {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             )
+            .without_forward_headers()
             .with_streaming();
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
@@ -1206,8 +1229,22 @@ mod tests {
         assert_eq!(cfg.body.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(cfg.headers.len(), 1, "should include custom header");
         assert!(
+            !cfg.copy_request_headers,
+            "should allow routes to disable default request-header forwarding"
+        );
+        assert!(
             cfg.stream_passthrough,
             "should enable streaming passthrough"
+        );
+    }
+
+    #[test]
+    fn proxy_request_config_forwards_curated_headers_by_default() {
+        let cfg = ProxyRequestConfig::new("https://example.com/asset");
+
+        assert!(
+            cfg.copy_request_headers,
+            "should forward curated request headers unless a route opts out"
         );
     }
 
