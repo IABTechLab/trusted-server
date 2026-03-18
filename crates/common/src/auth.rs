@@ -159,4 +159,43 @@ mod tests {
             "should describe the invalid handler regex"
         );
     }
+
+    #[test]
+    fn allow_admin_path_with_valid_credentials() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let token = STANDARD.encode("admin:admin-pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        assert!(
+            enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .is_none(),
+            "should allow admin path with correct credentials"
+        );
+    }
+
+    #[test]
+    fn challenge_admin_path_with_wrong_credentials() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let token = STANDARD.encode("admin:wrong");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge admin path with wrong credentials");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn challenge_admin_path_with_missing_credentials() {
+        let settings = settings_with_handlers();
+        let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge admin path with missing credentials");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
 }

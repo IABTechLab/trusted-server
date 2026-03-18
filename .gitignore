@@ -2,6 +2,7 @@
 /bin
 /pkg
 /target
+/crates/integration-tests/target
 
 # env
 .env*
@@ -29,3 +30,9 @@ src/*.html
 
 /guest-profiles
 /benchmark-results/**
+
+# Playwright browser tests
+/crates/integration-tests/browser/node_modules/
+/crates/integration-tests/browser/test-results/
+/crates/integration-tests/browser/playwright-report/
+/crates/integration-tests/browser/.browser-test-state.json

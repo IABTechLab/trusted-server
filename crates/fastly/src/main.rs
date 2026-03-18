@@ -12,6 +12,7 @@ use trusted_server_common::constants::{
 };
 use trusted_server_common::error::TrustedServerError;
 use trusted_server_common::geo::GeoInfo;
+use trusted_server_common::http_util::sanitize_forwarded_headers;
 use trusted_server_common::integrations::IntegrationRegistry;
 use trusted_server_common::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -31,6 +32,12 @@ use crate::error::to_error_response;
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
     init_logger();
+
+    // Keep the health probe independent from settings loading and routing so
+    // readiness checks still get a cheap liveness response during startup.
+    if req.get_method() == Method::GET && req.get_path() == "/health" {
+        return Ok(Response::from_status(200).with_body_text_plain("ok"));
+    }
 
     let settings = match get_settings() {
         Ok(s) => s,
@@ -70,8 +77,13 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Error> {
+    // Strip client-spoofable forwarded headers at the edge.
+    // On Fastly this service IS the first proxy — these headers from
+    // clients are untrusted and can hijack URL rewriting (see #409).
+    sanitize_forwarded_headers(&mut req);
+
     // Extract geo info before auth check or routing consumes the request
     let geo_info = GeoInfo::from_request(&req);
 
@@ -106,6 +118,7 @@ async fn route_request(
         (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
 
         // Key rotation admin endpoints
+        // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/common/src/settings.rs
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
 
@@ -188,7 +201,7 @@ fn init_logger() {
         .echo_stdout(true)
         .max_level(log::LevelFilter::Debug)
         .build()
-        .expect("Failed to build Logger");
+        .expect("should build Logger");
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -206,5 +219,5 @@ fn init_logger() {
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
-        .expect("Failed to initialize logger");
+        .expect("should initialize logger");
 }

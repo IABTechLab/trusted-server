@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -70,6 +71,18 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// Bidders that should run client-side in the browser via native Prebid.js
+    /// adapters instead of being routed through the server-side auction.
+    ///
+    /// These bidders are **not** absorbed into the `trustedServer` adapter and
+    /// remain as standalone bids in each ad unit.  The corresponding Prebid.js
+    /// adapter modules must be statically imported in the JS bundle so they are
+    /// available at runtime.
+    ///
+    /// This list is independent of [`bidders`](Self::bidders) — the operator
+    /// manages both lists explicitly.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub client_side_bidders: Vec<String>,
     /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
     /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
     /// — a non-standard Prebid.js field used as a temporary workaround),
@@ -216,6 +229,19 @@ fn build(
         return Ok(None);
     };
 
+    // Warn about bidders that appear in both lists — this is likely a config
+    // mistake. A bidder should be in either `bidders` (server-side) or
+    // `client_side_bidders` (browser-side), not both.
+    for bidder in &config.client_side_bidders {
+        if config.bidders.iter().any(|b| b == bidder) {
+            log::warn!(
+                "prebid: bidder \"{}\" is in both bidders and client_side_bidders — \
+                 it will run server-side AND be left for client-side, which is likely unintended",
+                bidder
+            );
+        }
+    }
+
     Ok(Some(PrebidIntegration::new(config)))
 }
 
@@ -314,6 +340,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: u32,
             debug: bool,
             bidders: &'a [String],
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            client_side_bidders: &'a [String],
         }
 
         let payload = InjectedPrebidClientConfig {
@@ -321,6 +349,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: self.config.timeout_ms,
             debug: self.config.debug,
             bidders: &self.config.bidders,
+            client_side_bidders: &self.config.client_side_bidders,
         };
 
         // Escape `</` to prevent breaking out of the script tag.
@@ -863,8 +892,12 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to set request body".to_string(),
             })?;
 
-        // Send request asynchronously
-        let backend_name = BackendConfig::from_url(&self.config.server_url, true)?;
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.server_url,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )?;
         let pending =
             pbs_req
                 .send_async(backend_name)
@@ -954,8 +987,19 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.server_url, true).ok()
+    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
+        BackendConfig::backend_name_for_url(
+            &self.config.server_url,
+            true,
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .inspect_err(|e| {
+            log::error!(
+                "Failed to create backend for Prebid server URL '{}': {e:?}",
+                self.config.server_url
+            );
+        })
+        .ok()
     }
 }
 
@@ -1036,6 +1080,7 @@ mod tests {
             test_mode: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::new(),
         }
     }
@@ -1096,6 +1141,11 @@ mod tests {
 
     /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
     const TOML_BASE: &str = r#"
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "admin-pass"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
@@ -1487,6 +1537,48 @@ server_url = "https://prebid.example"
         assert!(
             script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
             "should escape closing script tags inside JSON values: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_client_side_bidders_when_empty() {
+        let integration = PrebidIntegration::new(base_config());
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            !script.contains("clientSideBidders"),
+            "should omit clientSideBidders when empty: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_client_side_bidders_when_configured() {
+        let mut config = base_config();
+        config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
+            "should include clientSideBidders array: {}",
             script
         );
     }
