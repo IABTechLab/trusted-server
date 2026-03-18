@@ -50,6 +50,7 @@ pub mod models;
 pub mod openrtb;
 pub mod proxy;
 pub mod publisher;
+pub mod redacted;
 pub mod request_signing;
 pub mod rsc_flight;
 pub mod settings;
