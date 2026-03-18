@@ -85,6 +85,7 @@ fn is_safe_cookie_value(value: &str) -> bool {
 }
 
 /// Formats the `Set-Cookie` header value for the synthetic ID cookie.
+#[must_use]
 fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
     format!(
         "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
@@ -144,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cookies_to_jar_emtpy() {
+    fn test_parse_cookies_to_jar_empty() {
         let cookie_str = "";
         let jar = parse_cookies_to_jar(cookie_str);
 

@@ -132,6 +132,10 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         .and_then(|h| h.to_str().ok())
     {
         let id = synthetic_id.to_string();
+        // The ID is user-supplied from the x-synthetic-id request header. Log injection via
+        // embedded newlines is not a concern here: Fastly's log-fastly backend transmits log
+        // records as opaque byte sequences, so a newline in a field value does not synthesise
+        // an additional log record at the collector.
         log::info!("Using existing Synthetic ID from header: {}", id);
         return Ok(Some(id));
     }
@@ -140,6 +144,9 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
                 let id = cookie.value().to_string();
+                // The ID is user-supplied from the synthetic_id cookie. The same log-injection
+                // note as the header path applies: Fastly's log-fastly backend does not treat
+                // embedded newlines as record separators.
                 log::info!("Using existing Trusted Server ID from cookie: {}", id);
                 return Ok(Some(id));
             }

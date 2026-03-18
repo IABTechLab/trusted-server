@@ -334,6 +334,8 @@ pub fn handle_publisher_request(
         );
     }
 
+    // Response-header injection: Fastly's HeaderValue API rejects values containing \r, \n,
+    // or \0, so a crafted synthetic_id cannot inject additional response headers.
     response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
     // Cookie is intentionally not set when synthetic_id contains RFC 6265-illegal characters
     // (e.g. a crafted x-synthetic-id header value). The response header is still emitted so
