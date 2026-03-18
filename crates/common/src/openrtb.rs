@@ -113,6 +113,8 @@ pub struct RegsExt {
     pub gpp_sid: Option<Vec<u16>>,
 }
 
+impl ToExt for RegsExt {}
+
 #[derive(Debug, Serialize)]
 pub struct RequestExt {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,11 +253,16 @@ mod tests {
             gpp_sid: Some(vec![2, 6]),
         };
         let regs = Regs {
-            gdpr: ext.gdpr,
+            coppa: None,
+            gdpr: Some(true),
             us_privacy: ext.us_privacy.clone(),
             gpp: ext.gpp.clone(),
-            gpp_sid: ext.gpp_sid.clone(),
-            ext: Some(ext),
+            gpp_sid: ext
+                .gpp_sid
+                .as_ref()
+                .map(|ids| ids.iter().map(|&id| i32::from(id)).collect())
+                .unwrap_or_default(),
+            ext: ext.to_ext(),
         };
 
         let serialized = serde_json::to_value(&regs).expect("should serialize");
@@ -319,14 +326,16 @@ mod tests {
         let user = User {
             id: Some("user-1".to_string()),
             consent: Some("CPXxGfAPXxGfA".to_string()),
-            ext: Some(UserExt {
+            ext: UserExt {
                 consent: Some("CPXxGfAPXxGfA".to_string()),
                 consented_providers_settings: Some(ConsentedProvidersSettings {
                     consented_providers: Some("2~2628.2316~dv.".to_string()),
                 }),
                 eids: None,
                 synthetic_fresh: None,
-            }),
+            }
+            .to_ext(),
+            ..Default::default()
         };
 
         let serialized = serde_json::to_value(&user).expect("should serialize");
@@ -351,6 +360,7 @@ mod tests {
             id: Some("user-1".to_string()),
             consent: None,
             ext: None,
+            ..Default::default()
         };
 
         let serialized = serde_json::to_value(&user).expect("should serialize");

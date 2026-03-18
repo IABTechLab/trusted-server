@@ -19,7 +19,6 @@ use crate::backend::BackendConfig;
 use crate::consent_config::ConsentForwardingMode;
 use crate::cookies::forward_cookie_header;
 use crate::error::TrustedServerError;
-use crate::geo::is_gdpr_country;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -48,6 +47,7 @@ const DEFAULT_CURRENCY: &str = "USD";
 /// signed (`N`). The opt-out (position 2 = `Y`) matches GPC intent. Position 3
 /// (`N` = LSPA not applicable) is a conservative default that may not hold for
 /// all publishers — consider making this configurable per-publisher in the future.
+#[cfg(test)]
 const GPC_US_PRIVACY: &str = "1YYN";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -688,7 +688,7 @@ impl PrebidAuctionProvider {
             id: Some(request.user.id.clone()),
             // OpenRTB 2.6 top-level consent field
             consent: raw_tc.clone(),
-            ext: Some(UserExt {
+            ext: UserExt {
                 // Prebid ext-based consent field
                 consent: raw_tc,
                 consented_providers_settings: consent_ctx
@@ -700,7 +700,7 @@ impl PrebidAuctionProvider {
                 // is applied via `gate_eids_by_consent` before they are set here.
                 eids: None,
                 synthetic_fresh: Some(request.user.fresh_id.clone()),
-            })
+            }
             .to_ext(),
             ..Default::default()
         });
@@ -784,58 +784,9 @@ impl PrebidAuctionProvider {
                 }
             });
 
-        // Build regs object.
-        //
-        // GDPR applicability is determined from the user's geo (EU/EEA/UK
-        // country check). When geo is unavailable we fall back to the
-        // conservative assumption that GDPR applies if a consent string is
-        // present. A future enhancement can parse TCF segment 0 for the
-        // authoritative `isSubjectToGDPR` signal.
-        //
-        // us_privacy is set when Sec-GPC header signals opt-out.
-        let gdpr_from_geo = request
-            .device
-            .as_ref()
-            .and_then(|d| d.geo.as_ref())
-            .map(|geo| is_gdpr_country(&geo.country));
-
-        let gdpr = match gdpr_from_geo {
-            Some(true) => Some(true),
-            // Geo says non-GDPR, but a consent string is present — the CMP is
-            // the stronger signal (VPN, carrier IP, geo-DB drift can all cause
-            // false negatives).
-            Some(false) if request.user.consent.is_some() => Some(true),
-            Some(false) => Some(false),
-            // No geo available — conservatively assume GDPR if consent string
-            // is present (a CMP was active).
-            None => request.user.consent.as_ref().map(|_| true),
-        };
-
-        let has_gpc = context
-            .request
-            .get_header_str("Sec-GPC")
-            .is_some_and(|v| v.trim() == "1");
-
-        let us_privacy = if has_gpc {
-            Some(GPC_US_PRIVACY.to_string())
-        } else {
-            None
-        };
-
-        // `us_privacy` is placed at the top-level `regs.us_privacy` field per
-        // OpenRTB 2.6. Prebid Server v2+ and all major SSP adapters read this
-        // location. The legacy `regs.ext.us_privacy` placement (USP 1.0) is
-        // not duplicated here — if an older adapter requires it, PBS will
-        // copy the value downstream.
-        let regs = if gdpr.is_some() || us_privacy.is_some() {
-            Some(Regs {
-                gdpr,
-                us_privacy,
-                ..Default::default()
-            })
-        } else {
-            None
-        };
+        // Build regs object from ConsentContext, populating both OpenRTB 2.6
+        // top-level fields and `regs.ext` for Prebid Server compatibility.
+        let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
         let request_info = RequestInfo::from_request(context.request);
@@ -930,14 +881,14 @@ impl PrebidAuctionProvider {
             crate::consent::jurisdiction::Jurisdiction::Gdpr
         );
         let gdpr = if ctx.gdpr_applies || in_gdpr_jurisdiction {
-            Some(1)
+            Some(true)
         } else if matches!(
             ctx.jurisdiction,
             crate::consent::jurisdiction::Jurisdiction::Unknown
         ) {
             None
         } else {
-            Some(0)
+            Some(false)
         };
 
         // Dual-placement: OpenRTB 2.6 top-level fields AND `regs.ext` for
@@ -947,19 +898,26 @@ impl PrebidAuctionProvider {
         let gpp = ctx.raw_gpp_string.clone();
         let gpp_sid = ctx.gpp_section_ids.clone();
 
+        // RegsExt uses u8 for GDPR (Prebid convention) while the top-level
+        // Regs uses bool (OpenRTB proto). Map accordingly.
+        let gdpr_u8 = gdpr.map(u8::from);
+        let gpp_sid_u16 = gpp_sid.clone();
         let ext = RegsExt {
-            gdpr,
+            gdpr: gdpr_u8,
             us_privacy: us_privacy.clone(),
             gpp: gpp.clone(),
-            gpp_sid: gpp_sid.clone(),
+            gpp_sid: gpp_sid_u16,
         };
 
         Some(Regs {
+            coppa: None,
             gdpr,
             us_privacy,
             gpp,
-            gpp_sid,
-            ext: Some(ext),
+            gpp_sid: gpp_sid
+                .map(|ids| ids.into_iter().map(i32::from).collect())
+                .unwrap_or_default(),
+            ext: ext.to_ext(),
         })
     }
 
@@ -1351,6 +1309,7 @@ mod tests {
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
+    use crate::consent::ConsentContext;
     use crate::geo::GeoInfo;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
@@ -2102,7 +2061,11 @@ server_url = "https://prebid.example"
     fn to_openrtb_includes_consent_and_gdpr_flag_from_geo() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        auction_request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            gdpr_applies: true,
+            ..Default::default()
+        });
         // Set device with EU geo so GDPR applies from geo check
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
@@ -2143,7 +2106,11 @@ server_url = "https://prebid.example"
         // cause false negatives).
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        auction_request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            gdpr_applies: true,
+            ..Default::default()
+        });
         // US geo — but consent string overrides
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
@@ -2173,11 +2140,11 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn to_openrtb_sets_gdpr_false_for_non_eu_country_without_consent() {
+    fn to_openrtb_omits_regs_for_non_eu_country_without_consent() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = None;
-        // US geo, no consent string — GDPR should not apply
+        // US geo, no consent string — no consent data to forward
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
             ip: None,
@@ -2198,10 +2165,9 @@ server_url = "https://prebid.example"
 
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
 
-        assert_eq!(
-            openrtb.regs.as_ref().and_then(|r| r.gdpr),
-            Some(false),
-            "should set regs.gdpr=false for non-EU country without consent string"
+        assert!(
+            openrtb.regs.is_none(),
+            "should omit regs when no consent context is present"
         );
     }
 
@@ -2209,7 +2175,11 @@ server_url = "https://prebid.example"
     fn to_openrtb_falls_back_to_consent_when_no_geo() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some("BOtest-consent-string".to_string());
+        auction_request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            gdpr_applies: true,
+            ..Default::default()
+        });
         // No device/geo
 
         let settings = make_settings();
@@ -2242,11 +2212,17 @@ server_url = "https://prebid.example"
     #[test]
     fn to_openrtb_sets_gpc_us_privacy() {
         let provider = PrebidAuctionProvider::new(base_config());
-        let auction_request = create_test_auction_request();
+        let mut auction_request = create_test_auction_request();
+        // GPC signal is carried via ConsentContext, populated by the
+        // consent extraction pipeline from the Sec-GPC header.
+        auction_request.user.consent = Some(ConsentContext {
+            gpc: true,
+            raw_us_privacy: Some(GPC_US_PRIVACY.to_string()),
+            ..Default::default()
+        });
 
         let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Sec-GPC", "1");
+        let request = Request::get("https://pub.example/auction");
         let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
@@ -2255,26 +2231,199 @@ server_url = "https://prebid.example"
         assert_eq!(
             regs.us_privacy.as_deref(),
             Some(GPC_US_PRIVACY),
-            "should set us_privacy from Sec-GPC: 1"
+            "should set us_privacy from GPC consent signal"
+        );
+    }
+
+    // ========================================================================
+    // build_regs unit tests
+    // ========================================================================
+
+    #[test]
+    fn build_regs_returns_none_when_no_consent_context() {
+        let result = PrebidAuctionProvider::build_regs(None);
+        assert!(
+            result.is_none(),
+            "should return None when consent context is absent"
         );
     }
 
     #[test]
-    fn to_openrtb_ignores_gpc_header_with_non_one_value() {
-        let provider = PrebidAuctionProvider::new(base_config());
-        let auction_request = create_test_auction_request();
+    fn build_regs_returns_none_when_consent_context_is_empty() {
+        let ctx = ConsentContext::default();
+        let result = PrebidAuctionProvider::build_regs(Some(&ctx));
+        assert!(
+            result.is_none(),
+            "should return None when consent context has no actionable data"
+        );
+    }
 
-        let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Sec-GPC", "0");
-        let context = create_test_auction_context(&settings, &request);
+    #[test]
+    fn build_regs_populates_gpp_and_section_ids() {
+        let ctx = ConsentContext {
+            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
+            gpp_section_ids: Some(vec![2, 6]),
+            ..Default::default()
+        };
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs for GPP data");
+
+        assert_eq!(
+            regs.gpp.as_deref(),
+            Some("DBACNYA~CPXxRfA"),
+            "should set top-level regs.gpp"
+        );
+        assert_eq!(
+            regs.gpp_sid,
+            vec![2i32, 6i32],
+            "should convert gpp_sid u16 to i32"
+        );
+
+        // Verify dual-placement in ext
+        let ext = regs
+            .ext
+            .as_ref()
+            .expect("should have ext for dual-placement");
+        assert_eq!(
+            ext.get("gpp").and_then(|v| v.as_str()),
+            Some("DBACNYA~CPXxRfA"),
+            "should mirror gpp in regs.ext"
+        );
+        assert_eq!(
+            ext.get("gpp_sid"),
+            Some(&serde_json::json!([2, 6])),
+            "should mirror gpp_sid in regs.ext"
+        );
+    }
+
+    #[test]
+    fn build_regs_sets_gdpr_true_from_jurisdiction() {
+        // EU user with GPC but no TCF string — GDPR should still be flagged
+        // based on jurisdiction alone.
+        let ctx = ConsentContext {
+            gpc: true,
+            raw_us_privacy: Some("1YYN".to_string()),
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            ..Default::default()
+        };
+
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs for GDPR jurisdiction");
+
+        assert_eq!(
+            regs.gdpr,
+            Some(true),
+            "should set gdpr=true from GDPR jurisdiction even without TCF string"
+        );
+    }
+
+    #[test]
+    fn build_regs_omits_gdpr_for_unknown_jurisdiction_without_tcf() {
+        // GPC-only request with no geo — jurisdiction is Unknown, no TCF
+        // signal. GDPR field should be None (omitted) rather than false.
+        let ctx = ConsentContext {
+            gpc: true,
+            raw_us_privacy: Some("1YYN".to_string()),
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Unknown,
+            ..Default::default()
+        };
+
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs for GPC signal");
 
         assert!(
-            openrtb.regs.is_none(),
-            "should not set regs when Sec-GPC is not '1'"
+            regs.gdpr.is_none(),
+            "should omit gdpr when jurisdiction is unknown and no TCF signal exists"
         );
+    }
+
+    #[test]
+    fn build_regs_sets_gdpr_false_for_non_regulated_jurisdiction() {
+        // Non-EU, non-US-state user with a US privacy string.
+        let ctx = ConsentContext {
+            raw_us_privacy: Some("1NNN".to_string()),
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        };
+
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs for us_privacy");
+
+        assert_eq!(
+            regs.gdpr,
+            Some(false),
+            "should set gdpr=false for non-regulated jurisdiction"
+        );
+    }
+
+    #[test]
+    fn build_regs_dual_placement_mirrors_all_fields() {
+        let ctx = ConsentContext {
+            gdpr_applies: true,
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
+            gpp_section_ids: Some(vec![7]),
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            ..Default::default()
+        };
+
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs with full consent data");
+
+        let ext = regs
+            .ext
+            .as_ref()
+            .expect("should have ext for dual-placement");
+
+        // Top-level uses bool (OpenRTB proto); ext uses integer (Prebid convention).
+        // Both serialize to the same JSON value (1).
+        assert_eq!(regs.gdpr, Some(true), "top-level gdpr should be true");
+        assert_eq!(
+            ext.get("gdpr").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "ext.gdpr should be 1 (mirroring top-level)"
+        );
+
+        assert_eq!(regs.us_privacy.as_deref(), Some("1YNN"));
+        assert_eq!(
+            ext.get("us_privacy").and_then(|v| v.as_str()),
+            Some("1YNN"),
+            "ext.us_privacy should mirror top-level"
+        );
+
+        assert_eq!(regs.gpp.as_deref(), Some("DBACNYA~CPXxRfA"));
+        assert_eq!(
+            ext.get("gpp").and_then(|v| v.as_str()),
+            Some("DBACNYA~CPXxRfA"),
+            "ext.gpp should mirror top-level"
+        );
+
+        assert_eq!(regs.gpp_sid, vec![7i32]);
+        assert_eq!(
+            ext.get("gpp_sid"),
+            Some(&serde_json::json!([7])),
+            "ext.gpp_sid should mirror top-level"
+        );
+    }
+
+    #[test]
+    fn build_regs_ext_omitted_when_all_fields_none() {
+        // gdpr_applies=true but no strings — only gdpr flag is set.
+        // RegsExt should serialize to an object with only gdpr, which is
+        // non-empty, so ext should still be present.
+        let ctx = ConsentContext {
+            gdpr_applies: true,
+            ..Default::default()
+        };
+
+        let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
+            .expect("should produce regs for gdpr_applies");
+
+        assert_eq!(regs.gdpr, Some(true));
+        // ext should exist because RegsExt has gdpr=Some(1)
+        let ext = regs.ext.as_ref().expect("should have ext when gdpr is set");
+        assert_eq!(ext.get("gdpr").and_then(serde_json::Value::as_u64), Some(1));
     }
 
     #[test]
