@@ -102,8 +102,6 @@ function renderCreativeInline({
         seat,
         creativeId,
         originalLength: sanitization.originalLength,
-        sanitizedLength: sanitization.sanitizedLength,
-        removedCount: sanitization.removedCount,
         rejectionReason: sanitization.rejectionReason,
       });
       return;
@@ -144,8 +142,6 @@ function renderCreativeInline({
       width,
       height,
       originalLength: sanitization.originalLength,
-      sanitizedLength: sanitization.sanitizedLength,
-      removedCount: sanitization.removedCount,
     });
   } catch (err) {
     log.warn('renderCreativeInline: failed', { slotId, seat, creativeId, err });

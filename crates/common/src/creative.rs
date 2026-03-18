@@ -361,52 +361,23 @@ pub fn sanitize_creative_html(markup: &str) -> String {
         HtmlSettings {
             element_content_handlers: vec![
                 // Remove executable/dangerous elements along with their inner content.
-                element!("script", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("iframe", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("object", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("embed", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("base", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("meta", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("form", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("link", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                // <style> blocks can carry CSS expressions, @import for external
-                // resource loading, and url() data exfiltration — strip them for
-                // consistency with <link> (external stylesheets) treatment.
-                element!("style", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                // <noscript> content is rendered by browsers when scripts are disabled,
-                // which is always the case inside a sandbox without allow-scripts.
-                // Strip it as defense-in-depth against parser differential attacks.
-                element!("noscript", |el| {
-                    el.remove();
-                    Ok(())
-                }),
+                // - <script>, <iframe>, <object>, <embed>: direct execution vectors.
+                // - <base>: rewrites all relative URLs, undermining the proxy rewriter.
+                // - <meta>: can trigger redirects (http-equiv=refresh) or inject CSP.
+                // - <form>: action/formaction can exfiltrate data; stripped to match the
+                //   iframe sandbox which omits allow-forms.
+                // - <link>: external stylesheet/resource loading.
+                // - <style>: CSS expressions, @import, and url() data exfiltration.
+                // - <noscript>: rendered when scripts are disabled (always the case
+                //   inside a sandbox without allow-scripts); strip to prevent parser
+                //   differential attacks.
+                element!(
+                    "script, iframe, object, embed, base, meta, form, link, style, noscript",
+                    |el| {
+                        el.remove();
+                        Ok(())
+                    }
+                ),
                 // Strip event-handler attributes and dangerous URI scheme values from
                 // every element. Note: lol_html calls this handler for the opening tag of
                 // each element including those already marked for removal above (e.g.
@@ -449,33 +420,44 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                         }
                     }
 
-                    // srcset is a comma-separated list of "url [descriptor]" entries.
-                    // Check each URL individually so a dangerous URI anywhere in the list
-                    // is caught, not just one at the start of the attribute string.
+                    // srcset and imagesrcset are comma-separated lists of "url [descriptor]"
+                    // entries. Check each URL individually so a dangerous URI anywhere in
+                    // the list is caught, not just one at the start of the attribute string.
                     // Intentionally fail-closed: if any entry is dangerous, the entire
-                    // srcset attribute is removed rather than filtering individual entries.
-                    // A mixed safe/dangerous srcset is a strong indicator of a malicious
-                    // creative, so dropping the whole attribute is the correct response.
-                    if let Some(val) = el.get_attribute("srcset") {
-                        let is_dangerous = val.split(',').any(|entry| {
-                            let url = entry
-                                .trim()
-                                .split_ascii_whitespace()
-                                .next()
-                                .unwrap_or("")
-                                .to_ascii_lowercase();
-                            url.starts_with("javascript:")
-                                || url.starts_with("vbscript:")
-                                || (url.starts_with("data:") && !is_safe_data_uri(&url))
-                        });
-                        if is_dangerous {
-                            el.remove_attribute("srcset");
+                    // attribute is removed rather than filtering individual entries. A mixed
+                    // safe/dangerous srcset is a strong indicator of a malicious creative,
+                    // so dropping the whole attribute is the correct response.
+                    // imagesrcset appears on <link> and <source> elements; <link> is already
+                    // removed above, but <source> is not, so both attributes are checked here.
+                    for attr_name in ["srcset", "imagesrcset"] {
+                        if let Some(val) = el.get_attribute(attr_name) {
+                            let is_dangerous = val.split(',').any(|entry| {
+                                let url = entry
+                                    .trim()
+                                    .split_ascii_whitespace()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                url.starts_with("javascript:")
+                                    || url.starts_with("vbscript:")
+                                    || (url.starts_with("data:") && !is_safe_data_uri(&url))
+                            });
+                            if is_dangerous {
+                                el.remove_attribute(attr_name);
+                            }
                         }
                     }
 
                     // Strip inline styles containing CSS expressions, JS URIs, or
                     // data: URIs with executable MIME types (SVG and text/application
                     // subtypes can carry HTML/JS payloads inside CSS url() values).
+                    // NOTE: This uses simple substring matching on the lowercased value,
+                    // which does not handle CSS escape sequences (e.g. `\65xpression(`)
+                    // or comments (e.g. `expr/**/ession(`). That is acceptable: CSS
+                    // expression() is IE6-8 only and the iframe sandbox's absence of
+                    // allow-scripts prevents execution even if an obfuscated value were
+                    // to slip through. The sandbox is the primary mitigation; this check
+                    // is defense-in-depth for obvious patterns.
                     if let Some(style) = el.get_attribute("style") {
                         let lower = style.to_ascii_lowercase();
                         if lower.contains("expression(")
@@ -1643,6 +1625,73 @@ mod tests {
         assert!(
             out.contains("large.png"),
             "should preserve second srcset URL"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_imagesrcset_on_source() {
+        // <source> is not in the element removal list, so imagesrcset must be
+        // sanitized by the attribute handler. <link imagesrcset> is already
+        // covered by link removal, but <source> is not.
+        let html = r#"<picture><source imagesrcset="javascript:alert(1) 1x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should strip dangerous imagesrcset attribute"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should not contain javascript: after stripping imagesrcset"
+        );
+        assert!(
+            out.contains("<source"),
+            "should preserve the source element"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_imagesrcset_non_leading_entry() {
+        // A dangerous URI that is NOT the first entry must also be caught.
+        let html = r#"<picture><source imagesrcset="https://cdn.example/img.png 1x, javascript:alert(1) 2x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should remove imagesrcset with non-leading dangerous URL"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_imagesrcset() {
+        let html = r#"<picture><source imagesrcset="https://cdn.example/img-1x.png 1x, https://cdn.example/img-2x.png 2x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            out.contains("imagesrcset"),
+            "should preserve safe imagesrcset"
+        );
+        assert!(
+            out.contains("img-1x.png"),
+            "should preserve first candidate"
+        );
+        assert!(
+            out.contains("img-2x.png"),
+            "should preserve second candidate"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_data_svg_imagesrcset() {
+        // data:image/svg+xml can embed script — must be rejected even though it
+        // starts with "data:image/". Mirrors sanitize_strips_data_svg_src coverage
+        // for imagesrcset.
+        let html = r#"<picture><source imagesrcset="data:image/svg+xml,<svg onload=alert(1)> 1x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should strip data:image/svg imagesrcset"
+        );
+        assert!(
+            !out.contains("data:image/svg"),
+            "should not contain svg data URI after stripping"
         );
     }
 

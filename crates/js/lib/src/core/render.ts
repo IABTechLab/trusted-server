@@ -6,6 +6,13 @@ import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
+// Sandbox permissions granted to creative iframes.
+// Notably absent:
+//   allow-scripts, allow-same-origin — prevent JS execution and same-origin
+//     access, which are the primary attack vectors for malicious creatives.
+//   allow-forms — server-side sanitization strips <form> elements, so form
+//     submission from creatives is not a supported use case. Omitting this token
+//     is consistent with that server-side policy and reduces the attack surface.
 const CREATIVE_SANDBOX_TOKENS = [
   'allow-popups',
   'allow-popups-to-escape-sandbox',
@@ -18,14 +25,21 @@ export type AcceptedCreativeHtml = {
   kind: 'accepted';
   originalLength: number;
   sanitizedHtml: string;
+  // Always equal to originalLength: the client validates type/emptiness only;
+  // server-side sanitization has already run before adm reaches this function.
+  // Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
   sanitizedLength: number;
+  // Always 0 for the same reason — no content is removed client-side.
   removedCount: number;
 };
 
 export type RejectedCreativeHtml = {
   kind: 'rejected';
   originalLength: number;
+  // Always equal to originalLength (or 0 for non-string input): no client-side
+  // removal occurs. Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
   sanitizedLength: number;
+  // Always 0 — no content is removed client-side.
   removedCount: number;
   rejectionReason: CreativeSanitizationRejectionReason;
 };

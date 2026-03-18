@@ -62,7 +62,6 @@ describe('request.requestAds', () => {
         seat: 'trusted-server',
         creativeId: 'creative-1',
         originalLength: creativeHtml.length,
-        sanitizedLength: creativeHtml.length,
       })
     );
   });
