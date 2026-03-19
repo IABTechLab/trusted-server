@@ -17,6 +17,7 @@ use serde::Deserialize;
 use validator::Validate;
 
 use crate::backend::BackendConfig;
+use crate::cookies::forward_cookie_header;
 use crate::error::TrustedServerError;
 use crate::http_util::copy_custom_headers;
 use crate::integrations::{
@@ -213,6 +214,10 @@ impl LockrIntegration {
     }
 
     /// Copy relevant request headers for proxying.
+    ///
+    /// Consent cookies are always stripped — consent signals are forwarded
+    /// through the `OpenRTB` body by the Prebid integration, not through
+    /// Lockr's cookie-based API calls.
     fn copy_request_headers(&self, from: &Request, to: &mut Request) {
         let headers_to_copy = [
             header::CONTENT_TYPE,
@@ -221,7 +226,6 @@ impl LockrIntegration {
             header::AUTHORIZATION,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
-            header::COOKIE,
         ];
 
         for header_name in &headers_to_copy {
@@ -229,6 +233,9 @@ impl LockrIntegration {
                 to.set_header(header_name, value);
             }
         }
+
+        // Always strip consent cookies — consent travels through the OpenRTB body
+        forward_cookie_header(from, to, true);
 
         // Use origin override if configured, otherwise forward original
         let origin = self
