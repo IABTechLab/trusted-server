@@ -31,7 +31,7 @@ pub fn enforce_basic_auth(
         None => return Ok(Some(unauthorized_response())),
     };
 
-    if username == handler.username && password == handler.password {
+    if handler.username == username && handler.password == password {
         Ok(None)
     } else {
         Ok(Some(unauthorized_response()))
