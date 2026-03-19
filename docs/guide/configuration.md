@@ -245,6 +245,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 **Security**:
 
 - Keep confidential and secure
+- Cannot be the placeholder `"change-me-proxy-secret"` (case-insensitive) — startup will fail
 - Rotate periodically (90 days recommended)
 - Use cryptographically random values (32+ bytes)
 - Never commit to version control
@@ -360,7 +361,7 @@ fastly kv-store create --name=opid_store
 **Security**:
 
 - Must be non-empty
-- Cannot be `"secret_key"` or `"secret-key"` (reserved/invalid)
+- Cannot be a known placeholder: `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - Rotate periodically for security
 - Store securely (environment variable recommended)
 
@@ -374,7 +375,7 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
-- Exactly `"secret_key"` or `"secret-key"` (default placeholders)
+- Exactly `"secret-key"`, `"secret_key"`, or `"trusted-server"` (known placeholders, case-insensitive)
 
 #### `template`
 
@@ -996,11 +997,12 @@ Configuration is validated at startup:
 
 - All fields non-empty
 - `origin_url` is valid URL
+- `proxy_secret` ≠ known placeholder (`"change-me-proxy-secret"` — case-insensitive)
 
 **Synthetic Validation**:
 
 - `secret_key` ≥ 1 character
-- `secret_key` ≠ `"secret-key"`
+- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 - `template` non-empty
 
 **Handler Validation**:
@@ -1110,11 +1112,12 @@ trusted-server.dev.toml      # Development overrides
 - Verify all required fields present
 - Check environment variable format
 
-**"Secret key is not valid"**:
+**"Configuration field '...' is set to a known placeholder value"**:
 
-- Cannot use `"secret-key"` (placeholder)
+- `synthetic.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
-- Change to secure random value
+- Change to a secure random value (see generation commands above)
 
 **"Invalid regex"**:
 
