@@ -62,10 +62,6 @@ impl<T> fmt::Display for Redacted<T> {
     }
 }
 
-// TODO(#447): These `PartialEq` impls use standard (non-constant-time) comparison.
-// Security-sensitive call-sites should use `.expose()` with `subtle::ConstantTimeEq`
-// instead. Consider removing these impls to prevent accidental non-constant-time
-// comparisons of secrets.
 impl<T: PartialEq> PartialEq for Redacted<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
