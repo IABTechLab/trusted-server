@@ -16,6 +16,9 @@ use http::StatusCode;
 #[derive(Debug, Display)]
 pub enum TrustedServerError {
     /// Client-side input/validation error resulting in a 400 Bad Request.
+    ///
+    /// **Note:** `message` is returned to clients in the HTTP response body.
+    /// Keep it free of internal implementation details.
     #[display("Bad request: {message}")]
     BadRequest { message: String },
     /// Configuration errors that prevent the server from starting.
@@ -87,7 +90,10 @@ pub trait IntoHttpResponse {
     /// Convert the error into an HTTP status code.
     fn status_code(&self) -> StatusCode;
 
-    /// Get the error message to show to users (uses the Display implementation).
+    /// Get a safe, user-facing error message.
+    ///
+    /// Client errors (4xx) return a brief description; server/integration errors
+    /// return a generic message. Full error details are preserved in server logs.
     fn user_message(&self) -> String;
 }
 
@@ -112,7 +118,92 @@ impl IntoHttpResponse for TrustedServerError {
     }
 
     fn user_message(&self) -> String {
-        // Use the Display implementation which already has the specific error message
-        self.to_string()
+        match self {
+            // Client errors (4xx) — safe to surface a brief description
+            Self::BadRequest { message } => format!("Bad request: {message}"),
+            // Consent strings may contain user data; return category only.
+            Self::GdprConsent { .. } => "GDPR consent error".to_string(),
+            Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            Self::InvalidUtf8 { .. } => "Invalid request data".to_string(),
+            // Server/integration errors (5xx/502/503) — generic message only.
+            // Full details are already logged via log::error! in to_error_response.
+            _ => "An internal error occurred".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_errors_return_generic_message() {
+        let cases = [
+            TrustedServerError::Configuration {
+                message: "secret db path".into(),
+            },
+            TrustedServerError::KvStore {
+                store_name: "users".into(),
+                message: "timeout".into(),
+            },
+            TrustedServerError::Proxy {
+                message: "upstream 10.0.0.1 refused".into(),
+            },
+            TrustedServerError::SyntheticId {
+                message: "seed file missing".into(),
+            },
+            TrustedServerError::Template {
+                message: "render failed".into(),
+            },
+            TrustedServerError::Auction {
+                message: "bid timeout".into(),
+            },
+            TrustedServerError::Gam {
+                message: "api key invalid".into(),
+            },
+            TrustedServerError::Prebid {
+                message: "adapter error".into(),
+            },
+            TrustedServerError::Integration {
+                integration: "foo".into(),
+                message: "connection refused".into(),
+            },
+            TrustedServerError::Settings {
+                message: "parse failed".into(),
+            },
+            TrustedServerError::InsecureDefault {
+                field: "api_key".into(),
+            },
+        ];
+        for error in &cases {
+            assert_eq!(
+                error.user_message(),
+                "An internal error occurred",
+                "should not leak details for {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn client_errors_return_safe_descriptions() {
+        let error = TrustedServerError::BadRequest {
+            message: "missing field".into(),
+        };
+        assert_eq!(error.user_message(), "Bad request: missing field");
+
+        let error = TrustedServerError::GdprConsent {
+            message: "no consent string".into(),
+        };
+        assert_eq!(error.user_message(), "GDPR consent error");
+
+        let error = TrustedServerError::InvalidHeaderValue {
+            message: "non-ascii".into(),
+        };
+        assert_eq!(error.user_message(), "Invalid header value");
+
+        let error = TrustedServerError::InvalidUtf8 {
+            message: "byte 0xff".into(),
+        };
+        assert_eq!(error.user_message(), "Invalid request data");
     }
 }
