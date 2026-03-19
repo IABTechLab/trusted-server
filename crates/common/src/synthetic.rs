@@ -127,7 +127,7 @@ pub fn generate_synthetic_id(
 
     log::debug!("Generating fresh synthetic ID from template inputs");
 
-    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.as_bytes())
+    let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.expose().as_bytes())
         .change_context(TrustedServerError::SyntheticId {
             message: "Failed to create HMAC instance".to_string(),
         })?;
