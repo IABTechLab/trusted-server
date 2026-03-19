@@ -1,12 +1,17 @@
 import { log } from '../core/log';
 
+import {
+  DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
+  registerDomInsertionHandler,
+  type DomInsertionCandidate,
+} from './dom_insertion_dispatcher';
+
 /**
  * Shared Script Guard Factory
  *
- * Creates a DOM interception guard that patches appendChild and insertBefore
- * to intercept dynamically inserted script (and preload/prefetch link) elements
- * whose URLs match an integration's SDK. The matched URLs are rewritten to a
- * first-party proxy endpoint before the element is inserted into the DOM.
+ * Creates a DOM interception guard that registers with the shared DOM insertion
+ * dispatcher. Matching dynamically inserted script (and preload/prefetch link)
+ * elements are rewritten to a first-party proxy endpoint before insertion.
  *
  * Each call to createScriptGuard() produces an independent guard with its own
  * installation state, so multiple integrations can coexist without interference.
@@ -16,8 +21,12 @@ import { log } from '../core/log';
  * Base configuration shared by all guard types.
  */
 interface ScriptGuardConfigBase {
-  /** Integration name used in log messages (e.g. "Lockr", "Permutive"). */
-  name: string;
+  /** Integration ID used for deterministic ordering and internal identity. */
+  id: string;
+  /** Optional human-readable label used in log messages (e.g. "GTM"). */
+  displayName?: string;
+  /** Lower values run earlier when multiple handlers match the same node. */
+  priority?: number;
   /** Return true if the URL belongs to this integration's SDK. */
   isTargetUrl: (url: string) => boolean;
 }
@@ -45,7 +54,7 @@ interface ScriptGuardConfigWithRewriter extends ScriptGuardConfigBase {
 export type ScriptGuardConfig = ScriptGuardConfigWithProxyPath | ScriptGuardConfigWithRewriter;
 
 export interface ScriptGuard {
-  /** Patch appendChild/insertBefore to intercept matching scripts. */
+  /** Install a shared DOM insertion handler for matching scripts and links. */
   install: () => void;
   /** Whether the guard has already been installed. */
   isInstalled: () => boolean;
@@ -61,38 +70,6 @@ function rewriteToFirstParty(proxyPath: string): string {
 }
 
 /**
- * Determine whether a DOM node is a script or preload/prefetch link element
- * whose URL matches the guard's target pattern.
- */
-function shouldRewriteElement(
-  node: Node,
-  isTargetUrl: (url: string) => boolean
-): node is HTMLScriptElement | HTMLLinkElement {
-  if (!(node instanceof HTMLElement)) {
-    return false;
-  }
-
-  // Script elements
-  if (node.tagName === 'SCRIPT') {
-    const src = (node as HTMLScriptElement).src || node.getAttribute('src');
-    return !!src && isTargetUrl(src);
-  }
-
-  // Link preload/prefetch elements
-  if (node.tagName === 'LINK') {
-    const link = node as HTMLLinkElement;
-    const rel = link.getAttribute('rel');
-    if ((rel !== 'preload' && rel !== 'prefetch') || link.getAttribute('as') !== 'script') {
-      return false;
-    }
-    const href = link.href || link.getAttribute('href');
-    return !!href && isTargetUrl(href);
-  }
-
-  return false;
-}
-
-/**
  * Get the rewritten URL using either the custom rewriter or the proxy path.
  */
 function getRewrittenUrl(originalUrl: string, config: ScriptGuardConfig): string {
@@ -105,43 +82,32 @@ function getRewrittenUrl(originalUrl: string, config: ScriptGuardConfig): string
 /**
  * Rewrite the URL attribute on a matched element to the first-party proxy.
  */
-function rewriteElement(
-  element: HTMLScriptElement | HTMLLinkElement,
-  config: ScriptGuardConfig
-): void {
-  const prefix = `${config.name} guard`;
+function rewriteElement(candidate: DomInsertionCandidate, config: ScriptGuardConfig): void {
+  const prefix = `${config.displayName ?? config.id} guard`;
 
-  if (element.tagName === 'SCRIPT') {
-    const script = element as HTMLScriptElement;
-    const originalSrc = script.src || script.getAttribute('src');
-    if (!originalSrc) return;
-
-    const rewritten = getRewrittenUrl(originalSrc, config);
+  if (candidate.kind === 'script') {
+    const rewritten = getRewrittenUrl(candidate.url, config);
 
     log.info(`${prefix}: rewriting dynamically inserted SDK script`, {
-      original: originalSrc,
+      original: candidate.url,
       rewritten,
-      framework: script.getAttribute('data-nscript') || 'generic',
+      framework: candidate.element.getAttribute('data-nscript') || 'generic',
     });
 
-    script.src = rewritten;
-    script.setAttribute('src', rewritten);
-  } else if (element.tagName === 'LINK') {
-    const link = element as HTMLLinkElement;
-    const originalHref = link.href || link.getAttribute('href');
-    if (!originalHref) return;
+    candidate.element.src = rewritten;
+    candidate.element.setAttribute('src', rewritten);
+  } else {
+    const rewritten = getRewrittenUrl(candidate.url, config);
 
-    const rewritten = getRewrittenUrl(originalHref, config);
-
-    log.info(`${prefix}: rewriting SDK ${link.getAttribute('rel')} link`, {
-      original: originalHref,
+    log.info(`${prefix}: rewriting SDK ${candidate.rel} link`, {
+      original: candidate.url,
       rewritten,
-      rel: link.getAttribute('rel'),
-      as: link.getAttribute('as'),
+      rel: candidate.rel,
+      as: candidate.element.getAttribute('as'),
     });
 
-    link.href = rewritten;
-    link.setAttribute('href', rewritten);
+    candidate.element.href = rewritten;
+    candidate.element.setAttribute('href', rewritten);
   }
 }
 
@@ -150,7 +116,8 @@ function rewriteElement(
  */
 export function createScriptGuard(config: ScriptGuardConfig): ScriptGuard {
   let installed = false;
-  const prefix = `${config.name} guard`;
+  let unregister: (() => void) | undefined;
+  const prefix = `${config.displayName ?? config.id} guard`;
 
   function install(): void {
     if (installed) {
@@ -165,26 +132,18 @@ export function createScriptGuard(config: ScriptGuardConfig): ScriptGuard {
 
     log.info(`${prefix}: installing DOM interception for SDK`);
 
-    const originalAppendChild = Element.prototype.appendChild;
-    const originalInsertBefore = Element.prototype.insertBefore;
+    unregister = registerDomInsertionHandler({
+      handle(candidate): boolean {
+        if (!config.isTargetUrl(candidate.url)) {
+          return false;
+        }
 
-    Element.prototype.appendChild = function <T extends Node>(this: Element, node: T): T {
-      if (shouldRewriteElement(node, config.isTargetUrl)) {
-        rewriteElement(node as HTMLScriptElement | HTMLLinkElement, config);
-      }
-      return originalAppendChild.call(this, node) as T;
-    };
-
-    Element.prototype.insertBefore = function <T extends Node>(
-      this: Element,
-      node: T,
-      reference: Node | null
-    ): T {
-      if (shouldRewriteElement(node, config.isTargetUrl)) {
-        rewriteElement(node as HTMLScriptElement | HTMLLinkElement, config);
-      }
-      return originalInsertBefore.call(this, node, reference) as T;
-    };
+        rewriteElement(candidate, config);
+        return true;
+      },
+      id: config.id,
+      priority: config.priority ?? DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
+    });
 
     installed = true;
     log.info(`${prefix}: DOM interception installed successfully`);
@@ -195,6 +154,15 @@ export function createScriptGuard(config: ScriptGuardConfig): ScriptGuard {
   }
 
   function reset(): void {
+    if (unregister) {
+      unregister();
+      unregister = undefined;
+    }
+
+    if (installed) {
+      log.debug(`${prefix}: reset and uninstalled`);
+    }
+
     installed = false;
   }
 

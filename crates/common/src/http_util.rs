@@ -26,32 +26,66 @@ pub fn copy_custom_headers(from: &Request, to: &mut Request) {
     }
 }
 
+/// Headers that clients can spoof to hijack URL rewriting.
+///
+/// On Fastly Compute the service is the edge — there is no upstream proxy that
+/// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
+/// to fall back to the trustworthy `Host` header and Fastly SDK TLS detection.
+const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "fastly-ssl",
+];
+
+/// Strip forwarded headers that clients can spoof.
+///
+/// Call this at the edge entry point (before routing) to prevent
+/// `X-Forwarded-Host: evil.com` from hijacking all URL rewriting.
+/// See <https://github.com/IABTechLab/trusted-server/issues/409>.
+pub fn sanitize_forwarded_headers(req: &mut Request) {
+    for header in SPOOFABLE_FORWARDED_HEADERS {
+        if req.get_header(*header).is_some() {
+            log::debug!("Stripped spoofable header: {}", header);
+            req.remove_header(*header);
+        }
+    }
+}
+
 /// Extracted request information for host rewriting.
 ///
-/// This struct captures the effective host and scheme from an incoming request,
-/// accounting for proxy headers like `X-Forwarded-Host` and `X-Forwarded-Proto`.
+/// This struct captures the effective host and scheme from an incoming request.
+/// The parser checks forwarded headers (`Forwarded`, `X-Forwarded-Host`,
+/// `X-Forwarded-Proto`) as fallbacks, but on the Fastly edge
+/// [`sanitize_forwarded_headers`] strips those headers before this method is
+/// called, so the `Host` header and Fastly SDK TLS detection are the effective
+/// sources in production.
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
-    /// The effective host for URL rewriting (from Forwarded, X-Forwarded-Host, or Host header)
+    /// The effective host for URL rewriting (typically the `Host` header after edge sanitization).
     pub host: String,
-    /// The effective scheme (from TLS detection, Forwarded, X-Forwarded-Proto, or default)
+    /// The effective scheme (typically from Fastly SDK TLS detection after edge sanitization).
     pub scheme: String,
 }
 
 impl RequestInfo {
     /// Extract request info from a Fastly request.
     ///
-    /// Host priority:
-    /// 1. `Forwarded` header (RFC 7239, `host=...`)
-    /// 2. `X-Forwarded-Host` header (for chained proxy setups)
+    /// Host fallback order (first present wins):
+    /// 1. `Forwarded` header (`host=...`)
+    /// 2. `X-Forwarded-Host`
     /// 3. `Host` header
     ///
-    /// Scheme priority:
-    /// 1. Fastly SDK TLS detection (most reliable)
-    /// 2. `Forwarded` header (RFC 7239, `proto=https`)
-    /// 3. `X-Forwarded-Proto` header
-    /// 4. `Fastly-SSL` header
-    /// 5. Default to `http`
+    /// Scheme fallback order:
+    /// 1. Fastly SDK TLS detection
+    /// 2. `Forwarded` header (`proto=...`)
+    /// 3. `X-Forwarded-Proto`
+    /// 4. `Fastly-SSL`
+    /// 5. Default `http`
+    ///
+    /// In production the forwarded headers are stripped by
+    /// [`sanitize_forwarded_headers`] at the edge, so `Host` and SDK TLS
+    /// detection are the only sources that fire.
     pub fn from_request(req: &Request) -> Self {
         let host = extract_request_host(req);
         let scheme = detect_request_scheme(req);
@@ -222,13 +256,13 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
 #[must_use]
 pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     // Derive a 32-byte key via SHA-256(secret)
-    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
+    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
 
     // Deterministic 24-byte nonce derived from secret and plaintext (stable tokens)
     let mut hasher = Sha256::new();
     hasher.update(b"ts-proxy-x1");
-    hasher.update(settings.publisher.proxy_secret.as_bytes());
+    hasher.update(settings.publisher.proxy_secret.expose().as_bytes());
     hasher.update(plaintext_url.as_bytes());
     let nonce_full = hasher.finalize();
     let mut nonce = [0u8; 24];
@@ -260,7 +294,7 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
     let nonce = XNonce::from_slice(nonce_bytes);
     let ciphertext = &data[2 + 24..];
 
-    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.as_bytes());
+    let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
     cipher
         .decrypt(nonce, ciphertext)
@@ -278,7 +312,7 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
 pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ts-proxy-v2");
-    hasher.update(settings.publisher.proxy_secret.as_bytes());
+    hasher.update(settings.publisher.proxy_secret.expose().as_bytes());
     hasher.update(clear_url.as_bytes());
     let digest = hasher.finalize();
     URL_SAFE_NO_PAD.encode(digest)
@@ -465,6 +499,65 @@ mod tests {
         assert_eq!(
             info.scheme, "https",
             "Scheme should use X-Forwarded-Proto in chained proxy scenarios"
+        );
+    }
+
+    // Sanitization tests
+
+    #[test]
+    fn sanitize_removes_all_spoofable_headers() {
+        let mut req = Request::new(fastly::http::Method::GET, "https://example.com/page");
+        req.set_header("host", "legit.example.com");
+        req.set_header("forwarded", "host=evil.com;proto=https");
+        req.set_header("x-forwarded-host", "evil.com");
+        req.set_header("x-forwarded-proto", "https");
+        req.set_header("fastly-ssl", "1");
+
+        sanitize_forwarded_headers(&mut req);
+
+        assert!(
+            req.get_header("forwarded").is_none(),
+            "should strip Forwarded header"
+        );
+        assert!(
+            req.get_header("x-forwarded-host").is_none(),
+            "should strip X-Forwarded-Host header"
+        );
+        assert!(
+            req.get_header("x-forwarded-proto").is_none(),
+            "should strip X-Forwarded-Proto header"
+        );
+        assert!(
+            req.get_header("fastly-ssl").is_none(),
+            "should strip Fastly-SSL header"
+        );
+        assert_eq!(
+            req.get_header("host")
+                .expect("should have Host header")
+                .to_str()
+                .expect("should be valid UTF-8"),
+            "legit.example.com",
+            "should preserve Host header"
+        );
+    }
+
+    #[test]
+    fn sanitize_then_request_info_falls_back_to_host() {
+        let mut req = Request::new(fastly::http::Method::GET, "https://example.com/page");
+        req.set_header("host", "legit.example.com");
+        req.set_header("x-forwarded-host", "evil.com");
+        req.set_header("x-forwarded-proto", "http");
+
+        sanitize_forwarded_headers(&mut req);
+        let info = RequestInfo::from_request(&req);
+
+        assert_eq!(
+            info.host, "legit.example.com",
+            "should fall back to Host header after sanitization"
+        );
+        assert_eq!(
+            info.scheme, "http",
+            "should default to http when forwarded proto is stripped and no TLS"
         );
     }
 
