@@ -14,7 +14,7 @@ This document presents a performance analysis and optimization plan for the Trus
 
 | % CPU | Function | Notes |
 |-------|----------|-------|
-| ~96% | `trusted_server_fastly::main` | Almost all time is in application code |
+| ~96% | `trusted_server_adapter_fastly::main` | Almost all time is in application code |
 | ~90% | `route_request` → `handle_publisher_request` | Publisher proxy is the hot path |
 | **~76%** | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck** |
 | ~~5-8%~~ → **3.3%** | `get_settings()` | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |

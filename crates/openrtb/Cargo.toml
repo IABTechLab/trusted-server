@@ -1,0 +1,15 @@
+[package]
+name = "trusted-server-openrtb"
+version = "0.1.0"
+authors = []
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
