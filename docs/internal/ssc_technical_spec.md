@@ -35,22 +35,23 @@
 
 Edge Cookie (EC) replaces SyntheticID as the primary user identity mechanism in Trusted Server. It uses a simpler, more stable signal (IP address + publisher passphrase), adds consent enforcement, and backs identity with a server-side KV graph that accumulates partner IDs over time.
 
-EC is the intended full replacement for SyntheticID. The PRD explicitly states backward compatibility is a non-goal. Coexistence in this spec is a **temporary implementation detail only** — not a product commitment. SyntheticID runs alongside EC solely because the cutover and removal work belongs to a follow-on spec; it is not preserved for compatibility reasons. EC is authoritative where present.
+EC is the full replacement for SyntheticID. The PRD explicitly states backward compatibility is a non-goal. There is no coexistence, no fallback, no transitional period.
 
-**Prerequisites (completed before this epic begins):**
+**Prerequisites (must be merged before this epic begins):**
 
-The following work is handled in separate epics that must ship before this epic starts:
-
-- **SyntheticID → EC rename** — all SyntheticID references in both the product and codebase are renamed to Edge Cookie / EC terminology (e.g. `get_or_generate_synthetic_id` → `get_or_generate_ec`, `ts-synthetic` cookie → `ts-ec`, product-facing naming). This spec assumes the rename is already in place; any SyntheticID naming in existing code shown here reflects the current codebase state at time of writing.
-- **Consent implementation** — The consent pipeline (`build_consent_context()`, `ConsentContext`, TCF/GPP/US-Privacy decoding) is implemented and available as a stable interface before this epic. PR `#380` merged to `main`. This spec uses `ConsentContext` as a pre-existing contract and adds only the EC-specific `ec_consent_granted()` gating layer on top.
+- **SyntheticID removal** — [PR #479](https://github.com/IABTechLab/trusted-server/pull/479) removes SyntheticID from all active code paths: `get_or_generate_synthetic_id()`, `COOKIE_SYNTHETIC_ID`, `X-Synthetic-*` headers, `synthetic.rs` module, `settings.synthetic` config, and all SyntheticID generation/cookie code from `publisher.rs`, `endpoints.rs`, and `registry.rs`. It also renames `ConsentPipelineInput.synthetic_id` to `identity_key`, updates consent KV helper parameters/docs, and handles consent-store key migration (old SyntheticID keys orphaned, TTL expiry cleans them up). **This PR must be merged before implementation of this spec begins.** The spec assumes a codebase where SyntheticID no longer exists. Verify before starting:
+  - `grep -r 'synthetic_id' crates/` returns no hits outside test fixtures
+  - `grep -r 'X-Synthetic' crates/` returns no hits
+  - `trusted-server.toml` has no `[synthetic]` section
+  - `ConsentPipelineInput` uses `identity_key`, not `synthetic_id`
+- **Consent implementation** — The consent pipeline (`build_consent_context()`, `ConsentContext`, `allows_ec_creation()`, TCF/GPP/US-Privacy decoding) is implemented and available as a stable interface before this epic. PR `#380` merged to `main`. EC calls `allows_ec_creation()` directly — no new gating functions are introduced. Note: EC changes the _phase order_ relative to the old SyntheticID flow — consent is evaluated before EC generation, so first-visit consent KV persistence is deferred to the second request (see §6.1.1 for full analysis).
 
 **Deferred from this spec (not in scope):**
 
 - TS Lite deployment mode (PRD Section 5)
 - JOSE-signed KV entries / buyer attestation, and the associated `/.well-known/trusted-server.json` attestation object + `Cache-Control: max-age=3600` response (PRD Section 8.7). The existing discovery endpoint and its tests (`endpoints.rs:579–594`) assert only `version` and `jwks` fields — this spec does not modify that endpoint. Any addition of the PRD-required `attestation` field is deferred to when JOSE signing ships.
 - Data deletion framework JWT endpoint (PRD Section 7.4) — the formal IAB-compliant deletion endpoint is deferred. The PRD explicitly acknowledges that manual KV deletion is the interim process until the formal endpoint ships, and states that regulated onboarding requires the formal endpoint to be in place first. This spec implements the manual-deletion-only interim; the JWT endpoint is a prerequisite for regulated onboarding and must be tracked separately.
-- Winner notification EC headers on publisher ad server delivery (§12.5) — the current `/auction` path returns JSON inline to the JS caller; there is no server-to-server delivery step. §12.5 is deferred until that delivery architecture exists.
-- SyntheticID cutover — removing the old SyntheticID module, `X-Synthetic-*` headers, and related code is a follow-on spec. This spec only adds EC alongside the renamed SyntheticID code.
+- Winner notification EC headers on publisher ad server delivery — the current `/auction` path returns JSON inline to the JS caller; there is no server-to-server delivery step. A future delivery architecture is deferred. Note: §12.5 (auction response headers for the existing inline path) IS in scope; only the not-yet-built server-to-server delivery is deferred.
 
 ---
 
@@ -72,7 +73,7 @@ Phase 1 — pre-routing (like `GeoInfo::from_request()`):
     │  EcContext::read_from_request()          │
     │  - read ts-ec cookie / X-ts-ec header   │
     │  - build_consent_context() → ConsentContext  │
-    │  - ec_consent_granted(consent)               │
+    │  - allows_ec_creation(consent)               │
     │  No generation. No cookie writes.       │
     └──────┬──────────────────────────────────┘
            │
@@ -85,12 +86,17 @@ calls ec_context.generate_if_needed()   calls ec_context.generate_if_needed()
 
 EC route handlers (GET /sync, GET /identify, POST /auction,
 POST /api/v1/sync, POST /admin/*) NEVER call generate_if_needed().
-EcContext is available to them in read-only form. /auction reads
-EC identity but never bootstraps it — the publisher page-load path
-generates the EC before any auction request arrives.
+`/identify`, `/auction`, `POST /api/v1/sync`, and `POST /admin/*`
+use `EcContext` in read-only form. `GET /sync` is the one exception:
+it never bootstraps an EC, but it may replace `ec_context.consent`
+with a locally-decoded fallback consent context for that request only
+when the optional `consent` query param is the sole available signal.
+/auction reads EC identity but never bootstraps it — the publisher
+page-load path generates the EC before any auction request arrives.
 
-finalize_response() — after every handler:
-    - consent withdrawn + cookie present? → delete_ec_cookie() [always]
+ec_finalize_response() — after every handler:
+    - consent withdrawn + cookie present? → clear_ec_on_response() + tombstone
+    - returning-user mismatch? → set_ec_on_response() [reconcile cookie to header EC]
     - ec_generated == true? → set_ec_on_response() [new cookie only]
 ```
 
@@ -108,12 +114,12 @@ crates/common/src/
     mod.rs          — EcContext, pub re-exports
     identity.rs     — EC generation (HMAC-SHA256, IP normalization)
     cookie.rs       — create_ec_cookie(), delete_ec_cookie(), set_ec_on_response()
-    consent.rs      — ec_consent_granted()  [thin gating layer over prerequisite ConsentContext]
+    finalize.rs     — ec_finalize_response() (cookie write/delete, last_seen, tombstone)
     kv.rs           — KvIdentityGraph, read/write/delete identity entries
     partner.rs      — PartnerRecord, PartnerStore, load_partner()
     sync_pixel.rs   — handle_sync() handler
     sync_batch.rs   — handle_batch_sync() handler
-    pull_sync.rs    — dispatch_pull_sync() async
+    pull_sync.rs    — PullSyncDispatcher, dispatch_background()
     identify.rs     — handle_identify() handler
     admin.rs        — handle_register_partner() handler
 ```
@@ -144,7 +150,7 @@ The EC generation mirrors the SyntheticID approach (`synthetic.rs`) but strips v
 /// # Errors
 ///
 /// Returns `EdgeCookie` error if HMAC computation fails.
-pub fn generate_ec(ip: IpAddr, passphrase: &str) -> Result<String, Report<TrustedServerError>>;
+pub fn generate_ec(passphrase: &str, ip: IpAddr) -> Result<String, Report<TrustedServerError>>;
 
 /// Normalizes an IP address for use as an HMAC input.
 ///
@@ -178,7 +184,7 @@ The random suffix is generated with `fastly::rand` (same approach as SyntheticID
 **IPv6 /64 prefix:** Split on `:`, take first 4 groups, join with `:`. Example:
 `2001:db8:85a3:0000:0000:8a2e:0370:7334` → `2001:db8:85a3:0`.
 
-**IP source:** Use `req.get_client_ip_addr()` — Fastly's trusted API that returns the verified client IP without relying on any request header. This is the same source used by the existing `synthetic.rs` IP handling. Do not fall back to `X-Forwarded-For` or any other header — those are forgeable by clients. Return an error if the API returns `None`; do not create an EC without an IP.
+**IP source:** Use `req.get_client_ip_addr()` — Fastly's trusted API that returns the verified client IP without relying on any request header. This is the same source used by the existing `synthetic.rs` IP handling. Do not fall back to `X-Forwarded-For` or any other header — those are forgeable by clients. If the API returns `None`, `EcContext.client_ip` is `None` and `generate_if_needed()` logs `warn` and skips EC generation — the page loads without an EC. This is best-effort; a missing client IP never produces a 500.
 
 On dual-stack: prefer IPv6 if the returned address is IPv6; otherwise use IPv4.
 
@@ -190,13 +196,33 @@ Pre-routing, EC state is read (not generated) from the inbound request:
 2. `ts-ec` cookie
 3. Neither present → `ec_value = None`, `ec_was_present = false`
 
+When both header and cookie are present, the **header wins** as `ec_value` (used by handlers for identity reads, KV lookups, and response headers). `cookie_was_present` is still set to `true`.
+
+**Mismatch handling:** If the header and cookie carry different EC values, `EcContext` tracks both:
+
+- `ec_value` = header value (authoritative for handler reads)
+- `cookie_ec_value` = cookie value (tracked separately for withdrawal)
+
+On consent **withdrawal** (`!allows_ec_creation && cookie_was_present`):
+
+- Delete the browser cookie (always, based on `cookie_was_present`)
+- Tombstone the **cookie-derived** hash: `kv.write_withdrawal_tombstone(ec_hash(cookie_ec_value))`
+- If the header-derived hash differs, also tombstone it: `kv.write_withdrawal_tombstone(ec_hash(ec_value))`
+- This matches the existing SyntheticID behavior where revocation targets the cookie value (`publisher.rs:515`), not the header value.
+
+On **non-withdrawal** paths (last_seen, handler reads): use `ec_value` (header-derived) as the active identity. When `cookie_ec_value` is set (mismatch), `ec_finalize_response()` overwrites the browser cookie with the header-derived `ec_value` via `set_ec_on_response()`. This reconciles the browser identity to match the publisher-forwarded identity and prevents persistent oscillation between two ECs on subsequent requests.
+
+**Validation:** Both the header and cookie values are validated independently via `ec_hash()` (`{64-hex}.{6-alnum}` format). If the header is present but malformed, it is discarded and the cookie value is used instead (if valid). A malformed header must not suppress a valid cookie — bad forwarding infrastructure should not break returning-user identity. `cookie_was_present` is set based on the raw cookie existing, regardless of validity — an invalid cookie value is still a cookie that needs to be cleared on withdrawal.
+
 Generation (step 3 above becoming a new EC) happens only inside organic handlers — see §5.4. This logic lives in `EcContext::read_from_request()` (phase 1) and `EcContext::generate_if_needed()` (phase 2).
 
 ### 4.3 `EcContext`
 
 ```rust
-/// Per-request Edge Cookie state. Constructed pre-routing in read-only form;
-/// organic handlers call `generate_if_needed()` to mint new ECs.
+/// Per-request Edge Cookie state. Constructed pre-routing once per request.
+/// Organic handlers call `generate_if_needed()` to mint new ECs. `/sync` is the
+/// one EC route that may replace `consent` with a locally-decoded fallback for
+/// the remainder of that request only.
 pub struct EcContext {
     /// Full EC value (`hash.suffix`), if present on request or generated this request.
     pub ec_value: Option<String>,
@@ -204,13 +230,18 @@ pub struct EcContext {
     /// This is the only field that gates consent-withdrawal cookie deletion —
     /// the PRD's delete branch is conditioned on the cookie, not on X-ts-ec header.
     pub cookie_was_present: bool,
+    /// The cookie's EC value, if different from `ec_value` (header won priority).
+    /// Used only for withdrawal: tombstone targets the cookie-derived hash to match
+    /// existing SyntheticID revocation behavior (`publisher.rs:515`).
+    /// `None` when cookie absent or cookie == header value.
+    pub cookie_ec_value: Option<String>,
     /// Whether any EC value was available (cookie OR X-ts-ec header).
     pub ec_was_present: bool,
     /// Set to true by `generate_if_needed()` when a new EC is minted this request.
-    /// `finalize_response()` uses this to decide whether to write a Set-Cookie header.
+    /// `ec_finalize_response()` uses this to decide whether to write a Set-Cookie header.
     pub ec_generated: bool,
     /// Full consent context from the prerequisite consent pipeline.
-    /// Use `ec_consent_granted(&self.consent)` to derive a grant/deny decision.
+    /// Use `allows_ec_creation(&self.consent)` to derive a grant/deny decision.
     /// Raw TCF/GPP strings (for KV writes and `user.consent`) are on `consent.raw_tc_string`
     /// and `consent.raw_gpp_string`.
     pub consent: ConsentContext,
@@ -221,10 +252,20 @@ pub struct EcContext {
 }
 
 impl EcContext {
-    /// Phase 1: reads cookie/header and builds consent context. Does not generate. Does not write KV.
-    /// Called pre-routing, like `GeoInfo::from_request()` in the current `main.rs`.
-    /// Calls `build_consent_context()` with the EC hash (if cookie present) as `synthetic_id`
-    /// so KV-persisted consent can be loaded for users without fresh consent cookies.
+    /// Phase 1: reads cookie/header and builds consent context. Does not generate.
+    /// Does not write to the **EC identity KV store**. Called pre-routing, like
+    /// `GeoInfo::from_request()` in the current `main.rs`.
+    ///
+    /// Calls `build_consent_context()` with the EC hash (when present) passed
+    /// via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id`
+    /// in PR #479).
+    ///
+    /// When an EC hash is available (returning user), this enables the consent
+    /// pipeline's KV fallback (read) and KV persistence (write to the
+    /// **consent** KV store). On a first visit (no EC cookie), `ec_hash` is
+    /// `None` and no consent KV interaction occurs; consent is evaluated purely
+    /// from request cookies/headers. This means consent is not persisted to
+    /// consent KV until the user's second request. See §6.1.1.
     pub fn read_from_request(
         req: &Request,
         settings: &Settings,
@@ -239,23 +280,29 @@ impl EcContext {
     /// KV entry via `kv.create_or_revive()` (best-effort — logs warn on failure,
     /// does not block). Using `create_or_revive` (not `create`) ensures that a user
     /// who re-consents within the 24-hour tombstone window recovers immediately.
+    ///
+    /// **Best-effort / never 500s organic traffic.** If EC generation fails
+    /// (e.g., `get_client_ip_addr()` returns `None`), the function logs `warn`
+    /// and returns without setting `ec_generated`. The organic handler proceeds
+    /// normally without an EC — the page still loads. Callers must NOT propagate
+    /// this error with `?`.
     pub fn generate_if_needed(
         &mut self,
-        req: &Request,
         settings: &Settings,
         kv: &KvIdentityGraph,
-    ) -> Result<(), Report<TrustedServerError>>;
+    );
 
     /// Returns the stable 64-char hex prefix, or `None` if no EC.
     pub fn ec_hash(&self) -> Option<&str>;
 }
 ```
 
-**`finalize_response()` behavior** (updated signature: `finalize_response(settings, geo, ec_context, kv, response)`):
+**`ec_finalize_response()` behavior** (signature: `ec_finalize_response(settings, geo, ec_context, kv, response)`):
 
-1. If `!ec_consent_granted(&consent) && cookie_was_present`: call `delete_ec_cookie()` and `kv.write_withdrawal_tombstone(ec_hash)`. This runs on **every route** — consent withdrawal is always real-time enforced. Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser.
-2. If `ec_generated == true`: call `set_ec_on_response()` — sets `Set-Cookie` and `X-ts-ec`. KV create already happened inside `generate_if_needed()`; `finalize_response()` does NOT write KV beyond the tombstone.
-3. Handler-built response headers (`X-ts-ec`, `X-ts-eids` set directly by `/identify`) are not modified.
+1. If `!allows_ec_creation(&consent) && cookie_was_present`: call `clear_ec_on_response()` (deletes cookie **and** strips any handler-built `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`, and `X-ts-<partner_id>` response headers) and write withdrawal tombstones for each valid known EC hash (cookie-derived and, when different, header-derived). This runs on **every route** — consent withdrawal is always real-time enforced. Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser. When the cookie is malformed and there is no valid header-derived hash, no tombstone is written.
+2. If `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`: call `kv.update_last_seen()` (debounced). If `cookie_ec_value.is_some()`, also call `set_ec_on_response()` to reconcile the browser cookie to the authoritative header-derived EC.
+3. If `ec_generated == true`: call `set_ec_on_response()` — sets `Set-Cookie` and `X-ts-ec`. KV create already happened inside `generate_if_needed()`; `ec_finalize_response()` does NOT write KV beyond tombstones and `last_seen`.
+4. Handler-built response headers (`X-ts-ec`, `X-ts-eids` set directly by `/identify`) are preserved on non-withdrawal paths only.
 
 **Note on `kv_degraded`:** Not on `EcContext` — `read_from_request()` does not read KV. Handlers track degraded state locally. `/identify` returns `degraded: true` in the JSON body on KV read failure; the auction handler treats a failed read as `eids: []`.
 
@@ -282,7 +329,9 @@ impl EcContext {
 The `cookie_domain` parameter passed to all functions below is computed as
 `format!(".{}", settings.publisher.domain)`. Do **not** use
 `settings.publisher.cookie_domain` — that field is used by other cookie helpers
-and does not carry the EC ownership guarantee.
+and does not carry the EC ownership guarantee. No startup validation change is
+needed for `publisher.cookie_domain` — it continues to serve its existing
+purpose for non-EC cookies. EC simply does not read it.
 
 ```rust
 /// Builds the `Set-Cookie` header value for a newly generated EC.
@@ -295,13 +344,16 @@ pub fn delete_ec_cookie(cookie_domain: &str) -> String;
 /// Sets the EC cookie and `X-ts-ec` response header on a response.
 pub fn set_ec_on_response(response: &mut Response, ec_value: &str, cookie_domain: &str);
 
-/// Removes the EC cookie and clears `X-ts-ec` response header.
+/// Removes the EC cookie and strips all EC-related response headers:
+/// `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`,
+/// and any `X-ts-<partner_id>` headers. Called on consent withdrawal to
+/// prevent leaking EC identity in handler-built headers.
 pub fn clear_ec_on_response(response: &mut Response, cookie_domain: &str);
 ````
 
 ### 5.3 Response header
 
-`X-ts-ec: {ec_hash.suffix}` is set on every response where an EC is present.
+`X-ts-ec: {ec_hash.suffix}` is set by `set_ec_on_response()`, which is called by `ec_finalize_response()` in two cases: (1) `ec_generated == true` (new EC minted this request), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch reconciliation — overwrites cookie to match header). It is also set explicitly by `/identify` and `/auction` handlers on their own response paths when an EC is present. It is **not** set on ordinary returning-user requests where the cookie already matches the header (or no header is present).
 
 This header is added to `INTERNAL_HEADERS` in `constants.rs` so it is stripped before proxying to downstream backends, consistent with existing `X-ts-*` handling.
 
@@ -311,16 +363,29 @@ This header is added to `INTERNAL_HEADERS` in `constants.rs` so it is stripped b
 
 ```
 EcContext::read_from_request()
-  Read ts-ec cookie / X-ts-ec header → ec_value, ec_was_present
-  build_consent_context(jar, req, config, geo, ec_hash?) → consent: ConsentContext
+  Read ts-ec cookie value and X-ts-ec header value independently
+  Validate each via ec_hash() — returns None if not {64-hex}.{6-alnum}
+  If both valid: header wins as ec_value; cookie stored as cookie_ec_value (if differs)
+  If only header valid: ec_value = header, cookie_ec_value = None
+  If only cookie valid: ec_value = cookie, cookie_ec_value = None
+  If neither valid: ec_value = None
+  ec_was_present = ec_value.is_some()
+  cookie_was_present = ts-ec cookie raw key exists (regardless of validity)
+  ec_hash = ec_value.as_deref().and_then(ec_hash)   // None on first visit or malformed
+  build_consent_context(jar, req, config, geo, ec_hash) → consent: ConsentContext
+  // ec_hash is the identity key for consent KV (renamed from synthetic_id in PR #479).
+  // When ec_hash is Some: consent KV fallback read + consent KV write (to consent store, not EC store).
+  // When ec_hash is None (first visit): no consent KV interaction — cookies/headers only.
   ec_generated = false
 ```
 
 **Phase 2 — inside organic handlers only** (`handle_publisher_request`, `handle_proxy`):
 
 ```
-ec_context.generate_if_needed(&req, settings, &kv)
-  └── ec_consent_granted(&consent) && ec_value == None?
+ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
+  └── allows_ec_creation(&consent) && ec_value == None?
+          → client_ip from ec_context.client_ip (captured in phase 1)
+          → client_ip is None? log warn, return (no EC generation possible)
           → generate_ec(passphrase, ip)
           → ec_value = Some(new_ec)
           → ec_generated = true
@@ -329,25 +394,36 @@ ec_context.generate_if_needed(&req, settings, &kv)
             // no-ops if a live entry (ok=true) already exists
 ```
 
-**`finalize_response(settings, geo, ec_context, &kv, response)` — always runs, all routes:**
+**`ec_finalize_response(settings, geo, ec_context, &kv, response)` — always runs, all routes:**
 
 ```
-  ├── !ec_consent_granted(&consent) && cookie_was_present?
-  │       → delete_ec_cookie()                  (always — real-time withdrawal enforcement)
-  │       → kv.write_withdrawal_tombstone(ec_hash)   (synchronous — see §6.2)
-  │           Tombstone fails? log error, do NOT block — no retry possible on browser path
-  │             cookie deletion is the authoritative enforcement mechanism
+  ├── !allows_ec_creation(&consent) && cookie_was_present?
+  │       → clear_ec_on_response()             (delete cookie + strip ALL EC headers from response)
+  │       → // Tombstone all known valid EC hashes. May be 0, 1, or 2 hashes.
+  │         if let Some(cookie_hash) = cookie_ec_value.and_then(|v| ec_hash(&v)):
+  │           kv.write_withdrawal_tombstone(cookie_hash)       // cookie-derived hash
+  │         if let Some(header_hash) = ec_value.and_then(|v| ec_hash(&v)):
+  │           if Some(header_hash) != cookie_hash:
+  │             kv.write_withdrawal_tombstone(header_hash)     // header-derived hash (if different)
+  │         // When cookie is malformed and no valid header exists: no tombstone written.
+  │         // Cookie deletion is still the authoritative enforcement mechanism.
+  │         // Tombstone fails? log error, do NOT block — no retry possible on browser path.
   │
-  ├── ec_was_present == true && ec_generated == false && ec_consent_granted(&consent)?
+  ├── ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)?
   │       → kv.update_last_seen(ec_hash, now())   (returning user — debounced at 300s)
+  │       → if cookie_ec_value.is_some():
+  │           // Header and cookie disagree — reconcile by overwriting cookie with header value.
+  │           // Prevents persistent split identity where user oscillates between two ECs
+  │           // depending on whether the forwarded header is present on subsequent requests.
+  │           set_ec_on_response()   (Set-Cookie with ec_value, the header-derived identity)
   │
   └── ec_generated == true?
           → set_ec_on_response()        (Set-Cookie + X-ts-ec on response)
 ```
 
-EC route handlers (`GET /sync`, `GET /identify`, `POST /api/v1/sync`, `POST /admin/*`) never call `generate_if_needed()`. `finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
+EC route handlers (`GET /sync`, `GET /identify`, `POST /api/v1/sync`, `POST /admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
 
-**One rule:** `Set-Cookie` is written if and only if `ec_generated == true` (first-time generation). There is no cookie refresh or Max-Age reset on returning users. The PRD defers a blanket refresh-on-every-request strategy to a future iteration.
+**Cookie write rule:** `Set-Cookie` is written in exactly two cases: (1) `ec_generated == true` (first-time generation), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch — reconcile cookie to match the header-derived identity). There is no cookie refresh or Max-Age reset on ordinary returning users where cookie already matches. The PRD defers a blanket refresh-on-every-request strategy to a future iteration.
 
 ---
 
@@ -365,42 +441,34 @@ Consent decoding shipped in `#380` (already merged). This spec treats the follow
 
 ### 6.1.1 EC consent gating
 
-The consent pipeline surfaces signals — it does not make grant/deny decisions. EC defines its own gating function in `ec/consent.rs`:
+EC reuses the existing `allows_ec_creation(&ConsentContext) -> bool` function
+from the consent module (`consent/mod.rs`). No parallel gating function is
+introduced — EC calls `allows_ec_creation()` directly for all consent decisions
+(EC generation, withdrawal detection, sync gating).
 
-```rust
-/// Returns true when consent is sufficient to create or maintain an EC for this request.
-/// Uses Jurisdiction (geo-derived) as the primary enforcement signal.
-pub fn ec_consent_granted(consent: &ConsentContext) -> bool {
-    match &consent.jurisdiction {
-        // GDPR: require TCF Purpose 1 (storage) and not expired
-        Jurisdiction::Gdpr => {
-            let tcf_ok = consent.tcf.as_ref()
-                .or_else(|| consent.gpp.as_ref()?.eu_tcf.as_ref())
-                .map_or(false, |t| t.has_storage_consent());
-            tcf_ok && !consent.expired
-        }
-        // US state privacy law: require no opt-out
-        Jurisdiction::UsState(_) => {
-            !consent.gpc
-                && consent.us_privacy.as_ref()
-                    .map_or(true, |p| p.opt_out_sale != PrivacyFlag::Yes)
-        }
-        // Non-regulated region: always granted
-        Jurisdiction::NonRegulated => true,
-        // Unknown geo (Fastly lookup failed): fail-closed — treat as regulated
-        Jurisdiction::Unknown => false,
-    }
-}
-```
+There is no EC-specific consent gate and no behavior change to
+`allows_ec_creation()` in this spec. Shared consent-policy semantics stay in
+the consent module; EC only consumes that existing decision.
 
-`EcContext::read_from_request()` calls `build_consent_context()` then stores the result. All downstream logic (EC generation gating, withdrawal detection) calls `ec_consent_granted(&self.consent)`. No consent decoding logic lives in this epic.
+**Consent pipeline integration:**
+
+`EcContext::read_from_request()` calls `build_consent_context()` with the EC hash as the identity key, passed via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id` in PR #479). The consent pipeline's KV persistence and fallback behavior works with EC hashes:
+
+- **Returning user** (EC cookie present → `ec_hash` is `Some`): consent KV fallback read is available when consent cookies are absent; consent KV write persists cookie-sourced consent for future requests. Note: `build_consent_context()` calls `try_kv_write()` internally, so phase 1 writes to the **consent** KV store (not the EC identity store).
+- **First visit** (no EC cookie → `ec_hash` is `None`): no consent KV interaction. Consent is evaluated purely from request cookies/headers. The gap: consent is not persisted to consent KV on the first request. This is accepted — in regulated jurisdictions (GDPR, US state), consent cookies/headers must be present for `allows_ec_creation()` to return `true`, so there is always a signal to persist on the next request. In non-regulated jurisdictions, `allows_ec_creation()` returns `true` without consent signals, so there is nothing to persist anyway. Consent KV persistence begins on the second request when the EC cookie is present.
+
+**Consent store keying:** Old consent KV entries under SyntheticID keys become orphaned after PR #479 ships. New entries are keyed by EC hash. Orphaned entries expire via TTL — no explicit migration is performed.
+
+**Rollout impact:** At cutover, returning users who relied on consent KV fallback (consent cookies absent, consent loaded from KV under SyntheticID key) will lose that fallback until a new EC-keyed consent entry is written on a subsequent request where consent cookies are present. This is a one-time window: once the EC cookie is set and a request with consent cookies arrives, the consent KV entry is written under the EC hash and fallback works again. The window duration depends on how quickly users return with consent cookies. This is accepted — consent cookies are the primary signal; KV fallback is a secondary mechanism for when cookies are blocked or absent.
+
+All downstream EC logic calls `allows_ec_creation(&self.consent)`. No consent decoding or gating logic is added in this epic.
 
 ### 6.2 Consent withdrawal — KV delete
 
-When `ec_consent_granted(&consent)` returns `false` for a user whose **`ts-ec` cookie** is present (`cookie_was_present == true`). A user identified only by the `X-ts-ec` request header is not subject to cookie deletion — there is no cookie to expire.
+When `allows_ec_creation(&consent)` returns `false` for a user whose **`ts-ec` cookie** is present (`cookie_was_present == true`). A user identified only by the `X-ts-ec` request header is not subject to cookie deletion — there is no cookie to expire.
 
-1. Issue `Set-Cookie: ts-ec=; Max-Age=0; ...` (synchronous — must not fail silently)
-2. Write tombstone: `kv.write_withdrawal_tombstone(ec_hash)` — sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms
+1. Issue `Set-Cookie: ts-ec=; Max-Age=0; ...` and strip all EC response headers (synchronous — must not fail silently). This always happens when `cookie_was_present == true`.
+2. Write tombstone for each valid EC hash available (`cookie_ec_value` and/or `ec_value`). When neither is valid (malformed cookie, no header), **no tombstone is written** — cookie deletion alone is the enforcement mechanism. When at least one valid hash exists: `kv.write_withdrawal_tombstone(hash)` sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms per write.
 
 The tombstone write runs in the request path (not async) to ensure real-time enforcement. Using a tombstone rather than a hard delete preserves the `consent_withdrawn` signal for batch sync clients for 24 hours — otherwise batch sync cannot distinguish consent withdrawal from an EC that never existed.
 
@@ -459,7 +527,7 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 
 The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /api/v1/sync`) can return `consent_withdrawn` rather than `ec_hash_not_found` during the 24-hour tombstone TTL.
 
-**`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Consent withdrawal is determined entirely from `ec_consent_granted(&ec_context.consent)` on the current request. When withdrawal is detected, the cookie is deleted and `write_withdrawal_tombstone()` is called in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
+**`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Consent withdrawal is determined entirely from `allows_ec_creation(&ec_context.consent)` on the current request. When withdrawal is detected, the cookie is deleted and `write_withdrawal_tombstone()` is called in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
 
 **Rust types:**
 
@@ -556,6 +624,17 @@ impl KvIdentityGraph {
     /// Atomically merges `ids[partner_id]` into the existing entry using a
     /// generation marker. Retries up to `MAX_CAS_RETRIES` (3) times on
     /// generation conflict before returning `Err`.
+    ///
+    /// If the key does not exist, creates a minimal live entry first:
+    /// `consent.ok = true`, `consent.tcf = None`, `consent.gpp = None`,
+    /// `created = synced`, `last_seen = synced`, `geo.country = "ZZ"`,
+    /// `geo.region = None`, and `ids = { partner_id: ... }`.
+    ///
+    /// This recovery path is intentional: it materializes the graph later when
+    /// the initial best-effort `create_or_revive()` on EC generation failed.
+    /// Batch sync still performs its explicit existence/tombstone check before
+    /// calling this method, so `POST /api/v1/sync` retains its `ec_hash_not_found`
+    /// contract.
     pub fn upsert_partner_id(
         &self,
         ec_hash: &str,
@@ -585,7 +664,7 @@ impl KvIdentityGraph {
     /// returns `None` (`ec_hash_not_found`) — the distinction is time-bounded.
     ///
     /// Caller must handle `Err` by logging at `error` level; the cookie deletion
-    /// in `finalize_response()` is the primary enforcement mechanism.
+    /// in `ec_finalize_response()` is the primary enforcement mechanism.
     pub fn write_withdrawal_tombstone(
         &self,
         ec_hash: &str,
@@ -597,17 +676,17 @@ impl KvIdentityGraph {
 }
 ```
 
-`MAX_CAS_RETRIES = 3`. If all retries fail on a generation conflict, return `Err` — callers handle per-endpoint policy (Section 8.4 for pixel sync, Section 10 for batch).
+`MAX_CAS_RETRIES = 3`. If all retries fail on a generation conflict, return `Err` — callers handle per-endpoint policy (§8.3 step 7 for pixel sync, §9.4 for batch sync).
 
 ### 7.5 KV degraded behavior
 
-| Operation                          | KV unavailable | Action                                                                |
-| ---------------------------------- | -------------- | --------------------------------------------------------------------- |
-| EC cookie creation                 | KV error       | Set cookie. Skip KV create. Log `warn`.                               |
-| `/sync` KV write                   | KV error       | Redirect with `ts_synced=0&ts_reason=write_failed`.                   |
-| `/identify` KV read                | KV error       | Return `200` with `ec` set, `degraded: true`, empty `uids`/`eids`.    |
-| `POST /api/v1/sync`                | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.  |
-| Pull sync KV write                 | KV error       | Discard uid. Log `warn`. Retry on next qualifying request.            |
+| Operation                          | KV unavailable | Action                                                                                         |
+| ---------------------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
+| EC cookie creation                 | KV error       | Set cookie. Skip KV create. Log `warn`.                                                        |
+| `/sync` KV write                   | KV error       | Redirect with `ts_synced=0&ts_reason=write_failed`.                                            |
+| `/identify` KV read                | KV error       | Return `200` with `ec` set, `degraded: true`, empty `uids`/`eids`.                             |
+| `POST /api/v1/sync`                | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
+| Pull sync KV write                 | KV error       | Discard uid. Log `warn`. Retry on next qualifying request.                                     |
 | Consent withdrawal tombstone write | KV error       | Delete cookie (primary enforcement). Log `error`. Next request: no cookie → no EC regenerated. |
 
 ---
@@ -622,26 +701,28 @@ pub async fn handle_sync(
     kv: &KvIdentityGraph,
     partner_store: &PartnerStore,
     req: &Request,
-    ec_context: &EcContext,
+    ec_context: &mut EcContext,
 ) -> Result<Response, Report<TrustedServerError>>;
 ```
 
 ### 8.2 Query parameters
 
-| Parameter | Required | Description                                                       |
-| --------- | -------- | ----------------------------------------------------------------- |
-| `partner` | Yes      | Partner ID — must exist in `partner_store`                        |
-| `uid`     | Yes      | Partner's user ID for this user                                   |
-| `return`  | Yes      | Redirect-back URL (must match partner's `allowed_return_domains`) |
-| `consent` | No       | Fallback TCF/GPP string if no consent cookie on request           |
+| Parameter | Required | Description                                                                  |
+| --------- | -------- | ---------------------------------------------------------------------------- |
+| `partner` | Yes      | Partner ID — must exist in `partner_store`                                   |
+| `uid`     | Yes      | Partner's user ID for this user                                              |
+| `return`  | Yes      | Redirect-back URL (must match partner's `allowed_return_domains`)            |
+| `consent` | No       | Fallback TCF/GPP string if `ec_context.consent.is_empty()` after pre-routing |
 
 ### 8.3 Flow
 
 ```
 1. Parse query params. Missing required params → 400.
 
-2. Read ts-ec cookie.
-   Absent → redirect to {return}?ts_synced=0&ts_reason=no_ec
+2. Require a valid cookie-held EC.
+   If `cookie_was_present == false` OR `ec_context.ec_hash().is_none()`
+   (cookie missing or malformed) → redirect to
+   {return}?ts_synced=0&ts_reason=no_ec
 
 3. Look up partner record in partner_store.
    Not found → 400.
@@ -652,16 +733,33 @@ pub async fn handle_sync(
 
 5. Evaluate consent. Use `ec_context.consent` (built pre-routing via
    `build_consent_context()`). The optional `consent` query param is a **fallback
-   only** — used solely when `ec_context.consent.is_empty()` (no cookies or
-   headers carried consent signals). If any signal exists, the query param is
-   ignored entirely. When the fallback applies, re-call `build_consent_context()`
-   with a synthetic request or cookie jar that includes the consent param value.
-   `!ec_consent_granted(...)` → redirect to {return}?ts_synced=0&ts_reason=no_consent
+   only** — used solely when `ec_context.consent.is_empty()` returns `true`.
+   This is the actual contract from the consent module. It is broader than
+   “no cookies or headers on the wire”: if consent KV fallback, decoded objects,
+   GPP section IDs, AC string, raw US privacy, or GPC already populated the
+   context, `is_empty()` is `false` and the query param is ignored entirely.
+
+   When the fallback applies: decode the query param into a **locally-built**
+   `ConsentContext` (same TCF/GPP/USP decoders, same jurisdiction inputs), then
+   assign that value into `ec_context.consent` for the remainder of this request.
+   This makes the sync write decision and `ec_finalize_response()` use the same
+   effective consent view, avoiding a same-request “write partner ID, then
+   withdraw EC” conflict. Do NOT re-call `build_consent_context()` — that would
+   trigger `try_kv_write()` and persist the query-param consent to the consent KV
+   store, which is not intended. The decoded fallback applies only to this `/sync`
+   request; it is not written to the consent KV store and does not change any
+   future request unless the client sends real consent cookies/headers again.
+
+   `!allows_ec_creation(...)` → redirect to {return}?ts_synced=0&ts_reason=no_consent
 
 6. Check anti-stuffing rate limit (sync_rate_limit per EC hash per partner per hour).
    Exceeded → `429 Too Many Requests` (no redirect — the `return` URL is never called).
 
 7. kv.upsert_partner_id(ec_hash, partner_id, uid, now())
+   If the root KV entry is missing (e.g. initial `create_or_revive()` failed on
+   the organic page load), `upsert_partner_id()` creates a minimal live entry and
+   then writes `ids[partner_id]`. This is the recovery path for best-effort EC
+   creation misses.
    KV write failure → redirect to {return}?ts_synced=0&ts_reason=write_failed
 
 8. Success → redirect to {return}?ts_synced=1
@@ -672,7 +770,7 @@ pub async fn handle_sync(
 | Value                                | Meaning                       |
 | ------------------------------------ | ----------------------------- |
 | `ts_synced=1`                        | KV write succeeded            |
-| `ts_synced=0&ts_reason=no_ec`        | No EC cookie present          |
+| `ts_synced=0&ts_reason=no_ec`        | No valid EC cookie present    |
 | `ts_synced=0&ts_reason=no_consent`   | Consent absent or denied      |
 | `ts_synced=0&ts_reason=write_failed` | KV write failed after retries |
 
@@ -710,9 +808,15 @@ pub async fn handle_batch_sync(
 
 ### 9.2 Authentication
 
-`Authorization: Bearer <api_key>` header required. The `api_key` is looked up in `partner_store` by a constant-time comparison of its SHA-256 hash against the stored `api_key_hash`. Key rotation does not require binary redeployment — partners update `partner_store` directly via `/admin/partners/register`.
+`Authorization: Bearer <api_key>` header required. Auth flow:
 
-Returns `401 Unauthorized` with no body processing if auth fails.
+1. Compute `sha256_hex(api_key)`.
+2. Look up `partner_store.find_by_api_key_hash(hash)` — uses the `apikey:{hash}` secondary index (§13.1) for O(1) lookup instead of scanning all partners.
+3. If the index returns a partner, verify the partner's stored `api_key_hash` matches the computed hash (constant-time comparison). This guards against stale index entries from key rotation.
+4. If no match or verification fails → `401 Unauthorized` with no body processing.
+5. If KV lookup fails (store unavailable) → `503 Service Unavailable`.
+
+Key rotation does not require binary redeployment — partners update via `/admin/partners/register`, which handles old API-key index cleanup (§13.1).
 
 ### 9.2.1 API-key rate limiting
 
@@ -771,6 +875,7 @@ HTTP status rules:
 | Some accepted, some rejected           | `207 Multi-Status`                                     |
 | All rejected (auth valid, batch valid) | `207 Multi-Status` with `accepted: 0`                  |
 | Auth invalid                           | `401 Unauthorized`                                     |
+| Auth KV lookup failed (store down)     | `503 Service Unavailable`                              |
 | Malformed JSON or > 1000 mappings      | `400 Bad Request`                                      |
 | KV entirely unavailable                | `207 Multi-Status`, all rejected with `kv_unavailable` |
 
@@ -816,8 +921,13 @@ impl PullSyncDispatcher {
     pub fn new(concurrency_limit: usize) -> Self;
 
     /// Dispatches pull sync calls for all qualifying partners.
-    /// Called after `send_to_client()` — fires outbound requests using `send_async()`.
-    /// Takes `client_ip` directly (extracted before `req` is consumed by routing).
+    /// Called after `send_to_client()` — fires outbound requests using
+    /// `Request::send_async()` which returns `PendingRequest` handles.
+    /// Internally: fires up to `concurrency_limit` requests via `send_async()`,
+    /// then calls `PendingRequest::wait()` (blocking) on each handle to collect
+    /// responses and write results to KV. This is synchronous blocking code
+    /// running after the client response is already flushed — no async runtime
+    /// needed. The Fastly WASM invocation remains alive until this returns.
     pub fn dispatch_background(
         &self,
         ec_context: &EcContext,
@@ -827,8 +937,9 @@ impl PullSyncDispatcher {
     );
 }
 
-/// Calls a single partner's resolution endpoint and writes the result to KV.
-async fn pull_one_partner(
+/// Fires a single partner pull request via `send_async()`, waits for the
+/// response via `PendingRequest::wait()`, and writes the result to KV.
+fn pull_one_partner(
     ec_hash: &str,
     ip: IpAddr,
     partner: &PartnerRecord,
@@ -840,11 +951,15 @@ async fn pull_one_partner(
 
 A pull sync is dispatched for a partner when all of the following are true on a request:
 
-1. A valid `ts-ec` cookie is present
-2. `ec_consent_granted(&ec_context.consent) == true`
-3. `partner.pull_sync_enabled == true`
-4. Either: no entry exists for this partner in the KV graph, or the existing `synced` timestamp is older than `partner.pull_sync_ttl_sec` (default 86400 seconds)
-5. Rate limit not exceeded: `partner.pull_sync_rate_limit` calls per EC hash per partner per hour (default 10)
+1. The request was routed to an **organic handler** (`handle_publisher_request` or `integration_registry.handle_proxy`). Pull sync never fires on EC route handlers (`/sync`, `/identify`, `/api/v1/sync`, `/admin/*`) or `/auction`. This matches the PRD requirement that pull calls must not happen during the pixel sync flow.
+2. A valid EC is present (`ec_context.ec_hash().is_some()`). This includes an EC
+   newly generated on the current organic request — pull sync may run immediately
+   after first-page EC creation because the response cookie is flushed before the
+   background dispatch starts.
+3. `allows_ec_creation(&ec_context.consent) == true`
+4. `partner.pull_sync_enabled == true`
+5. Either: no entry exists for this partner in the KV graph, or the existing `synced` timestamp is older than `partner.pull_sync_ttl_sec` (default 86400 seconds)
+6. Rate limit not exceeded: `partner.pull_sync_rate_limit` calls per EC hash per partner per hour (default 10)
 
 ### 10.3 Execution model
 
@@ -878,7 +993,7 @@ Any other non-200 response is treated as a transient failure. No retry. The next
 
 ### 10.5 KV write on success
 
-On a non-null `uid`: call `kv.upsert_partner_id(ec_hash, partner_id, uid, now())`. On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request.
+On a non-null `uid`: call `kv.upsert_partner_id(ec_hash, partner_id, uid, now())`. If the root entry is missing, the upsert creates a minimal live entry first (same recovery path as `/sync`). On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request.
 
 The write updates `ids[partner_id].synced` to the current timestamp, resetting the `pull_sync_ttl_sec` window.
 
@@ -904,15 +1019,19 @@ pub async fn handle_identify(
 
 **Server-side proxy (for use case 2):** The publisher's origin server must forward:
 
-| Header                                                  | Required                               |
-| ------------------------------------------------------- | -------------------------------------- |
-| `Cookie: ts-ec=<value>` or `X-ts-ec: <value>`           | Yes                                    |
-| `Cookie: euconsent-v2=<value>` or `Cookie: gpp=<value>` | Yes for EU/UK/US users                 |
-| `X-consent-advertising: <value>`                        | Optional — takes precedence if present |
+| Header                                                    | Required                               |
+| --------------------------------------------------------- | -------------------------------------- |
+| `Cookie: ts-ec=<value>` or `X-ts-ec: <value>`             | Yes                                    |
+| `Cookie: euconsent-v2=<value>` or `Cookie: __gpp=<value>` | Yes for EU/UK/US users                 |
+| `X-consent-advertising: <value>`                          | Optional — takes precedence if present |
 
 ### 11.3 EC and consent handling
 
-`/identify` follows `EcContext` retrieval priority (Section 4.2). It does **not** generate a new EC. It does **not** set or modify cookies.
+`/identify` follows `EcContext` retrieval priority (Section 4.2). It does **not**
+generate a new EC, and the handler itself does not write cookies. However,
+`ec_finalize_response()` still runs after the handler: on consent withdrawal it
+deletes the EC cookie, and on header/cookie mismatch it may reconcile the cookie
+to the authoritative header-derived EC.
 
 Consent is evaluated using the same logic as Section 6.
 
@@ -950,24 +1069,42 @@ Consent is evaluated using the same logic as Section 6.
 }
 ```
 
-**`403 Forbidden` — consent denied:**
+**`200 OK` — EC present, KV entry missing (no synced partners yet):**
+
+This case occurs by design when `create_or_revive()` fails on EC generation (best-effort) or when the EC was just created and no partners have synced yet. It is not an error — the EC is valid, just has no partner data.
+
+```json
+{
+  "ec": "a1b2c3...AbC123",
+  "consent": "ok",
+  "degraded": false,
+  "uids": {},
+  "eids": []
+}
+```
+
+Note: `degraded` is `false` because the KV read succeeded (it returned `None`, meaning no entry exists). `degraded: true` is reserved for KV read errors where the entry might exist but couldn't be retrieved.
+
+**`403 Forbidden` — consent denied (regardless of EC presence):**
 
 ```json
 { "consent": "denied" }
 ```
 
-**`204 No Content` — no EC present.** No body.
+Consent is evaluated **before** EC presence. If `!allows_ec_creation(&consent)`, return `403` immediately — do not fall through to the `204` branch. This ensures consent denial is always surfaced, even for users with no EC.
+
+**`204 No Content` — no EC present, consent not denied.** No body.
 
 ### 11.5 Response headers (supplementary)
 
 Set on `200` responses only:
 
-| Header              | Value                                                        |
-| ------------------- | ------------------------------------------------------------ |
-| `X-ts-ec`           | `{ec_hash.suffix}`                                           |
+| Header              | Value                                                                                                                                                                                                                                                                                                                           |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-ts-ec`           | `{ec_hash.suffix}`                                                                                                                                                                                                                                                                                                              |
 | `X-ts-eids`         | Standard base64 (RFC 4648, with `=` padding) of the JSON array of OpenRTB 2.6 `user.eids` objects. Capped at **4 KB** after encoding. If the encoded value exceeds 4 KB, the array is truncated (fewest partners first — highest `synced` timestamp retained) until it fits, and a `x-ts-eids-truncated: true` header is added. |
-| `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`). One header per partner with a resolved UID. **Capped at 20 partners** — partners sorted by most-recently synced; excess partners are omitted silently. |
-| `X-ts-ec-consent`   | `ok` or `denied`                                             |
+| `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`). One header per partner with a resolved UID. **Capped at 20 partners** — partners sorted by most-recently synced; excess partners are omitted silently.                                                                                                                            |
+| `X-ts-ec-consent`   | `ok` (always — denied consent returns `403`, not `200`)                                                                                                                                                                                                                                                                         |
 
 These are supplementary — callers should read the JSON body as the primary contract. The 4 KB cap on `X-ts-eids` and the 20-partner cap on `X-ts-<partner_id>` headers reflect typical proxy and browser total-header-budget constraints. Both caps apply independently.
 
@@ -1006,30 +1143,26 @@ Browser `fetch()` with `credentials: "include"` sends an `OPTIONS` preflight. Th
 
 ### 12.1 Changes to existing auction path
 
-The auction handler (`crates/common/src/auction/`) is modified to inject EC identity into outbound OpenRTB requests. This is **not** a builder tweak — it requires explicit schema additions across multiple files.
+The auction handler (`crates/common/src/auction/`) is modified to inject EC identity into outbound OpenRTB requests. This is **not** a builder tweak — it requires explicit schema additions across multiple files. SyntheticID is fully removed from the auction path — no fallback, no `X-Synthetic-*` headers, no `get_or_generate_synthetic_id()`.
 
-**EC + SyntheticID coexistence (transitional — cutover is out of scope for this spec):**
-
-EC is the authoritative identity signal where present; SyntheticID continues to run alongside it during the transition. Removal of SyntheticID generation, its cookies, and its response headers is a follow-on spec.
-
-| Concern | This-spec behavior |
-|---------|-------------------|
-| `UserInfo.id` | Add `ec_id: Option<String>` to `UserInfo`. When EC is present, `ec_id = Some(ec_value)`. `id` continues to hold synthetic ID unchanged. |
-| Outbound OpenRTB `user.id` | Set to `ec_value` when EC present, `synthetic_id` otherwise. |
-| `X-Synthetic-*` response headers | **Kept unchanged** — transitional compatibility. Removal is a follow-on. |
-| `X-ts-ec` response header | Added alongside `X-Synthetic-*` when EC is present. |
-| Publisher and integration proxy paths | Both `get_or_generate_synthetic_id()` and `ec_context.generate_if_needed()` run. |
-| `convert_tsjs_to_auction_request()` | Add `ec_context: Option<&EcContext>` parameter alongside existing synthetic logic. |
+| Concern                               | Behavior                                                                                                    |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `UserInfo.id`                         | Replace with `ec_value` when EC is present. Remove `synthetic_id` field. When no EC → `user.id` is omitted. |
+| Outbound OpenRTB `user.id`            | Set to `ec_value` when EC present. Omit when no EC (no fallback).                                           |
+| `X-Synthetic-*` response headers      | **Removed.** Replaced by `X-ts-ec`.                                                                         |
+| `X-ts-ec` response header             | Set when EC is present.                                                                                     |
+| Publisher and integration proxy paths | Only `ec_context.generate_if_needed()` runs. `get_or_generate_synthetic_id()` is removed.                   |
+| `convert_tsjs_to_auction_request()`   | Takes `ec_context: &EcContext` (not Optional). SyntheticID parameter removed.                               |
 
 **Schema changes required before handler changes:**
 
-| File           | Change                                                                                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `types.rs`     | Add `ec_id: Option<String>` to `UserInfo`. Add `Eid` and `EidUid` OpenRTB 2.6 types. No removals.                             |
-| `openrtb.rs`   | Add `eids: Vec<Eid>` and `consent: Option<String>` to `User` struct. Keep `ext.synthetic_fresh`.                              |
-| `prebid.rs`    | Populate `user.id` from EC when present (fall back to synthetic). Add `user.eids`, `user.consent`. Keep existing synthetic fields. |
-| `formats.rs`   | Accept `ec_context: Option<&EcContext>`. Keep `get_or_generate_synthetic_id()` calls.                                          |
-| `endpoints.rs` | Pass `ec_context` to `convert_tsjs_to_auction_request()`. Add `X-ts-ec` header. Keep `X-Synthetic-*`.                         |
+| File           | Change                                                                                                                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.rs`     | Replace `id: String` in `UserInfo` with `ec_value: Option<String>`. Add `Eid` and `EidUid` OpenRTB 2.6 types. Remove synthetic fields.                                                                                                |
+| `openrtb.rs`   | Add `eids: Vec<Eid>` and `consent: Option<String>` to `User` struct. Remove `ext.synthetic_fresh`.                                                                                                                                    |
+| `prebid.rs`    | Populate `user.id` from EC value. Add `user.eids`, `user.consent`. Remove synthetic fallback.                                                                                                                                         |
+| `formats.rs`   | Accept `ec_context: &EcContext` (not Optional). Remove `synthetic_id` parameter.                                                                                                                                                      |
+| `endpoints.rs` | Remove `get_or_generate_synthetic_id()` call. Remove `X-Synthetic-*` headers. Use `ec_context.consent` instead of internal `build_consent_context()`. Pass `ec_context` to `convert_tsjs_to_auction_request()`. Add `X-ts-ec` header. |
 
 These changes affect the OpenRTB wire format — confirm with engineering that no existing SSP integrations break before merging.
 
@@ -1039,14 +1172,21 @@ When an `EcContext` is available on the request, the auction handler performs an
 
 ```rust
 // In handle_auction():
-let kv_entry = kv.get(ec_context.ec_hash()?).ok().flatten();
-
-user.id = ec_context.ec_value.clone();  // full hash.suffix
-user.consent = consent_string;           // TCF string from ec_context.consent, else None
-user.eids = match kv_entry {
-    Some((entry, _gen)) => build_eids_from_kv(&entry, partner_store),
-    None => vec![],  // KV read failed or no entry — degrade gracefully, omit eids
+let (user_id, eids) = match ec_context.ec_hash() {
+    Some(hash) => {
+        let kv_entry = kv.get(hash).ok().flatten();
+        let eids = match kv_entry {
+            Some((entry, _gen)) => build_eids_from_kv(&entry, partner_store),
+            None => vec![],  // KV read failed or no entry — degrade gracefully
+        };
+        (ec_context.ec_value.clone(), eids)
+    }
+    None => (None, vec![]),  // No EC — user.id omitted, no EIDs. Auction still runs.
 };
+
+user.id = user_id;
+user.consent = consent_string;  // TCF string from ec_context.consent, else None
+user.eids = eids;
 ```
 
 `build_eids_from_kv` iterates `kv_entry.ids` and includes only partners with `bidstream_enabled: true` and a non-empty `uid`. Partners without a resolved UID are omitted.
@@ -1082,15 +1222,12 @@ When calling a specific PBS adapter, include only that SSP's resolved ID in the 
 
 The current `/auction` path returns a JSON response inline to the JS caller (`endpoints.rs:71`). There is no server-to-server delivery step to a publisher ad server. EC headers are added to this existing response:
 
-| Header              | Value                                                |
-| ------------------- | ---------------------------------------------------- |
-| `X-ts-ec`           | `{ec_hash.suffix}` — when EC is present              |
-| `X-ts-eids`         | Standard base64 (RFC 4648) of OpenRTB 2.6 `user.eids` JSON array. Capped at 4 KB — same truncation rules as §11.5. |
-| `X-ts-eids-truncated` | `true` — present only when `X-ts-eids` was truncated |
-| `X-ts-ec-consent`   | `ok` or `denied`                                     |
-| `X-Synthetic-ID`    | **Transitional** — kept while SyntheticID cutover is pending |
-| `X-Synthetic-Fresh` | **Transitional** — kept while SyntheticID cutover is pending |
-| `X-Synthetic-Trusted-Server` | **Transitional** — kept while SyntheticID cutover is pending |
+| Header                | Value                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `X-ts-ec`             | `{ec_hash.suffix}` — when EC is present                                                                            |
+| `X-ts-eids`           | Standard base64 (RFC 4648) of OpenRTB 2.6 `user.eids` JSON array. Capped at 4 KB — same truncation rules as §11.5. |
+| `X-ts-eids-truncated` | `true` — present only when `X-ts-eids` was truncated                                                               |
+| `X-ts-ec-consent`     | `ok` — only present when consent granted; on withdrawal `ec_finalize_response()` strips all EC headers             |
 
 **Deferred:** A future server-to-server winner-notification delivery step to a publisher ad server is not in scope for this iteration. See §1 deferred items.
 
@@ -1138,25 +1275,47 @@ impl PartnerStore {
     pub fn verify_api_key(&self, partner_id: &str, api_key: &str) -> bool;
 
     /// Writes or updates a partner record.
-    pub fn upsert(&self, record: &PartnerRecord) -> Result<(), Report<TrustedServerError>>;
+    /// Returns `true` if this was a new partner (create), `false` if an existing
+    /// partner was updated. The pre-read needed for index maintenance (old API key
+    /// deletion) also determines this.
+    pub fn upsert(&self, record: &PartnerRecord) -> Result<bool, Report<TrustedServerError>>;
 
     /// Looks up the partner owning a given API key hash (for batch sync auth).
-    /// Iterates all partner records — called once per batch request, not per mapping.
+    /// Uses the `apikey:{hash}` secondary index for O(1) lookup, then verifies the
+    /// stored `api_key_hash` matches (guards against stale index from key rotation).
     pub fn find_by_api_key_hash(&self, hash: &str) -> Result<Option<PartnerRecord>, Report<TrustedServerError>>;
 
     /// Returns all partner records with `pull_sync_enabled == true`.
-    /// Used by the pull sync dispatcher after each organic request.
+    /// Used by the pull sync dispatcher after each organic request. Implementations
+    /// must re-check `pull_sync_enabled` on the fetched record before returning it,
+    /// because the `_pull_enabled` secondary index is best-effort and may be stale.
     pub fn pull_enabled_partners(&self) -> Result<Vec<PartnerRecord>, Report<TrustedServerError>>;
 }
 ```
 
-Partner records are stored as JSON values in `partner_store` KV, keyed by `partner_id`.
+**Storage layout:** Partner records are stored as JSON values in `partner_store` KV, keyed by `partner_id`. Two operations require access patterns beyond single-key lookup:
+
+1. **`find_by_api_key_hash(hash)`** — batch sync auth needs to find the partner owning a given API key hash. Implementation: maintain a secondary index entry `apikey:{sha256_hex} → partner_id` in the same KV store. Written on `upsert()`, looked up on batch auth. **On key rotation:** `upsert()` must read the existing record first, and if the `api_key_hash` has changed, delete the old `apikey:{old_hash}` index entry before writing the new one. This prevents old API keys from remaining valid after rotation.
+
+2. **`pull_enabled_partners()`** — pull sync needs all partners with `pull_sync_enabled == true`. Implementation: maintain an index entry `_pull_enabled → [partner_id_1, partner_id_2, ...]` (JSON array of partner IDs) in the same KV store. Updated on `upsert()` when `pull_sync_enabled` changes. The dispatcher reads this list, then does individual `get()` calls for each partner record. This bounds the number of KV reads to `1 + pull_partner_count` per organic request.
+
+**Consistency model:** These index writes are **best-effort, not atomic** — Fastly KV does not support multi-key transactions. `upsert()` writes in order: (1) primary record, (2) old API-key index deletion (if key changed), (3) new API-key index, (4) `_pull_enabled` list. If the process fails mid-sequence, indexes may be stale. All readers handle this defensively:
+
+- `find_by_api_key_hash()`: if the index points to a partner whose stored `api_key_hash` does not match the lookup hash, treat as auth failure (stale index from a rotation).
+- `pull_enabled_partners()`: if a listed partner ID returns `None` from `get()`, skip it silently. If the fetched record has `pull_sync_enabled == false`, also skip it silently — that is a stale `_pull_enabled` index entry.
+- The `_pull_enabled` list is vulnerable to lost updates under concurrent registrations. This is accepted — partner registration is a low-frequency admin operation (not a hot path). If lost updates become an issue, a CAS-based read-modify-write can be added later.
 
 ### 13.2 Admin endpoint (`POST /admin/partners/register`)
 
 **Module:** `ec/admin.rs`
 
-> **Codebase invariant:** `Settings::ADMIN_ENDPOINTS` in `settings.rs` hard-codes the list of admin routes and its tests verify coverage. Adding `/admin/partners/register` requires updating that constant and the associated auth-coverage tests. Failure to do so will break existing tests. See `settings.rs:391,398` and the test at `settings.rs:1363,1395`.
+> **Codebase invariant — requires test update:** `Settings::ADMIN_ENDPOINTS` in `settings.rs` lists routes that must be covered by a `[[handlers]]` Basic Auth entry. The existing test at `settings.rs:1504-1530` scans `main.rs` for **every** `/admin/` route string and asserts it appears in `ADMIN_ENDPOINTS`. When `/admin/partners/register` is added to `main.rs`, this test will fail.
+>
+> **Required changes:**
+>
+> 1. Do **NOT** add `/admin/partners/register` to `ADMIN_ENDPOINTS` — it uses bearer-token-in-handler auth.
+> 2. Update the admin-route-scan test (`settings.rs:1504-1530`) to maintain an exclusion list of bearer-token-authed admin routes (e.g., `const BEARER_AUTH_ADMIN_ROUTES: &[&str] = &["/admin/partners/register"]`) and skip those when asserting `ADMIN_ENDPOINTS` coverage.
+> 3. Narrow the `[[handlers]]` pattern in `trusted-server.toml` from `"^/admin"` to `"^/admin/keys"` so that `/admin/partners/register` is not intercepted by `enforce_basic_auth()` before reaching its bearer-token handler.
 
 ```rust
 pub async fn handle_register_partner(
@@ -1203,8 +1362,11 @@ Content-Type: application/json
 3. If `pull_sync_enabled == true`, validate that both `pull_sync_url` and `ts_pull_token` are present and non-empty. `400` with `"pull_sync_url and ts_pull_token are required when pull_sync_enabled is true"` if either is missing.
    If `pull_sync_url` is set, validate that its hostname is present in `pull_sync_allowed_domains`. `400` on failure with `"pull_sync_url domain must be in pull_sync_allowed_domains"`. This prevents TS from being directed to call arbitrary URLs — the allowlist must be declared in the same registration payload.
 4. Hash `api_key` with SHA-256 before writing — never store plaintext.
-5. `partner_store.upsert(record)`. `503` on KV failure.
-6. Return `201 Created` with the stored record (without `api_key_hash` raw value).
+5. `let created = partner_store.upsert(record)?`. `503` on KV failure.
+   `upsert()` returns `true` for a new partner, `false` for an update.
+6. Return `201 Created` if new partner (`created == true`), or `200 OK` if update
+   (`created == false`). Use an explicit response DTO — do NOT serialize the full
+   `PartnerRecord` (which contains `api_key_hash` and `ts_pull_token`).
 
 **Response:**
 
@@ -1212,9 +1374,13 @@ Content-Type: application/json
 {
   "id": "ssp_x",
   "name": "SSP Example",
-  "registered_at": 1741824000
+  "pull_sync_enabled": false,
+  "bidstream_enabled": true,
+  "created": true
 }
 ```
+
+The response confirms the registration succeeded and echoes key fields. `api_key_hash`, `ts_pull_token`, and `api_key` are never returned. `PartnerRecord` does not have a `registered_at` field — use the `created` boolean to signal first registration vs. upsert update.
 
 ---
 
@@ -1225,7 +1391,7 @@ Content-Type: application/json
 Added to `crates/common/src/settings.rs`:
 
 ```rust
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct EdgeCookie {
     /// Publisher passphrase used as HMAC key for EC generation.
     /// Must be identical across all of the publisher's owned domains.
@@ -1234,17 +1400,21 @@ pub struct EdgeCookie {
     pub passphrase: String,
 
     /// Fastly KV store name for the EC identity graph.
+    #[validate(length(min = 1))]
     pub ec_store: String,
 
     /// Fastly KV store name for the partner registry.
+    #[validate(length(min = 1))]
     pub partner_store: String,
 
     /// SHA-256 hex of the publisher admin token for `POST /admin/partners/register`.
     /// The plaintext token is provided in the `Authorization: Bearer` header;
     /// it is never stored in plaintext.
+    #[validate(custom(function = EdgeCookie::validate_sha256_hex))]
     pub admin_token_hash: String,
 
     /// Maximum concurrent pull sync calls dispatched per request.
+    #[validate(range(min = 1))]
     #[serde(default = "EdgeCookie::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 }
@@ -1252,6 +1422,9 @@ pub struct EdgeCookie {
 impl EdgeCookie {
     fn validate_passphrase(passphrase: &str) -> Result<(), ValidationError>;
     // Rejects "passphrase" or empty string as placeholder.
+
+    fn validate_sha256_hex(value: &str) -> Result<(), ValidationError>;
+    // Requires exactly 64 lowercase hex characters.
 
     fn default_pull_sync_concurrency() -> usize { 3 }
 }
@@ -1262,10 +1435,12 @@ Added to `Settings`:
 ```rust
 pub struct Settings {
     // ... existing fields ...
-    #[serde(default)]
-    pub ec: EdgeCookie,
+    #[validate(nested)]
+    pub ec: EdgeCookie,  // Required — omitting [ec] is a startup error
 }
 ```
+
+`EdgeCookie` does not derive `Default` — omitting the `[ec]` section from TOML is a deserialization error at startup. This is intentional: `passphrase`, `ec_store`, `partner_store`, and `admin_token_hash` have no safe defaults. The `#[validate(nested)]` attribute ensures `EdgeCookie::validate_passphrase()` runs when `settings.validate()` is called at startup (`settings_data.rs:28`), matching the pattern used by `Publisher` and `Rewrite` in the existing `Settings` struct (`Synthetic` is removed in PR #479).
 
 ### 14.2 TOML configuration example
 
@@ -1290,11 +1465,11 @@ Pixel sync and pull sync rate limits (per EC hash per partner per hour) cannot u
 | Pull sync  | `pull:{partner_id}:{ec_hash}` | 1 hour   |
 | Batch sync | `batch:{partner_id}`          | 1 minute |
 
-If the rate-limiting API is unavailable in the WASM target, fall back to a KV-based counter (`ec_store` key `rl:{partner_id}:{ec_hash}`, hourly TTL). Engineering to confirm API availability during Step 7 (pixel sync implementation).
+Engineering must confirm `fastly::erl::RateCounter` availability in the target before implementation of Steps 7, 9, and 10 is considered complete. Do NOT silently skip rate limiting in production if ERL is unavailable. Do NOT fall back to KV-based counters — they would hit the same 1 write/sec/key limit that necessitates `update_last_seen()` debouncing, and would thrash under real sync traffic. If ERL is unavailable, the rate-limited routes are blocked on an approved alternative counting mechanism.
 
 ### 14.4 Deprecation note
 
-`settings.synthetic.counter_store` and `settings.synthetic.opid_store` are currently configured but unused. They are not removed in this iteration — a follow-on cleanup ticket will address them.
+`settings.synthetic` is removed in PR #479. The `[synthetic]` TOML section, `counter_store`, `opid_store`, and `secret_key` fields are no longer present.
 
 ---
 
@@ -1314,9 +1489,11 @@ pub const HEADER_X_TS_EIDS: &str = "x-ts-eids";
 pub const HEADER_X_TS_EC_CONSENT: &str = "x-ts-ec-consent";
 pub const HEADER_X_TS_EIDS_TRUNCATED: &str = "x-ts-eids-truncated";
 
-// Consent cookies
+// Consent cookies (must match existing constants in constants.rs)
 pub const COOKIE_TCF: &str = "euconsent-v2";
-pub const COOKIE_GPP: &str = "gpp";
+pub const COOKIE_GPP: &str = "__gpp";
+pub const COOKIE_GPP_SID: &str = "__gpp_sid";
+pub const COOKIE_US_PRIVACY: &str = "us_privacy";
 
 // No EC-specific geo/IP header constants — use req.get_client_ip_addr() and GeoInfo::from_request(req).
 ```
@@ -1327,7 +1504,7 @@ The following EC headers must be added to `INTERNAL_HEADERS` in `constants.rs` t
 - `HEADER_X_TS_EIDS` (`x-ts-eids`)
 - `HEADER_X_TS_EC_CONSENT` (`x-ts-ec-consent`)
 - `HEADER_X_TS_EIDS_TRUNCATED` (`x-ts-eids-truncated`)
-- Dynamic `X-ts-<partner_id>` headers — these cannot be registered statically. The current `INTERNAL_HEADERS` filter uses explicit names, not a wildcard. Engineering must either extend the filter to strip the full `x-ts-` prefix pattern or enumerate all active partner IDs at startup. This must be confirmed before shipping.
+- Dynamic `X-ts-<partner_id>` headers — these cannot be registered statically because partners are added at runtime via `/admin/partners/register`. The `INTERNAL_HEADERS` filter **must use prefix stripping** (`x-ts-` prefix match) rather than enumerating partner IDs. A startup snapshot would miss partners registered after deployment. The current filter in `http_util.rs` uses explicit header names — extend it to also strip any header matching the `x-ts-` prefix pattern.
 
 ---
 
@@ -1339,11 +1516,14 @@ New error variants in `crates/common/src/error.rs`:
 pub enum TrustedServerError {
     // ... existing variants ...
 
-    /// Edge Cookie operation failed.
+    /// Edge Cookie operation failed — used only for EC-specific route handler
+    /// errors (e.g., KV read failure in /identify). EC generation failure on
+    /// organic routes does NOT produce this error — it is best-effort (log warn,
+    /// continue without EC). Missing client IP is logged but never surfaced as 500.
     #[display("Edge Cookie error: {message}")]
     EdgeCookie { message: String },
     // Maps to StatusCode::INTERNAL_SERVER_ERROR (500)
-    // Used for: EC generation failure, req.get_client_ip_addr() returning None
+    // Used for: EC-specific handler errors only (not organic-path generation)
 
     /// Partner not found in partner_store.
     #[display("Partner not found: {partner_id}")]
@@ -1365,74 +1545,123 @@ New routes added to `route_request()` in `crates/fastly/src/main.rs`:
 
 ```rust
 // EC sync pixel — no auth required (partner validation is internal)
-(GET, "/sync") → handle_sync(settings, &ec_context, kv, partner_store, req)
+(GET, "/sync") → handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
 
 // EC identity resolution — no auth required (consent-gated)
-(GET, "/identify") → handle_identify(settings, &ec_context, kv, partner_store, &req)
+(GET, "/identify") → handle_identify(settings, &kv, &partner_store, &req, &ec_context)
 
 // CORS preflight for /identify — must be registered explicitly, current router dispatches by exact method/path
 (OPTIONS, "/identify") → cors_preflight_identify(settings, &req)
 
 // S2S batch sync — partner API key auth (internal to handler)
-(POST, "/api/v1/sync") → handle_batch_sync(settings, kv, partner_store, req)
+(POST, "/api/v1/sync") → handle_batch_sync(settings, &kv, &partner_store, req)
 
 // Partner registration — publisher admin auth enforced in-handler (Bearer token)
-(POST, "/admin/partners/register") → handle_register_partner(settings, partner_store, req)
+(POST, "/admin/partners/register") → handle_register_partner(settings, &partner_store, req)
 ```
 
-Route ordering: EC routes are inserted before the fallback `handle_publisher_request()`. The `/admin/partners/register` route is NOT covered by the `[[handlers]]` Basic Auth config — it validates `Authorization: Bearer <token>` against `settings.ec.admin_token_hash` inside `handle_register_partner()`. The `[[handlers]]` block in `trusted-server.toml` must NOT include `/admin/partners/register` in its pattern (or must be narrowed so it does not cover this path).
+Route ordering: EC routes are inserted before the fallback `handle_publisher_request()`. The `/admin/partners/register` route uses bearer-token auth in-handler (not `[[handlers]]` Basic Auth). The current `trusted-server.toml` has `path = "^/admin"` which catches **all** `/admin/*` paths via `enforce_basic_auth()` before routing — this would block bearer-token requests to `/admin/partners/register`. **Required change:** narrow the existing `[[handlers]]` pattern from `"^/admin"` to `"^/admin/keys"` so it covers only `/admin/keys/rotate` and `/admin/keys/deactivate` (the routes in `Settings::ADMIN_ENDPOINTS`). `/admin/partners/register` then passes through `enforce_basic_auth()` unchallenged and reaches the bearer-token handler.
 
 ### 17.1 EC integration in `main.rs`
 
-Follows the same pattern as `GeoInfo::from_request()` which already runs pre-routing (line 70):
+EC follows the same pre-routing pattern as `GeoInfo::from_request()` (line 70). The pull sync background step requires a **structural refactor of the Fastly entrypoint**:
+
+1. `route_request()` return type changes from `Result<Response, Error>` to `Result<(), Error>`.
+2. The response is flushed mid-function via `response.send_to_client()` instead of being returned to `main()`.
+3. The `#[fastly::main]` function (`main.rs:32`) currently returns `Result<Response, Error>` — it must change to call `route_request()` and return `Ok(())` (or map the error). The current `fn main(req: Request) -> Result<Response, Error>` signature is incompatible with the `send_to_client()` pattern.
+4. After `send_to_client()`, the WASM invocation continues for background pull sync work.
+
+This is a supported Fastly Compute pattern — `Response::send_to_client()` flushes the response to the client immediately and allows the WASM invocation to continue. This is not a small wiring change; it restructures how the application returns responses.
 
 ```rust
-// Pre-routing — read only, no generation (matches GeoInfo pattern).
-// EcContext::read_from_request() extracts and stores client_ip internally
-// (same req.get_client_ip_addr() call used by GeoInfo::from_request() above).
-let mut ec_context = EcContext::read_from_request(&req, settings, geo_info.as_ref())?;
-let kv = KvIdentityGraph::new(&settings.ec.ec_store);
+async fn route_request(...) -> Result<(), Error> {
+    let geo_info = GeoInfo::from_request(&req);
 
-// Route dispatch — req is moved (consumed) inside the matching arm
-let result = match (method, path.as_str()) {
-    // EC-specific routes — receive ec_context read-only
-    (GET, "/sync")     => handle_sync(settings, &kv, partner_store, &req, &ec_context),
-    (GET, "/identify") => handle_identify(settings, &kv, partner_store, &req, &ec_context),
-    (OPTIONS, "/identify") => cors_preflight_identify(settings, &req),
-    (POST, "/api/v1/sync") => handle_batch_sync(settings, &kv, partner_store, req),
-    (POST, "/admin/partners/register") => handle_register_partner(settings, partner_store, req),
+    // Pre-routing — read only, no generation (matches GeoInfo pattern).
+    // EcContext stores client_ip internally (same req.get_client_ip_addr()
+    // already called by GeoInfo::from_request() above).
+    let ec_context_result = EcContext::read_from_request(&req, settings, geo_info.as_ref());
+    let mut ec_context = match ec_context_result {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            // Pre-routing failure — no route matched yet, but we still need to
+            // send an HTTP error response. Construct one and flush immediately.
+            log::error!("EcContext initialization failed: {e:?}");
+            let mut response = to_error_response(&e);
+            response.send_to_client();
+            return Ok(());
+        }
+    };
+    let kv = KvIdentityGraph::new(&settings.ec.ec_store);
+    let partner_store = PartnerStore::new(&settings.ec.partner_store);
+    let pull_sync_dispatcher = PullSyncDispatcher::new(settings.ec.pull_sync_concurrency);
 
-    // /auction — EC-read-only; never generates EC
-    (POST, "/auction") => handle_auction(settings, orchestrator, &kv, req, &ec_context).await,
+    if let Some(mut response) = enforce_basic_auth(settings, &req) {
+        ec_finalize_response(settings, geo_info.as_ref(), &ec_context, &kv, &mut response);
+        response.send_to_client();
+        return Ok(());
+    }
 
-    // Organic routes — generate EC if needed, then dispatch
-    (m, path) if integration_registry.has_route(&m, path) => {
-        ec_context.generate_if_needed(&req, settings, &kv)?;
-        integration_registry.handle_proxy(&m, path, settings, req, &ec_context).await
-    },
-    _ => {
-        ec_context.generate_if_needed(&req, settings, &kv)?;
-        handle_publisher_request(settings, integration_registry, req, &ec_context)
-    },
-};
+    let path = req.get_path().to_string();
+    let method = req.get_method().clone();
 
-// finalize_response runs on every route — enforces cookie write/deletion
-finalize_response(settings, geo_info.as_ref(), &ec_context, &kv, &mut response);
+    // Route dispatch — req is moved (consumed) inside the matching arm.
+    // is_organic tracks whether pull sync should fire (organic routes only — §10.2).
+    let mut is_organic = false;
+    let result = match (method, path.as_str()) {
+        // EC-specific routes — all read-only except /sync which takes &mut.
+        // /sync may assign fallback consent into ec_context.consent when the
+        // query param is the only signal — see §8.3.
+        (GET, "/sync")              => handle_sync(settings, &kv, &partner_store, &req, &mut ec_context).await,
+        (GET, "/identify")          => handle_identify(settings, &kv, &partner_store, &req, &ec_context).await,
+        (OPTIONS, "/identify")      => cors_preflight_identify(settings, &req),
+        (POST, "/api/v1/sync")      => handle_batch_sync(settings, &kv, &partner_store, req).await,
+        (POST, "/admin/partners/register") => handle_register_partner(settings, &partner_store, req).await,
 
-// Send the response to the client first, then continue for background work.
-// In Fastly Compute, calling send_to_client() flushes the response immediately;
-// the WASM invocation continues running after the client connection is released.
-response.send_to_client();
+        // /auction — EC-read-only; never generates EC.
+        // NOTE: handle_auction signature changes from (settings, orchestrator, req) to
+        // (settings, orchestrator, &kv, req, &ec_context) — this is a call-graph change,
+        // not just wiring. See §12 for the full auction integration.
+        (POST, "/auction")          => handle_auction(settings, orchestrator, &kv, req, &ec_context).await,
 
-// Background pull sync — fires outbound HTTP calls using send_async() (non-blocking).
-// req is already consumed above; client_ip is read from ec_context (stored at construction).
-// pull_enabled_partners() returns only records with pull_sync_enabled == true.
-if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
-    pull_sync_dispatcher.dispatch_background(&ec_context, ip, &pull_partners, &kv);
+        // Organic routes — generate EC if needed (best-effort, never 500s), then dispatch
+        (m, path) if integration_registry.has_route(&m, path) => {
+            is_organic = true;
+            ec_context.generate_if_needed(settings, &kv);
+            integration_registry.handle_proxy(&m, path, settings, req, &ec_context).await
+        },
+        _ => {
+            is_organic = true;
+            ec_context.generate_if_needed(settings, &kv);
+            handle_publisher_request(settings, integration_registry, req, &ec_context)
+        },
+    };
+
+    // Unwrap result — errors become error responses (matches existing pattern)
+    let mut response = result.unwrap_or_else(|e| to_error_response(&e));
+
+    // finalize_response runs on every route — enforces cookie write/deletion/last_seen
+    ec_finalize_response(settings, geo_info.as_ref(), &ec_context, &kv, &mut response);
+
+    // Flush response to client; WASM continues for background pull sync.
+    response.send_to_client();
+
+    // Background pull sync — organic routes only (§10.2). Never fires on /sync,
+    // /identify, /auction, /api/v1/sync, or /admin/* routes.
+    // Fires outbound HTTP calls via send_async(), blocks on PendingRequest::wait().
+    if is_organic {
+        if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
+            pull_sync_dispatcher.dispatch_background(&ec_context, ip, &pull_partners, &kv);
+        }
+    }
+
+    Ok(())
 }
 ```
 
-`PullSyncDispatcher::dispatch_background` uses `Request::send_async()` for each partner call — it fires the outbound HTTP requests and collects the `PendingRequest` handles, then awaits them with a concurrency cap of `settings.ec.pull_sync_concurrency`. This does not add latency to the user-facing response because `send_to_client()` has already been called.
+The existing `finalize_response()` in `main.rs` becomes `ec_finalize_response()` with the extended signature that accepts `ec_context` and `kv`. The `#[fastly::main]` entrypoint changes to call `route_request()` and return `Ok(())` (the response is already sent via `send_to_client()`).
+
+`PullSyncDispatcher::dispatch_background` uses `Request::send_async()` to fire outbound HTTP calls, then calls `PendingRequest::wait()` (blocking) on each handle under `settings.ec.pull_sync_concurrency` concurrency. No async runtime is needed — this is synchronous blocking code running after `send_to_client()` has flushed the response. The Fastly WASM invocation stays alive until `dispatch_background` returns. This does not add latency to the user-facing response.
 
 ---
 
@@ -1444,28 +1673,28 @@ Follow the project's **Arrange-Act-Assert** pattern. Test both happy paths and e
 
 Each module in `ec/` has a `#[cfg(test)]` module covering:
 
-| Module          | Key test cases                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------- |
-| `identity.rs`   | IPv4/IPv6 normalization, /64 truncation, HMAC determinism, output format                       |
-| `consent.rs`    | `ec_consent_granted()`: each `Jurisdiction` variant, fail-closed `Unknown` case                |
-| `cookie.rs`     | Cookie string format, Max-Age=0 for deletion, domain derivation                                |
-| `kv.rs`         | Serialization/deserialization roundtrip, CAS merge logic, metadata extraction                  |
-| `partner.rs`    | API key hash verification (constant-time), record serialization                                |
-| `sync_pixel.rs` | All `ts_synced` redirect codes, 429 rate limit, return URL construction                        |
-| `sync_batch.rs` | Status code selection (200/207/401/400/429), per-mapping rejection reasons, API-key rate limit |
-| `pull_sync.rs`  | Trigger conditions, null/404 no-op, dispatch limit                                             |
-| `identify.rs`   | All response codes (200/403/204), degraded flag, `uids` filtering                              |
+| Module          | Key test cases                                                                                            |
+| --------------- | --------------------------------------------------------------------------------------------------------- |
+| `identity.rs`   | IPv4/IPv6 normalization, /64 truncation, HMAC determinism, output format                                  |
+| `finalize.rs`   | `ec_finalize_response()`: cookie write on generation, deletion on withdrawal, `update_last_seen` debounce |
+| `cookie.rs`     | Cookie string format, Max-Age=0 for deletion, domain derivation                                           |
+| `kv.rs`         | Serialization/deserialization roundtrip, CAS merge logic, metadata extraction                             |
+| `partner.rs`    | API key hash verification (constant-time), record serialization                                           |
+| `sync_pixel.rs` | All `ts_synced` redirect codes, 429 rate limit, return URL construction                                   |
+| `sync_batch.rs` | Status code selection (200/207/401/400/429), per-mapping rejection reasons, API-key rate limit            |
+| `pull_sync.rs`  | Trigger conditions, null/404 no-op, dispatch limit                                                        |
+| `identify.rs`   | All response codes (200/403/204), degraded flag, `uids` filtering                                         |
 
 ### 18.2 Integration tests
 
 KV behavior is tested with Viceroy (local Fastly Compute simulator) using real KV store operations. Key scenarios:
 
-- Consent withdrawal: cookie deletion + KV delete in same request
+- Consent withdrawal: cookie deletion + tombstone write (`write_withdrawal_tombstone()`) + all EC response headers stripped — in same request
 - Concurrent writes: CAS retry logic under simulated generation conflicts
-- KV degraded: EC cookie still set when KV create fails
-- Full sync-and-identify flow: pixel sync writes, then `/identify` returns the uid
+- KV degraded: EC cookie still set when KV `create_or_revive()` fails (best-effort)
+- Sync-then-identify flow: pixel sync writes partner ID, then `/identify` returns it
 
-**Eventually-consistent caveat:** Fastly KV does not guarantee read-after-write consistency. Acceptance criteria that require a sync write to be immediately visible to a subsequent `/identify` read are written too strongly for the production platform. Integration tests under Viceroy may exhibit different consistency behavior than production. Tests for the sync→identify flow should either use retry with backoff (up to 1s) or be documented as a Viceroy-only behavior that is eventually consistent in production.
+**Eventually-consistent caveat:** Fastly KV does not guarantee read-after-write consistency. The sync→identify scenario may not be immediately visible on production — Viceroy may behave differently. Tests for this flow should use retry with backoff (up to 1s) and be documented as Viceroy-only consistency. Do not write assertions that assume immediate visibility after a KV write.
 
 ### 18.3 JS tests (if applicable)
 
@@ -1477,26 +1706,26 @@ If any JS changes are made for EC (e.g., publisher-side `/identify` fetch helper
 
 Suggested order to minimize risk and allow incremental testing. Each step should pass `cargo test --workspace` before the next begins.
 
-| Step | Scope                                                     | Deliverable                                                                         |
-| ---- | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| 1    | `ec/identity.rs` + constants + settings                   | `generate_ec()`, `normalize_ip()`, `EcContext`                                      |
-| 2    | `ec/consent.rs`                                           | `ec_consent_granted()` gating layer (consent pipeline is a prerequisite)            |
-| 3    | `ec/cookie.rs`                                            | Cookie creation, deletion, response header                                          |
-| 4    | `ec/kv.rs`                                                | `KvIdentityGraph` CRUD with CAS                                                     |
-| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/admin/partners/register`                                          |
-| 6    | EC middleware in `main.rs`, `publisher.rs`, `registry.rs` | `EcContext::read_from_request()` pre-routing, `generate_if_needed()`, `finalize_response()` |
-| 7    | `ec/sync_pixel.rs`                                        | `GET /sync` handler + route                                                         |
-| 8    | `ec/identify.rs`                                          | `GET /identify` handler + route                                                     |
-| 9    | `ec/sync_batch.rs`                                        | `POST /api/v1/sync` handler + route                                                 |
-| 10   | `ec/pull_sync.rs`                                         | Async pull dispatch after response                                                  |
-| 11   | Auction integration                                       | EC injection into `user.id`, `user.eids`, `user.consent`                            |
-| 12   | End-to-end integration tests                              | Viceroy-based flow tests                                                            |
+| Step | Scope                                                     | Deliverable                                                                                    |
+| ---- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 1    | `ec/identity.rs` + constants + settings                   | `generate_ec()`, `normalize_ip()`, `EcContext`                                                 |
+| 2    | `ec/finalize.rs`                                          | `ec_finalize_response()` (cookie write, deletion, tombstone, last_seen)                        |
+| 3    | `ec/cookie.rs`                                            | Cookie creation, deletion, response header                                                     |
+| 4    | `ec/kv.rs`                                                | `KvIdentityGraph` CRUD with CAS                                                                |
+| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/admin/partners/register`                                                     |
+| 6    | EC middleware in `main.rs`, `publisher.rs`, `registry.rs` | `EcContext::read_from_request()` pre-routing, `generate_if_needed()`, `ec_finalize_response()` |
+| 7    | `ec/sync_pixel.rs`                                        | `GET /sync` handler + route                                                                    |
+| 8    | `ec/identify.rs`                                          | `GET /identify` handler + route                                                                |
+| 9    | `ec/sync_batch.rs`                                        | `POST /api/v1/sync` handler + route                                                            |
+| 10   | `ec/pull_sync.rs`                                         | Background pull sync dispatch (blocking, after `send_to_client()`)                             |
+| 11   | Auction integration                                       | EC injection into `user.id`, `user.eids`, `user.consent`                                       |
+| 12   | End-to-end integration tests                              | Viceroy-based flow tests                                                                       |
 
 ---
 
 ## 20. Epic and Stories
 
-### Epic: Implement Server-Side Cookie (SSC) identity system
+### Epic: Implement Edge Cookie (EC) identity system
 
 Enable the trusted server to generate, persist, and serve a publisher-owned,
 privacy-safe Edge Cookie (EC) that can be used for ID sync, identity lookup,
@@ -1526,45 +1755,66 @@ struct that all subsequent stories depend on.
 - `normalize_ip()` truncates IPv6 to /64 (first 4 groups), passes IPv4 unchanged.
 - IP is sourced from `req.get_client_ip_addr()` — no header fallback.
 - `EcContext::read_from_request(req, settings, geo)` reads the `ts-ec` cookie
-  and `X-ts-ec` header, sets `cookie_was_present`, `ec_was_present`, `ec_value`.
-  Does not generate. Does not write KV.
-- `EcContext::generate_if_needed(req, settings, kv)` generates a new EC when
-  `ec_value == None && consent == Granted`, sets `ec_generated = true`, and writes
-  the initial KV entry via `kv.create()` (best-effort).
-- `[ec]` settings block parses from TOML: `enabled`, `passphrase`, `ec_store`,
-  `partner_store`, `pull_sync_concurrency`.
+  and `X-ts-ec` header. Sets `cookie_was_present`, `ec_was_present`, `ec_value`,
+  and `cookie_ec_value` (when header and cookie carry different valid EC values —
+  see §4.2 mismatch handling). Validates values via `ec_hash()` — malformed
+  values are treated as absent; if header is invalid, falls back to cookie.
+  Captures `client_ip` from `req.get_client_ip_addr()` (stored as
+  `Option<IpAddr>` for pull sync use after `req` is consumed by routing).
+  Calls `build_consent_context()` with the EC hash as identity key and stores
+  the result as `consent: ConsentContext` (see §6.1.1). Does not generate.
+  Does not write to EC identity KV. (Note: `build_consent_context()` may write
+  to the consent KV store when an EC hash is available.)
+- `EcContext::generate_if_needed(settings, kv)` generates a new EC when
+  `ec_value == None && allows_ec_creation(&consent)`, sets `ec_generated = true`,
+  and writes the initial KV entry via `kv.create_or_revive()` (best-effort).
+  Using `create_or_revive` (not `create`) ensures re-consent within the 24h
+  tombstone window recovers immediately. This function is best-effort: if
+  generation fails (e.g., missing client IP), it logs `warn` and returns
+  without setting `ec_generated`. It never returns an error — organic traffic
+  must not 500 on EC failure.
+- `[ec]` settings block parses from TOML: `passphrase`, `ec_store`,
+  `partner_store`, `admin_token_hash`, `pull_sync_concurrency`.
 - All unit tests in `identity.rs` pass (HMAC determinism, format, IP normalization).
 
 **Spec ref:** §2, §3, §4, §5.4, §14.1
 
 ---
 
-### Story 2 — EC consent gating layer *(prerequisite: consent pipeline already merged)*
+### Story 2 — EC finalize response
 
-Add `ec_consent_granted()` — the thin EC-specific gating function that derives a
-grant/deny decision from the pre-existing `ConsentContext`.
+Implement `ec_finalize_response()` — the post-routing function that enforces
+cookie writes, deletions, tombstones, and last-seen updates on every response.
 
-**Scope:** `ec/consent.rs` (new file; consent pipeline itself is a prerequisite)
+**Scope:** `ec/finalize.rs` (new file)
 
 **Acceptance criteria:**
 
-- `ec_consent_granted(consent: &ConsentContext) -> bool` is implemented per §6.1.1.
-  - `Jurisdiction::Gdpr` → requires `has_storage_consent()` and `!expired`
-  - `Jurisdiction::UsState(_)` → requires `!gpc` and no CCPA opt-out
-  - `Jurisdiction::NonRegulated` → `true`
-  - `Jurisdiction::Unknown` → `false` (fail-closed)
-- Unit tests cover each `Jurisdiction` variant × signal combination.
+- `ec_finalize_response(settings, geo, ec_context, kv, response)` runs on every route.
+- Consent gating uses the existing `allows_ec_creation()` — no new gating function.
+- When `!allows_ec_creation(&consent) && cookie_was_present`: calls
+  `clear_ec_on_response()` (deletes cookie and strips all EC response headers)
+  and writes tombstone for each valid EC hash available. When the cookie is
+  malformed and no valid header exists, no tombstone is written — cookie
+  deletion alone enforces withdrawal (see §6.2).
+- When `ec_was_present && !ec_generated && allows_ec_creation(&consent)`: calls
+  `kv.update_last_seen(ec_hash, now())` (debounced at 300s). If `cookie_ec_value`
+  is set (header/cookie mismatch), also calls `set_ec_on_response()` to reconcile
+  the browser cookie to the header-derived identity.
+- When `ec_generated == true`: calls `set_ec_on_response()`.
+- Unit tests cover all four branches: withdrawal (with and without valid hash),
+  returning-user last_seen + mismatch reconciliation, and new-EC generation.
 
-**Spec ref:** §6.1.1
+**Spec ref:** §5.4, §6.2
 
 ---
 
 ### Story 3 — EC cookie helpers
 
-Implement the functions that create and delete the `ts-ec` cookie on responses,
-and wire them into `finalize_response()`.
+Implement the low-level functions that create and delete the `ts-ec` cookie
+and set EC response headers. These are called by `ec_finalize_response()` (Story 2).
 
-**Scope:** `ec/cookie.rs`, `finalize_response()` in `main.rs`
+**Scope:** `ec/cookie.rs`
 
 **Acceptance criteria:**
 
@@ -1573,14 +1823,15 @@ and wire them into `finalize_response()`.
   (JS on the publisher page must be able to read the cookie).
 - `delete_ec_cookie()` produces a cookie with `Max-Age=0`, same attributes.
 - `set_ec_on_response()` sets `Set-Cookie` and `X-ts-ec` response headers.
-- `finalize_response()` signature updated to accept `ec_context: &EcContext` and `kv: &KvIdentityGraph`.
-- `finalize_response()` deletes the cookie and calls `kv.write_withdrawal_tombstone()` when
-  `!ec_consent_granted(&consent) && cookie_was_present`.
-- `finalize_response()` sets the cookie only when `ec_generated == true`.
-  No other cookie writes occur. No `suppress_mutation` flag.
-- Unit tests cover cookie string format, Max-Age=0 deletion, domain derivation.
+- `clear_ec_on_response()` sets `Set-Cookie` with `Max-Age=0` **and** strips all
+  EC-related response headers: `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`,
+  `x-ts-eids-truncated`, and any `X-ts-<partner_id>` headers. This prevents
+  leaking EC identity on consent-withdrawal responses where a handler may have
+  already set these headers before `ec_finalize_response()` runs.
+- Unit tests cover cookie string format, Max-Age=0 deletion, domain derivation,
+  and header stripping (verify headers are removed after `clear_ec_on_response`).
 
-**Spec ref:** §5.1, §5.3, §5.4, §17 (finalize_response)
+**Spec ref:** §5.1, §5.3, §5.4, §17 (ec_finalize_response)
 
 ---
 
@@ -1598,22 +1849,29 @@ CAS-based concurrent write protection and consent withdrawal delete.
 - `KvIdentityGraph::get_metadata(ec_hash)` returns `Option<KvMetadata>` for
   cheap consent/country checks without streaming the full body.
 - `KvIdentityGraph::create(ec_hash, &entry)` writes a new entry with
-  `consent.ok = true` using CAS; retries up to 3 times on generation conflict.
+  `consent.ok = true`. Returns `Err` if the key already exists (concurrent
+  create) or on KV error. No retry — callers handle conflicts.
 - `KvIdentityGraph::create_or_revive(ec_hash, &entry)` creates a new entry OR
   overwrites an existing tombstone (`consent.ok = false`) with a fresh entry;
   no-ops if a live entry already exists. Called by `generate_if_needed()`.
-- `KvIdentityGraph::update_last_seen(ec_hash)` updates `last_seen` without
-  overwriting partner IDs (CAS merge), and only writes if the stored value is
-  more than 300s old (debounce to avoid 1 write/sec KV limit).
+- `KvIdentityGraph::update_last_seen(ec_hash, timestamp)` updates `last_seen`
+  without overwriting partner IDs (CAS merge), and only writes if the stored
+  value is more than 300s older than `timestamp` (debounce to avoid 1 write/sec
+  KV limit). Callers pass `now()` as `timestamp`.
 - `KvIdentityGraph::write_withdrawal_tombstone(ec_hash)` sets `consent.ok = false`,
-  clears partner IDs, and applies a 24-hour TTL (see §6.3).
+  clears partner IDs, and applies a 24-hour TTL (see §6.2). Returns `Result` —
+  callers log `error` on failure and continue (cookie deletion is the primary
+  enforcement mechanism).
+- `KvIdentityGraph::delete(ec_hash)` hard-deletes the entry — used only for IAB
+  data deletion requests, not for consent withdrawal (which uses tombstones).
 - `kv.upsert_partner_id(ec_hash, partner_id, uid, timestamp)` writes to
-  `ids[partner_id]` and skips if existing `synced >= timestamp` (idempotent).
+  `ids[partner_id]`, creating a minimal live root entry first if the key is
+  absent, and skips if existing `synced >= timestamp` (idempotent).
 - KV schema matches §7 exactly (JSON roundtrip test).
-- Unit tests cover CAS merge logic, tombstone write, serialization/deserialization
-  roundtrip, metadata extraction.
+- Unit tests cover CAS merge logic, tombstone write, tombstone error handling,
+  serialization/deserialization roundtrip, metadata extraction.
 
-**Spec ref:** §4, §5.4, §6.3
+**Spec ref:** §4, §5.4, §6.2
 
 ---
 
@@ -1630,6 +1888,8 @@ that operators use to onboard ID sync partners.
   `pull_sync_allowed_domains` and `batch_rate_limit`.
 - `PartnerStore::get()`, `upsert()`, `find_by_api_key_hash()` operate on
   `partner_store` KV.
+- `pull_enabled_partners()` re-checks `pull_sync_enabled == true` on fetched
+  records so stale `_pull_enabled` index entries do not dispatch disabled partners.
 - API key stored as SHA-256 hex; plaintext never written to KV.
 - `verify_api_key()` uses constant-time comparison.
 - `POST /admin/partners/register` validates `Authorization: Bearer <token>` inside
@@ -1637,10 +1897,16 @@ that operators use to onboard ID sync partners.
   Returns `401` if missing or invalid — before any request body is read.
 - Admin endpoint validates: `pull_sync_url` hostname must be in
   `pull_sync_allowed_domains` when set — returns `400` otherwise.
-- Returns `201 Created` with the stored record on success; `400` on validation
-  failure; `503` on KV failure.
-- `/admin/partners/register` is added to `Settings::ADMIN_ENDPOINTS` in
-  `settings.rs` and the auth-coverage tests pass (`settings.rs:1363,1395`).
+- Returns `201 Created` on new partner or `200 OK` on update, with an explicit
+  response DTO (see §13.2 step 6 — do NOT serialize full `PartnerRecord`).
+  Returns `400` on validation failure; `503` on KV failure.
+- `/admin/partners/register` is **NOT** added to `Settings::ADMIN_ENDPOINTS` —
+  it uses bearer-token-in-handler auth, not `[[handlers]]` Basic Auth.
+- The admin-route-scan test (`settings.rs:1504-1530`) must be updated to exclude
+  bearer-token-authed routes from its `ADMIN_ENDPOINTS` assertion. Add an exclusion
+  list (see §13.2 codebase invariant note).
+- The `[[handlers]]` pattern in `trusted-server.toml` must be narrowed from
+  `"^/admin"` to `"^/admin/keys"` (see §13.2).
 - Unit tests cover API key hash verification and record serialization.
 
 **Spec ref:** §13
@@ -1653,21 +1919,43 @@ Wire `EcContext` into the request pipeline following the two-phase model
 (§5.4 and §17.1). `EcContext::read_from_request()` runs pre-routing like
 `GeoInfo`; `generate_if_needed()` runs inside organic handlers only.
 
-**Scope:** `main.rs`, `publisher.rs`, `registry.rs` (route wiring only — no new modules)
+**Scope:** `main.rs`, `publisher.rs`, `endpoints.rs`, `registry.rs`
 
 **Acceptance criteria:**
 
 - `EcContext::read_from_request()` is called before the route match on every
   request, passed the existing `geo_info` (no duplicate geo header parsing).
-- EC-specific and EC-read-only route handlers (`/sync`, `/identify`, `/auction`,
-  `/api/v1/sync`, `/admin/*`) receive `ec_context` in read-only form — they never
-  call `generate_if_needed()`. `/auction` consumes EC identity but never bootstraps it.
+- EC route handlers receive `ec_context` without EC generation. `/identify`,
+  `/auction`, `/api/v1/sync`, and `/admin/*` use read-only `&EcContext` and
+  never mutate it. **Exception:** `/sync` receives `&mut EcContext`; when the
+  consent query-param fallback applies (`ec_context.consent.is_empty()`), it
+  assigns the locally-decoded consent into `ec_context.consent` so that both
+  the sync write decision and `ec_finalize_response()` share the same effective
+  consent view. This prevents a same-request "write partner ID, then withdraw
+  EC" conflict. See §8.3 for full details.
+- `/auction` consumes EC identity but never bootstraps it.
 - `handle_publisher_request()` and `integration_registry.handle_proxy()` call
-  `ec_context.generate_if_needed(&req, settings, &kv)` before their handler logic.
-- `finalize_response()` receives `ec_context` and `kv` and:
-  - Deletes the EC cookie and writes a withdrawal tombstone if consent is withdrawn (runs on all routes).
-  - Sets a new `Set-Cookie` only when `ec_context.ec_generated == true`.
-- No existing route behavior changes — EC context is additive.
+  `ec_context.generate_if_needed(settings, &kv)` before their handler logic (best-effort, never 500s).
+- `ec_finalize_response()` receives `ec_context` and `kv` and:
+  - Deletes the EC cookie and writes a withdrawal tombstone when `!allows_ec_creation(&consent) && cookie_was_present` (runs on all routes).
+  - Calls `kv.update_last_seen(ec_hash, now())` when `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)` (returning user with valid consent).
+  - Calls `set_ec_on_response()` when `ec_context.ec_generated == true`, and also
+    on returning-user mismatch reconciliation when `cookie_ec_value.is_some()`.
+- `route_request()` return type changes from `Result<Response, Error>` to
+  `Result<(), Error>`; response is flushed via `response.send_to_client()` instead
+  of being returned. The `#[fastly::main]` entrypoint must also change to match.
+  This is a structural refactor of the Fastly entrypoint, not an additive change —
+  see §17.1 for the full scope.
+- `handle_auction()` signature changes to accept `&KvIdentityGraph` and `&EcContext`
+  (see §17.1 pseudocode comment).
+- **Handler refactoring:** PR #479 removes `get_or_generate_synthetic_id()`,
+  `COOKIE_SYNTHETIC_ID`, and `X-Synthetic-*` headers from all handlers. This
+  epic completes the refactoring by replacing the internal `build_consent_context()`
+  calls with `ec_context.consent`:
+  - `handle_publisher_request()`, `handle_auction()`, and
+    `integration_registry.handle_proxy()` no longer call `build_consent_context()`
+    internally — they use `ec_context.consent` (built pre-routing).
+  - Identity comes from `ec_context.ec_value` (no synthetic fallback).
 - `cargo test --workspace` passes with no regressions.
 
 **Spec ref:** §5, §17
@@ -1684,16 +1972,29 @@ user ID against an EC hash.
 **Acceptance criteria:**
 
 - Missing required query params (`partner`, `uid`, `return`) → `400`.
-- No `ts-ec` cookie → redirect to `{return}?ts_synced=0&ts_reason=no_ec`.
+- No valid `ts-ec` cookie (missing or malformed) → redirect to
+  `{return}?ts_synced=0&ts_reason=no_ec`.
 - Unknown `partner` ID → `400`.
 - `return` URL hostname not in `partner.allowed_return_domains` → `400`.
 - Consent uses `ec_context.consent`. The optional `consent` query param is a fallback
-  only: it is used exclusively when `ec_context.consent.is_empty()`
-  (no X-consent-advertising header and no framework cookie on the request).
-  When a fresher signal exists, the param is ignored. Does not mutate `ec_context`.
+  only: it is used exclusively when `ec_context.consent.is_empty()` returns `true`
+  — meaning no consent signals of any kind are present (no TCF string, no GPP
+  string, no US Privacy string, no AC string, no GPC, no decoded consent objects).
+  Use the `ConsentContext::is_empty()` method directly; do not reimplement the
+  check from this description. If consent KV fallback or any other pre-routing
+  source has already populated `ec_context.consent`, `is_empty()` is `false` and
+  the param is ignored.
+  When the fallback applies, decode the consent string locally into a
+  `ConsentContext` and **assign it into `ec_context.consent`** so that both
+  the sync write and `ec_finalize_response()` share the same effective consent
+  (prevents a same-request "write partner ID, then withdraw EC" conflict).
+  Do NOT re-call `build_consent_context()` (that would trigger consent KV writes).
   Denied or absent → redirect to `{return}?ts_synced=0&ts_reason=no_consent`.
 - Rate limit exceeded → `429 Too Many Requests` (no redirect).
 - KV write failure → redirect to `{return}?ts_synced=0&ts_reason=write_failed`.
+- `kv.upsert_partner_id()` creates a minimal live root entry first when the EC
+  exists in the cookie but the identity graph key is still missing because the
+  original best-effort `create_or_revive()` failed on generation.
 - Success → redirect to `{return}?ts_synced=1`.
 - Return URL construction correctly appends `&` or `?` based on existing query string.
 - Rate counter key: `{partner_id}:{ec_hash}`, 1-hour window, via `fastly::erl::RateCounter`.
@@ -1712,19 +2013,27 @@ hash and synced partner UIDs for the current user.
 
 **Acceptance criteria:**
 
-- No `ts-ec` cookie AND no `X-ts-ec` header (`ec_was_present == false`) and `!ec_consent_granted(consent)` → `403 Forbidden`.
-- No `ts-ec` cookie AND no `X-ts-ec` header (`ec_was_present == false`) and consent not denied → `204 No Content`.
-- Valid EC, consent granted, KV read succeeds → `200` with full JSON body
+- `!allows_ec_creation(consent)` (consent denied, regardless of EC presence) → `403 Forbidden`.
+  When EC is present but consent is denied, the handler returns `403` and
+  `ec_finalize_response()` deletes the cookie and writes a tombstone.
+- No EC present (`ec_was_present == false`) and consent not denied → `204 No Content`.
+- Valid EC, consent granted, KV read succeeds with entry → `200` with full JSON body
   including `ec`, `consent`, `uids`, `eids`.
+- Valid EC, consent granted, KV read succeeds but no entry (never synced or
+  `create_or_revive()` failed on generation) → `200` with `degraded: false`,
+  empty `uids`/`eids`. This is not an error — see §11.4.
 - `uids` filtered to partners where `bidstream_enabled = true` and consent
   granted.
-- KV read failure → `200` with `degraded: true` and empty `uids`/`eids`.
+- KV read error (store unavailable) → `200` with `degraded: true` and empty
+  `uids`/`eids`.
 - No `Origin` header (server-side proxy): process normally, no CORS headers, no `403`.
 - `Origin` header present and matches `publisher.domain` or subdomain: reflect in
   `Access-Control-Allow-Origin` + `Vary: Origin`.
 - `Origin` header present but does not match: `403`, no body.
 - `OPTIONS /identify` preflight → `200` with CORS headers, no body.
-- `generate_if_needed()` is never called — no new EC generated, no `Set-Cookie`.
+- `generate_if_needed()` is never called — no new EC is generated. The handler
+  itself does not write cookies, but `ec_finalize_response()` may still delete
+  the cookie on withdrawal or reconcile it on header/cookie mismatch.
 - Response time target: 30ms p95 (documented, not gate).
 - Unit tests cover all response codes, degraded flag, `uids` filtering,
   CORS origin validation.
@@ -1742,7 +2051,9 @@ their UIDs against a list of EC hashes.
 
 **Acceptance criteria:**
 
-- Missing or invalid `Authorization: Bearer` → `401`.
+- Missing or invalid `Authorization: Bearer` → `401`. Auth uses index-based
+  lookup via `find_by_api_key_hash()` (§9.2) with constant-time hash verification.
+- Auth KV lookup failure (store unavailable) → `503 Service Unavailable`.
 - API-key rate limit exceeded (`batch_rate_limit` per partner per minute) → `429`
   with `{ "error": "rate_limit_exceeded" }`.
 - More than 1000 mappings → `400`.
@@ -1763,16 +2074,18 @@ their UIDs against a list of EC hashes.
 
 ### Story 10 — Pull sync dispatch
 
-Implement the async background task that calls partner resolution endpoints
-after a response is flushed, when trigger conditions are met.
+Implement the background pull sync dispatcher that calls partner resolution
+endpoints after the response is flushed via `send_to_client()`. Uses
+`send_async()` + `PendingRequest::wait()` (synchronous blocking, no async
+runtime). Only fires on organic routes (§10.2).
 
 **Scope:** `ec/pull_sync.rs`
 
 **Acceptance criteria:**
 
-- Dispatch only when: EC present, consent granted, `pull_sync_enabled = true`,
-  and either no existing partner entry or existing `synced` is older than
-  `pull_sync_ttl_sec`.
+- Dispatch only when: EC present (including an EC generated on the current
+  organic request), consent granted, `pull_sync_enabled = true`, and either no
+  existing partner entry or existing `synced` is older than `pull_sync_ttl_sec`.
 - Rate limit: `pull_sync_rate_limit` per EC hash per partner per hour; counter
   key `pull:{partner_id}:{ec_hash}`.
 - Maximum concurrent pulls per request: `settings.ec.pull_sync_concurrency`
@@ -1784,7 +2097,10 @@ after a response is flushed, when trigger conditions are met.
 - `{ "uid": null }` and `404` are no-ops — no KV write, no error logged above
   `debug`.
 - Any other non-200 → transient failure, no retry, no error above `warn`.
-- Dispatch is non-blocking — does not add latency to the user-facing response.
+- Dispatch runs after `send_to_client()` — does not add latency to the
+  user-facing response. Uses `send_async()` + `PendingRequest::wait()` (blocking).
+- Only fires on organic routes (`handle_publisher_request`, `handle_proxy`) —
+  never on `/sync`, `/identify`, `/auction`, `/api/v1/sync`, or `/admin/*`.
 - Unit tests cover trigger conditions, null/404 no-op, domain allowlist check,
   dispatch limit enforcement.
 
@@ -1801,14 +2117,18 @@ Inject EC identity data into outbound OpenRTB bid requests for publishers with
 
 **Acceptance criteria:**
 
-- `user.id` set to `ec_context.ec_value` (the full `hash.suffix` string) when EC present and consent granted; falls back to `synthetic_id` when EC is absent (matching §12.1 coexistence table — EC is authoritative where present, synthetic otherwise).
+- `user.id` set to `ec_context.ec_value` when EC present and consent granted.
+  No synthetic fallback — when no EC is present, `user.id` is omitted.
 - `user.eids` populated with one entry per `bidstream_enabled` partner that
   has a synced UID, using `partner.source_domain` and `partner.openrtb_atype`.
 - `user.consent` set to `ec_context.consent.raw_tc_string` when present.
 - No EID entry written for partners with no synced UID.
-- KV read failure → `user.eids` omitted (empty); `user.id` still set from EC or synthetic fallback; auction proceeds without EID data (no 5xx).
-- No EC present → `user.id` set from synthetic fallback; `user.eids` is empty.
-- Unit tests cover EID structure, consent string threading, KV-degraded path.
+- KV read failure → `user.eids` omitted (empty); `user.id` still set from EC;
+  auction proceeds without EID data (no 5xx).
+- No EC present → `user.id` omitted; `user.eids` is empty. Auction still runs.
+- `X-Synthetic-*` response headers are not present (removed in PR #479). Only `X-ts-ec` is set.
+- Unit tests cover EID structure, consent string threading, KV-degraded path,
+  and no-EC path (verify no synthetic fallback).
 
 **Spec ref:** §12
 
@@ -1827,10 +2147,13 @@ across multiple handlers in a single simulated environment.
   partner UID → `/identify` returns that UID → auction includes EID.
 - **Consent withdrawal:** Request with denied consent clears EC cookie and writes
   a KV tombstone (`consent.ok = false`, 24h TTL) in the same request; subsequent
-  `/identify` with consent still denied returns `403` (no cookie + denied → §11.3);
+  `/identify` with consent still denied returns `403` (consent denied → §11.4);
   batch sync returns `consent_withdrawn` within the tombstone TTL.
-- **KV degraded:** EC cookie is still set when KV create fails; `/identify`
-  returns `degraded: true`.
+- **KV create failure:** EC cookie is still set when `create_or_revive()` fails
+  (best-effort). Subsequent `/identify` returns `200` with `degraded: false` and
+  empty `uids`/`eids` (KV read succeeds — entry simply does not exist).
+- **KV read failure:** `/identify` returns `200` with `degraded: true` and empty
+  `uids`/`eids` (store unavailable, entry might exist but can't be read).
 - **Concurrent writes:** Two simultaneous EC creates for the same hash resolve
   without data loss (CAS retry).
 - **Rate limits:** Pixel sync returns `429` after `sync_rate_limit` is
