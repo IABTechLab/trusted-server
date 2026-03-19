@@ -55,7 +55,7 @@ SyntheticID is created unconditionally. There is no mechanism to check TCF (EU/U
 
 ### 2.3 Publishers need a reliable, deterministic signal that can be explicitly shared
 
-Today, regular cookies don't suffice for publisher and partner needs. Additionally, only having these identifiers in the 1st party domain's cookie have created slow, undesirable behaviour in the form of cookie syncs. 
+Today, regular cookies don't suffice for publisher and partner needs. Additionally, only having these identifiers in the 1st party domain's cookie have created slow, undesirable behaviour in the form of cookie syncs.
 
 ---
 
@@ -86,13 +86,13 @@ Today, regular cookies don't suffice for publisher and partner needs. Additional
 
 **This iteration** targets publishers running the full Trusted Server stack. SSP, DSP, and identity provider customers interact with EC via the sync and bidstream endpoints but do not require a separate TS deployment.
 
-| Customer type | Deployment mode | Primary value | In scope |
-|---|---|---|---|
-| Publisher (full TS) | Full TS + EC enabled | Consent-aware first-party ID, bidstream enrichment, identity graph | **Yes** |
-| SSP | Partner — integrates via pixel sync and/or S2S pull | Build match table against EC hash; receive enriched bid requests | **Yes** (as partner) |
-| DSP | Partner — integrates via S2S batch and/or S2S pull | Push/receive ID mappings; enriched bid requests | **Yes** (as partner) |
-| Identity provider | Partner — integrates via S2S batch | Sync resolved IDs into the KV identity graph | **Yes** (as partner) |
-| Publisher (EC only) | TS Lite at `ec.publisher.com` | First-party cookie at apex domain without full TS | Deferred (see Section 5) |
+| Customer type       | Deployment mode                                     | Primary value                                                      | In scope                 |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------------------------ | ------------------------ |
+| Publisher (full TS) | Full TS + EC enabled                                | Consent-aware first-party ID, bidstream enrichment, identity graph | **Yes**                  |
+| SSP                 | Partner — integrates via pixel sync and/or S2S pull | Build match table against EC hash; receive enriched bid requests   | **Yes** (as partner)     |
+| DSP                 | Partner — integrates via S2S batch and/or S2S pull  | Push/receive ID mappings; enriched bid requests                    | **Yes** (as partner)     |
+| Identity provider   | Partner — integrates via S2S batch                  | Sync resolved IDs into the KV identity graph                       | **Yes** (as partner)     |
+| Publisher (EC only) | TS Lite at `ec.publisher.com`                       | First-party cookie at apex domain without full TS                  | Deferred (see Section 5) |
 
 ---
 
@@ -106,20 +106,20 @@ TS Lite is a runtime configuration of the existing Trusted Server binary. It is 
 
 ### 5.2 Route surface in TS Lite
 
-| Route | Full TS | TS Lite |
-|---|---|---|
-| `GET /static/tsjs=<ids>` | Enabled | Disabled |
-| `POST /auction` | Enabled | Optional (configurable) |
-| `GET /first-party/proxy` | Enabled | Disabled |
-| `GET /first-party/click` | Enabled | Disabled |
-| `POST /first-party/sign` | Enabled | Disabled |
-| `GET /first-party/proxy-rebuild` | Enabled | Disabled |
-| HTML injection pipeline | Enabled | Disabled |
-| GTM integration | Enabled | Disabled |
-| `GET /sync` | Disabled | **Enabled** |
-| `GET /identify` | Disabled | **Enabled** |
-| `POST /api/v1/sync` | Disabled | **Enabled** |
-| `GET /.well-known/trusted-server.json` | Enabled | Enabled |
+| Route                                  | Full TS  | TS Lite                 |
+| -------------------------------------- | -------- | ----------------------- |
+| `GET /static/tsjs=<ids>`               | Enabled  | Disabled                |
+| `POST /auction`                        | Enabled  | Optional (configurable) |
+| `GET /first-party/proxy`               | Enabled  | Disabled                |
+| `GET /first-party/click`               | Enabled  | Disabled                |
+| `POST /first-party/sign`               | Enabled  | Disabled                |
+| `GET /first-party/proxy-rebuild`       | Enabled  | Disabled                |
+| HTML injection pipeline                | Enabled  | Disabled                |
+| GTM integration                        | Enabled  | Disabled                |
+| `GET /sync`                            | Disabled | **Enabled**             |
+| `GET /identify`                        | Disabled | **Enabled**             |
+| `POST /api/v1/sync`                    | Disabled | **Enabled**             |
+| `GET /.well-known/trusted-server.json` | Enabled  | Enabled                 |
 
 When a disabled route is requested, TS returns `404` with the header `X-ts-error: feature-disabled`.
 
@@ -147,18 +147,20 @@ The EC is generated by HMAC-SHA256 of a fixed input set, using a publisher-speci
 
 **Inputs (IP address + salt only):**
 
-| Input | Value |
-|---|---|
-| IP address | IPv4 as-is; IPv6 summarized to /64 prefix (first 4 hextets) — discards rotating interface ID. On dual-stack, IPv6 is preferred. |
+| Input      | Value                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| IP address | IPv4 as-is; IPv6 summarized to /64 prefix (first 4 hextets) — discards rotating interface ID. On dual-stack, IPv6 is preferred.                                                                                                                                                                                                                                                                       |
 | Secret key | Publisher-chosen passphrase, configured in `trusted-server.toml`. Consistent across all of the publisher's own domains. Publishers who share the same passphrase with other publishers form an identity-federated consortium — the same user produces the same EC hash across all consortium members. Publishers using different passphrases produce unrelated hashes with no cross-property linkage. |
 
 **Removed from SyntheticID:**
+
 - `User-Agent`
 - `Accept-Language`
 - `Accept-Encoding`
 - Handlebars template (input is now fixed, not configurable)
 
 **Output format (unchanged from SyntheticID):**
+
 ```
 {64-character hex HMAC-SHA256}.{6-character random alphanumeric suffix}
 ```
@@ -169,15 +171,15 @@ The 64-character prefix is the stable, deterministic portion used as the KV stor
 
 ### 6.2 Cookie attributes
 
-| Attribute | Value |
-|---|---|
-| Name | `ts-ec` |
-| Domain | `.publisher.com` (derived from `publisher.domain` in TOML) |
-| Path | `/` |
-| Secure | Yes |
-| SameSite | `Lax` |
-| Max-Age | `31536000` (1 year) |
-| HttpOnly | No — JavaScript on `www.publisher.com` may need to read the value for ad stack decoration |
+| Attribute | Value                                                                                     |
+| --------- | ----------------------------------------------------------------------------------------- |
+| Name      | `ts-ec`                                                                                   |
+| Domain    | `.publisher.com` (derived from `publisher.domain` in TOML)                                |
+| Path      | `/`                                                                                       |
+| Secure    | Yes                                                                                       |
+| SameSite  | `Lax`                                                                                     |
+| Max-Age   | `31536000` (1 year)                                                                       |
+| HttpOnly  | No — JavaScript on `www.publisher.com` may need to read the value for ad stack decoration |
 
 ### 6.3 Response header
 
@@ -222,25 +224,28 @@ When a consent signal is required for the user's region, Trusted Server checks s
 
 Before creating a new EC, Trusted Server first evaluates the user's region (via Fastly's `x-geo-country` header) to determine whether a consent signal is required. If the region requires a signal, TS reads it using the precedence order in Section 7.1; if no signal is found, creation is blocked (the fail-safe in step 4 applies). If the region does not require a signal, TS creates the EC unconditionally.
 
-| Region | Required signal | Rule |
-|---|---|---|
-| EU member states | TCF string | Create EC only if `purposeConsents[1]` (store and/or access information on a device) is `true`. If no TCF signal is found, do not create EC (7.1 step 4 applies). |
-| United Kingdom | TCF string | Same as EU |
-| US states with privacy laws (CA, CO, CT, VA, TX, OR, MT, DE, NH, NJ, TN, IN, IA, KY, NE, MD, MN, RI) | GPP string | Create EC unless user has opted out of sale or sharing of personal data. If no GPP signal is found, do not create EC (7.1 step 4 applies). |
-| Rest of world | None required | Create EC on first visit regardless of whether any consent signal is present. Section 7.1 step 4 does not apply. |
+| Region                                                                                               | Required signal | Rule                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EU member states                                                                                     | TCF string      | Create EC only if `purposeConsents[1]` (store and/or access information on a device) is `true`. If no TCF signal is found, do not create EC (7.1 step 4 applies). |
+| United Kingdom                                                                                       | TCF string      | Same as EU                                                                                                                                                        |
+| US states with privacy laws (CA, CO, CT, VA, TX, OR, MT, DE, NH, NJ, TN, IN, IA, KY, NE, MD, MN, RI) | GPP string      | Create EC unless user has opted out of sale or sharing of personal data. If no GPP signal is found, do not create EC (7.1 step 4 applies).                        |
+| Rest of world                                                                                        | None required   | Create EC on first visit regardless of whether any consent signal is present. Section 7.1 step 4 does not apply.                                                  |
 
 ### 7.3 Consent withdrawal (real-time enforcement)
 
 On every request, Trusted Server decodes the consent signal (a microsecond in-memory operation with no I/O). If consent is not present or has been revoked:
 
 **If `ts-ec` cookie is present:**
+
 1. Delete the cookie by issuing `Set-Cookie: ts-ec=; Max-Age=0; Domain=.publisher.com; Path=/; Secure; SameSite=Lax`
 2. Delete the KV identity graph entry: `kv_store.delete(ec_hash)` — this operation takes approximately 25ms and runs in the request path
 
 **If no `ts-ec` cookie is present:**
+
 - Do nothing
 
 **If consent is present:**
+
 - Proceed with normal EC create-or-refresh flow
 
 **Known tradeoff:** The KV delete adds approximately 25ms of latency to the first request after consent withdrawal. This is an intentional product decision — real-time consent enforcement is a differentiating capability of Trusted Server, and the latency cost is acceptable.
@@ -321,9 +326,9 @@ Concurrent writes from different partners to the same KV entry must not overwrit
 
 Two KV stores are required:
 
-| Store | TOML key | Contents |
-|---|---|---|
-| Identity graph | `ec_store` | EC hash → identity graph JSON |
+| Store            | TOML key        | Contents                           |
+| ---------------- | --------------- | ---------------------------------- |
+| Identity graph   | `ec_store`      | EC hash → identity graph JSON      |
 | Partner registry | `partner_store` | Partner ID → config + API key hash |
 
 The existing `counter_store` and `opid_store` settings (currently defined but unused in `settings.rs`) can be deprecated in a follow-on cleanup.
@@ -332,15 +337,15 @@ The existing `counter_store` and `opid_store` settings (currently defined but un
 
 The EC cookie is deterministic (derived from IP + publisher salt) and lives in the browser. It does not depend on KV Store availability. KV Store holds identity enrichment only — resolved partner UIDs accumulated over time. The degraded behavior policy follows from this: **EC always works; enrichment degrades gracefully.**
 
-| Operation | KV unavailable or error | Rationale |
-|---|---|---|
-| EC cookie creation | Set the cookie. Skip the KV entry creation silently. Log the failure at `warn` level. | The cookie is the identity anchor — it does not require KV. The KV entry will be created on the next request once KV recovers. |
-| EC cookie refresh (existing user) | Refresh the cookie. Skip the KV `last_seen` update silently. Log at `warn`. | Same as above — the cookie continues working. Stale `last_seen` is acceptable. |
-| `/sync` KV write | Redirect to `return` with `ts_synced=0&ts_reason=write_failed`. | The browser redirect must not be blocked by KV availability. This case is already specified in Section 9.4. |
-| `/identify` KV read | Return `200` with `ec` hash (from cookie) and `degraded: true`. Set `uids: {}` and `eids: []`. | The EC hash is still valid and useful for attribution and analytics. Empty uids signal that enrichment is unavailable, not that the user has no synced partners. `degraded: true` lets callers distinguish transient KV failure from a genuinely unenriched user. |
-| S2S batch write (`/api/v1/sync`) | Return `207` with all mappings rejected, `reason: "kv_unavailable"`. | The request was valid; the failure is infrastructure. Partners should retry the batch. |
-| S2S pull sync write (async) | Discard the resolved uid. Log at `warn`. Retry will occur on the next qualifying request per the `pull_sync_ttl_sec` window. | Async path — no user-facing impact. |
-| Consent withdrawal KV delete | Expire the cookie immediately. Log the KV delete failure at `error` level. Retry the KV delete on the next request for this user. | Cookie deletion is the primary enforcement mechanism. KV delete failure must not block or delay the cookie expiry. |
+| Operation                         | KV unavailable or error                                                                                                           | Rationale                                                                                                                                                                                                                                                         |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EC cookie creation                | Set the cookie. Skip the KV entry creation silently. Log the failure at `warn` level.                                             | The cookie is the identity anchor — it does not require KV. The KV entry will be created on the next request once KV recovers.                                                                                                                                    |
+| EC cookie refresh (existing user) | Refresh the cookie. Skip the KV `last_seen` update silently. Log at `warn`.                                                       | Same as above — the cookie continues working. Stale `last_seen` is acceptable.                                                                                                                                                                                    |
+| `/sync` KV write                  | Redirect to `return` with `ts_synced=0&ts_reason=write_failed`.                                                                   | The browser redirect must not be blocked by KV availability. This case is already specified in Section 9.4.                                                                                                                                                       |
+| `/identify` KV read               | Return `200` with `ec` hash (from cookie) and `degraded: true`. Set `uids: {}` and `eids: []`.                                    | The EC hash is still valid and useful for attribution and analytics. Empty uids signal that enrichment is unavailable, not that the user has no synced partners. `degraded: true` lets callers distinguish transient KV failure from a genuinely unenriched user. |
+| S2S batch write (`/api/v1/sync`)  | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                                                              | The request was valid; the failure is infrastructure. Partners should retry the batch.                                                                                                                                                                            |
+| S2S pull sync write (async)       | Discard the resolved uid. Log at `warn`. Retry will occur on the next qualifying request per the `pull_sync_ttl_sec` window.      | Async path — no user-facing impact.                                                                                                                                                                                                                               |
+| Consent withdrawal KV delete      | Expire the cookie immediately. Log the KV delete failure at `error` level. Retry the KV delete on the next request for this user. | Cookie deletion is the primary enforcement mechanism. KV delete failure must not block or delay the cookie expiry.                                                                                                                                                |
 
 **`degraded: true` in `/identify` responses**
 
@@ -360,7 +365,7 @@ When a KV read fails, the `/identify` response includes `"degraded": true` in th
 
 #### Problem
 
-Code attestation (reproducible WASM builds + published binary hashes) proves that the TS binary running on Fastly's infrastructure matches the open-source repository. It does not, however, prove that the *data* inside `ec_store` was written by that attested binary. A malicious or compromised operator could write arbitrary identity mappings directly into the KV store — bypassing all code paths — and buyers would have no way to detect it.
+Code attestation (reproducible WASM builds + published binary hashes) proves that the TS binary running on Fastly's infrastructure matches the open-source repository. It does not, however, prove that the _data_ inside `ec_store` was written by that attested binary. A malicious or compromised operator could write arbitrary identity mappings directly into the KV store — bypassing all code paths — and buyers would have no way to detect it.
 
 #### Solution: JOSE-signed KV entry bodies
 
@@ -376,7 +381,7 @@ At read time, the TS binary verifies the JWS signature before consuming any fiel
 
 **What it does not prove:**
 
-- That the *input data* (e.g., a partner-supplied UID) was accurate at the time of write. Signal accuracy remains the partner's responsibility.
+- That the _input data_ (e.g., a partner-supplied UID) was accurate at the time of write. Signal accuracy remains the partner's responsibility.
 - Anything about entries written before this feature was deployed. A migration pass will resign existing entries or treat them as unsigned (degraded) until they are refreshed by a normal TS write.
 
 #### Attestation record endpoint
@@ -394,7 +399,13 @@ Response (application/json):
   "version": "1.0",
   "jwks": {
     "keys": [
-      { "kty": "OKP", "crv": "Ed25519", "kid": "ts-2026-A", "use": "sig", "x": "..." }
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "ts-2026-A",
+        "use": "sig",
+        "x": "..."
+      }
     ]
   },
   "attestation": {
@@ -408,12 +419,12 @@ Response (application/json):
 
 The `jwks` field is unchanged — it continues to serve request signing keys on its existing rotation schedule. The `attestation` object is a separate namespace and does not affect existing consumers of this endpoint.
 
-| Field | Description |
-|---|---|
-| `attestation.binary_hash` | SHA-256 hex of the deployed WASM binary. Cross-referenced with Fastly's signed deployment manifest in the reproducible builds PRD. |
-| `attestation.alg` | JWS algorithm used for all KV entry signatures. Fixed at `ES256` (ECDSA P-256). |
-| `attestation.jwk` | Public key in JWK format (RFC 7517). Buyers use this to verify signatures in KV-derived `user.eids`. Distinct from the `jwks` request-signing keys. |
-| `attestation.expires_at` | UTC timestamp after which the attestation key should be considered untrustworthy. Buyers must re-fetch before this time. |
+| Field                     | Description                                                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attestation.binary_hash` | SHA-256 hex of the deployed WASM binary. Cross-referenced with Fastly's signed deployment manifest in the reproducible builds PRD.                  |
+| `attestation.alg`         | JWS algorithm used for all KV entry signatures. Fixed at `ES256` (ECDSA P-256).                                                                     |
+| `attestation.jwk`         | Public key in JWK format (RFC 7517). Buyers use this to verify signatures in KV-derived `user.eids`. Distinct from the `jwks` request-signing keys. |
+| `attestation.expires_at`  | UTC timestamp after which the attestation key should be considered untrustworthy. Buyers must re-fetch before this time.                            |
 
 **Key TTL:** 90 days. The attestation key rotates on each new TS deployment. The previous key's `expires_at` is set 7 days after rotation to allow in-flight impressions to drain.
 
@@ -433,7 +444,7 @@ The `jwks` field is unchanged — it continues to serve request signing keys on 
 
 #### Relationship to reproducible builds PRD
 
-JOSE-signed KV entries close the *data integrity* gap that code attestation leaves open. Reproducible builds and published binary hashes address the *code integrity* layer — proving that the deployed binary matches the audited source. These are complementary controls that together form a complete trust chain for buyers.
+JOSE-signed KV entries close the _data integrity_ gap that code attestation leaves open. Reproducible builds and published binary hashes address the _code integrity_ layer — proving that the deployed binary matches the audited source. These are complementary controls that together form a complete trust chain for buyers.
 
 The reproducible builds feature has broader scope than the identity graph (it applies to all TS behaviour, not just KV writes) and will be specified in a dedicated PRD. The `attestation.binary_hash` field in `trusted-server.json` anticipates that PRD — buyers can record it today, and the reproducible builds PRD will define the process for independently verifying it against Fastly's signed deployment manifest.
 
@@ -455,12 +466,12 @@ GET /sync
 
 ### 9.3 Parameters
 
-| Parameter | Required | Description |
-|---|---|---|
-| `partner` | Yes | Partner ID, must match a registered partner in `partner_store` KV |
-| `uid` | Yes | Partner's user ID for this user |
-| `return` | Yes | Callback URL to redirect to after sync (must match partner's `allowed_return_domains`) |
-| `consent` | No | TCF or GPP string from the partner's context, used if no consent signal is present on the request |
+| Parameter | Required | Description                                                                                       |
+| --------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `partner` | Yes      | Partner ID, must match a registered partner in `partner_store` KV                                 |
+| `uid`     | Yes      | Partner's user ID for this user                                                                   |
+| `return`  | Yes      | Callback URL to redirect to after sync (must match partner's `allowed_return_domains`)            |
+| `consent` | No       | TCF or GPP string from the partner's context, used if no consent signal is present on the request |
 
 ### 9.4 Flow
 
@@ -473,11 +484,11 @@ GET /sync
 
 **`ts_synced` values:**
 
-| Value | Meaning |
-|---|---|
-| `ts_synced=1` | KV write succeeded — partner uid is now in the identity graph |
-| `ts_synced=0&ts_reason=no_ec` | No EC cookie present — user has not established an EC on this publisher |
-| `ts_synced=0&ts_reason=no_consent` | Consent absent or invalid — write suppressed |
+| Value                                | Meaning                                                                     |
+| ------------------------------------ | --------------------------------------------------------------------------- |
+| `ts_synced=1`                        | KV write succeeded — partner uid is now in the identity graph               |
+| `ts_synced=0&ts_reason=no_ec`        | No EC cookie present — user has not established an EC on this publisher     |
+| `ts_synced=0&ts_reason=no_consent`   | Consent absent or invalid — write suppressed                                |
 | `ts_synced=0&ts_reason=write_failed` | KV write failed after retries — partner should retry on a future pixel fire |
 
 Partners should treat `ts_synced=0` as a signal that the mapping was not stored. The `ts_reason` parameter is informational; partners should not gate their own behavior on specific reason values.
@@ -493,6 +504,7 @@ Partners should treat `ts_synced=0` as a signal that the mapping was not stored.
 **As an SSP**, I want to fire a sync pixel when I see a user so that I can associate my user ID with the EC hash and receive enriched bid requests when the publisher calls Trusted Server for auction.
 
 **Acceptance criteria:**
+
 - [ ] `GET /sync?partner=ssp_x&uid=abc&return=https://sync.ssp.com/ack` returns a redirect to the `return` URL within 50ms (excluding KV write time)
 - [ ] KV entry for the EC hash contains `ids.ssp_x.uid = "abc"` after a successful sync; response redirects to `return` with `ts_synced=1`
 - [ ] If no `ts-ec` cookie is present, redirects to `return` with `ts_synced=0&ts_reason=no_ec`; no KV write performed
@@ -555,13 +567,13 @@ Maximum batch size per request: 1000 mappings (subject to revision based on KV w
 
 **HTTP status rules:**
 
-| Condition | Status |
-|---|---|
-| All mappings accepted | `200 OK` |
-| Some mappings accepted, some rejected | `207 Multi-Status` |
-| Auth valid, batch valid, but **all** mappings rejected | `207 Multi-Status` with `accepted: 0` |
-| Auth invalid | `401 Unauthorized` (no body processing) |
-| Batch exceeds 1000 mappings or malformed JSON | `400 Bad Request` (no body processing) |
+| Condition                                              | Status                                  |
+| ------------------------------------------------------ | --------------------------------------- |
+| All mappings accepted                                  | `200 OK`                                |
+| Some mappings accepted, some rejected                  | `207 Multi-Status`                      |
+| Auth valid, batch valid, but **all** mappings rejected | `207 Multi-Status` with `accepted: 0`   |
+| Auth invalid                                           | `401 Unauthorized` (no body processing) |
+| Batch exceeds 1000 mappings or malformed JSON          | `400 Bad Request` (no body processing)  |
 
 A `207` with `accepted: 0` signals "your request was received and processed correctly, but none of the submitted EC hashes were found or eligible." This is distinct from an auth or protocol error. Partners should treat this as a data signal — either the EC hashes are stale/unknown, or consent has been withdrawn for all submitted users — and should not retry the same batch without investigating the underlying cause.
 
@@ -580,6 +592,7 @@ Before writing a mapping, Trusted Server checks the KV metadata for the given EC
 **As a DSP**, I want to push my user ID mappings to Trusted Server in bulk so that the publisher's auction requests are enriched with my resolved ID and I can bid on users I recognize.
 
 **Acceptance criteria:**
+
 - [ ] `POST /api/v1/sync` with a valid Bearer token and a batch of up to 1000 mappings returns a response within 5 seconds
 - [ ] Accepted mappings are written to the corresponding KV identity graph entries within 1 second
 - [ ] Mappings for unknown `ec_hash` values are rejected with `ec_hash_not_found`
@@ -610,13 +623,13 @@ The partner's resolution endpoint receives the EC hash and IP address. The partn
 
 **What it solves and what it doesn't:**
 
-| User scenario | Pixel sync | S2S batch | S2S pull |
-|---|---|---|---|
-| New user, Chrome, 3p cookies available | Works (bootstraps KV) | Not applicable | No server-side mapping yet — no-op |
-| Returning user after prior pixel sync | Redundant (already in KV) | Works | Works (partner has IP or bid-stream mapping) |
-| Safari user, partner has IP-based mapping | Blocked / unreliable | Works if partner knows EC hash | Works — partner resolves from their IP graph |
-| User unknown to partner by any signal | No uid to sync | No uid to push | No uid to return — no-op |
-| Authenticated user with hashed email | Works | Works | Works |
+| User scenario                             | Pixel sync                | S2S batch                      | S2S pull                                     |
+| ----------------------------------------- | ------------------------- | ------------------------------ | -------------------------------------------- |
+| New user, Chrome, 3p cookies available    | Works (bootstraps KV)     | Not applicable                 | No server-side mapping yet — no-op           |
+| Returning user after prior pixel sync     | Redundant (already in KV) | Works                          | Works (partner has IP or bid-stream mapping) |
+| Safari user, partner has IP-based mapping | Blocked / unreliable      | Works if partner knows EC hash | Works — partner resolves from their IP graph |
+| User unknown to partner by any signal     | No uid to sync            | No uid to push                 | No uid to return — no-op                     |
+| Authenticated user with hashed email      | Works                     | Works                          | Works                                        |
 
 S2S pull does not solve the cold-start problem for users the partner has never seen. It degrades gracefully to a no-op in those cases.
 
@@ -692,6 +705,7 @@ The following fields are added to the partner record schema (Section 13.3):
 **As an SSP**, I want Trusted Server to call my resolution endpoint when it sees a user I might know, so that my uid is available for bidstream decoration without requiring the publisher to include a sync pixel in their page.
 
 **Acceptance criteria:**
+
 - [ ] When a request arrives with a valid `ts-ec` cookie and a partner with `pull_sync_enabled: true` has no KV entry (or a stale entry), a pull call is dispatched asynchronously after the response is sent
 - [ ] A successful pull response with a non-null `uid` results in a KV write within 1 second
 - [ ] A `null` or `404` response results in no KV write and no error logged above `DEBUG` level
@@ -733,26 +747,29 @@ Some SSPs run client-side header bidding wrappers (e.g., Amazon TAM, certain Ind
 A script on the publisher's page calls `/identify` via `fetch()`. Because `ec.publisher.com` is same-site with the publisher's domain, the browser sends the `ts-ec` cookie and consent cookies automatically. No forwarding required.
 
 ```js
-const identity = await fetch('https://ec.publisher.com/identify')
-  .then(r => r.json());
+const identity = await fetch('https://ec.publisher.com/identify').then((r) =>
+  r.json()
+)
 
 // GAM key-value targeting
-googletag.pubads().setTargeting('ts_ec', identity.ec);
-googletag.pubads().setTargeting('ts_uid2', identity.uids.uid2);
+googletag.pubads().setTargeting('ts_ec', identity.ec)
+googletag.pubads().setTargeting('ts_uid2', identity.uids.uid2)
 
 // Prebid.js userIds injection
-pbjs.setConfig({ userSync: { userIds: [{ name: 'uid2', value: { id: identity.uids.uid2 } }] } });
+pbjs.setConfig({
+  userSync: { userIds: [{ name: 'uid2', value: { id: identity.uids.uid2 } }] },
+})
 ```
 
 **Pattern 2 — Origin-server proxy (for use case 2 when TS winner headers are unavailable)**
 
 A server-side caller must forward the following from the original browser request:
 
-| Header to forward | Required |
-|---|---|
-| `Cookie: ts-ec=<value>` or `X-ts-ec: <value>` | Yes — without this, TS cannot identify the user |
+| Header to forward                                       | Required                                                              |
+| ------------------------------------------------------- | --------------------------------------------------------------------- |
+| `Cookie: ts-ec=<value>` or `X-ts-ec: <value>`           | Yes — without this, TS cannot identify the user                       |
 | `Cookie: euconsent-v2=<value>` or `Cookie: gpp=<value>` | Yes — without this, TS returns `consent: denied` and no identity data |
-| `X-consent-advertising: <value>` | Optional — takes precedence over cookie consent if present |
+| `X-consent-advertising: <value>`                        | Optional — takes precedence over cookie consent if present            |
 
 #### Cookie and consent handling
 
@@ -813,12 +830,12 @@ No `ts-ec` cookie and no `X-ts-ec` header was found on the request. The user has
 
 In addition to the JSON body, TS sets the following response headers for server-to-server callers, logging, and future use. These are not the primary integration contract — callers should read the JSON body.
 
-| Header | Value |
-|---|---|
-| `X-ts-ec` | `<ec_hash.suffix>` or absent if no EC |
-| `X-ts-eids` | Base64-encoded JSON array of OpenRTB 2.6 `user.eids` objects |
+| Header              | Value                                                         |
+| ------------------- | ------------------------------------------------------------- |
+| `X-ts-ec`           | `<ec_hash.suffix>` or absent if no EC                         |
+| `X-ts-eids`         | Base64-encoded JSON array of OpenRTB 2.6 `user.eids` objects  |
 | `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`, `X-ts-liveramp`) |
-| `X-ts-ec-consent` | `ok` or `denied` |
+| `X-ts-ec-consent`   | `ok` or `denied`                                              |
 
 ### 12.3 Mode B: Full auction orchestration (`/auction`)
 
@@ -835,11 +852,11 @@ Trusted Server owns the full auction path in Mode B. TS builds the OpenRTB reque
 
 When TS delivers auction winners to the publisher's ad server endpoint, the response includes EC identity so the publisher's ad server has full context for its outbid decision without needing to call `/identify` separately:
 
-| Header | Value |
-|---|---|
-| `X-ts-ec` | `<ec_hash.suffix>` |
-| `X-ts-eids` | Base64-encoded JSON array of OpenRTB 2.6 `user.eids` objects |
-| `X-ts-ec-consent` | `ok` or `denied` |
+| Header            | Value                                                        |
+| ----------------- | ------------------------------------------------------------ |
+| `X-ts-ec`         | `<ec_hash.suffix>`                                           |
+| `X-ts-eids`       | Base64-encoded JSON array of OpenRTB 2.6 `user.eids` objects |
+| `X-ts-ec-consent` | `ok` or `denied`                                             |
 
 ### 12.4 OpenRTB 2.6 `user.eids` structure
 
@@ -881,6 +898,7 @@ Each partner registered in `partner_store` declares:
 **As a publisher using Mode A for analytics/attribution**, I want to call `/identify` from a browser script so that I can tag events and impressions with the user's EC hash and resolved partner UIDs using URL parameters.
 
 **Acceptance criteria:**
+
 - [ ] `GET /identify` returns `200` with a valid JSON body within 30ms when EC is present and consent is valid
 - [ ] `uids` object contains one key per partner with `bidstream_enabled: true` and a resolved UID; partners with no resolved UID are omitted
 - [ ] If consent is denied, response is `403 Forbidden` with body `{"consent": "denied"}`
@@ -890,6 +908,7 @@ Each partner registered in `partner_store` declares:
 **As a publisher using a client-side wrapper for non-TS SSPs**, I want to call `/identify` from my Prebid.js configuration so that SSPs outside TS's auction receive the same identity enrichment as TS-orchestrated bids, enabling a fair winner comparison.
 
 **Acceptance criteria:**
+
 - [ ] `GET /identify` called from the browser returns resolved UIDs for all registered partners with a KV entry for this user
 - [ ] A partner with no KV entry for this user is omitted from `uids` — no empty or null entries
 - [ ] Response is available within 30ms so it does not block Prebid.js auction timeout
@@ -897,6 +916,7 @@ Each partner registered in `partner_store` declares:
 **As a publisher using Mode B**, I want Trusted Server to build and send enriched OpenRTB requests to Prebid Server and deliver winners to my ad server with full EC context, so my ad server can make outbid decisions without additional identity lookups.
 
 **Acceptance criteria:**
+
 - [ ] Outbound OpenRTB request to PBS contains `user.id` equal to the EC value
 - [ ] `user.eids` contains one entry per partner with `bidstream_enabled: true` and a resolved UID in the KV graph
 - [ ] `user.consent` contains the decoded TCF string when available
@@ -937,20 +957,20 @@ The following documentation changes are required alongside the EC feature:
 
 ## 15. Open Questions
 
-| # | Question | Owner | Status |
-|---|---|---|---|
-| 1 | Partner provisioning: TS will expose a `/admin/partners/register` endpoint authenticated at the publisher level (bearer token issued per publisher Fastly service), so publishers can onboard SSP/DSP partners without touching KV directly. Engineering to define the exact auth mechanism. | Engineering | **Resolved** — `/admin/partners/register` endpoint, publisher-authenticated |
-| 2 | Should TS Lite expose a `GET /health` endpoint so partners can programmatically verify their service is running and their partner config is active in KV? | Product | **N/A** — TS Lite deferred (see Section 5) |
+| #   | Question                                                                                                                                                                                                                                                                                     | Owner       | Status                                                                      |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------- |
+| 1   | Partner provisioning: TS will expose a `/admin/partners/register` endpoint authenticated at the publisher level (bearer token issued per publisher Fastly service), so publishers can onboard SSP/DSP partners without touching KV directly. Engineering to define the exact auth mechanism. | Engineering | **Resolved** — `/admin/partners/register` endpoint, publisher-authenticated |
+| 2   | Should TS Lite expose a `GET /health` endpoint so partners can programmatically verify their service is running and their partner config is active in KV?                                                                                                                                    | Product     | **N/A** — TS Lite deferred (see Section 5)                                  |
 
 ---
 
 ## 16. Success Metrics
 
-| Metric | Target | Measurement method |
-|---|---|---|
-| EC match rate (returning users) | >90% within 30 days | Fastly real-time logs: ratio of requests with existing `ts-ec` cookie vs. new EC generations |
-| Consent enforcement accuracy | 0 ECs created for opted-out EU/UK users | Log audit: verify no `ts-ec` `Set-Cookie` in responses where consent signal is absent |
-| KV sync latency (pixel sync) | p99 <75ms end-to-end | Fastly log timing on `/sync` endpoint |
-| S2S batch API throughput | >500 mappings/sec sustained | Load test prior to partner onboarding |
-| S2S pull sync resolution rate | >30% of pull calls return a non-null uid within 60 days of first partner go-live | Fastly log: pull call outcomes per partner |
-| Identity graph fill rate | >50% of EC hashes with at least 1 resolved partner ID within 60 days of partner go-live | KV scan sample |
+| Metric                          | Target                                                                                  | Measurement method                                                                           |
+| ------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| EC match rate (returning users) | >90% within 30 days                                                                     | Fastly real-time logs: ratio of requests with existing `ts-ec` cookie vs. new EC generations |
+| Consent enforcement accuracy    | 0 ECs created for opted-out EU/UK users                                                 | Log audit: verify no `ts-ec` `Set-Cookie` in responses where consent signal is absent        |
+| KV sync latency (pixel sync)    | p99 <75ms end-to-end                                                                    | Fastly log timing on `/sync` endpoint                                                        |
+| S2S batch API throughput        | >500 mappings/sec sustained                                                             | Load test prior to partner onboarding                                                        |
+| S2S pull sync resolution rate   | >30% of pull calls return a non-null uid within 60 days of first partner go-live        | Fastly log: pull call outcomes per partner                                                   |
+| Identity graph fill rate        | >50% of EC hashes with at least 1 resolved partner ID within 60 days of partner go-live | KV scan sample                                                                               |
