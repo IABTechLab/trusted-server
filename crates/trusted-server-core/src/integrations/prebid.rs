@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -545,13 +545,21 @@ fn append_query_params(url: &str, params: &str) -> String {
 /// Prebid Server auction provider.
 pub struct PrebidAuctionProvider {
     config: PrebidIntegrationConfig,
+    /// Cached request info from the original client request, captured during
+    /// [`request_bids`] and used in [`parse_response`] for URL rewriting.
+    /// This avoids trusting the upstream Prebid Server response to faithfully
+    /// echo back the host and scheme values we sent.
+    request_info: OnceLock<RequestInfo>,
 }
 
 impl PrebidAuctionProvider {
     /// Create a new Prebid auction provider.
     #[must_use]
     pub fn new(config: PrebidIntegrationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            request_info: OnceLock::new(),
+        }
     }
 
     /// Convert auction request to `OpenRTB` format with all enrichments.
@@ -1082,6 +1090,12 @@ impl AuctionProvider for PrebidAuctionProvider {
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
+        // Capture request info from the original client request for use in
+        // parse_response. This ensures URL rewriting uses locally trusted
+        // values rather than values echoed back by the upstream Prebid Server.
+        let captured_info = RequestInfo::from_request(context.request);
+        let _ = self.request_info.set(captured_info);
+
         // Create signer and compute signature if request signing is enabled
         let signer_with_signature = if let Some(request_signing_config) =
             &context.settings.request_signing
@@ -1205,25 +1219,13 @@ impl AuctionProvider for PrebidAuctionProvider {
             }
         }
 
-        let request_host = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_host"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let request_scheme = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_scheme"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("https")
-            .to_string();
-
-        if request_host.is_empty() {
-            log::warn!("Prebid response missing request host; skipping URL rewrites");
+        // Use locally captured request info for URL rewriting instead of
+        // trusting the upstream Prebid Server response body. A compromised or
+        // misconfigured bidder could inject arbitrary host/scheme values.
+        if let Some(info) = self.request_info.get() {
+            transform_prebid_response(&mut response_json, &info.host, &info.scheme)?;
         } else {
-            transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
+            log::warn!("Prebid request info not captured; skipping URL rewrites");
         }
 
         let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
