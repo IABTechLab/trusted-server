@@ -9,6 +9,14 @@ use crate::error::TrustedServerError;
 
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
 
+/// Fastly-backed config store with the store name baked in at construction.
+///
+/// # Migration note
+///
+/// This type predates the `platform` abstraction. New code should use
+/// [`crate::platform::PlatformConfigStore`] via [`crate::platform::RuntimeServices`]
+/// instead. `FastlyConfigStore` will be removed once all call sites have
+/// migrated.
 pub struct FastlyConfigStore {
     store_name: String,
 }
@@ -39,6 +47,14 @@ impl FastlyConfigStore {
     }
 }
 
+/// Fastly-backed secret store with the store name baked in at construction.
+///
+/// # Migration note
+///
+/// This type predates the `platform` abstraction. New code should use
+/// [`crate::platform::PlatformSecretStore`] via [`crate::platform::RuntimeServices`]
+/// instead. `FastlySecretStore` will be removed once all call sites have
+/// migrated.
 pub struct FastlySecretStore {
     store_name: String,
 }

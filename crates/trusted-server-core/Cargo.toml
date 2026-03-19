@@ -68,5 +68,6 @@ validator = { workspace = true }
 default = []
 
 [dev-dependencies]
+edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
 tokio-test = { workspace = true }

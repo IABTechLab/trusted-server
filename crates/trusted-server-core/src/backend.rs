@@ -90,7 +90,8 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
-    /// Compute the deterministic backend name without registering anything.
+    /// Compute the deterministic backend name and resolved port without
+    /// registering anything.
     ///
     /// The name encodes scheme, host, port, certificate setting, and
     /// first-byte timeout so that backends with different configurations
@@ -123,6 +124,19 @@ impl<'a> BackendConfig<'a> {
         );
 
         Ok((backend_name, target_port))
+    }
+
+    /// Return the deterministic backend name without registering anything.
+    ///
+    /// Convenience wrapper over [`Self::compute_name`] that discards the
+    /// resolved port, used by [`crate::platform::PlatformBackend`]
+    /// implementations that only need the name for correlation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host is empty.
+    pub fn predict_name(self) -> Result<String, Report<TrustedServerError>> {
+        self.compute_name().map(|(name, _)| name)
     }
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
