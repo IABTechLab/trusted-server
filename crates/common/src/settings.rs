@@ -219,8 +219,9 @@ impl Synthetic {
     ///
     /// Placeholder detection is intentionally **not** performed here because
     /// this validator runs at build time (via `from_toml_and_env`) when the
-    /// config legitimately contains placeholder values. Placeholder rejection
-    /// happens at runtime via [`Settings::reject_placeholder_secrets`].
+    /// config may legitimately contain placeholder values (e.g. debug builds).
+    /// Placeholder rejection happens in release builds at both compile time
+    /// (`build.rs`) and runtime ([`Settings::reject_placeholder_secrets`]).
     ///
     /// # Errors
     ///

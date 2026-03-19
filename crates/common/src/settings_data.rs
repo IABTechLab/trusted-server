@@ -34,7 +34,11 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    // Reject known placeholder values for secrets that feed into cryptographic operations.
+    // Reject known placeholder values for secrets that feed into cryptographic
+    // operations. Release builds also enforce this at compile time (build.rs),
+    // so this is a runtime safety net. Debug builds skip the check so the
+    // default trusted-server.toml works without env var overrides.
+    #[cfg(not(debug_assertions))]
     settings.reject_placeholder_secrets()?;
 
     if !settings.proxy.certificate_check {
@@ -140,18 +144,12 @@ mod tests {
     }
 
     /// Smoke-test the full `get_settings()` pipeline (embedded bytes → UTF-8 →
-    /// parse → validate → placeholder check).  The build-time TOML ships with
-    /// placeholder secrets, so the expected outcome is an [`InsecureDefault`]
-    /// error — but reaching that error proves every earlier stage succeeded.
+    /// parse → validate).  Debug builds skip the placeholder-secret check so
+    /// the default `trusted-server.toml` works without env var overrides.
+    /// Release builds enforce placeholders at both compile time (`build.rs`)
+    /// and runtime, but tests run in debug mode.
     #[test]
-    fn get_settings_rejects_embedded_placeholder_secrets() {
-        let err = super::get_settings().expect_err("should reject embedded placeholder secrets");
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::InsecureDefault { .. }
-            ),
-            "should fail with InsecureDefault, got: {err}"
-        );
+    fn get_settings_allows_placeholders_in_debug_builds() {
+        super::get_settings().expect("debug builds should allow placeholder secrets");
     }
 }

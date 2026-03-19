@@ -38,13 +38,24 @@ fn main() {
 
     // Merge base TOML with environment variable overrides and write output.
     // Panics if admin endpoints are not covered by a handler.
-    // Note: placeholder secret rejection is intentionally NOT done here.
-    // The base trusted-server.toml ships with placeholder secrets that
-    // production deployments override via TRUSTED_SERVER__* env vars at
-    // build time. Runtime startup (get_settings) rejects any remaining
-    // placeholders so a misconfigured deployment fails fast.
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
+
+    // Reject placeholder secrets in release builds so a misconfigured
+    // production deployment fails at compile time rather than at runtime.
+    // Debug builds (cargo test, cargo build) allow placeholders so that
+    // the base trusted-server.toml works without env var overrides.
+    //
+    // The runtime code uses `cfg(not(debug_assertions))` for the same
+    // purpose; both align under standard debug/release profiles.
+    let profile = std::env::var("PROFILE").expect("should have PROFILE set by Cargo");
+    if profile == "release" {
+        settings.reject_placeholder_secrets().expect(
+            "Release build must not contain placeholder secrets. \
+             Override them with TRUSTED_SERVER__PUBLISHER__PROXY_SECRET \
+             and TRUSTED_SERVER__SYNTHETIC__SECRET_KEY environment variables.",
+        );
+    }
 
     let merged_toml =
         toml::to_string_pretty(&settings).expect("Failed to serialize settings to TOML");
