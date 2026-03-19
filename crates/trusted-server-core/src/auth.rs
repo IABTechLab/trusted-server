@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
+use subtle::ConstantTimeEq as _;
 
 use crate::settings::Settings;
 
@@ -30,7 +31,21 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
         None => return Some(unauthorized_response()),
     };
 
-    if handler.username == username && handler.password == password {
+    // Use constant-time comparison to prevent timing side-channel attacks
+    // that could leak password prefix information. Both username and password
+    // are always fully compared regardless of where the first mismatch occurs.
+    let username_match = handler
+        .username
+        .expose()
+        .as_bytes()
+        .ct_eq(username.as_bytes());
+    let password_match = handler
+        .password
+        .expose()
+        .as_bytes()
+        .ct_eq(password.as_bytes());
+
+    if bool::from(username_match & password_match) {
         None
     } else {
         Some(unauthorized_response())
@@ -168,5 +183,55 @@ mod tests {
         let response = enforce_basic_auth(&settings, &req)
             .expect("should challenge admin path with missing credentials");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn challenge_when_username_wrong_password_correct() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("wrong:pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should challenge when only username is wrong");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn challenge_when_username_correct_password_wrong() {
+        let settings = settings_with_handlers();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("user:wrong");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should challenge when only password is wrong");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Both valid and invalid credentials exercise the same constant-time
+    /// comparison path via `subtle::ConstantTimeEq`, preventing timing
+    /// side-channels from leaking password prefix information.
+    #[test]
+    fn constant_time_comparison_exercises_both_fields() {
+        let settings = settings_with_handlers();
+
+        // Valid credentials — both fields evaluated in constant time
+        let mut valid_req = Request::new(Method::GET, "https://example.com/secure/data");
+        let valid_token = STANDARD.encode("user:pass");
+        valid_req.set_header(header::AUTHORIZATION, format!("Basic {valid_token}"));
+        assert!(
+            enforce_basic_auth(&settings, &valid_req).is_none(),
+            "should allow valid credentials"
+        );
+
+        // Invalid credentials — both fields still fully evaluated in constant time
+        let mut invalid_req = Request::new(Method::GET, "https://example.com/secure/data");
+        let invalid_token = STANDARD.encode("wrong:wrong");
+        invalid_req.set_header(header::AUTHORIZATION, format!("Basic {invalid_token}"));
+        assert!(
+            enforce_basic_auth(&settings, &invalid_req).is_some(),
+            "should reject invalid credentials"
+        );
     }
 }
