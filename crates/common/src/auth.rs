@@ -36,8 +36,12 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
 
     // Use bitwise & (not &&) so both sides always evaluate — eliminates the
     // username-existence oracle that short-circuit evaluation would create.
-    let username_ok = username.as_bytes().ct_eq(handler.username.as_bytes());
-    let password_ok = password.as_bytes().ct_eq(handler.password.as_bytes());
+    let username_ok = username
+        .as_bytes()
+        .ct_eq(handler.username.expose().as_bytes());
+    let password_ok = password
+        .as_bytes()
+        .ct_eq(handler.password.expose().as_bytes());
     if (username_ok & password_ok).into() {
         None
     } else {
