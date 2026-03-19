@@ -1,10 +1,19 @@
-#![allow(clippy::unwrap_used, clippy::panic)]
+// Build script includes source modules (`error`, `auction_config_types`, etc.)
+// for compile-time config validation. Not all items from those modules are used
+// in the build context, so `dead_code` is expected.
+#![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
 #[path = "src/error.rs"]
 mod error;
 
 #[path = "src/auction_config_types.rs"]
 mod auction_config_types;
+
+#[path = "src/redacted.rs"]
+mod redacted;
+
+#[path = "src/consent_config.rs"]
+mod consent_config;
 
 #[path = "src/settings.rs"]
 mod settings;
@@ -29,6 +38,11 @@ fn main() {
 
     // Merge base TOML with environment variable overrides and write output.
     // Panics if admin endpoints are not covered by a handler.
+    // Note: placeholder secret rejection is intentionally NOT done here.
+    // The base trusted-server.toml ships with placeholder secrets that
+    // production deployments override via TRUSTED_SERVER__* env vars at
+    // build time. Runtime startup (get_settings) rejects any remaining
+    // placeholders so a misconfigured deployment fails fast.
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
 

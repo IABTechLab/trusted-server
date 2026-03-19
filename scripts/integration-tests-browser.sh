@@ -31,6 +31,8 @@ echo "==> Validating shared integration-test dependency versions..."
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY="integration-test-secret-key" \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
 

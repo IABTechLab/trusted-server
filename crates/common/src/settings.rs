@@ -10,7 +10,9 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
+use crate::redacted::Redacted;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
@@ -24,21 +26,35 @@ pub struct Publisher {
     pub origin_url: String,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
-    pub proxy_secret: String,
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub proxy_secret: Redacted<String>,
 }
 
 impl Publisher {
+    /// Known placeholder values that must not be used in production.
+    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
+
+    /// Returns `true` if `proxy_secret` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
+        Self::PROXY_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(proxy_secret))
+    }
+
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
     ///
     /// ```
     /// # use trusted_server_common::settings::Publisher;
+    /// # use trusted_server_common::redacted::Redacted;
     /// let publisher = Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
-    ///     proxy_secret: "proxy-secret".to_string(),
+    ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -181,23 +197,40 @@ impl DerefMut for IntegrationSettings {
 pub struct Synthetic {
     pub counter_store: String,
     pub opid_store: String,
-    #[validate(length(min = 1), custom(function = Synthetic::validate_secret_key))]
-    pub secret_key: String,
+    #[validate(custom(function = Synthetic::validate_secret_key))]
+    pub secret_key: Redacted<String>,
     #[validate(length(min = 1))]
     pub template: String,
 }
 
 impl Synthetic {
-    /// Validates that the secret key is not the placeholder value.
+    /// Known placeholder values that must not be used in production.
+    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+
+    /// Returns `true` if `secret_key` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
+        Self::SECRET_KEY_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(secret_key))
+    }
+
+    /// Validates that the secret key is not empty.
+    ///
+    /// Placeholder detection is intentionally **not** performed here because
+    /// this validator runs at build time (via `from_toml_and_env`) when the
+    /// config legitimately contains placeholder values. Placeholder rejection
+    /// happens at runtime via [`Settings::reject_placeholder_secrets`].
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the secret key is `"secret_key"` (the placeholder).
-    pub fn validate_secret_key(secret_key: &str) -> Result<(), ValidationError> {
-        match secret_key {
-            "secret_key" => Err(ValidationError::new("Secret key is not valid")),
-            _ => Ok(()),
+    /// Returns a validation error if the secret key is empty.
+    pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
+        if secret_key.expose().is_empty() {
+            return Err(ValidationError::new("empty_secret_key"));
         }
+        Ok(())
     }
 }
 
@@ -241,10 +274,10 @@ impl Rewrite {
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
-    #[validate(length(min = 1))]
-    pub username: String,
-    #[validate(length(min = 1))]
-    pub password: String,
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub username: Redacted<String>,
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub password: Redacted<String>,
     #[serde(skip, default)]
     #[validate(skip)]
     regex: OnceLock<Regex>,
@@ -316,6 +349,8 @@ pub struct Settings {
     #[serde(default)]
     pub auction: AuctionConfig,
     #[serde(default)]
+    pub consent: ConsentConfig,
+    #[serde(default)]
     pub proxy: Proxy,
 }
 
@@ -330,11 +365,12 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let settings: Self =
+        let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
+        settings.consent.validate();
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -370,6 +406,7 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+        settings.consent.validate();
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
@@ -380,6 +417,33 @@ impl Settings {
         settings.validate_admin_coverage()?;
 
         Ok(settings)
+    }
+
+    /// Checks all secret fields for known placeholder values and returns an
+    /// error listing every offending field. This centralises the placeholder
+    /// policy so callers don't need to know which fields are secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
+    /// fields still contain a placeholder value.
+    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut insecure_fields: Vec<&str> = Vec::new();
+
+        if Synthetic::is_placeholder_secret_key(self.synthetic.secret_key.expose()) {
+            insecure_fields.push("synthetic.secret_key");
+        }
+        if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
+            insecure_fields.push("publisher.proxy_secret");
+        }
+
+        if insecure_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::InsecureDefault {
+                field: insecure_fields.join(", "),
+            }))
+        }
     }
 
     #[must_use]
@@ -467,6 +531,13 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
         err.add_param("value".into(), &value);
         err.message = Some("origin_url must not end with '/'".into());
         return Err(err);
+    }
+    Ok(())
+}
+
+fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), ValidationError> {
+    if value.expose().is_empty() {
+        return Err(ValidationError::new("empty_value"));
     }
     Ok(())
 }
@@ -607,6 +678,7 @@ mod tests {
         nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
         testlight::TestlightConfig,
     };
+    use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
     #[test]
@@ -650,7 +722,7 @@ mod tests {
         );
         assert_eq!(settings.synthetic.counter_store, "test-counter-store");
         assert_eq!(settings.synthetic.opid_store, "test-opid-store");
-        assert_eq!(settings.synthetic.secret_key, "test-secret-key");
+        assert_eq!(settings.synthetic.secret_key.expose(), "test-secret-key");
         assert!(settings.synthetic.template.contains("{{client_ip}}"));
 
         settings.validate().expect("Failed to validate settings");
@@ -674,6 +746,7 @@ mod tests {
     #[test]
     fn test_settings_missing_required_fields() {
         let re = Regex::new(r"origin_url = .*").expect("regex should compile");
+
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
 
@@ -681,6 +754,62 @@ mod tests {
         assert!(
             settings.is_err(),
             "Should fail when required fields are missing"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
+        for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
+            assert!(
+                Synthetic::is_placeholder_secret_key(placeholder),
+                "should detect placeholder secret_key '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_secret_key_is_case_insensitive() {
+        assert!(
+            Synthetic::is_placeholder_secret_key("SECRET-KEY"),
+            "should detect case-insensitive placeholder secret_key"
+        );
+        assert!(
+            Synthetic::is_placeholder_secret_key("Trusted-Server"),
+            "should detect mixed-case placeholder secret_key"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_secret_key_accepts_non_placeholder() {
+        assert!(
+            !Synthetic::is_placeholder_secret_key("test-secret-key"),
+            "should accept non-placeholder secret_key"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_rejects_all_known_placeholders() {
+        for placeholder in Publisher::PROXY_SECRET_PLACEHOLDERS {
+            assert!(
+                Publisher::is_placeholder_proxy_secret(placeholder),
+                "should detect placeholder proxy_secret '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_is_case_insensitive() {
+        assert!(
+            Publisher::is_placeholder_proxy_secret("CHANGE-ME-PROXY-SECRET"),
+            "should detect case-insensitive placeholder proxy_secret"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_proxy_secret_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_proxy_secret("unit-test-proxy-secret"),
+            "should accept non-placeholder proxy_secret"
         );
     }
 
@@ -878,8 +1007,8 @@ mod tests {
                 assert_eq!(settings.handlers.len(), 2);
                 let handler = &settings.handlers[0];
                 assert_eq!(handler.path, "^/env-handler");
-                assert_eq!(handler.username, "env-user");
-                assert_eq!(handler.password, "env-pass");
+                assert_eq!(handler.username.expose(), "env-user");
+                assert_eq!(handler.password.expose(), "env-pass");
             },
         );
     }
@@ -972,7 +1101,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -981,7 +1110,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -990,7 +1119,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -999,7 +1128,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -1008,7 +1137,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -1017,7 +1146,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
-            proxy_secret: "test-secret".to_string(),
+            proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
