@@ -105,14 +105,14 @@ Move header bidding to the server for:
 - Reduced client-side latency
 - Improved user experience
 
-### OpenRTB 2.x Support
+### OpenRTB 2.6 Support
 
 Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
 - Adds synthetic ID for privacy-safe tracking
-- Supports banner, video, and native formats
+- Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
 ### Synthetic ID Injection
 
@@ -285,9 +285,16 @@ See [crates/common/src/integrations/prebid.rs](https://github.com/IABTechLab/tru
 The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 
 - Converts ad slots to OpenRTB `imp` objects with bidder params
-- Adds site metadata with publisher domain and page URL
+- Sets bid floor and currency (`bidfloor`/`bidfloorcur`) from slot configuration
+- Marks impressions as `secure: 1` (HTTPS-only creatives)
+- Sets `tagid` from the slot ID
+- Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
 - Injects synthetic ID in the user object
-- Includes device info (user-agent, client IP) and geo when available
+- Forwards user consent string and sets the GDPR flag based on geo and consent presence
+- Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
+- Extracts `DNT` and `Accept-Language` headers into device fields
+- Includes device info (user-agent, client IP) and geo (lat/lon/metro) when available
+- Sets `tmax` from the configured timeout and `cur` to `["USD"]`
 - Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
 - Sets the top-level `test: 1` flag when `test_mode` is enabled
 - Appends `debug_query_params` to page URL when configured

@@ -165,10 +165,16 @@ export function installGptShim(): boolean {
 // script can call it explicitly. The server emits:
 //   <script>window.__tsjs_gpt_enabled=true;
 //          window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>
-// Because that inline <script> runs *after* the unified bundle has evaluated,
-// the function is guaranteed to be available by the time the inline script
-// executes. This avoids a race where the module-scope auto-init would check
-// `__tsjs_gpt_enabled` before the flag is set.
+// The HTML pipeline currently injects that inline script before the unified
+// bundle, so the explicit call is best-effort only. To make activation robust
+// regardless of script order, the module also checks for a pre-set enable flag
+// immediately after registering the function.
 if (typeof window !== 'undefined') {
-  (window as Record<string, unknown>).__tsjs_installGptShim = installGptShim;
+  const win = window as Record<string, unknown>;
+
+  win.__tsjs_installGptShim = installGptShim;
+
+  if (win.__tsjs_gpt_enabled === true) {
+    installGptShim();
+  }
 }
