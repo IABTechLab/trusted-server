@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 ### 2. Clippy
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ### 3. Rust Tests
@@ -49,7 +49,7 @@ cd docs && npm run format
 ### 7. WASM Build
 
 ```bash
-cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 ```
 
 ## Output

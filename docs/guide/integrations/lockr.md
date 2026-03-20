@@ -138,7 +138,7 @@ Lockr identities are injected into OpenRTB bid requests as Extended Identifiers:
 
 ## Implementation Details
 
-The Lockr integration is implemented in [crates/common/src/integrations/lockr.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/lockr.rs).
+The Lockr integration is implemented in [crates/trusted-server-core/src/integrations/lockr.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/lockr.rs).
 
 ### Key Components
 

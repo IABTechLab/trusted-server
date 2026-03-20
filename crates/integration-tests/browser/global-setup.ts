@@ -13,7 +13,7 @@ const WASM_PATH =
   process.env.WASM_BINARY_PATH ||
   resolve(
     __dirname,
-    "../../../target/wasm32-wasip1/release/trusted-server-fastly.wasm",
+    "../../../target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm",
   );
 
 const VICEROY_CONFIG =

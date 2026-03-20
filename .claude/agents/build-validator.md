@@ -17,13 +17,13 @@ Validate that the project builds correctly across all targets.
 2. **WASM build** (production target)
 
    ```bash
-   cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+   cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
    ```
 
 3. **Clippy**
 
    ```bash
-   cargo clippy --all-targets --all-features -- -D warnings
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
    ```
 
 4. **Format check**
