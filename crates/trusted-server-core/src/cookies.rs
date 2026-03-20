@@ -188,8 +188,8 @@ pub fn forward_cookie_header(from: &Request, to: &mut Request, strip_consent: bo
 /// # Examples
 ///
 /// ```no_run
-/// # use trusted_server_common::cookies::create_synthetic_cookie;
-/// # use trusted_server_common::settings::Settings;
+/// # use trusted_server_core::cookies::create_synthetic_cookie;
+/// # use trusted_server_core::settings::Settings;
 /// // `settings` is loaded at startup via `Settings::from_toml_and_env`.
 /// # fn example(settings: &Settings) {
 /// let cookie = create_synthetic_cookie(settings, "abc123.xk92ab");
