@@ -1,4 +1,4 @@
-# trusted-server-common
+# trusted-server-core
 
 Utilities shared by Trusted Server components. This crate contains HTML/CSS rewriting helpers used to normalize ad creative assets to first‑party proxy endpoints.
 
@@ -45,7 +45,7 @@ JS bundles (served by publisher module):
   - At runtime, the server concatenates `tsjs-core.js` + enabled integration modules based on `IntegrationRegistry` config
   - The URL filename is fixed for backward compatibility; the `?v=` hash changes when modules change
 
-Behavior is covered by an extensive test suite in `crates/common/src/creative.rs`.
+Behavior is covered by an extensive test suite in `crates/trusted-server-core/src/creative.rs`.
 
 ## Synthetic Identifier Propagation
 
