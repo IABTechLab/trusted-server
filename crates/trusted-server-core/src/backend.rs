@@ -104,7 +104,7 @@ impl<'a> BackendConfig<'a> {
                 message: "missing host".to_string(),
             }));
         }
-        if self.host.chars().any(|c| c.is_control()) {
+        if self.host.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "host contains control characters".to_string(),
             }));
