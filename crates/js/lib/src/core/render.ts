@@ -6,9 +6,86 @@ import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
+// Sandbox permissions granted to creative iframes.
+// Notably absent:
+//   allow-scripts, allow-same-origin — prevent JS execution and same-origin
+//     access, which are the primary attack vectors for malicious creatives.
+//   allow-forms — server-side sanitization strips <form> elements, so form
+//     submission from creatives is not a supported use case. Omitting this token
+//     is consistent with that server-side policy and reduces the attack surface.
+const CREATIVE_SANDBOX_TOKENS = [
+  'allow-popups',
+  'allow-popups-to-escape-sandbox',
+  'allow-top-navigation-by-user-activation',
+] as const;
+
+export type CreativeSanitizationRejectionReason = 'empty-after-sanitize' | 'invalid-creative-html';
+
+export type AcceptedCreativeHtml = {
+  kind: 'accepted';
+  originalLength: number;
+  sanitizedHtml: string;
+  // Always equal to originalLength: the client validates type/emptiness only;
+  // server-side sanitization has already run before adm reaches this function.
+  // Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
+  sanitizedLength: number;
+  // Always 0 for the same reason — no content is removed client-side.
+  removedCount: number;
+};
+
+export type RejectedCreativeHtml = {
+  kind: 'rejected';
+  originalLength: number;
+  // Always equal to originalLength (or 0 for non-string input): no client-side
+  // removal occurs. Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
+  sanitizedLength: number;
+  // Always 0 — no content is removed client-side.
+  removedCount: number;
+  rejectionReason: CreativeSanitizationRejectionReason;
+};
+
+export type SanitizeCreativeHtmlResult = AcceptedCreativeHtml | RejectedCreativeHtml;
+
 function normalizeId(raw: string): string {
   const s = String(raw ?? '').trim();
   return s.startsWith('#') ? s.slice(1) : s;
+}
+
+// Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
+// Dangerous markup is stripped server-side before adm reaches the client; this function
+// only guards against type errors and empty payloads. As a result, sanitizedLength always
+// equals originalLength and removedCount is always 0 for accepted creatives — these fields
+// exist for structural consistency with the shared result type but carry no signal here.
+export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
+  if (typeof creativeHtml !== 'string') {
+    return {
+      kind: 'rejected',
+      originalLength: 0,
+      sanitizedLength: 0,
+      removedCount: 0,
+      rejectionReason: 'invalid-creative-html',
+    };
+  }
+
+  const originalLength = creativeHtml.length;
+
+  if (creativeHtml.trim().length === 0) {
+    return {
+      kind: 'rejected',
+      originalLength,
+      sanitizedLength: originalLength,
+      removedCount: 0,
+      rejectionReason: 'empty-after-sanitize',
+    };
+  }
+
+  return {
+    kind: 'accepted',
+    originalLength,
+    sanitizedHtml: creativeHtml,
+    sanitizedLength: originalLength,
+    removedCount: 0,
+  };
 }
 
 // Locate an ad slot element by id, tolerating funky selectors provided by tag managers.
@@ -85,7 +162,7 @@ export function renderAllAdUnits(): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-// Construct a sandboxed iframe sized for the ad so we can render arbitrary HTML.
+// Construct a sandboxed iframe sized for sanitized, non-executable creative HTML.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}
@@ -101,16 +178,14 @@ export function createAdIframe(
   iframe.setAttribute('aria-label', 'Advertisement');
   // Sandbox permissions for creatives
   try {
-    iframe.sandbox.add(
-      'allow-forms',
-      'allow-popups',
-      'allow-popups-to-escape-sandbox',
-      'allow-same-origin',
-      'allow-scripts',
-      'allow-top-navigation-by-user-activation'
-    );
+    if (iframe.sandbox && typeof iframe.sandbox.add === 'function') {
+      iframe.sandbox.add(...CREATIVE_SANDBOX_TOKENS);
+    } else {
+      iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
+    }
   } catch (err) {
     log.debug('createAdIframe: sandbox add failed', err);
+    iframe.setAttribute('sandbox', CREATIVE_SANDBOX_TOKENS.join(' '));
   }
   // Sizing + style
   const w = Math.max(0, Number(opts.width ?? 0) | 0);
@@ -129,10 +204,10 @@ export function createAdIframe(
   return iframe;
 }
 
-// Build a complete HTML document for a creative, suitable for use with iframe.srcdoc
+// Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
-  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', NORMALIZE_CSS).replace(
+  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS).replace(
     '%CREATIVE_HTML%',
-    creativeHtml
+    () => creativeHtml
   );
 }
