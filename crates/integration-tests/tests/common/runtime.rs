@@ -106,7 +106,7 @@ pub fn wasm_binary_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/wasm32-wasip1/release/trusted-server-fastly.wasm")
+                .join("../../target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm")
         })
 }
 

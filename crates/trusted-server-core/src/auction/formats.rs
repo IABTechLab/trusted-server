@@ -230,15 +230,17 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Process creative HTML if present - rewrite URLs and return inline
+        // Process creative HTML if present - — sanitize dangerous markup first, then rewrite URLs.
         let creative_html = if let Some(ref raw_creative) = bid.creative {
-            // Rewrite creative HTML with proxy URLs for first-party delivery
-            let rewritten = creative::rewrite_creative_html(settings, raw_creative);
+            let sanitized = creative::sanitize_creative_html(raw_creative);
+            let rewritten = creative::rewrite_creative_html(settings, &sanitized);
 
             log::debug!(
-                "Rewritten creative for auction {} slot {} ({} bytes)",
+                "Processed creative for auction {} slot {} ({} → {} → {} bytes)",
                 auction_request.id,
                 slot_id,
+                raw_creative.len(),
+                sanitized.len(),
                 rewritten.len()
             );
 

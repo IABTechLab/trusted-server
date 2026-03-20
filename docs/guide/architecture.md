@@ -25,7 +25,7 @@ flowchart TD
 
 ## Core Components
 
-### trusted-server-common
+### trusted-server-core
 
 Core library containing shared functionality:
 
@@ -35,7 +35,7 @@ Core library containing shared functionality:
 - GDPR consent management
 - Ad server integrations
 
-### trusted-server-fastly
+### trusted-server-adapter-fastly
 
 Fastly-specific implementation:
 

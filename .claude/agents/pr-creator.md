@@ -21,7 +21,7 @@ Before creating the PR, verify the branch is healthy:
 
 ```
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cd crates/js/lib && npx vitest run
 cd crates/js/lib && npm run format

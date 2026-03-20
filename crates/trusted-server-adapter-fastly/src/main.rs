@@ -3,28 +3,28 @@ use fastly::http::Method;
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
-use trusted_server_common::auction::endpoints::handle_auction;
-use trusted_server_common::auction::{build_orchestrator, AuctionOrchestrator};
-use trusted_server_common::auth::enforce_basic_auth;
-use trusted_server_common::constants::{
+use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_common::error::TrustedServerError;
-use trusted_server_common::geo::GeoInfo;
-use trusted_server_common::http_util::sanitize_forwarded_headers;
-use trusted_server_common::integrations::IntegrationRegistry;
-use trusted_server_common::proxy::{
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::http_util::sanitize_forwarded_headers;
+use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_common::publisher::{handle_publisher_request, handle_tsjs_dynamic};
-use trusted_server_common::request_signing::{
+use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_common::settings::Settings;
-use trusted_server_common::settings_data::get_settings;
+use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::get_settings;
 
 mod error;
 use crate::error::to_error_response;
@@ -118,7 +118,7 @@ async fn route_request(
         (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
 
         // Key rotation admin endpoints
-        // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/common/src/settings.rs
+        // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
 

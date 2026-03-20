@@ -21,7 +21,7 @@ const GTM_URL_PATTERN =
 /**
  * Supported paths that the server can proxy.
  * Must match the route patterns defined in the GoogleTagManagerIntegration handler
- * in crates/common/src/integrations/google_tag_manager.rs
+ * in crates/trusted-server-core/src/integrations/google_tag_manager.rs
  */
 const SUPPORTED_PATHS = ['/gtm.js', '/gtag/js', '/gtag.js', '/collect', '/g/collect'];
 

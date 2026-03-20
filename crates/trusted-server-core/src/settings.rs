@@ -47,8 +47,8 @@ impl Publisher {
     /// # Examples
     ///
     /// ```
-    /// # use trusted_server_common::settings::Publisher;
-    /// # use trusted_server_common::redacted::Redacted;
+    /// # use trusted_server_core::settings::Publisher;
+    /// # use trusted_server_core::redacted::Redacted;
     /// let publisher = Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
@@ -518,7 +518,7 @@ impl Settings {
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/fastly/src/main.rs`.
+    /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
@@ -1739,19 +1739,19 @@ mod tests {
     }
 
     /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
-    /// admin route table in `crates/fastly/src/main.rs`.
+    /// admin route table in `crates/trusted-server-adapter-fastly/src/main.rs`.
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
     #[test]
     fn admin_endpoints_match_fastly_router() {
-        let router_source = include_str!("../../fastly/src/main.rs");
+        let router_source = include_str!("../../trusted-server-adapter-fastly/src/main.rs");
 
         for endpoint in Settings::ADMIN_ENDPOINTS {
             assert!(
                 router_source.contains(endpoint),
                 "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
+                 crates/trusted-server-adapter-fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
                  add the route back to the router"
             );
         }

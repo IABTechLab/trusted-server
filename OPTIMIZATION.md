@@ -14,7 +14,7 @@ This document presents a performance analysis and optimization plan for the Trus
 
 | % CPU | Function | Notes |
 |-------|----------|-------|
-| ~96% | `trusted_server_fastly::main` | Almost all time is in application code |
+| ~96% | `trusted_server_adapter_fastly::main` | Almost all time is in application code |
 | ~90% | `route_request` → `handle_publisher_request` | Publisher proxy is the hot path |
 | **~76%** | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck** |
 | ~~5-8%~~ → **3.3%** | `get_settings()` | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |
@@ -139,7 +139,7 @@ Small, safe changes that reduce CPU and memory waste. Ship as one PR, measure be
 
 #### 1.1 Fix gzip streaming — remove full-body buffering
 
-**File**: `crates/common/src/streaming_processor.rs` — `process_gzip_to_gzip`
+**File**: `crates/trusted-server-core/src/streaming_processor.rs` — `process_gzip_to_gzip`
 
 **Problem**: Reads entire decompressed body into memory via `read_to_end`, despite deflate/brotli paths already using chunk-based `process_through_compression`.
 
@@ -159,7 +159,7 @@ fn process_gzip_to_gzip<R: Read, W: Write>(&mut self, input: R, output: W) -> Re
 
 #### 1.2 Fix `HtmlRewriterAdapter` — enable true streaming
 
-**File**: `crates/common/src/streaming_processor.rs` — `HtmlRewriterAdapter`
+**File**: `crates/trusted-server-core/src/streaming_processor.rs` — `HtmlRewriterAdapter`
 
 **Problem**: Accumulates entire HTML document before processing, defeating the streaming pipeline. The comment says this is a `lol_html` limitation — **it's not**. `lol_html::HtmlRewriter` supports incremental `write()` calls and emits output via its `OutputSink` callback per-chunk.
 
@@ -203,7 +203,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
 #### 1.3 ~~Eliminate redundant `config` crate parsing in `get_settings()` — ~5-8% CPU~~ DONE (~3.3% post-fix)
 
-**Files**: `crates/common/src/settings_data.rs`, `crates/common/src/settings.rs`
+**Files**: `crates/trusted-server-core/src/settings_data.rs`, `crates/trusted-server-core/src/settings.rs`
 
 **Problem**: Profiling shows `get_settings()` consuming ~5-8% of per-request CPU. The `build.rs` already merges `trusted-server.toml` + all `TRUSTED_SERVER__*` env vars at compile time and writes a fully-resolved TOML file to `target/trusted-server-out.toml`. But at runtime, `get_settings()` calls `Settings::from_toml()`, which re-runs the entire `config` crate pipeline — `Config::builder().add_source(File).add_source(Environment).build().try_deserialize()` — redundantly scanning env vars and merging sources that were already resolved at build time.
 
@@ -244,7 +244,7 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 
 #### 1.4 Reduce verbose per-request logging — ~0.5% CPU
 
-**Files**: `crates/fastly/src/main.rs:37,64-67,152-177`
+**Files**: `crates/trusted-server-adapter-fastly/src/main.rs:37,64-67,152-177`
 
 **Problem**: `log::info!("Settings {settings:?}")` serializes the entire Settings struct (~2KB) on every request. `FASTLY_SERVICE_VERSION` env var logged at info level. The logger is configured with `max_level(LevelFilter::Debug)`, meaning every `debug!` and above is evaluated.
 
@@ -282,7 +282,7 @@ The high-impact architectural change. Uses Fastly's `stream_to_client()` API to 
 
 #### 2.1 Publisher proxy: `stream_to_client()` integration
 
-**Files**: `crates/common/src/publisher.rs`, `crates/fastly/src/main.rs`
+**Files**: `crates/trusted-server-core/src/publisher.rs`, `crates/trusted-server-adapter-fastly/src/main.rs`
 
 **Current flow** (fully buffered):
 ```

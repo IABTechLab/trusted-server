@@ -114,6 +114,11 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
     if (!Array.isArray(sbBids)) continue;
 
     for (const b of sbBids) {
+      // Coerce missing/null adm to '' so AuctionBid.adm is always a string.
+      // The empty-string case is filtered in renderCreativeInline via the
+      // `if (!bid.adm)` guard. The client-side `typeof !== 'string'` check in
+      // sanitizeCreativeHtml is a second line of defense for callers that bypass
+      // parseAuctionResponse and pass untrusted values directly.
       bids.push({
         impid: b.impid ?? '',
         adm: b.adm ?? '',
