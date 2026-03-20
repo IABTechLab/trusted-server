@@ -109,6 +109,11 @@ impl<'a> BackendConfig<'a> {
                 message: "host contains control characters".to_string(),
             }));
         }
+        if self.scheme.chars().any(char::is_control) {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "scheme contains control characters".to_string(),
+            }));
+        }
 
         let target_port = self
             .port
