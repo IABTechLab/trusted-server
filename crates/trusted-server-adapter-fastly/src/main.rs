@@ -31,7 +31,7 @@ mod error;
 mod platform;
 
 use crate::error::to_error_response;
-use crate::platform::{build_runtime_services, open_kv_store};
+use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -66,14 +66,16 @@ fn main(req: Request) -> Result<Response, Error> {
     let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
         Ok(s) => s,
         Err(e) => {
-            let report = Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Failed to open KV store '{}': {e}",
-                    settings.synthetic.opid_store
-                ),
-            });
-            log::error!("Failed to open KV store: {:?}", report);
-            return Ok(to_error_response(&report));
+            // Degrade gracefully: routes that do not touch synthetic IDs
+            // (e.g. /.well-known/, /verify-signature, /admin/keys/*) must
+            // still succeed even when the KV store is unavailable.
+            // Handlers that call kv_handle() will receive KvError::Unavailable.
+            log::warn!(
+                "KV store '{}' unavailable, synthetic ID routes will return errors: {e}",
+                settings.synthetic.opid_store
+            );
+            std::sync::Arc::new(UnavailableKvStore)
+                as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>
         }
     };
     let runtime_services = build_runtime_services(&req, kv_store);
@@ -102,7 +104,7 @@ async fn route_request(
     // Look up geo info via the platform abstraction using the client IP
     // already captured in RuntimeServices at the entry point.
     let geo_info = runtime_services
-        .geo
+        .geo()
         .lookup(runtime_services.client_info.client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");

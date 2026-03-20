@@ -8,8 +8,9 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::KvError;
+use edgezero_core::key_value_store::{KvError, KvPage};
 use error_stack::{Report, ResultExt};
 use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
@@ -45,12 +46,22 @@ pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
     fn get(&self, store_name: &str, key: &str) -> Result<String, Report<PlatformError>> {
-        let store = ConfigStore::open(store_name);
-        store.get(key).ok_or_else(|| {
-            Report::new(PlatformError::ConfigStore).attach(format!(
-                "key '{key}' not found in config store '{store_name}'"
-            ))
-        })
+        let store = ConfigStore::try_open(store_name).map_err(|e| {
+            Report::new(PlatformError::ConfigStore)
+                .attach(format!("failed to open config store '{store_name}': {e}"))
+        })?;
+        store
+            .try_get(key)
+            .map_err(|e| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "lookup for key '{key}' in config store '{store_name}' failed: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "key '{key}' not found in config store '{store_name}'"
+                ))
+            })
     }
 
     fn put(&self, store_id: &str, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
@@ -92,11 +103,18 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
             Report::new(PlatformError::SecretStore)
                 .attach(format!("failed to open secret store '{store_name}': {e}"))
         })?;
-        let secret = store.get(key).ok_or_else(|| {
-            Report::new(PlatformError::SecretStore).attach(format!(
-                "key '{key}' not found in secret store '{store_name}'"
-            ))
-        })?;
+        let secret = store
+            .try_get(key)
+            .map_err(|e| {
+                Report::new(PlatformError::SecretStore).attach(format!(
+                    "lookup for key '{key}' in secret store '{store_name}' failed: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                Report::new(PlatformError::SecretStore).attach(format!(
+                    "key '{key}' not found in secret store '{store_name}'"
+                ))
+            })?;
         secret
             .try_plaintext()
             .map(|bytes| bytes.into_iter().collect())
@@ -163,6 +181,8 @@ impl PlatformBackend for FastlyPlatformBackend {
 /// The Fastly-backed `send` / `send_async` / `select` behavior lands in a
 /// follow-up PR once the orchestrator migration is complete. Until then all
 /// methods return [`PlatformError::Unsupported`].
+///
+/// Implementation lands in #487 (PR 6: Backend + HTTP client traits).
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
@@ -228,19 +248,63 @@ pub fn build_runtime_services(
     req: &Request,
     kv_store: Arc<dyn PlatformKvStore>,
 ) -> RuntimeServices {
-    RuntimeServices {
-        config_store: Arc::new(FastlyPlatformConfigStore),
-        secret_store: Arc::new(FastlyPlatformSecretStore),
+    RuntimeServices::new(
+        Arc::new(FastlyPlatformConfigStore),
+        Arc::new(FastlyPlatformSecretStore),
         kv_store,
-        backend: Arc::new(FastlyPlatformBackend),
-        http_client: Arc::new(FastlyPlatformHttpClient),
-        geo: Arc::new(FastlyPlatformGeo),
-
-        client_info: ClientInfo {
+        Arc::new(FastlyPlatformBackend),
+        Arc::new(FastlyPlatformHttpClient),
+        Arc::new(FastlyPlatformGeo),
+        ClientInfo {
             client_ip: req.get_client_ip_addr(),
             tls_protocol: req.get_tls_protocol().map(str::to_string),
             tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
         },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// UnavailableKvStore
+// ---------------------------------------------------------------------------
+
+/// A [`PlatformKvStore`] stand-in used when the primary KV store cannot be
+/// opened at startup.
+///
+/// Every method returns [`KvError::Unavailable`], ensuring that handlers
+/// which call [`RuntimeServices::kv_handle`] receive a typed error rather than
+/// a panic. Routes that do not touch the KV store are unaffected.
+pub(crate) struct UnavailableKvStore;
+
+#[async_trait::async_trait(?Send)]
+impl trusted_server_core::platform::PlatformKvStore for UnavailableKvStore {
+    async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+        Err(KvError::Unavailable)
+    }
+
+    async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+        Err(KvError::Unavailable)
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        _key: &str,
+        _value: Bytes,
+        _ttl: std::time::Duration,
+    ) -> Result<(), KvError> {
+        Err(KvError::Unavailable)
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), KvError> {
+        Err(KvError::Unavailable)
+    }
+
+    async fn list_keys_page(
+        &self,
+        _prefix: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<KvPage, KvError> {
+        Err(KvError::Unavailable)
     }
 }
 

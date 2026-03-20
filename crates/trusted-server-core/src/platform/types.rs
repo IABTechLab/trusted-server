@@ -76,29 +76,85 @@ pub struct PlatformBackendSpec {
 #[derive(Clone)]
 pub struct RuntimeServices {
     /// Access to key-value config stores.
-    pub config_store: Arc<dyn PlatformConfigStore>,
+    pub(crate) config_store: Arc<dyn PlatformConfigStore>,
     /// Access to encrypted secret stores.
-    pub secret_store: Arc<dyn PlatformSecretStore>,
+    pub(crate) secret_store: Arc<dyn PlatformSecretStore>,
     /// KV store for the primary (opid) store.
     ///
     /// Additional stores (`counter_store`, `creative_store`) are opened on
     /// demand in individual handlers until multi-store support lands here.
-    pub kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
     /// Dynamic backend registration and name prediction.
-    pub backend: Arc<dyn PlatformBackend>,
+    pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
-    pub http_client: Arc<dyn PlatformHttpClient>,
+    pub(crate) http_client: Arc<dyn PlatformHttpClient>,
     /// Geographic information lookup.
-    pub geo: Arc<dyn PlatformGeo>,
+    pub(crate) geo: Arc<dyn PlatformGeo>,
     /// Per-request client metadata extracted at the entry point.
     pub client_info: ClientInfo,
 }
 
 impl RuntimeServices {
-    /// Wrap the KV store in a [`edgezero_core::key_value_store::KvHandle`] for
-    /// ergonomic access to JSON helpers, pagination, and validation.
+    /// Construct a [`RuntimeServices`] with the given platform service implementations.
+    ///
+    /// Adapter crates should call this constructor rather than using struct
+    /// literal syntax so that any future invariants on the struct are enforced
+    /// in one place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config_store: Arc<dyn PlatformConfigStore>,
+        secret_store: Arc<dyn PlatformSecretStore>,
+        kv_store: Arc<dyn PlatformKvStore>,
+        backend: Arc<dyn PlatformBackend>,
+        http_client: Arc<dyn PlatformHttpClient>,
+        geo: Arc<dyn PlatformGeo>,
+        client_info: ClientInfo,
+    ) -> Self {
+        Self {
+            config_store,
+            secret_store,
+            kv_store,
+            backend,
+            http_client,
+            geo,
+            client_info,
+        }
+    }
+
+    /// Returns the config store service.
     #[must_use]
-    pub fn kv_handle(&self) -> edgezero_core::key_value_store::KvHandle {
-        edgezero_core::key_value_store::KvHandle::new(self.kv_store.clone())
+    pub fn config_store(&self) -> &dyn PlatformConfigStore {
+        &*self.config_store
+    }
+
+    /// Returns the secret store service.
+    #[must_use]
+    pub fn secret_store(&self) -> &dyn PlatformSecretStore {
+        &*self.secret_store
+    }
+
+    /// Returns the dynamic backend service.
+    #[must_use]
+    pub fn backend(&self) -> &dyn PlatformBackend {
+        &*self.backend
+    }
+
+    /// Returns the outbound HTTP client service.
+    #[must_use]
+    pub fn http_client(&self) -> &dyn PlatformHttpClient {
+        &*self.http_client
+    }
+
+    /// Returns the platform geo lookup service.
+    #[must_use]
+    pub fn geo(&self) -> &dyn PlatformGeo {
+        &*self.geo
+    }
+
+    /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
+    /// JSON helpers, pagination, and validation.
+    #[must_use]
+    pub fn kv_handle(&self) -> super::KvHandle {
+        super::KvHandle::new(self.kv_store.clone())
     }
 }

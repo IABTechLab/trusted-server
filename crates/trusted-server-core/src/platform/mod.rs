@@ -9,7 +9,7 @@ mod http;
 mod traits;
 mod types;
 
-pub use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore as PlatformKvStore};
+pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
