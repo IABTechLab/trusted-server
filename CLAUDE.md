@@ -368,8 +368,8 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
 | `crates/trusted-server-core/src/synthetic.rs`             | Synthetic ID generation                           |
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/gdpr.rs`                  | GDPR consent management                           |
-| `crates/trusted-server-core/src/http_wrapper.rs`          | HTTP abstractions                                 |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
 | `crates/js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
 | `crates/js/src/bundle.rs`                    | Module map, concatenation, hashing                |
 
