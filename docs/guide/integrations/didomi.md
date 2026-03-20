@@ -181,7 +181,7 @@ Didomi integration supports IAB's Transparency & Consent Framework 2.2:
 
 ## Implementation
 
-The Didomi integration is implemented in [crates/common/src/integrations/didomi.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/didomi.rs).
+The Didomi integration is implemented in [crates/trusted-server-core/src/integrations/didomi.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/didomi.rs).
 
 ### Key Components
 

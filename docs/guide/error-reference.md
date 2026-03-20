@@ -512,7 +512,7 @@ secret_store_id = "your-secret-store-id"
 **Error Message:**
 
 ```
-error: could not compile `trusted-server-fastly`
+error: could not compile `trusted-server-adapter-fastly`
 ```
 
 **Cause:** Rust compilation error or missing dependencies
@@ -668,7 +668,7 @@ curl http://localhost:7676/first-party/ad?slot=test&w=300&h=250
 
 ```bash
 # Test configuration load
-cargo run --bin trusted-server-fastly -- --validate-config
+cargo run --bin trusted-server-adapter-fastly -- --validate-config
 
 # Or check startup logs
 fastly compute serve 2>&1 | grep -i "settings"
