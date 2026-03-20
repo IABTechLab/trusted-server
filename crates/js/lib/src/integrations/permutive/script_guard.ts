@@ -15,7 +15,8 @@ function isPermutiveSdkUrl(url: string): boolean {
 }
 
 const guard = createScriptGuard({
-  name: 'Permutive',
+  displayName: 'Permutive',
+  id: 'permutive',
   isTargetUrl: isPermutiveSdkUrl,
   proxyPath: '/integrations/permutive/sdk',
 });

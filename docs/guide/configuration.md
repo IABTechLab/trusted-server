@@ -92,7 +92,8 @@ secret_store_id = "01GYYY"
 enabled = true
 server_url = "https://prebid-server.com/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["kargo", "rubicon", "appnexus"]
+bidders = ["kargo", "appnexus", "openx"]
+client_side_bidders = ["rubicon"]
 ```
 
 ## Detailed Reference
@@ -243,6 +244,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 **Security**:
 
 - Keep confidential and secure
+- Cannot be the placeholder `"change-me-proxy-secret"` (case-insensitive) — startup will fail
 - Rotate periodically (90 days recommended)
 - Use cryptographically random values (32+ bytes)
 - Never commit to version control
@@ -358,7 +360,7 @@ fastly kv-store create --name=opid_store
 **Security**:
 
 - Must be non-empty
-- Cannot be `"secret_key"` or `"secret-key"` (reserved/invalid)
+- Cannot be a known placeholder: `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - Rotate periodically for security
 - Store securely (environment variable recommended)
 
@@ -372,7 +374,7 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
-- Exactly `"secret_key"` or `"secret-key"` (default placeholders)
+- Exactly `"secret-key"`, `"secret_key"`, or `"trusted-server"` (known placeholders, case-insensitive)
 
 #### `template`
 
@@ -735,16 +737,17 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                | Type          | Default                                                                | Description                                                                                                |
-| -------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `enabled`            | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                  |
-| `server_url`         | String        | Required                                                               | Prebid Server endpoint URL                                                                                 |
-| `timeout_ms`         | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                            |
-| `bidders`            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                    |
-| `debug`              | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses) |
-| `test_mode`          | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                          |
-| `debug_query_params` | String        | `None`                                                                 | Extra query params appended for debugging                                                                  |
-| `script_patterns`    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                |
+| Field                 | Type          | Default                                                                | Description                                                                                                                                           |
+| --------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`             | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
+| `server_url`          | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
+| `timeout_ms`          | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
+| `bidders`             | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
+| `debug`               | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
+| `test_mode`           | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
+| `debug_query_params`  | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
+| `client_side_bidders` | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
+| `script_patterns`     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
 **Example**:
 
@@ -753,9 +756,12 @@ apply when the integration section exists in `trusted-server.toml`.
 enabled = true
 server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
-bidders = ["kargo", "rubicon", "appnexus", "openx"]
+bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
+
+# Bidders that run client-side via native Prebid.js adapters
+client_side_bidders = ["rubicon"]
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
@@ -767,7 +773,8 @@ script_patterns = ["/prebid.js", "/prebid.min.js"]
 TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,rubicon,appnexus
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,appnexus,openx
+TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=rubicon
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG_QUERY_PARAMS=debug=1
@@ -916,11 +923,12 @@ Configuration is validated at startup:
 
 - All fields non-empty
 - `origin_url` is valid URL
+- `proxy_secret` ≠ known placeholder (`"change-me-proxy-secret"` — case-insensitive)
 
 **Synthetic Validation**:
 
 - `secret_key` ≥ 1 character
-- `secret_key` ≠ `"secret-key"`
+- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 - `template` non-empty
 
 **Handler Validation**:
@@ -1030,11 +1038,12 @@ trusted-server.dev.toml      # Development overrides
 - Verify all required fields present
 - Check environment variable format
 
-**"Secret key is not valid"**:
+**"Configuration field '...' is set to a known placeholder value"**:
 
-- Cannot use `"secret-key"` (placeholder)
+- `synthetic.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
-- Change to secure random value
+- Change to a secure random value (see generation commands above)
 
 **"Invalid regex"**:
 

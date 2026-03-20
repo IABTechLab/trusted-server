@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{build_url_with_context_params, ContextQueryParams};
@@ -200,6 +201,17 @@ impl AdServerMockProvider {
             json!(null)
         };
 
+        // Build consent summary from ConsentContext
+        let consent_json = request.user.consent.as_ref().map(|ctx| {
+            json!({
+                "gdpr": if ctx.gdpr_applies { 1 } else { 0 },
+                "consent": ctx.raw_tc_string,
+                "us_privacy": ctx.raw_us_privacy,
+                "gpp": ctx.raw_gpp_string,
+                "gpp_sid": ctx.gpp_section_ids,
+            })
+        });
+
         // Build full mediation request
         Ok(json!({
             "id": request.id,
@@ -207,6 +219,7 @@ impl AdServerMockProvider {
             "ext": {
                 "bidder_responses": bidder_responses_json,
                 "config": config_json,
+                "consent": consent_json,
             },
         }))
     }
@@ -281,7 +294,7 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to build mediation request".to_string(),
             })?;
 
-        log::debug!("AdServer Mock: mediation request: {:?}", mediation_req);
+        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
 
         // Build endpoint URL with context-driven query parameters
         let endpoint_url = self.build_endpoint_url(request);
@@ -306,15 +319,18 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to set mediation request body".to_string(),
             })?;
 
-        // Send async
-        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
-            TrustedServerError::Auction {
-                message: format!(
-                    "Failed to resolve backend for mediation endpoint: {}",
-                    self.config.endpoint
-                ),
-            },
-        )?;
+        // Send async with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for mediation endpoint: {}",
+                self.config.endpoint
+            ),
+        })?;
 
         let pending = req
             .send_async(backend_name)
@@ -344,7 +360,7 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to parse mediation response".to_string(),
             })?;
 
-        log::debug!("AdServer Mock response: {:?}", response_json);
+        log::trace!("AdServer Mock response: {:?}", response_json);
 
         let auction_response = self.parse_mediation_response(&response_json, response_time_ms);
 
@@ -369,8 +385,19 @@ impl AuctionProvider for AdServerMockProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.endpoint, true).ok()
+    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
+        BackendConfig::backend_name_for_url(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .inspect_err(|e| {
+            log::error!(
+                "Failed to create backend for AdServer Mock endpoint '{}': {e:?}",
+                self.config.endpoint
+            );
+        })
+        .ok()
     }
 }
 
@@ -684,6 +711,58 @@ mod tests {
         assert!(provider.supports_media_type(&MediaType::Banner));
         assert!(!provider.supports_media_type(&MediaType::Video));
         assert!(!provider.supports_media_type(&MediaType::Native));
+    }
+
+    #[test]
+    fn test_mediation_request_includes_consent() {
+        use crate::consent::ConsentContext;
+
+        let config = AdServerMockConfig {
+            enabled: true,
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            timeout_ms: 500,
+            price_floor: None,
+            context_query_params: BTreeMap::new(),
+        };
+
+        let provider = AdServerMockProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOEFEAyO".to_string()),
+            gdpr_applies: true,
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
+            gpp_section_ids: Some(vec![2, 6]),
+            ..Default::default()
+        });
+
+        let mediation_req = provider
+            .build_mediation_request(&request, &[])
+            .expect("should build request");
+
+        let consent = &mediation_req["ext"]["consent"];
+        assert_eq!(consent["gdpr"], 1);
+        assert_eq!(consent["consent"], "BOEFEAyO");
+        assert_eq!(consent["us_privacy"], "1YNN");
+        assert_eq!(consent["gpp"], "DBACNYA~CPXxRfAPXxRfA");
+        assert_eq!(consent["gpp_sid"], json!([2, 6]));
+    }
+
+    #[test]
+    fn test_mediation_request_no_consent() {
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+        let request = create_test_auction_request(); // consent is None
+
+        let mediation_req = provider
+            .build_mediation_request(&request, &[])
+            .expect("should build request");
+
+        assert!(
+            mediation_req["ext"]["consent"].is_null(),
+            "consent should be null when no consent context"
+        );
     }
 
     #[test]

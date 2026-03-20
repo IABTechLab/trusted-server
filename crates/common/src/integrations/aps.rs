@@ -8,6 +8,7 @@ use fastly::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
+use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -41,6 +42,32 @@ struct ApsBidRequest {
     /// Timeout in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u32>,
+
+    /// GDPR consent information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gdpr: Option<ApsGdprConsent>,
+
+    /// US Privacy (CCPA) string.
+    #[serde(rename = "usPrivacy", skip_serializing_if = "Option::is_none")]
+    us_privacy: Option<String>,
+
+    /// GPP consent string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpp: Option<String>,
+
+    /// GPP section IDs as comma-separated string.
+    #[serde(rename = "gppSid", skip_serializing_if = "Option::is_none")]
+    gpp_sid: Option<String>,
+}
+
+/// GDPR consent information for APS requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApsGdprConsent {
+    /// Whether GDPR applies to this request.
+    enabled: bool,
+    /// TCF v2 consent string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consent: Option<String>,
 }
 
 /// APS slot configuration.
@@ -268,6 +295,9 @@ impl ApsAuctionProvider {
     }
 
     /// Convert unified `AuctionRequest` to APS TAM bid request format.
+    ///
+    /// Populates consent fields (GDPR, US Privacy, GPP) from the
+    /// [`ConsentContext`](crate::consent::ConsentContext) attached to the request.
     fn to_aps_request(&self, request: &AuctionRequest) -> ApsBidRequest {
         let slots: Vec<ApsSlot> = request
             .slots
@@ -289,12 +319,33 @@ impl ApsAuctionProvider {
             })
             .collect();
 
+        // Build consent fields from ConsentContext
+        let consent_ctx = request.user.consent.as_ref();
+        let gdpr = consent_ctx.map(|ctx| ApsGdprConsent {
+            enabled: ctx.gdpr_applies,
+            consent: ctx.raw_tc_string.clone(),
+        });
+        let us_privacy = consent_ctx.and_then(|ctx| ctx.raw_us_privacy.clone());
+        let gpp = consent_ctx.and_then(|ctx| ctx.raw_gpp_string.clone());
+        let gpp_sid = consent_ctx.and_then(|ctx| {
+            ctx.gpp_section_ids.as_ref().map(|ids| {
+                ids.iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        });
+
         ApsBidRequest {
             pub_id: self.config.pub_id.clone(),
             slots,
             page_url: request.publisher.page_url.clone(),
             user_agent: request.device.as_ref().and_then(|d| d.user_agent.clone()),
             timeout: Some(self.config.timeout_ms),
+            gdpr,
+            us_privacy,
+            gpp,
+            gpp_sid,
         }
     }
 
@@ -424,7 +475,7 @@ impl AuctionProvider for ApsAuctionProvider {
     fn request_bids(
         &self,
         request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
+        context: &AuctionContext<'_>,
     ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
         log::info!(
             "APS: requesting bids for {} slots (pub_id: {})",
@@ -441,7 +492,7 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to serialize APS bid request".to_string(),
             })?;
 
-        log::debug!("APS: sending bid request: {:?}", aps_json);
+        log::trace!("APS: sending bid request: {:?}", aps_json);
 
         // Create HTTP POST request
         let mut aps_req = Request::new(Method::POST, &self.config.endpoint);
@@ -452,15 +503,18 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to set APS request body".to_string(),
             })?;
 
-        // Send request asynchronously
-        let backend_name = BackendConfig::from_url(&self.config.endpoint, true).change_context(
-            TrustedServerError::Auction {
-                message: format!(
-                    "Failed to resolve backend for APS endpoint: {}",
-                    self.config.endpoint
-                ),
-            },
-        )?;
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for APS endpoint: {}",
+                self.config.endpoint
+            ),
+        })?;
 
         let pending =
             aps_req
@@ -490,7 +544,7 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to parse APS response JSON".to_string(),
             })?;
 
-        log::debug!("APS: received response: {:?}", response_json);
+        log::trace!("APS: received response: {:?}", response_json);
 
         // Transform to unified format
         let auction_response = self.parse_aps_response(&response_json, response_time_ms);
@@ -517,8 +571,19 @@ impl AuctionProvider for ApsAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self) -> Option<String> {
-        BackendConfig::from_url(&self.config.endpoint, true).ok()
+    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
+        BackendConfig::backend_name_for_url(
+            &self.config.endpoint,
+            true,
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .inspect_err(|e| {
+            log::error!(
+                "Failed to create backend for APS endpoint '{}': {e:?}",
+                self.config.endpoint
+            );
+        })
+        .ok()
     }
 }
 
@@ -860,6 +925,97 @@ mod tests {
         assert!(provider.supports_media_type(&MediaType::Banner));
         assert!(provider.supports_media_type(&MediaType::Video));
         assert!(!provider.supports_media_type(&MediaType::Native));
+    }
+
+    #[test]
+    fn test_aps_request_includes_consent_fields() {
+        use crate::consent::ConsentContext;
+
+        let config = ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        };
+        let provider = ApsAuctionProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA".to_string()),
+            gdpr_applies: true,
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
+            gpp_section_ids: Some(vec![2, 6]),
+            ..Default::default()
+        });
+
+        let aps_request = provider.to_aps_request(&request);
+
+        // Verify GDPR consent
+        let gdpr = aps_request.gdpr.expect("should have gdpr");
+        assert!(gdpr.enabled);
+        assert_eq!(
+            gdpr.consent.as_deref(),
+            Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA")
+        );
+
+        // Verify US Privacy
+        assert_eq!(aps_request.us_privacy.as_deref(), Some("1YNN"));
+
+        // Verify GPP
+        assert_eq!(aps_request.gpp.as_deref(), Some("DBACNYA~CPXxRfAPXxRfA"));
+        assert_eq!(aps_request.gpp_sid.as_deref(), Some("2,6"));
+    }
+
+    #[test]
+    fn test_aps_request_no_consent() {
+        let config = ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        };
+        let provider = ApsAuctionProvider::new(config);
+        let request = create_test_auction_request(); // consent is None
+
+        let aps_request = provider.to_aps_request(&request);
+
+        assert!(aps_request.gdpr.is_none());
+        assert!(aps_request.us_privacy.is_none());
+        assert!(aps_request.gpp.is_none());
+        assert!(aps_request.gpp_sid.is_none());
+    }
+
+    #[test]
+    fn test_aps_request_consent_serialization() {
+        use crate::consent::ConsentContext;
+
+        let config = ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        };
+        let provider = ApsAuctionProvider::new(config);
+
+        let mut request = create_test_auction_request();
+        request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOE".to_string()),
+            gdpr_applies: true,
+            ..Default::default()
+        });
+
+        let aps_request = provider.to_aps_request(&request);
+        let json = serde_json::to_value(&aps_request).expect("should serialize");
+
+        // GDPR fields present
+        assert_eq!(json["gdpr"]["enabled"], true);
+        assert_eq!(json["gdpr"]["consent"], "BOE");
+
+        // Absent fields should not appear (skip_serializing_if)
+        assert!(json.get("usPrivacy").is_none());
+        assert!(json.get("gpp").is_none());
+        assert!(json.get("gppSid").is_none());
     }
 
     #[test]
