@@ -297,7 +297,7 @@ curl -X POST https://your-domain/admin/keys/rotate \
 ### Using the Rust API
 
 ```rust
-use trusted_server_common::request_signing::KeyRotationManager;
+use trusted_server_core::request_signing::KeyRotationManager;
 
 // Initialize rotation manager
 let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
@@ -510,7 +510,7 @@ Immediate switchover with rollback capability:
 ### Track Current Key
 
 ```rust
-use trusted_server_common::request_signing::get_current_key_id;
+use trusted_server_core::request_signing::get_current_key_id;
 
 let current_kid = get_current_key_id()?;
 println!("Current signing key: {}", current_kid);

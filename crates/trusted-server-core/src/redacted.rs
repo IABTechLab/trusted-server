@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```
-/// use trusted_server_common::redacted::Redacted;
+/// use trusted_server_core::redacted::Redacted;
 ///
 /// let secret = Redacted::new("my-secret-key".to_string());
 /// assert_eq!(format!("{:?}", secret), "[REDACTED]");

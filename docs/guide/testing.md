@@ -21,7 +21,7 @@ cargo test
 Tests are organized alongside source code in `#[cfg(test)]` modules:
 
 ```rust
-// crates/common/src/synthetic.rs
+// crates/trusted-server-core/src/synthetic.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,7 +57,7 @@ cargo test test_generate_synthetic_id
 cargo test -- --nocapture
 
 # Run tests for specific crate
-cargo test -p trusted-server-common
+cargo test -p trusted-server-core
 
 # Run tests matching a pattern
 cargo test synthetic
@@ -88,7 +88,7 @@ curl http://localhost:7676/.well-known/trusted-server.json
 
 ### Synthetic ID Tests
 
-From `crates/common/src/synthetic.rs`:
+From `crates/trusted-server-core/src/synthetic.rs`:
 
 ```rust
 #[test]
@@ -127,7 +127,7 @@ fn test_get_synthetic_id_none() {
 
 ### Creative Rewriting Tests
 
-From `crates/common/src/creative.rs`:
+From `crates/trusted-server-core/src/creative.rs`:
 
 ```rust
 #[test]
@@ -172,7 +172,7 @@ fn rewrite_style_urls_handles_absolute_and_relative() {
 
 ### Proxy Tests
 
-From `crates/common/src/proxy.rs`:
+From `crates/trusted-server-core/src/proxy.rs`:
 
 ```rust
 #[test]
@@ -209,7 +209,7 @@ fn header_copy_copies_curated_set() {
 
 ## Test Helpers
 
-The codebase provides test utilities in `crates/common/src/test_support.rs`:
+The codebase provides test utilities in `crates/trusted-server-core/src/test_support.rs`:
 
 ```rust
 use crate::test_support::tests::{create_test_settings, create_test_request};
@@ -240,7 +240,7 @@ cargo fmt
 
 ```bash
 # Run clippy with all checks
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Fix clippy warnings automatically
 cargo clippy --fix --allow-dirty
@@ -274,7 +274,7 @@ jobs:
       - name: Run tests
         run: cargo test
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Debugging Tests
