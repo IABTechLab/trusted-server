@@ -39,7 +39,7 @@ fastly compute serve
 cargo fmt
 
 # Lint
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Run tests
 cargo test

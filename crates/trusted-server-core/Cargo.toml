@@ -1,5 +1,5 @@
 [package]
-name = "trusted-server-common"
+name = "trusted-server-core"
 version = "0.1.0"
 authors = []
 edition = "2021"
@@ -50,6 +50,7 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
+edgezero-core = { workspace = true }
 once_cell = { workspace = true }
 
 [build-dependencies]
