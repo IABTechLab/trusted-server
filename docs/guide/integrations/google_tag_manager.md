@@ -225,7 +225,7 @@ _Expected_: `200 OK` (or 204).
 
 ## Implementation Details
 
-See [crates/common/src/integrations/google_tag_manager.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/google_tag_manager.rs).
+See [crates/trusted-server-core/src/integrations/google_tag_manager.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/google_tag_manager.rs).
 
 ## Next Steps
 

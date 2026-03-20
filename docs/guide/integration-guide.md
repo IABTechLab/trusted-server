@@ -1,15 +1,15 @@
 # Integration Guide
 
-This document explains how to integrate a new integration module with the Trusted Server runtime. The workflow mirrors the built-in `testlight` sample in `crates/common/src/integrations/testlight.rs`.
+This document explains how to integrate a new integration module with the Trusted Server runtime. The workflow mirrors the built-in `testlight` sample in `crates/trusted-server-core/src/integrations/testlight.rs`.
 
 ## Architecture Overview
 
-| Component                                                  | Purpose                                                                                                                                                                                                                                                      |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/common/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                   |
-| `Settings::integrations` (`crates/common/src/settings.rs`) | Free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
-| Fastly entrypoint (`crates/fastly/src/main.rs`)            | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
-| `html_processor.rs`                                        | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
+| Component                                                               | Purpose                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/trusted-server-core/src/integrations/registry.rs`               | Defines the `IntegrationProxy`, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, and `IntegrationHeadInjector` traits and hosts the `IntegrationRegistry`, which drives proxy routing, HTML/text rewrites, and head injection.                   |
+| `Settings::integrations` (`crates/trusted-server-core/src/settings.rs`) | Free-form JSON blob keyed by integration ID. Use `IntegrationSettings::insert_config` to seed configs; each module deserializes and validates (`validator::Validate`) its own config and exposes an `enabled` flag so the core settings schema stays stable. |
+| Fastly entrypoint (`crates/trusted-server-adapter-fastly/src/main.rs`)  | Instantiates the registry once per request, routes `/integrations/<id>/…` requests to the appropriate proxy, and passes the registry to the publisher origin proxy so HTML rewriting remains integration-aware.                                              |
+| `html_processor.rs`                                                     | Applies first-party URL rewrites, injects the Trusted Server JS shim, and lets integrations override attribute values (for example to swap script URLs).                                                                                                     |
 
 ## Step-by-Step Integration
 
@@ -26,7 +26,7 @@ rewrite_scripts = true
 
 ### 2. Create the Integration Module
 
-Add a module under `crates/common/src/integrations/<id>/mod.rs` (see `crates/common/src/integrations/testlight.rs` for reference) and expose it in `crates/common/src/integrations/mod.rs`.
+Add a module under `crates/trusted-server-core/src/integrations/<id>/mod.rs` (see `crates/trusted-server-core/src/integrations/testlight.rs` for reference) and expose it in `crates/trusted-server-core/src/integrations/mod.rs`.
 
 Key pieces:
 
@@ -87,7 +87,7 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
 }
 ```
 
-Any combination of the vectors may be populated. Modules that only need HTML rewrites can skip the `proxies` field altogether, and vice versa. The registry automatically iterates over the static builder list in `crates/common/src/integrations/mod.rs`, so adding the new `register` function is enough to make the integration discoverable.
+Any combination of the vectors may be populated. Modules that only need HTML rewrites can skip the `proxies` field altogether, and vice versa. The registry automatically iterates over the static builder list in `crates/trusted-server-core/src/integrations/mod.rs`, so adding the new `register` function is enough to make the integration discoverable.
 
 ### 4. Implement IntegrationProxy for Endpoints
 
@@ -121,13 +121,13 @@ impl IntegrationProxy for MyIntegration {
 Use the provided helper methods to automatically namespace your routes under `/integrations/{integration_name()}/`. Available helpers: `get()`, `post()`, `put()`, `delete()`, and `patch()`. This lets you define routes with just their relative paths (e.g., `self.post("/auction")` becomes `"/integrations/my_integration/auction"`).
 :::
 
-Routes are matched verbatim in `crates/fastly/src/main.rs`, so stick to stable paths and register whichever HTTP methods you need. **New integrations should namespace their routes under `/integrations/{INTEGRATION_NAME}/`** using the helper methods for consistency, but you can define routes manually if needed (e.g., for backwards compatibility).
+Routes are matched verbatim in `crates/trusted-server-adapter-fastly/src/main.rs`, so stick to stable paths and register whichever HTTP methods you need. **New integrations should namespace their routes under `/integrations/{INTEGRATION_NAME}/`** using the helper methods for consistency, but you can define routes manually if needed (e.g., for backwards compatibility).
 
 The shared context already injects Trusted Server logging, headers, and error handling; the handler only needs to deserialize the request, call the upstream endpoint, and stamp integration-specific headers.
 
 #### Proxying Upstream Requests
 
-Use the shared helper in `crates/common/src/proxy.rs` to forward requests so you automatically get the same header copying, redirect handling, HTML/CSS rewrite behavior, and synthetic ID handling the first-party proxy uses:
+Use the shared helper in `crates/trusted-server-core/src/proxy.rs` to forward requests so you automatically get the same header copying, redirect handling, HTML/CSS rewrite behavior, and synthetic ID handling the first-party proxy uses:
 
 ```rust
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -240,9 +240,9 @@ Use `IntegrationHeadInjector` when you need to emit configuration, inline script
 
 ### 6. Register the Module
 
-Add the module to `crates/common/src/integrations/mod.rs`'s builder list. The registry will call its `register` function automatically. Once registered:
+Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder list. The registry will call its `register` function automatically. Once registered:
 
-- `crates/fastly/src/main.rs` automatically exposes the declared route(s).
+- `crates/trusted-server-adapter-fastly/src/main.rs` automatically exposes the declared route(s).
 - `handle_publisher_request` receives the same registry so HTML responses get integration shims without further code changes.
 - `IntegrationRegistry::registered_integrations()` exposes a machine-readable summary of hooks for tests, tooling, or diagnostics.
 - Declared assets are injected automatically into `<head>`; the runtime emits `<script async data-tsjs-integration="<name>">` tags for every bundle discovered through `.with_asset(...)`.
@@ -256,8 +256,8 @@ Integrations that ship additional JS (such as Testlight) typically expose a `shi
 ### 8. Test Locally
 
 1. Add minimal config (`trusted-server.toml` + `.env.*` overrides).
-2. Run `cargo fmt && cargo clippy --all-targets --all-features`.
-3. Execute targeted tests, e.g. `cargo test -p trusted-server-common html_processor`.
+2. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+3. Execute targeted tests, e.g. `cargo test -p trusted-server-core html_processor`.
 4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and fetch HTML from your origin to confirm rewrites are applied.
 
 ::: tip Testing Strategy
@@ -283,7 +283,7 @@ Integrations are loaded in one of two ways:
 
 **Key files**:
 
-- `crates/common/src/integrations/testlight.rs` - Rust implementation
+- `crates/trusted-server-core/src/integrations/testlight.rs` - Rust implementation
 - `crates/js/lib/src/integrations/testlight.ts` - TypeScript shim
 
 ### Prebid
@@ -294,7 +294,7 @@ Integrations are loaded in one of two ways:
 
 **Key files**:
 
-- `crates/common/src/integrations/prebid.rs` - Rust implementation
+- `crates/trusted-server-core/src/integrations/prebid.rs` - Rust implementation
 - `crates/js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
 
 #### Prebid Integration Details
@@ -303,7 +303,7 @@ Prebid applies the same steps outlined above with a few notable patterns:
 
 **1. Typed Configuration**
 
-`PrebidIntegrationConfig` lives alongside the integration module (`crates/common/src/integrations/prebid.rs`), implements `IntegrationConfig + Validate`, and exposes an `enabled` flag so operators can toggle it without code changes. Configuration lives under `[integrations.prebid]`:
+`PrebidIntegrationConfig` lives alongside the integration module (`crates/trusted-server-core/src/integrations/prebid.rs`), implements `IntegrationConfig + Validate`, and exposes an `enabled` flag so operators can toggle it without code changes. Configuration lives under `[integrations.prebid]`:
 
 ```toml
 [integrations.prebid]

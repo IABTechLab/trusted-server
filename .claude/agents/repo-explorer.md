@@ -11,8 +11,8 @@ implementation details.
 
 This is a Rust workspace with three crates:
 
-- `crates/common/` — core library (integrations, HTML processing, synthetic IDs, GDPR)
-- `crates/fastly/` — Fastly Compute entry point
+- `crates/trusted-server-core/` — core library (integrations, HTML processing, synthetic IDs, GDPR)
+- `crates/trusted-server-adapter-fastly/` — Fastly Compute entry point
 - `crates/js/` — TypeScript/JS build pipeline (per-integration IIFE bundles)
 
 Target: `wasm32-wasip1` (Fastly Compute)

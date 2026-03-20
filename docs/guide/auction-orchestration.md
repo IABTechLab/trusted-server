@@ -202,14 +202,14 @@ Convert OrchestrationResult → OpenRTB 2.x Response
 
 The orchestrator is composed of several modules:
 
-| Module            | Path                         | Purpose                                     |
-| ----------------- | ---------------------------- | ------------------------------------------- |
-| `orchestrator.rs` | `crates/common/src/auction/` | Core parallel execution and bid selection   |
-| `provider.rs`     | `crates/common/src/auction/` | `AuctionProvider` trait definition          |
-| `types.rs`        | `crates/common/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
-| `formats.rs`      | `crates/common/src/auction/` | Format conversions (TSJS ↔ OpenRTB)         |
-| `endpoints.rs`    | `crates/common/src/auction/` | HTTP handler for `POST /auction`            |
-| `config.rs`       | `crates/common/src/auction/` | Auction configuration types                 |
+| Module            | Path                                      | Purpose                                     |
+| ----------------- | ----------------------------------------- | ------------------------------------------- |
+| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Core parallel execution and bid selection   |
+| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait definition          |
+| `types.rs`        | `crates/trusted-server-core/src/auction/` | Data structures (AuctionRequest, Bid, etc.) |
+| `formats.rs`      | `crates/trusted-server-core/src/auction/` | Format conversions (TSJS ↔ OpenRTB)         |
+| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`            |
+| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                 |
 
 ### Provider Auto-Discovery
 

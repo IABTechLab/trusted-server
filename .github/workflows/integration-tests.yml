@@ -13,7 +13,7 @@ on:
 env:
   ORIGIN_PORT: 8888
   ARTIFACTS_DIR: /tmp/integration-test-artifacts
-  WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-fastly.wasm
+  WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-adapter-fastly.wasm
   DOCKER_ARTIFACT_PATH: /tmp/integration-test-artifacts/docker/test-images.tar
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
       - name: Package integration test artifacts
         run: |
           mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")"
-          cp target/wasm32-wasip1/release/trusted-server-fastly.wasm "$WASM_ARTIFACT_PATH"
+          cp target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm "$WASM_ARTIFACT_PATH"
           docker save \
             --output "$DOCKER_ARTIFACT_PATH" \
             test-wordpress:latest test-nextjs:latest

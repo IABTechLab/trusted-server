@@ -309,7 +309,7 @@ pub struct Unlisted {
         );
     }
 
-    /// Verify enum derives strip prost::Enumeration and add serde.
+    /// Verify enum derives strip `prost::Enumeration` and add serde.
     const PROST_ENUM: &str = "\
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
