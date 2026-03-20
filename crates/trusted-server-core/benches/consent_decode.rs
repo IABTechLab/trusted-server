@@ -4,16 +4,16 @@
 //! US Privacy) to determine whether wiring decoding into the auction hot path
 //! introduces unacceptable latency.
 //!
-//! Run with: `cargo bench -p trusted-server-common`
+//! Run with: `cargo bench -p trusted-server-core`
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use trusted_server_common::consent::tcf::decode_tc_string;
-use trusted_server_common::consent::types::RawConsentSignals;
-use trusted_server_common::consent::us_privacy::decode_us_privacy;
-use trusted_server_common::consent::{build_context_from_signals, gpp};
+use trusted_server_core::consent::tcf::decode_tc_string;
+use trusted_server_core::consent::types::RawConsentSignals;
+use trusted_server_core::consent::us_privacy::decode_us_privacy;
+use trusted_server_core::consent::{build_context_from_signals, gpp};
 
 // ---------------------------------------------------------------------------
 // Test data
