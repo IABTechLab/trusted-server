@@ -404,6 +404,7 @@ impl Settings {
             })?;
 
         settings.consent.validate();
+        settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -525,18 +526,24 @@ impl Settings {
     /// Called by [`from_toml_and_env`](Self::from_toml_and_env) at build time
     /// to enforce that every admin endpoint has a handler. An empty return
     /// value means all admin endpoints are properly covered.
-    #[must_use]
-    pub(crate) fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
-        Self::ADMIN_ENDPOINTS
-            .iter()
-            .copied()
-            .filter(|path| {
-                !self
-                    .handlers
-                    .iter()
-                    .any(|h| h.matches_path(path).unwrap_or(false))
-            })
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] if any handler has an invalid path regex.
+    pub(crate) fn uncovered_admin_endpoints(
+        &self,
+    ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
+        let mut uncovered = Vec::new();
+        for &path in Self::ADMIN_ENDPOINTS {
+            let covered = self
+                .handlers
+                .iter()
+                .try_fold(false, |acc, h| h.matches_path(path).map(|m| acc || m))?;
+            if !covered {
+                uncovered.push(path);
+            }
+        }
+        Ok(uncovered)
     }
 
     /// Validates that every admin endpoint is covered by at least one handler.
@@ -546,7 +553,7 @@ impl Settings {
     /// Returns [`TrustedServerError::Configuration`] listing any uncovered
     /// admin endpoints.
     fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
-        let uncovered = self.uncovered_admin_endpoints();
+        let uncovered = self.uncovered_admin_endpoints()?;
         if uncovered.is_empty() {
             return Ok(());
         }
@@ -798,10 +805,7 @@ mod tests {
     fn prepare_runtime_rejects_invalid_handler_regex() {
         let toml_str = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
 
-        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
-        let err = settings
-            .prepare_runtime()
-            .expect_err("should reject invalid handler regex");
+        let err = Settings::from_toml(&toml_str).expect_err("should reject invalid handler regex");
         assert!(
             err.to_string()
                 .contains("Handler path regex `(` failed to compile"),
@@ -1650,7 +1654,9 @@ mod tests {
         // since this test exercises uncovered_admin_endpoints itself.
         let settings: Settings =
             toml::from_str(&settings_str_without_admin_handler()).expect("should deserialize TOML");
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert_eq!(
             uncovered,
             vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
@@ -1661,7 +1667,9 @@ mod tests {
     #[test]
     fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
         let settings = create_test_settings();
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert!(
             uncovered.is_empty(),
             "should report no uncovered admin endpoints when handler covers /admin"
@@ -1680,7 +1688,9 @@ mod tests {
         // Deserialize directly to bypass from_toml's admin validation,
         // since this test exercises uncovered_admin_endpoints itself.
         let settings: Settings = toml::from_str(&toml_str).expect("should deserialize TOML");
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert_eq!(
             uncovered,
             vec!["/admin/keys/deactivate"],

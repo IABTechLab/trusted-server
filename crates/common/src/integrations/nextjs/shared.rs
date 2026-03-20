@@ -19,14 +19,6 @@ pub(crate) static RSC_PUSH_CALL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid RSC push call regex")
 });
 
-/// Generic URL pattern for RSC payload rewriting.
-pub(crate) static RSC_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>\[[^\]]+\](?::\d+)?|[^/"'\\\s?#<>,)]+)"#,
-    )
-    .expect("valid RSC URL rewrite regex")
-});
-
 /// Find the payload string boundaries within an RSC push script.
 ///
 /// Returns `Some((start, end))` where `start` is the position after the opening quote
@@ -108,6 +100,21 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
 // URL Rewriting
 // =============================================================================
 
+/// Compile a URL-matching regex anchored to a specific `origin_host`.
+///
+/// The slash alternatives cover all escape variants that appear in RSC payloads:
+/// `\\\\//` (JSON double-encoded), `\\//` (JSON encoded), `\/\/` (escaped), `//` (plain).
+///
+/// Compiling per-request ensures only origin URLs are matched, avoiding the closure overhead
+/// that a broad static pattern would incur for every URL-like token in the payload.
+fn build_origin_url_pattern(origin_host: &str) -> Regex {
+    let escaped = regex::escape(origin_host);
+    Regex::new(&format!(
+        r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>{escaped}(?::\d+)?)"#
+    ))
+    .expect("should compile origin-specific RSC URL regex")
+}
+
 /// Rewriter for URL patterns in RSC payloads.
 ///
 /// This rewrites all occurrences of origin URLs in content, including:
@@ -138,8 +145,13 @@ impl RscUrlRewriter {
             return Cow::Borrowed(input);
         }
 
+        // Compile an origin-specific pattern so the regex only matches URLs that contain
+        // this origin's host, avoiding closure overhead for non-origin URL tokens in large
+        // RSC payloads. Regex compilation is cheap relative to replace_all on a large payload.
+        let origin_pattern = build_origin_url_pattern(origin_host);
+
         // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
-        let replaced = RSC_URL_PATTERN.replace_all(input, |caps: &regex::Captures<'_>| {
+        let replaced = origin_pattern.replace_all(input, |caps: &regex::Captures<'_>| {
             let host = caps.name("host").map_or("", |m| m.as_str());
             let Some(host_suffix) = strip_origin_host_with_optional_port(host, origin_host) else {
                 return caps

@@ -149,10 +149,7 @@ mod tests {
     #[test]
     fn returns_error_for_invalid_handler_regex_without_panicking() {
         let config = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
-        let settings = Settings::from_toml(&config).expect("should parse invalid regex TOML");
-        let req = Request::new(Method::GET, "https://example.com/secure");
-
-        let err = enforce_basic_auth(&settings, &req).expect_err("should return config error");
+        let err = Settings::from_toml(&config).expect_err("should reject invalid handler regex");
         assert!(
             err.to_string()
                 .contains("Handler path regex `(` failed to compile"),

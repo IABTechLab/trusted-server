@@ -30,15 +30,11 @@ fn restrict_accept_encoding(req: &mut Request) {
     };
     req.set_header(
         header::ACCEPT_ENCODING,
-        select_supported_accept_encoding(Some(current)),
+        select_supported_accept_encoding(current),
     );
 }
 
-fn select_supported_accept_encoding(client_accept_encoding: Option<&str>) -> String {
-    let Some(client_accept_encoding) = client_accept_encoding else {
-        return "identity".to_string();
-    };
-
+fn select_supported_accept_encoding(client_accept_encoding: &str) -> String {
     let supported_subset = SUPPORTED_ENCODING_VALUES
         .into_iter()
         .filter(|encoding| client_accepts_content_encoding(client_accept_encoding, encoding))
@@ -86,7 +82,10 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
             }
         }
 
+        // First match wins per RFC 7231 — duplicate tokens are non-normative,
+        // but using first-match is the conventional interpretation.
         matched_qvalue = Some(qvalue);
+        break;
     }
 
     matched_qvalue
