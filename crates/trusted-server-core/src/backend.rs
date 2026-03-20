@@ -104,6 +104,11 @@ impl<'a> BackendConfig<'a> {
                 message: "missing host".to_string(),
             }));
         }
+        if self.host.chars().any(|c| c.is_control()) {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "host contains control characters".to_string(),
+            }));
+        }
 
         let target_port = self
             .port
@@ -388,6 +393,17 @@ mod tests {
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
         assert_eq!(name, "backend_http_example_org_80_t15000");
+    }
+
+    #[test]
+    fn error_on_host_with_control_characters() {
+        let err = BackendConfig::new("https", "evil.com\nINFO fake log entry")
+            .predict_name()
+            .expect_err("should reject host containing newline");
+        assert!(
+            err.to_string().contains("control characters"),
+            "should report control characters in error message"
+        );
     }
 
     #[test]
