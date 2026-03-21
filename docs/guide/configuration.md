@@ -761,7 +761,7 @@ TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
 
 **Purpose**: Allowlist of redirect destinations the proxy is permitted to follow.
 
-**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy` or `/first-party/click`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
+**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
 
 **Default — open mode**: When `allowed_domains` is absent or empty, every redirect destination is allowed. This default is intentional for zero-config development but should not be used in production.
 

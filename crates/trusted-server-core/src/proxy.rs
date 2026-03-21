@@ -543,6 +543,16 @@ async fn proxy_with_redirects(
             }));
         }
 
+        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+            log::warn!(
+                "request to `{}` blocked: host not in proxy allowed_domains",
+                host
+            );
+            return Err(Report::new(TrustedServerError::AllowlistViolation {
+                host: host.to_string(),
+            }));
+        }
+
         let backend_name = crate::backend::BackendConfig::new(&scheme, host)
             .port(parsed_url.port())
             .certificate_check(settings.proxy.certificate_check)
@@ -619,8 +629,8 @@ async fn proxy_with_redirects(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
             );
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: format!("redirect to `{next_host}` is not permitted"),
+            return Err(Report::new(TrustedServerError::AllowlistViolation {
+                host: next_host.to_string(),
             }));
         }
 
@@ -2048,4 +2058,39 @@ mod tests {
             "should block redirect with empty host when allowlist is non-empty"
         );
     }
+
+    // --- initial target allowlist enforcement (integration-level) ---
+
+    #[tokio::test]
+    async fn proxy_initial_target_blocked_by_allowlist() {
+        use crate::http_util::compute_encrypted_sha256_token;
+
+        let mut settings = create_test_settings();
+        settings.proxy.allowed_domains = vec!["allowed.com".to_string()];
+
+        let target = "https://blocked.com/pixel.gif";
+        let token = compute_encrypted_sha256_token(&settings, target);
+        let url = format!(
+            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+            urlencoding::encode(target),
+            token,
+        );
+        let req = Request::new(Method::GET, url);
+        let err = handle_first_party_proxy(&settings, req)
+            .await
+            .expect_err("should block initial target not in allowlist");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::FORBIDDEN,
+            "should return 403 for allowlist violation"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::AllowlistViolation { .. }
+            ),
+            "should be AllowlistViolation error"
+        );
+    }
+
 }

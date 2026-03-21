@@ -354,6 +354,11 @@ impl Proxy {
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
+        if self.allowed_domains.is_empty() {
+            log::warn!(
+                "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
+            );
+        }
     }
 }
 

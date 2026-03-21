@@ -562,7 +562,7 @@ Only essential headers are forwarded to reduce overhead:
 **Invalid Signature**:
 
 ```
-HTTP 403 Forbidden
+HTTP 502 Bad Gateway
 tstoken validation failed: signature mismatch
 ```
 
@@ -575,7 +575,7 @@ tstoken validation failed: signature mismatch
 **Expired URL**:
 
 ```
-HTTP 403 Forbidden
+HTTP 502 Bad Gateway
 tstoken expired
 ```
 
@@ -640,7 +640,7 @@ Attacker tries:
 Trusted Server:
   1. Computes expected token for https://evil.com
   2. Compares with provided token
-  3. Rejects if mismatch (403 Forbidden)
+  3. Rejects if mismatch (502 Bad Gateway)
 ```
 
 ### Content Security
