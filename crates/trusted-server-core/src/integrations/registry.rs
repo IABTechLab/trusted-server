@@ -1304,6 +1304,57 @@ mod tests {
     }
 
     #[test]
+    fn handle_proxy_replaces_invalid_request_header_with_matching_response_cookie() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+        req.set_header(HEADER_X_SYNTHETIC_ID, "evil;injected");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ))
+        .expect("should handle proxy request");
+
+        let response = result.expect("handler should succeed");
+        let response_header = response
+            .get_header(HEADER_X_SYNTHETIC_ID)
+            .expect("response should have x-synthetic-id header")
+            .to_str()
+            .expect("header should be valid UTF-8")
+            .to_string();
+        let cookie_header = response
+            .get_header(header::SET_COOKIE)
+            .expect("response should have Set-Cookie header")
+            .to_str()
+            .expect("header should be valid UTF-8");
+        let cookie_value = cookie_header
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(value, _)| value))
+            .expect("should contain the synthetic_id cookie value");
+
+        assert_ne!(
+            response_header, "evil;injected",
+            "should not reflect the tampered request header"
+        );
+        assert_eq!(
+            response_header, cookie_value,
+            "response header and cookie should carry the same effective synthetic ID"
+        );
+    }
+
+    #[test]
     fn handle_proxy_always_sets_cookie() {
         let settings = create_test_settings();
         let routes = vec![(

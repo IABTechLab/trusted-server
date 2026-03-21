@@ -3,6 +3,8 @@
 //! This module provides functionality for parsing and creating cookies
 //! used in the trusted server system.
 
+use std::borrow::Cow;
+
 use cookie::{Cookie, CookieJar};
 use error_stack::{Report, ResultExt};
 use fastly::http::header;
@@ -27,6 +29,42 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
 ];
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
+
+fn is_allowed_synthetic_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+#[must_use]
+pub(crate) fn synthetic_id_has_only_allowed_chars(synthetic_id: &str) -> bool {
+    synthetic_id.chars().all(is_allowed_synthetic_id_char)
+}
+
+fn sanitize_synthetic_id_for_cookie(synthetic_id: &str) -> Cow<'_, str> {
+    if synthetic_id_has_only_allowed_chars(synthetic_id) {
+        return Cow::Borrowed(synthetic_id);
+    }
+
+    let safe_id = synthetic_id
+        .chars()
+        .filter(|c| is_allowed_synthetic_id_char(*c))
+        .collect::<String>();
+
+    log::warn!(
+        "Stripped disallowed characters from synthetic_id before setting cookie (len {} -> {}); \
+         callers should reject invalid request IDs before cookie creation",
+        synthetic_id.len(),
+        safe_id.len(),
+    );
+
+    Cow::Owned(safe_id)
+}
+
+fn synthetic_cookie_attributes(settings: &Settings, max_age: i32) -> String {
+    format!(
+        "Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}",
+        settings.publisher.cookie_domain,
+    )
+}
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
@@ -151,12 +189,46 @@ fn is_safe_cookie_value(value: &str) -> bool {
             .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
 }
 
-/// Formats the `Set-Cookie` header value for the synthetic ID cookie.
+/// Generates a `Set-Cookie` header value with the following security attributes:
+/// - `Secure`: transmitted over HTTPS only.
+/// - `HttpOnly`: inaccessible to JavaScript (`document.cookie`), blocking XSS exfiltration.
+///   Safe to set because integrations receive the synthetic ID via the `x-synthetic-id`
+///   response header instead of reading it from the cookie directly.
+/// - `SameSite=Lax`: sent on same-site requests and top-level cross-site navigations.
+///   `Strict` is intentionally avoided — it would suppress the cookie on the first
+///   request when a user arrives from an external page, breaking first-visit attribution.
+/// - `Max-Age`: 1 year retention.
+///
+/// The `synthetic_id` is sanitized via an allowlist before embedding in the cookie value.
+/// Only ASCII alphanumeric characters and `.`, `-`, `_` are permitted — matching the
+/// known synthetic ID format (`{64-char-hex}.{6-char-alphanumeric}`). Request-sourced IDs
+/// with disallowed characters are rejected earlier in [`crate::synthetic::get_synthetic_id`];
+/// this sanitization remains as a defense-in-depth backstop for unexpected callers.
+///
+/// The `cookie_domain` is validated at config load time via [`validator::Validate`] on
+/// [`crate::settings::Publisher`]; bad config fails at startup, not per-request.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use trusted_server_core::cookies::create_synthetic_cookie;
+/// # use trusted_server_core::settings::Settings;
+/// // `settings` is loaded at startup via `Settings::from_toml_and_env`.
+/// # fn example(settings: &Settings) {
+/// let cookie = create_synthetic_cookie(settings, "abc123.xk92ab");
+/// assert!(cookie.contains("HttpOnly"));
+/// assert!(cookie.contains("Secure"));
+/// # }
+/// ```
 #[must_use]
-fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
+pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
+    let safe_id = sanitize_synthetic_id_for_cookie(synthetic_id);
+
     format!(
-        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+        "{}={}; {}",
+        COOKIE_SYNTHETIC_ID,
+        safe_id,
+        synthetic_cookie_attributes(settings, COOKIE_MAX_AGE),
     )
 }
 
@@ -192,8 +264,9 @@ pub fn set_synthetic_cookie(
 /// on receipt of this header.
 pub fn expire_synthetic_cookie(settings: &Settings, response: &mut fastly::Response) {
     let cookie = format!(
-        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
-        COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain,
+        "{}=; {}",
+        COOKIE_SYNTHETIC_ID,
+        synthetic_cookie_attributes(settings, 0),
     );
     response.append_header(header::SET_COOKIE, cookie);
 }
@@ -294,11 +367,42 @@ mod tests {
         assert_eq!(
             cookie_str,
             format!(
-                "{}=abc123.XyZ789; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                "{}=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
                 COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
             ),
             "Set-Cookie header should match expected format"
         );
+    }
+
+    #[test]
+    fn test_create_synthetic_cookie_sanitizes_disallowed_chars_in_id() {
+        let settings = create_test_settings();
+        // Allowlist permits only ASCII alphanumeric, '.', '-', '_'.
+        // ';', '=', '\r', '\n', spaces, NUL bytes, and other control chars are all stripped.
+        let result = create_synthetic_cookie(&settings, "evil;injected\r\nfoo=bar\0baz");
+        // Extract the value portion anchored to the cookie name constant to
+        // avoid false positives from disallowed chars in cookie attributes.
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(
+            value, "evilinjectedfoobarbaz",
+            "should strip disallowed characters and preserve safe chars"
+        );
+    }
+
+    #[test]
+    fn test_create_synthetic_cookie_preserves_well_formed_id() {
+        let settings = create_test_settings();
+        // A well-formed ID should pass through the allowlist unmodified.
+        let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
+        let result = create_synthetic_cookie(&settings, id);
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(value, id, "should not modify a well-formed synthetic ID");
     }
 
     #[test]
@@ -376,6 +480,30 @@ mod tests {
         assert!(
             !is_safe_cookie_value("val\x7fue"),
             "should reject DEL character"
+        );
+    }
+
+    #[test]
+    fn test_expire_synthetic_cookie_matches_security_attributes() {
+        let settings = create_test_settings();
+        let mut response = fastly::Response::new();
+
+        expire_synthetic_cookie(&settings, &mut response);
+
+        let cookie_header = response
+            .get_header(header::SET_COOKIE)
+            .expect("Set-Cookie header should be present");
+        let cookie_str = cookie_header
+            .to_str()
+            .expect("header should be valid UTF-8");
+
+        assert_eq!(
+            cookie_str,
+            format!(
+                "{}=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+                COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain,
+            ),
+            "expiry cookie should retain the same security attributes as the live cookie"
         );
     }
 
