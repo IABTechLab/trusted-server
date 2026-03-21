@@ -3,6 +3,8 @@
 //! This module provides functionality for parsing and creating cookies
 //! used in the trusted server system.
 
+use std::borrow::Cow;
+
 use cookie::{Cookie, CookieJar};
 use error_stack::{Report, ResultExt};
 use fastly::http::header;
@@ -27,6 +29,42 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
 ];
 
 const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
+
+fn is_allowed_synthetic_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+#[must_use]
+pub(crate) fn synthetic_id_has_only_allowed_chars(synthetic_id: &str) -> bool {
+    synthetic_id.chars().all(is_allowed_synthetic_id_char)
+}
+
+fn sanitize_synthetic_id_for_cookie(synthetic_id: &str) -> Cow<'_, str> {
+    if synthetic_id_has_only_allowed_chars(synthetic_id) {
+        return Cow::Borrowed(synthetic_id);
+    }
+
+    let safe_id = synthetic_id
+        .chars()
+        .filter(|c| is_allowed_synthetic_id_char(*c))
+        .collect::<String>();
+
+    log::warn!(
+        "Stripped disallowed characters from synthetic_id before setting cookie (len {} -> {}); \
+         callers should reject invalid request IDs before cookie creation",
+        synthetic_id.len(),
+        safe_id.len(),
+    );
+
+    Cow::Owned(safe_id)
+}
+
+fn synthetic_cookie_attributes(settings: &Settings, max_age: i32) -> String {
+    format!(
+        "Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}",
+        settings.publisher.cookie_domain,
+    )
+}
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
@@ -126,27 +164,94 @@ pub fn forward_cookie_header(from: &Request, to: &mut Request, strip_consent: bo
     }
 }
 
-/// Creates a synthetic ID cookie string.
+/// Returns `true` if every byte in `value` is a valid RFC 6265 `cookie-octet`.
+/// An empty string is always rejected.
 ///
-/// Generates a properly formatted cookie with security attributes
-/// for storing the synthetic ID.
+/// RFC 6265 restricts cookie values to printable US-ASCII excluding whitespace,
+/// double-quote, comma, semicolon, and backslash. Rejecting these characters
+/// prevents header-injection attacks where a crafted value could append
+/// spurious cookie attributes (e.g. `evil; Domain=.attacker.com`).
+///
+/// Non-ASCII characters (multi-byte UTF-8) are always rejected because their
+/// byte values exceed `0x7E`.
+#[must_use]
+fn is_safe_cookie_value(value: &str) -> bool {
+    // RFC 6265 §4.1.1 cookie-octet:
+    //   0x21        — '!'
+    //   0x23–0x2B  — '#' through '+'   (excludes 0x22 DQUOTE)
+    //   0x2D–0x3A  — '-' through ':'   (excludes 0x2C comma)
+    //   0x3C–0x5B  — '<' through '['   (excludes 0x3B semicolon)
+    //   0x5D–0x7E  — ']' through '~'   (excludes 0x5C backslash, 0x7F DEL)
+    // All control characters (0x00–0x20) and non-ASCII (0x80+) are also excluded.
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+}
+
+/// Generates a `Set-Cookie` header value with the following security attributes:
+/// - `Secure`: transmitted over HTTPS only.
+/// - `HttpOnly`: inaccessible to JavaScript (`document.cookie`), blocking XSS exfiltration.
+///   Safe to set because integrations receive the synthetic ID via the `x-synthetic-id`
+///   response header instead of reading it from the cookie directly.
+/// - `SameSite=Lax`: sent on same-site requests and top-level cross-site navigations.
+///   `Strict` is intentionally avoided — it would suppress the cookie on the first
+///   request when a user arrives from an external page, breaking first-visit attribution.
+/// - `Max-Age`: 1 year retention.
+///
+/// The `synthetic_id` is sanitized via an allowlist before embedding in the cookie value.
+/// Only ASCII alphanumeric characters and `.`, `-`, `_` are permitted — matching the
+/// known synthetic ID format (`{64-char-hex}.{6-char-alphanumeric}`). Request-sourced IDs
+/// with disallowed characters are rejected earlier in [`crate::synthetic::get_synthetic_id`];
+/// this sanitization remains as a defense-in-depth backstop for unexpected callers.
+///
+/// The `cookie_domain` is validated at config load time via [`validator::Validate`] on
+/// [`crate::settings::Publisher`]; bad config fails at startup, not per-request.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use trusted_server_core::cookies::create_synthetic_cookie;
+/// # use trusted_server_core::settings::Settings;
+/// // `settings` is loaded at startup via `Settings::from_toml_and_env`.
+/// # fn example(settings: &Settings) {
+/// let cookie = create_synthetic_cookie(settings, "abc123.xk92ab");
+/// assert!(cookie.contains("HttpOnly"));
+/// assert!(cookie.contains("Secure"));
+/// # }
+/// ```
 #[must_use]
 pub fn create_synthetic_cookie(settings: &Settings, synthetic_id: &str) -> String {
+    let safe_id = sanitize_synthetic_id_for_cookie(synthetic_id);
+
     format!(
-        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-        COOKIE_SYNTHETIC_ID, synthetic_id, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
+        "{}={}; {}",
+        COOKIE_SYNTHETIC_ID,
+        safe_id,
+        synthetic_cookie_attributes(settings, COOKIE_MAX_AGE),
     )
 }
 
 /// Sets the synthetic ID cookie on the given response.
 ///
-/// This helper abstracts the logic of creating the cookie string and appending
-/// the Set-Cookie header to the response.
+/// Validates `synthetic_id` against RFC 6265 `cookie-octet` rules before
+/// interpolation. If the value contains unsafe characters (e.g. semicolons),
+/// the cookie is not set and a warning is logged. This prevents an attacker
+/// from injecting spurious cookie attributes via a controlled ID value.
+///
+/// `cookie_domain` comes from operator configuration and is considered trusted.
 pub fn set_synthetic_cookie(
     settings: &Settings,
     response: &mut fastly::Response,
     synthetic_id: &str,
 ) {
+    if !is_safe_cookie_value(synthetic_id) {
+        log::warn!(
+            "Rejecting synthetic_id for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
+            synthetic_id.len()
+        );
+        return;
+    }
     response.append_header(
         header::SET_COOKIE,
         create_synthetic_cookie(settings, synthetic_id),
@@ -159,8 +264,9 @@ pub fn set_synthetic_cookie(
 /// on receipt of this header.
 pub fn expire_synthetic_cookie(settings: &Settings, response: &mut fastly::Response) {
     let cookie = format!(
-        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
-        COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain,
+        "{}=; {}",
+        COOKIE_SYNTHETIC_ID,
+        synthetic_cookie_attributes(settings, 0),
     );
     response.append_header(header::SET_COOKIE, cookie);
 }
@@ -191,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cookies_to_jar_emtpy() {
+    fn test_parse_cookies_to_jar_empty() {
         let cookie_str = "";
         let jar = parse_cookies_to_jar(cookie_str);
 
@@ -247,23 +353,142 @@ mod tests {
     }
 
     #[test]
-    fn test_create_synthetic_cookie() {
+    fn test_set_synthetic_cookie() {
         let settings = create_test_settings();
-        let result = create_synthetic_cookie(&settings, "12345");
+        let mut response = fastly::Response::new();
+        set_synthetic_cookie(&settings, &mut response, "abc123.XyZ789");
+
+        let cookie_str = response
+            .get_header(header::SET_COOKIE)
+            .expect("Set-Cookie header should be present")
+            .to_str()
+            .expect("header should be valid UTF-8");
+
         assert_eq!(
-            result,
+            cookie_str,
             format!(
-                "{}=12345; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                "{}=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
                 COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain, COOKIE_MAX_AGE,
-            )
+            ),
+            "Set-Cookie header should match expected format"
         );
     }
 
     #[test]
-    fn test_set_synthetic_cookie() {
+    fn test_create_synthetic_cookie_sanitizes_disallowed_chars_in_id() {
+        let settings = create_test_settings();
+        // Allowlist permits only ASCII alphanumeric, '.', '-', '_'.
+        // ';', '=', '\r', '\n', spaces, NUL bytes, and other control chars are all stripped.
+        let result = create_synthetic_cookie(&settings, "evil;injected\r\nfoo=bar\0baz");
+        // Extract the value portion anchored to the cookie name constant to
+        // avoid false positives from disallowed chars in cookie attributes.
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(
+            value, "evilinjectedfoobarbaz",
+            "should strip disallowed characters and preserve safe chars"
+        );
+    }
+
+    #[test]
+    fn test_create_synthetic_cookie_preserves_well_formed_id() {
+        let settings = create_test_settings();
+        // A well-formed ID should pass through the allowlist unmodified.
+        let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
+        let result = create_synthetic_cookie(&settings, id);
+        let value = result
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(v, _)| v))
+            .expect("should have cookie value portion");
+        assert_eq!(value, id, "should not modify a well-formed synthetic ID");
+    }
+
+    #[test]
+    fn test_set_synthetic_cookie_rejects_semicolon() {
         let settings = create_test_settings();
         let mut response = fastly::Response::new();
-        set_synthetic_cookie(&settings, &mut response, "test-id-123");
+        set_synthetic_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
+
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "Set-Cookie should not be set when value contains a semicolon"
+        );
+    }
+
+    #[test]
+    fn test_set_synthetic_cookie_rejects_crlf() {
+        let settings = create_test_settings();
+        let mut response = fastly::Response::new();
+        set_synthetic_cookie(&settings, &mut response, "evil\r\nX-Injected: header");
+
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "Set-Cookie should not be set when value contains CRLF"
+        );
+    }
+
+    #[test]
+    fn test_set_synthetic_cookie_rejects_space() {
+        let settings = create_test_settings();
+        let mut response = fastly::Response::new();
+        set_synthetic_cookie(&settings, &mut response, "bad value");
+
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "Set-Cookie should not be set when value contains whitespace"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_cookie_value_rejects_empty_string() {
+        assert!(!is_safe_cookie_value(""), "should reject empty string");
+    }
+
+    #[test]
+    fn test_is_safe_cookie_value_accepts_valid_synthetic_id_characters() {
+        // Hex digits, dot separator, alphanumeric suffix — the full synthetic ID character set
+        assert!(
+            is_safe_cookie_value("abcdef0123456789.ABCDEFabcdef"),
+            "should accept hex digits, dots, and alphanumeric characters"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_cookie_value_rejects_non_ascii() {
+        assert!(
+            !is_safe_cookie_value("valüe"),
+            "should reject non-ASCII UTF-8 characters"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_cookie_value_rejects_illegal_characters() {
+        assert!(!is_safe_cookie_value("val;ue"), "should reject semicolon");
+        assert!(!is_safe_cookie_value("val,ue"), "should reject comma");
+        assert!(
+            !is_safe_cookie_value("val\"ue"),
+            "should reject double-quote"
+        );
+        assert!(!is_safe_cookie_value("val\\ue"), "should reject backslash");
+        assert!(!is_safe_cookie_value("val ue"), "should reject space");
+        assert!(
+            !is_safe_cookie_value("val\x00ue"),
+            "should reject null byte"
+        );
+        assert!(
+            !is_safe_cookie_value("val\x7fue"),
+            "should reject DEL character"
+        );
+    }
+
+    #[test]
+    fn test_expire_synthetic_cookie_matches_security_attributes() {
+        let settings = create_test_settings();
+        let mut response = fastly::Response::new();
+
+        expire_synthetic_cookie(&settings, &mut response);
 
         let cookie_header = response
             .get_header(header::SET_COOKIE)
@@ -272,10 +497,13 @@ mod tests {
             .to_str()
             .expect("header should be valid UTF-8");
 
-        let expected = create_synthetic_cookie(&settings, "test-id-123");
         assert_eq!(
-            cookie_str, expected,
-            "Set-Cookie header should match create_synthetic_cookie output"
+            cookie_str,
+            format!(
+                "{}=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+                COOKIE_SYNTHETIC_ID, settings.publisher.cookie_domain,
+            ),
+            "expiry cookie should retain the same security attributes as the live cookie"
         );
     }
 
