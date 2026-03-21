@@ -2092,5 +2092,4 @@ mod tests {
             "should be AllowlistViolation error"
         );
     }
-
 }
