@@ -1,8 +1,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
-use subtle::ConstantTimeEq as _;
 
+use crate::http_util::ct_str_eq;
 use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
@@ -36,13 +36,9 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
 
     // Use bitwise & (not &&) so both sides always evaluate — eliminates the
     // username-existence oracle that short-circuit evaluation would create.
-    let username_ok = username
-        .as_bytes()
-        .ct_eq(handler.username.expose().as_bytes());
-    let password_ok = password
-        .as_bytes()
-        .ct_eq(handler.password.expose().as_bytes());
-    if (username_ok & password_ok).into() {
+    let username_ok = ct_str_eq(&username, handler.username.expose());
+    let password_ok = ct_str_eq(&password, handler.password.expose());
+    if username_ok & password_ok {
         None
     } else {
         log::warn!("Basic auth failed for path: {}", req.get_path());

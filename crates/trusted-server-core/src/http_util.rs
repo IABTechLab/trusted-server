@@ -319,6 +319,26 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Constant-time string comparison.
+///
+/// The explicit length check documents the invariant that both values have known,
+/// non-secret lengths. Both checks always run — the short-circuit `&&` is safe
+/// here because token lengths are public information, not secrets.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::http_util::ct_str_eq;
+///
+/// assert!(ct_str_eq("hello", "hello"));
+/// assert!(!ct_str_eq("hello", "world"));
+/// assert!(!ct_str_eq("hello", "hell"));
+/// ```
+#[must_use]
+pub fn ct_str_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 /// Verify a `tstoken` for the given clear-text URL.
 ///
 /// Uses constant-time comparison to prevent timing side-channel attacks.
@@ -327,7 +347,7 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 #[must_use]
 pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
     let expected = sign_clear_url(settings, clear_url);
-    expected.len() == token.len() && bool::from(expected.as_bytes().ct_eq(token.as_bytes()))
+    ct_str_eq(&expected, token)
 }
 
 /// Compute tstoken for the new proxy scheme: SHA-256 of the encrypted full URL (including query).

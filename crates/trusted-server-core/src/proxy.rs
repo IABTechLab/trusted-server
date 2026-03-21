@@ -1,10 +1,9 @@
-use crate::http_util::compute_encrypted_sha256_token;
+use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq as _;
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -1078,10 +1077,8 @@ fn reconstruct_and_validate_signed_target(
     // Constant-time comparison to prevent timing side-channel attacks on the token.
     // Length is not secret (always 43 bytes for base64url-encoded SHA-256),
     // but we check explicitly to document the invariant.
-    let valid =
-        expected.len() == sig.len() && bool::from(expected.as_bytes().ct_eq(sig.as_bytes()));
-    if !valid {
-        return Err(Report::new(TrustedServerError::Proxy {
+    if !ct_str_eq(&expected, &sig) {
+        return Err(Report::new(TrustedServerError::Unauthorized {
             message: "invalid tstoken".to_string(),
         }));
     }
@@ -1299,8 +1296,8 @@ mod tests {
                 .expect_err("should reject tampered token");
         assert_eq!(
             err.current_context().status_code(),
-            StatusCode::BAD_GATEWAY,
-            "should return 502 for invalid tstoken"
+            StatusCode::FORBIDDEN,
+            "should return 403 for invalid tstoken"
         );
     }
 
