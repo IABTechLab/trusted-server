@@ -6,6 +6,7 @@
 
 mod error;
 mod http;
+mod kv;
 mod traits;
 mod types;
 
@@ -15,8 +16,12 @@ pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult,
 };
+pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
-pub use types::{ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices};
+pub use types::{
+    ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
+    StoreName,
+};
 
 #[cfg(test)]
 mod tests {
@@ -44,20 +49,24 @@ mod tests {
 
     struct NoopConfigStore;
     impl PlatformConfigStore for NoopConfigStore {
-        fn get(&self, _store_name: &str, _key: &str) -> Result<String, Report<PlatformError>> {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
 
         fn put(
             &self,
-            _store_id: &str,
+            _store_id: &StoreId,
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &str, _key: &str) -> Result<(), Report<PlatformError>> {
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
@@ -66,7 +75,7 @@ mod tests {
     impl PlatformSecretStore for NoopSecretStore {
         fn get_bytes(
             &self,
-            _store_name: &str,
+            _store_name: &StoreName,
             _key: &str,
         ) -> Result<Vec<u8>, Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
@@ -74,14 +83,14 @@ mod tests {
 
         fn create(
             &self,
-            _store_id: &str,
+            _store_id: &StoreId,
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
 
-        fn delete(&self, _store_id: &str, _name: &str) -> Result<(), Report<PlatformError>> {
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
@@ -138,21 +147,21 @@ mod tests {
     }
 
     fn noop_services() -> RuntimeServices {
-        RuntimeServices {
-            config_store: Arc::new(NoopConfigStore),
-            secret_store: Arc::new(NoopSecretStore),
-            // edgezero_core::key_value_store::NoopKvStore is available via the
-            // test-utils feature enabled in dev-dependencies.
-            kv_store: Arc::new(edgezero_core::key_value_store::NoopKvStore),
-            backend: Arc::new(NoopBackend),
-            http_client: Arc::new(NoopHttpClient),
-            geo: Arc::new(NoopGeo),
-            client_info: ClientInfo {
+        // edgezero_core::key_value_store::NoopKvStore is available via the
+        // test-utils feature enabled in dev-dependencies.
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo {
                 client_ip: None,
                 tls_protocol: None,
                 tls_cipher: None,
-            },
-        }
+            })
+            .build()
     }
 
     #[test]

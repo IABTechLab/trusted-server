@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,60 @@ pub struct ClientInfo {
     pub tls_cipher: Option<String>,
 }
 
+/// Edge-visible name used to open a config or secret store at runtime.
+///
+/// Passed to read methods on [`super::PlatformConfigStore`] and
+/// [`super::PlatformSecretStore`]. Distinct from [`StoreId`] to prevent
+/// accidentally passing a management API identifier where a runtime name is
+/// expected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
+pub struct StoreName(pub String);
+
+impl From<String> for StoreName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for StoreName {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl AsRef<str> for StoreName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Management API identifier used to write to a config or secret store.
+///
+/// Passed to write methods on [`super::PlatformConfigStore`] and
+/// [`super::PlatformSecretStore`]. Distinct from [`StoreName`] to prevent
+/// accidentally passing a runtime store name where a management API
+/// identifier is expected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
+pub struct StoreId(pub String);
+
+impl From<String> for StoreId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for StoreId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl AsRef<str> for StoreId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Input specification for a dynamic backend.
 ///
 /// Passed to [`PlatformBackend::predict_name`] and [`PlatformBackend::ensure`]
@@ -95,30 +150,28 @@ pub struct RuntimeServices {
 }
 
 impl RuntimeServices {
-    /// Construct a [`RuntimeServices`] with the given platform service implementations.
+    /// Create a builder for [`RuntimeServices`].
     ///
-    /// Adapter crates should call this constructor rather than using struct
-    /// literal syntax so that any future invariants on the struct are enforced
-    /// in one place.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        config_store: Arc<dyn PlatformConfigStore>,
-        secret_store: Arc<dyn PlatformSecretStore>,
-        kv_store: Arc<dyn PlatformKvStore>,
-        backend: Arc<dyn PlatformBackend>,
-        http_client: Arc<dyn PlatformHttpClient>,
-        geo: Arc<dyn PlatformGeo>,
-        client_info: ClientInfo,
-    ) -> Self {
-        Self {
-            config_store,
-            secret_store,
-            kv_store,
-            backend,
-            http_client,
-            geo,
-            client_info,
-        }
+    /// Adapter crates should use this builder rather than constructing
+    /// [`RuntimeServices`] directly, so that any future invariants on the
+    /// struct are enforced in one place.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let services = RuntimeServices::builder()
+    ///     .config_store(Arc::new(MyConfigStore))
+    ///     .secret_store(Arc::new(MySecretStore))
+    ///     .kv_store(kv_store)
+    ///     .backend(Arc::new(MyBackend))
+    ///     .http_client(Arc::new(MyHttpClient))
+    ///     .geo(Arc::new(MyGeo))
+    ///     .client_info(client_info)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn builder() -> RuntimeServicesBuilder {
+        RuntimeServicesBuilder::new()
     }
 
     /// Returns the config store service.
@@ -156,5 +209,122 @@ impl RuntimeServices {
     #[must_use]
     pub fn kv_handle(&self) -> super::KvHandle {
         super::KvHandle::new(self.kv_store.clone())
+    }
+}
+
+impl fmt::Debug for RuntimeServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeServices")
+            .field("client_info", &self.client_info)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builder for [`RuntimeServices`].
+///
+/// Obtain a builder via [`RuntimeServices::builder`] and set each service
+/// before calling [`RuntimeServicesBuilder::build`].
+pub struct RuntimeServicesBuilder {
+    config_store: Option<Arc<dyn PlatformConfigStore>>,
+    secret_store: Option<Arc<dyn PlatformSecretStore>>,
+    kv_store: Option<Arc<dyn PlatformKvStore>>,
+    backend: Option<Arc<dyn PlatformBackend>>,
+    http_client: Option<Arc<dyn PlatformHttpClient>>,
+    geo: Option<Arc<dyn PlatformGeo>>,
+    client_info: Option<ClientInfo>,
+}
+
+impl RuntimeServicesBuilder {
+    fn new() -> Self {
+        Self {
+            config_store: None,
+            secret_store: None,
+            kv_store: None,
+            backend: None,
+            http_client: None,
+            geo: None,
+            client_info: None,
+        }
+    }
+
+    /// Set the config store implementation.
+    #[must_use]
+    pub fn config_store(mut self, config_store: Arc<dyn PlatformConfigStore>) -> Self {
+        self.config_store = Some(config_store);
+        self
+    }
+
+    /// Set the secret store implementation.
+    #[must_use]
+    pub fn secret_store(mut self, secret_store: Arc<dyn PlatformSecretStore>) -> Self {
+        self.secret_store = Some(secret_store);
+        self
+    }
+
+    /// Set the KV store implementation.
+    #[must_use]
+    pub fn kv_store(mut self, kv_store: Arc<dyn PlatformKvStore>) -> Self {
+        self.kv_store = Some(kv_store);
+        self
+    }
+
+    /// Set the backend implementation.
+    #[must_use]
+    pub fn backend(mut self, backend: Arc<dyn PlatformBackend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Set the HTTP client implementation.
+    #[must_use]
+    pub fn http_client(mut self, http_client: Arc<dyn PlatformHttpClient>) -> Self {
+        self.http_client = Some(http_client);
+        self
+    }
+
+    /// Set the geo lookup implementation.
+    #[must_use]
+    pub fn geo(mut self, geo: Arc<dyn PlatformGeo>) -> Self {
+        self.geo = Some(geo);
+        self
+    }
+
+    /// Set the per-request client metadata.
+    #[must_use]
+    pub fn client_info(mut self, client_info: ClientInfo) -> Self {
+        self.client_info = Some(client_info);
+        self
+    }
+
+    /// Construct [`RuntimeServices`] from the accumulated configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any required service has not been set via the builder methods.
+    #[must_use]
+    pub fn build(self) -> RuntimeServices {
+        RuntimeServices {
+            config_store: self
+                .config_store
+                .expect("should set config_store before building RuntimeServices"),
+            secret_store: self
+                .secret_store
+                .expect("should set secret_store before building RuntimeServices"),
+            kv_store: self
+                .kv_store
+                .expect("should set kv_store before building RuntimeServices"),
+            backend: self
+                .backend
+                .expect("should set backend before building RuntimeServices"),
+            http_client: self
+                .http_client
+                .expect("should set http_client before building RuntimeServices"),
+            geo: self
+                .geo
+                .expect("should set geo before building RuntimeServices"),
+            client_info: self
+                .client_info
+                .expect("should set client_info before building RuntimeServices"),
+        }
     }
 }

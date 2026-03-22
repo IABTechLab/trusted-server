@@ -8,9 +8,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::{KvError, KvPage};
+use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
@@ -21,8 +20,11 @@ use trusted_server_core::geo::geo_from_fastly;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName,
 };
+
+pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -45,38 +47,38 @@ use trusted_server_core::platform::{
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
-    fn get(&self, store_name: &str, key: &str) -> Result<String, Report<PlatformError>> {
-        let store = ConfigStore::try_open(store_name).map_err(|e| {
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        let name = store_name.as_ref();
+        let store = ConfigStore::try_open(name).map_err(|e| {
             Report::new(PlatformError::ConfigStore)
-                .attach(format!("failed to open config store '{store_name}': {e}"))
+                .attach(format!("failed to open config store '{name}': {e}"))
         })?;
         store
             .try_get(key)
             .map_err(|e| {
                 Report::new(PlatformError::ConfigStore).attach(format!(
-                    "lookup for key '{key}' in config store '{store_name}' failed: {e}"
+                    "lookup for key '{key}' in config store '{name}' failed: {e}"
                 ))
             })?
             .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "key '{key}' not found in config store '{store_name}'"
-                ))
+                Report::new(PlatformError::ConfigStore)
+                    .attach(format!("key '{key}' not found in config store '{name}'"))
             })
     }
 
-    fn put(&self, store_id: &str, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
         FastlyApiClient::new()
             .change_context(PlatformError::ConfigStore)
             .attach("failed to initialize Fastly API client for config store write")?
-            .update_config_item(store_id, key, value)
+            .update_config_item(store_id.as_ref(), key, value)
             .change_context(PlatformError::ConfigStore)
     }
 
-    fn delete(&self, store_id: &str, key: &str) -> Result<(), Report<PlatformError>> {
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
         FastlyApiClient::new()
             .change_context(PlatformError::ConfigStore)
             .attach("failed to initialize Fastly API client for config store delete")?
-            .delete_config_item(store_id, key)
+            .delete_config_item(store_id.as_ref(), key)
             .change_context(PlatformError::ConfigStore)
     }
 }
@@ -98,22 +100,26 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 pub struct FastlyPlatformSecretStore;
 
 impl PlatformSecretStore for FastlyPlatformSecretStore {
-    fn get_bytes(&self, store_name: &str, key: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-        let store = SecretStore::open(store_name).map_err(|e| {
+    fn get_bytes(
+        &self,
+        store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        let name = store_name.as_ref();
+        let store = SecretStore::open(name).map_err(|e| {
             Report::new(PlatformError::SecretStore)
-                .attach(format!("failed to open secret store '{store_name}': {e}"))
+                .attach(format!("failed to open secret store '{name}': {e}"))
         })?;
         let secret = store
             .try_get(key)
             .map_err(|e| {
                 Report::new(PlatformError::SecretStore).attach(format!(
-                    "lookup for key '{key}' in secret store '{store_name}' failed: {e}"
+                    "lookup for key '{key}' in secret store '{name}' failed: {e}"
                 ))
             })?
             .ok_or_else(|| {
-                Report::new(PlatformError::SecretStore).attach(format!(
-                    "key '{key}' not found in secret store '{store_name}'"
-                ))
+                Report::new(PlatformError::SecretStore)
+                    .attach(format!("key '{key}' not found in secret store '{name}'"))
             })?;
         secret
             .try_plaintext()
@@ -124,19 +130,24 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
             })
     }
 
-    fn create(&self, store_id: &str, name: &str, value: &str) -> Result<(), Report<PlatformError>> {
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>> {
         FastlyApiClient::new()
             .change_context(PlatformError::SecretStore)
             .attach("failed to initialize Fastly API client for secret store create")?
-            .create_secret(store_id, name, value)
+            .create_secret(store_id.as_ref(), name, value)
             .change_context(PlatformError::SecretStore)
     }
 
-    fn delete(&self, store_id: &str, name: &str) -> Result<(), Report<PlatformError>> {
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
         FastlyApiClient::new()
             .change_context(PlatformError::SecretStore)
             .attach("failed to initialize Fastly API client for secret store delete")?
-            .delete_secret(store_id, name)
+            .delete_secret(store_id.as_ref(), name)
             .change_context(PlatformError::SecretStore)
     }
 }
@@ -248,64 +259,19 @@ pub fn build_runtime_services(
     req: &Request,
     kv_store: Arc<dyn PlatformKvStore>,
 ) -> RuntimeServices {
-    RuntimeServices::new(
-        Arc::new(FastlyPlatformConfigStore),
-        Arc::new(FastlyPlatformSecretStore),
-        kv_store,
-        Arc::new(FastlyPlatformBackend),
-        Arc::new(FastlyPlatformHttpClient),
-        Arc::new(FastlyPlatformGeo),
-        ClientInfo {
+    RuntimeServices::builder()
+        .config_store(Arc::new(FastlyPlatformConfigStore))
+        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .kv_store(kv_store)
+        .backend(Arc::new(FastlyPlatformBackend))
+        .http_client(Arc::new(FastlyPlatformHttpClient))
+        .geo(Arc::new(FastlyPlatformGeo))
+        .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
             tls_protocol: req.get_tls_protocol().map(str::to_string),
             tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
-        },
-    )
-}
-
-// ---------------------------------------------------------------------------
-// UnavailableKvStore
-// ---------------------------------------------------------------------------
-
-/// A [`PlatformKvStore`] stand-in used when the primary KV store cannot be
-/// opened at startup.
-///
-/// Every method returns [`KvError::Unavailable`], ensuring that handlers
-/// which call [`RuntimeServices::kv_handle`] receive a typed error rather than
-/// a panic. Routes that do not touch the KV store are unaffected.
-pub(crate) struct UnavailableKvStore;
-
-#[async_trait::async_trait(?Send)]
-impl trusted_server_core::platform::PlatformKvStore for UnavailableKvStore {
-    async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
-        Err(KvError::Unavailable)
-    }
-
-    async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
-        Err(KvError::Unavailable)
-    }
-
-    async fn put_bytes_with_ttl(
-        &self,
-        _key: &str,
-        _value: Bytes,
-        _ttl: std::time::Duration,
-    ) -> Result<(), KvError> {
-        Err(KvError::Unavailable)
-    }
-
-    async fn delete(&self, _key: &str) -> Result<(), KvError> {
-        Err(KvError::Unavailable)
-    }
-
-    async fn list_keys_page(
-        &self,
-        _prefix: &str,
-        _cursor: Option<&str>,
-        _limit: usize,
-    ) -> Result<KvPage, KvError> {
-        Err(KvError::Unavailable)
-    }
+        })
+        .build()
 }
 
 /// Open a named KV store as a [`PlatformKvStore`] implementation.

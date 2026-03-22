@@ -157,7 +157,7 @@ pub struct UserId(Uuid);
 - Use concrete error types with `Report<E>`.
 - Use `ensure!()` / `bail!()` macros for early returns.
 - Import `Error` from `core::error::` instead of `std::error::`.
-- Use `change_context()` to map error types, `attach()` / `attach_with()` for debug info.
+- Use `change_context()` to map error types, `attach()` for debug info.
 - Define errors with `derive_more::Display` (not thiserror):
 
 ```rust

@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{GeoInfo, PlatformBackendSpec, PlatformError};
+use super::{GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
 
 /// Synchronous, object-safe access to a key-value config store.
 ///
@@ -16,7 +16,7 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the key does not exist or
     /// the store cannot be opened.
-    fn get(&self, store_name: &str, key: &str) -> Result<String, Report<PlatformError>>;
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>>;
 
     /// Store a string value in the management store identified by `store_id`.
     ///
@@ -24,7 +24,7 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the write fails or the
     /// platform management API is unreachable.
-    fn put(&self, store_id: &str, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
 
     /// Delete a key from the management store identified by `store_id`.
     ///
@@ -32,7 +32,7 @@ pub trait PlatformConfigStore: Send + Sync {
     ///
     /// Returns [`PlatformError::ConfigStore`] when the delete fails or the
     /// platform management API is unreachable.
-    fn delete(&self, store_id: &str, key: &str) -> Result<(), Report<PlatformError>>;
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
 }
 
 /// Synchronous, object-safe access to a secret store.
@@ -46,7 +46,11 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the store cannot be opened,
     /// the key does not exist, or decryption fails.
-    fn get_bytes(&self, store_name: &str, key: &str) -> Result<Vec<u8>, Report<PlatformError>>;
+    fn get_bytes(
+        &self,
+        store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>>;
 
     /// Retrieve a secret value as a UTF-8 string from `store_name` by `key`.
     ///
@@ -54,7 +58,11 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the secret cannot be
     /// retrieved or is not valid UTF-8.
-    fn get_string(&self, store_name: &str, key: &str) -> Result<String, Report<PlatformError>> {
+    fn get_string(
+        &self,
+        store_name: &StoreName,
+        key: &str,
+    ) -> Result<String, Report<PlatformError>> {
         let bytes = self.get_bytes(store_name, key)?;
         String::from_utf8(bytes).map_err(|error| {
             Report::new(PlatformError::SecretStore)
@@ -68,7 +76,12 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the create fails or the
     /// platform management API is unreachable.
-    fn create(&self, store_id: &str, name: &str, value: &str) -> Result<(), Report<PlatformError>>;
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>>;
 
     /// Delete a secret from the management store identified by `store_id`.
     ///
@@ -76,7 +89,7 @@ pub trait PlatformSecretStore: Send + Sync {
     ///
     /// Returns [`PlatformError::SecretStore`] when the delete fails or the
     /// platform management API is unreachable.
-    fn delete(&self, store_id: &str, name: &str) -> Result<(), Report<PlatformError>>;
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
 }
 
 /// Synchronous, object-safe dynamic backend management.

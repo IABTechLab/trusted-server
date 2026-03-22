@@ -61,6 +61,16 @@ impl PlatformResponse {
 ///
 /// The core stores this as an opaque support type. Adapter implementations can
 /// recover their concrete runtime handle through [`Self::downcast`].
+///
+/// # `!Send` design
+///
+/// `inner` is `Box<dyn Any>` (not `Box<dyn Any + Send>`) because all async
+/// operations in this platform layer use `#[async_trait(?Send)]`. The `?Send`
+/// bound exists because [`edgezero_core::body::Body`] wraps a
+/// `LocalBoxStream` that is intentionally `!Send` for wasm32 compatibility —
+/// wasm32 targets are single-threaded and cannot use `Send` futures.
+/// Adapter crates targeting a multi-threaded runtime (e.g. Axum with tokio)
+/// would need to wrap state in `Arc` rather than relying on `Send` here.
 pub struct PlatformPendingRequest {
     inner: Box<dyn Any>,
     backend_name: Option<String>,
