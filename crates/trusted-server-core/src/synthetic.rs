@@ -16,7 +16,7 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::handle_request_cookies;
+use crate::cookies::{handle_request_cookies, synthetic_id_has_only_allowed_chars};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -114,34 +114,50 @@ pub fn generate_synthetic_id(
     Ok(synthetic_id)
 }
 
-/// Gets or creates a synthetic ID from the request.
+fn validate_existing_synthetic_id(source: &str, synthetic_id: &str) -> Option<String> {
+    if synthetic_id_has_only_allowed_chars(synthetic_id) {
+        return Some(synthetic_id.to_string());
+    }
+
+    log::warn!(
+        "Rejected synthetic_id from {source} with disallowed characters; \
+         ignoring it and using another valid source or a fresh synthetic ID"
+    );
+    None
+}
+
+/// Gets an existing synthetic ID from the request.
 ///
 /// Attempts to retrieve an existing synthetic ID from:
 /// 1. The `x-synthetic-id` header
 /// 2. The `synthetic_id` cookie
 ///
-/// If neither exists, generates a new synthetic ID.
+/// Existing values that contain disallowed characters are rejected and ignored.
+/// If no valid existing value remains, returns [`None`].
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::Template`] if template rendering fails during generation
-/// - [`TrustedServerError::SyntheticId`] if ID generation fails
+/// - [`TrustedServerError::InvalidHeaderValue`] if the Cookie header contains invalid UTF-8
 pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(synthetic_id) = req
         .get_header(HEADER_X_SYNTHETIC_ID)
         .and_then(|h| h.to_str().ok())
     {
-        let id = synthetic_id.to_string();
-        log::trace!("Using existing Synthetic ID from header: {}", id);
-        return Ok(Some(id));
+        if let Some(id) = validate_existing_synthetic_id("x-synthetic-id header", synthetic_id) {
+            log::trace!("Using existing Synthetic ID from header: {}", id);
+            return Ok(Some(id));
+        }
     }
 
     match handle_request_cookies(req)? {
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
-                let id = cookie.value().to_string();
-                log::trace!("Using existing Trusted Server ID from cookie: {}", id);
-                return Ok(Some(id));
+                if let Some(id) =
+                    validate_existing_synthetic_id("synthetic_id cookie", cookie.value())
+                {
+                    log::trace!("Using existing Trusted Server ID from cookie: {}", id);
+                    return Ok(Some(id));
+                }
             }
         }
         None => {
@@ -158,7 +174,8 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 /// 1. The `x-synthetic-id` header
 /// 2. The `synthetic_id` cookie
 ///
-/// If neither exists, generates a new synthetic ID.
+/// Existing values that contain disallowed characters are rejected and ignored.
+/// If no valid existing value remains, generates a new synthetic ID.
 ///
 /// # Errors
 ///
@@ -336,6 +353,29 @@ mod tests {
     }
 
     #[test]
+    fn test_get_synthetic_id_rejects_invalid_header_and_falls_back_to_cookie() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, "evil;injected"),
+            (
+                header::COOKIE,
+                &format!("{}=existing_cookie_id", COOKIE_SYNTHETIC_ID),
+            ),
+        ]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should resolve synthetic ID");
+        assert_eq!(
+            synthetic_id,
+            Some("existing_cookie_id".to_string()),
+            "should ignore invalid header and reuse valid cookie"
+        );
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should reuse valid cookie synthetic ID");
+        assert_eq!(synthetic_id, "existing_cookie_id");
+    }
+
+    #[test]
     fn test_get_synthetic_id_none() {
         let req = create_test_request(vec![]);
         let synthetic_id = get_synthetic_id(&req).expect("should handle missing ID");
@@ -350,5 +390,23 @@ mod tests {
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
             .expect("should get or generate synthetic ID");
         assert!(!synthetic_id.is_empty());
+    }
+
+    #[test]
+    fn test_get_or_generate_synthetic_id_replaces_invalid_header() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "evil;injected")]);
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should replace invalid header synthetic ID");
+
+        assert!(
+            is_synthetic_id_format(&synthetic_id),
+            "should generate a fresh synthetic ID when the header is invalid"
+        );
+        assert_ne!(
+            synthetic_id, "evil;injected",
+            "should not reuse a tampered synthetic ID value"
+        );
     }
 }

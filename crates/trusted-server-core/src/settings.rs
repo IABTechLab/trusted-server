@@ -20,6 +20,7 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
+    #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
@@ -510,6 +511,18 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_cookie_domain(value: &str) -> Result<(), ValidationError> {
+    // `=` is excluded: it only has special meaning in the name=value pair,
+    // not within the Domain attribute value.
+    if value.contains([';', '\n', '\r']) {
+        let mut err = ValidationError::new("cookie_metacharacters");
+        err.message =
+            Some("cookie_domain must not contain cookie metacharacters (;, \\n, \\r)".into());
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
@@ -1368,6 +1381,32 @@ mod tests {
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
             "Empty allowed_context_keys should be respected (blocks all keys)"
+        );
+    }
+
+    #[test]
+    fn test_publisher_rejects_cookie_domain_with_metacharacters() {
+        for bad_domain in [
+            "evil.com;\nSet-Cookie: bad=1",
+            "evil.com\r\nX-Injected: yes",
+            "evil.com;path=/",
+        ] {
+            let mut settings = create_test_settings();
+            settings.publisher.cookie_domain = bad_domain.to_string();
+            assert!(
+                settings.validate().is_err(),
+                "should reject cookie_domain containing metacharacters: {bad_domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_publisher_accepts_valid_cookie_domain() {
+        let mut settings = create_test_settings();
+        settings.publisher.cookie_domain = ".example.com".to_string();
+        assert!(
+            settings.validate().is_ok(),
+            "should accept a valid cookie_domain"
         );
     }
 
