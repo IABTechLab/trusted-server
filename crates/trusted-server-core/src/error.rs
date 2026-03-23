@@ -17,8 +17,9 @@ use http::StatusCode;
 pub enum TrustedServerError {
     /// Client-side input/validation error resulting in a 400 Bad Request.
     ///
-    /// **Note:** `message` is returned to clients in the HTTP response body.
-    /// Keep it free of internal implementation details.
+    /// **Note:** The `message` field is included in client-facing HTTP responses
+    /// via [`IntoHttpResponse::user_message()`]. Keep it free of internal
+    /// implementation details.
     #[display("Bad request: {message}")]
     BadRequest { message: String },
     /// Configuration errors that prevent the server from starting.
@@ -33,6 +34,10 @@ pub enum TrustedServerError {
     #[display("GAM error: {message}")]
     Gam { message: String },
     /// GDPR consent handling error.
+    ///
+    /// **Note:** Unlike [`BadRequest`](Self::BadRequest), the detail `message`
+    /// is intentionally suppressed in client-facing responses because consent
+    /// strings may contain user data. Only the category name is returned.
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
@@ -107,7 +112,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
@@ -124,7 +129,6 @@ impl IntoHttpResponse for TrustedServerError {
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
-            Self::InvalidUtf8 { .. } => "Invalid request data".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
             _ => "An internal error occurred".to_string(),
@@ -174,6 +178,9 @@ mod tests {
             TrustedServerError::InsecureDefault {
                 field: "api_key".into(),
             },
+            TrustedServerError::InvalidUtf8 {
+                message: "byte 0xff".into(),
+            },
         ];
         for error in &cases {
             assert_eq!(
@@ -200,10 +207,5 @@ mod tests {
             message: "non-ascii".into(),
         };
         assert_eq!(error.user_message(), "Invalid header value");
-
-        let error = TrustedServerError::InvalidUtf8 {
-            message: "byte 0xff".into(),
-        };
-        assert_eq!(error.user_message(), "Invalid request data");
     }
 }
