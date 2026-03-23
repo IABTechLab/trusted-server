@@ -40,6 +40,22 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         );
     }
 
+    if settings.synthetic.secret_key.expose() == "trusted-server" {
+        log::warn!(
+            "INSECURE: synthetic.secret_key is set to the default placeholder — \
+             HMAC-SHA256 signatures can be forged. \
+             Override via TRUSTED_SERVER__SYNTHETIC__SECRET_KEY at build time"
+        );
+    }
+
+    if settings.publisher.proxy_secret.expose() == "change-me-proxy-secret" {
+        log::warn!(
+            "INSECURE: publisher.proxy_secret is set to the default placeholder — \
+             XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone. \
+             Override via TRUSTED_SERVER__PUBLISHER__PROXY_SECRET at build time"
+        );
+    }
+
     Ok(settings)
 }
 
@@ -48,12 +64,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_settings() {
-        // Test that Settings::new() loads successfully
-        let settings = get_settings();
-        assert!(settings.is_ok(), "Settings should load from embedded TOML");
-
-        let settings = settings.expect("should load settings from embedded TOML");
+    fn get_settings_loads_embedded_toml_successfully() {
+        // The embedded TOML contains placeholder secrets (e.g. "trusted-server",
+        // "change-me-proxy-secret"). This is expected — production builds override
+        // them via TRUSTED_SERVER__* env vars at build time.
+        let settings = get_settings().expect("should load settings from embedded TOML");
         // Verify basic structure is loaded
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
