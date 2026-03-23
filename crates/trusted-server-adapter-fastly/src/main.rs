@@ -129,7 +129,7 @@ async fn route_request(
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, req)
+            handle_trusted_server_discovery(settings, runtime_services, req)
         }
 
         // Signature verification endpoint

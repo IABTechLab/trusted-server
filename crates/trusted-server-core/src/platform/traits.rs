@@ -23,7 +23,9 @@ pub trait PlatformConfigStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::ConfigStore`] when the write fails or the
-    /// platform management API is unreachable.
+    /// platform management API is unreachable. Returns
+    /// [`PlatformError::NotImplemented`] when the adapter has not yet
+    /// implemented write support.
     fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
 
     /// Delete a key from the management store identified by `store_id`.
@@ -31,7 +33,9 @@ pub trait PlatformConfigStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::ConfigStore`] when the delete fails or the
-    /// platform management API is unreachable.
+    /// platform management API is unreachable. Returns
+    /// [`PlatformError::NotImplemented`] when the adapter has not yet
+    /// implemented write support.
     fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
 }
 
@@ -75,7 +79,9 @@ pub trait PlatformSecretStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::SecretStore`] when the create fails or the
-    /// platform management API is unreachable.
+    /// platform management API is unreachable. Returns
+    /// [`PlatformError::NotImplemented`] when the adapter has not yet
+    /// implemented write support.
     fn create(
         &self,
         store_id: &StoreId,
@@ -88,7 +94,9 @@ pub trait PlatformSecretStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::SecretStore`] when the delete fails or the
-    /// platform management API is unreachable.
+    /// platform management API is unreachable. Returns
+    /// [`PlatformError::NotImplemented`] when the adapter has not yet
+    /// implemented write support.
     fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
 }
 

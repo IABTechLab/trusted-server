@@ -8,6 +8,7 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
@@ -24,12 +25,12 @@ use crate::settings::Settings;
 /// Returns an error if JWKS cannot be retrieved, parsed, or serialized.
 pub fn handle_trusted_server_discovery(
     _settings: &Settings,
+    services: &RuntimeServices,
     _req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Get JWKS
-    let jwks_json = crate::request_signing::jwks::get_active_jwks().change_context(
+    let jwks_json = crate::request_signing::jwks::get_active_jwks(services).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to retrieve JWKS".into(),
+            message: "failed to retrieve JWKS".into(),
         },
     )?;
 
@@ -282,7 +283,10 @@ pub fn handle_deactivate_key(
 
     match result {
         Ok(()) => {
-            let remaining_keys = manager.list_active_keys().unwrap_or_else(|_| vec![]);
+            let remaining_keys = manager.list_active_keys().unwrap_or_else(|e| {
+                log::warn!("failed to list active keys after deactivation: {}", e);
+                vec![]
+            });
 
             let response = DeactivateKeyResponse {
                 success: true,
@@ -336,8 +340,132 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    use error_stack::Report;
+
+    use crate::platform::{
+        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+        RuntimeServices, StoreId, StoreName,
+    };
+
     use super::*;
     use fastly::http::{Method, StatusCode};
+
+    struct NoopConfigStore;
+    impl PlatformConfigStore for NoopConfigStore {
+        fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct NoopSecretStore;
+    impl PlatformSecretStore for NoopSecretStore {
+        fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct NoopBackend;
+    impl PlatformBackend for NoopBackend {
+        fn predict_name(&self, _: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        fn ensure(&self, _: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct NoopHttpClient;
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for NoopHttpClient {
+        async fn send(
+            &self,
+            _: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        async fn send_async(
+            &self,
+            _: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+        async fn select(
+            &self,
+            _: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct NoopGeo;
+    impl PlatformGeo for NoopGeo {
+        fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            Ok(None)
+        }
+    }
+
+    fn noop_services() -> RuntimeServices {
+        build_services_with_config(NoopConfigStore)
+    }
+
+    /// Config store stub that returns a minimal JWKS with one Ed25519 key.
+    struct StubJwksConfigStore;
+
+    impl PlatformConfigStore for StubJwksConfigStore {
+        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            match key {
+                "active-kids" => Ok("test-kid-1".to_string()),
+                "test-kid-1" => Ok(
+                    r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#
+                        .to_string(),
+                ),
+                _ => Err(Report::new(PlatformError::ConfigStore)),
+            }
+        }
+
+        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    fn build_services_with_config(
+        config_store: impl PlatformConfigStore + 'static,
+    ) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(config_store))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo {
+                client_ip: None,
+                tls_protocol: None,
+                tls_cipher: None,
+            })
+            .build()
+    }
 
     #[test]
     fn test_handle_verify_signature_valid() {
@@ -580,7 +708,8 @@ mod tests {
             "https://test.com/.well-known/trusted-server.json",
         );
 
-        let result = handle_trusted_server_discovery(&settings, req);
+        let services = noop_services();
+        let result = handle_trusted_server_discovery(&settings, &services, req);
         match result {
             Ok(mut resp) => {
                 assert_eq!(resp.get_status(), StatusCode::OK);
@@ -600,5 +729,36 @@ mod tests {
             }
             Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
+    }
+
+    #[test]
+    fn test_handle_trusted_server_discovery_returns_jwks_document() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = Request::new(
+            Method::GET,
+            "https://test.com/.well-known/trusted-server.json",
+        );
+
+        let services = build_services_with_config(StubJwksConfigStore);
+        let mut resp = handle_trusted_server_discovery(&settings, &services, req)
+            .expect("should return discovery document when config store is populated");
+
+        assert_eq!(resp.get_status(), StatusCode::OK, "should return 200 OK");
+
+        let body = resp.take_body_str();
+        let discovery: serde_json::Value =
+            serde_json::from_str(&body).expect("should parse discovery document as JSON");
+
+        assert_eq!(discovery["version"], "1.0", "should return version 1.0");
+
+        let keys = discovery["jwks"]["keys"]
+            .as_array()
+            .expect("should have jwks.keys array");
+        assert_eq!(keys.len(), 1, "should contain exactly one key");
+        assert_eq!(
+            keys[0]["kid"], "test-kid-1",
+            "should include the active key ID"
+        );
+        assert_eq!(keys[0]["crv"], "Ed25519", "should be an Ed25519 key");
     }
 }

@@ -15,7 +15,6 @@ use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
-use trusted_server_core::fastly_storage::FastlyApiClient;
 use trusted_server_core::geo::geo_from_fastly;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -34,16 +33,10 @@ pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 ///
 /// Stateless — the store name is supplied per call, matching the trait
 /// signature. This replaces the store-name-at-construction pattern of
-/// [`trusted_server_core::fastly_storage::FastlyConfigStore`].
+/// [`trusted_server_core::storage::FastlyConfigStore`].
 ///
-/// # Write cost
-///
-/// `put` and `delete` construct a [`FastlyApiClient`] on every call, which
-/// opens the `"api-keys"` secret store to read the management API key. On
-/// Fastly Compute, the SDK caches the open handle so repeated opens within a
-/// single request are cheap. Callers that issue many writes in one request
-/// should be aware that each call performs a synchronous outbound API
-/// request to the Fastly management API.
+/// Write methods (`put`, `delete`) are not yet implemented and return
+/// [`PlatformError::NotImplemented`]. Management writes land in a follow-up PR.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
@@ -66,20 +59,17 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
             })
     }
 
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::ConfigStore)
-            .attach("failed to initialize Fastly API client for config store write")?
-            .update_config_item(store_id.as_ref(), key, value)
-            .change_context(PlatformError::ConfigStore)
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::NotImplemented))
     }
 
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::ConfigStore)
-            .attach("failed to initialize Fastly API client for config store delete")?
-            .delete_config_item(store_id.as_ref(), key)
-            .change_context(PlatformError::ConfigStore)
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::NotImplemented))
     }
 }
 
@@ -91,12 +81,10 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 ///
 /// Stateless — the store name is supplied per call. This replaces the
 /// store-name-at-construction pattern of
-/// [`trusted_server_core::fastly_storage::FastlySecretStore`].
+/// [`trusted_server_core::storage::FastlySecretStore`].
 ///
-/// # Write cost
-///
-/// `create` and `delete` have the same per-call [`FastlyApiClient`] cost
-/// described on [`FastlyPlatformConfigStore`].
+/// Write methods (`create`, `delete`) are not yet implemented and return
+/// [`PlatformError::NotImplemented`]. Management writes land in a follow-up PR.
 pub struct FastlyPlatformSecretStore;
 
 impl PlatformSecretStore for FastlyPlatformSecretStore {
@@ -132,23 +120,15 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 
     fn create(
         &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
+        _store_id: &StoreId,
+        _name: &str,
+        _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::SecretStore)
-            .attach("failed to initialize Fastly API client for secret store create")?
-            .create_secret(store_id.as_ref(), name, value)
-            .change_context(PlatformError::SecretStore)
+        Err(Report::new(PlatformError::NotImplemented))
     }
 
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::SecretStore)
-            .attach("failed to initialize Fastly API client for secret store delete")?
-            .delete_secret(store_id.as_ref(), name)
-            .change_context(PlatformError::SecretStore)
+    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::NotImplemented))
     }
 }
 
