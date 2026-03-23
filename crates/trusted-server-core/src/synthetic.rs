@@ -457,6 +457,29 @@ mod tests {
     }
 
     #[test]
+    fn test_get_synthetic_id_rejects_invalid_header_and_falls_back_to_cookie() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, "evil;injected"),
+            (
+                header::COOKIE,
+                &format!("{}={}", COOKIE_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
+            ),
+        ]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should resolve synthetic ID");
+        assert_eq!(
+            synthetic_id,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should ignore invalid header and reuse valid cookie"
+        );
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should reuse valid cookie synthetic ID");
+        assert_eq!(synthetic_id, VALID_SYNTHETIC_ID);
+    }
+
+    #[test]
     fn test_get_synthetic_id_none() {
         let req = create_test_request(vec![]);
         let synthetic_id = get_synthetic_id(&req).expect("should handle missing ID");
@@ -490,6 +513,24 @@ mod tests {
         assert!(
             is_valid_synthetic_id(&synthetic_id),
             "should generate a valid synthetic ID"
+        );
+    }
+
+    #[test]
+    fn test_get_or_generate_synthetic_id_replaces_invalid_header() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "evil;injected")]);
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should replace invalid header synthetic ID");
+
+        assert!(
+            is_valid_synthetic_id(&synthetic_id),
+            "should generate a fresh synthetic ID when the header is invalid"
+        );
+        assert_ne!(
+            synthetic_id, "evil;injected",
+            "should not reuse a tampered synthetic ID value"
         );
     }
 }

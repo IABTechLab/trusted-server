@@ -370,7 +370,11 @@ pub fn handle_publisher_request(
     // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
     // - Consent absent + no cookie → do nothing.
     if ssc_allowed {
+        // Fastly's HeaderValue API rejects \r, \n, and \0, so the synthetic ID
+        // cannot inject additional response headers.
         response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+        // Cookie persistence is skipped if the synthetic ID contains RFC 6265-illegal
+        // characters. The header is still emitted when consent allows it.
         set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
     } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
         log::info!(
