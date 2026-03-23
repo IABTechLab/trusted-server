@@ -366,6 +366,11 @@ mod tests {
         let mut resp =
             handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_content_type(),
+            Some(fastly::mime::APPLICATION_JSON),
+            "should return application/json content type"
+        );
 
         // Parse response
         let resp_body = resp.take_body_str();
@@ -403,6 +408,11 @@ mod tests {
         let mut resp =
             handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_content_type(),
+            Some(fastly::mime::APPLICATION_JSON),
+            "should return application/json content type"
+        );
 
         // Parse response
         let resp_body = resp.take_body_str();
@@ -584,6 +594,11 @@ mod tests {
         match result {
             Ok(mut resp) => {
                 assert_eq!(resp.get_status(), StatusCode::OK);
+                assert_eq!(
+                    resp.get_content_type(),
+                    Some(fastly::mime::APPLICATION_JSON),
+                    "should return application/json content type"
+                );
                 let body = resp.take_body_str();
 
                 // Parse the discovery document
