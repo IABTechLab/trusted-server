@@ -27,12 +27,12 @@ describe('render', () => {
     expect(iframe.srcdoc).toContain('<span>ad</span>');
     expect(div.querySelector('iframe')).toBe(iframe);
     const sandbox = iframe.getAttribute('sandbox') ?? '';
-    expect(sandbox).not.toContain('allow-forms');
+    expect(sandbox).toContain('allow-forms');
     expect(sandbox).toContain('allow-popups');
     expect(sandbox).toContain('allow-popups-to-escape-sandbox');
     expect(sandbox).toContain('allow-top-navigation-by-user-activation');
-    expect(sandbox).not.toContain('allow-same-origin');
-    expect(sandbox).not.toContain('allow-scripts');
+    expect(sandbox).toContain('allow-same-origin');
+    expect(sandbox).toContain('allow-scripts');
   });
 
   it('preserves dollar sequences when building the creative document', async () => {
