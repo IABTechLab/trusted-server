@@ -3,6 +3,11 @@ path = "^/secure"
 username = "user"
 password = "pass"
 
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "changeme"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
@@ -40,11 +45,16 @@ secret_store_id = "<fastly-secret-store-id>"
 enabled = true
 server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
-bidders = ["kargo", "rubicon", "appnexus", "openx"]
+bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
 # debug_query_params = ""
 # script_patterns = ["/prebid.js"]
+
+# Bidders that run client-side via native Prebid.js adapters instead of
+# being routed through the server-side auction. Their adapter modules must
+# be statically imported in the JS bundle.
+client_side_bidders = ["rubicon"]
 
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
@@ -80,7 +90,7 @@ secure_signals_endpoint = "https://secure-signals.permutive.app"
 enabled = false
 app_id = ""
 api_endpoint = "https://identity.loc.kr"
-sdk_url = "https://aim.loc.kr/identity-lockr-v1.0.js"
+sdk_url = "https://aim.loc.kr/identity-lockr-trust-server.js"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 
@@ -101,6 +111,32 @@ enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
+
+# Consent forwarding configuration
+# Controls how Trusted Server interprets and forwards privacy consent signals.
+# All values shown below are the defaults — uncomment to override.
+# [consent]
+# mode = "interpreter"          # "interpreter" (decode + forward) or "proxy" (raw passthrough)
+# check_expiration = true       # Check TCF consent freshness
+# max_consent_age_days = 395    # Max age before consent is treated as expired (~13 months)
+
+# [consent.gdpr]
+# applies_in = ["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","LI","NO","GB"]
+
+# [consent.us_states]
+# privacy_states = ["CA","VA","CO","CT","UT","MT","OR","TX","FL","DE","IA","NE","NH","NJ","TN","MN","MD","IN","KY","RI"]
+
+# [consent.us_privacy_defaults]
+# notice_given = true           # Has publisher actually shown CCPA notice?
+# lspa_covered = false          # Is publisher subject to LSPA?
+# gpc_implies_optout = true     # Should Sec-GPC: 1 trigger opt-out?
+
+# [consent.conflict_resolution]
+# mode = "restrictive"          # "restrictive" | "newest" | "permissive"
+# freshness_threshold_days = 30
+
+# KV Store consent persistence (requires a KV store named "consent_store" in fastly.toml)
+# consent_store = "consent_store"
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]

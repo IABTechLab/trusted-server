@@ -59,7 +59,7 @@ Aggregate audience data across your property portfolio.
 
 ## Implementation
 
-See [crates/common/src/integrations/permutive.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/permutive.rs) for implementation details.
+See [crates/trusted-server-core/src/integrations/permutive.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/permutive.rs) for implementation details.
 
 ## Next Steps
 

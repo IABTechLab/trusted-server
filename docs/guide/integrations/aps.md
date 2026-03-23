@@ -242,7 +242,7 @@ The integration automatically transforms this to unified `Bid` format.
 ### Unit Tests
 
 ```bash
-cargo test -p trusted-server-common aps::tests
+cargo test -p trusted-server-core aps::tests
 ```
 
 ### Local Testing
@@ -270,7 +270,7 @@ timeout_ms = 800
 Run unit tests:
 
 ```bash
-cargo test -p trusted-server-common aps
+cargo test -p trusted-server-core aps
 ```
 
 ## Monitoring
@@ -392,8 +392,8 @@ Potential additions for complete APS TAM parity:
 ## Reference
 
 - **APS TAM Docs**: https://aps.amazon.com/aps/transparent-ad-marketplace-api/
-- **Integration Code**: `crates/common/src/integrations/aps.rs`
-- **Tests**: `crates/common/src/integrations/aps.rs#tests`
+- **Integration Code**: `crates/trusted-server-core/src/integrations/aps.rs`
+- **Tests**: `crates/trusted-server-core/src/integrations/aps.rs#tests`
 - **Example Config**: `trusted-server.toml`
 
 ## Support

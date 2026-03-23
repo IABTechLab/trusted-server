@@ -1,0 +1,9 @@
+[package]
+name = "openrtb-codegen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+prost-build = "0.13"

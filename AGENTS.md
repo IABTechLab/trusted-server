@@ -18,8 +18,8 @@ If you cannot read `CLAUDE.md`, follow these rules:
 1. Present a plan and get approval before coding.
 2. Keep changes minimal — do not refactor unrelated code.
 3. Run `cargo test --workspace` after every code change.
-4. Run `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+4. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 5. Run JS tests with `cd crates/js/lib && npx vitest run` when touching JS/TS code.
 6. Use `error-stack` (`Report<E>`) for error handling — not anyhow, eyre, or thiserror.
-7. Use `tracing` macros (not `println!`) and `expect("should ...")` (not `unwrap()`).
+7. Use `log` macros (not `println!`) and `expect("should ...")` (not `unwrap()`).
 8. Target is `wasm32-wasip1` — no Tokio or OS-specific dependencies in core crates.

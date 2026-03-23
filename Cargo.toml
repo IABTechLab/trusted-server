@@ -1,15 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/common",
-    "crates/fastly", 
+    "crates/trusted-server-core",
+    "crates/trusted-server-adapter-fastly",
     "crates/js",
+    "crates/openrtb",
+]
+# integration-tests is intentionally excluded from workspace members because it
+# requires a native target (testcontainers, reqwest) while the workspace default
+# is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
+exclude = [
+    "crates/integration-tests",
+    "crates/openrtb-codegen",
 ]
 
-# Build defaults exclude the web-only tsjs crate, which is compiled via wasm-pack.
 default-members = [
-    "crates/common",
-    "crates/fastly",
+    "crates/trusted-server-core",
+    "crates/trusted-server-adapter-fastly",
 ]
 
 [workspace.lints.clippy]
@@ -49,6 +56,10 @@ config = "0.15.19"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
 error-stack = "0.6"
 fastly = "0.11.12"
 fern = "0.7.1"
@@ -58,10 +69,11 @@ handlebars = "6.4.0"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.4.0"
+iab_gpp = "0.1"
 jose-jwk = "0.1.2"
 log = "0.4.29"
 log-fastly = "0.11.12"
-lol_html = "2.7.1"
+lol_html = "2.7.2"
 once_cell = "1.21"
 matchit = "0.9"
 pin-project-lite = "0.2"
@@ -70,12 +82,14 @@ regex = "1.12.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
+subtle = "2.6"
 temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-test = "0.4"
-toml = "0.9.8"
+toml = "1.0"
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
 which = "8"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

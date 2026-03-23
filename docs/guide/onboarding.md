@@ -35,14 +35,14 @@ Welcome to the Trusted Server project! This guide keeps internal onboarding note
 
 ## Codebase Pointers
 
-| File                                         | Purpose                          |
-| -------------------------------------------- | -------------------------------- |
-| `crates/fastly/src/main.rs`                  | Request routing entry point      |
-| `crates/common/src/publisher.rs`             | Publisher origin handling        |
-| `crates/common/src/proxy.rs`                 | First-party proxy implementation |
-| `crates/common/src/synthetic.rs`             | Synthetic ID generation          |
-| `crates/common/src/integrations/registry.rs` | Integration module pattern       |
-| `trusted-server.toml`                        | Application configuration        |
+| File                                                      | Purpose                          |
+| --------------------------------------------------------- | -------------------------------- |
+| `crates/trusted-server-adapter-fastly/src/main.rs`        | Request routing entry point      |
+| `crates/trusted-server-core/src/publisher.rs`             | Publisher origin handling        |
+| `crates/trusted-server-core/src/proxy.rs`                 | First-party proxy implementation |
+| `crates/trusted-server-core/src/synthetic.rs`             | Synthetic ID generation          |
+| `crates/trusted-server-core/src/integrations/registry.rs` | Integration module pattern       |
+| `trusted-server.toml`                                     | Application configuration        |
 
 ## Development Workflow
 

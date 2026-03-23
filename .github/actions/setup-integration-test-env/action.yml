@@ -1,0 +1,92 @@
+name: Setup integration test environment
+description: Prepare toolchains, Viceroy, and Docker images for integration test jobs.
+
+inputs:
+  origin-port:
+    description: Fixed origin port baked into the WASM binary for integration tests.
+    required: true
+  check-dependency-versions:
+    description: Run the integration dependency version consistency check.
+    required: false
+    default: "true"
+  install-viceroy:
+    description: Install the Viceroy binary used by integration tests.
+    required: false
+    default: "true"
+  build-wasm:
+    description: Build the trusted-server WASM binary for integration tests.
+    required: false
+    default: "true"
+  build-test-images:
+    description: Build the framework Docker images used by integration tests.
+    required: false
+    default: "true"
+
+outputs:
+  node-version:
+    description: Node.js version read from .tool-versions.
+    value: ${{ steps.node-version.outputs.node-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check shared dependency versions
+      if: ${{ inputs.check-dependency-versions == 'true' }}
+      shell: bash
+      run: ./scripts/check-integration-dependency-versions.sh
+
+    - name: Retrieve Rust version
+      id: rust-version
+      shell: bash
+      run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+    - name: Retrieve Node.js version
+      id: node-version
+      shell: bash
+      run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.rust-version.outputs.rust-version }}
+        target: wasm32-wasip1
+        cache-shared-key: cargo-${{ runner.os }}
+
+    - name: Cache Viceroy binary
+      if: ${{ inputs.install-viceroy == 'true' }}
+      id: cache-viceroy
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/viceroy
+        key: viceroy-${{ runner.os }}-v0.16.4
+
+    - name: Install Viceroy
+      if: ${{ inputs.install-viceroy == 'true' && steps.cache-viceroy.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: cargo install --git https://github.com/fastly/Viceroy --tag v0.16.4 viceroy
+
+    - name: Build WASM binary
+      if: ${{ inputs.build-wasm == 'true' }}
+      shell: bash
+      env:
+        TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:${{ inputs.origin-port }}
+        TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+        TRUSTED_SERVER__SYNTHETIC__SECRET_KEY: integration-test-secret-key
+        TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+      run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+
+    - name: Build WordPress test container
+      if: ${{ inputs.build-test-images == 'true' }}
+      shell: bash
+      run: |
+        docker build -t test-wordpress:latest \
+          crates/integration-tests/fixtures/frameworks/wordpress/
+
+    - name: Build Next.js test container
+      if: ${{ inputs.build-test-images == 'true' }}
+      shell: bash
+      run: |
+        docker build \
+          --build-arg NODE_VERSION=${{ steps.node-version.outputs.node-version }} \
+          -t test-nextjs:latest \
+          crates/integration-tests/fixtures/frameworks/nextjs/
