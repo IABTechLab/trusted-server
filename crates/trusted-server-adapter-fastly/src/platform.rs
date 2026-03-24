@@ -5,6 +5,7 @@
 //! constructs a [`RuntimeServices`] instance once at the entry point from the
 //! incoming Fastly request.
 
+use core::fmt::Display;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -25,6 +26,114 @@ use trusted_server_core::platform::{
 
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 
+trait ConfigStoreReader: Sized {
+    type LookupError: Display;
+
+    fn try_get(&self, key: &str) -> Result<Option<String>, Self::LookupError>;
+}
+
+impl ConfigStoreReader for ConfigStore {
+    type LookupError = fastly::config_store::LookupError;
+
+    fn try_get(&self, key: &str) -> Result<Option<String>, Self::LookupError> {
+        ConfigStore::try_get(self, key)
+    }
+}
+
+fn get_config_value<S, Open, OpenError>(
+    store_name: &str,
+    key: &str,
+    open_store: Open,
+) -> Result<String, Report<PlatformError>>
+where
+    S: ConfigStoreReader,
+    Open: FnOnce() -> Result<S, OpenError>,
+    OpenError: Display,
+{
+    let store = open_store().map_err(|error| {
+        Report::new(PlatformError::ConfigStore).attach(format!(
+            "failed to open config store '{store_name}': {error}"
+        ))
+    })?;
+
+    store
+        .try_get(key)
+        .map_err(|error| {
+            Report::new(PlatformError::ConfigStore).attach(format!(
+                "lookup for key '{key}' in config store '{store_name}' failed: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            Report::new(PlatformError::ConfigStore).attach(format!(
+                "key '{key}' not found in config store '{store_name}'"
+            ))
+        })
+}
+
+enum SecretReadError<LookupError, DecryptError> {
+    Lookup(LookupError),
+    Decrypt(DecryptError),
+}
+
+type SecretBytesResult<LookupError, DecryptError> =
+    Result<Option<Vec<u8>>, SecretReadError<LookupError, DecryptError>>;
+
+trait SecretStoreReader: Sized {
+    type LookupError: Display;
+    type DecryptError: Display;
+
+    fn try_get_bytes(&self, key: &str) -> SecretBytesResult<Self::LookupError, Self::DecryptError>;
+}
+
+impl SecretStoreReader for SecretStore {
+    type LookupError = fastly::secret_store::LookupError;
+    type DecryptError = fastly::secret_store::DecryptError;
+
+    fn try_get_bytes(&self, key: &str) -> SecretBytesResult<Self::LookupError, Self::DecryptError> {
+        let secret = self.try_get(key).map_err(SecretReadError::Lookup)?;
+        let Some(secret) = secret else {
+            return Ok(None);
+        };
+
+        secret
+            .try_plaintext()
+            .map(|bytes| Some(bytes.into_iter().collect()))
+            .map_err(SecretReadError::Decrypt)
+    }
+}
+
+fn get_secret_bytes<S, Open, OpenError>(
+    store_name: &str,
+    key: &str,
+    open_store: Open,
+) -> Result<Vec<u8>, Report<PlatformError>>
+where
+    S: SecretStoreReader,
+    Open: FnOnce() -> Result<S, OpenError>,
+    OpenError: Display,
+{
+    let store = open_store().map_err(|error| {
+        Report::new(PlatformError::SecretStore).attach(format!(
+            "failed to open secret store '{store_name}': {error}"
+        ))
+    })?;
+
+    store
+        .try_get_bytes(key)
+        .map_err(|error| match error {
+            SecretReadError::Lookup(error) => Report::new(PlatformError::SecretStore).attach(
+                format!("lookup for key '{key}' in secret store '{store_name}' failed: {error}"),
+            ),
+            SecretReadError::Decrypt(error) => Report::new(PlatformError::SecretStore)
+                .attach(format!("failed to decrypt secret '{key}': {error}")),
+        })?
+        .ok_or_else(|| {
+            Report::new(PlatformError::SecretStore).attach(format!(
+                "key '{key}' not found in secret store '{store_name}'"
+            ))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
 // ---------------------------------------------------------------------------
@@ -42,21 +151,7 @@ pub struct FastlyPlatformConfigStore;
 impl PlatformConfigStore for FastlyPlatformConfigStore {
     fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         let name = store_name.as_ref();
-        let store = ConfigStore::try_open(name).map_err(|e| {
-            Report::new(PlatformError::ConfigStore)
-                .attach(format!("failed to open config store '{name}': {e}"))
-        })?;
-        store
-            .try_get(key)
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "lookup for key '{key}' in config store '{name}' failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("key '{key}' not found in config store '{name}'"))
-            })
+        get_config_value::<ConfigStore, _, _>(name, key, || ConfigStore::try_open(name))
     }
 
     fn put(
@@ -94,28 +189,7 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         let name = store_name.as_ref();
-        let store = SecretStore::open(name).map_err(|e| {
-            Report::new(PlatformError::SecretStore)
-                .attach(format!("failed to open secret store '{name}': {e}"))
-        })?;
-        let secret = store
-            .try_get(key)
-            .map_err(|e| {
-                Report::new(PlatformError::SecretStore).attach(format!(
-                    "lookup for key '{key}' in secret store '{name}' failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::SecretStore)
-                    .attach(format!("key '{key}' not found in secret store '{name}'"))
-            })?;
-        secret
-            .try_plaintext()
-            .map(|bytes| bytes.into_iter().collect())
-            .map_err(|e| {
-                Report::new(PlatformError::SecretStore)
-                    .attach(format!("failed to decrypt secret '{key}': {e}"))
-            })
+        get_secret_bytes::<SecretStore, _, _>(name, key, || SecretStore::open(name))
     }
 
     fn create(
@@ -171,7 +245,7 @@ impl PlatformBackend for FastlyPlatformBackend {
 ///
 /// The Fastly-backed `send` / `send_async` / `select` behavior lands in a
 /// follow-up PR once the orchestrator migration is complete. Until then all
-/// methods return [`PlatformError::Unsupported`].
+/// methods return [`PlatformError::NotImplemented`].
 ///
 /// Implementation lands in #487 (PR 6: Backend + HTTP client traits).
 pub struct FastlyPlatformHttpClient;
@@ -182,7 +256,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported)
+        Err(Report::new(PlatformError::NotImplemented)
             .attach("FastlyPlatformHttpClient::send is not yet implemented"))
     }
 
@@ -190,7 +264,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported)
+        Err(Report::new(PlatformError::NotImplemented)
             .attach("FastlyPlatformHttpClient::send_async is not yet implemented"))
     }
 
@@ -198,7 +272,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported)
+        Err(Report::new(PlatformError::NotImplemented)
             .attach("FastlyPlatformHttpClient::select is not yet implemented"))
     }
 }
@@ -273,9 +347,47 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
     use edgezero_core::key_value_store::NoopKvStore;
 
     use super::*;
+
+    struct StubConfigStore {
+        value: Result<Option<String>, &'static str>,
+    }
+
+    impl ConfigStoreReader for StubConfigStore {
+        type LookupError = &'static str;
+
+        fn try_get(&self, _key: &str) -> Result<Option<String>, Self::LookupError> {
+            self.value.clone()
+        }
+    }
+
+    enum StubSecretReadError {
+        Decrypt(&'static str),
+    }
+
+    struct StubSecretStore {
+        value: Result<Option<Vec<u8>>, StubSecretReadError>,
+    }
+
+    impl SecretStoreReader for StubSecretStore {
+        type LookupError = &'static str;
+        type DecryptError = &'static str;
+
+        fn try_get_bytes(
+            &self,
+            _key: &str,
+        ) -> SecretBytesResult<Self::LookupError, Self::DecryptError> {
+            match &self.value {
+                Ok(Some(bytes)) => Ok(Some(bytes.clone())),
+                Ok(None) => Ok(None),
+                Err(StubSecretReadError::Decrypt(error)) => Err(SecretReadError::Decrypt(*error)),
+            }
+        }
+    }
 
     fn noop_kv_store() -> Arc<dyn PlatformKvStore> {
         Arc::new(NoopKvStore)
@@ -388,6 +500,53 @@ mod tests {
         assert_eq!(
             services.client_info.client_ip, cloned.client_info.client_ip,
             "should preserve client_ip through clone"
+        );
+    }
+
+    #[test]
+    fn get_config_value_returns_error_when_lookup_fails() {
+        let err = get_config_value::<StubConfigStore, _, _>("jwks_store", "active-kids", || {
+            Ok::<StubConfigStore, &'static str>(StubConfigStore {
+                value: Err("lookup failed"),
+            })
+        })
+        .expect_err("should return an error when config lookup fails");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::ConfigStore),
+            "should surface as PlatformError::ConfigStore"
+        );
+    }
+
+    #[test]
+    fn get_secret_bytes_returns_error_when_decrypt_fails() {
+        let err = get_secret_bytes::<StubSecretStore, _, _>("signing_keys", "kid", || {
+            Ok::<StubSecretStore, &'static str>(StubSecretStore {
+                value: Err(StubSecretReadError::Decrypt("decrypt failed")),
+            })
+        })
+        .expect_err("should return an error when secret decryption fails");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::SecretStore),
+            "should surface as PlatformError::SecretStore"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_reports_not_implemented() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .uri("https://example.com/")
+            .body(Body::empty())
+            .expect("should build test request");
+        let err =
+            futures::executor::block_on(client.send(PlatformHttpRequest::new(request, "origin")))
+                .expect_err("should fail until the HTTP client is implemented");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::NotImplemented),
+            "should report NotImplemented while the Fastly HTTP client is still a stub"
         );
     }
 }
