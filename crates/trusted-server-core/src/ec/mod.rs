@@ -20,15 +20,19 @@
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`partner`] — Partner registry (`PartnerRecord`, `PartnerStore`)
 //! - [`admin`] — Admin endpoints for partner management
+//! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
+//! - [`identify`] — Browser identity read endpoint (`GET /identify`)
 
 pub mod admin;
 pub mod consent;
 pub mod cookies;
 pub mod finalize;
 pub mod generation;
+pub mod identify;
 pub mod kv;
 pub mod kv_types;
 pub mod partner;
+pub mod sync_pixel;
 
 use cookie::CookieJar;
 use error_stack::Report;
@@ -291,6 +295,15 @@ impl EcContext {
         &self.consent
     }
 
+    /// Returns a mutable reference to the consent context.
+    ///
+    /// Used by `/sync` to apply query-param fallback consent for the current
+    /// request only when pre-routing consent extraction produced an empty
+    /// context.
+    pub fn consent_mut(&mut self) -> &mut ConsentContext {
+        &mut self.consent
+    }
+
     /// Returns the normalized client IP, if available.
     #[must_use]
     pub fn client_ip(&self) -> Option<&str> {
@@ -327,6 +340,12 @@ impl EcContext {
             (self.cookie_ec_value.as_deref(), self.ec_value.as_deref()),
             (Some(cookie), Some(active)) if cookie != active
         )
+    }
+
+    /// Returns the stable EC hash prefix from the active EC value.
+    #[must_use]
+    pub fn ec_hash(&self) -> Option<&str> {
+        self.ec_value.as_deref().map(generation::ec_hash)
     }
 }
 
