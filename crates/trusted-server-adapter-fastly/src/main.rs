@@ -21,6 +21,7 @@ use trusted_server_core::ec::pull_sync::{
 };
 use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sync_pixel::handle_sync;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -307,6 +308,15 @@ async fn route_request(
         (Method::OPTIONS, "/_ts/api/v1/identify") => {
             (cors_preflight_identify(settings, &req), false)
         }
+
+        (Method::GET, "/sync") => (
+            require_identity_graph(settings).and_then(|kv| {
+                require_partner_store(settings).and_then(|partner_store| {
+                    handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
+                })
+            }),
+            false,
+        ),
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {

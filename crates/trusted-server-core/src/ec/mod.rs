@@ -28,6 +28,7 @@
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 //! - [`admin`] — Admin endpoints for partner management
+//! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
 
 mod auth;
 
@@ -47,6 +48,7 @@ pub mod prebid_eids;
 pub mod pull_sync;
 pub mod rate_limiter;
 pub mod registry;
+pub mod sync_pixel;
 
 /// Truncates an EC ID for safe inclusion in log messages.
 ///
