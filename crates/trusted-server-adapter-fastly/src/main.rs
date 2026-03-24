@@ -12,8 +12,10 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
+use trusted_server_core::ec::sync_pixel::handle_sync;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -155,6 +157,18 @@ async fn route_request(
             require_partner_store(settings).and_then(|store| handle_register_partner(&store, req))
         }
 
+        (Method::GET, "/sync") => require_identity_graph(settings).and_then(|kv| {
+            require_partner_store(settings).and_then(|partner_store| {
+                handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
+            })
+        }),
+        (Method::GET, "/identify") => require_identity_graph(settings).and_then(|kv| {
+            require_partner_store(settings).and_then(|partner_store| {
+                handle_identify(settings, &kv, &partner_store, &req, &ec_context)
+            })
+        }),
+        (Method::OPTIONS, "/identify") => cors_preflight_identify(settings, &req),
+
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
             handle_auction(settings, orchestrator, kv_graph.as_ref(), &ec_context, req).await
@@ -285,4 +299,18 @@ fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<Tru
         })
     })?;
     Ok(PartnerStore::new(store_name))
+}
+
+/// Constructs a `KvIdentityGraph` from settings, or returns 503 if the
+/// `ec_store` config is not set.
+fn require_identity_graph(
+    settings: &Settings,
+) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.ec_store".to_owned(),
+            message: "ec.ec_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(KvIdentityGraph::new(store_name))
 }
