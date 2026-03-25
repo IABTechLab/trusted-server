@@ -349,6 +349,12 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
+    /// Fastly KV store name for the partner registry.
+    ///
+    /// Required for the partner registration admin endpoint.
+    #[serde(default)]
+    pub partner_store: Option<String>,
+
     /// Maximum number of concurrent pull-sync requests.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
@@ -759,8 +765,11 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
-        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/partners/register",
+    ];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///

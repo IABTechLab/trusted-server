@@ -9,11 +9,13 @@ use trusted_server_core::constants::{
     COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION,
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
+use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::partner::PartnerStore;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
@@ -290,6 +292,10 @@ async fn route_request(
             handle_deactivate_key(settings, runtime_services, req),
             false,
         ),
+        (Method::POST, "/_ts/admin/partners/register") => (
+            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
+            false,
+        ),
         (Method::GET, "/_ts/api/v1/identify") => (
             // Bot gate is intentionally write-only in this PR. `/identify` reads
             // remain gated by bearer auth + consent, even when request-classification
@@ -521,6 +527,18 @@ fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(store_name))
+}
+
+/// Constructs a `PartnerStore` from settings, or returns 503 if the
+/// `partner_store` config is not set.
+fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
+    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.partner_store".to_owned(),
+            message: "ec.partner_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(PartnerStore::new(store_name))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.

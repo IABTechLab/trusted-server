@@ -20,16 +20,18 @@
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
-//! - [`partner`] — Partner validation helpers (ID format, pull sync config)
+//! - [`partner`] — Partner validation helpers plus KV-backed admin store types
 //! - [`registry`] — In-memory partner registry built from config
 //! - [`rate_limiter`] — Rate limiting abstraction (Fastly Edge Rate Limiting)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
+//! - [`admin`] — Admin endpoints for partner management
 
 mod auth;
 
+pub mod admin;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
