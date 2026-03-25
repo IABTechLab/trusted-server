@@ -11,7 +11,10 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::admin::handle_register_partner;
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -101,21 +104,33 @@ async fn route_request(
     // clients are untrusted and can hijack URL rewriting (see #409).
     sanitize_forwarded_headers(&mut req);
 
-    // Look up geo info via the platform abstraction using the client IP
-    // already captured in RuntimeServices at the entry point.
-    let geo_info = runtime_services
-        .geo()
-        .lookup(runtime_services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
+    // Extract geo info before auth check or routing consumes the request.
+    let geo_info = GeoInfo::from_request(&req);
+
+    let mut ec_context =
+        match EcContext::read_from_request_with_geo(settings, &req, geo_info.as_ref()) {
+            Ok(context) => context,
+            Err(err) => {
+                let mut response = to_error_response(&err);
+                finalize_response(settings, geo_info.as_ref(), &mut response);
+                return Ok(response);
+            }
+        };
+
+    let kv_graph = maybe_identity_graph(settings);
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
+            ec_finalize_response(
+                settings,
+                geo_info.as_ref(),
+                &ec_context,
+                kv_graph.as_ref(),
+                &mut response,
+            );
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(response);
         }
@@ -157,29 +172,20 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(auction_services) => {
-                    handle_auction(settings, orchestrator, &auction_services, req).await
-                }
-                Err(e) => Err(e),
-            }
+            handle_auction(settings, orchestrator, kv_graph.as_ref(), &ec_context, req).await
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => {
-            handle_first_party_proxy(settings, runtime_services, req).await
-        }
-        (Method::GET, "/first-party/click") => {
-            handle_first_party_click(settings, runtime_services, req).await
-        }
+        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
+        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, runtime_services, req).await
+            handle_first_party_proxy_sign(settings, req).await
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await
+            handle_first_party_proxy_rebuild(settings, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, runtime_services, req)
+            .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -194,22 +200,18 @@ async fn route_request(
                 path
             );
 
-            match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(publisher_services) => {
-                    match handle_publisher_request(
-                        settings,
-                        integration_registry,
-                        &publisher_services,
-                        req,
-                    ) {
-                        Ok(response) => Ok(response),
-                        Err(e) => {
-                            log::error!("Failed to proxy to publisher origin: {:?}", e);
-                            Err(e)
-                        }
-                    }
+            match handle_publisher_request(
+                settings,
+                integration_registry,
+                kv_graph.as_ref(),
+                &mut ec_context,
+                req,
+            ) {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    log::error!("Failed to proxy to publisher origin: {:?}", e);
+                    Err(e)
                 }
-                Err(e) => Err(e),
             }
         }
     };
@@ -217,27 +219,21 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
+    ec_finalize_response(
+        settings,
+        geo_info.as_ref(),
+        &ec_context,
+        kv_graph.as_ref(),
+        &mut response,
+    );
+
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
     Ok(response)
 }
 
-fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
+fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
