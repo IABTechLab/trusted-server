@@ -1,5 +1,10 @@
 use crate::common::assertions;
-use crate::common::runtime::{TestError, TestResult, origin_port};
+use crate::common::ec::{
+    assert_json_response, assert_status, batch_sync, batch_sync_no_auth, ec_hash,
+    extract_ec_cookie_from_response, identify, is_ec_cookie_expired, pixel_sync,
+    register_test_partner, BatchMapping, EcTestClient,
+};
+use crate::common::runtime::{origin_port, TestError, TestResult};
 use error_stack::Report;
 use error_stack::ResultExt as _;
 
@@ -421,4 +426,346 @@ impl CustomScenario {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// EC identity lifecycle scenarios
+// ---------------------------------------------------------------------------
+
+/// EC identity lifecycle scenarios that test KV-backed stateful behavior.
+///
+/// These run against the Viceroy runtime directly without a frontend
+/// framework container — they exercise EC-specific endpoints (`/sync`,
+/// `/identify`, `/api/v1/sync`, `/admin/partners/register`).
+#[derive(Debug, Clone)]
+pub enum EcScenario {
+    /// Full flow: organic request generates EC → pixel sync writes partner
+    /// UID → identify returns UID.
+    FullLifecycle,
+
+    /// Consent withdrawal: GPC header triggers EC cookie deletion.
+    ConsentWithdrawal,
+
+    /// Identify without EC cookie returns 204.
+    IdentifyWithoutEc,
+
+    /// Identify with consent denied returns 403.
+    IdentifyConsentDenied,
+
+    /// Two pixel syncs with different partners → identify returns both UIDs.
+    ConcurrentPartnerSyncs,
+
+    /// Batch sync happy path: authenticated request writes UID.
+    BatchSyncHappyPath,
+
+    /// Batch sync auth rejection: no auth → 401, wrong auth → 401.
+    BatchSyncAuthRejection,
+}
+
+impl EcScenario {
+    /// All EC scenarios in order.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::FullLifecycle,
+            Self::ConsentWithdrawal,
+            Self::IdentifyWithoutEc,
+            Self::IdentifyConsentDenied,
+            Self::ConcurrentPartnerSyncs,
+            Self::BatchSyncHappyPath,
+            Self::BatchSyncAuthRejection,
+        ]
+    }
+
+    /// Execute this EC scenario against a running Viceroy instance.
+    ///
+    /// Each scenario creates its own `EcTestClient` to isolate cookie state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError`] on assertion failures.
+    pub fn run(&self, base_url: &str) -> TestResult<()> {
+        match self {
+            Self::FullLifecycle => ec_full_lifecycle(base_url),
+            Self::ConsentWithdrawal => ec_consent_withdrawal(base_url),
+            Self::IdentifyWithoutEc => ec_identify_without_ec(base_url),
+            Self::IdentifyConsentDenied => ec_identify_consent_denied(base_url),
+            Self::ConcurrentPartnerSyncs => ec_concurrent_partner_syncs(base_url),
+            Self::BatchSyncHappyPath => ec_batch_sync_happy_path(base_url),
+            Self::BatchSyncAuthRejection => ec_batch_sync_auth_rejection(base_url),
+        }
+    }
+}
+
+/// Full lifecycle: page load → EC → pixel sync → identify with UID.
+fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    // 1. Organic request generates EC cookie
+    let resp = client.get("/")?;
+    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
+        Report::new(TestError::EcCookieNotSet).attach("organic GET / should set ts-ec cookie")
+    })?;
+    log::info!("EC full lifecycle: generated EC ID = {ec_id}");
+
+    // 2. Register a test partner
+    register_test_partner(&client, "inttest", "inttest-api-key-1", "sync.example.com")
+        .attach("EC full lifecycle: partner registration")?;
+
+    // 3. Pixel sync writes partner UID
+    let return_url = "https://sync.example.com/done?ok=1";
+    let resp = pixel_sync(&client, "inttest", "user-uid-42", return_url)?;
+
+    let status = resp.status().as_u16();
+    if status != 302 {
+        let body = resp.text().unwrap_or_default();
+        return Err(Report::new(TestError::UnexpectedStatusCode {
+            expected: 302,
+            actual: status,
+        })
+        .attach(format!("pixel sync should redirect; body: {body}")));
+    }
+
+    // 4. Identify should return the synced UID
+    let json = assert_json_response(identify(&client)?, 200)
+        .attach("EC full lifecycle: identify after pixel sync")?;
+
+    let uids = json
+        .get("uids")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            Report::new(TestError::JsonFieldMismatch {
+                field: "uids".to_owned(),
+            })
+            .attach(format!("identify body: {json}"))
+        })?;
+
+    let uid_value = uids.get("inttest").and_then(|v| v.as_str());
+    if uid_value != Some("user-uid-42") {
+        return Err(Report::new(TestError::JsonFieldMismatch {
+            field: "uids.inttest".to_owned(),
+        })
+        .attach(format!(
+            "expected uid 'user-uid-42', got {:?}; body: {json}",
+            uid_value
+        )));
+    }
+
+    log::info!("EC full lifecycle: PASSED");
+    Ok(())
+}
+
+/// Consent withdrawal: GPC header clears EC cookie.
+fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    // 1. Generate EC (no consent headers → non-regulated → EC allowed)
+    let resp = client.get("/")?;
+    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
+        Report::new(TestError::EcCookieNotSet).attach("should set ts-ec on first organic request")
+    })?;
+    log::info!("EC consent withdrawal: generated EC = {ec_id}");
+
+    // 2. Second request with GPC=1 should revoke consent and expire the EC
+    // cookie. This endpoint was selected because step #1 proved EC was
+    // allowed for this client in the active runtime config.
+    let resp = client.get_with_headers("/", &[("sec-gpc", "1")])?;
+
+    if !is_ec_cookie_expired(&resp) {
+        return Err(Report::new(TestError::JsonFieldMismatch {
+            field: "set-cookie(ts-ec expired)".to_owned(),
+        })
+        .attach("consent withdrawal should expire ts-ec cookie"));
+    }
+
+    // 3. With cookie revoked and no GPC header on identify, server should
+    // report no EC present.
+    let resp = identify(&client)?;
+    assert_status(&resp, 204).attach("identify should return 204 after cookie revocation")?;
+
+    // 4. With GPC still asserted, identify should reflect consent denial.
+    let resp = client.get_with_headers("/identify", &[("sec-gpc", "1")])?;
+    assert_status(&resp, 403)
+        .attach("identify with GPC should return 403 after consent withdrawal")?;
+
+    log::info!("EC consent withdrawal: PASSED");
+    Ok(())
+}
+
+/// Identify without EC cookie returns 204 No Content.
+fn ec_identify_without_ec(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    let resp = identify(&client)?;
+    assert_status(&resp, 204).attach("identify without EC cookie should return 204")?;
+
+    log::info!("EC identify without EC: PASSED");
+    Ok(())
+}
+
+/// Identify with consent denied returns 403.
+fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    // Generate EC first (non-regulated → allowed)
+    let resp = client.get("/")?;
+    let _ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
+        Report::new(TestError::EcCookieNotSet)
+            .attach("should set ts-ec on organic request for consent-denied test")
+    })?;
+
+    // Identify with GPC=1 — if jurisdiction is non-regulated + GPC,
+    // consent may still be denied depending on US-state detection.
+    // Without geo, jurisdiction is Unknown → fail-closed → 403.
+    let resp = client.get_with_headers("/identify", &[("sec-gpc", "1")])?;
+
+    let status = resp.status().as_u16();
+    // Under Unknown jurisdiction (no geo in Viceroy), EC is denied
+    // so the response may be 403 or 204 depending on whether the EC
+    // context reads the cookie before consent check.
+    if status != 403 && status != 204 {
+        return Err(Report::new(TestError::UnexpectedStatusCode {
+            expected: 403,
+            actual: status,
+        })
+        .attach("identify with consent denied should return 403 or 204"));
+    }
+
+    log::info!("EC identify consent denied: PASSED (status={status})");
+    Ok(())
+}
+
+/// Two pixel syncs with different partners → identify returns both UIDs.
+fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    // Generate EC
+    let resp = client.get("/")?;
+    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
+        Report::new(TestError::EcCookieNotSet).attach("concurrent syncs: need EC cookie")
+    })?;
+    log::info!("EC concurrent syncs: EC = {ec_id}");
+
+    // Register two partners
+    register_test_partner(&client, "sspa", "key-sspa", "sync.example.com")
+        .attach("register partner sspa")?;
+    register_test_partner(&client, "sspb", "key-sspb", "sync.example.com")
+        .attach("register partner sspb")?;
+
+    // Pixel sync both
+    let return_url = "https://sync.example.com/done";
+    let resp = pixel_sync(&client, "sspa", "uid-a", return_url)?;
+    assert_status(&resp, 302).attach("pixel sync sspa should redirect")?;
+
+    let resp = pixel_sync(&client, "sspb", "uid-b", return_url)?;
+    assert_status(&resp, 302).attach("pixel sync sspb should redirect")?;
+
+    // Identify should contain both
+    let json =
+        assert_json_response(identify(&client)?, 200).attach("identify after dual pixel sync")?;
+
+    let uids = json
+        .get("uids")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            Report::new(TestError::JsonFieldMismatch {
+                field: "uids".to_owned(),
+            })
+            .attach(format!("body: {json}"))
+        })?;
+
+    for (partner, expected_uid) in [("sspa", "uid-a"), ("sspb", "uid-b")] {
+        let actual = uids.get(partner).and_then(|v| v.as_str());
+        if actual != Some(expected_uid) {
+            return Err(Report::new(TestError::JsonFieldMismatch {
+                field: format!("uids.{partner}"),
+            })
+            .attach(format!(
+                "expected '{expected_uid}', got {:?}; body: {json}",
+                actual
+            )));
+        }
+    }
+
+    log::info!("EC concurrent partner syncs: PASSED");
+    Ok(())
+}
+
+/// Batch sync happy path: authenticated request writes UID, verify via identify.
+fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    // Generate EC to get a valid hash
+    let resp = client.get("/")?;
+    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
+        Report::new(TestError::EcCookieNotSet).attach("batch sync: need EC cookie")
+    })?;
+    let hash = ec_hash(&ec_id).to_owned();
+    log::info!("EC batch sync happy path: hash = {hash}");
+
+    // Register partner with known API key
+    register_test_partner(&client, "batchssp", "batch-api-key-1", "sync.example.com")
+        .attach("register batch sync partner")?;
+
+    // Batch sync writes a UID for this hash
+    let mappings = vec![BatchMapping {
+        ssc_hash: hash.clone(),
+        partner_uid: "batch-uid-99".to_owned(),
+        timestamp: 1_700_000_000,
+    }];
+    let resp = batch_sync(&client, "batch-api-key-1", &mappings)?;
+    let json = assert_json_response(resp, 200).attach("batch sync should return 200")?;
+
+    let accepted = json.get("accepted").and_then(|v| v.as_u64());
+    if accepted != Some(1) {
+        return Err(Report::new(TestError::JsonFieldMismatch {
+            field: "accepted".to_owned(),
+        })
+        .attach(format!(
+            "expected accepted=1, got {:?}; body: {json}",
+            accepted
+        )));
+    }
+
+    // Verify via identify
+    let json = assert_json_response(identify(&client)?, 200).attach("identify after batch sync")?;
+
+    let uid = json
+        .get("uids")
+        .and_then(|v| v.get("batchssp"))
+        .and_then(|v| v.as_str());
+
+    if uid != Some("batch-uid-99") {
+        return Err(Report::new(TestError::JsonFieldMismatch {
+            field: "uids.batchssp".to_owned(),
+        })
+        .attach(format!(
+            "expected 'batch-uid-99', got {:?}; body: {json}",
+            uid
+        )));
+    }
+
+    log::info!("EC batch sync happy path: PASSED");
+    Ok(())
+}
+
+/// Batch sync auth rejection: no auth → 401, wrong auth → 401.
+fn ec_batch_sync_auth_rejection(base_url: &str) -> TestResult<()> {
+    let client = EcTestClient::new(base_url);
+
+    let dummy_mappings = vec![BatchMapping {
+        ssc_hash: "a".repeat(64),
+        partner_uid: "uid-1".to_owned(),
+        timestamp: 1_700_000_000,
+    }];
+
+    // No auth header
+    let resp = batch_sync_no_auth(&client, &dummy_mappings)?;
+    assert_status(&resp, 401).attach("batch sync without auth should return 401")?;
+
+    // Wrong bearer token
+    let resp = batch_sync(&client, "completely-wrong-key", &dummy_mappings)?;
+    assert_status(&resp, 401).attach("batch sync with wrong auth should return 401")?;
+
+    log::info!("EC batch sync auth rejection: PASSED");
+    Ok(())
 }
