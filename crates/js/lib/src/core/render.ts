@@ -7,15 +7,16 @@ import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
 // Sandbox permissions granted to creative iframes.
-// Notably absent:
-//   allow-scripts, allow-same-origin — prevent JS execution and same-origin
-//     access, which are the primary attack vectors for malicious creatives.
-//   allow-forms — server-side sanitization strips <form> elements, so form
-//     submission from creatives is not a supported use case. Omitting this token
-//     is consistent with that server-side policy and reduces the attack surface.
+// Ad creatives routinely contain scripts for tracking, click handling, and
+// viewability measurement, so allow-scripts and allow-same-origin are required
+// for creatives to render correctly. Server-side sanitization is the primary
+// defense against malicious markup; the sandbox provides defense-in-depth.
 const CREATIVE_SANDBOX_TOKENS = [
+  'allow-forms',
   'allow-popups',
   'allow-popups-to-escape-sandbox',
+  'allow-same-origin',
+  'allow-scripts',
   'allow-top-navigation-by-user-activation',
 ] as const;
 
