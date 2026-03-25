@@ -30,8 +30,8 @@ pub mod tests {
             enabled = false
             rewrite_attributes = ["href", "link", "url"]
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key"
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"

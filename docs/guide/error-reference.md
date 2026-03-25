@@ -69,7 +69,7 @@ proxy_secret = "change-me-to-random-string"
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `edge_cookie.secret_key`
+- `ec.passphrase`
 
 ---
 
@@ -141,11 +141,11 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `secret_key` is set in `trusted-server.toml`:
+1. Ensure `passphrase` is set in `trusted-server.toml`:
 
 ```toml
-[edge_cookie]
-secret_key = "your-secure-hmac-secret"
+[ec]
+passphrase = "your-secure-hmac-secret"
 ```
 
 2. Or set via environment variable:
@@ -245,7 +245,9 @@ curl -w "%{time_total}\n" https://upstream-service.example.com
 Warning: Cookie not set due to domain mismatch
 ```
 
-**Cause:** `publisher.cookie_domain` doesn't match request domain
+**Cause:** `publisher.cookie_domain` doesn't match request domain.
+Note: EC cookies (`ts-ec`) use a computed domain from `publisher.domain`,
+not `cookie_domain`.
 
 **Solution:**
 

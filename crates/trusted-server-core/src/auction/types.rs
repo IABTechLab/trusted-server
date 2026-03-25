@@ -71,8 +71,6 @@ pub struct PublisherInfo {
 pub struct UserInfo {
     /// Stable EC ID (from cookie or freshly generated)
     pub id: String,
-    /// Fresh ID for this session
-    pub fresh_id: String,
     /// Decoded consent context for this request.
     ///
     /// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded

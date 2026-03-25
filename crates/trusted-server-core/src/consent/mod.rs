@@ -475,8 +475,12 @@ pub fn gate_eids_by_consent<T>(
 ///   information on a device) must be explicitly consented. If no TCF data is
 ///   available under GDPR, consent is assumed absent and EC is blocked.
 /// - **US state privacy**: opt-out model — EC is allowed unless the user has
-///   explicitly opted out via the US Privacy string or Global Privacy Control.
-/// - **Non-regulated / Unknown**: EC is allowed (no consent requirement).
+///   explicitly opted out via the US Privacy string **or** Global Privacy
+///   Control. GPC is checked independently — it always blocks EC creation
+///   regardless of what the US Privacy string says.
+/// - **Non-regulated**: EC is allowed (no consent requirement).
+/// - **Unknown**: fail-closed — jurisdiction cannot be determined so EC is
+///   blocked as a precaution.
 #[must_use]
 pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
     match &ctx.jurisdiction {
@@ -488,15 +492,23 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
             }
         }
         jurisdiction::Jurisdiction::UsState(_) => {
-            // US: opt-out model — allow unless user explicitly opted out.
+            // GPC is an independent opt-out signal — it always blocks EC
+            // creation regardless of what the US Privacy string says.
+            if ctx.gpc {
+                return false;
+            }
+            // Check US Privacy string for explicit opt-out.
             if let Some(usp) = &ctx.us_privacy {
                 usp.opt_out_sale != PrivacyFlag::Yes
             } else {
-                // No US Privacy string — fall back to GPC signal.
-                !ctx.gpc
+                // No opt-out signals present — allow under opt-out model.
+                true
             }
         }
-        jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => true,
+        jurisdiction::Jurisdiction::NonRegulated => true,
+        // No geolocation data — cannot determine jurisdiction.
+        // Fail-closed: block EC creation as a precaution.
+        jurisdiction::Jurisdiction::Unknown => false,
     }
 }
 
@@ -1029,14 +1041,33 @@ mod tests {
     }
 
     #[test]
-    fn ec_allowed_unknown_jurisdiction() {
+    fn ec_blocked_unknown_jurisdiction() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Unknown,
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "unknown jurisdiction should allow EC (no geo data available)"
+            !allows_ec_creation(&ctx),
+            "unknown jurisdiction should block EC (fail-closed when geo unavailable)"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::No,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC=true should block EC even when US Privacy says no opt-out"
         );
     }
 

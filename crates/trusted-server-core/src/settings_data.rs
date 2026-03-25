@@ -58,22 +58,22 @@ mod tests {
     ///
     /// Panics if the replacement patterns no longer match the test TOML,
     /// which would cause the substitution to silently no-op.
-    fn toml_with_secrets(secret_key: &str, proxy_secret: &str) -> String {
+    fn toml_with_secrets(passphrase: &str, proxy_secret: &str) -> String {
         let original = crate_test_settings_str();
-        let after_secret_key = original.replace(
-            r#"secret_key = "test-secret-key""#,
-            &format!(r#"secret_key = "{secret_key}""#),
+        let after_passphrase = original.replace(
+            r#"passphrase = "test-secret-key""#,
+            &format!(r#"passphrase = "{passphrase}""#),
         );
         assert_ne!(
-            after_secret_key, original,
-            "should have replaced secret_key value"
+            after_passphrase, original,
+            "should have replaced passphrase value"
         );
-        let result = after_secret_key.replace(
+        let result = after_passphrase.replace(
             r#"proxy_secret = "unit-test-proxy-secret""#,
             &format!(r#"proxy_secret = "{proxy_secret}""#),
         );
         assert_ne!(
-            result, after_secret_key,
+            result, after_passphrase,
             "should have replaced proxy_secret value"
         );
         result
@@ -88,8 +88,8 @@ mod tests {
             .expect_err("should reject placeholder secret_key");
         let root = err.current_context();
         assert!(
-            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("edge_cookie.secret_key")),
-            "error should mention edge_cookie.secret_key, got: {root}"
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("ec.passphrase")),
+            "error should mention ec.passphrase, got: {root}"
         );
     }
 
@@ -118,8 +118,8 @@ mod tests {
         match root {
             TrustedServerError::InsecureDefault { field } => {
                 assert!(
-                    field.contains("edge_cookie.secret_key"),
-                    "error should mention edge_cookie.secret_key, got: {field}"
+                    field.contains("ec.passphrase"),
+                    "error should mention ec.passphrase, got: {field}"
                 );
                 assert!(
                     field.contains("publisher.proxy_secret"),
