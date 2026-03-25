@@ -13,7 +13,7 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
-use crate::edge_cookie::get_ec_id;
+use crate::ec::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices,

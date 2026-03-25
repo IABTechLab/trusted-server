@@ -329,7 +329,7 @@ fn is_safe_data_uri(lower: &str) -> bool {
 
 /// Strip dangerous elements and attributes from ad creative HTML.
 ///
-/// Removes elements that can execute code or exfiltrate data (`script`,
+/// Removes elements that can execute code or exfiltrate data (`script`, `iframe`,
 /// `object`, `embed`, `base`, `meta`, `form`, `link`, `style`, `noscript`) and strips `on*` event-handler
 /// attributes and dangerous URI schemes from all remaining elements:
 /// - `javascript:`, `vbscript:`
@@ -361,17 +361,18 @@ pub fn sanitize_creative_html(markup: &str) -> String {
         HtmlSettings {
             element_content_handlers: vec![
                 // Remove executable/dangerous elements along with their inner content.
-                // - <script>, <object>, <embed>: direct execution vectors.
+                // - <script>, <iframe>, <object>, <embed>: direct execution vectors.
                 // - <base>: rewrites all relative URLs, undermining the proxy rewriter.
                 // - <meta>: can trigger redirects (http-equiv=refresh) or inject CSP.
-                // - <form>: action/formaction can exfiltrate data.
+                // - <form>: action/formaction can exfiltrate data; stripped to match the
+                //   iframe sandbox which omits allow-forms.
                 // - <link>: external stylesheet/resource loading.
                 // - <style>: CSS expressions, @import, and url() data exfiltration.
                 // - <noscript>: rendered when scripts are disabled (always the case
                 //   inside a sandbox without allow-scripts); strip to prevent parser
                 //   differential attacks.
                 element!(
-                    "script, object, embed, base, meta, form, link, style, noscript",
+                    "script, iframe, object, embed, base, meta, form, link, style, noscript",
                     |el| {
                         el.remove();
                         Ok(())
@@ -453,9 +454,10 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                     // NOTE: This uses simple substring matching on the lowercased value,
                     // which does not handle CSS escape sequences (e.g. `\65xpression(`)
                     // or comments (e.g. `expr/**/ession(`). That is acceptable: CSS
-                    // expression() is IE6-8 only, and downstream rendering still happens
-                    // inside a sandboxed iframe. This check is defense-in-depth for
-                    // obvious patterns.
+                    // expression() is IE6-8 only and the iframe sandbox's absence of
+                    // allow-scripts prevents execution even if an obfuscated value were
+                    // to slip through. The sandbox is the primary mitigation; this check
+                    // is defense-in-depth for obvious patterns.
                     if let Some(style) = el.get_attribute("style") {
                         let lower = style.to_ascii_lowercase();
                         if lower.contains("expression(")
@@ -1478,14 +1480,10 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_preserves_iframe_element_and_src() {
+    fn sanitize_removes_iframe_element() {
         let html = r#"<div>ad</div><iframe src="https://evil.example/"></iframe>"#;
         let out = sanitize_creative_html(html);
-        assert!(out.contains("<iframe"), "should preserve iframe element");
-        assert!(
-            out.contains("https://evil.example/"),
-            "should preserve safe iframe src"
-        );
+        assert!(!out.contains("<iframe"), "should remove iframe element");
         assert!(out.contains("ad"), "should preserve safe content");
     }
 

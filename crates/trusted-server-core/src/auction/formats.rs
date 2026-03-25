@@ -14,9 +14,8 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
+use crate::constants::HEADER_X_TS_EC;
 use crate::creative;
-use crate::edge_cookie::generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
 use crate::platform::{GeoInfo, RuntimeServices};
@@ -90,10 +89,6 @@ pub fn convert_tsjs_to_auction_request(
     geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.to_owned();
-    let fresh_id =
-        generate_ec_id(settings, services).change_context(TrustedServerError::Auction {
-            message: "Failed to generate fresh EC ID".to_string(),
-        })?;
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -187,7 +182,6 @@ pub fn convert_tsjs_to_auction_request(
         },
         user: UserInfo {
             id: ec_id,
-            fresh_id,
             consent: Some(consent),
         },
         device,
@@ -315,6 +309,5 @@ pub fn convert_to_openrtb_response(
     Ok(Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_header(HEADER_X_TS_EC, &auction_request.user.id)
-        .with_header(HEADER_X_TS_EC_FRESH, &auction_request.user.fresh_id)
         .with_body(body_bytes))
 }
