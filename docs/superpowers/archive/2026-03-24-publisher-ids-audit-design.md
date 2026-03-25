@@ -13,7 +13,7 @@ This document lists all publisher-specific IDs and configurations found in the c
 
 **Equativ Configuration:**
 
-- `sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&synthetic_id={{synthetic_id}}"` (line 8)
+- `sync_url = "https://adapi-srv-eu.smartadserver.com/ac?pgid=2040327&fmtid=137675&ec_id={{ec_id}}"` (line 8)
   - Page ID: `2040327`
   - Format ID: `137675`
 
@@ -23,10 +23,8 @@ This document lists all publisher-specific IDs and configurations found in the c
 - `cookie_domain = ".test-publisher.com"` (line 3)
 - `origin_url = "https://origin.test-publisher.com"` (line 4)
 
-**KV Store Names (user-specific):**
-
-- `counter_store = "jevans_synth_id_counter"` (line 24)
-- `opid_store = "jevans_synth_id_opid"` (line 25)
+**KV Store Names:**
+*(Removed — `counter_store` and `opid_store` were removed in the EC rename; they were vestigial from the template-based SyntheticID generation.)*
 
 ## Hardcoded in Source Code
 

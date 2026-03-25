@@ -40,19 +40,11 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         );
     }
 
-    if settings.synthetic.secret_key.expose() == "trusted-server" {
-        log::warn!(
-            "INSECURE: synthetic.secret_key is set to the default placeholder — \
-             HMAC-SHA256 signatures can be forged. \
-             Override via TRUSTED_SERVER__SYNTHETIC__SECRET_KEY at build time"
-        );
-    }
+    settings.reject_placeholder_secrets()?;
 
-    if settings.publisher.proxy_secret.expose() == "change-me-proxy-secret" {
+    if !settings.proxy.certificate_check {
         log::warn!(
-            "INSECURE: publisher.proxy_secret is set to the default placeholder — \
-             XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone. \
-             Override via TRUSTED_SERVER__PUBLISHER__PROXY_SECRET at build time"
+            "INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified"
         );
     }
 
@@ -63,19 +55,99 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
 mod tests {
     use super::*;
 
+    fn toml_with_secrets(secret_key: &str, proxy_secret: &str) -> String {
+        format!(
+            r#"
+[publisher]
+domain = "test-publisher.com"
+cookie_domain = ".test-publisher.com"
+origin_url = "https://origin.test-publisher.com"
+proxy_secret = "{proxy_secret}"
+
+[edge_cookie]
+secret_key = "{secret_key}"
+
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "admin-pass"
+"#
+        )
+    }
+
     #[test]
-    fn get_settings_loads_embedded_toml_successfully() {
-        // The embedded TOML contains placeholder secrets (e.g. "trusted-server",
-        // "change-me-proxy-secret"). This is expected — production builds override
-        // them via TRUSTED_SERVER__* env vars at build time.
-        let settings = get_settings().expect("should load settings from embedded TOML");
-        // Verify basic structure is loaded
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.expose().is_empty());
-        assert!(!settings.synthetic.template.is_empty());
+    fn rejects_placeholder_secret_key() {
+        let toml = toml_with_secrets("secret-key", "real-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder secret_key");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("edge_cookie.secret_key")),
+            "error should mention edge_cookie.secret_key, got: {root}"
+        );
+    }
+
+    #[test]
+    fn rejects_placeholder_proxy_secret() {
+        let toml = toml_with_secrets("real-secret-key", "change-me-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder proxy_secret");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("publisher.proxy_secret")),
+            "error should mention publisher.proxy_secret, got: {root}"
+        );
+    }
+
+    #[test]
+    fn rejects_both_placeholders_in_single_error() {
+        let toml = toml_with_secrets("secret_key", "change-me-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject both placeholder secrets");
+        let root = err.current_context();
+        match root {
+            TrustedServerError::InsecureDefault { field } => {
+                assert!(
+                    field.contains("edge_cookie.secret_key"),
+                    "error should mention edge_cookie.secret_key, got: {field}"
+                );
+                assert!(
+                    field.contains("publisher.proxy_secret"),
+                    "error should mention publisher.proxy_secret, got: {field}"
+                );
+            }
+            other => panic!("expected InsecureDefault, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_placeholder_secrets() {
+        let toml = toml_with_secrets("production-secret-key", "production-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        settings
+            .reject_placeholder_secrets()
+            .expect("non-placeholder secrets should pass validation");
+    }
+
+    /// Smoke-test the full `get_settings()` pipeline (embedded bytes → UTF-8 →
+    /// parse → validate → placeholder check).  The build-time TOML ships with
+    /// placeholder secrets, so the expected outcome is an [`InsecureDefault`]
+    /// error — but reaching that error proves every earlier stage succeeded.
+    #[test]
+    fn get_settings_rejects_embedded_placeholder_secrets() {
+        let err = super::get_settings().expect_err("should reject embedded placeholder secrets");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::InsecureDefault { .. }
+            ),
+            "should fail with InsecureDefault, got: {err}"
+        );
     }
 }
