@@ -588,3 +588,15 @@ fn derive_device_signals(req: &Request) -> DeviceSignals {
 
     DeviceSignals::derive(ua, ja4, h2_fp)
 }
+
+/// Constructs a `PartnerStore` from settings, or returns 503 if the
+/// `partner_store` config is not set.
+fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
+    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.partner_store".to_owned(),
+            message: "ec.partner_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(PartnerStore::new(store_name))
+}
