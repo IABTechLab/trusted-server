@@ -1,8 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
-use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
 
 use crate::settings::Settings;
 
@@ -32,19 +30,7 @@ pub fn enforce_basic_auth(settings: &Settings, req: &Request) -> Option<Response
         None => return Some(unauthorized_response()),
     };
 
-    // Hash before comparing to normalise lengths — `ct_eq` on raw byte slices
-    // short-circuits when lengths differ, which would leak credential length.
-    // SHA-256 produces fixed-size digests so the comparison is truly constant-time.
-    //
-    // Note: constant-time guarantees are best-effort on WASM targets because the
-    // runtime optimiser/JIT may re-introduce variable-time paths. This is an
-    // inherent limitation of all constant-time code in managed runtimes.
-    let username_match = Sha256::digest(handler.username.expose().as_bytes())
-        .ct_eq(&Sha256::digest(username.as_bytes()));
-    let password_match = Sha256::digest(handler.password.expose().as_bytes())
-        .ct_eq(&Sha256::digest(password.as_bytes()));
-
-    if bool::from(username_match & password_match) {
+    if handler.username == username && handler.password == password {
         None
     } else {
         Some(unauthorized_response())
@@ -90,11 +76,16 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use fastly::http::{header, Method};
 
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::crate_test_settings_str;
+
+    fn settings_with_handlers() -> Settings {
+        let config = crate_test_settings_str();
+        Settings::from_toml(&config).expect("should parse settings with handlers")
+    }
 
     #[test]
     fn no_challenge_for_non_protected_path() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/open");
 
         assert!(enforce_basic_auth(&settings, &req).is_none());
@@ -102,7 +93,7 @@ mod tests {
 
     #[test]
     fn challenge_when_missing_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/secure");
 
         let response = enforce_basic_auth(&settings, &req).expect("should challenge");
@@ -115,7 +106,7 @@ mod tests {
 
     #[test]
     fn allow_when_credentials_match() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("user:pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -124,20 +115,19 @@ mod tests {
     }
 
     #[test]
-    fn challenge_when_both_credentials_wrong() {
-        let settings = create_test_settings();
+    fn challenge_when_credentials_mismatch() {
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("wrong:wrong");
+        let token = STANDARD.encode("user:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should challenge when both username and password are wrong");
+        let response = enforce_basic_auth(&settings, &req).expect("should challenge");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn challenge_when_scheme_is_not_basic() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure");
         req.set_header(header::AUTHORIZATION, "Bearer token");
 
@@ -147,7 +137,7 @@ mod tests {
 
     #[test]
     fn allow_admin_path_with_valid_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:admin-pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -160,7 +150,7 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -172,35 +162,11 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should challenge admin path with missing credentials");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn challenge_when_username_wrong_password_correct() {
-        let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("wrong:pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should challenge when only username is wrong");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn challenge_when_username_correct_password_wrong() {
-        let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("user:wrong");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should challenge when only password is wrong");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -3,10 +3,9 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
-use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
-use crate::ec::get_or_generate_ec_id;
+use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
+use crate::ec::cookies::{expire_ec_cookie, set_ec_cookie};
+use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -235,37 +234,21 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Parse cookies once for reuse by both consent extraction and EC ID logic.
-    let cookie_jar = handle_request_cookies(&req)?;
+    // Read EC state from the request (existing ID, consent, client IP).
+    // This must happen before the request body is consumed.
+    let mut ec_context = EcContext::read_from_request(settings, &req)?;
 
-    // Capture the current EC cookie value for revocation handling.
-    // This must come from the cookie itself (not the x-ts-ec header)
-    // to ensure KV deletion targets the same identifier being revoked.
-    let existing_ec_cookie = cookie_jar
-        .as_ref()
-        .and_then(|jar| jar.get(COOKIE_TS_EC))
-        .map(|cookie| cookie.value().to_owned());
+    // Generate a new EC ID if none exists and consent allows it.
+    // This is an organic handler, so generation is permitted here.
+    if let Err(err) = ec_context.generate_if_needed(settings) {
+        log::warn!("EC generation failed: {err:?}");
+    }
 
-    // Generate EC identifiers before the request body is consumed.
-    // Always generated for internal use (KV lookups, logging) even when
-    // consent is absent — the cookie is only *set* when consent allows it.
-    let ec_id = get_or_generate_ec_id(settings, &req)?;
-
-    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
-    // from the incoming request. The ConsentContext carries both raw strings
-    // (for OpenRTB forwarding) and decoded data (for enforcement).
-    // When a consent_store is configured, this also persists consent to KV
-    // and falls back to stored consent when cookies are absent.
-    let geo = crate::geo::GeoInfo::from_request(&req);
-    let consent_context = build_consent_context(&ConsentPipelineInput {
-        jar: cookie_jar.as_ref(),
-        req: &req,
-        config: &settings.consent,
-        geo: geo.as_ref(),
-        ec_id: Some(ec_id.as_str()),
-    });
-    let ec_allowed = allows_ec_creation(&consent_context);
-    log::debug!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed,);
+    let ec_allowed = ec_context.ec_allowed();
+    log::debug!(
+        "Proxy EC ID: {:?}, ec_allowed: {ec_allowed}",
+        ec_context.ec_value(),
+    );
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -366,17 +349,14 @@ pub fn handle_publisher_request(
     // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
     // - Consent absent + no cookie → do nothing.
     if ec_allowed {
-        // Fastly's HeaderValue API rejects \r, \n, and \0, so the EC ID
-        // cannot inject additional response headers.
-        response.set_header(HEADER_X_TS_EC, ec_id.as_str());
-        // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
-        // characters. The header is still emitted when consent allows it.
-        set_ec_cookie(settings, &mut response, ec_id.as_str());
-    } else if let Some(cookie_ec_id) = existing_ec_cookie.as_deref() {
+        if let Some(ec_id) = ec_context.ec_value() {
+            response.set_header(HEADER_X_TS_EC, ec_id);
+            set_ec_cookie(settings, &mut response, ec_id);
+        }
+    } else if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id() {
         log::info!(
-            "EC revoked for '{}': consent withdrawn (jurisdiction={})",
-            cookie_ec_id,
-            consent_context.jurisdiction,
+            "EC revoked for '{cookie_ec_id}': consent withdrawn (jurisdiction={})",
+            ec_context.consent().jurisdiction,
         );
         expire_ec_cookie(settings, &mut response);
         if let Some(store_name) = &settings.consent.consent_store {
@@ -385,7 +365,7 @@ pub fn handle_publisher_request(
     } else {
         log::debug!(
             "EC skipped: no consent and no existing cookie (jurisdiction={})",
-            consent_context.jurisdiction,
+            ec_context.consent().jurisdiction,
         );
     }
 
@@ -518,22 +498,22 @@ mod tests {
         req.set_header("x-ts-ec", "header_id");
         req.set_header("cookie", "ts-ec=cookie_id; other=value");
 
-        let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
-        let existing_ec_cookie = cookie_jar
-            .as_ref()
-            .and_then(|jar| jar.get(COOKIE_TS_EC))
-            .map(|cookie| cookie.value().to_owned());
-
-        let resolved_ec_id = get_or_generate_ec_id(&settings, &req).expect("should resolve EC ID");
+        let ec_context =
+            EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
         assert_eq!(
-            existing_ec_cookie.as_deref(),
-            Some("cookie_id"),
-            "should read revocation target from cookie value"
+            ec_context.ec_value(),
+            Some("header_id"),
+            "should resolve request EC ID from header precedence"
+        );
+        assert!(
+            ec_context.cookie_was_present(),
+            "should detect cookie was present"
         );
         assert_eq!(
-            resolved_ec_id, "header_id",
-            "should still resolve request EC ID from header precedence"
+            ec_context.existing_cookie_ec_id(),
+            Some("cookie_id"),
+            "should return cookie EC value for revocation, not the header value"
         );
     }
 
