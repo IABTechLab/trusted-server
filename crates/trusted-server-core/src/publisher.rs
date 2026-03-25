@@ -18,8 +18,8 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::ec::cookies::{expire_ec_cookie, set_ec_cookie};
+use crate::constants::HEADER_X_COMPRESS_HINT;
+use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
@@ -444,6 +444,8 @@ pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
+    kv: Option<&KvIdentityGraph>,
+    ec_context: &mut EcContext,
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -465,13 +467,9 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Read EC state from the request (existing ID, consent, client IP).
-    // This must happen before the request body is consumed.
-    let mut ec_context = EcContext::read_from_request(settings, &req)?;
-
     // Generate a new EC ID if none exists and consent allows it.
     // This is an organic handler, so generation is permitted here.
-    if let Err(err) = ec_context.generate_if_needed(settings) {
+    if let Err(err) = ec_context.generate_if_needed(settings, kv) {
         log::warn!("EC generation failed: {err:?}");
     }
 
@@ -503,10 +501,6 @@ pub fn handle_publisher_request(
     for (name, value) in response.get_headers() {
         log::debug!("  {}: {:?}", name, value);
     }
-
-    // Set EC ID / cookie headers BEFORE body processing.
-    // These are body-independent (computed from request cookies + consent).
-    apply_ec_headers(settings, services, &mut response, &ec_context);
 
     let content_type = response
         .get_header(header::CONTENT_TYPE)
@@ -632,47 +626,6 @@ fn is_processable_content_type(content_type: &str) -> bool {
 /// bodies as identity-encoded would produce garbled output.
 fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
-}
-
-/// Apply EC ID and cookie headers to the response.
-///
-/// Extracted so headers can be set before streaming begins (headers must
-/// be finalized before `stream_to_client()` commits them).
-///
-/// Consent-gated EC creation:
-/// - Consent given → set EC ID header + cookie.
-/// - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
-/// - Consent absent + no cookie → do nothing.
-fn apply_ec_headers(
-    settings: &Settings,
-    services: &RuntimeServices,
-    response: &mut Response,
-    ec_context: &EcContext,
-) {
-    if ec_context.ec_allowed() {
-        if let Some(ec_id) = ec_context.ec_value() {
-            // Fastly's HeaderValue API rejects \r, \n, and \0, so the EC ID
-            // cannot inject additional response headers.
-            response.set_header(HEADER_X_TS_EC, ec_id);
-            // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
-            // characters. The header is still emitted when consent allows it.
-            set_ec_cookie(settings, response, ec_id);
-        }
-    } else if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id() {
-        log::info!(
-            "EC revoked for '{cookie_ec_id}': consent withdrawn (jurisdiction={})",
-            ec_context.consent().jurisdiction,
-        );
-        expire_ec_cookie(settings, response);
-        if settings.consent.consent_store.is_some() {
-            crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
-        }
-    } else {
-        log::debug!(
-            "EC skipped: no consent and no existing cookie (jurisdiction={})",
-            ec_context.consent().jurisdiction,
-        );
-    }
 }
 
 #[cfg(test)]
