@@ -11,11 +11,12 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::admin::handle_register_partner;
+use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
-use trusted_server_core::ec::sync_pixel::handle_sync;
+use trusted_server_core::ec::sync_pixel::{handle_sync, FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -183,6 +184,21 @@ async fn route_request(
 
     // Extract geo info before auth check or routing consumes the request.
     let geo_info = GeoInfo::from_request(&req);
+
+    // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
+    // context creation and the EC finalize middleware entirely.
+    if req.get_method() == Method::POST && req.get_path() == "/api/v1/sync" {
+        let mut response = require_identity_graph(settings)
+            .and_then(|kv| {
+                require_partner_store(settings).and_then(|partner_store| {
+                    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                    handle_batch_sync(&kv, &partner_store, &limiter, req)
+                })
+            })
+            .unwrap_or_else(|e| to_error_response(&e));
+        finalize_response(settings, geo_info.as_ref(), &mut response);
+        return Ok(response);
+    }
 
     let mut ec_context =
         match EcContext::read_from_request_with_geo(settings, &req, geo_info.as_ref()) {
