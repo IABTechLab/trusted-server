@@ -547,6 +547,34 @@ mod tests {
     }
 
     #[test]
+    fn fastly_platform_secret_store_create_returns_not_implemented() {
+        let store = FastlyPlatformSecretStore;
+        let store_id = StoreId::from("test-store-id");
+        let err = store
+            .create(&store_id, "my-secret", "value")
+            .expect_err("should return an error for unimplemented create");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::NotImplemented),
+            "should report NotImplemented while secret store write is not yet implemented"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_secret_store_delete_returns_not_implemented() {
+        let store = FastlyPlatformSecretStore;
+        let store_id = StoreId::from("test-store-id");
+        let err = store
+            .delete(&store_id, "my-secret")
+            .expect_err("should return an error for unimplemented delete");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::NotImplemented),
+            "should report NotImplemented while secret store write is not yet implemented"
+        );
+    }
+
+    #[test]
     fn fastly_platform_http_client_reports_not_implemented() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
