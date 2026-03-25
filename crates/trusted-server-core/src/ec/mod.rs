@@ -16,10 +16,14 @@
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
+//! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
+//! - [`kv_types`] — Schema types for KV identity graph entries
 
 pub mod consent;
 pub mod cookies;
 pub mod generation;
+pub mod kv;
+pub mod kv_types;
 
 use cookie::CookieJar;
 use error_stack::Report;
@@ -32,7 +36,7 @@ use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::settings::Settings;
 
-pub use generation::{ec_hash, extract_client_ip, generate_ec_id, is_valid_ec_id};
+pub use generation::{ec_hash, generate_ec_id, is_valid_ec_id};
 
 /// Parsed EC identity from an incoming request.
 ///
@@ -89,36 +93,6 @@ pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<Trusted
     if let Some(ref id) = ec_id {
         log::trace!("Existing EC ID found: {id}");
     }
-    Ok(ec_id)
-}
-
-/// Gets an existing EC ID from the request, or generates a new one.
-///
-/// This is a convenience wrapper that combines [`get_ec_id`] with
-/// [`generation::generate_ec_id`]. It extracts the client IP from the
-/// request for generation when no existing ID is found.
-///
-/// When the client IP is unavailable (e.g. in local testing environments),
-/// falls back to `"unknown"` — all such requests share the same HMAC
-/// base, but the random suffix still provides uniqueness.
-///
-/// # Errors
-///
-/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-/// - [`TrustedServerError::Ec`] if HMAC generation fails
-pub fn get_or_generate_ec_id(
-    settings: &Settings,
-    req: &Request,
-) -> Result<String, Report<TrustedServerError>> {
-    if let Some(id) = get_ec_id(req)? {
-        return Ok(id);
-    }
-
-    // Fallback to "unknown" when client IP is unavailable (e.g. local testing).
-    // All such requests share the same HMAC base; the random suffix provides uniqueness.
-    let client_ip = extract_client_ip(req).unwrap_or_else(|_| "unknown".to_string());
-    let ec_id = generate_ec_id(settings, &client_ip)?;
-    log::trace!("No existing EC ID, generated: {ec_id}");
     Ok(ec_id)
 }
 
