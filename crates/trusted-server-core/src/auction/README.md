@@ -67,7 +67,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  4. Generate User IDs (mod.rs:206-214)                               │
-│     - Create/retrieve synthetic ID (persistent)                      │
+│     - Create/retrieve EC ID (persistent)                             │
 │     - Generate fresh ID (per-request)                                │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -519,7 +519,7 @@ impl AuctionProvider for YourAuctionProvider {
 
 APS and adserver_mock providers are used for testing the orchestration pattern:
 
-- **APS Mock**: Returns synthetic bids with Amazon branding
+- **APS Mock**: Returns mock bids with Amazon branding
 - **AdServer Mock**: Acts as mediator by calling mocktioneer's mediation endpoint, selects winning bids based on highest CPM
 
 Set `mock = false` in APS config when real APS integration is ready.

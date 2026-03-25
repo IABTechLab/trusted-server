@@ -192,18 +192,15 @@ impl DerefMut for IntegrationSettings {
     }
 }
 
+/// Edge Cookie configuration.
 #[allow(unused)]
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-pub struct Synthetic {
-    pub counter_store: String,
-    pub opid_store: String,
-    #[validate(custom(function = Synthetic::validate_secret_key))]
+pub struct EdgeCookie {
+    #[validate(custom(function = EdgeCookie::validate_secret_key))]
     pub secret_key: Redacted<String>,
-    #[validate(length(min = 1))]
-    pub template: String,
 }
 
-impl Synthetic {
+impl EdgeCookie {
     /// Known placeholder values that must not be used in production.
     pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
 
@@ -334,7 +331,7 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     #[validate(nested)]
-    pub synthetic: Synthetic,
+    pub edge_cookie: EdgeCookie,
     #[serde(default)]
     pub integrations: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -430,8 +427,8 @@ impl Settings {
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
         let mut insecure_fields: Vec<&str> = Vec::new();
 
-        if Synthetic::is_placeholder_secret_key(self.synthetic.secret_key.expose()) {
-            insecure_fields.push("synthetic.secret_key");
+        if EdgeCookie::is_placeholder_secret_key(self.edge_cookie.secret_key.expose()) {
+            insecure_fields.push("edge_cookie.secret_key");
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret");
@@ -720,10 +717,7 @@ mod tests {
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
-        assert_eq!(settings.synthetic.counter_store, "test-counter-store");
-        assert_eq!(settings.synthetic.opid_store, "test-opid-store");
-        assert_eq!(settings.synthetic.secret_key.expose(), "test-secret-key");
-        assert!(settings.synthetic.template.contains("{{client_ip}}"));
+        assert_eq!(settings.edge_cookie.secret_key.expose(), "test-secret-key");
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -759,9 +753,9 @@ mod tests {
 
     #[test]
     fn is_placeholder_secret_key_rejects_all_known_placeholders() {
-        for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
+        for placeholder in EdgeCookie::SECRET_KEY_PLACEHOLDERS {
             assert!(
-                Synthetic::is_placeholder_secret_key(placeholder),
+                EdgeCookie::is_placeholder_secret_key(placeholder),
                 "should detect placeholder secret_key '{placeholder}'"
             );
         }
@@ -770,11 +764,11 @@ mod tests {
     #[test]
     fn is_placeholder_secret_key_is_case_insensitive() {
         assert!(
-            Synthetic::is_placeholder_secret_key("SECRET-KEY"),
+            EdgeCookie::is_placeholder_secret_key("SECRET-KEY"),
             "should detect case-insensitive placeholder secret_key"
         );
         assert!(
-            Synthetic::is_placeholder_secret_key("Trusted-Server"),
+            EdgeCookie::is_placeholder_secret_key("Trusted-Server"),
             "should detect mixed-case placeholder secret_key"
         );
     }
@@ -782,7 +776,7 @@ mod tests {
     #[test]
     fn is_placeholder_secret_key_accepts_non_placeholder() {
         assert!(
-            !Synthetic::is_placeholder_secret_key("test-secret-key"),
+            !EdgeCookie::is_placeholder_secret_key("test-secret-key"),
             "should accept non-placeholder secret_key"
         );
     }
@@ -1425,11 +1419,8 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [synthetic]
-            counter_store = "test-counter-store"
-            opid_store = "test-opid-store"
+            [edge_cookie]
             secret_key = "test-secret-key"
-            template = "{{client_ip}}"
 
             [request_signing]
             config_store_id = "test-config-store-id"

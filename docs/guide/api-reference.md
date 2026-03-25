@@ -37,7 +37,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 **Response Headers:**
 
-- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
+- `x-ts-ec` - EC ID (`64hex.6alnum` format)
 
 **Use Cases:**
 
@@ -127,7 +127,7 @@ Unified proxy for resources referenced by creatives (images, scripts, CSS, etc.)
 
 - Validates `tstoken` against reconstructed URL
 - Follows redirects (301/302/303/307/308, max 4 hops)
-- Injects synthetic ID as `synthetic_id` query parameter
+- Injects EC ID as `ts-ec` query parameter
 - Logs 1×1 pixel impressions
 
 **Example:**
@@ -160,12 +160,12 @@ Click tracking redirect endpoint.
 **Response:**
 
 - **Status:** `302 Found`
-- **Location:** Reconstructed target URL with synthetic ID injected
+- **Location:** Reconstructed target URL with EC ID injected
 
 **Behavior:**
 
 - Validates `tstoken` against reconstructed URL
-- Injects `synthetic_id` query parameter
+- Injects `ts-ec` query parameter
 - Logs click metadata (tsurl, referer, user agent)
 - Does not proxy content (redirect only)
 
@@ -173,7 +173,7 @@ Click tracking redirect endpoint.
 
 ```bash
 curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com/landing&campaign=123&tstoken=xyz..."
-# → 302 Location: https://advertiser.com/landing?campaign=123&synthetic_id=abc123
+# → 302 Location: https://advertiser.com/landing?campaign=123&ts-ec=abc123
 ```
 
 ---
@@ -529,7 +529,7 @@ Proxies to `cdn.permutive.com` for static assets.
 
 #### POST /integrations/testlight/auction
 
-Testing auction endpoint with synthetic ID injection.
+Testing auction endpoint with EC ID injection.
 
 **Request Body:**
 
@@ -543,11 +543,11 @@ Testing auction endpoint with synthetic ID injection.
 ```
 
 **Response:**
-Proxies to configured endpoint with `user.id` populated with synthetic ID.
+Proxies to configured endpoint with `user.id` populated with EC ID.
 
 **Response Headers:**
 
-- `x-synthetic-id` - Synthetic ID (`64hex.6alnum` format)
+- `x-ts-ec` - EC ID (`64hex.6alnum` format)
 
 ---
 

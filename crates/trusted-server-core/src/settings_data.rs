@@ -88,8 +88,8 @@ mod tests {
             .expect_err("should reject placeholder secret_key");
         let root = err.current_context();
         assert!(
-            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("synthetic.secret_key")),
-            "error should mention synthetic.secret_key, got: {root}"
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("edge_cookie.secret_key")),
+            "error should mention edge_cookie.secret_key, got: {root}"
         );
     }
 
@@ -118,8 +118,8 @@ mod tests {
         match root {
             TrustedServerError::InsecureDefault { field } => {
                 assert!(
-                    field.contains("synthetic.secret_key"),
-                    "error should mention synthetic.secret_key, got: {field}"
+                    field.contains("edge_cookie.secret_key"),
+                    "error should mention edge_cookie.secret_key, got: {field}"
                 );
                 assert!(
                     field.contains("publisher.proxy_secret"),

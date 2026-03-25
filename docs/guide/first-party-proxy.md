@@ -7,7 +7,7 @@ Learn how Trusted Server proxies third-party assets through first-party domains 
 The First-Party Proxy system rewrites third-party URLs in ad creatives to route through your domain, providing:
 
 - **Privacy Protection** - No direct third-party cookies or tracking
-- **Synthetic ID Forwarding** - Controlled identity propagation
+- **EC ID Forwarding** - Controlled identity propagation
 - **Creative Rewrites** - Automatic HTML/CSS URL transformation
 - **Click Tracking** - First-party click redirects
 - **Content Security** - Validated, signed URLs prevent tampering
@@ -18,7 +18,7 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 flowchart TD
   original["`Creative (Original) &lt;img src='tracker.com/pixel.gif' /&gt;`"]
   rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
-  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append synthetic_id<br/>3. Proxy to tracker.com<br/>4. Return response"]
+  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.com<br/>4. Return response"]
 
   original -->|Rewrite| rewritten -->|Browser Request| server
 ```
@@ -46,7 +46,7 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 **Behavior**:
 
 1. **Validates** the `tstoken` signature against reconstructed URL
-2. **Appends** `synthetic_id` query parameter (if available)
+2. **Appends** `ts-ec` query parameter (if available)
 3. **Proxies** request to target URL with forwarded headers:
    - `User-Agent`
    - `Accept`
@@ -81,7 +81,7 @@ Signed proxy URL:
 Final proxied request:
 
 ```
-https://tracker.com/pixel.gif?campaign=123&uid=abc&synthetic_id=xyz
+https://tracker.com/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
 ```
 
 ### `/first-party/click` - Click Redirects
@@ -99,14 +99,14 @@ GET /first-party/click?tsurl=https://advertiser.com/landing&tstoken=signature
 **Behavior**:
 
 1. **Validates** the `tstoken` signature
-2. **Appends** `synthetic_id` parameter to target URL
+2. **Appends** `ts-ec` parameter to target URL
 3. **Issues** 302 redirect to target (browser navigates directly)
 4. **Logs** click metadata:
    - Target URL base (`tsurl`)
    - Whether parameters were present
    - Full reconstructed URL
    - Referer, User-Agent
-   - Synthetic ID (if available)
+   - EC ID (if available)
 
 **Example**:
 
@@ -127,7 +127,7 @@ User clicks → Server responds:
 
 ```
 HTTP/1.1 302 Found
-Location: https://advertiser.com/buy?product=widget&synthetic_id=xyz
+Location: https://advertiser.com/buy?product=widget&ts-ec=xyz
 ```
 
 ::: tip Click vs Proxy
@@ -335,7 +335,7 @@ The proxy automatically follows HTTP redirects:
 **Behavior**:
 
 1. Follow up to **4 redirect hops**
-2. Re-apply `synthetic_id` on each hop
+2. Re-apply `ts-ec` on each hop
 3. Switch to `GET` after `303` response
 4. Log when redirect limit reached
 5. Preserve request headers across hops
@@ -349,16 +349,16 @@ Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
   → Rewrite HTML and return
 ```
 
-## Synthetic ID Propagation
+## EC ID Propagation
 
 ### Automatic Forwarding
 
-When proxying, Trusted Server automatically appends the `synthetic_id` parameter:
+When proxying, Trusted Server automatically appends the `ts-ec` parameter:
 
 **Source Priority**:
 
-1. `x-synthetic-id` request header
-2. `synthetic_id` cookie
+1. `x-ts-ec` request header
+2. `ts-ec` cookie
 3. Generate new ID if missing
 
 **Example**:
@@ -366,23 +366,23 @@ When proxying, Trusted Server automatically appends the `synthetic_id` parameter
 ```
 Original request to proxy:
   /first-party/proxy?tsurl=https://tracker.com/pixel.gif&tstoken=sig
-  Cookie: synthetic_id=user123
+  Cookie: ts-ec=user123
 
 Proxied backend request:
-  https://tracker.com/pixel.gif?synthetic_id=user123
+  https://tracker.com/pixel.gif?ts-ec=user123
 ```
 
 ### Redirect Propagation
 
-Synthetic IDs are re-applied on **every redirect hop**:
+EC IDs are re-applied on **every redirect hop**:
 
 ```
 /first-party/proxy?tsurl=https://redirect1.com&tstoken=sig
-  → https://redirect1.com?synthetic_id=user123
+  → https://redirect1.com?ts-ec=user123
   → 302 to https://redirect2.com
-  → https://redirect2.com?synthetic_id=user123
+  → https://redirect2.com?ts-ec=user123
   → 302 to https://final.com
-  → https://final.com?synthetic_id=user123
+  → https://final.com?ts-ec=user123
   → 200 response
 ```
 
@@ -390,7 +390,7 @@ This ensures downstream trackers receive consistent IDs even through redirect ch
 
 ### Click ID Forwarding
 
-Click redirects also forward synthetic IDs:
+Click redirects also forward EC IDs:
 
 ```html
 <a href="/first-party/click?tsurl=https://advertiser.com&tstoken=sig"></a>
@@ -400,15 +400,15 @@ User clicks → redirect includes ID:
 
 ```
 302 Found
-Location: https://advertiser.com?synthetic_id=user123
+Location: https://advertiser.com?ts-ec=user123
 ```
 
 ::: tip Privacy Control
-Synthetic IDs are only forwarded when:
+EC IDs are only forwarded when:
 
 1. User has given GDPR consent (if required)
 2. ID exists in request (header/cookie)
-3. Integration hasn't disabled forwarding (`forward_synthetic_id: false`)
+3. Integration hasn't disabled forwarding (`forward_ec_id: false`)
    :::
 
 ## Configuration
@@ -422,7 +422,7 @@ Configure proxy behavior in `trusted-server.toml`:
 domain = "publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-random-secret"
-cookie_domain = ".publisher.com"  # For synthetic_id cookies
+cookie_domain = ".publisher.com"  # For ts-ec cookies
 ```
 
 ### URL Rewrite Exclusions
@@ -511,7 +511,7 @@ Only essential headers are forwarded to reduce overhead:
 **Not Forwarded**:
 
 - Authentication headers (unless explicitly added)
-- Cookies (except synthetic ID appended as query param)
+- Cookies (except EC ID appended as query param)
 - Custom headers (unless added via `ProxyRequestConfig`)
 
 ## Error Handling
@@ -652,6 +652,6 @@ X-TS-Version = "1.0"
 ## Next Steps
 
 - Learn about [Creative Processing](/guide/creative-processing) for HTML rewriting details
-- Review [Synthetic IDs](/guide/synthetic-ids) for identity management
+- Review [Edge Cookies](/guide/edge-cookies) for identity management
 - Set up [Configuration](/guide/configuration) for your deployment
 - Explore [Integration Guide](/guide/integration-guide) for custom integrations
