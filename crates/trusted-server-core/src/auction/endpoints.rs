@@ -4,6 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -28,20 +29,10 @@ use super::AuctionOrchestrator;
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
+    _kv: Option<&KvIdentityGraph>,
+    ec_context: &EcContext,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Read EC state before consuming the request body.
-    let mut ec_context = EcContext::read_from_request(settings, &req).change_context(
-        TrustedServerError::Auction {
-            message: "Failed to read EC context".to_string(),
-        },
-    )?;
-
-    // Auction is an organic handler — generate EC if needed.
-    if let Err(err) = ec_context.generate_if_needed(settings) {
-        log::warn!("EC generation failed for auction: {err:?}");
-    }
-
     // Parse request body
     let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
         TrustedServerError::Auction {
@@ -54,6 +45,8 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    // Story 5 middleware contract: auction is a read-only EC route.
+    // It must not generate EC IDs; it only consumes pre-routed context.
     // Only forward the EC ID to auction partners when consent allows it.
     // A returning user may still have a ts-ec cookie but have since
     // withdrawn consent — forwarding that revoked ID to bidders would

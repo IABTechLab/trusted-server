@@ -3,8 +3,8 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
-use crate::constants::{HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::ec::cookies::{expire_ec_cookie, set_ec_cookie};
+use crate::constants::HEADER_X_COMPRESS_HINT;
+use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
@@ -288,6 +288,8 @@ fn create_html_stream_processor(
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    kv: Option<&KvIdentityGraph>,
+    ec_context: &mut EcContext,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -309,13 +311,9 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Read EC state from the request (existing ID, consent, client IP).
-    // This must happen before the request body is consumed.
-    let mut ec_context = EcContext::read_from_request(settings, &req)?;
-
     // Generate a new EC ID if none exists and consent allows it.
     // This is an organic handler, so generation is permitted here.
-    if let Err(err) = ec_context.generate_if_needed(settings) {
+    if let Err(err) = ec_context.generate_if_needed(settings, kv) {
         log::warn!("EC generation failed: {err:?}");
     }
 
@@ -418,31 +416,6 @@ pub fn handle_publisher_request(
             "Skipping response processing - should_process: {}, request_host: '{}'",
             should_process,
             request_host
-        );
-    }
-
-    // Consent-gated EC creation:
-    // - Consent given → set EC ID header + cookie.
-    // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
-    // - Consent absent + no cookie → do nothing.
-    if ec_allowed {
-        if let Some(ec_id) = ec_context.ec_value() {
-            response.set_header(HEADER_X_TS_EC, ec_id);
-            set_ec_cookie(settings, &mut response, ec_id);
-        }
-    } else if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id() {
-        log::info!(
-            "EC revoked for '{cookie_ec_id}': consent withdrawn (jurisdiction={})",
-            ec_context.consent().jurisdiction,
-        );
-        expire_ec_cookie(settings, &mut response);
-        if let Some(store_name) = &settings.consent.consent_store {
-            crate::consent::kv::delete_consent_from_kv(store_name, cookie_ec_id);
-        }
-    } else {
-        log::debug!(
-            "EC skipped: no consent and no existing cookie (jurisdiction={})",
-            ec_context.consent().jurisdiction,
         );
     }
 

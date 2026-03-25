@@ -11,7 +11,10 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::admin::handle_register_partner;
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -86,14 +89,33 @@ async fn route_request(
     // clients are untrusted and can hijack URL rewriting (see #409).
     sanitize_forwarded_headers(&mut req);
 
-    // Extract geo info before auth check or routing consumes the request
+    // Extract geo info before auth check or routing consumes the request.
     let geo_info = GeoInfo::from_request(&req);
+
+    let mut ec_context =
+        match EcContext::read_from_request_with_geo(settings, &req, geo_info.as_ref()) {
+            Ok(context) => context,
+            Err(err) => {
+                let mut response = to_error_response(&err);
+                finalize_response(settings, geo_info.as_ref(), &mut response);
+                return Ok(response);
+            }
+        };
+
+    let kv_graph = maybe_identity_graph(settings);
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
+            ec_finalize_response(
+                settings,
+                geo_info.as_ref(),
+                &ec_context,
+                kv_graph.as_ref(),
+                &mut response,
+            );
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(response);
         }
@@ -134,7 +156,9 @@ async fn route_request(
         }
 
         // Unified auction endpoint (returns creative HTML inline)
-        (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
+        (Method::POST, "/auction") => {
+            handle_auction(settings, orchestrator, kv_graph.as_ref(), &ec_context, req).await
+        }
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
@@ -146,7 +170,7 @@ async fn route_request(
             handle_first_party_proxy_rebuild(settings, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, req)
+            .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -161,7 +185,13 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(settings, integration_registry, req) {
+            match handle_publisher_request(
+                settings,
+                integration_registry,
+                kv_graph.as_ref(),
+                &mut ec_context,
+                req,
+            ) {
                 Ok(response) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);
@@ -174,9 +204,21 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
+    ec_finalize_response(
+        settings,
+        geo_info.as_ref(),
+        &ec_context,
+        kv_graph.as_ref(),
+        &mut response,
+    );
+
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
     Ok(response)
+}
+
+fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
