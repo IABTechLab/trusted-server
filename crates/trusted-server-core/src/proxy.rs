@@ -46,10 +46,19 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// Domain allowlist enforced on the initial target and every redirect hop.
+    ///
+    /// An empty slice disables allowlist enforcement (open mode).
+    /// Integration proxies should pass `&[]`; first-party proxy passes
+    /// `&settings.proxy.allowed_domains`.
+    pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the synthetic ID.
+    ///
+    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
+    /// first-party proxy by setting [`allowed_domains`] directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
@@ -60,6 +69,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &[],
         }
     }
 
@@ -390,6 +400,7 @@ fn finalize_response(
 struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
     copy_request_headers: bool,
+    allowed_domains: &'a [String],
 }
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
@@ -415,6 +426,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        allowed_domains,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -436,6 +448,7 @@ pub async fn proxy_request(
         ProxyRequestHeaders {
             additional_headers: &headers,
             copy_request_headers,
+            allowed_domains,
         },
         stream_passthrough,
     )
@@ -483,8 +496,11 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn redirect_is_permitted(allowed_domains: &[String], host: &str) -> bool {
-    allowed_domains.is_empty() || allowed_domains.iter().any(|p| is_host_allowed(host, p))
+fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+    allowed_domains.is_empty()
+        || allowed_domains
+            .iter()
+            .any(|p| is_host_allowed(host, p.as_ref()))
 }
 
 /// Returns `true` if `host` is permitted by `pattern`.
@@ -543,7 +559,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -623,8 +639,15 @@ async fn proxy_with_redirects(
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
-        let next_host = next_url.host_str().unwrap_or("");
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+        let next_host = match next_url.host_str() {
+            Some(h) if !h.is_empty() => h,
+            _ => {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: "missing host in redirect location".to_string(),
+                }));
+            }
+        };
+        if !redirect_is_permitted(request_headers.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -687,6 +710,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &settings.proxy.allowed_domains,
         },
     )
     .await
@@ -2059,7 +2083,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redirect_is_permitted_accepts_str_slices() {
+        // Verifies the &[impl AsRef<str>] bound works with &str literals,
+        // not just Vec<String>.
+        let allowed: &[&str] = &["example.com", "*.cdn.example.com"];
+        assert!(
+            redirect_is_permitted(allowed, "example.com"),
+            "should permit exact match via &str slice"
+        );
+        assert!(
+            redirect_is_permitted(allowed, "static.cdn.example.com"),
+            "should permit wildcard match via &str slice"
+        );
+        assert!(
+            !redirect_is_permitted(allowed, "evil.com"),
+            "should block host not in &str slice allowlist"
+        );
+    }
+
+    #[test]
+    fn ip_literal_blocked_by_domain_allowlist() {
+        let allowed = vec!["*.example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, "169.254.169.254"),
+            "should block cloud metadata IP"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "127.0.0.1"),
+            "should block loopback IPv4"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "[::1]"),
+            "should block loopback IPv6"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "::1"),
+            "should block bare loopback IPv6"
+        );
+    }
+
     // --- initial target allowlist enforcement (integration-level) ---
+    //
+    // NOTE: A test for Nth-hop redirect blocking (i.e. exercising the
+    // `redirect_is_permitted` check that fires *after* receiving a 302
+    // response) requires a Viceroy backend fixture that returns a redirect.
+    // That infrastructure is not available here. The unit tests above for
+    // `redirect_is_permitted` and `ip_literal_blocked_by_domain_allowlist`
+    // cover the blocking logic used at every hop.
 
     #[tokio::test]
     async fn proxy_initial_target_blocked_by_allowlist() {

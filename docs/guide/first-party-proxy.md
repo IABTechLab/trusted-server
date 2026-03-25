@@ -450,8 +450,13 @@ allowed_domains = [
 - The `*` prefix matches the base domain and any subdomain at any depth.
 - Matching is case-insensitive; entries are normalized to lowercase on startup.
 - The wildcard requires a dot boundary — `*.example.com` will **not** match `evil-example.com`.
+- A bare `"*"` entry is **not** valid and will be removed at startup with a warning. Use an empty list for open mode.
 
-**Default behavior**: When `allowed_domains` is omitted (or set to an empty list) every redirect destination is permitted. This default is intentional for zero-config development but should not be used in production.
+:::note Unicode / Internationalized Domain Names
+Matching uses ASCII case-folding (`to_ascii_lowercase`). Internationalized domain names (IDNs) in Punycode form (e.g., `xn--nxasmq6b.com`) are matched literally — the Unicode label and its Punycode equivalent are treated as different strings. If your ad network uses IDN domains, add the Punycode form to `allowed_domains`.
+:::
+
+**Default behavior**: When `allowed_domains` is omitted (or set to an empty list) every redirect destination is permitted. This default exists solely for development convenience and **must be overridden in production**.
 
 ::: danger Production Recommendation
 Always set `allowed_domains` explicitly in production deployments. Without an allowlist, a signed proxy URL that follows redirects could be used to reach internal or unintended hosts (SSRF).

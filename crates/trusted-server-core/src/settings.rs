@@ -345,8 +345,9 @@ impl Proxy {
     ///
     /// Each entry is trimmed of surrounding whitespace and lowercased.
     /// Empty entries (including those that were only whitespace) are removed.
-    /// This prevents blank patterns from making the list non-empty while
-    /// still never matching any host, which would silently block all redirects.
+    /// A bare `"*"` entry is removed with a warning: it is not a valid pattern
+    /// (it never matches any real host) and is likely a mistake. Users who want
+    /// open mode should omit `allowed_domains` entirely or leave it empty.
     fn normalize(&mut self) {
         self.allowed_domains = self
             .allowed_domains
@@ -354,6 +355,16 @@ impl Proxy {
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
+
+        let before = self.allowed_domains.len();
+        self.allowed_domains.retain(|s| s != "*");
+        if self.allowed_domains.len() < before {
+            log::warn!(
+                "proxy.allowed_domains: bare \"*\" is not a valid pattern and has been removed; \
+                 omit allowed_domains or leave it empty for open mode"
+            );
+        }
+
         if self.allowed_domains.is_empty() {
             log::warn!(
                 "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
@@ -1455,6 +1466,33 @@ mod tests {
             proxy.allowed_domains,
             vec!["example.com".to_string(), "cdn.example.com".to_string()],
             "should drop blank and whitespace-only entries"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_removes_bare_wildcard() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
+        };
+        proxy.normalize();
+        assert_eq!(
+            proxy.allowed_domains,
+            vec!["tracker.com".to_string()],
+            "should remove bare \"*\" (invalid pattern that blocks all traffic)"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_bare_wildcard_alone_yields_open_mode() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec!["*".to_string()],
+        };
+        proxy.normalize();
+        assert!(
+            proxy.allowed_domains.is_empty(),
+            "bare \"*\" alone should normalize to empty list (open mode)"
         );
     }
 
