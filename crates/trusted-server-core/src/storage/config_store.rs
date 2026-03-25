@@ -12,6 +12,9 @@ use fastly::ConfigStore;
 
 use crate::error::TrustedServerError;
 
+// TODO: Deduplicate this transitional helper with
+// trusted-server-adapter-fastly/src/platform.rs:get_config_value once
+// FastlyConfigStore is removed.
 trait ConfigStoreReader {
     type LookupError: Display;
 
@@ -152,15 +155,5 @@ mod tests {
                 .contains("key 'current-kid' not found in config store 'jwks_store'"),
             "should describe the missing key"
         );
-    }
-
-    #[test]
-    fn config_store_get_in_test_environment() {
-        let store = FastlyConfigStore::new("jwks_store");
-        let result = store.get("current-kid");
-        match result {
-            Ok(kid) => println!("Current KID: {}", kid),
-            Err(e) => println!("Expected error in test environment: {}", e),
-        }
     }
 }

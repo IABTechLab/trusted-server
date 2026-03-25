@@ -18,6 +18,10 @@ use crate::storage::secret_store::FastlySecretStore;
 
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
 
+fn build_config_item_payload(value: &str) -> String {
+    format!("item_value={}", urlencoding::encode(value))
+}
+
 /// HTTP client for the Fastly management API.
 ///
 /// Used to perform write operations on config and secret stores via the
@@ -119,7 +123,7 @@ impl FastlyApiClient {
         value: &str,
     ) -> Result<(), Report<TrustedServerError>> {
         let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
-        let payload = format!("item_value={}", value);
+        let payload = build_config_item_payload(value);
 
         let mut response = self.make_request(
             "PUT",
@@ -275,38 +279,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_client_creation_in_test_environment() {
-        let result = FastlyApiClient::new();
-        match result {
-            Ok(_) => println!("Successfully created API client"),
-            Err(e) => println!("Expected error in test environment: {}", e),
-        }
-    }
+    fn config_item_payload_url_encodes_reserved_characters() {
+        let payload = build_config_item_payload(r#"value with spaces + symbols &= {"kid":"a+b"}"#);
 
-    #[test]
-    fn api_client_update_config_item_in_test_environment() {
-        if let Ok(client) = FastlyApiClient::new() {
-            let result =
-                client.update_config_item("5WNlRjznCUAGTU0QeYU8x2", "test-key", "test-value");
-            match result {
-                Ok(()) => println!("Successfully updated config item"),
-                Err(e) => println!("Expected error in test environment: {}", e),
-            }
-        }
-    }
-
-    #[test]
-    fn api_client_create_secret_in_test_environment() {
-        if let Ok(client) = FastlyApiClient::new() {
-            let result = client.create_secret(
-                "Ltf3CkSGV0Yn2PIC2lDcZx",
-                "test-secret-new",
-                "SGVsbG8sIHdvcmxkIQ==",
-            );
-            match result {
-                Ok(()) => println!("Successfully created secret"),
-                Err(e) => println!("Expected error in test environment: {}", e),
-            }
-        }
+        assert_eq!(
+            payload,
+            "item_value=value%20with%20spaces%20%2B%20symbols%20%26%3D%20%7B%22kid%22%3A%22a%2Bb%22%7D",
+            "should URL-encode config item values in form payloads"
+        );
     }
 }

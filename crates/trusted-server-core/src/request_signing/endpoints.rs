@@ -36,14 +36,14 @@ pub fn handle_trusted_server_discovery(
 
     let jwks_value: serde_json::Value =
         serde_json::from_str(&jwks_json).change_context(TrustedServerError::Configuration {
-            message: "Failed to parse JWKS JSON".into(),
+            message: "failed to parse JWKS JSON".into(),
         })?;
 
     let discovery = TrustedServerDiscovery::new(jwks_value);
 
     let json = serde_json::to_string_pretty(&discovery).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to serialize discovery document".into(),
+            message: "failed to serialize discovery document".into(),
         },
     )?;
 
@@ -81,7 +81,7 @@ pub fn handle_verify_signature(
     let body = req.take_body_str();
     let verify_req: VerifySignatureRequest =
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?;
 
     let verification_result = signing::verify_signature(
@@ -113,7 +113,7 @@ pub fn handle_verify_signature(
 
     let response_json = serde_json::to_string(&response).map_err(|e| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("Failed to serialize response: {}", e),
+            message: format!("failed to serialize response: {}", e),
         })
     })?;
 
@@ -153,7 +153,7 @@ pub fn handle_rotate_key(
         Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
         None => {
             return Err(TrustedServerError::Configuration {
-                message: "Missing signing storage configuration.".to_string(),
+                message: "missing signing storage configuration".to_string(),
             }
             .into());
         }
@@ -164,13 +164,13 @@ pub fn handle_rotate_key(
         RotateKeyRequest { kid: None }
     } else {
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?
     };
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to create KeyRotationManager".into(),
+            message: "failed to create KeyRotationManager".into(),
         },
     )?;
 
@@ -178,7 +178,7 @@ pub fn handle_rotate_key(
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize JWK: {}", e),
+                    message: format!("failed to serialize JWK: {}", e),
                 })
             })?;
 
@@ -194,7 +194,7 @@ pub fn handle_rotate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
@@ -215,7 +215,7 @@ pub fn handle_rotate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
@@ -257,7 +257,7 @@ pub fn handle_deactivate_key(
         Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
         None => {
             return Err(TrustedServerError::Configuration {
-                message: "Missing signing storage configuration.".to_string(),
+                message: "missing signing storage configuration".to_string(),
             }
             .into());
         }
@@ -266,12 +266,12 @@ pub fn handle_deactivate_key(
     let body = req.take_body_str();
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?;
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to create KeyRotationManager".into(),
+            message: "failed to create KeyRotationManager".into(),
         },
     )?;
 
@@ -303,7 +303,7 @@ pub fn handle_deactivate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
@@ -327,7 +327,7 @@ pub fn handle_deactivate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
@@ -340,90 +340,15 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-    use std::sync::Arc;
-
     use error_stack::Report;
 
     use crate::platform::{
-        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-        RuntimeServices, StoreId, StoreName,
+        test_support::{build_services_with_config, noop_services},
+        PlatformConfigStore, PlatformError, StoreId, StoreName,
     };
 
     use super::*;
     use fastly::http::{Method, StatusCode};
-
-    struct NoopConfigStore;
-    impl PlatformConfigStore for NoopConfigStore {
-        fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopSecretStore;
-    impl PlatformSecretStore for NoopSecretStore {
-        fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopBackend;
-    impl PlatformBackend for NoopBackend {
-        fn predict_name(&self, _: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        fn ensure(&self, _: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopHttpClient;
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for NoopHttpClient {
-        async fn send(
-            &self,
-            _: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        async fn send_async(
-            &self,
-            _: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-        async fn select(
-            &self,
-            _: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopGeo;
-    impl PlatformGeo for NoopGeo {
-        fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            Ok(None)
-        }
-    }
-
-    fn noop_services() -> RuntimeServices {
-        build_services_with_config(NoopConfigStore)
-    }
 
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
@@ -448,25 +373,6 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
-
-    fn build_services_with_config(
-        config_store: impl PlatformConfigStore + 'static,
-    ) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(config_store))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            })
-            .build()
-    }
-
     #[test]
     fn test_handle_verify_signature_valid() {
         let settings = crate::test_support::tests::create_test_settings();

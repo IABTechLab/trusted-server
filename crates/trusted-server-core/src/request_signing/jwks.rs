@@ -3,6 +3,8 @@
 //! This module provides functionality for generating, storing, and retrieving
 //! Ed25519 keypairs in JWK format for request signing.
 
+use std::sync::LazyLock;
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use error_stack::{Report, ResultExt};
 use jose_jwk::{
@@ -14,6 +16,9 @@ use rand::rngs::OsRng;
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreName};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
+
+static JWKS_STORE_NAME: LazyLock<StoreName> =
+    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
 
 /// An Ed25519 keypair used for request signing.
 pub struct Keypair {
@@ -70,10 +75,9 @@ impl Keypair {
 /// cannot be read. The underlying [`crate::platform::PlatformError`] is
 /// preserved as context in the error chain.
 pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<TrustedServerError>> {
-    let store_name = StoreName::from(JWKS_CONFIG_STORE_NAME);
     let active_kids_str = services
         .config_store()
-        .get(&store_name, "active-kids")
+        .get(&JWKS_STORE_NAME, "active-kids")
         .change_context(TrustedServerError::Configuration {
             message: "failed to read active-kids from config store".into(),
         })
@@ -89,7 +93,7 @@ pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<Trus
     for kid in active_kids {
         let jwk = services
             .config_store()
-            .get(&store_name, kid)
+            .get(&JWKS_STORE_NAME, kid)
             .change_context(TrustedServerError::Configuration {
                 message: format!("failed to get JWK for kid: {}", kid),
             })?;
@@ -102,18 +106,13 @@ pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<Trus
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-    use std::sync::Arc;
-
     use ed25519_dalek::{Signer, Verifier};
     use error_stack::Report;
     use jose_jwk::Key;
 
     use crate::platform::{
-        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-        RuntimeServices, StoreId, StoreName,
+        test_support::build_services_with_config, PlatformConfigStore, PlatformError, StoreId,
+        StoreName,
     };
 
     use super::*;
@@ -145,101 +144,6 @@ mod tests {
         fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
-    }
-
-    struct NoopSecretStore;
-
-    impl PlatformSecretStore for NoopSecretStore {
-        fn get_bytes(
-            &self,
-            _store_name: &StoreName,
-            _key: &str,
-        ) -> Result<Vec<u8>, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        fn create(
-            &self,
-            _store_id: &StoreId,
-            _name: &str,
-            _value: &str,
-        ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopBackend;
-
-    impl PlatformBackend for NoopBackend {
-        fn predict_name(
-            &self,
-            _spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for NoopHttpClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct NoopGeo;
-
-    impl PlatformGeo for NoopGeo {
-        fn lookup(
-            &self,
-            _client_ip: Option<IpAddr>,
-        ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            Ok(None)
-        }
-    }
-
-    fn build_services_with_config(
-        config_store: impl PlatformConfigStore + 'static,
-    ) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(config_store))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            })
-            .build()
     }
 
     // ---------------------------------------------------------------------------
