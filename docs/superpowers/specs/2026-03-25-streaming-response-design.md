@@ -271,8 +271,75 @@ improvements.
 - Compare response bodies before/after to confirm byte-identical output for
   HTML, text, and binary.
 
-### Measurement (post-deploy)
+### Performance measurement via Chrome DevTools MCP
 
-- Compare TTFB and time-to-last-byte on staging before and after.
+Capture before/after metrics using Chrome DevTools MCP against Viceroy locally
+and staging. Run each measurement set on `main` (baseline) and the feature
+branch, then compare.
+
+#### Baseline capture (before — on `main`)
+
+1. Start local server: `fastly compute serve`
+2. Navigate to publisher proxy URL via `navigate_page`
+3. Capture network timing:
+   - `list_network_requests` — record TTFB (`responseStart - requestStart`),
+     total time (`responseEnd - requestStart`), and transfer size for the
+     document request
+   - Filter for the main document (`resourceType: Document`)
+4. Run Lighthouse audit:
+   - `lighthouse_audit` with categories `["performance"]`
+   - Record TTFB, LCP, Speed Index, Total Blocking Time
+5. Capture performance trace:
+   - `performance_start_trace` → load page → `performance_stop_trace`
+   - `performance_analyze_insight` — extract "Time to First Byte" and
+     "Network requests" insights
+6. Take memory snapshot:
+   - `take_memory_snapshot` — record JS heap size as a secondary check
+     (WASM heap is measured separately via Fastly dashboard)
+7. Repeat 3-5 times for stable medians
+
+#### Post-implementation capture (after — on feature branch)
+
+Repeat the same steps on the feature branch. Compare:
+
+| Metric | Source | Expected change |
+|--------|--------|-----------------|
+| TTFB (document) | Network timing | Minimal change (gated by backend response time) |
+| Time to last byte | Network timing (`responseEnd`) | Reduced — body streams incrementally |
+| LCP | Lighthouse | Improved — browser receives `<head>` resources sooner |
+| Speed Index | Lighthouse | Improved — progressive rendering starts earlier |
+| Transfer size | Network timing | Unchanged (same content, same compression) |
+| Response body hash | `evaluate_script` with hash | Identical — correctness check |
+
+#### Automated comparison script
+
+Use `evaluate_script` to compute a response body hash in the browser for
+correctness verification:
+
+```js
+// Run via evaluate_script after page load
+const response = await fetch(location.href);
+const buffer = await response.arrayBuffer();
+const hash = await crypto.subtle.digest('SHA-256', buffer);
+const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+hex; // compare this between baseline and feature branch
+```
+
+#### What to watch for
+
+- **TTFB regression**: If TTFB increases, the header finalization reordering
+  may be adding latency. Investigate `finalize_response()` and synthetic ID
+  computation timing.
+- **Body mismatch**: If response body hashes differ between baseline and
+  feature branch, the streaming pipeline is producing different output.
+  Bisect between Step 1 and Step 2 to isolate.
+- **LCP unchanged**: If LCP doesn't improve, the `<head>` content may not be
+  reaching the browser earlier. Check whether `lol_html` emits the `<head>`
+  injection in the first chunk or buffers until more input arrives.
+
+### Measurement (post-deploy to staging)
+
+- Repeat Chrome DevTools MCP measurements against staging URL.
+- Compare against Viceroy results to account for real network conditions.
 - Monitor WASM heap usage via Fastly dashboard.
 - Verify no regressions on static endpoints or auction.
