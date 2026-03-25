@@ -11,7 +11,10 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::admin::handle_register_partner;
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
@@ -176,15 +179,20 @@ async fn route_request(
     // clients are untrusted and can hijack URL rewriting (see #409).
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    // Look up geo info via the platform abstraction using the client IP
-    // already captured in RuntimeServices at the entry point.
-    let geo_info = runtime_services
-        .geo()
-        .lookup(runtime_services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
+    // Extract geo info before auth check or routing consumes the request.
+    let geo_info = GeoInfo::from_request(&req);
+
+    let mut ec_context =
+        match EcContext::read_from_request_with_geo(settings, &req, geo_info.as_ref()) {
+            Ok(context) => context,
+            Err(err) => {
+                let mut response = to_error_response(&err);
+                finalize_response(settings, geo_info.as_ref(), &mut response);
+                return Some(response);
+            }
+        };
+
+    let kv_graph = maybe_identity_graph(settings);
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
@@ -193,6 +201,13 @@ async fn route_request(
     match enforce_basic_auth(settings, &auth_req) {
         Ok(Some(response)) => {
             let mut response = compat::to_fastly_response(response);
+            ec_finalize_response(
+                settings,
+                geo_info.as_ref(),
+                &ec_context,
+                kv_graph.as_ref(),
+                &mut response,
+            );
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Some(response);
         }
@@ -231,36 +246,35 @@ async fn route_request(
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, runtime_services, req),
         (Method::POST, "/admin/keys/deactivate") => {
             handle_deactivate_key(settings, runtime_services, req)
-        },
+        }
         (Method::POST, "/admin/partners/register") => {
             require_partner_store(settings).and_then(|store| handle_register_partner(&store, req))
-        },
+        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(auction_services) => {
-                    handle_auction(settings, orchestrator, &auction_services, req).await
-                }
-                Err(e) => Err(e),
-            }
+            handle_auction(
+                settings,
+                orchestrator,
+                kv_graph.as_ref(),
+                &ec_context,
+                runtime_services,
+                req,
+            )
+            .await
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => {
-            handle_first_party_proxy(settings, runtime_services, req).await
-        }
-        (Method::GET, "/first-party/click") => {
-            handle_first_party_click(settings, runtime_services, req).await
-        }
+        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
+        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, runtime_services, req).await
+            handle_first_party_proxy_sign(settings, req).await
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await
+            handle_first_party_proxy_rebuild(settings, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, runtime_services, req)
+            .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -281,6 +295,8 @@ async fn route_request(
                         settings,
                         integration_registry,
                         &publisher_services,
+                        kv_graph.as_ref(),
+                        &mut ec_context,
                         req,
                     ) {
                         Ok(PublisherResponse::Stream {
@@ -289,6 +305,13 @@ async fn route_request(
                             params,
                         }) => {
                             // Streaming path: finalize headers, then stream body to client.
+                            ec_finalize_response(
+                                settings,
+                                geo_info.as_ref(),
+                                &ec_context,
+                                kv_graph.as_ref(),
+                                &mut response,
+                            );
                             finalize_response(settings, geo_info.as_ref(), &mut response);
                             let mut streaming_body = response.stream_to_client();
                             if let Err(e) = stream_publisher_body(
@@ -323,7 +346,6 @@ async fn route_request(
                         }
                     }
                 }
-                Err(e) => Err(e),
             }
         }
     };
@@ -331,27 +353,21 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
+    ec_finalize_response(
+        settings,
+        geo_info.as_ref(),
+        &ec_context,
+        kv_graph.as_ref(),
+        &mut response,
+    );
+
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
     Some(response)
 }
 
-fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
+fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

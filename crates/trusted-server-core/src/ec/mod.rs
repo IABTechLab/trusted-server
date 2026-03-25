@@ -24,6 +24,7 @@
 pub mod admin;
 pub mod consent;
 pub mod cookies;
+pub mod finalize;
 pub mod generation;
 pub mod kv;
 pub mod kv_types;
@@ -40,8 +41,10 @@ use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+
+use self::kv::KvIdentityGraph;
+use self::kv_types::KvEntry;
 
 pub use generation::{ec_hash, generate_ec_id, is_valid_ec_id};
 
@@ -136,6 +139,8 @@ pub struct EcContext {
     /// The normalized client IP, captured early before the request body
     /// is consumed. `None` when the platform cannot determine client IP.
     client_ip: Option<String>,
+    /// Geo information captured pre-routing for downstream KV writes.
+    geo_info: Option<GeoInfo>,
 }
 
 impl EcContext {
@@ -155,40 +160,21 @@ impl EcContext {
         settings: &Settings,
         req: &Request,
     ) -> Result<Self, Report<TrustedServerError>> {
-        Self::read_from_request_with_context(settings, req, None, None)
+        Self::read_from_request_with_geo(settings, req, None)
     }
 
-    /// Reads EC state using runtime services for geo and consent KV access.
+    /// Reads EC state from an incoming request using pre-extracted geo data.
+    ///
+    /// Use this when geo has already been resolved in router prelude to avoid
+    /// duplicate lookup work.
     ///
     /// # Errors
     ///
     /// Returns an error if cookie parsing fails.
-    pub fn read_from_request_with_services(
-        settings: &Settings,
-        services: &RuntimeServices,
-        req: &Request,
-    ) -> Result<Self, Report<TrustedServerError>> {
-        let geo = services
-            .geo()
-            .lookup(services.client_info.client_ip)
-            .unwrap_or_else(|e| {
-                log::warn!("geo lookup failed: {e}");
-                None
-            });
-        let kv_store = settings
-            .consent
-            .consent_store
-            .as_deref()
-            .map(|_| services.kv_store());
-
-        Self::read_from_request_with_context(settings, req, geo.as_ref(), kv_store)
-    }
-
-    fn read_from_request_with_context(
+    pub fn read_from_request_with_geo(
         settings: &Settings,
         req: &Request,
-        geo: Option<&GeoInfo>,
-        kv_store: Option<&dyn crate::platform::PlatformKvStore>,
+        geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
 
@@ -211,9 +197,9 @@ impl EcContext {
             jar: parsed.jar.as_ref(),
             req: &http_req,
             config: &settings.consent,
-            geo,
+            geo: geo_info,
             ec_id: ec_value.as_deref(),
-            kv_store,
+            kv_store: None,
         });
 
         Ok(Self {
@@ -223,6 +209,7 @@ impl EcContext {
             ec_generated: false,
             consent,
             client_ip,
+            geo_info: geo_info.cloned(),
         })
     }
 
@@ -242,6 +229,7 @@ impl EcContext {
     pub fn generate_if_needed(
         &mut self,
         settings: &Settings,
+        kv: Option<&KvIdentityGraph>,
     ) -> Result<(), Report<TrustedServerError>> {
         if self.ec_value.is_some() {
             return Ok(());
@@ -265,6 +253,19 @@ impl EcContext {
         log::trace!("Generated new EC ID: {ec_id}");
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
+
+        if let (Some(graph), Some(ec_value)) = (kv, self.ec_value.as_deref()) {
+            let now = current_timestamp();
+            let entry = KvEntry::new(&self.consent, self.geo_info.as_ref(), now);
+            let ec_hash = generation::ec_hash(ec_value);
+
+            if let Err(err) = graph.create_or_revive(ec_hash, &entry) {
+                log::error!(
+                    "Failed to create or revive EC entry for hash '{}' after generation: {err:?}",
+                    ec_hash,
+                );
+            }
+        }
 
         Ok(())
     }
@@ -306,6 +307,12 @@ impl EcContext {
         self.client_ip.as_deref()
     }
 
+    /// Returns the pre-routing geo data, if available.
+    #[must_use]
+    pub fn geo_info(&self) -> Option<&GeoInfo> {
+        self.geo_info.as_ref()
+    }
+
     /// Returns whether EC creation is permitted by consent for this request.
     #[must_use]
     pub fn ec_allowed(&self) -> bool {
@@ -322,6 +329,22 @@ impl EcContext {
     pub fn existing_cookie_ec_id(&self) -> Option<&str> {
         self.cookie_ec_value.as_deref()
     }
+
+    /// Returns true when both cookie and active EC are present and differ.
+    #[must_use]
+    pub fn has_cookie_mismatch(&self) -> bool {
+        matches!(
+            (self.cookie_ec_value.as_deref(), self.ec_value.as_deref()),
+            (Some(cookie), Some(active)) if cookie != active
+        )
+    }
+}
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -400,7 +423,7 @@ mod tests {
         let req = create_test_request(&[("x-ts-ec", "existing-id")]);
 
         let mut ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
-        ec.generate_if_needed(&settings)
+        ec.generate_if_needed(&settings, None)
             .expect("should not error when EC already exists");
 
         assert_eq!(
