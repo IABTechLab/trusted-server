@@ -10,6 +10,8 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
+use trusted_server_core::ec::admin::handle_register_partner;
+use trusted_server_core::ec::partner::PartnerStore;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -123,10 +125,13 @@ async fn route_request(
         // Signature verification endpoint
         (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
 
-        // Key rotation admin endpoints
+        // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
         (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
+        (Method::POST, "/admin/partners/register") => {
+            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req))
+        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
@@ -226,4 +231,16 @@ fn init_logger() {
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
         .expect("should initialize logger");
+}
+
+/// Constructs a `PartnerStore` from settings, or returns 503 if the
+/// `partner_store` config is not set.
+fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
+    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.partner_store".to_owned(),
+            message: "ec.partner_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(PartnerStore::new(store_name))
 }
