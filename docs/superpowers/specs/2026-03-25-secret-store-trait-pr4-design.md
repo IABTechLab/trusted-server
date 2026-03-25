@@ -57,9 +57,16 @@ existing `#[cfg(test)]` block, following established patterns:
 
 ### 1. `get_secret_bytes_returns_error_when_open_fails`
 
-Verifies the open-failure path surfaces as `PlatformError::SecretStore`.
-Follows the pattern of `get_config_value_returns_error_when_lookup_fails`.
-Uses the `get_secret_bytes` free function with a closure that returns `Err`.
+Verifies the **store-open failure** path surfaces as `PlatformError::SecretStore`.
+The `open_store` closure passed to `get_secret_bytes` returns `Err("open failed")`,
+simulating a failed `SecretStore::open()` call. No changes to `StubSecretStore`
+are needed — the closure fails before the stub is ever constructed.
+
+Note: `get_secret_bytes` has four reachable error/success branches:
+open failure, lookup error, key not found (`Ok(None)`), and decrypt failure.
+The decrypt-failure branch is already tested. The lookup-error and key-not-found
+branches are deferred — they are not required by the issue's "Done when" criteria
+and the coverage gap does not affect production correctness for this PR's scope.
 
 ### 2. `fastly_platform_secret_store_create_returns_not_implemented`
 
@@ -102,6 +109,10 @@ No other files are modified.
 - `AuctionContext` changes — PR 12.5
 - Any changes to `trusted-server-core` — trait and `RuntimeServices` already
   defined
+- `PlatformSecretStore::get_string` default method — it delegates to `get_bytes`
+  and performs UTF-8 conversion; it has no direct tests in this PR since it is a
+  provided trait method whose correctness depends entirely on `get_bytes`, which
+  is already covered
 
 ---
 
