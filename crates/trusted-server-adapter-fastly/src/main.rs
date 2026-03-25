@@ -1,6 +1,6 @@
 use error_stack::Report;
 use fastly::http::{header, Method};
-use fastly::{Request, Response};
+use fastly::{Error, Request, Response};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -10,13 +10,15 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
-use trusted_server_core::ec::sync_pixel::{handle_sync, FastlyRateLimiter, RATE_COUNTER_NAME};
+use trusted_server_core::ec::pull_sync::{
+    build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
+};
+use trusted_server_core::ec::sync_pixel::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -26,9 +28,7 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
-};
+use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -45,16 +45,9 @@ mod route_tests;
 
 use crate::error::to_error_response;
 use crate::logging::init_logger;
-use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+use crate::platform::{build_runtime_services, UnavailableKvStore};
 
-/// Entry point for the Fastly Compute program.
-///
-/// Uses an undecorated `main()` with `Request::from_client()` instead of
-/// `#[fastly::main]` so we can call `stream_to_client()` or `send_to_client()`
-/// explicitly. `#[fastly::main]` is syntactic sugar that auto-calls
-/// `send_to_client()` on the returned `Response`, which is incompatible with
-/// streaming.
-fn main() {
+fn main() -> Result<(), Error> {
     init_logger();
 
     let req = Request::from_client();
@@ -65,7 +58,7 @@ fn main() {
         Response::from_status(200)
             .with_body_text_plain("ok")
             .send_to_client();
-        return;
+        return Ok(());
     }
 
     let settings = match get_settings() {
@@ -73,9 +66,11 @@ fn main() {
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
             to_error_response(&e).send_to_client();
-            return;
+            return Ok(());
         }
     };
+    // lgtm[rust/cleartext-logging]
+    // `Settings` uses `Redacted<T>` for secrets, so this debug dump is redacted.
     log::debug!("Settings {settings:?}");
 
     // Short-circuit the ja4 debug probe before finalize_response so that
@@ -86,16 +81,16 @@ fn main() {
         } else {
             Response::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
         }
-        return;
+        return Ok(());
     }
 
     // Build the auction orchestrator once at startup
     let orchestrator = match build_orchestrator(&settings) {
-        Ok(o) => o,
+        Ok(orchestrator) => orchestrator,
         Err(e) => {
             log::error!("Failed to build auction orchestrator: {:?}", e);
             to_error_response(&e).send_to_client();
-            return;
+            return Ok(());
         }
     };
 
@@ -104,7 +99,7 @@ fn main() {
         Err(e) => {
             log::error!("Failed to create integration registry: {:?}", e);
             to_error_response(&e).send_to_client();
-            return;
+            return Ok(());
         }
     };
 
@@ -115,17 +110,32 @@ fn main() {
         as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
     let runtime_services = build_runtime_services(&req, kv_store);
 
-    // route_request may send the response directly (streaming path) or
-    // return it for us to send (buffered path).
-    if let Some(response) = futures::executor::block_on(route_request(
+    let outcome = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &runtime_services,
         req,
-    )) {
-        response.send_to_client();
+    ))?;
+
+    let RouteOutcome {
+        response,
+        pull_sync_context,
+    } = outcome;
+
+    response.send_to_client();
+
+    if let Some(context) = pull_sync_context {
+        run_pull_sync_after_send(&settings, &context);
     }
+
+    Ok(())
+}
+
+#[must_use]
+struct RouteOutcome {
+    response: Response,
+    pull_sync_context: Option<PullSyncContext>,
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -176,18 +186,21 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
     mut req: Request,
-) -> Option<Response> {
+) -> Result<RouteOutcome, Error> {
     // Strip client-spoofable forwarded headers at the edge.
     // On Fastly this service IS the first proxy — these headers from
     // clients are untrusted and can hijack URL rewriting (see #409).
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     // Extract geo info before auth check or routing consumes the request.
+    #[allow(deprecated)]
     let geo_info = GeoInfo::from_request(&req);
+
+    let is_real_browser = true;
 
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
-    if req.get_method() == Method::POST && req.get_path() == "/api/v1/sync" {
+    if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/batch-sync" {
         let mut response = require_identity_graph(settings)
             .and_then(|kv| {
                 require_partner_store(settings).and_then(|partner_store| {
@@ -197,7 +210,10 @@ async fn route_request(
             })
             .unwrap_or_else(|e| to_error_response(&e));
         finalize_response(settings, geo_info.as_ref(), &mut response);
-        return Ok(response);
+        return Ok(RouteOutcome {
+            response,
+            pull_sync_context: None,
+        });
     }
 
     let mut ec_context =
@@ -206,11 +222,18 @@ async fn route_request(
             Err(err) => {
                 let mut response = to_error_response(&err);
                 finalize_response(settings, geo_info.as_ref(), &mut response);
-                return Some(response);
+                return Ok(RouteOutcome {
+                    response,
+                    pull_sync_context: None,
+                });
             }
         };
 
-    let kv_graph = maybe_identity_graph(settings);
+    let kv_graph = if is_real_browser {
+        maybe_identity_graph(settings)
+    } else {
+        None
+    };
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
@@ -227,14 +250,20 @@ async fn route_request(
                 &mut response,
             );
             finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Some(response);
+            return Ok(RouteOutcome {
+                response,
+                pull_sync_context: None,
+            });
         }
         Ok(None) => {}
         Err(e) => {
             log::error!("Failed to evaluate basic auth: {:?}", e);
             let mut response = to_error_response(&e);
             finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Some(response);
+            return Ok(RouteOutcome {
+                response,
+                pull_sync_context: None,
+            });
         }
     }
 
@@ -243,76 +272,94 @@ async fn route_request(
     let method = req.get_method().clone();
 
     // Match known routes and handle them
-    let result = match (method, path.as_str()) {
+    let (result, organic_route) = match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&req, integration_registry)
+            (handle_tsjs_dynamic(&req, integration_registry), false)
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
-        (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, runtime_services, req)
-        }
+        (Method::GET, "/.well-known/trusted-server.json") => (
+            handle_trusted_server_discovery(settings, runtime_services, req),
+            false,
+        ),
 
         // Signature verification endpoint
-        (Method::POST, "/verify-signature") => {
-            handle_verify_signature(settings, runtime_services, req)
-        }
+        (Method::POST, "/verify-signature") => (
+            handle_verify_signature(settings, runtime_services, req),
+            false,
+        ),
 
         // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, runtime_services, req),
-        (Method::POST, "/admin/keys/deactivate") => {
-            handle_deactivate_key(settings, runtime_services, req)
+        (Method::POST, "/admin/keys/rotate") | (Method::POST, "/_ts/admin/keys/rotate") => {
+            (handle_rotate_key(settings, runtime_services, req), false)
         }
-        (Method::POST, "/admin/partners/register") => {
-            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req))
+        (Method::POST, "/admin/keys/deactivate") | (Method::POST, "/_ts/admin/keys/deactivate") => {
+            (
+                handle_deactivate_key(settings, runtime_services, req),
+                false,
+            )
         }
-
-        (Method::GET, "/sync") => require_identity_graph(settings).and_then(|kv| {
-            require_partner_store(settings).and_then(|partner_store| {
-                handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
-            })
-        }),
-        (Method::GET, "/identify") => require_identity_graph(settings).and_then(|kv| {
-            require_partner_store(settings).and_then(|partner_store| {
-                handle_identify(settings, &kv, &partner_store, &req, &ec_context)
-            })
-        }),
-        (Method::OPTIONS, "/identify") => cors_preflight_identify(settings, &req),
+        (Method::POST, "/admin/partners/register")
+        | (Method::POST, "/_ts/admin/partners/register") => (
+            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
+            false,
+        ),
+        (Method::GET, "/_ts/api/v1/identify") => (
+            require_identity_graph(settings).and_then(|kv| {
+                require_partner_store(settings).and_then(|partner_store| {
+                    handle_identify(settings, &kv, &partner_store, &req, &ec_context)
+                })
+            }),
+            false,
+        ),
+        (Method::OPTIONS, "/_ts/api/v1/identify") => {
+            (cors_preflight_identify(settings, &req), false)
+        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
             let partner_store = require_partner_store(settings).ok();
-            handle_auction(
-                settings,
-                orchestrator,
-                kv_graph.as_ref(),
-                partner_store.as_ref(),
-                &ec_context,
-                runtime_services,
-                req,
+            (
+                handle_auction(
+                    settings,
+                    orchestrator,
+                    kv_graph.as_ref(),
+                    partner_store.as_ref(),
+                    &ec_context,
+                    runtime_services,
+                    req,
+                )
+                .await,
+                false,
             )
-            .await
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
-        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
+        (Method::GET, "/first-party/proxy") => {
+            (handle_first_party_proxy(settings, req).await, false)
+        }
+        (Method::GET, "/first-party/click") => {
+            (handle_first_party_click(settings, req).await, false)
+        }
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, req).await
+            (handle_first_party_proxy_sign(settings, req).await, false)
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, req).await
+            (handle_first_party_proxy_rebuild(settings, req).await, false)
         }
-        (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
-            .await
-            .unwrap_or_else(|| {
-                Err(Report::new(TrustedServerError::BadRequest {
-                    message: format!("Unknown integration route: {path}"),
-                }))
-            }),
+        (m, path) if integration_registry.has_route(&m, path) => {
+            let result = integration_registry
+                .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
+                .await
+                .unwrap_or_else(|| {
+                    Err(Report::new(TrustedServerError::BadRequest {
+                        message: format!("Unknown integration route: {path}"),
+                    }))
+                });
+            (result, true)
+        }
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
@@ -321,70 +368,32 @@ async fn route_request(
                 path
             );
 
-            match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(publisher_services) => {
-                    match handle_publisher_request(
-                        settings,
-                        integration_registry,
-                        &publisher_services,
-                        kv_graph.as_ref(),
-                        &mut ec_context,
-                        req,
-                    ) {
-                        Ok(PublisherResponse::Stream {
-                            mut response,
-                            body,
-                            params,
-                        }) => {
-                            // Streaming path: finalize headers, then stream body to client.
-                            ec_finalize_response(
-                                settings,
-                                geo_info.as_ref(),
-                                &ec_context,
-                                kv_graph.as_ref(),
-                                &mut response,
-                            );
-                            finalize_response(settings, geo_info.as_ref(), &mut response);
-                            let mut streaming_body = response.stream_to_client();
-                            if let Err(e) = stream_publisher_body(
-                                body,
-                                &mut streaming_body,
-                                &params,
-                                settings,
-                                integration_registry,
-                            ) {
-                                // Headers already committed. Log and abort — client
-                                // sees a truncated response. Standard proxy behavior.
-                                log::error!("Streaming processing failed: {e:?}");
-                                drop(streaming_body);
-                            } else if let Err(e) = streaming_body.finish() {
-                                log::error!("Failed to finish streaming body: {e}");
-                            }
-                            // Response already sent via stream_to_client()
-                            return None;
-                        }
-                        Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                            // Binary pass-through: reattach body and send via send_to_client().
-                            // This preserves Content-Length and avoids chunked encoding overhead.
-                            // Fastly streams the body from its internal buffer — no WASM
-                            // memory buffering occurs.
-                            response.set_body(body);
-                            Ok(response)
-                        }
-                        Ok(PublisherResponse::Buffered(response)) => Ok(response),
-                        Err(e) => {
-                            log::error!("Failed to proxy to publisher origin: {:?}", e);
-                            Err(e)
-                        }
-                    }
+            let result = match handle_publisher_request(
+                settings,
+                integration_registry,
+                runtime_services,
+                kv_graph.as_ref(),
+                &mut ec_context,
+                req,
+            ) {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    log::error!("Failed to proxy to publisher origin: {:?}", e);
+                    Err(e)
                 }
-            }
+            };
+            (result, true)
         }
     };
+
+    let route_succeeded = result.is_ok();
 
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
+    // Bot gate still suppresses KV-backed side effects and pull sync via
+    // `kv_graph = None`, but response finalization always runs so cookie
+    // writes and revocations behave consistently for browser traffic.
     ec_finalize_response(
         settings,
         geo_info.as_ref(),
@@ -395,11 +404,45 @@ async fn route_request(
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
-    Some(response)
+    let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
+        // Pull sync is intentionally refreshed only from successful organic
+        // browser traffic. This keeps the trigger narrow in the current PR;
+        // broadening it to auction-heavy or SPA-only flows is a follow-up
+        // product decision rather than an implicit behavior change here.
+        build_pull_sync_context(&ec_context)
+    } else {
+        None
+    };
+
+    Ok(RouteOutcome {
+        response,
+        pull_sync_context,
+    })
 }
 
 fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
     settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
+}
+
+fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
+    let kv = match require_identity_graph(settings) {
+        Ok(kv) => kv,
+        Err(err) => {
+            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
+            return;
+        }
+    };
+
+    let partner_store = match require_partner_store(settings) {
+        Ok(store) => store,
+        Err(err) => {
+            log::debug!("Pull sync: partner store unavailable, skipping: {err:?}");
+            return;
+        }
+    };
+
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    dispatch_pull_sync(settings, &kv, &partner_store, &limiter, context);
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

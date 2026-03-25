@@ -18,6 +18,7 @@ proxy_secret = "change-me-proxy-secret"
 passphrase = "trusted-server"
 ec_store = "ec_identity_store"
 partner_store = "ec_partner_store"
+pull_sync_concurrency = 3
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
