@@ -18,12 +18,16 @@
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_types`] — Schema types for KV identity graph entries
+//! - [`partner`] — Partner registry (`PartnerRecord`, `PartnerStore`)
+//! - [`admin`] — Admin endpoints for partner management
 
+pub mod admin;
 pub mod consent;
 pub mod cookies;
 pub mod generation;
 pub mod kv;
 pub mod kv_types;
+pub mod partner;
 
 use cookie::CookieJar;
 use error_stack::Report;
