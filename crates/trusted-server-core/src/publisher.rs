@@ -6,7 +6,7 @@ use crate::backend::BackendConfig;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::ec::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -340,7 +340,7 @@ pub fn handle_publisher_request(
         ec_id: Some(ec_id.as_str()),
     });
     let ec_allowed = allows_ec_creation(&consent_context);
-    log::trace!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed);
+    log::debug!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed,);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,

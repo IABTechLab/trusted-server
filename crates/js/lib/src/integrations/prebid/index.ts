@@ -269,13 +269,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       } else {
         unit.bids.push({ bidder: ADAPTER_CODE, params: tsParams });
       }
-
-      // Remove server-side bidder entries — they are now handled via the
-      // trustedServer adapter. Only keep client-side bidders (which run via
-      // their native Prebid.js adapters) and the trustedServer bid itself.
-      unit.bids = unit.bids.filter(
-        (b) => b.bidder === ADAPTER_CODE || clientSideBidders.has(b.bidder ?? '')
-      );
     }
 
     // Ensure the trustedServer adapter is allowed to return bids under any
