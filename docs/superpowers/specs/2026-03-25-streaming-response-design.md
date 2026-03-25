@@ -61,21 +61,32 @@ Note: this makes `HtmlRewriterAdapter` single-use — `reset()` becomes a no-op
 since the `Settings` are consumed by the rewriter constructor. This matches
 actual usage (one adapter per request).
 
-#### B) `process_gzip_to_gzip` — chunk-based decompression
+#### B) Chunk-based decompression for all compression paths
 
-Currently calls `read_to_end()` to decompress the entire body into memory. The
-deflate and brotli paths already use the chunk-based
+`process_gzip_to_gzip` calls `read_to_end()` to decompress the entire body into
+memory. The deflate and brotli keep-compression paths already use chunk-based
 `process_through_compression()`.
 
 Fix: use the same `process_through_compression` pattern for gzip.
 
+Additionally, `decompress_and_process()` (used by `process_gzip_to_none`,
+`process_deflate_to_none`, `process_brotli_to_none`) also calls
+`read_to_end()`. These strip-compression paths must be converted to chunk-based
+processing too — read decompressed chunks, process each, write uncompressed
+output directly.
+
+Reference: `process_uncompressed` already implements the correct chunk-based
+pattern (read loop → `process_chunk()` per chunk → `write_all()` → flush). The
+compressed paths should follow the same structure.
+
 #### C) `process_through_compression` finalization — prerequisite for B
 
 `process_through_compression` currently uses `drop(encoder)` which silently
-swallows errors. For gzip specifically, the trailer contains a CRC32 checksum —
-if `finish()` fails, corrupted responses are served silently. Today this affects
-deflate and brotli (which already use `process_through_compression`); after Step
-1B moves gzip to this path, it will affect gzip too.
+swallows errors. Today this affects deflate and brotli (which already use this
+path). The current `process_gzip_to_gzip` calls `encoder.finish()` explicitly —
+but Step 1B moves gzip to `process_through_compression`, which would **regress**
+gzip from working `finish()` to broken `drop()`. This fix prevents that
+regression and also fixes the pre-existing issue for deflate/brotli.
 
 Fix: call `encoder.finish()` explicitly and propagate errors. This must land
 before or with Step 1B.
@@ -89,11 +100,14 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
    `send_to_client()`.
 3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
    to buffered path.
-4. Finalize all response headers (cookies, synthetic ID, geo, version).
-   Today, synthetic ID/cookie headers are set _after_ body processing in
-   `handle_publisher_request`. Since they are body-independent (computed from
-   request cookies and consent context), they must be reordered to run _before_
-   `stream_to_client()` so headers are complete before streaming begins.
+4. Finalize all response headers. This requires reordering two things:
+   - **Synthetic ID/cookie headers**: today set _after_ body processing in
+     `handle_publisher_request`. Since they are body-independent (computed from
+     request cookies and consent context), move them _before_ streaming.
+   - **`finalize_response()`** (main.rs): today called _after_ `route_request`
+     returns, adding geo, version, staging, and operator headers. In the
+     streaming path, this must run _before_ `stream_to_client()` since the
+     publisher handler sends the response directly instead of returning it.
 5. Remove `Content-Length` header — the final size is unknown after processing.
    Fastly's `StreamingBody` sends the response using chunked transfer encoding
    automatically.
@@ -103,17 +117,36 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
 8. Call `finish()` on success; on error, log and drop (client sees truncated
    response).
 
-For binary/non-text content: call `response.take_body()` then
-`StreamingBody::append(body)` for zero-copy pass-through, bypassing the pipeline
-entirely. Today binary responses skip `take_body()` and return the response
-as-is — the streaming path needs to explicitly take the body to hand it to
-`append()`.
+For binary/non-text content: call `response.take_body()` then stream via
+`io::copy(&mut body, &mut streaming_body)`. The `Body` type implements `Read`
+and `StreamingBody` implements `Write`, so this streams the backend body to the
+client without buffering the full content. Today binary responses skip
+`take_body()` and return the response as-is — the streaming path needs to
+explicitly take the body to pipe it through.
 
 #### Entry point change
 
-Migrate `main.rs` from `#[fastly::main]` to raw `main()` with `fastly::init()`
-\+ `Request::from_client()`. This is required because `stream_to_client()` /
-`send_to_client()` are incompatible with `#[fastly::main]`'s return-based model.
+Migrate `main.rs` from `#[fastly::main]` to an undecorated `main()` with
+`Request::from_client()`. No separate initialization call is needed —
+`#[fastly::main]` is just syntactic sugar for `Request::from_client()` +
+`Response::send_to_client()`. The migration is required because
+`stream_to_client()` / `send_to_client()` are incompatible with
+`#[fastly::main]`'s return-based model.
+
+```rust
+fn main() {
+    let req = Request::from_client();
+    match handle(req) {
+        Ok(()) => {}
+        Err(e) => to_error_response(&e).send_to_client(),
+    }
+}
+```
+
+Note: the return type changes from `Result<Response, Error>` to `()` (or
+`Result<(), Error>`). Errors that currently propagate to `main`'s `Result` must
+now be caught explicitly and sent via `send_to_client()` with
+`to_error_response()`.
 
 Non-streaming routes (static, auction, discovery) use `send_to_client()` as
 before.
@@ -134,18 +167,19 @@ Origin body (gzip)
   → StreamingBody::finish()
 ```
 
-Memory at steady state: ~8KB input chunk buffer + lol_html internal parser state
-\+ gzip encoder window + overlap buffer for replacer. Roughly constant regardless
+Memory at steady state: ~8KB input chunk buffer, lol_html internal parser state,
+gzip encoder window, and overlap buffer for replacer. Roughly constant regardless
 of document size, versus the current ~4x document size.
 
 ### Pass-through path (binary, images, fonts, etc.)
 
 ```
-Origin body
-  → StreamingBody::append(body) → zero-copy transfer
+Origin body (via take_body())
+  → io::copy(&mut body, &mut streaming_body) → streamed transfer
+  → StreamingBody::finish()
 ```
 
-No decompression, no processing, no buffering.
+No decompression, no processing. Body streams through as read.
 
 ### Buffered fallback path (error responses or post-processors present)
 
@@ -168,8 +202,10 @@ headers have not been sent yet, return a proper error response via
 
 **Processing fails mid-stream**: `lol_html` parse error, decompression
 corruption, I/O error during chunk processing. Headers (200 OK) are already
-sent. Log the error server-side, drop the `StreamingBody`. Client sees a
-truncated response and the connection closes. Standard reverse proxy behavior.
+sent. Log the error server-side, drop the `StreamingBody`. Per the Fastly SDK,
+`StreamingBody` automatically aborts the response if dropped without calling
+`finish()` — the client sees a connection reset / truncated response. This is
+standard reverse proxy behavior.
 
 **Compression finalization fails**: The gzip trailer CRC32 write fails. With the
 fix, `encoder.finish()` is called explicitly and errors propagate. Same
@@ -182,9 +218,9 @@ headers are sent, we are committed.
 
 | File                                                    | Change                                                                                                                                                                                                | Risk   |
 | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); fix `process_gzip_to_gzip` to use chunk-based processing; fix `process_through_compression` to call `finish()` explicitly | High   |
+| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); convert all compression paths to chunk-based processing (`process_gzip_to_gzip` and `decompress_and_process`); fix `process_through_compression` to call `finish()` explicitly | High |
 | `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming | Medium |
-| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to raw `main()` with `fastly::init()` + `Request::from_client()`; route results to `send_to_client()` or let streaming path handle its own output                      | Medium |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming | Medium |
 
 **Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
 `HtmlRewriterAdapter`, works as-is), integration registration, JS build
@@ -194,6 +230,12 @@ Note: `HtmlWithPostProcessing` wraps `HtmlRewriterAdapter` and applies
 post-processors on `is_last`. In the streaming path the post-processor list is
 empty (that's the gate condition), so the wrapper is a no-op passthrough. It
 remains in place — no need to bypass it.
+
+Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
+`html_post_processors`. Script rewriters run inside `lol_html` element handlers
+during streaming — they do not require buffering and are unaffected by this
+change. The streaming gate checks only `html_post_processors().is_empty()`, not
+script rewriters. Currently only Next.js registers a post-processor.
 
 ## Rollback Strategy
 
