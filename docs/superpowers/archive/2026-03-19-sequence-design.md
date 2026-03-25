@@ -106,12 +106,12 @@ sequenceDiagram
     TS->>TS: ✅ Reconstruct full URL<br/>✅ Validate tstoken (enc+SHA256)
     TS->>CS: GET original_url
     CS-->>TS: 200 (image/HTML)
-    
+
     opt 📄 HTML Response
       TS->>TS: 🔏 Generate signed target URLs<br/>🔄 Rewrite resource URLs
       TS-->>U: 200 text/html (secured)
     end
-    
+
     opt 🖼️ Image Response
       TS->>TS: ✅ Verify content-type<br/>📊 Log pixel tracking
       TS-->>U: 200 image/* (proxied)
@@ -128,6 +128,7 @@ sequenceDiagram
 ```
 
 ## Notes
+
 - TSJS
   - Served first-party at `/static/tsjs=tsjs-unified.min.js?v=<hash>`. The server dynamically concatenates core + enabled integration modules based on config.
   - Discovers ad units and renders placeholders; either uses slot-level HTML (`/first-party/ad`) or JSON auction (`/auction`).
