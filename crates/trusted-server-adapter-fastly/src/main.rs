@@ -186,7 +186,16 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            handle_auction(settings, orchestrator, kv_graph.as_ref(), &ec_context, req).await
+            let partner_store = require_partner_store(settings).ok();
+            handle_auction(
+                settings,
+                orchestrator,
+                kv_graph.as_ref(),
+                partner_store.as_ref(),
+                &ec_context,
+                req,
+            )
+            .await
         }
 
         // tsjs endpoints
