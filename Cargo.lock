@@ -2779,7 +2779,6 @@ name = "trusted-server-adapter-fastly"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "chrono",
  "edgezero-adapter-fastly",
  "edgezero-core",

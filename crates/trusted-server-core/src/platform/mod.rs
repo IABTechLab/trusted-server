@@ -3,6 +3,15 @@
 //! This module defines platform-neutral service contracts and request-scoped
 //! runtime state. Concrete implementations live in adapter crates such as
 //! `trusted-server-adapter-fastly`.
+//!
+//! ## Traits
+//!
+//! - [`PlatformConfigStore`] — key-value config store access
+//! - [`PlatformSecretStore`] — encrypted secret store access
+//! - [`PlatformKvStore`] — (re-exported from `edgezero_core`)
+//! - [`PlatformBackend`] — dynamic backend registration
+//! - [`PlatformHttpClient`] — outbound HTTP client
+//! - [`PlatformGeo`] — geographic information lookup
 
 mod error;
 mod http;

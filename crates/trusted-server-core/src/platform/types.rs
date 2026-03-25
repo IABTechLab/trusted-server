@@ -62,7 +62,7 @@ pub struct ClientInfo {
 /// accidentally passing a management API identifier where a runtime name is
 /// expected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
-pub struct StoreName(pub String);
+pub struct StoreName(String);
 
 impl From<String> for StoreName {
     fn from(s: String) -> Self {
@@ -89,7 +89,7 @@ impl AsRef<str> for StoreName {
 /// accidentally passing a runtime store name where a management API
 /// identifier is expected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
-pub struct StoreId(pub String);
+pub struct StoreId(String);
 
 impl From<String> for StoreId {
     fn from(s: String) -> Self {

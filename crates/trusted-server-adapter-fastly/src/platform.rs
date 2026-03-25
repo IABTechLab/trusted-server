@@ -106,6 +106,8 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         let name = store_name.as_ref();
+        // Unlike ConfigStore::open (which panics), SecretStore::open already
+        // returns Result — there is no try_open variant on SecretStore.
         let store = SecretStore::open(name).map_err(|e| {
             Report::new(PlatformError::SecretStore)
                 .attach(format!("failed to open secret store '{name}': {e}"))
@@ -123,7 +125,7 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
             })?;
         secret
             .try_plaintext()
-            .map(|bytes| bytes.into_iter().collect())
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| {
                 Report::new(PlatformError::SecretStore)
                     .attach(format!("failed to decrypt secret '{key}': {e}"))
@@ -163,21 +165,22 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 /// timeout → unique name).
 pub struct FastlyPlatformBackend;
 
+fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
+    BackendConfig::new(&spec.scheme, &spec.host)
+        .port(spec.port)
+        .certificate_check(spec.certificate_check)
+        .first_byte_timeout(spec.first_byte_timeout)
+}
+
 impl PlatformBackend for FastlyPlatformBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        BackendConfig::new(&spec.scheme, &spec.host)
-            .port(spec.port)
-            .certificate_check(spec.certificate_check)
-            .first_byte_timeout(spec.first_byte_timeout)
+        backend_config_from_spec(spec)
             .predict_name()
             .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        BackendConfig::new(&spec.scheme, &spec.host)
-            .port(spec.port)
-            .certificate_check(spec.certificate_check)
-            .first_byte_timeout(spec.first_byte_timeout)
+        backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
     }
