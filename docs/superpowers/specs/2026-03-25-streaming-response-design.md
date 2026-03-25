@@ -15,8 +15,8 @@ in memory before sending any bytes to the client. This creates two costs:
 ## Scope
 
 **In scope**: All content types flowing through the publisher proxy path — HTML,
-text/JSON, and binary pass-through. Only when Next.js is disabled (no
-post-processor requiring the full document).
+text/JSON, RSC Flight (`text/x-component`), and binary pass-through. Only when
+Next.js is disabled (no post-processor requiring the full document).
 
 **Out of scope**: Concurrent origin+auction fetch, Next.js-enabled paths (these
 require full-document post-processing by design), non-publisher routes (static
@@ -27,11 +27,14 @@ JS, auction, discovery).
 Before committing to `stream_to_client()`, check:
 
 1. Backend status is success (2xx).
-2. `html_post_processors()` is empty — no registered post-processors.
+2. For HTML content: `html_post_processors()` is empty — no registered
+   post-processors. Non-HTML content types (text/JSON, RSC Flight, binary) can
+   always stream regardless of post-processor registration, since
+   post-processors only apply to HTML.
 
-If either check fails, fall back to the current buffered path. This keeps the
-optimization transparent: same behavior for all existing configurations,
-streaming only activates when safe.
+If either check fails for the given content type, fall back to the current
+buffered path. This keeps the optimization transparent: same behavior for all
+existing configurations, streaming only activates when safe.
 
 ## Architecture
 
@@ -51,6 +54,12 @@ each chunk.
 Fix: create the rewriter eagerly in the constructor, use
 `Rc<RefCell<Vec<u8>>>` to share the output buffer between the sink and
 `process_chunk()`, drain the buffer on every call instead of only on `is_last`.
+The output buffer is drained *after* each `rewriter.write()` returns, so the
+`RefCell` borrow in the sink closure never overlaps with the drain borrow.
+
+Note: this makes `HtmlRewriterAdapter` single-use — `reset()` becomes a no-op
+since the `Settings` are consumed by the rewriter constructor. This matches
+actual usage (one adapter per request).
 
 #### B) `process_gzip_to_gzip` — chunk-based decompression
 
@@ -60,12 +69,16 @@ deflate and brotli paths already use the chunk-based
 
 Fix: use the same `process_through_compression` pattern for gzip.
 
-#### C) `process_through_compression` finalization
+#### C) `process_through_compression` finalization — prerequisite for B
 
-Currently uses `drop(encoder)` which silently swallows errors from the gzip
-trailer CRC32 checksum.
+`process_through_compression` currently uses `drop(encoder)` which silently
+swallows errors. For gzip specifically, the trailer contains a CRC32 checksum —
+if `finish()` fails, corrupted responses are served silently. Today this affects
+deflate and brotli (which already use `process_through_compression`); after Step
+1B moves gzip to this path, it will affect gzip too.
 
-Fix: call `encoder.finish()` explicitly and propagate errors.
+Fix: call `encoder.finish()` explicitly and propagate errors. This must land
+before or with Step 1B.
 
 ### Step 2: Stream response to client
 
@@ -77,10 +90,13 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
 3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
    to buffered path.
 4. Finalize all response headers (cookies, synthetic ID, geo, version).
-5. Call `response.stream_to_client()` — headers sent to client immediately.
-6. Pipe origin body through the streaming pipeline, writing chunks directly to
+5. Remove `Content-Length` header — the final size is unknown after processing.
+   Fastly's `StreamingBody` sends the response using chunked transfer encoding
+   automatically.
+6. Call `response.stream_to_client()` — headers sent to client immediately.
+7. Pipe origin body through the streaming pipeline, writing chunks directly to
    `StreamingBody`.
-7. Call `finish()` on success; on error, log and drop (client sees truncated
+8. Call `finish()` on success; on error, log and drop (client sees truncated
    response).
 
 For binary/non-text content: use `StreamingBody::append(body)` for zero-copy
@@ -154,13 +170,27 @@ headers are sent, we are committed.
 
 | File | Change | Risk |
 |------|--------|------|
-| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally; fix `process_gzip_to_gzip` to use chunk-based processing; fix `process_through_compression` to call `finish()` explicitly | Medium |
+| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); fix `process_gzip_to_gzip` to use chunk-based processing; fix `process_through_compression` to call `finish()` explicitly | High |
 | `crates/trusted-server-core/src/publisher.rs` | Split `handle_publisher_request` into streaming vs buffered paths based on `html_post_processors().is_empty()` | Medium |
 | `crates/trusted-server-adapter-fastly/src/main.rs` | Migrate from `#[fastly::main]` to raw `main()` with `fastly::init()` + `Request::from_client()`; route results to `send_to_client()` or let streaming path handle its own output | Medium |
 
 **Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
 `HtmlRewriterAdapter`, works as-is), integration registration, JS build
 pipeline, tsjs module serving, auction handler, cookie/synthetic ID logic.
+
+Note: `HtmlWithPostProcessing` wraps `HtmlRewriterAdapter` and applies
+post-processors on `is_last`. In the streaming path the post-processor list is
+empty (that's the gate condition), so the wrapper is a no-op passthrough. It
+remains in place — no need to bypass it.
+
+## Rollback Strategy
+
+The `#[fastly::main]` to raw `main()` migration is a structural change. If
+streaming causes issues in production, the fastest rollback is reverting the
+`main.rs` change — the buffered path still exists and the pipeline improvements
+(Step 1) are safe to keep regardless. No feature flag needed; a git revert of
+the Step 2 commit restores buffered behavior while retaining Step 1 memory
+improvements.
 
 ## Testing Strategy
 
