@@ -63,7 +63,7 @@ impl FastlyApiClient {
         let backend_name = BackendConfig::from_url("https://api.fastly.com", true)?;
         let api_key = FastlySecretStore::new(store_name).get(key_name)?;
 
-        log::debug!("FastlyApiClient initialized with backend: {}", backend_name);
+        log::debug!("FastlyApiClient initialized");
 
         Ok(Self {
             api_key,
