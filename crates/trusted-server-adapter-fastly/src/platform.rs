@@ -534,6 +534,19 @@ mod tests {
     }
 
     #[test]
+    fn get_secret_bytes_returns_error_when_open_fails() {
+        let err = get_secret_bytes::<StubSecretStore, _, _>("signing_keys", "active", || {
+            Err::<StubSecretStore, &'static str>("permission denied")
+        })
+        .expect_err("should return an error when the secret store cannot be opened");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::SecretStore),
+            "should surface as PlatformError::SecretStore"
+        );
+    }
+
+    #[test]
     fn fastly_platform_http_client_reports_not_implemented() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
