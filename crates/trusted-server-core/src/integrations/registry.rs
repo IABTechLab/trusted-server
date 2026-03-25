@@ -10,7 +10,7 @@ use matchit::Router;
 
 use crate::constants::HEADER_X_TS_EC;
 use crate::cookies::set_ec_cookie;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::ec::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 

@@ -618,7 +618,6 @@ impl PrebidAuctionProvider {
                 // EIDs will be populated by identity providers; consent gating
                 // is applied via `gate_eids_by_consent` before they are set here.
                 eids: None,
-                ec_fresh: Some(request.user.fresh_id.clone()),
             }
             .to_ext(),
             ..Default::default()
@@ -1269,7 +1268,7 @@ mod tests {
             },
             user: UserInfo {
                 id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+
                 consent: None,
             },
             device: None,
@@ -1316,8 +1315,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
@@ -2629,7 +2628,7 @@ server_url = "https://prebid.example"
             },
             user: UserInfo {
                 id: "synth-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+
                 consent: None,
             },
             device: Some(DeviceInfo {

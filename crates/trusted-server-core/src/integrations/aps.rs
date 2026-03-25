@@ -678,7 +678,6 @@ mod tests {
             },
             user: UserInfo {
                 id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
                 consent: None,
             },
             device: Some(DeviceInfo {
