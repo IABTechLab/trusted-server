@@ -15,7 +15,8 @@ use super::kv::KvIdentityGraph;
 use super::partner::{PartnerRecord, PartnerStore};
 use super::EcContext;
 
-const RATE_COUNTER_NAME: &str = "counter_store";
+/// Name of the Fastly rate counter resource used by sync rate limiting.
+pub const RATE_COUNTER_NAME: &str = "counter_store";
 
 /// Handles `GET /sync` pixel sync requests.
 ///
@@ -233,16 +234,43 @@ fn decode_query_fallback_consent(
     }
 }
 
-trait RateLimiter {
+/// Rate limiter abstraction for sync endpoints.
+///
+/// Used by both pixel sync (`/sync`) and batch sync (`/api/v1/sync`)
+/// for per-partner request rate enforcement.
+pub trait RateLimiter {
+    /// Returns `true` when the rate limit has been exceeded for the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] on rate counter I/O failure.
     fn exceeded(&self, key: &str, hourly_limit: u32) -> Result<bool, Report<TrustedServerError>>;
+
+    /// Returns `true` when the per-minute rate limit has been exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] on rate counter I/O failure.
+    fn exceeded_per_minute(
+        &self,
+        key: &str,
+        per_minute_limit: u32,
+    ) -> Result<bool, Report<TrustedServerError>> {
+        // Default implementation maps a per-minute budget to the existing
+        // hourly API used by pixel sync.
+        self.exceeded(key, per_minute_limit.saturating_mul(60))
+    }
 }
 
-struct FastlyRateLimiter {
+/// Fastly Edge Rate Limiting implementation of [`RateLimiter`].
+pub struct FastlyRateLimiter {
     counter: RateCounter,
 }
 
 impl FastlyRateLimiter {
-    fn new(counter_name: &str) -> Self {
+    /// Creates a new rate limiter backed by the named Fastly rate counter.
+    #[must_use]
+    pub fn new(counter_name: &str) -> Self {
         Self {
             counter: RateCounter::open(counter_name),
         }
@@ -284,7 +312,9 @@ impl RateLimiter for FastlyRateLimiter {
     }
 }
 
-fn current_timestamp() -> u64 {
+/// Returns the current Unix timestamp in seconds.
+#[must_use]
+pub fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

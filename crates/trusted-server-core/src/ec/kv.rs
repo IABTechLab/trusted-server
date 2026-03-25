@@ -30,6 +30,24 @@ const ENTRY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// TTL for withdrawal tombstones (24 hours).
 const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Outcome of an [`KvIdentityGraph::upsert_partner_id_if_exists`] call.
+///
+/// Unlike [`KvIdentityGraph::upsert_partner_id`] (which auto-creates entries),
+/// this enum encodes the per-mapping rejection reasons needed by the S2S
+/// batch sync endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertResult {
+    /// The partner ID was successfully written.
+    Written,
+    /// The KV key does not exist — S2S must not create new entries.
+    NotFound,
+    /// The entry's `consent.ok` is `false` (withdrawal tombstone).
+    ConsentWithdrawn,
+    /// The request timestamp is not newer than the stored `synced` value,
+    /// so the write was skipped. Counted as accepted by the batch endpoint.
+    Stale,
+}
+
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
 /// Each EC hash (64-char hex prefix) maps to a JSON-encoded [`KvEntry`]
@@ -402,6 +420,90 @@ impl KvIdentityGraph {
                         attempt + 1,
                     );
                     // Loop will re-read on next iteration.
+                }
+                Err(err) => {
+                    return Err(
+                        Report::new(err).change_context(TrustedServerError::KvStore {
+                            store_name: self.store_name.clone(),
+                            message: format!(
+                                "Failed to upsert partner '{partner_id}' for key '{ec_hash}'"
+                            ),
+                        }),
+                    );
+                }
+            }
+        }
+
+        Err(Report::new(TrustedServerError::KvStore {
+            store_name: self.store_name.clone(),
+            message: format!(
+                "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_hash}'"
+            ),
+        }))
+    }
+
+    /// Upserts a partner ID only if the KV entry already exists.
+    ///
+    /// Unlike [`Self::upsert_partner_id`], this method does **not** create
+    /// entries for missing keys. Used by the S2S batch sync endpoint where
+    /// the KV entry must have been created by the organic EC flow.
+    ///
+    /// Returns [`UpsertResult::Stale`] when the stored `synced` timestamp
+    /// for this partner is already >= `synced`, skipping the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store I/O or CAS
+    /// exhaustion errors.
+    pub fn upsert_partner_id_if_exists(
+        &self,
+        ec_hash: &str,
+        partner_id: &str,
+        uid: &str,
+        synced: u64,
+    ) -> Result<UpsertResult, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (mut entry, generation) = match self.get(ec_hash)? {
+                Some(pair) => pair,
+                None => return Ok(UpsertResult::NotFound),
+            };
+
+            if !entry.consent.ok {
+                return Ok(UpsertResult::ConsentWithdrawn);
+            }
+
+            // Skip if existing sync is at least as fresh as the request.
+            if let Some(existing) = entry.ids.get(partner_id) {
+                if existing.synced >= synced {
+                    return Ok(UpsertResult::Stale);
+                }
+            }
+
+            entry.ids.insert(
+                partner_id.to_owned(),
+                super::kv_types::KvPartnerId {
+                    uid: uid.to_owned(),
+                    synced,
+                },
+            );
+
+            let (body, meta_str) = Self::serialize_entry(&entry, &self.store_name)?;
+
+            match store
+                .build_insert()
+                .if_generation_match(generation)
+                .metadata(&meta_str)
+                .time_to_live(ENTRY_TTL)
+                .execute(ec_hash, body.as_str())
+            {
+                Ok(()) => return Ok(UpsertResult::Written),
+                Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
+                    log::debug!(
+                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_hash}'",
+                        attempt + 1,
+                    );
                 }
                 Err(err) => {
                     return Err(
