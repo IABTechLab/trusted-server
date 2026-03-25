@@ -4,9 +4,13 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::consent::gate_eids_by_consent;
+use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::partner::PartnerStore;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::openrtb::Eid;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
@@ -29,7 +33,8 @@ use super::AuctionOrchestrator;
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
-    _kv: Option<&KvIdentityGraph>,
+    kv: Option<&KvIdentityGraph>,
+    partner_store: Option<&PartnerStore>,
     ec_context: &EcContext,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
@@ -58,9 +63,21 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
+    // Resolve partner EIDs from the KV identity graph when the user has
+    // a valid EC and both KV and partner stores are available.
+    let eids = resolve_auction_eids(kv, partner_store, ec_context);
+
     // Convert tsjs request format to auction request
-    let auction_request =
+    let mut auction_request =
         convert_tsjs_to_auction_request(&body, settings, &req, consent_context, ec_id)?;
+
+    // Apply consent gating to the resolved EIDs before attaching them to the
+    // auction request. `gate_eids_by_consent` checks TCF Purpose 1 + 4.
+    let had_eids = eids.as_ref().is_some_and(|v| !v.is_empty());
+    auction_request.user.eids = gate_eids_by_consent(eids, auction_request.user.consent.as_ref());
+    if had_eids && auction_request.user.eids.is_none() {
+        log::debug!("Auction EIDs stripped by TCF consent gating");
+    }
 
     // Create auction context
     let context = AuctionContext {
@@ -86,5 +103,126 @@ pub async fn handle_auction(
     );
 
     // Convert to OpenRTB response format with inline creative HTML
-    convert_to_openrtb_response(&result, settings, &auction_request)
+    convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
+}
+
+/// Resolves partner EIDs from the KV identity graph for bidstream decoration.
+///
+/// Returns `None` when any prerequisite is missing (no KV store, no partner
+/// store, no EC, consent denied). On KV or partner-resolution errors, logs a
+/// warning and returns empty EIDs so the auction can proceed in degraded mode.
+fn resolve_auction_eids(
+    kv: Option<&KvIdentityGraph>,
+    partner_store: Option<&PartnerStore>,
+    ec_context: &EcContext,
+) -> Option<Vec<Eid>> {
+    let kv = kv?;
+    let partner_store = partner_store?;
+
+    if !ec_context.ec_allowed() {
+        return None;
+    }
+
+    let ec_hash = ec_context.ec_hash()?;
+
+    let entry = match kv.get(ec_hash) {
+        Ok(Some((entry, _generation))) => entry,
+        Ok(None) => return Some(Vec::new()),
+        Err(err) => {
+            log::warn!("Auction KV read failed for EC hash '{ec_hash}': {err:?}");
+            return Some(Vec::new());
+        }
+    };
+
+    match resolve_partner_ids(partner_store, &entry) {
+        Ok(resolved) => Some(to_eids(&resolved)),
+        Err(err) => {
+            log::warn!("Auction partner resolution failed: {err:?}");
+            Some(Vec::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::ConsentContext;
+
+    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test(
+            ec_value.map(str::to_owned),
+            ConsentContext {
+                jurisdiction,
+                ..ConsentContext::default()
+            },
+        )
+    }
+
+    #[test]
+    fn resolve_auction_eids_returns_none_without_kv() {
+        let partner_store = PartnerStore::new("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let result = resolve_auction_eids(None, Some(&partner_store), &ec_context);
+        assert!(result.is_none(), "should return None when KV is missing");
+    }
+
+    #[test]
+    fn resolve_auction_eids_returns_none_without_partner_store() {
+        let kv = KvIdentityGraph::new("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let result = resolve_auction_eids(Some(&kv), None, &ec_context);
+        assert!(
+            result.is_none(),
+            "should return None when partner store is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_returns_none_when_consent_denied() {
+        let kv = KvIdentityGraph::new("test_store");
+        let partner_store = PartnerStore::new("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+
+        let result = resolve_auction_eids(Some(&kv), Some(&partner_store), &ec_context);
+        assert!(
+            result.is_none(),
+            "should return None when consent is denied"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_returns_none_when_no_ec() {
+        let kv = KvIdentityGraph::new("test_store");
+        let partner_store = PartnerStore::new("test_store");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let result = resolve_auction_eids(Some(&kv), Some(&partner_store), &ec_context);
+        assert!(
+            result.is_none(),
+            "should return None when no EC value is present"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_returns_empty_on_kv_miss() {
+        let kv = KvIdentityGraph::new("nonexistent_store");
+        let partner_store = PartnerStore::new("nonexistent_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        // KV store doesn't exist, so the get() call will error — should return
+        // empty Vec (degraded mode), not None.
+        let result = resolve_auction_eids(Some(&kv), Some(&partner_store), &ec_context);
+        let eids = result.expect("should return Some on KV error (degraded mode)");
+        assert!(
+            eids.is_empty(),
+            "should return empty vec on KV error (degraded mode)"
+        );
+    }
 }

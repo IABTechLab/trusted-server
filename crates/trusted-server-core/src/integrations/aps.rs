@@ -672,6 +672,7 @@ mod tests {
             user: UserInfo {
                 id: "user-123".to_string(),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("Mozilla/5.0".to_string()),
