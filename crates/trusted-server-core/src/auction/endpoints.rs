@@ -4,9 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
-use crate::consent;
-use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -34,6 +32,18 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    // Read EC state before consuming the request body.
+    let mut ec_context = EcContext::read_from_request(settings, &req).change_context(
+        TrustedServerError::Auction {
+            message: "Failed to read EC context".to_string(),
+        },
+    )?;
+
+    // Auction is an organic handler — generate EC if needed.
+    if let Err(err) = ec_context.generate_if_needed(settings) {
+        log::warn!("EC generation failed for auction: {err:?}");
+    }
+
     // Parse request body
     let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
         TrustedServerError::Auction {
@@ -46,16 +56,17 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
-    // Generate EC ID early so the consent pipeline can use it for
-    // KV Store fallback/write operations.
-    let ec_id = get_or_generate_ec_id(settings, services, &req).change_context(
-        TrustedServerError::Auction {
-            message: "Failed to generate EC ID".to_string(),
-        },
-    )?;
+    // Only forward the EC ID to auction partners when consent allows it.
+    // A returning user may still have a ts-ec cookie but have since
+    // withdrawn consent — forwarding that revoked ID to bidders would
+    // defeat the consent gating.
+    let ec_id = if ec_context.ec_allowed() {
+        ec_context.ec_value().unwrap_or("")
+    } else {
+        ""
+    };
+    let consent_context = ec_context.consent().clone();
 
-    // Extract consent from request cookies, headers, and geo.
-    let cookie_jar = handle_request_cookies(&req)?;
     let geo = services
         .geo()
         .lookup(services.client_info.client_ip)
@@ -63,18 +74,6 @@ pub async fn handle_auction(
             log::warn!("geo lookup failed: {e}");
             None
         });
-    let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
-        jar: cookie_jar.as_ref(),
-        req: &req,
-        config: &settings.consent,
-        geo: geo.as_ref(),
-        ec_id: Some(ec_id.as_str()),
-        kv_store: settings
-            .consent
-            .consent_store
-            .as_deref()
-            .map(|_| services.kv_store()),
-    });
 
     // Convert tsjs request format to auction request
     let auction_request = convert_tsjs_to_auction_request(
@@ -83,7 +82,7 @@ pub async fn handle_auction(
         services,
         &req,
         consent_context,
-        &ec_id,
+        ec_id,
         geo,
     )?;
 

@@ -366,7 +366,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
 | `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
 | `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/trusted-server-core/src/edge_cookie.rs`           | Edge Cookie (EC) ID generation                    |
+| `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |

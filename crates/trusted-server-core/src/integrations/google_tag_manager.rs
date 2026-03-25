@@ -1318,8 +1318,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1351,8 +1351,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"

@@ -420,9 +420,9 @@ Configure proxy behavior in `trusted-server.toml`:
 ```toml
 [publisher]
 domain = "publisher.com"
+cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-random-secret"
-cookie_domain = ".publisher.com"  # For ts-ec cookies
 ```
 
 ### Proxy Allowlist
