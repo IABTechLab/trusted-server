@@ -175,9 +175,7 @@ impl RscUrlRewriter {
                     regex
                 }
                 Err(e) => {
-                    log::error!(
-                        "Failed to compile origin URL pattern for host {origin_host:?}: {e}"
-                    );
+                    log::error!("Failed to compile origin URL pattern: {e}");
                     return Cow::Borrowed(input);
                 }
             },
