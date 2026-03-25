@@ -66,9 +66,9 @@ pub enum TrustedServerError {
     #[display("Proxy error: {message}")]
     Proxy { message: String },
 
-    /// Authorization failure — request understood but not permitted.
-    #[display("Unauthorized: {message}")]
-    Unauthorized { message: String },
+    /// Request understood but not permitted — results in a 403 Forbidden response.
+    #[display("Forbidden: {message}")]
+    Forbidden { message: String },
 
     /// Settings parsing or validation failed.
     #[display("Settings error: {message}")]
@@ -110,7 +110,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
-            Self::Unauthorized { .. } => StatusCode::FORBIDDEN,
+            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }

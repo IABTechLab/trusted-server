@@ -1078,7 +1078,7 @@ fn reconstruct_and_validate_signed_target(
     // Length is not secret (always 43 bytes for base64url-encoded SHA-256),
     // but we check explicitly to document the invariant.
     if !ct_str_eq(&expected, &sig) {
-        return Err(Report::new(TrustedServerError::Unauthorized {
+        return Err(Report::new(TrustedServerError::Forbidden {
             message: "invalid tstoken".to_string(),
         }));
     }

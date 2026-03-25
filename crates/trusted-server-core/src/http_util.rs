@@ -325,6 +325,15 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 /// non-secret lengths. Both checks always run — the short-circuit `&&` is safe
 /// here because token lengths are public information, not secrets.
 ///
+/// # Security
+///
+/// The length equality check short-circuits (via `&&`), which reveals whether the
+/// two strings have equal length via timing. This is safe when both strings have
+/// **publicly known, fixed lengths** (e.g. base64url-encoded SHA-256 digests are
+/// always 43 bytes). Do **not** use this function to compare secrets of
+/// variable or confidential length — use a constant-time comparison that
+/// also hides length, such as comparing HMAC outputs.
+///
 /// # Examples
 ///
 /// ```
