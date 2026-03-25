@@ -54,7 +54,7 @@ each chunk.
 Fix: create the rewriter eagerly in the constructor, use
 `Rc<RefCell<Vec<u8>>>` to share the output buffer between the sink and
 `process_chunk()`, drain the buffer on every call instead of only on `is_last`.
-The output buffer is drained *after* each `rewriter.write()` returns, so the
+The output buffer is drained _after_ each `rewriter.write()` returns, so the
 `RefCell` borrow in the sink closure never overlaps with the drain borrow.
 
 Note: this makes `HtmlRewriterAdapter` single-use — `reset()` becomes a no-op
@@ -90,6 +90,10 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
 3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
    to buffered path.
 4. Finalize all response headers (cookies, synthetic ID, geo, version).
+   Today, synthetic ID/cookie headers are set _after_ body processing in
+   `handle_publisher_request`. Since they are body-independent (computed from
+   request cookies and consent context), they must be reordered to run _before_
+   `stream_to_client()` so headers are complete before streaming begins.
 5. Remove `Content-Length` header — the final size is unknown after processing.
    Fastly's `StreamingBody` sends the response using chunked transfer encoding
    automatically.
@@ -99,13 +103,16 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
 8. Call `finish()` on success; on error, log and drop (client sees truncated
    response).
 
-For binary/non-text content: use `StreamingBody::append(body)` for zero-copy
-pass-through, bypassing the pipeline entirely.
+For binary/non-text content: call `response.take_body()` then
+`StreamingBody::append(body)` for zero-copy pass-through, bypassing the pipeline
+entirely. Today binary responses skip `take_body()` and return the response
+as-is — the streaming path needs to explicitly take the body to hand it to
+`append()`.
 
 #### Entry point change
 
 Migrate `main.rs` from `#[fastly::main]` to raw `main()` with `fastly::init()`
-+ `Request::from_client()`. This is required because `stream_to_client()` /
+\+ `Request::from_client()`. This is required because `stream_to_client()` /
 `send_to_client()` are incompatible with `#[fastly::main]`'s return-based model.
 
 Non-streaming routes (static, auction, discovery) use `send_to_client()` as
@@ -128,7 +135,7 @@ Origin body (gzip)
 ```
 
 Memory at steady state: ~8KB input chunk buffer + lol_html internal parser state
-+ gzip encoder window + overlap buffer for replacer. Roughly constant regardless
+\+ gzip encoder window + overlap buffer for replacer. Roughly constant regardless
 of document size, versus the current ~4x document size.
 
 ### Pass-through path (binary, images, fonts, etc.)
@@ -154,10 +161,15 @@ Origin returns 4xx/5xx OR html_post_processors() is non-empty
 Return the backend response as-is via `send_to_client()`. Client sees the
 correct error status code. No change from current behavior.
 
+**Processor creation fails**: `create_html_stream_processor()` or pipeline
+construction errors happen _before_ `stream_to_client()` is called. Since
+headers have not been sent yet, return a proper error response via
+`send_to_client()`. Same as current behavior.
+
 **Processing fails mid-stream**: `lol_html` parse error, decompression
-corruption, I/O error. Headers (200 OK) are already sent. Log the error
-server-side, drop the `StreamingBody`. Client sees a truncated response and the
-connection closes. Standard reverse proxy behavior.
+corruption, I/O error during chunk processing. Headers (200 OK) are already
+sent. Log the error server-side, drop the `StreamingBody`. Client sees a
+truncated response and the connection closes. Standard reverse proxy behavior.
 
 **Compression finalization fails**: The gzip trailer CRC32 write fails. With the
 fix, `encoder.finish()` is called explicitly and errors propagate. Same
@@ -168,11 +180,11 @@ headers are sent, we are committed.
 
 ## Files Changed
 
-| File | Change | Risk |
-|------|--------|------|
-| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); fix `process_gzip_to_gzip` to use chunk-based processing; fix `process_through_compression` to call `finish()` explicitly | High |
-| `crates/trusted-server-core/src/publisher.rs` | Split `handle_publisher_request` into streaming vs buffered paths based on `html_post_processors().is_empty()` | Medium |
-| `crates/trusted-server-adapter-fastly/src/main.rs` | Migrate from `#[fastly::main]` to raw `main()` with `fastly::init()` + `Request::from_client()`; route results to `send_to_client()` or let streaming path handle its own output | Medium |
+| File                                                    | Change                                                                                                                                                                                                | Risk   |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); fix `process_gzip_to_gzip` to use chunk-based processing; fix `process_through_compression` to call `finish()` explicitly | High   |
+| `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming | Medium |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to raw `main()` with `fastly::init()` + `Request::from_client()`; route results to `send_to_client()` or let streaming path handle its own output                      | Medium |
 
 **Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
 `HtmlRewriterAdapter`, works as-is), integration registration, JS build
