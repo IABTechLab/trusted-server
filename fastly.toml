@@ -23,11 +23,27 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
+        [[local_server.kv_stores.counter_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.opid_store]]
+            key = "placeholder"
+            data = "placeholder"
+
         [[local_server.kv_stores.creative_store]]
             key = "placeholder"
             data = "placeholder"
 
         [[local_server.kv_stores.consent_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.ec_partner_store]]
             key = "placeholder"
             data = "placeholder"
     [local_server.secret_stores]

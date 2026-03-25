@@ -2,8 +2,6 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use error_stack::Report;
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
-use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -93,9 +91,14 @@ mod tests {
 
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    fn settings_with_handlers() -> Settings {
+        let config = crate_test_settings_str();
+        Settings::from_toml(&config).expect("should parse settings with handlers")
+    }
+
     #[test]
     fn no_challenge_for_non_protected_path() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/open");
 
         assert!(enforce_basic_auth(&settings, &req)
@@ -105,7 +108,7 @@ mod tests {
 
     #[test]
     fn challenge_when_missing_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::GET, "https://example.com/secure");
 
         let response = enforce_basic_auth(&settings, &req)
@@ -120,7 +123,7 @@ mod tests {
 
     #[test]
     fn allow_when_credentials_match() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("user:pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -131,10 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn challenge_when_both_credentials_wrong() {
-        let settings = create_test_settings();
+    fn challenge_when_credentials_mismatch() {
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("wrong:wrong");
+        let token = STANDARD.encode("user:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
         let response = enforce_basic_auth(&settings, &req)
@@ -145,7 +148,7 @@ mod tests {
 
     #[test]
     fn challenge_when_scheme_is_not_basic() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::GET, "https://example.com/secure");
         req.set_header(header::AUTHORIZATION, "Bearer token");
 
@@ -168,7 +171,7 @@ mod tests {
 
     #[test]
     fn allow_admin_path_with_valid_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:admin-pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -183,7 +186,7 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
@@ -196,7 +199,7 @@ mod tests {
 
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
-        let settings = create_test_settings();
+        let settings = settings_with_handlers();
         let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
