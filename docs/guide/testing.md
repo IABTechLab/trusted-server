@@ -323,7 +323,6 @@ k6 run load-test.js
 5. **Use test helpers** - `create_test_settings()`, `create_test_request()`
 6. **Assert specific values** - Not just `assert!(result.is_ok())`
 
-
 ## Next Steps
 
 - Review [Architecture](/guide/architecture) for system design

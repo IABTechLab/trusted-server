@@ -20,6 +20,8 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
     pub domain: String,
+    /// Domain for non-EC cookies. EC cookies use a separate computed domain
+    /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
     #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
@@ -33,6 +35,17 @@ pub struct Publisher {
 impl Publisher {
     /// Known placeholder values that must not be used in production.
     pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret", "proxy-secret"];
+
+    /// Returns the EC cookie domain, computed as `.{domain}`.
+    ///
+    /// Per spec §5.2, EC cookies derive their domain from
+    /// `publisher.domain` — **not** from `publisher.cookie_domain`.
+    /// This ensures the EC cookie is always scoped to the publisher's
+    /// apex domain regardless of how `cookie_domain` is configured.
+    #[must_use]
+    pub fn ec_cookie_domain(&self) -> String {
+        format!(".{}", self.domain)
+    }
 
     /// Returns `true` if `proxy_secret` matches a known placeholder value
     /// (case-insensitive).
@@ -58,16 +71,6 @@ impl Publisher {
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
-    /// Returns the domain to use for the EC `Set-Cookie` header.
-    ///
-    /// Per spec §5.2, the EC cookie domain is `.{publisher.domain}` so
-    /// that the cookie is available on all subdomains of the publisher's
-    /// apex domain.
-    #[must_use]
-    pub fn ec_cookie_domain(&self) -> String {
-        format!(".{}", self.domain)
-    }
-
     #[allow(dead_code)]
     #[must_use]
     pub fn origin_host(&self) -> String {
@@ -522,6 +525,19 @@ impl Settings {
     ///
     /// # Errors
     ///
+    /// Returns a configuration error if any handler path regex does not compile.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            handler.prepare_runtime()?;
+        }
+
+        Ok(())
+    }
+
+    /// Rejects known placeholder secret values.
+    ///
+    /// # Errors
+    ///
     /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
     /// fields still contain a placeholder value.
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
@@ -534,7 +550,13 @@ impl Settings {
             insecure_fields.push("publisher.proxy_secret");
         }
 
-        Ok(())
+        if insecure_fields.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::InsecureDefault {
+            field: insecure_fields.join(", "),
+        }))
     }
 
     /// Resolve the first handler whose regex matches the request path.
@@ -832,6 +854,11 @@ mod tests {
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
+        assert_eq!(
+            settings.publisher.ec_cookie_domain(),
+            ".test-publisher.com",
+            "EC cookie domain should be computed as .{{domain}}"
+        );
         assert_eq!(
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"

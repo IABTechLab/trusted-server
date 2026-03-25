@@ -9,8 +9,8 @@ use fastly::{Request, Response};
 use matchit::Router;
 
 use crate::constants::HEADER_X_TS_EC;
-use crate::cookies::set_ec_cookie;
-use crate::ec::get_or_generate_ec_id;
+use crate::ec::cookies::{expire_ec_cookie, set_ec_cookie};
+use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -665,33 +665,46 @@ impl IntegrationRegistry {
         mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Generate EC ID before consuming request
-            let ec_id_result = get_or_generate_ec_id(settings, services, &req);
+            // Read EC state and generate if needed before consuming request.
+            let ec_context = match EcContext::read_from_request(settings, &req) {
+                Ok(mut ec) => {
+                    if let Err(err) = ec.generate_if_needed(settings) {
+                        log::warn!("EC generation failed for integration proxy: {err:?}");
+                    }
+                    Some(ec)
+                }
+                Err(err) => {
+                    log::warn!("Failed to read EC context for integration proxy: {err:?}");
+                    None
+                }
+            };
 
             // Set EC ID header on the request so integrations can read it.
-            // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
-            // so a crafted EC ID cannot inject additional request headers.
-            if let Ok(ref ec_id) = ec_id_result {
-                req.set_header(HEADER_X_TS_EC, ec_id.as_str());
+            if let Some(ec_id) = ec_context.as_ref().and_then(|ec| ec.ec_value()) {
+                req.set_header(HEADER_X_TS_EC, ec_id);
             }
 
             let mut result = proxy.handle(settings, services, req).await;
 
-            // Set EC ID header on successful responses
+            // Consent-gated EC on successful responses:
+            // - Consent given → set header + cookie.
+            // - Consent denied + existing cookie → expire cookie (revoke).
+            // - Otherwise → set header only (for internal use).
             if let Ok(ref mut response) = result {
-                match ec_id_result {
-                    Ok(ref ec_id) => {
-                        // Response-header injection: Fastly's HeaderValue API rejects values
-                        // containing \r, \n, or \0, so a crafted EC ID cannot inject
-                        // additional response headers.
-                        response.set_header(HEADER_X_TS_EC, ec_id.as_str());
-                        // Cookie is intentionally not set when EC ID contains RFC 6265-illegal
-                        // characters (e.g. a crafted x-ts-ec header value). The response header
-                        // is still emitted; only cookie persistence is skipped.
-                        set_ec_cookie(settings, response, ec_id.as_str());
+                if let Some(ref ec) = ec_context {
+                    if let Some(ec_id) = ec.ec_value() {
+                        response.set_header(HEADER_X_TS_EC, ec_id);
+                        if ec.ec_allowed() {
+                            set_ec_cookie(settings, response, ec_id);
+                        }
                     }
-                    Err(ref err) => {
-                        log::warn!("Failed to generate EC ID for integration response: {err:?}");
+                    if !ec.ec_allowed() {
+                        if let Some(cookie_ec_id) = ec.existing_cookie_ec_id() {
+                            log::info!(
+                                "EC revoked for '{cookie_ec_id}': consent withdrawn on integration proxy"
+                            );
+                            expire_ec_cookie(settings, response);
+                        }
                     }
                 }
             }
@@ -1233,7 +1246,6 @@ mod tests {
     }
 
     // Tests for EC ID header on proxy responses
-    use crate::constants::COOKIE_TS_EC;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::header;
 
@@ -1284,8 +1296,10 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        // Create a request without an EC ID cookie
-        let req = Request::get("https://test-publisher.com/integrations/test/ec");
+        // Provide an existing EC via header (client IP is unavailable in
+        // the test environment, so generation would fail).
+        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
+        req.set_header("x-ts-ec", "test-ec-id-from-header");
 
         // Call handle_proxy (uses futures executor in test environment)
         let result = futures::executor::block_on(registry.handle_proxy(
@@ -1297,35 +1311,29 @@ mod tests {
         ));
 
         // Should have matched and returned a response
-        assert!(result.is_some(), "Should find route and handle request");
+        assert!(result.is_some(), "should find route and handle request");
         let response = result.unwrap();
-        assert!(response.is_ok(), "Handler should succeed");
+        assert!(response.is_ok(), "handler should succeed");
 
         let response = response.unwrap();
 
-        // Verify x-ts-ec header is present
+        // The x-ts-ec header is always set for internal use by downstream
+        // integrations, regardless of consent.
         assert!(
             response.get_header(HEADER_X_TS_EC).is_some(),
-            "Response should have x-ts-ec header"
+            "should have x-ts-ec header on response"
         );
 
-        // Verify Set-Cookie header is present (since no cookie was in request)
-        let set_cookie = response.get_header(header::SET_COOKIE);
+        // Without geo data, jurisdiction is Unknown → consent denied
+        // (fail-closed). The Set-Cookie header should not be set.
         assert!(
-            set_cookie.is_some(),
-            "Response should have Set-Cookie header for ts-ec"
-        );
-
-        let cookie_value = set_cookie.unwrap().to_str().unwrap();
-        assert!(
-            cookie_value.contains(COOKIE_TS_EC),
-            "Set-Cookie should contain ts-ec cookie, got: {}",
-            cookie_value
+            response.get_header(header::SET_COOKIE).is_none(),
+            "should not set Set-Cookie when consent is denied"
         );
     }
 
     #[test]
-    fn handle_proxy_replaces_invalid_ec_request_header_with_matching_response_cookie() {
+    fn handle_proxy_rejects_invalid_ec_request_header_without_cookie() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1350,34 +1358,19 @@ mod tests {
         .expect("should handle proxy request");
 
         let response = result.expect("handler should succeed");
-        let response_header = response
-            .get_header(HEADER_X_TS_EC)
-            .expect("response should have x-ts-ec header")
-            .to_str()
-            .expect("header should be valid UTF-8")
-            .to_string();
-        let cookie_header = response
-            .get_header(header::SET_COOKIE)
-            .expect("response should have Set-Cookie header")
-            .to_str()
-            .expect("header should be valid UTF-8");
-        let cookie_value = cookie_header
-            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
-            .and_then(|s| s.split_once(';').map(|(value, _)| value))
-            .expect("should contain the ts-ec cookie value");
 
-        assert_ne!(
-            response_header, "evil;injected",
+        assert!(
+            response.get_header(HEADER_X_TS_EC).is_none(),
             "should not reflect the tampered request header"
         );
-        assert_eq!(
-            response_header, cookie_value,
-            "response header and cookie should carry the same effective EC ID"
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "should not set Set-Cookie for a tampered request header"
         );
     }
 
     #[test]
-    fn handle_proxy_always_sets_cookie() {
+    fn handle_proxy_skips_cookie_when_consent_denied() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1388,7 +1381,7 @@ mod tests {
         let registry = IntegrationRegistry::from_routes(routes);
 
         let mut req = Request::get("https://test.example.com/integrations/test/ec");
-        // Pre-existing cookie
+        // Pre-existing cookie, but no geo data → Unknown jurisdiction → consent denied.
         req.set_header(header::COOKIE, "ts-ec=existing_id_12345");
 
         let result = futures::executor::block_on(registry.handle_proxy(
@@ -1402,28 +1395,22 @@ mod tests {
 
         let response = result.expect("proxy handle should succeed");
 
-        // Should still have x-ts-ec header
+        // The x-ts-ec header is always set (for internal use by integrations).
         assert!(
             response.get_header(HEADER_X_TS_EC).is_some(),
-            "Response should still have x-ts-ec header"
+            "should still have x-ts-ec header for internal use"
         );
 
-        // Should ALWAYS set the cookie again (per new requirements)
-        let set_cookie = response.get_header(header::SET_COOKIE);
-
+        // Without geo data, jurisdiction is Unknown and consent is denied
+        // (fail-closed). An existing cookie should be expired (revoked).
+        let set_cookie = response
+            .get_header(header::SET_COOKIE)
+            .expect("should have Set-Cookie header to expire the existing cookie");
+        let cookie_str = set_cookie.to_str().expect("should be valid UTF-8");
         assert!(
-            set_cookie.is_some(),
-            "Should set Set-Cookie header even if cookie is present"
+            cookie_str.contains("Max-Age=0"),
+            "should expire the EC cookie when consent is denied, got: {cookie_str}"
         );
-
-        if let Some(cookie) = set_cookie {
-            let cookie_str = cookie.to_str().unwrap_or("");
-            assert!(
-                cookie_str.contains(COOKIE_TS_EC),
-                "Should contain ts-ec cookie, got: {}",
-                cookie_str
-            );
-        }
     }
 
     #[test]
@@ -1439,8 +1426,9 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let req =
+        let mut req =
             Request::post("https://test-publisher.com/integrations/test/ec").with_body("test body");
+        req.set_header("x-ts-ec", "test-ec-id-from-header");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::POST,
