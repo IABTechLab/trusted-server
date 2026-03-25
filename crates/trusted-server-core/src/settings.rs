@@ -58,6 +58,16 @@ impl Publisher {
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
+    /// Returns the domain to use for the EC `Set-Cookie` header.
+    ///
+    /// Per spec §5.2, the EC cookie domain is `.{publisher.domain}` so
+    /// that the cookie is available on all subdomains of the publisher's
+    /// apex domain.
+    #[must_use]
+    pub fn ec_cookie_domain(&self) -> String {
+        format!(".{}", self.domain)
+    }
+
     #[allow(dead_code)]
     #[must_use]
     pub fn origin_host(&self) -> String {
@@ -203,35 +213,49 @@ impl DerefMut for IntegrationSettings {
     }
 }
 
-/// Edge Cookie configuration.
+/// Edge Cookie (EC) configuration.
+///
+/// Mapped from the `[ec]` TOML section. Controls EC identity generation,
+/// KV store names, and partner registry.
 #[allow(unused)]
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-pub struct EdgeCookie {
-    #[validate(custom(function = EdgeCookie::validate_secret_key))]
-    pub secret_key: Redacted<String>,
+pub struct Ec {
+    /// Publisher passphrase used as HMAC key for EC generation.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+
+    /// Fastly KV store name for the EC identity graph.
+    /// Required for Stories 3+ (KV identity graph).
+    #[serde(default)]
+    pub ec_store: Option<String>,
+
+    /// Fastly KV store name for the partner registry.
+    /// Required for Story 4+ (partner registry).
+    #[serde(default)]
+    pub partner_store: Option<String>,
 }
 
-impl EdgeCookie {
+impl Ec {
     /// Known placeholder values that must not be used in production.
-    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+    pub const PASSPHRASE_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
 
-    /// Returns `true` if `secret_key` matches a known placeholder value
+    /// Returns `true` if `passphrase` matches a known placeholder value
     /// (case-insensitive).
     #[must_use]
-    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
-        Self::SECRET_KEY_PLACEHOLDERS
+    pub fn is_placeholder_passphrase(passphrase: &str) -> bool {
+        Self::PASSPHRASE_PLACEHOLDERS
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(secret_key))
+            .any(|p| p.eq_ignore_ascii_case(passphrase))
     }
 
-    /// Validates that the secret key is not empty.
+    /// Validates that the passphrase is not empty.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the secret key is empty.
-    pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
-        if secret_key.expose().is_empty() {
-            return Err(ValidationError::new("empty_secret_key"));
+    /// Returns a validation error if the passphrase is empty.
+    pub fn validate_passphrase(passphrase: &Redacted<String>) -> Result<(), ValidationError> {
+        if passphrase.expose().is_empty() {
+            return Err(ValidationError::new("empty_passphrase"));
         }
         Ok(())
     }
@@ -405,7 +429,7 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     #[validate(nested)]
-    pub edge_cookie: EdgeCookie,
+    pub ec: Ec,
     #[serde(default)]
     pub integrations: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -498,10 +522,16 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        for handler in &self.handlers {
-            handler.prepare_runtime()?;
+    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
+    /// fields still contain a placeholder value.
+    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut insecure_fields: Vec<&str> = Vec::new();
+
+        if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
+            insecure_fields.push("ec.passphrase");
+        }
+        if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
+            insecure_fields.push("publisher.proxy_secret");
         }
 
         Ok(())
@@ -806,7 +836,7 @@ mod tests {
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
-        assert_eq!(settings.edge_cookie.secret_key.expose(), "test-secret-key");
+        assert_eq!(settings.ec.passphrase.expose(), "test-secret-key");
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -853,32 +883,32 @@ mod tests {
     }
 
     #[test]
-    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
-        for placeholder in EdgeCookie::SECRET_KEY_PLACEHOLDERS {
+    fn is_placeholder_passphrase_rejects_all_known_placeholders() {
+        for placeholder in Ec::PASSPHRASE_PLACEHOLDERS {
             assert!(
-                EdgeCookie::is_placeholder_secret_key(placeholder),
-                "should detect placeholder secret_key '{placeholder}'"
+                Ec::is_placeholder_passphrase(placeholder),
+                "should detect placeholder passphrase '{placeholder}'"
             );
         }
     }
 
     #[test]
-    fn is_placeholder_secret_key_is_case_insensitive() {
+    fn is_placeholder_passphrase_is_case_insensitive() {
         assert!(
-            EdgeCookie::is_placeholder_secret_key("SECRET-KEY"),
-            "should detect case-insensitive placeholder secret_key"
+            Ec::is_placeholder_passphrase("SECRET-KEY"),
+            "should detect case-insensitive placeholder passphrase"
         );
         assert!(
-            EdgeCookie::is_placeholder_secret_key("Trusted-Server"),
-            "should detect mixed-case placeholder secret_key"
+            Ec::is_placeholder_passphrase("Trusted-Server"),
+            "should detect mixed-case placeholder passphrase"
         );
     }
 
     #[test]
-    fn is_placeholder_secret_key_accepts_non_placeholder() {
+    fn is_placeholder_passphrase_accepts_non_placeholder() {
         assert!(
-            !EdgeCookie::is_placeholder_secret_key("test-secret-key"),
-            "should accept non-placeholder secret_key"
+            !Ec::is_placeholder_passphrase("test-secret-key"),
+            "should accept non-placeholder passphrase"
         );
     }
 
@@ -1815,8 +1845,8 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key"
 
             [request_signing]
             config_store_id = "test-config-store-id"

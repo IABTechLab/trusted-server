@@ -21,7 +21,7 @@ cargo test
 Tests are organized alongside source code in `#[cfg(test)]` modules:
 
 ```rust
-// crates/trusted-server-core/src/edge_cookie.rs
+// crates/trusted-server-core/src/ec/generation.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,7 +88,7 @@ curl http://localhost:7676/.well-known/trusted-server.json
 
 ### EC ID Tests
 
-From `crates/trusted-server-core/src/edge_cookie.rs`:
+From `crates/trusted-server-core/src/ec/mod.rs`:
 
 ```rust
 #[test]
@@ -322,6 +322,7 @@ k6 run load-test.js
 4. **Keep tests fast** - Mock external dependencies
 5. **Use test helpers** - `create_test_settings()`, `create_test_request()`
 6. **Assert specific values** - Not just `assert!(result.is_ok())`
+
 
 ## Next Steps
 

@@ -20,7 +20,7 @@ EC IDs use HMAC (Hash-based Message Authentication Code) to generate a determini
 
 ## Configuration
 
-Configure EC secrets in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `[edge_cookie]` section and environment variable overrides.
+Configure EC settings in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `[ec]` section and environment variable overrides.
 
 ## Privacy Considerations
 

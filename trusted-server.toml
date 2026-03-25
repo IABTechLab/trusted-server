@@ -14,8 +14,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
-[edge_cookie]
-secret_key = "trusted-server"
+[ec]
+passphrase = "trusted-server"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
