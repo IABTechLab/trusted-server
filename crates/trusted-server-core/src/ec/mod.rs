@@ -23,8 +23,10 @@
 //! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
 //! - [`identify`] — Browser identity read endpoint (`GET /identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`batch_sync`] — S2S batch sync endpoint (`POST /api/v1/sync`)
 
 pub mod admin;
+pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
 pub mod eids;
