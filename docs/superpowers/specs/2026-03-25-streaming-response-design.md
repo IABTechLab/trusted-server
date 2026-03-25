@@ -81,9 +81,11 @@ compressed paths should follow the same structure.
 
 #### C) `process_through_compression` finalization — prerequisite for B
 
-`process_through_compression` currently uses `drop(encoder)` which silently
-swallows errors. Today this affects deflate and brotli (which already use this
-path). The current `process_gzip_to_gzip` calls `encoder.finish()` explicitly —
+`process_through_compression` currently calls `flush()` (with error
+propagation) then `drop(encoder)` for finalization. The `flush()` only flushes
+buffered data but does not write compression trailers/footers — `drop()`
+handles finalization but silently swallows errors. Today this affects deflate
+and brotli (which already use this path). The current `process_gzip_to_gzip` calls `encoder.finish()` explicitly —
 but Step 1B moves gzip to `process_through_compression`, which would **regress**
 gzip from working `finish()` to broken `drop()`. This fix prevents that
 regression and also fixes the pre-existing issue for deflate/brotli.
