@@ -546,12 +546,13 @@ mod tests {
         );
     }
 
+    // --- FastlyPlatformSecretStore write stubs ------------------------------
+
     #[test]
     fn fastly_platform_secret_store_create_returns_not_implemented() {
         let store = FastlyPlatformSecretStore;
-        let store_id = StoreId::from("test-store-id");
         let err = store
-            .create(&store_id, "my-secret", "value")
+            .create(&StoreId::from("test-store-id"), "my-secret", "value")
             .expect_err("should return an error for unimplemented create");
 
         assert!(
@@ -563,9 +564,8 @@ mod tests {
     #[test]
     fn fastly_platform_secret_store_delete_returns_not_implemented() {
         let store = FastlyPlatformSecretStore;
-        let store_id = StoreId::from("test-store-id");
         let err = store
-            .delete(&store_id, "my-secret")
+            .delete(&StoreId::from("test-store-id"), "my-secret")
             .expect_err("should return an error for unimplemented delete");
 
         assert!(
