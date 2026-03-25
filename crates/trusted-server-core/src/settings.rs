@@ -598,7 +598,11 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+        "/admin/partners/register",
+    ];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -2014,8 +2018,12 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
-            "should report both admin endpoints as uncovered"
+            vec![
+                "/admin/keys/rotate",
+                "/admin/keys/deactivate",
+                "/admin/partners/register",
+            ],
+            "should report all admin endpoints as uncovered"
         );
     }
 
@@ -2048,8 +2056,8 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/admin/keys/deactivate"],
-            "should detect that only deactivate is uncovered"
+            vec!["/admin/keys/deactivate", "/admin/partners/register"],
+            "should detect endpoints not covered by the rotate-only handler"
         );
     }
 
