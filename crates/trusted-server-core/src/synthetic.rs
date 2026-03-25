@@ -38,7 +38,7 @@ const SYNTHETIC_ID_LEN: usize = 71;
 ///
 /// The total length is checked first so that oversized attacker-supplied
 /// strings are rejected in O(1) before any character scanning occurs.
-fn is_valid_synthetic_id(value: &str) -> bool {
+pub(crate) fn is_valid_synthetic_id(value: &str) -> bool {
     if value.len() != SYNTHETIC_ID_LEN {
         return false;
     }
@@ -171,7 +171,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
         .and_then(|h| h.to_str().ok())
     {
         if is_valid_synthetic_id(raw) {
-            log::info!("Using existing synthetic ID from header");
+            log::debug!("Using existing synthetic ID from header");
             return Ok(Some(raw.to_string()));
         }
         log::warn!(
@@ -185,7 +185,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
                 let raw = cookie.value();
                 if is_valid_synthetic_id(raw) {
-                    log::info!("Using existing synthetic ID from cookie");
+                    log::debug!("Using existing synthetic ID from cookie");
                     return Ok(Some(raw.to_string()));
                 }
                 log::warn!(
@@ -205,8 +205,8 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 /// Gets a validated synthetic ID from the request, or generates a fresh one.
 ///
 /// Checks the `x-synthetic-id` header then the `synthetic_id` cookie via
-/// [`get_synthetic_id`]. Values that fail format validation are silently
-/// discarded — a warning is logged and a fresh ID is generated in their place,
+/// [`get_synthetic_id`]. Values that fail format validation are discarded — a
+/// warning is logged and a fresh ID is generated in their place,
 /// identical to the no-ID-present path.
 ///
 /// # Errors
@@ -223,7 +223,7 @@ pub fn get_or_generate_synthetic_id(
 
     // If no existing Synthetic ID found, generate a fresh one
     let synthetic_id = generate_synthetic_id(settings, req)?;
-    log::info!("No existing synthetic ID found, generated a fresh one");
+    log::debug!("No existing synthetic ID found, generated a fresh one");
     Ok(synthetic_id)
 }
 

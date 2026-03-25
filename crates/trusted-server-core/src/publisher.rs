@@ -13,7 +13,7 @@ use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
-use crate::synthetic::get_or_generate_synthetic_id;
+use crate::synthetic::{get_or_generate_synthetic_id, is_valid_synthetic_id};
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
@@ -377,14 +377,23 @@ pub fn handle_publisher_request(
         // characters. The header is still emitted when consent allows it.
         set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
     } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
-        log::info!(
-            "SSC revoked for '{}': consent withdrawn (jurisdiction={})",
-            cookie_synthetic_id,
-            consent_context.jurisdiction,
-        );
+        // Always expire the cookie — consent is withdrawn regardless of whether the
+        // stored value is well-formed.
         expire_synthetic_cookie(settings, &mut response);
-        if let Some(store_name) = &settings.consent.consent_store {
-            crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+        if is_valid_synthetic_id(cookie_synthetic_id) {
+            log::info!(
+                "SSC revoked: consent withdrawn (jurisdiction={})",
+                consent_context.jurisdiction,
+            );
+            if let Some(store_name) = &settings.consent.consent_store {
+                crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+            }
+        } else {
+            log::warn!(
+                "SSC cookie has invalid format, skipping KV deletion (len={}, jurisdiction={})",
+                cookie_synthetic_id.len(),
+                consent_context.jurisdiction,
+            );
         }
     } else {
         log::debug!(
