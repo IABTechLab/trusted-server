@@ -700,9 +700,9 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs will be populated by identity providers; consent gating
-                // is applied via `gate_eids_by_consent` before they are set here.
-                eids: None,
+                // EIDs resolved from the KV identity graph and consent-gated
+                // in `handle_auction` via `gate_eids_by_consent`.
+                eids: request.user.eids.clone(),
             }
             .to_ext(),
             ..Default::default()
@@ -1384,8 +1384,8 @@ mod tests {
             },
             user: UserInfo {
                 id: "user-123".to_string(),
-
                 consent: None,
+                eids: None,
             },
             device: None,
             site: None,
@@ -2695,6 +2695,67 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn to_openrtb_includes_eids_from_auction_request() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.eids = Some(vec![
+            crate::openrtb::Eid {
+                source: "liveramp.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "LR_xyz".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+            crate::openrtb::Eid {
+                source: "id5-sync.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "ID5_abc".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+        ]);
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        let ext_eids = &serialized["user"]["ext"]["eids"];
+        assert!(ext_eids.is_array(), "should populate user.ext.eids");
+        assert_eq!(ext_eids.as_array().unwrap().len(), 2, "should have 2 EIDs");
+        assert_eq!(
+            ext_eids[0]["source"], "liveramp.com",
+            "should include liveramp EID"
+        );
+        assert_eq!(
+            ext_eids[1]["source"], "id5-sync.com",
+            "should include id5 EID"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_eids_when_none() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert!(
+            serialized["user"]["ext"]["eids"].is_null(),
+            "should omit user.ext.eids when no EIDs available"
+        );
+    }
+
+    #[test]
     fn expand_trusted_server_bidders_uses_per_bidder_map_when_present() {
         let params = json!({
             "bidderParams": {
@@ -2796,8 +2857,8 @@ server_url = "https://prebid.example"
             },
             user: UserInfo {
                 id: "synth-123".to_string(),
-
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("test-agent".to_string()),

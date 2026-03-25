@@ -22,10 +22,12 @@
 //! - [`admin`] — Admin endpoints for partner management
 //! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
 //! - [`identify`] — Browser identity read endpoint (`GET /identify`)
+//! - [`eids`] — Shared EID resolution and formatting helpers
 
 pub mod admin;
 pub mod consent;
 pub mod cookies;
+pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
@@ -346,6 +348,21 @@ impl EcContext {
     #[must_use]
     pub fn ec_hash(&self) -> Option<&str> {
         self.ec_value.as_deref().map(generation::ec_hash)
+    }
+
+    /// Creates a test-only `EcContext` with explicit field values.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_test(ec_value: Option<String>, consent: ConsentContext) -> Self {
+        Self {
+            ec_was_present: ec_value.is_some(),
+            cookie_ec_value: ec_value.clone(),
+            ec_value,
+            ec_generated: false,
+            consent,
+            client_ip: None,
+            geo_info: None,
+        }
     }
 }
 
