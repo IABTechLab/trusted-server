@@ -80,6 +80,13 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
+    /// Consent-gated Extended User IDs resolved from the KV identity graph.
+    ///
+    /// Populated by the auction handler from partner data when the user has
+    /// a valid EC and consent permits EID transmission. `None` when no EIDs
+    /// are available (no EC, consent denied, or KV read failure).
+    #[serde(skip)]
+    pub eids: Option<Vec<crate::openrtb::Eid>>,
 }
 
 /// Device information from request.
