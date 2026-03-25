@@ -152,12 +152,12 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field           | Type   | Required | Description                                             |
-| --------------- | ------ | -------- | ------------------------------------------------------- |
-| `domain`        | String | Yes      | Publisher's apex domain name                            |
-| `cookie_domain` | String | Yes      | Domain for non-EC cookies (typically with leading dot)  |
-| `origin_url`    | String | Yes      | Full URL of publisher origin server                     |
-| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs            |
+| Field           | Type   | Required | Description                                            |
+| --------------- | ------ | -------- | ------------------------------------------------------ |
+| `domain`        | String | Yes      | Publisher's apex domain name                           |
+| `cookie_domain` | String | Yes      | Domain for non-EC cookies (typically with leading dot) |
+| `origin_url`    | String | Yes      | Full URL of publisher origin server                    |
+| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs           |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -270,11 +270,11 @@ Settings for generating privacy-preserving Edge Cookie identifiers.
 
 ### `[ec]`
 
-| Field           | Type            | Required | Description                                      |
-| --------------- | --------------- | -------- | ------------------------------------------------ |
-| `passphrase`    | String          | Yes      | Publisher passphrase used as HMAC key             |
-| `ec_store`      | String or null  | No       | Fastly KV store name for EC identity graph        |
-| `partner_store` | String or null  | No       | Fastly KV store name for partner registry         |
+| Field           | Type           | Required | Description                                |
+| --------------- | -------------- | -------- | ------------------------------------------ |
+| `passphrase`    | String         | Yes      | Publisher passphrase used as HMAC key      |
+| `ec_store`      | String or null | No       | Fastly KV store name for EC identity graph |
+| `partner_store` | String or null | No       | Fastly KV store name for partner registry  |
 
 **Example**:
 
