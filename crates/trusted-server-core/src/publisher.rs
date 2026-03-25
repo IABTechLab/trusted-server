@@ -22,7 +22,8 @@ use crate::compat;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
+use crate::ec::cookies::{expire_ec_cookie, set_ec_cookie};
+use crate::ec::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -487,7 +488,7 @@ pub fn handle_publisher_request(
     // Generate EC identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &http_req)?;
+    let ec_id = get_or_generate_ec_id(settings, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
@@ -704,14 +705,14 @@ fn apply_ec_headers(
         response.set_header(HEADER_X_TS_EC, ec_id);
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        compat::set_fastly_ec_cookie(settings, response, ec_id);
+        set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        compat::expire_fastly_ec_cookie(settings, response);
+        expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -726,7 +727,6 @@ fn apply_ec_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge_cookie::get_or_generate_ec_id;
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
