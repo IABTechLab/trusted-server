@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
@@ -13,16 +12,15 @@ use crate::constants::{
     HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
 };
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::settings::Settings;
 
+use super::eids::{build_eids_header, resolve_partner_ids, to_eids};
 use super::kv::KvIdentityGraph;
-use super::kv_types::KvEntry;
 use super::partner::PartnerStore;
 use super::EcContext;
 
 const MAX_EXPOSE_PARTNER_HEADERS: usize = 20;
-const MAX_EIDS_HEADER_BYTES: usize = 4096;
 
 /// Handles `GET /identify`.
 ///
@@ -162,77 +160,6 @@ struct IdentifyResponse {
     eids: Vec<Eid>,
 }
 
-struct ResolvedPartnerId {
-    partner_id: String,
-    uid: String,
-    synced: u64,
-    source_domain: String,
-    openrtb_atype: u8,
-}
-
-fn resolve_partner_ids(
-    partner_store: &PartnerStore,
-    entry: &KvEntry,
-) -> Result<Vec<ResolvedPartnerId>, Report<TrustedServerError>> {
-    let mut resolved = Vec::new();
-
-    for (partner_id, partner_uid) in &entry.ids {
-        if partner_uid.uid.is_empty() {
-            continue;
-        }
-
-        let Some(partner) = partner_store.get(partner_id)? else {
-            continue;
-        };
-        if !partner.bidstream_enabled {
-            continue;
-        }
-
-        resolved.push(ResolvedPartnerId {
-            partner_id: partner_id.clone(),
-            uid: partner_uid.uid.clone(),
-            synced: partner_uid.synced,
-            source_domain: partner.source_domain,
-            openrtb_atype: partner.openrtb_atype,
-        });
-    }
-
-    resolved.sort_by(|a, b| b.synced.cmp(&a.synced));
-    Ok(resolved)
-}
-
-fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
-    resolved
-        .iter()
-        .map(|item| Eid {
-            source: item.source_domain.clone(),
-            uids: vec![Uid {
-                id: item.uid.clone(),
-                atype: Some(item.openrtb_atype),
-                ext: None,
-            }],
-        })
-        .collect()
-}
-
-fn build_eids_header(
-    resolved: &[ResolvedPartnerId],
-) -> Result<(String, bool), Report<TrustedServerError>> {
-    for size in (0..=resolved.len()).rev() {
-        let eids = to_eids(&resolved[..size]);
-        let json = serde_json::to_vec(&eids).change_context(TrustedServerError::Configuration {
-            message: "Failed to serialize identify eids header payload".to_owned(),
-        })?;
-        let encoded = BASE64.encode(json);
-
-        if encoded.len() <= MAX_EIDS_HEADER_BYTES {
-            return Ok((encoded, size != resolved.len()));
-        }
-    }
-
-    Ok((BASE64.encode("[]"), true))
-}
-
 fn json_response<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
@@ -295,6 +222,7 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::eids::{ResolvedPartnerId, MAX_EIDS_HEADER_BYTES};
     use crate::test_support::tests::create_test_settings;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
