@@ -2,9 +2,10 @@ mod common;
 mod environments;
 mod frameworks;
 
-use common::runtime::{TestError, origin_port, wasm_binary_path};
+use common::runtime::{RuntimeEnvironment, TestError, origin_port, wasm_binary_path};
 use environments::{RUNTIME_ENVIRONMENTS, ReadyCheckOptions, wait_for_http_ready};
 use error_stack::ResultExt as _;
+use frameworks::scenarios::EcScenario;
 use frameworks::{FRAMEWORKS, FrontendFramework};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
@@ -133,4 +134,40 @@ fn test_nextjs_fastly() {
     let runtime = environments::fastly::FastlyViceroy;
     let framework = frameworks::nextjs::NextJs;
     test_combination(&runtime, &framework).expect("should pass Next.js on Fastly");
+}
+
+// ---------------------------------------------------------------------------
+// EC identity lifecycle tests (no frontend framework container needed)
+// ---------------------------------------------------------------------------
+
+/// Runs all EC lifecycle scenarios against a standalone Viceroy instance.
+///
+/// Unlike framework tests, these use a minimal TCP origin server instead
+/// of a Docker container — organic routes need *something* to proxy to
+/// so the trusted-server can generate and set EC cookies.
+#[test]
+#[ignore = "requires Viceroy and pre-built WASM binary"]
+fn test_ec_lifecycle_fastly() {
+    init_logger();
+    let port = origin_port();
+
+    // Start a minimal origin server so organic route proxying succeeds.
+    let _origin = common::ec::MinimalOrigin::start(port);
+    log::info!("EC lifecycle tests: minimal origin running on port {port}");
+
+    let runtime = environments::fastly::FastlyViceroy;
+    let wasm_path = wasm_binary_path();
+
+    let process = runtime
+        .spawn(&wasm_path)
+        .expect("should spawn Viceroy for EC tests");
+
+    log::info!("EC lifecycle tests: Viceroy running at {}", process.base_url);
+
+    for scenario in EcScenario::all() {
+        log::info!("  Running EC scenario: {scenario:?}");
+        scenario
+            .run(&process.base_url)
+            .unwrap_or_else(|e| panic!("EC scenario {scenario:?} failed: {e:?}"));
+    }
 }
