@@ -21,6 +21,18 @@
             key = "placeholder"
             data = "placeholder"
 
+        [[local_server.kv_stores.consent_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.ec_partner_store]]
+            key = "placeholder"
+            data = "placeholder"
+
     # These are generated test-only key pairs, not production credentials.
     # The Ed25519 private key (data) and its matching public key (x in jwks_store below)
     # exist solely for signing and verifying tokens in the integration test environment.
