@@ -24,6 +24,7 @@
 //! - [`identify`] — Browser identity read endpoint (`GET /identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /api/v1/sync`)
+//! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
 pub mod admin;
 pub mod batch_sync;
@@ -36,6 +37,7 @@ pub mod identify;
 pub mod kv;
 pub mod kv_types;
 pub mod partner;
+pub mod pull_sync;
 pub mod sync_pixel;
 
 use cookie::CookieJar;
@@ -363,6 +365,25 @@ impl EcContext {
             ec_generated: false,
             consent,
             client_ip: None,
+            geo_info: None,
+        }
+    }
+
+    /// Creates a test-only [`EcContext`] with explicit client IP.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_test_with_ip(
+        ec_value: Option<String>,
+        consent: ConsentContext,
+        client_ip: Option<String>,
+    ) -> Self {
+        Self {
+            ec_was_present: ec_value.is_some(),
+            cookie_ec_value: ec_value.clone(),
+            ec_value,
+            ec_generated: false,
+            consent,
+            client_ip,
             geo_info: None,
         }
     }

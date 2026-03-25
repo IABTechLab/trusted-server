@@ -236,11 +236,21 @@ pub struct Ec {
     /// Required for Story 4+ (partner registry).
     #[serde(default)]
     pub partner_store: Option<String>,
+
+    /// Maximum number of concurrent pull-sync requests.
+    #[serde(default = "Ec::default_pull_sync_concurrency")]
+    pub pull_sync_concurrency: usize,
 }
 
 impl Ec {
     /// Known placeholder values that must not be used in production.
     pub const PASSPHRASE_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+
+    /// Default maximum concurrent pull-sync requests.
+    #[must_use]
+    pub const fn default_pull_sync_concurrency() -> usize {
+        3
+    }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
     /// (case-insensitive).
