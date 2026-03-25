@@ -1,6 +1,7 @@
 //! Shared utilities for Next.js integration modules.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use std::sync::LazyLock;
 
@@ -107,12 +108,11 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
 ///
 /// Compiling per-request ensures only origin URLs are matched, avoiding the closure overhead
 /// that a broad static pattern would incur for every URL-like token in the payload.
-fn build_origin_url_pattern(origin_host: &str) -> Regex {
+fn build_origin_url_pattern(origin_host: &str) -> Result<Regex, regex::Error> {
     let escaped = regex::escape(origin_host);
     Regex::new(&format!(
         r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>{escaped}(?::\d+)?)"#
     ))
-    .expect("should compile origin-specific RSC URL regex")
 }
 
 /// Rewriter for URL patterns in RSC payloads.
@@ -126,12 +126,18 @@ fn build_origin_url_pattern(origin_host: &str) -> Regex {
 /// Use this for RSC T-chunk content where any origin URL should be rewritten.
 /// For attribute-specific rewriting (e.g., only rewrite `"href"` values), use
 /// the `UrlRewriter` in `script_rewriter.rs` instead.
+///
+/// The compiled regex for the last-seen `origin_host` is cached so that
+/// repeated calls within a single request (e.g. across multiple RSC payloads)
+/// avoid recompiling the same pattern each time.
 #[derive(Clone, Default)]
-pub(crate) struct RscUrlRewriter;
+pub(crate) struct RscUrlRewriter {
+    cached_pattern: RefCell<Option<(String, Regex)>>,
+}
 
 impl RscUrlRewriter {
     pub(crate) fn new() -> Self {
-        Self
+        Self::default()
     }
 
     pub(crate) fn rewrite<'a>(
@@ -145,10 +151,37 @@ impl RscUrlRewriter {
             return Cow::Borrowed(input);
         }
 
-        // Compile an origin-specific pattern so the regex only matches URLs that contain
-        // this origin's host, avoiding closure overhead for non-origin URL tokens in large
-        // RSC payloads. Regex compilation is cheap relative to replace_all on a large payload.
-        let origin_pattern = build_origin_url_pattern(origin_host);
+        // Retrieve a compiled origin-specific pattern from cache, or compile and store one.
+        // The same origin_host is used for every payload in a request, so this avoids
+        // recompiling the pattern on each call. regex::escape() guarantees validity, but
+        // treat compilation failure as non-fatal rather than panic.
+        let cached = self.cached_pattern.borrow();
+        let origin_pattern = if let Some((ref host, ref regex)) = *cached {
+            if host == origin_host {
+                Some(regex.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(cached);
+        let origin_pattern = match origin_pattern {
+            Some(p) => p,
+            None => match build_origin_url_pattern(origin_host) {
+                Ok(pattern) => {
+                    let regex = pattern.clone();
+                    *self.cached_pattern.borrow_mut() = Some((origin_host.to_string(), pattern));
+                    regex
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to compile origin URL pattern for host {origin_host:?}: {e}"
+                    );
+                    return Cow::Borrowed(input);
+                }
+            },
+        };
 
         // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
         let replaced = origin_pattern.replace_all(input, |caps: &regex::Captures<'_>| {

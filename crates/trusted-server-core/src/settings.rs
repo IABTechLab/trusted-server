@@ -536,10 +536,13 @@ impl Settings {
     ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
         let mut uncovered = Vec::new();
         for &path in Self::ADMIN_ENDPOINTS {
-            let covered = self
-                .handlers
-                .iter()
-                .try_fold(false, |acc, h| h.matches_path(path).map(|m| acc || m))?;
+            let mut covered = false;
+            for h in &self.handlers {
+                if h.matches_path(path)? {
+                    covered = true;
+                    break;
+                }
+            }
             if !covered {
                 uncovered.push(path);
             }

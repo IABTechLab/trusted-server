@@ -34,10 +34,6 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
             message: "Failed to validate configuration".to_string(),
         })?;
 
-    // `from_toml` only deserializes the embedded runtime TOML. Startup still
-    // needs to prepare cached runtime artifacts like compiled handler regexes.
-    settings.prepare_runtime()?;
-
     // Reject known placeholder values for secrets that feed into cryptographic operations.
     settings.reject_placeholder_secrets()?;
 

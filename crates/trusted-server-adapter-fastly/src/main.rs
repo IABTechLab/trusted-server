@@ -90,12 +90,18 @@ async fn route_request(
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    if let Some(mut response) = enforce_basic_auth(settings, &req).unwrap_or_else(|e| {
-        log::error!("Failed to evaluate basic auth: {:?}", e);
-        Some(to_error_response(&e))
-    }) {
-        finalize_response(settings, geo_info.as_ref(), &mut response);
-        return Ok(response);
+    match enforce_basic_auth(settings, &req) {
+        Ok(Some(mut response)) => {
+            finalize_response(settings, geo_info.as_ref(), &mut response);
+            return Ok(response);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log::error!("Failed to evaluate basic auth: {:?}", e);
+            let mut response = to_error_response(&e);
+            finalize_response(settings, geo_info.as_ref(), &mut response);
+            return Ok(response);
+        }
     }
 
     // Get path and method for routing
