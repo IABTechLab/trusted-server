@@ -1,0 +1,539 @@
+//! Pull sync background dispatch.
+//!
+//! Launches partner pull-sync requests for organic traffic after the client
+//! response has been sent. Dispatch is best-effort and never affects client
+//! response status.
+
+use fastly::http::request::PendingRequest;
+use fastly::http::{Method, StatusCode};
+use fastly::Request;
+use serde::Deserialize;
+use url::Url;
+
+use crate::backend::BackendConfig;
+use crate::settings::Settings;
+
+use super::generation::is_valid_ec_id;
+use super::kv::KvIdentityGraph;
+use super::kv_types::KvEntry;
+use super::partner::{PartnerRecord, PartnerStore};
+use super::sync_pixel::{current_timestamp, RateLimiter};
+use super::EcContext;
+
+/// Inputs needed to dispatch pull sync after response flush.
+#[derive(Debug, Clone)]
+pub struct PullSyncContext {
+    ec_hash: String,
+    client_ip: String,
+}
+
+impl PullSyncContext {
+    /// Returns the stable EC hash for the request.
+    #[must_use]
+    pub fn ec_hash(&self) -> &str {
+        &self.ec_hash
+    }
+
+    /// Returns the normalized client IP for pull endpoint query parameters.
+    #[must_use]
+    pub fn client_ip(&self) -> &str {
+        &self.client_ip
+    }
+}
+
+struct InFlightPull {
+    partner_id: String,
+    pending: PendingRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullSyncResponse {
+    uid: Option<String>,
+}
+
+/// Builds post-send pull-sync context from the route EC context.
+///
+/// Returns `None` when consent denies EC, there is no active EC hash, or no
+/// client IP is available.
+#[must_use]
+pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
+    if !ec_context.ec_allowed() {
+        return None;
+    }
+
+    let ec_id = ec_context.ec_value()?;
+    if !is_valid_ec_id(ec_id) {
+        log::debug!("Pull sync: skipping dispatch because active EC ID is invalid format");
+        return None;
+    }
+
+    let ec_hash = ec_context.ec_hash()?.to_owned();
+    let client_ip = ec_context.client_ip()?.to_owned();
+    Some(PullSyncContext { ec_hash, client_ip })
+}
+
+/// Dispatches partner pull-sync requests in the background.
+///
+/// This function is best-effort: all errors are logged and swallowed.
+pub fn dispatch_pull_sync(
+    settings: &Settings,
+    kv: &KvIdentityGraph,
+    partner_store: &PartnerStore,
+    rate_limiter: &dyn RateLimiter,
+    context: &PullSyncContext,
+) {
+    let now = current_timestamp();
+    let kv_entry = match kv.get(context.ec_hash()) {
+        Ok(entry) => entry.map(|(entry, _)| entry),
+        Err(err) => {
+            log::warn!(
+                "Pull sync: failed to read identity graph for '{}': {err:?}",
+                context.ec_hash()
+            );
+            return;
+        }
+    };
+
+    let partners = match partner_store.list_registered() {
+        Ok(partners) => partners,
+        Err(err) => {
+            log::warn!("Pull sync: failed to list partners: {err:?}");
+            return;
+        }
+    };
+
+    let pull_enabled_count = partners.iter().filter(|p| p.pull_sync_enabled).count();
+    log::debug!(
+        "Pull sync: enumerated {} partners ({} pull-enabled)",
+        partners.len(),
+        pull_enabled_count
+    );
+
+    if pull_enabled_count == 0 {
+        return;
+    }
+
+    let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
+    let mut in_flight: Vec<InFlightPull> = Vec::new();
+
+    for partner in partners {
+        if !partner.pull_sync_enabled {
+            continue;
+        }
+
+        if !is_partner_pull_eligible(&partner, kv_entry.as_ref(), now) {
+            continue;
+        }
+
+        let Some(url) = validated_pull_sync_url(&partner) else {
+            continue;
+        };
+
+        let rate_key = format!("pull:{}:{}", partner.id, context.ec_hash());
+        match rate_limiter.exceeded(&rate_key, partner.pull_sync_rate_limit) {
+            Ok(true) => {
+                log::debug!(
+                    "Pull sync: rate-limited partner '{}' for hash '{}'",
+                    partner.id,
+                    context.ec_hash()
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!(
+                    "Pull sync: failed to read rate limit for partner '{}': {err:?}",
+                    partner.id
+                );
+                continue;
+            }
+        }
+
+        let Some(token) = partner.ts_pull_token.as_deref() else {
+            log::warn!(
+                "Pull sync: partner '{}' enabled but missing ts_pull_token",
+                partner.id
+            );
+            continue;
+        };
+
+        let request_url = build_pull_request_url(url, context.ec_hash(), context.client_ip());
+        let mut request = Request::new(Method::GET, request_url.as_str());
+        request.set_header("authorization", format!("Bearer {token}"));
+
+        let backend_name =
+            match BackendConfig::from_url(request_url.as_str(), settings.proxy.certificate_check) {
+                Ok(name) => name,
+                Err(err) => {
+                    log::warn!(
+                        "Pull sync: failed to resolve backend for partner '{}': {err:?}",
+                        partner.id
+                    );
+                    continue;
+                }
+            };
+
+        let pending = match request.send_async(backend_name) {
+            Ok(pending) => pending,
+            Err(err) => {
+                log::warn!(
+                    "Pull sync: failed to dispatch partner '{}': {err:?}",
+                    partner.id
+                );
+                continue;
+            }
+        };
+
+        in_flight.push(InFlightPull {
+            partner_id: partner.id,
+            pending,
+        });
+
+        if in_flight.len() >= max_concurrency {
+            drain_pull_batch(kv, context.ec_hash(), &mut in_flight);
+        }
+    }
+
+    drain_pull_batch(kv, context.ec_hash(), &mut in_flight);
+}
+
+fn is_partner_pull_eligible(partner: &PartnerRecord, kv_entry: Option<&KvEntry>, now: u64) -> bool {
+    let Some(entry) = kv_entry else {
+        return true;
+    };
+
+    let Some(existing) = entry.ids.get(&partner.id) else {
+        return true;
+    };
+
+    now.saturating_sub(existing.synced) >= partner.pull_sync_ttl_sec
+}
+
+fn validated_pull_sync_url(partner: &PartnerRecord) -> Option<Url> {
+    let pull_sync_url = partner.pull_sync_url.as_deref()?;
+    let parsed = match Url::parse(pull_sync_url) {
+        Ok(url) => url,
+        Err(err) => {
+            log::error!(
+                "Pull sync: partner '{}' has invalid pull_sync_url '{}': {err}",
+                partner.id,
+                pull_sync_url
+            );
+            return None;
+        }
+    };
+
+    if parsed.scheme() != "https" {
+        log::error!(
+            "Pull sync: partner '{}' pull_sync_url must use HTTPS, got scheme '{}'",
+            partner.id,
+            parsed.scheme()
+        );
+        return None;
+    }
+
+    let Some(hostname) = parsed.host_str() else {
+        log::error!(
+            "Pull sync: partner '{}' pull_sync_url has no hostname: {}",
+            partner.id,
+            pull_sync_url
+        );
+        return None;
+    };
+
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    if !partner.pull_sync_allowed_domains.iter().any(|domain| {
+        domain
+            .trim()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(&hostname)
+    }) {
+        log::error!(
+            "Pull sync: partner '{}' URL host '{}' not in pull_sync_allowed_domains",
+            partner.id,
+            hostname
+        );
+        return None;
+    }
+
+    Some(parsed)
+}
+
+fn build_pull_request_url(mut base_url: Url, ec_hash: &str, client_ip: &str) -> Url {
+    base_url
+        .query_pairs_mut()
+        .append_pair("ec_hash", ec_hash)
+        .append_pair("ip", client_ip);
+    base_url
+}
+
+fn drain_pull_batch(kv: &KvIdentityGraph, ec_hash: &str, in_flight: &mut Vec<InFlightPull>) {
+    for pending in in_flight.drain(..) {
+        let partner_id = pending.partner_id;
+        let response = match pending.pending.wait() {
+            Ok(response) => response,
+            Err(err) => {
+                log::warn!(
+                    "Pull sync: request failed for partner '{}': {err:?}",
+                    partner_id
+                );
+                continue;
+            }
+        };
+
+        let Some(uid) = extract_pull_uid(response, &partner_id) else {
+            continue;
+        };
+
+        if let Err(err) = kv.upsert_partner_id(ec_hash, &partner_id, &uid, current_timestamp()) {
+            log::warn!(
+                "Pull sync: failed to upsert partner '{}' for hash '{}': {err:?}",
+                partner_id,
+                ec_hash
+            );
+        }
+    }
+}
+
+fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<String> {
+    let status = response.get_status();
+
+    if status == StatusCode::NOT_FOUND {
+        log::debug!(
+            "Pull sync: partner '{}' returned 404, treating as no-op",
+            partner_id
+        );
+        return None;
+    }
+
+    if !status.is_success() {
+        log::warn!(
+            "Pull sync: partner '{}' returned non-success status {}",
+            partner_id,
+            status
+        );
+        return None;
+    }
+
+    let body = response.take_body_bytes();
+    let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            log::warn!(
+                "Pull sync: partner '{}' returned invalid JSON body: {err}",
+                partner_id
+            );
+            return None;
+        }
+    };
+
+    const MAX_UID_LENGTH: usize = 256;
+
+    let uid = payload.uid.filter(|value| !value.is_empty());
+    match uid {
+        None => {
+            log::debug!(
+                "Pull sync: partner '{}' returned null/empty uid, treating as no-op",
+                partner_id
+            );
+            None
+        }
+        Some(ref value) if value.len() > MAX_UID_LENGTH => {
+            log::warn!(
+                "Pull sync: partner '{}' returned uid exceeding {} bytes (got {}), rejecting",
+                partner_id,
+                MAX_UID_LENGTH,
+                value.len()
+            );
+            None
+        }
+        _ => uid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consent::types::ConsentContext;
+    use crate::ec::kv_types::KvEntry;
+
+    fn pull_partner(ttl_sec: u64) -> PartnerRecord {
+        PartnerRecord {
+            id: "ssp_x".to_owned(),
+            name: "SSP X".to_owned(),
+            allowed_return_domains: vec!["sync.example.com".to_owned()],
+            api_key_hash: "deadbeef".to_owned(),
+            bidstream_enabled: true,
+            source_domain: "ssp.example.com".to_owned(),
+            openrtb_atype: 3,
+            sync_rate_limit: 60,
+            batch_rate_limit: 60,
+            pull_sync_enabled: true,
+            pull_sync_url: Some("https://sync.partner.test/pull".to_owned()),
+            pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
+            pull_sync_ttl_sec: ttl_sec,
+            pull_sync_rate_limit: 20,
+            ts_pull_token: Some("token".to_owned()),
+        }
+    }
+
+    #[test]
+    fn build_pull_sync_context_requires_ec_and_ip() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_context =
+            EcContext::new_for_test(Some(format!("{}.ABC123", "a".repeat(64))), consent);
+
+        let context = build_pull_sync_context(&ec_context);
+        assert!(
+            context.is_none(),
+            "should require client_ip for pull sync dispatch context"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_returns_context_when_valid() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context =
+            EcContext::new_for_test_with_ip(Some(ec_id), consent, Some("1.2.3.4".to_owned()));
+
+        let context = build_pull_sync_context(&ec_context)
+            .expect("should build pull sync context for valid EC with IP");
+        assert_eq!(context.ec_hash(), "a".repeat(64).as_str());
+        assert_eq!(context.client_ip(), "1.2.3.4");
+    }
+
+    #[test]
+    fn build_pull_sync_context_rejects_invalid_ec_id() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_context = EcContext::new_for_test_with_ip(
+            Some("invalid-ec".to_owned()),
+            consent,
+            Some("1.2.3.4".to_owned()),
+        );
+
+        let context = build_pull_sync_context(&ec_context);
+        assert!(
+            context.is_none(),
+            "should reject pull sync context when EC ID format is invalid"
+        );
+    }
+
+    #[test]
+    fn partner_is_eligible_when_missing_from_entry() {
+        let partner = pull_partner(3600);
+        let entry = KvEntry::minimal("other_partner", "uid-1", 100);
+
+        assert!(
+            is_partner_pull_eligible(&partner, Some(&entry), 200),
+            "should dispatch when partner has no stored sync"
+        );
+    }
+
+    #[test]
+    fn partner_is_not_eligible_when_not_stale() {
+        let partner = pull_partner(3600);
+        let entry = KvEntry::minimal("ssp_x", "uid-1", 1000);
+
+        assert!(
+            !is_partner_pull_eligible(&partner, Some(&entry), 1500),
+            "should skip dispatch when sync is fresher than ttl"
+        );
+    }
+
+    #[test]
+    fn validated_pull_sync_url_rejects_http_scheme() {
+        let mut partner = pull_partner(3600);
+        partner.pull_sync_url = Some("http://sync.partner.test/pull".to_owned());
+
+        let validated = validated_pull_sync_url(&partner);
+        assert!(
+            validated.is_none(),
+            "should reject pull_sync_url with HTTP scheme"
+        );
+    }
+
+    #[test]
+    fn validated_pull_sync_url_rejects_non_allowlisted_host() {
+        let mut partner = pull_partner(3600);
+        partner.pull_sync_url = Some("https://evil.test/pull".to_owned());
+
+        let validated = validated_pull_sync_url(&partner);
+        assert!(
+            validated.is_none(),
+            "should reject runtime pull_sync_url host outside allowlist"
+        );
+    }
+
+    #[test]
+    fn validated_pull_sync_url_accepts_normalized_allowlist_match() {
+        let mut partner = pull_partner(3600);
+        partner.pull_sync_url = Some("https://SYNC.PARTNER.TEST./pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.partner.test".to_owned()];
+
+        let validated = validated_pull_sync_url(&partner);
+        assert!(
+            validated.is_some(),
+            "should accept allowlist match after hostname normalization"
+        );
+    }
+
+    #[test]
+    fn build_pull_request_url_appends_query_pairs() {
+        let url = Url::parse("https://sync.partner.test/pull?x=1").expect("should parse URL");
+        let result = build_pull_request_url(url, "hash123", "1.2.3.4");
+
+        let query = result.query().expect("should have query string");
+        assert!(query.contains("x=1"), "should preserve existing query");
+        assert!(query.contains("ec_hash=hash123"), "should append ec_hash");
+        assert!(query.contains("ip=1.2.3.4"), "should append ip");
+    }
+
+    #[test]
+    fn extract_pull_uid_treats_404_as_noop() {
+        let response = fastly::Response::from_status(StatusCode::NOT_FOUND);
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert!(uid.is_none(), "should treat 404 as no-op");
+    }
+
+    #[test]
+    fn extract_pull_uid_treats_uid_null_as_noop() {
+        let response = fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":null}");
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert!(uid.is_none(), "should treat uid=null as no-op");
+    }
+
+    #[test]
+    fn extract_pull_uid_rejects_oversized_uid() {
+        let long_uid = "x".repeat(257);
+        let body = format!("{{\"uid\":\"{long_uid}\"}}");
+        let response = fastly::Response::from_status(StatusCode::OK).with_body(body);
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert!(uid.is_none(), "should reject uid exceeding 256 bytes");
+    }
+
+    #[test]
+    fn extract_pull_uid_reads_uid_from_success_body() {
+        let response =
+            fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":\"abc123\"}");
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert_eq!(
+            uid.as_deref(),
+            Some("abc123"),
+            "should parse uid from 200 body"
+        );
+    }
+}

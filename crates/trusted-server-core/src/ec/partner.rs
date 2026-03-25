@@ -137,9 +137,18 @@ pub fn validate_pull_sync_config(record: &PartnerRecord) -> Result<(), String> {
         );
     }
 
-    // Validate that the pull sync URL hostname is in the allowed domains.
+    // Validate that the pull sync URL uses HTTPS (bearer tokens must not
+    // travel over plaintext).
     let parsed =
         url::Url::parse(url_str).map_err(|e| format!("pull_sync_url is not a valid URL: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "pull_sync_url must use HTTPS, got scheme '{}'",
+            parsed.scheme()
+        ));
+    }
+
+    // Validate that the pull sync URL hostname is in the allowed domains.
     let host = parsed
         .host_str()
         .ok_or("pull_sync_url has no hostname")?
@@ -239,6 +248,58 @@ impl PartnerStore {
             })?;
 
         Ok(Some(record))
+    }
+
+    /// Lists all registered partner records.
+    ///
+    /// Scans the partner KV store and returns records for non-index keys.
+    /// Secondary index entries (e.g. `apikey:*`) are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on list, lookup, or
+    /// deserialization failure.
+    pub fn list_registered(&self) -> Result<Vec<PartnerRecord>, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+        let mut records = Vec::new();
+
+        for page in store.build_list().limit(1000).iter() {
+            let page = page.change_context(TrustedServerError::KvStore {
+                store_name: self.store_name.clone(),
+                message: "Failed to list partner keys".to_owned(),
+            })?;
+
+            for key in page.keys() {
+                if key.starts_with(APIKEY_INDEX_PREFIX) {
+                    continue;
+                }
+
+                let mut response = match store.lookup(key) {
+                    Ok(resp) => resp,
+                    Err(fastly::kv_store::KVStoreError::ItemNotFound) => continue,
+                    Err(err) => {
+                        return Err(
+                            Report::new(err).change_context(TrustedServerError::KvStore {
+                                store_name: self.store_name.clone(),
+                                message: format!("Failed to read partner '{key}' while listing"),
+                            }),
+                        );
+                    }
+                };
+
+                let body_bytes = response.take_body_bytes();
+                let record = serde_json::from_slice::<PartnerRecord>(&body_bytes).change_context(
+                    TrustedServerError::KvStore {
+                        store_name: self.store_name.clone(),
+                        message: format!("Failed to deserialize partner '{key}' while listing"),
+                    },
+                )?;
+
+                records.push(record);
+            }
+        }
+
+        Ok(records)
     }
 
     /// Writes or updates a partner record and maintains the API key index.
@@ -649,6 +710,32 @@ mod tests {
         };
         let err = validate_pull_sync_config(&record).unwrap_err();
         assert!(err.contains("ts_pull_token"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_pull_sync_rejects_http_scheme() {
+        let record = PartnerRecord {
+            id: "test".to_owned(),
+            name: "Test".to_owned(),
+            allowed_return_domains: vec![],
+            api_key_hash: String::new(),
+            bidstream_enabled: false,
+            source_domain: "test.com".to_owned(),
+            openrtb_atype: 3,
+            sync_rate_limit: 100,
+            batch_rate_limit: 60,
+            pull_sync_enabled: true,
+            pull_sync_url: Some("http://sync.test.com/pull".to_owned()),
+            pull_sync_allowed_domains: vec!["sync.test.com".to_owned()],
+            pull_sync_ttl_sec: 86400,
+            pull_sync_rate_limit: 10,
+            ts_pull_token: Some("token".to_owned()),
+        };
+        let err = validate_pull_sync_config(&record).unwrap_err();
+        assert!(
+            err.contains("HTTPS"),
+            "should reject HTTP scheme, got: {err}"
+        );
     }
 
     #[test]
