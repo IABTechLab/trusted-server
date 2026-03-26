@@ -354,23 +354,29 @@ pub fn handle_publisher_request(
         || content_type.contains("application/javascript")
         || content_type.contains("application/json");
 
+    if !should_process || request_host.is_empty() {
+        log::debug!(
+            "Skipping response processing - should_process: {}, request_host: '{}'",
+            should_process,
+            request_host
+        );
+        return Ok(PublisherResponse::Buffered(response));
+    }
+
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+
     // Streaming gate: can we stream this response?
-    // - Must have processable content
-    // - Must have a request host for URL rewriting
-    // - Backend must return success (already guaranteed — errors propagated above)
     // - No HTML post-processors registered (they need the full document)
+    // - Non-HTML content always streams (post-processors only apply to HTML)
     let is_html = content_type.contains("text/html");
     let has_post_processors = !integration_registry.html_post_processors().is_empty();
-    let can_stream =
-        should_process && !request_host.is_empty() && (!is_html || !has_post_processors);
+    let can_stream = !is_html || !has_post_processors;
 
     if can_stream {
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_lowercase();
-
         log::debug!(
             "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
             content_type, content_encoding, request_host, origin_host
@@ -393,43 +399,28 @@ pub fn handle_publisher_request(
         });
     }
 
-    // Buffered fallback: process body in memory (post-processors need full document,
-    // or content type doesn't need processing).
-    if should_process && !request_host.is_empty() {
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_lowercase();
+    // Buffered fallback: post-processors need the full document.
+    log::debug!(
+        "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+        content_type, content_encoding, request_host, origin_host
+    );
 
-        log::debug!(
-            "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-            content_type, content_encoding, request_host, origin_host
-        );
+    let body = response.take_body();
+    let params = ProcessResponseParams {
+        content_encoding: &content_encoding,
+        origin_host: &origin_host,
+        origin_url: &settings.publisher.origin_url,
+        request_host,
+        request_scheme,
+        settings,
+        content_type: &content_type,
+        integration_registry,
+    };
+    let mut output = Vec::new();
+    process_response_streaming(body, &mut output, &params)?;
 
-        let body = response.take_body();
-        let params = ProcessResponseParams {
-            content_encoding: &content_encoding,
-            origin_host: &origin_host,
-            origin_url: &settings.publisher.origin_url,
-            request_host,
-            request_scheme,
-            settings,
-            content_type: &content_type,
-            integration_registry,
-        };
-        let mut output = Vec::new();
-        process_response_streaming(body, &mut output, &params)?;
-
-        response.set_body(Body::from(output));
-        response.remove_header(header::CONTENT_LENGTH);
-    } else {
-        log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}'",
-            should_process,
-            request_host
-        );
-    }
+    response.set_body(Body::from(output));
+    response.remove_header(header::CONTENT_LENGTH);
 
     Ok(PublisherResponse::Buffered(response))
 }
