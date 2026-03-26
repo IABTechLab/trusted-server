@@ -6,6 +6,9 @@
 //! - Memory-efficient streaming
 //! - UTF-8 boundary handling
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use error_stack::{Report, ResultExt};
 use std::io::{self, Read, Write};
 
@@ -389,81 +392,70 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 }
 
-/// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`
-/// Important: Due to `lol_html`'s ownership model, we must accumulate input
-/// and process it all at once when the stream ends. This is a limitation
-/// of the `lol_html` library's API design.
+/// Shared output buffer used as an [`lol_html::OutputSink`].
+///
+/// The `HtmlRewriter` invokes [`OutputSink::handle_chunk`] synchronously during
+/// each [`HtmlRewriter::write`] call, so the buffer is drained after every
+/// `process_chunk` invocation to emit output incrementally.
+struct RcVecSink(Rc<RefCell<Vec<u8>>>);
+
+impl lol_html::OutputSink for RcVecSink {
+    fn handle_chunk(&mut self, chunk: &[u8]) {
+        self.0.borrow_mut().extend_from_slice(chunk);
+    }
+}
+
+/// Adapter to use `lol_html` [`HtmlRewriter`](lol_html::HtmlRewriter) as a [`StreamProcessor`].
+///
+/// Output is emitted incrementally on every [`StreamProcessor::process_chunk`] call.
+/// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
+/// is a no-op because the rewriter consumes its settings on construction.
 pub struct HtmlRewriterAdapter {
-    settings: lol_html::Settings<'static, 'static>,
-    accumulated_input: Vec<u8>,
+    rewriter: Option<lol_html::HtmlRewriter<'static, RcVecSink>>,
+    output: Rc<RefCell<Vec<u8>>>,
 }
 
 impl HtmlRewriterAdapter {
-    /// Create a new HTML rewriter adapter
+    /// Create a new HTML rewriter adapter that streams output per chunk.
     #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let sink = RcVecSink(Rc::clone(&output));
+        let rewriter = lol_html::HtmlRewriter::new(settings, sink);
         Self {
-            settings,
-            accumulated_input: Vec::new(),
+            rewriter: Some(rewriter),
+            output,
         }
     }
 }
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        // Accumulate input chunks
-        self.accumulated_input.extend_from_slice(chunk);
-
-        if !chunk.is_empty() {
-            log::debug!(
-                "Buffering chunk: {} bytes, total buffered: {} bytes",
-                chunk.len(),
-                self.accumulated_input.len()
-            );
+        if let Some(rewriter) = &mut self.rewriter {
+            if !chunk.is_empty() {
+                rewriter.write(chunk).map_err(|e| {
+                    log::error!("Failed to process HTML chunk: {e}");
+                    io::Error::other(format!("HTML processing failed: {e}"))
+                })?;
+            }
         }
 
-        // Only process when we have all the input
         if is_last {
-            log::info!(
-                "Processing complete document: {} bytes",
-                self.accumulated_input.len()
-            );
-
-            // Process all accumulated input at once
-            let mut output = Vec::new();
-
-            // Create rewriter with output sink
-            let mut rewriter = lol_html::HtmlRewriter::new(
-                std::mem::take(&mut self.settings),
-                |chunk: &[u8]| {
-                    output.extend_from_slice(chunk);
-                },
-            );
-
-            // Process the entire document
-            rewriter.write(&self.accumulated_input).map_err(|e| {
-                log::error!("Failed to process HTML: {}", e);
-                io::Error::other(format!("HTML processing failed: {}", e))
-            })?;
-
-            // Finalize the rewriter
-            rewriter.end().map_err(|e| {
-                log::error!("Failed to finalize: {}", e);
-                io::Error::other(format!("HTML finalization failed: {}", e))
-            })?;
-
-            log::debug!("Output size: {} bytes", output.len());
-            self.accumulated_input.clear();
-            Ok(output)
-        } else {
-            // Return empty until we have all input
-            // This is a limitation of lol_html's API
-            Ok(Vec::new())
+            if let Some(rewriter) = self.rewriter.take() {
+                rewriter.end().map_err(|e| {
+                    log::error!("Failed to finalize HTML: {e}");
+                    io::Error::other(format!("HTML finalization failed: {e}"))
+                })?;
+            }
         }
+
+        // Drain whatever lol_html produced since the last call
+        Ok(std::mem::take(&mut *self.output.borrow_mut()))
     }
 
     fn reset(&mut self) {
-        self.accumulated_input.clear();
+        // No-op: the rewriter consumed its Settings on construction.
+        // Single-use by design (one adapter per request).
     }
 }
 
@@ -530,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_html_rewriter_adapter_accumulates_until_last() {
+    fn test_html_rewriter_adapter_streams_incrementally() {
         use lol_html::{element, Settings};
 
         // Create a simple HTML rewriter that replaces text
@@ -544,32 +536,40 @@ mod tests {
 
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
-        // Test that intermediate chunks return empty
         let chunk1 = b"<html><body>";
         let result1 = adapter
             .process_chunk(chunk1, false)
             .expect("should process chunk1");
-        assert_eq!(result1.len(), 0, "Should return empty for non-last chunk");
 
         let chunk2 = b"<p>original</p>";
         let result2 = adapter
             .process_chunk(chunk2, false)
             .expect("should process chunk2");
-        assert_eq!(result2.len(), 0, "Should return empty for non-last chunk");
 
-        // Test that last chunk processes everything
         let chunk3 = b"</body></html>";
         let result3 = adapter
             .process_chunk(chunk3, true)
             .expect("should process final chunk");
+
+        // Concatenate all outputs and verify the final HTML is correct
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        all_output.extend_from_slice(&result3);
+
         assert!(
-            !result3.is_empty(),
-            "Should return processed content for last chunk"
+            !all_output.is_empty(),
+            "should produce non-empty concatenated output"
         );
 
-        let output = String::from_utf8(result3).expect("output should be valid UTF-8");
-        assert!(output.contains("replaced"), "Should have replaced content");
-        assert!(output.contains("<html>"), "Should have complete HTML");
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("replaced"),
+            "should have replaced content in concatenated output"
+        );
+        assert!(
+            output.contains("<html>"),
+            "should have complete HTML in concatenated output"
+        );
     }
 
     #[test]
@@ -586,59 +586,59 @@ mod tests {
         }
         large_html.push_str("</body></html>");
 
-        // Process in chunks
+        // Process in chunks and collect all output
         let chunk_size = 1024;
         let bytes = large_html.as_bytes();
-        let mut chunks = bytes.chunks(chunk_size);
-        let mut last_chunk = chunks.next().unwrap_or(&[]);
+        let mut chunks = bytes.chunks(chunk_size).peekable();
+        let mut all_output = Vec::new();
 
-        for chunk in chunks {
+        while let Some(chunk) = chunks.next() {
+            let is_last = chunks.peek().is_none();
             let result = adapter
-                .process_chunk(last_chunk, false)
-                .expect("should process intermediate chunk");
-            assert_eq!(result.len(), 0, "Intermediate chunks should return empty");
-            last_chunk = chunk;
+                .process_chunk(chunk, is_last)
+                .expect("should process chunk");
+            all_output.extend_from_slice(&result);
         }
 
-        // Process last chunk
-        let result = adapter
-            .process_chunk(last_chunk, true)
-            .expect("should process last chunk");
-        assert!(!result.is_empty(), "Last chunk should return content");
+        assert!(
+            !all_output.is_empty(),
+            "should produce non-empty output for large document"
+        );
 
-        let output = String::from_utf8(result).expect("output should be valid UTF-8");
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
         assert!(
             output.contains("Paragraph 999"),
-            "Should contain all content"
+            "should contain all content from large document"
         );
     }
 
     #[test]
-    fn test_html_rewriter_adapter_reset() {
+    fn test_html_rewriter_adapter_reset_is_noop() {
         use lol_html::Settings;
 
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
         // Process some content
-        adapter
-            .process_chunk(b"<html>", false)
-            .expect("should process html tag");
-        adapter
-            .process_chunk(b"<body>test</body>", false)
-            .expect("should process body");
+        let result1 = adapter
+            .process_chunk(b"<html><body>test</body></html>", false)
+            .expect("should process html");
 
-        // Reset should clear accumulated input
+        // Reset is a no-op — the adapter is single-use by design
         adapter.reset();
 
-        // After reset, adapter should be ready for new input
-        let result = adapter
-            .process_chunk(b"<p>new</p>", true)
-            .expect("should process new content after reset");
-        let output = String::from_utf8(result).expect("output should be valid UTF-8");
-        assert_eq!(
-            output, "<p>new</p>",
-            "Should only contain new input after reset"
+        // The rewriter is still alive; finalize it
+        let result2 = adapter
+            .process_chunk(b"", true)
+            .expect("should finalize after reset");
+
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("test"),
+            "should still produce output after no-op reset"
         );
     }
 
@@ -786,6 +786,53 @@ mod tests {
         assert_eq!(
             result, "<html><body>hi world</body></html>",
             "should have replaced content after gzip decompression"
+        );
+    }
+
+    #[test]
+    fn test_html_rewriter_adapter_emits_output_per_chunk() {
+        use lol_html::Settings;
+
+        let settings = Settings::default();
+        let mut adapter = HtmlRewriterAdapter::new(settings);
+
+        // Send three chunks
+        let chunk1 = b"<html><body>";
+        let result1 = adapter
+            .process_chunk(chunk1, false)
+            .expect("should process chunk1");
+        assert!(
+            !result1.is_empty(),
+            "should emit output for first chunk, got empty"
+        );
+
+        let chunk2 = b"<p>hello</p>";
+        let result2 = adapter
+            .process_chunk(chunk2, false)
+            .expect("should process chunk2");
+
+        let chunk3 = b"</body></html>";
+        let result3 = adapter
+            .process_chunk(chunk3, true)
+            .expect("should process final chunk");
+
+        // Concatenate all outputs and verify correctness
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        all_output.extend_from_slice(&result3);
+
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("<html>"),
+            "should contain html tag in concatenated output"
+        );
+        assert!(
+            output.contains("<p>hello</p>"),
+            "should contain paragraph in concatenated output"
+        );
+        assert!(
+            output.contains("</html>"),
+            "should contain closing html tag in concatenated output"
         );
     }
 
