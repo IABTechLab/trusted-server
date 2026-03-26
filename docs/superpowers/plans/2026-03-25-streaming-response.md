@@ -35,6 +35,14 @@ rewriting), `flate2` (gzip/deflate), `brotli` (brotli compression).
 
 ## Phase 1: Make the Pipeline Chunk-Emitting
 
+> **Implementation note (2026-03-26):** Tasks 1-3 were implemented as planned,
+> then followed by a refactor that unified all 9 `process_*_to_*` methods into
+> a single `process_chunks` method with inline decoder/encoder creation in
+> `process()`. This eliminated ~150 lines of duplication. The refactor was
+> committed as "Unify compression paths into single process_chunks method".
+> Tasks 1-3 descriptions below reflect the original plan; the final code is
+> cleaner than described.
+
 ### Task 1: Fix encoder finalization in `process_through_compression`
 
 This is the prerequisite for Task 2. The current code calls `flush()` then
