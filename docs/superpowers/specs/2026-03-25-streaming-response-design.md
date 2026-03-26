@@ -239,6 +239,22 @@ during streaming — they do not require buffering and are unaffected by this
 change. The streaming gate checks only `html_post_processors().is_empty()`, not
 script rewriters. Currently only Next.js registers a post-processor.
 
+## Text Node Fragmentation (Phase 3)
+
+`lol_html` fragments text nodes across input chunk boundaries when processing
+HTML incrementally. Script rewriters (`NextJsNextDataRewriter`,
+`GoogleTagManagerIntegration`) expect complete text content — if a domain string
+is split across chunks, the rewrite silently fails.
+
+**Phase 1 workaround**: `HtmlRewriterAdapter` has two modes. `new()` streams
+per chunk (no script rewriters). `new_buffered()` accumulates input and
+processes in one `write()` call (script rewriters registered).
+`create_html_processor` selects the mode automatically.
+
+**Phase 3** will make each script rewriter fragment-safe by accumulating text
+fragments internally via `is_last_in_text_node`. This removes the buffered
+fallback and enables streaming for all configurations. See #584.
+
 ## Rollback Strategy
 
 The `#[fastly::main]` to raw `main()` migration is a structural change. If
