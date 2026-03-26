@@ -94,8 +94,9 @@ impl StreamProcessor for HtmlWithPostProcessing {
         Ok(html.into_bytes())
     }
 
+    /// No-op. `HtmlWithPostProcessing` wraps a single-use
+    /// [`HtmlRewriterAdapter`] and cannot be meaningfully reset.
     fn reset(&mut self) {
-        self.inner.reset();
         self.accumulated_output.clear();
         self.document_state.clear();
     }
