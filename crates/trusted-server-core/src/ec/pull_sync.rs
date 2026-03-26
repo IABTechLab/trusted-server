@@ -94,33 +94,40 @@ pub fn dispatch_pull_sync(
         }
     };
 
-    let partners = match partner_store.list_registered() {
+    // Use the _pull_enabled secondary index for O(1+N) reads instead of
+    // scanning all partners (§13.1). Falls back to list_registered() if
+    // the index is missing or unreadable.
+    let mut pull_partners = match partner_store.pull_enabled_partners() {
         Ok(partners) => partners,
         Err(err) => {
-            log::warn!("Pull sync: failed to list partners: {err:?}");
+            log::warn!("Pull sync: failed to list pull-enabled partners: {err:?}");
             return;
         }
     };
 
-    let pull_enabled_count = partners.iter().filter(|p| p.pull_sync_enabled).count();
+    // Sort by ID for deterministic ordering, then apply a rotating hourly
+    // offset so that different partners get dispatch priority (§10.3).
+    pull_partners.sort_by(|a, b| a.id.cmp(&b.id));
+
     log::debug!(
-        "Pull sync: enumerated {} partners ({} pull-enabled)",
-        partners.len(),
-        pull_enabled_count
+        "Pull sync: {} pull-enabled partners after filtering",
+        pull_partners.len(),
     );
 
-    if pull_enabled_count == 0 {
+    if pull_partners.is_empty() {
         return;
     }
+
+    // Rotate the partner list so that the starting partner changes each
+    // hour. This ensures fair distribution when max_concurrency limits
+    // how many partners are dispatched per request.
+    let offset = (now / 3600) as usize % pull_partners.len();
+    pull_partners.rotate_left(offset);
 
     let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
     let mut in_flight: Vec<InFlightPull> = Vec::new();
 
-    for partner in partners {
-        if !partner.pull_sync_enabled {
-            continue;
-        }
-
+    for partner in pull_partners {
         if !is_partner_pull_eligible(&partner, kv_entry.as_ref(), now) {
             continue;
         }
@@ -534,6 +541,38 @@ mod tests {
             uid.as_deref(),
             Some("abc123"),
             "should parse uid from 200 body"
+        );
+    }
+
+    #[test]
+    fn rotating_offset_distributes_partners_across_hours() {
+        // Simulate 3 partners sorted by ID: alpha, beta, gamma.
+        let ids = vec!["alpha", "beta", "gamma"];
+
+        // Hour 0: offset = 0 % 3 = 0 → [alpha, beta, gamma]
+        let ts_h0: u64 = 100; // within hour 0
+        let offset_h0 = (ts_h0 / 3600) as usize % ids.len();
+        assert_eq!(offset_h0, 0, "hour 0 should start at index 0");
+
+        // Hour 1: offset = (3600 / 3600) % 3 = 1 → [beta, gamma, alpha]
+        let offset_h1 = (3600u64 / 3600) as usize % ids.len();
+        assert_eq!(offset_h1, 1, "hour 1 should start at index 1");
+
+        // Hour 2: offset = (7200 / 3600) % 3 = 2 → [gamma, alpha, beta]
+        let offset_h2 = (7200u64 / 3600) as usize % ids.len();
+        assert_eq!(offset_h2, 2, "hour 2 should start at index 2");
+
+        // Hour 3: offset = (10800 / 3600) % 3 = 0 → wraps back to [alpha, beta, gamma]
+        let offset_h3 = (10800u64 / 3600) as usize % ids.len();
+        assert_eq!(offset_h3, 0, "hour 3 should wrap back to index 0");
+
+        // Verify rotate_left produces expected ordering
+        let mut rotated = ids.clone();
+        rotated.rotate_left(offset_h1);
+        assert_eq!(
+            rotated,
+            vec!["beta", "gamma", "alpha"],
+            "hour 1 rotation should move beta to front"
         );
     }
 }

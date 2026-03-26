@@ -98,11 +98,33 @@ pub fn set_ec_on_response(settings: &Settings, ec_context: &EcContext, response:
 }
 
 /// Clears EC cookie and removes EC-specific response headers.
+///
+/// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips any
+/// dynamic `X-ts-<partner_id>` headers (matching the `x-ts-` prefix) to
+/// prevent leaking EC identity data when consent is withdrawn.
 pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
     expire_ec_cookie(settings, response);
 
     for header in EC_RESPONSE_HEADERS {
         response.remove_header(*header);
+    }
+
+    // Strip any dynamic x-ts-<partner_id> headers set by /identify or
+    // earlier processing. Collect names first to avoid borrow conflict.
+    let dynamic_ts_headers: Vec<String> = response
+        .get_header_names()
+        .filter_map(|name| {
+            let s = name.as_str();
+            if s.starts_with("x-ts-") {
+                Some(s.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for header in &dynamic_ts_headers {
+        response.remove_header(header.as_str());
     }
 }
 
@@ -170,6 +192,9 @@ mod tests {
         let mut response = Response::new();
         response.set_header("x-ts-ec", "abc");
         response.set_header("x-ts-eids", "[]");
+        // Dynamic partner headers that should also be stripped
+        response.set_header("x-ts-ssp_x", "partner-uid-123");
+        response.set_header("x-ts-liveramp", "lr-uid-456");
 
         clear_ec_on_response(&settings, &mut response);
 
@@ -180,6 +205,14 @@ mod tests {
         assert!(
             response.get_header("x-ts-eids").is_none(),
             "should remove x-ts-eids"
+        );
+        assert!(
+            response.get_header("x-ts-ssp_x").is_none(),
+            "should remove dynamic x-ts-<partner_id> headers"
+        );
+        assert!(
+            response.get_header("x-ts-liveramp").is_none(),
+            "should remove dynamic x-ts-<partner_id> headers"
         );
 
         let set_cookie = response

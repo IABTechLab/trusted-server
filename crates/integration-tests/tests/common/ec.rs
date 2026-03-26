@@ -272,7 +272,7 @@ pub fn batch_sync_no_auth(
 
 /// Single mapping in a batch sync request.
 pub struct BatchMapping {
-    pub ssc_hash: String,
+    pub ec_hash: String,
     pub partner_uid: String,
     pub timestamp: u64,
 }
@@ -282,7 +282,7 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
         .iter()
         .map(|m| {
             serde_json::json!({
-                "ssc_hash": m.ssc_hash,
+                "ec_hash": m.ec_hash,
                 "partner_uid": m.partner_uid,
                 "timestamp": m.timestamp,
             })

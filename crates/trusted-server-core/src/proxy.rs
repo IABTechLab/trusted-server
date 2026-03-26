@@ -1407,7 +1407,8 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(crate::constants::HEADER_X_TS_EC, "ec-123");
+        let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
+        req.set_header(crate::constants::HEADER_X_TS_EC, &valid_ec_id);
 
         let resp = handle_first_party_click(&settings, req)
             .await
@@ -1423,7 +1424,7 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
+        assert_eq!(pairs.remove("ts-ec").as_deref(), Some(valid_ec_id.as_str()));
         assert!(pairs.is_empty());
     }
 
