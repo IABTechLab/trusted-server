@@ -277,14 +277,14 @@ impl lol_html::OutputSink for RcVecSink {
 ///
 /// Operates in one of two modes:
 ///
-/// - **Streaming** (`buffered = false`): output is emitted incrementally on every
-///   [`StreamProcessor::process_chunk`] call. Use when no script rewriters are
-///   registered.
-/// - **Buffered** (`buffered = true`): input is accumulated and processed in a
-///   single `write()` call on `is_last`. Use when script rewriters are registered,
-///   because `lol_html` fragments text nodes across chunk boundaries and rewriters
-///   that expect complete text content (e.g., `__NEXT_DATA__`, GTM) would silently
-///   miss rewrites on split fragments.
+/// - **Streaming** ([`new`](Self::new)): output is emitted incrementally on every
+///   [`process_chunk`](StreamProcessor::process_chunk) call. Use when no script
+///   rewriters are registered.
+/// - **Buffered** ([`new_buffered`](Self::new_buffered)): input is accumulated and
+///   processed in a single `write()` call on `is_last`. Use when script rewriters
+///   are registered, because `lol_html` fragments text nodes across chunk boundaries
+///   and rewriters that expect complete text content would silently miss rewrites on
+///   split fragments. (See Phase 3 plan for making rewriters fragment-safe.)
 ///
 /// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
 /// is a no-op because the rewriter consumes its settings on construction.
@@ -344,7 +344,6 @@ impl StreamProcessor for HtmlRewriterAdapter {
             if !is_last {
                 return Ok(Vec::new());
             }
-            // Feed entire document to lol_html in one pass
             if let Some(rewriter) = &mut self.rewriter {
                 if !self.accumulated_input.is_empty() {
                     let input = std::mem::take(&mut self.accumulated_input);
@@ -355,7 +354,7 @@ impl StreamProcessor for HtmlRewriterAdapter {
                 }
             }
         } else {
-            // Streaming mode: feed chunks to lol_html incrementally.
+            // Streaming mode: feed chunks to `lol_html` incrementally.
             match &mut self.rewriter {
                 Some(rewriter) => {
                     if !chunk.is_empty() {
