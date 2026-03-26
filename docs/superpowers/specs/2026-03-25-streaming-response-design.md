@@ -224,9 +224,10 @@ headers are sent, we are committed.
 | `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming | Medium |
 | `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming | Medium |
 
-**Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
-`HtmlRewriterAdapter`, works as-is), integration registration, JS build
-pipeline, tsjs module serving, auction handler, cookie/synthetic ID logic.
+**Minimal changes**: `html_processor.rs` now selects `HtmlRewriterAdapter` mode
+based on script rewriter presence (see [Text Node Fragmentation](#text-node-fragmentation-phase-3)),
+but is otherwise unchanged. Integration registration, JS build pipeline, tsjs
+module serving, auction handler, cookie/synthetic ID logic are not changed.
 
 Note: `HtmlWithPostProcessing` wraps `HtmlRewriterAdapter` and applies
 post-processors on `is_last`. In the streaming path the post-processor list is
@@ -235,9 +236,12 @@ remains in place — no need to bypass it.
 
 Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 `html_post_processors`. Script rewriters run inside `lol_html` element handlers
-during streaming — they do not require buffering and are unaffected by this
-change. The streaming gate checks only `html_post_processors().is_empty()`, not
-script rewriters. Currently only Next.js registers a post-processor.
+and currently require buffered mode because `lol_html` fragments text nodes
+across chunk boundaries (see [Phase 3](#text-node-fragmentation-phase-3)).
+`html_post_processors` require the full document for post-processing.
+The streaming gate checks `html_post_processors().is_empty()` for the
+post-processor path; `create_html_processor` separately gates the adapter mode
+on `script_rewriters`. Currently only Next.js registers a post-processor.
 
 ## Text Node Fragmentation (Phase 3)
 

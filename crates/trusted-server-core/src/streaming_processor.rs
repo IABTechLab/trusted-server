@@ -339,7 +339,14 @@ impl StreamProcessor for HtmlRewriterAdapter {
         if self.buffered {
             // Buffered mode: accumulate input, process all at once on is_last.
             if !chunk.is_empty() {
-                self.accumulated_input.extend_from_slice(chunk);
+                if self.rewriter.is_none() {
+                    log::warn!(
+                        "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
+                        chunk.len()
+                    );
+                } else {
+                    self.accumulated_input.extend_from_slice(chunk);
+                }
             }
             if !is_last {
                 return Ok(Vec::new());
@@ -458,6 +465,57 @@ mod tests {
                 .iter()
                 .any(|(text, _)| text.contains("googletagmanager.com")),
             "no individual fragment should contain the full domain when split across chunks: {:?}",
+            *frags
+        );
+    }
+
+    /// Companion to [`lol_html_fragments_text_across_chunk_boundaries`]:
+    /// proves that `new_buffered()` prevents fragmentation by feeding the
+    /// entire document to `lol_html` in one `write()` call.
+    #[test]
+    fn buffered_adapter_prevents_text_fragmentation() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let fragments: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let fragments_clone = Rc::clone(&fragments);
+
+        let settings = lol_html::Settings {
+            element_content_handlers: vec![lol_html::text!("script", move |text| {
+                fragments_clone
+                    .borrow_mut()
+                    .push((text.as_str().to_string(), text.last_in_text_node()));
+                Ok(())
+            })],
+            ..lol_html::Settings::default()
+        };
+
+        let mut adapter = HtmlRewriterAdapter::new_buffered(settings);
+
+        // Feed the same split chunks as the fragmentation test
+        let r1 = adapter
+            .process_chunk(b"<script>google", false)
+            .expect("should process chunk1");
+        assert!(
+            r1.is_empty(),
+            "buffered adapter should return empty before is_last"
+        );
+
+        let r2 = adapter
+            .process_chunk(b"tagmanager.com/gtm.js</script>", true)
+            .expect("should process chunk2");
+        assert!(
+            !r2.is_empty(),
+            "buffered adapter should emit output on is_last"
+        );
+
+        let frags = fragments.borrow();
+        // With buffered mode, the text handler should see the complete string
+        assert!(
+            frags
+                .iter()
+                .any(|(text, _)| text.contains("googletagmanager.com")),
+            "buffered adapter should deliver complete text to handler, got: {:?}",
             *frags
         );
     }
