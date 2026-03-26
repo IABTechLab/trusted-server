@@ -25,7 +25,7 @@ pub const RATE_COUNTER_NAME: &str = "counter_store";
 /// Returns [`TrustedServerError`] when request validation fails (`400`) or
 /// required stores are unavailable (`503`).
 pub fn handle_sync(
-    _settings: &Settings,
+    _settings: &Settings, // reserved for future per-publisher sync config
     kv: &KvIdentityGraph,
     partner_store: &PartnerStore,
     req: &Request,
@@ -312,14 +312,8 @@ impl RateLimiter for FastlyRateLimiter {
     }
 }
 
-/// Returns the current Unix timestamp in seconds.
-#[must_use]
-pub fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// Re-export `current_timestamp` from parent module for sibling modules.
+pub(crate) use super::current_timestamp;
 
 #[cfg(test)]
 mod tests {

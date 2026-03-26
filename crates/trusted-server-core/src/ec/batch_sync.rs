@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
 
+use super::generation::is_valid_ec_hash;
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::partner::{hash_api_key, PartnerRecord, PartnerStore};
 use super::sync_pixel::RateLimiter;
@@ -25,11 +26,6 @@ const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
-
-/// Regex-free validation: 64 lowercase hex characters.
-fn is_valid_ssc_hash(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
 
 trait BatchSyncWriter {
     fn upsert_partner_id_if_exists(
@@ -199,7 +195,7 @@ fn process_mappings(
     let mut errors = Vec::new();
 
     for (idx, mapping) in mappings.iter().enumerate() {
-        if !is_valid_ssc_hash(&mapping.ssc_hash) {
+        if !is_valid_ec_hash(&mapping.ssc_hash) {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_EC_HASH,
@@ -266,7 +262,7 @@ fn json_response<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let body = serde_json::to_string(body).change_context(TrustedServerError::Configuration {
+    let body = serde_json::to_string(body).change_context(TrustedServerError::Ec {
         message: "Failed to serialize batch sync response".to_owned(),
     })?;
 
@@ -289,32 +285,12 @@ mod tests {
 
     use crate::error::TrustedServerError;
 
+    // Hash validation tests are in generation.rs (is_valid_ec_hash).
+    // Verify the import works here with a basic smoke test.
     #[test]
-    fn is_valid_ssc_hash_accepts_64_hex_chars() {
-        assert!(is_valid_ssc_hash(&"a".repeat(64)));
-        assert!(is_valid_ssc_hash(&"0123456789abcdef".repeat(4)));
-    }
-
-    #[test]
-    fn is_valid_ssc_hash_rejects_wrong_length() {
-        assert!(!is_valid_ssc_hash(&"a".repeat(63)));
-        assert!(!is_valid_ssc_hash(&"a".repeat(65)));
-        assert!(!is_valid_ssc_hash(""));
-    }
-
-    #[test]
-    fn is_valid_ssc_hash_rejects_non_hex() {
-        let mut hash = "a".repeat(64);
-        hash.replace_range(0..1, "g");
-        assert!(!is_valid_ssc_hash(&hash));
-    }
-
-    #[test]
-    fn is_valid_ssc_hash_accepts_uppercase_hex() {
-        assert!(
-            is_valid_ssc_hash(&"A".repeat(64)),
-            "should accept uppercase hex (normalized to lowercase before KV lookup)"
-        );
+    fn is_valid_ec_hash_smoke_test() {
+        assert!(is_valid_ec_hash(&"a".repeat(64)));
+        assert!(!is_valid_ec_hash(&"a".repeat(63)));
     }
 
     #[test]
