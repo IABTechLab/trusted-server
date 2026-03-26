@@ -1,8 +1,13 @@
 //! Partner registry — `PartnerRecord` schema and `PartnerStore` operations.
 //!
 //! Each partner (SSP, DSP, identity vendor) is stored as a JSON record in
-//! the Fastly KV Store keyed by `partner_id`. A secondary index
-//! `apikey:{sha256_hex}` provides O(1) API key lookups for batch sync auth.
+//! the Fastly KV Store keyed by `partner_id`. Two secondary indexes exist:
+//!
+//! - `apikey:{sha256_hex}` — maps API key hashes to partner IDs for O(1)
+//!   auth lookups during batch sync.
+//! - `_pull_enabled` — JSON array of partner IDs with `pull_sync_enabled:
+//!   true`, enabling O(1+N) reads on the pull sync hot path instead of a
+//!   full partner scan.
 
 use std::{collections::HashSet, sync::OnceLock};
 
@@ -33,6 +38,13 @@ const RESERVED_PARTNER_IDS: &[&str] = &[
 
 /// Prefix for the API key hash secondary index keys.
 const APIKEY_INDEX_PREFIX: &str = "apikey:";
+
+/// Key for the pull-enabled partner secondary index.
+///
+/// Stores a JSON array of partner IDs that have `pull_sync_enabled: true`.
+/// Updated on every `upsert()` so that `pull_enabled_partners()` can read
+/// a single index key instead of listing/scanning all partners.
+const PULL_ENABLED_INDEX_KEY: &str = "_pull_enabled";
 
 /// Cached compiled regex for partner ID validation.
 static PARTNER_ID_REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
@@ -190,9 +202,13 @@ pub fn hash_api_key(api_key: &str) -> String {
 
 /// Wraps a Fastly KV Store for partner registry operations.
 ///
-/// Partner records are keyed by `partner_id`. A secondary index
-/// `apikey:{sha256_hex}` maps API key hashes to partner IDs for
-/// O(1) auth lookups during batch sync.
+/// Partner records are keyed by `partner_id`. Two secondary indexes
+/// optimize hot-path operations:
+///
+/// - `apikey:{sha256_hex}` maps API key hashes to partner IDs for
+///   O(1) auth lookups during batch sync.
+/// - `_pull_enabled` stores a JSON array of partner IDs with
+///   `pull_sync_enabled: true` for O(1+N) reads during pull sync dispatch.
 pub struct PartnerStore {
     store_name: String,
 }
@@ -289,7 +305,7 @@ impl PartnerStore {
             })?;
 
             for key in page.keys() {
-                if key.starts_with(APIKEY_INDEX_PREFIX) {
+                if key.starts_with(APIKEY_INDEX_PREFIX) || key == PULL_ENABLED_INDEX_KEY {
                     continue;
                 }
 
@@ -321,7 +337,73 @@ impl PartnerStore {
         Ok(records)
     }
 
-    /// Writes or updates a partner record and maintains the API key index.
+    /// Returns pull-enabled partners via the `_pull_enabled` secondary index.
+    ///
+    /// Performs 1 index read + N partner reads (where N = pull-enabled count)
+    /// instead of scanning all partners. Falls back to [`list_registered`]
+    /// with client-side filtering when the index is missing or unreadable,
+    /// ensuring correctness even before the first `upsert()` writes the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store or deserialization failure.
+    pub fn pull_enabled_partners(&self) -> Result<Vec<PartnerRecord>, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+
+        // Read the secondary index.
+        let index_body = match store.lookup(PULL_ENABLED_INDEX_KEY) {
+            Ok(mut resp) => resp.take_body_bytes(),
+            Err(fastly::kv_store::KVStoreError::ItemNotFound) => {
+                // Index not yet written — fall back to full scan.
+                log::debug!("Pull-enabled index missing, falling back to list_registered");
+                return self
+                    .list_registered()
+                    .map(|v| v.into_iter().filter(|p| p.pull_sync_enabled).collect());
+            }
+            Err(err) => {
+                // Index unreadable — fall back to full scan rather than failing.
+                log::warn!(
+                    "Failed to read pull-enabled index, falling back to list_registered: {err:?}"
+                );
+                return self
+                    .list_registered()
+                    .map(|v| v.into_iter().filter(|p| p.pull_sync_enabled).collect());
+            }
+        };
+
+        let partner_ids: Vec<String> =
+            serde_json::from_slice(&index_body).change_context(TrustedServerError::KvStore {
+                store_name: self.store_name.clone(),
+                message: "Failed to deserialize pull-enabled index".to_owned(),
+            })?;
+
+        let mut records = Vec::with_capacity(partner_ids.len());
+        for partner_id in &partner_ids {
+            match self.get(partner_id)? {
+                Some(record) if record.pull_sync_enabled => {
+                    records.push(record);
+                }
+                Some(_) => {
+                    // Index is stale — partner is no longer pull-enabled.
+                    // This is self-healing: the next `upsert()` will fix the index.
+                    log::debug!(
+                        "Pull-enabled index references partner '{}' which is no longer pull-enabled",
+                        partner_id
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "Pull-enabled index references non-existent partner '{}'",
+                        partner_id
+                    );
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// Writes or updates a partner record and maintains secondary indexes.
     ///
     /// Returns `true` if this was a new partner (create), `false` if an
     /// existing partner was updated.
@@ -331,6 +413,7 @@ impl PartnerStore {
     /// 2. Write new `apikey:` index
     /// 3. Write primary record
     /// 4. Delete old `apikey:` index (if key rotated)
+    /// 5. Update `_pull_enabled` secondary index (best-effort)
     ///
     /// Writes are still **not fully atomic**, but this order ensures
     /// registration does not return success after a failed index write and
@@ -403,6 +486,12 @@ impl PartnerStore {
             }
         }
 
+        // 4. Update _pull_enabled secondary index (best-effort).
+        //    This is the last step so a failure here doesn't affect the
+        //    primary registration. `pull_enabled_partners()` falls back to
+        //    `list_registered()` if the index is missing or stale.
+        self.update_pull_enabled_index(&store, &record.id, record.pull_sync_enabled);
+
         Ok(is_create)
     }
 
@@ -436,6 +525,56 @@ impl PartnerStore {
         })?;
 
         Ok(Some(partner_id))
+    }
+
+    /// Best-effort update of the `_pull_enabled` secondary index.
+    ///
+    /// Reads the current index, adds or removes the partner ID, and writes
+    /// it back. All errors are logged and swallowed — the primary record
+    /// write has already succeeded.
+    fn update_pull_enabled_index(
+        &self,
+        store: &KVStore,
+        partner_id: &str,
+        pull_sync_enabled: bool,
+    ) {
+        // Read existing index (or start with empty list).
+        let mut ids: Vec<String> = match store.lookup(PULL_ENABLED_INDEX_KEY) {
+            Ok(mut resp) => {
+                let bytes = resp.take_body_bytes();
+                serde_json::from_slice(&bytes).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let had_id = ids.iter().any(|id| id == partner_id);
+
+        if pull_sync_enabled && !had_id {
+            ids.push(partner_id.to_owned());
+        } else if !pull_sync_enabled && had_id {
+            ids.retain(|id| id != partner_id);
+        } else {
+            // No change needed.
+            return;
+        }
+
+        let body = match serde_json::to_string(&ids) {
+            Ok(b) => b,
+            Err(err) => {
+                log::warn!(
+                    "Failed to serialize pull-enabled index after updating partner '{}': {err}",
+                    partner_id
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = store.build_insert().execute(PULL_ENABLED_INDEX_KEY, body) {
+            log::warn!(
+                "Failed to write pull-enabled index after updating partner '{}': {err:?}",
+                partner_id
+            );
+        }
     }
 
     fn restore_previous_index_mapping(

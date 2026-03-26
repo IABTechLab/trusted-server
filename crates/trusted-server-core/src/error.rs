@@ -80,9 +80,17 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
-    /// EC ID generation or validation failed.
-    #[display("EC error: {message}")]
-    Ec { message: String },
+    /// Edge cookie ID generation or validation failed.
+    #[display("Edge cookie error: {message}")]
+    EdgeCookie { message: String },
+
+    /// Requested partner was not found in the partner registry.
+    #[display("Partner not found: {partner_id}")]
+    PartnerNotFound { partner_id: String },
+
+    /// Partner authentication failed (invalid or missing credentials).
+    #[display("Partner auth failed: {partner_id}")]
+    PartnerAuthFailed { partner_id: String },
 }
 
 impl Error for TrustedServerError {}
@@ -117,6 +125,8 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::PartnerNotFound { .. } => StatusCode::BAD_REQUEST,
+            Self::PartnerAuthFailed { .. } => StatusCode::UNAUTHORIZED,
         }
     }
 
