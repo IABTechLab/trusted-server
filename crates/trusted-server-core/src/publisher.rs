@@ -93,12 +93,21 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
 }
 
-/// Process response body in streaming fashion with compression preservation
-fn process_response_streaming(
+/// Process response body through the streaming pipeline.
+///
+/// Selects the appropriate processor based on content type (HTML rewriter,
+/// RSC Flight rewriter, or URL replacer) and pipes chunks from `body`
+/// through it into `output`. The caller decides what `output` is — a
+/// `Vec<u8>` for buffered responses, or a `StreamingBody` for streaming.
+///
+/// # Errors
+///
+/// Returns an error if processor creation or chunk processing fails.
+fn process_response_streaming<W: std::io::Write>(
     body: Body,
+    output: &mut W,
     params: &ProcessResponseParams,
-) -> Result<Body, Report<TrustedServerError>> {
-    // Check if this is HTML content
+) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
     log::debug!(
@@ -110,15 +119,14 @@ fn process_response_streaming(
         params.origin_host
     );
 
-    // Determine compression type
     let compression = Compression::from_content_encoding(params.content_encoding);
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: 8192,
+    };
 
-    // Create output body to collect results
-    let mut output = Vec::new();
-
-    // Choose processor based on content type
     if is_html {
-        // Use HTML rewriter for HTML content
         let processor = create_html_stream_processor(
             params.origin_host,
             params.request_host,
@@ -126,57 +134,26 @@ fn process_response_streaming(
             params.settings,
             params.integration_registry,
         )?;
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else if is_rsc_flight {
-        // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
-        // corrupt the stream by changing byte lengths without updating the prefixes.
         let processor = RscFlightUrlRewriter::new(
             params.origin_host,
             params.origin_url,
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else {
-        // Use simple text replacer for non-HTML content
         let replacer = create_url_replacer(
             params.origin_host,
             params.origin_url,
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, replacer);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, replacer).process(body, output)?;
     }
 
-    log::debug!(
-        "Streaming processing complete - output size: {} bytes",
-        output.len()
-    );
-    Ok(Body::from(output))
+    Ok(())
 }
 
 /// Create a unified HTML stream processor
@@ -335,28 +312,11 @@ pub fn handle_publisher_request(
             content_type: &content_type,
             integration_registry,
         };
-        match process_response_streaming(body, &params) {
-            Ok(processed_body) => {
-                // Set the processed body back
-                response.set_body(processed_body);
+        let mut output = Vec::new();
+        process_response_streaming(body, &mut output, &params)?;
 
-                // Remove Content-Length as the size has likely changed
-                response.remove_header(header::CONTENT_LENGTH);
-
-                // Keep Content-Encoding header since we're returning compressed content
-                log::debug!(
-                    "Preserved Content-Encoding: {} for compressed response",
-                    content_encoding
-                );
-
-                log::debug!("Completed streaming processing of response body");
-            }
-            Err(e) => {
-                log::error!("Failed to process response body: {:?}", e);
-                // Return an error response
-                return Err(e);
-            }
-        }
+        response.set_body(Body::from(output));
+        response.remove_header(header::CONTENT_LENGTH);
     } else {
         log::debug!(
             "Skipping response processing - should_process: {}, request_host: '{}'",
