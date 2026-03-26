@@ -599,4 +599,55 @@ mod tests {
             final_html
         );
     }
+
+    /// Regression test: with a small chunk size, `lol_html` fragments the
+    /// `__NEXT_DATA__` text node across chunks. The rewriter must accumulate
+    /// fragments and produce correct output.
+    #[test]
+    fn small_chunk_next_data_rewrite_survives_fragmentation() {
+        // Build a __NEXT_DATA__ payload large enough to cross a 32-byte chunk boundary.
+        let html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"href":"https://origin.example.com/reviews","title":"Hello World"}}}</script></body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Use a very small chunk size to force fragmentation.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "should rewrite fragmented __NEXT_DATA__ href. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "should not contain original origin href. Got: {processed}"
+        );
+        assert!(
+            processed.contains("Hello World"),
+            "should preserve non-URL content. Got: {processed}"
+        );
+    }
 }

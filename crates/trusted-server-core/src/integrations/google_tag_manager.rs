@@ -1770,4 +1770,51 @@ container_id = "GTM-DEFAULT"
             other => panic!("expected Replace with passthrough, got {other:?}"),
         }
     }
+
+    /// Regression test: with a small chunk size, `lol_html` fragments the
+    /// inline GTM script text node. The rewriter must accumulate fragments
+    /// and produce correct output through the full HTML pipeline.
+    #[test]
+    fn small_chunk_gtm_rewrite_survives_fragmentation() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-SMALL1"
+                }),
+            )
+            .expect("should update config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Use a very small chunk size to force fragmentation mid-domain.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><head><script>j.src='https://www.googletagmanager.com/gtm.js?id=GTM-SMALL1';</script></head><body></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("/integrations/google_tag_manager/gtm.js"),
+            "should rewrite fragmented GTM URL. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("googletagmanager.com"),
+            "should not contain original GTM domain. Got: {processed}"
+        );
+    }
 }

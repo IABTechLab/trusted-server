@@ -575,7 +575,8 @@ mod tests {
 
     #[test]
     fn fragmented_next_data_without_rewritable_urls_preserves_content() {
-        let rewriter = NextJsNextDataRewriter::new(test_config());
+        let rewriter = NextJsNextDataRewriter::new(test_config())
+            .expect("should build rewriter");
         let document_state = IntegrationDocumentState::default();
 
         // __NEXT_DATA__ JSON with no origin URLs — rewrite_structured returns Keep.

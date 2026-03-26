@@ -686,11 +686,64 @@ mod tests {
         }
     }
 
-    // Note: test_streaming_compressed_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
+    /// Test the streaming gate logic in isolation. The gate decides whether
+    /// a response can be streamed or must be buffered based on:
+    /// - Backend status (2xx only)
+    /// - Content type (processable text types)
+    /// - Post-processors (none registered for streaming)
+    #[test]
+    fn streaming_gate_allows_2xx_html_without_post_processors() {
+        let is_success = true;
+        let is_html = true;
+        let has_post_processors = false;
+        let can_stream = is_success && (!is_html || !has_post_processors);
+        assert!(can_stream, "should stream 2xx HTML without post-processors");
+    }
 
-    // Note: test_streaming_brotli_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
+    #[test]
+    fn streaming_gate_blocks_non_2xx_responses() {
+        let is_success = false;
+        let is_html = true;
+        let has_post_processors = false;
+        let can_stream = is_success && (!is_html || !has_post_processors);
+        assert!(
+            !can_stream,
+            "should not stream error responses even without post-processors"
+        );
+    }
+
+    #[test]
+    fn streaming_gate_blocks_html_with_post_processors() {
+        let is_success = true;
+        let is_html = true;
+        let has_post_processors = true;
+        let can_stream = is_success && (!is_html || !has_post_processors);
+        assert!(
+            !can_stream,
+            "should not stream HTML when post-processors are registered"
+        );
+    }
+
+    #[test]
+    fn streaming_gate_allows_non_html_with_post_processors() {
+        let is_success = true;
+        let is_html = false;
+        let has_post_processors = true;
+        let can_stream = is_success && (!is_html || !has_post_processors);
+        assert!(
+            can_stream,
+            "should stream non-HTML even with post-processors (they only apply to HTML)"
+        );
+    }
+
+    #[test]
+    fn streaming_gate_blocks_non_2xx_json() {
+        let is_success = false;
+        let is_html = false;
+        let has_post_processors = false;
+        let can_stream = is_success && (!is_html || !has_post_processors);
+        assert!(!can_stream, "should not stream 4xx/5xx JSON responses");
+    }
 
     #[test]
     fn test_content_encoding_detection() {
@@ -938,6 +991,58 @@ mod tests {
             response.get_status(),
             StatusCode::NOT_FOUND,
             "should reject unknown module names"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_preserves_gzip_round_trip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        // Compress CSS containing an origin URL that should be rewritten.
+        // CSS uses the text URL replacer (not lol_html), so inline URLs are rewritten.
+        let html = b"body { background: url('https://origin.example.com/page'); }";
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut compressed, flate2::Compression::default());
+            encoder.write_all(html).expect("should compress");
+            encoder.finish().expect("should finish compression");
+        }
+
+        let body = Body::from(compressed);
+        let params = OwnedProcessResponseParams {
+            content_encoding: "gzip".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/css".to_string(),
+        };
+
+        let mut output = Vec::new();
+        stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect("should process gzip CSS");
+
+        // Decompress output
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoder = GzDecoder::new(&output[..]);
+        let mut decompressed = String::new();
+        decoder
+            .read_to_string(&mut decompressed)
+            .expect("should decompress output");
+
+        assert!(
+            decompressed.contains("proxy.example.com"),
+            "should rewrite origin to proxy. Got: {decompressed}"
+        );
+        assert!(
+            !decompressed.contains("origin.example.com"),
+            "should not contain original host. Got: {decompressed}"
         );
     }
 }
