@@ -273,14 +273,27 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
+    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
     let cookie_jar = handle_request_cookies(&req)?;
+
+    // Capture the current SSC cookie value for revocation handling.
+    // This must come from the cookie itself (not the x-synthetic-id header)
+    // to ensure KV deletion targets the same identifier being revoked.
     let existing_ssc_cookie = cookie_jar
         .as_ref()
         .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
         .map(|cookie| cookie.value().to_owned());
 
+    // Generate synthetic identifiers before the request body is consumed.
+    // Always generated for internal use (KV lookups, logging) even when
+    // consent is absent — the cookie is only *set* when consent allows it.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
+    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
+    // from the incoming request. The ConsentContext carries both raw strings
+    // (for OpenRTB forwarding) and decoded data (for enforcement).
+    // When a consent_store is configured, this also persists consent to KV
+    // and falls back to stored consent when cookies are absent.
     let geo = crate::geo::GeoInfo::from_request(&req);
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),

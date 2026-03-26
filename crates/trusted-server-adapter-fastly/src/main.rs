@@ -177,10 +177,8 @@ async fn route_request(
                         // sees a truncated response. Standard proxy behavior.
                         log::error!("Streaming processing failed: {e:?}");
                         drop(streaming_body);
-                    } else {
-                        streaming_body
-                            .finish()
-                            .expect("should finish streaming body");
+                    } else if let Err(e) = streaming_body.finish() {
+                        log::error!("Failed to finish streaming body: {e}");
                     }
                     // Response already sent via stream_to_client()
                     return None;
