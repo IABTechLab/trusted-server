@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -177,28 +179,87 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
-/// Proxies requests to the publisher's origin server.
+/// Result of publisher request handling, indicating whether the response
+/// body should be streamed or has already been buffered.
+pub enum PublisherResponse {
+    /// Response is fully buffered and ready to send via `send_to_client()`.
+    Buffered(Response),
+    /// Response headers are ready. The caller must:
+    /// 1. Call `finalize_response()` on the response
+    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
+    /// 3. Call `stream_publisher_body()` with the body and streaming writer
+    /// 4. Call `StreamingBody::finish()`
+    Stream {
+        /// Response with all headers set (synthetic ID, cookies, etc.)
+        /// but body not yet written. `Content-Length` already removed.
+        response: Response,
+        /// Origin body to be piped through the streaming pipeline.
+        body: Body,
+        /// Parameters for `process_response_streaming`.
+        params: OwnedProcessResponseParams,
+    },
+}
+
+/// Owned version of [`ProcessResponseParams`] for returning from
+/// `handle_publisher_request` without lifetime issues.
+pub struct OwnedProcessResponseParams {
+    pub content_encoding: String,
+    pub origin_host: String,
+    pub origin_url: String,
+    pub request_host: String,
+    pub request_scheme: String,
+    pub content_type: String,
+}
+
+/// Stream the publisher response body through the processing pipeline.
 ///
-/// This function forwards incoming requests to the configured origin URL,
-/// preserving headers and request body. It's used as a fallback for routes
-/// not explicitly handled by the trusted server.
+/// Called by the adapter after `stream_to_client()` has committed the
+/// response headers. Writes processed chunks directly to `output`.
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if:
-/// - The proxy request fails
-/// - The origin backend is unreachable
+/// Returns an error if processing fails mid-stream. Since headers are
+/// already committed, the caller should log the error and drop the
+/// `StreamingBody` (client sees a truncated response).
+pub fn stream_publisher_body<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<(), Report<TrustedServerError>> {
+    let borrowed = ProcessResponseParams {
+        content_encoding: &params.content_encoding,
+        origin_host: &params.origin_host,
+        origin_url: &params.origin_url,
+        request_host: &params.request_host,
+        request_scheme: &params.request_scheme,
+        settings,
+        content_type: &params.content_type,
+        integration_registry,
+    };
+    process_response_streaming(body, output, &borrowed)
+}
+
+/// Proxies requests to the publisher's origin server.
+///
+/// Returns a [`PublisherResponse`] indicating whether the response can be
+/// streamed or must be sent buffered. The streaming path is chosen when:
+/// - The backend returns a 2xx status
+/// - The response has a processable content type
+/// - No HTML post-processors are registered (the streaming gate)
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if the proxy request fails or the
+/// origin backend is unreachable.
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
-    // Prebid.js requests are not intercepted here anymore. The HTML processor removes
-    // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
-
-    // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
     let request_info = RequestInfo::from_request(&req);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
@@ -212,27 +273,14 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
     let cookie_jar = handle_request_cookies(&req)?;
-
-    // Capture the current SSC cookie value for revocation handling.
-    // This must come from the cookie itself (not the x-synthetic-id header)
-    // to ensure KV deletion targets the same identifier being revoked.
     let existing_ssc_cookie = cookie_jar
         .as_ref()
         .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
         .map(|cookie| cookie.value().to_owned());
 
-    // Generate synthetic identifiers before the request body is consumed.
-    // Always generated for internal use (KV lookups, logging) even when
-    // consent is absent — the cookie is only *set* when consent allows it.
     let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
-    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
-    // from the incoming request. The ConsentContext carries both raw strings
-    // (for OpenRTB forwarding) and decoded data (for enforcement).
-    // When a consent_store is configured, this also persists consent to KV
-    // and falls back to stored consent when cookies are absent.
     let geo = crate::geo::GeoInfo::from_request(&req);
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
@@ -267,13 +315,22 @@ pub fn handle_publisher_request(
             message: "Failed to proxy request to origin".to_string(),
         })?;
 
-    // Log all response headers for debugging
     log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
         log::debug!("  {}: {:?}", name, value);
     }
 
-    // Check if the response has a text-based content type that we should process
+    // Set synthetic ID / cookie headers BEFORE body processing.
+    // These are body-independent (computed from request cookies + consent).
+    apply_synthetic_id_headers(
+        settings,
+        &mut response,
+        &synthetic_id,
+        ssc_allowed,
+        existing_ssc_cookie.as_deref(),
+        &consent_context,
+    );
+
     let content_type = response
         .get_header(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
@@ -284,24 +341,60 @@ pub fn handle_publisher_request(
         || content_type.contains("application/javascript")
         || content_type.contains("application/json");
 
-    if should_process && !request_host.is_empty() {
-        // Check if the response is compressed
+    // Streaming gate: can we stream this response?
+    // - Must have processable content
+    // - Must have a request host for URL rewriting
+    // - Backend must return success (already guaranteed — errors propagated above)
+    // - No HTML post-processors registered (they need the full document)
+    let is_html = content_type.contains("text/html");
+    let has_post_processors = !integration_registry.html_post_processors().is_empty();
+    let can_stream =
+        should_process && !request_host.is_empty() && (!is_html || !has_post_processors);
+
+    if can_stream {
         let content_encoding = response
             .get_header(header::CONTENT_ENCODING)
             .map(|h| h.to_str().unwrap_or_default())
             .unwrap_or_default()
             .to_lowercase();
 
-        // Log response details for debugging
         log::debug!(
-            "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+            "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
             content_type, content_encoding, request_host, origin_host
         );
 
-        // Take the response body for streaming processing
         let body = response.take_body();
+        response.remove_header(header::CONTENT_LENGTH);
 
-        // Process the body using streaming approach
+        return Ok(PublisherResponse::Stream {
+            response,
+            body,
+            params: OwnedProcessResponseParams {
+                content_encoding,
+                origin_host,
+                origin_url: settings.publisher.origin_url.clone(),
+                request_host: request_host.to_string(),
+                request_scheme: request_scheme.to_string(),
+                content_type,
+            },
+        });
+    }
+
+    // Buffered fallback: process body in memory (post-processors need full document,
+    // or content type doesn't need processing).
+    if should_process && !request_host.is_empty() {
+        let content_encoding = response
+            .get_header(header::CONTENT_ENCODING)
+            .map(|h| h.to_str().unwrap_or_default())
+            .unwrap_or_default()
+            .to_lowercase();
+
+        log::debug!(
+            "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+            content_type, content_encoding, request_host, origin_host
+        );
+
+        let body = response.take_body();
         let params = ProcessResponseParams {
             content_encoding: &content_encoding,
             origin_host: &origin_host,
@@ -325,24 +418,31 @@ pub fn handle_publisher_request(
         );
     }
 
-    // Consent-gated SSC creation:
-    // - Consent given → set synthetic ID header + cookie.
-    // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
-    // - Consent absent + no cookie → do nothing.
+    Ok(PublisherResponse::Buffered(response))
+}
+
+/// Apply synthetic ID and cookie headers to the response.
+///
+/// Extracted so headers can be set before streaming begins (headers must
+/// be finalized before `stream_to_client()` commits them).
+fn apply_synthetic_id_headers(
+    settings: &Settings,
+    response: &mut Response,
+    synthetic_id: &str,
+    ssc_allowed: bool,
+    existing_ssc_cookie: Option<&str>,
+    consent_context: &crate::consent::ConsentContext,
+) {
     if ssc_allowed {
-        // Fastly's HeaderValue API rejects \r, \n, and \0, so the synthetic ID
-        // cannot inject additional response headers.
-        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-        // Cookie persistence is skipped if the synthetic ID contains RFC 6265-illegal
-        // characters. The header is still emitted when consent allows it.
-        set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
-    } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
+        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id);
+        set_synthetic_cookie(settings, response, synthetic_id);
+    } else if let Some(cookie_synthetic_id) = existing_ssc_cookie {
         log::info!(
             "SSC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_synthetic_id,
             consent_context.jurisdiction,
         );
-        expire_synthetic_cookie(settings, &mut response);
+        expire_synthetic_cookie(settings, response);
         if let Some(store_name) = &settings.consent.consent_store {
             crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
         }
@@ -352,8 +452,6 @@ pub fn handle_publisher_request(
             consent_context.jurisdiction,
         );
     }
-
-    Ok(response)
 }
 
 #[cfg(test)]

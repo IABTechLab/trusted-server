@@ -18,7 +18,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -72,14 +74,16 @@ fn main() {
         }
     };
 
-    let response = futures::executor::block_on(route_request(
+    // route_request may send the response directly (streaming path) or
+    // return it for us to send (buffered path).
+    if let Some(response) = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         req,
-    ));
-
-    response.send_to_client();
+    )) {
+        response.send_to_client();
+    }
 }
 
 async fn route_request(
@@ -87,7 +91,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     mut req: Request,
-) -> Response {
+) -> Option<Response> {
     // Strip client-spoofable forwarded headers at the edge.
     // On Fastly this service IS the first proxy — these headers from
     // clients are untrusted and can hijack URL rewriting (see #409).
@@ -98,7 +102,7 @@ async fn route_request(
 
     if let Some(mut response) = enforce_basic_auth(settings, &req) {
         finalize_response(settings, geo_info.as_ref(), &mut response);
-        return response;
+        return Some(response);
     }
 
     // Get path and method for routing
@@ -154,7 +158,34 @@ async fn route_request(
             );
 
             match handle_publisher_request(settings, integration_registry, req) {
-                Ok(response) => Ok(response),
+                Ok(PublisherResponse::Stream {
+                    mut response,
+                    body,
+                    params,
+                }) => {
+                    // Streaming path: finalize headers, then stream body to client.
+                    finalize_response(settings, geo_info.as_ref(), &mut response);
+                    let mut streaming_body = response.stream_to_client();
+                    if let Err(e) = stream_publisher_body(
+                        body,
+                        &mut streaming_body,
+                        &params,
+                        settings,
+                        integration_registry,
+                    ) {
+                        // Headers already sent (200 OK). Log and abort — client
+                        // sees a truncated response. Standard proxy behavior.
+                        log::error!("Streaming processing failed: {e:?}");
+                        drop(streaming_body);
+                    } else {
+                        streaming_body
+                            .finish()
+                            .expect("should finish streaming body");
+                    }
+                    // Response already sent via stream_to_client()
+                    return None;
+                }
+                Ok(PublisherResponse::Buffered(response)) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);
                     Err(e)
@@ -168,7 +199,7 @@ async fn route_request(
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
-    response
+    Some(response)
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
