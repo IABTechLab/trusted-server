@@ -1,7 +1,7 @@
 //! Server-to-server batch sync endpoint (`POST /api/v1/sync`).
 //!
 //! Partners send authenticated batch ID sync requests via Bearer token.
-//! Each mapping associates an `ssc_hash` (the 64-char hex EC hash prefix)
+//! Each mapping associates an `ec_hash` (the 64-char hex EC hash prefix)
 //! with the partner's user ID. Mappings are individually validated and
 //! written to the KV identity graph, with per-mapping rejection reasons
 //! reported in the response.
@@ -60,7 +60,7 @@ struct BatchSyncRequest {
 
 #[derive(Debug, Deserialize)]
 struct SyncMapping {
-    ssc_hash: String,
+    ec_hash: String,
     partner_uid: String,
     timestamp: u64,
 }
@@ -195,7 +195,7 @@ fn process_mappings(
     let mut errors = Vec::new();
 
     for (idx, mapping) in mappings.iter().enumerate() {
-        if !is_valid_ec_hash(&mapping.ssc_hash) {
+        if !is_valid_ec_hash(&mapping.ec_hash) {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_EC_HASH,
@@ -212,9 +212,9 @@ fn process_mappings(
         }
 
         // Normalize to lowercase — KV keys are always lowercase hex.
-        let ssc_hash = mapping.ssc_hash.to_ascii_lowercase();
+        let ec_hash = mapping.ec_hash.to_ascii_lowercase();
         match writer.upsert_partner_id_if_exists(
-            &ssc_hash,
+            &ec_hash,
             partner_id,
             &mapping.partner_uid,
             mapping.timestamp,
@@ -236,8 +236,8 @@ fn process_mappings(
             }
             Err(err) => {
                 log::warn!(
-                    "Batch sync KV write failed for index {idx} (ssc_hash '{}'): {err:?}",
-                    mapping.ssc_hash
+                    "Batch sync KV write failed for index {idx} (ec_hash '{}'): {err:?}",
+                    mapping.ec_hash
                 );
                 errors.push(MappingError {
                     index: idx,
@@ -262,7 +262,7 @@ fn json_response<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let body = serde_json::to_string(body).change_context(TrustedServerError::Ec {
+    let body = serde_json::to_string(body).change_context(TrustedServerError::EdgeCookie {
         message: "Failed to serialize batch sync response".to_owned(),
     })?;
 
@@ -395,9 +395,9 @@ mod tests {
         }
     }
 
-    fn mapping(ssc_hash: &str, partner_uid: &str, timestamp: u64) -> SyncMapping {
+    fn mapping(ec_hash: &str, partner_uid: &str, timestamp: u64) -> SyncMapping {
         SyncMapping {
-            ssc_hash: ssc_hash.to_owned(),
+            ec_hash: ec_hash.to_owned(),
             partner_uid: partner_uid.to_owned(),
             timestamp,
         }
@@ -473,18 +473,18 @@ mod tests {
 
     #[test]
     fn batch_sync_request_deserializes_correctly() {
-        let json = r#"{"mappings": [{"ssc_hash": "aaaa", "partner_uid": "u1", "timestamp": 100}]}"#;
+        let json = r#"{"mappings": [{"ec_hash": "aaaa", "partner_uid": "u1", "timestamp": 100}]}"#;
         let parsed: BatchSyncRequest =
             serde_json::from_str(json).expect("should deserialize batch sync request");
         assert_eq!(parsed.mappings.len(), 1);
-        assert_eq!(parsed.mappings[0].ssc_hash, "aaaa");
+        assert_eq!(parsed.mappings[0].ec_hash, "aaaa");
         assert_eq!(parsed.mappings[0].partner_uid, "u1");
         assert_eq!(parsed.mappings[0].timestamp, 100);
     }
 
     #[test]
     fn batch_sync_request_rejects_missing_timestamp() {
-        let json = r#"{"mappings": [{"ssc_hash": "bbbb", "partner_uid": "u2"}]}"#;
+        let json = r#"{"mappings": [{"ec_hash": "bbbb", "partner_uid": "u2"}]}"#;
         let result = serde_json::from_str::<BatchSyncRequest>(json);
         assert!(
             result.is_err(),

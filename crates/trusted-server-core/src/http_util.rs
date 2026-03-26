@@ -9,14 +9,18 @@ use crate::settings::Settings;
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
 ///
-/// This filters out all headers listed in [`INTERNAL_HEADERS`] to prevent leaking
-/// internal identity, geo-enrichment, and debugging data to downstream third-party
-/// services. Integrations that forward custom headers should use this utility
-/// instead of manually iterating over header names.
+/// This filters out all headers listed in [`INTERNAL_HEADERS`] **and** any header
+/// matching the `x-ts-` prefix (case-insensitive) to prevent leaking internal
+/// identity, geo-enrichment, debugging data, and dynamic `X-ts-<partner_id>`
+/// headers to downstream third-party services. Integrations that forward custom
+/// headers should use this utility instead of manually iterating over header names.
 pub fn copy_custom_headers(from: &Request, to: &mut Request) {
     for header_name in from.get_header_names() {
         let name_str = header_name.as_str();
+        // Header names are lowercased by the HTTP library, so a single
+        // prefix check covers both `x-ts-` and `X-ts-` variants.
         if (name_str.starts_with("x-") || name_str.starts_with("X-"))
+            && !name_str.starts_with("x-ts-")
             && !INTERNAL_HEADERS.contains(&name_str)
         {
             if let Some(value) = from.get_header(header_name) {
@@ -569,6 +573,9 @@ mod tests {
         req.set_header("X-Custom-2", "value2");
         req.set_header("x-ts-ec", "should not copy");
         req.set_header("x-geo-country", "US");
+        // Dynamic partner header (x-ts-<partner_id>)
+        req.set_header("x-ts-ssp_x", "partner-uid-123");
+        req.set_header("x-ts-liveramp", "lr-uid-456");
 
         let mut target = Request::new(fastly::http::Method::GET, "https://target.com");
         copy_custom_headers(&req, &mut target);
@@ -590,6 +597,14 @@ mod tests {
         assert!(
             target.get_header("x-geo-country").is_none(),
             "Should filter x-geo-country"
+        );
+        assert!(
+            target.get_header("x-ts-ssp_x").is_none(),
+            "Should filter dynamic x-ts-<partner_id> headers"
+        );
+        assert!(
+            target.get_header("x-ts-liveramp").is_none(),
+            "Should filter dynamic x-ts-<partner_id> headers"
         );
     }
 }

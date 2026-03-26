@@ -708,7 +708,7 @@ fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
 
     // Batch sync writes a UID for this hash
     let mappings = vec![BatchMapping {
-        ssc_hash: hash.clone(),
+        ec_hash: hash.clone(),
         partner_uid: "batch-uid-99".to_owned(),
         timestamp: 1_700_000_000,
     }];
@@ -753,7 +753,7 @@ fn ec_batch_sync_auth_rejection(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
 
     let dummy_mappings = vec![BatchMapping {
-        ssc_hash: "a".repeat(64),
+        ec_hash: "a".repeat(64),
         partner_uid: "uid-1".to_owned(),
         timestamp: 1_700_000_000,
     }];
