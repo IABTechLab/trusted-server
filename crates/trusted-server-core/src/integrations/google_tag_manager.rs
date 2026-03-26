@@ -12,7 +12,7 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
@@ -132,11 +132,17 @@ fn validate_container_id(container_id: &str) -> Result<(), validator::Validation
 
 pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
+    /// Accumulates text fragments when lol_html splits a text node across
+    /// chunk boundaries. Drained on `is_last_in_text_node`.
+    accumulated_text: Mutex<String>,
 }
 
 impl GoogleTagManagerIntegration {
     fn new(config: GoogleTagManagerConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        Arc::new(Self {
+            config,
+            accumulated_text: Mutex::new(String::new()),
+        })
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -488,14 +494,40 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         "script" // Match all scripts to find inline GTM snippets
     }
 
-    fn rewrite(&self, content: &str, _ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+        let mut buf = self
+            .accumulated_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if !ctx.is_last_in_text_node {
+            // Intermediate fragment — accumulate and suppress output.
+            buf.push_str(content);
+            return ScriptRewriteAction::RemoveNode;
+        }
+
+        // Last fragment. Determine the full content to inspect.
+        let full_content;
+        let text = if buf.is_empty() {
+            content
+        } else {
+            buf.push_str(content);
+            full_content = std::mem::take(&mut *buf);
+            &full_content
+        };
+
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
         // Note: analytics.google.com is intentionally excluded — gtag.js stores
         // that domain as a bare string and constructs URLs dynamically, so
         // rewriting it in scripts produces broken URLs.
-        if content.contains("googletagmanager.com") || content.contains("google-analytics.com") {
-            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(content));
+        if text.contains("googletagmanager.com") || text.contains("google-analytics.com") {
+            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(text));
+        }
+
+        // No GTM content — if we accumulated fragments, emit them unchanged.
+        if text.len() != content.len() {
+            return ScriptRewriteAction::replace(text.to_string());
         }
 
         ScriptRewriteAction::keep()
@@ -1630,6 +1662,112 @@ container_id = "GTM-DEFAULT"
                 assert_eq!(message, "test failure");
             }
             other => panic!("Expected Integration error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fragmented_gtm_snippet_is_accumulated_and_rewritten() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-FRAG1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let document_state = IntegrationDocumentState::default();
+
+        // Simulate lol_html splitting the GTM snippet mid-domain.
+        let fragment1 = r#"(function(w,d,s,l,i){j.src='https://www.google"#;
+        let fragment2 = r#"tagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-FRAG1');"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        // Intermediate fragment: should be suppressed.
+        let action1 =
+            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        assert_eq!(
+            action1,
+            ScriptRewriteAction::RemoveNode,
+            "should suppress intermediate fragment"
+        );
+
+        // Last fragment: should emit full rewritten content.
+        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(rewritten) => {
+                assert!(
+                    rewritten.contains("/integrations/google_tag_manager/gtm.js"),
+                    "should rewrite GTM URL. Got: {rewritten}"
+                );
+                assert!(
+                    !rewritten.contains("googletagmanager.com"),
+                    "should not contain original GTM domain. Got: {rewritten}"
+                );
+            }
+            other => panic!("expected Replace for fragmented GTM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_gtm_fragmented_script_is_passed_through() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-PASS1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let document_state = IntegrationDocumentState::default();
+
+        let fragment1 = "console.log('hel";
+        let fragment2 = "lo world');";
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action1 =
+            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        assert_eq!(
+            action1,
+            ScriptRewriteAction::RemoveNode,
+            "should suppress intermediate"
+        );
+
+        // Last fragment: should emit full unchanged content since it's not GTM.
+        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(content) => {
+                assert_eq!(
+                    content, "console.log('hello world');",
+                    "should emit full accumulated non-GTM content"
+                );
+            }
+            other => panic!("expected Replace with passthrough, got {other:?}"),
         }
     }
 }
