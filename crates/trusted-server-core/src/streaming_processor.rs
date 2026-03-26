@@ -280,12 +280,14 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     ) -> Result<(), Report<TrustedServerError>> {
         use flate2::read::ZlibDecoder;
         use flate2::write::ZlibEncoder;
-        use flate2::Compression;
 
         let decoder = ZlibDecoder::new(input);
-        let encoder = ZlibEncoder::new(output, Compression::default());
-
-        self.process_through_compression(decoder, encoder)
+        let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
+        self.process_through_compression(decoder, &mut encoder)?;
+        encoder.finish().change_context(TrustedServerError::Proxy {
+            message: "Failed to finalize deflate encoder".to_string(),
+        })?;
+        Ok(())
     }
 
     /// Process deflate compressed input to uncompressed output (decompression only)
@@ -315,9 +317,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             lgwin: 22,
             ..Default::default()
         };
-        let encoder = CompressorWriter::with_params(output, 4096, &params);
-
-        self.process_through_compression(decoder, encoder)
+        let mut encoder = CompressorWriter::with_params(output, 4096, &params);
+        self.process_through_compression(decoder, &mut encoder)?;
+        // CompressorWriter finalizes on flush (already called) and into_inner
+        encoder.into_inner();
+        Ok(())
     }
 
     /// Process brotli compressed input to uncompressed output (decompression only)
@@ -332,10 +336,14 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     }
 
     /// Generic processing through compression layers
+    ///
+    /// The caller retains ownership of `encoder` and must call its
+    /// type-specific finalization method (e.g., `finish()` or `into_inner()`)
+    /// after this function returns successfully.
     fn process_through_compression<R: Read, W: Write>(
         &mut self,
         mut decoder: R,
-        mut encoder: W,
+        encoder: &mut W,
     ) -> Result<(), Report<TrustedServerError>> {
         let mut buffer = vec![0u8; self.config.chunk_size];
 
@@ -380,15 +388,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             }
         }
 
-        // Flush encoder (this also finishes compression)
         encoder.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush encoder".to_string(),
         })?;
 
-        // For GzEncoder and similar, we need to finish() to properly close the stream
-        // The flush above might not be enough
-        drop(encoder);
-
+        // Caller owns encoder and must call finish() after this returns.
         Ok(())
     }
 }
@@ -643,6 +647,58 @@ mod tests {
         assert_eq!(
             output, "<p>new</p>",
             "Should only contain new input after reset"
+        );
+    }
+
+    #[test]
+    fn test_deflate_round_trip_produces_valid_output() {
+        // Verify that deflate-to-deflate (which uses process_through_compression)
+        // produces valid output that decompresses correctly. This establishes the
+        // correctness contract before we change the finalization path.
+        use flate2::read::ZlibDecoder;
+        use flate2::write::ZlibEncoder;
+        use std::io::{Read as _, Write as _};
+
+        let input_data = b"<html><body>hello world</body></html>";
+
+        // Compress input
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc =
+                ZlibEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Deflate,
+            output_compression: Compression::Deflate,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process deflate-to-deflate");
+
+        // Decompress output and verify correctness
+        let mut decompressed = Vec::new();
+        ZlibDecoder::new(&output[..])
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
+        assert_eq!(
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through deflate round-trip"
         );
     }
 
