@@ -86,9 +86,16 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
         }
 
         // Complete the accumulated text and process the full content.
+        // If rewrite_structured returns Keep, we must still emit the full
+        // accumulated text via Replace — intermediate fragments were already
+        // removed from lol_html's output via RemoveNode.
         buf.push_str(content);
         let full_content = std::mem::take(&mut *buf);
-        self.rewrite_structured(&full_content, ctx)
+        let action = self.rewrite_structured(&full_content, ctx);
+        if matches!(action, ScriptRewriteAction::Keep) {
+            return ScriptRewriteAction::replace(full_content);
+        }
+        action
     }
 }
 
@@ -563,6 +570,46 @@ mod tests {
                 );
             }
             other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_next_data_without_rewritable_urls_preserves_content() {
+        let rewriter = NextJsNextDataRewriter::new(test_config());
+        let document_state = IntegrationDocumentState::default();
+
+        // __NEXT_DATA__ JSON with no origin URLs — rewrite_structured returns Keep.
+        let fragment1 = r#"{"props":{"pageProps":{"title":"Hello"#;
+        let fragment2 = r#" World","count":42}}}"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action1 = rewriter.rewrite(fragment1, &ctx_intermediate);
+        assert_eq!(action1, ScriptRewriteAction::RemoveNode);
+
+        // Last fragment: even though no URLs to rewrite, must emit full content
+        // because intermediate fragments were removed.
+        let action2 = rewriter.rewrite(fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(content) => {
+                let expected = format!("{fragment1}{fragment2}");
+                assert_eq!(
+                    content, expected,
+                    "should emit full accumulated content unchanged"
+                );
+            }
+            other => panic!("expected Replace with passthrough, got {other:?}"),
         }
     }
 }
