@@ -275,16 +275,33 @@ impl lol_html::OutputSink for RcVecSink {
 
 /// Adapter to use `lol_html` [`HtmlRewriter`](lol_html::HtmlRewriter) as a [`StreamProcessor`].
 ///
-/// Output is emitted incrementally on every [`StreamProcessor::process_chunk`] call.
+/// Operates in one of two modes:
+///
+/// - **Streaming** (`buffered = false`): output is emitted incrementally on every
+///   [`StreamProcessor::process_chunk`] call. Use when no script rewriters are
+///   registered.
+/// - **Buffered** (`buffered = true`): input is accumulated and processed in a
+///   single `write()` call on `is_last`. Use when script rewriters are registered,
+///   because `lol_html` fragments text nodes across chunk boundaries and rewriters
+///   that expect complete text content (e.g., `__NEXT_DATA__`, GTM) would silently
+///   miss rewrites on split fragments.
+///
 /// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
 /// is a no-op because the rewriter consumes its settings on construction.
 pub struct HtmlRewriterAdapter {
     rewriter: Option<lol_html::HtmlRewriter<'static, RcVecSink>>,
     output: Rc<RefCell<Vec<u8>>>,
+    /// When true, input is accumulated and fed to `lol_html` in one pass on `is_last`.
+    buffered: bool,
+    /// Accumulated input for the buffered path.
+    accumulated_input: Vec<u8>,
 }
 
 impl HtmlRewriterAdapter {
     /// Create a new HTML rewriter adapter that streams output per chunk.
+    ///
+    /// Use [`Self::new_buffered`] when script rewriters are registered to
+    /// avoid text node fragmentation.
     #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
         let output = Rc::new(RefCell::new(Vec::new()));
@@ -293,28 +310,69 @@ impl HtmlRewriterAdapter {
         Self {
             rewriter: Some(rewriter),
             output,
+            buffered: false,
+            accumulated_input: Vec::new(),
+        }
+    }
+
+    /// Create a new HTML rewriter adapter that buffers all input before processing.
+    ///
+    /// This avoids `lol_html` text node fragmentation that breaks script rewriters
+    /// expecting complete text content. The entire document is fed to the rewriter
+    /// in a single `write()` call when `is_last` is true.
+    #[must_use]
+    pub fn new_buffered(settings: lol_html::Settings<'static, 'static>) -> Self {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let sink = RcVecSink(Rc::clone(&output));
+        let rewriter = lol_html::HtmlRewriter::new(settings, sink);
+        Self {
+            rewriter: Some(rewriter),
+            output,
+            buffered: true,
+            accumulated_input: Vec::new(),
         }
     }
 }
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        match &mut self.rewriter {
-            Some(rewriter) => {
-                if !chunk.is_empty() {
-                    rewriter.write(chunk).map_err(|e| {
-                        log::error!("Failed to process HTML chunk: {e}");
+        if self.buffered {
+            // Buffered mode: accumulate input, process all at once on is_last.
+            if !chunk.is_empty() {
+                self.accumulated_input.extend_from_slice(chunk);
+            }
+            if !is_last {
+                return Ok(Vec::new());
+            }
+            // Feed entire document to lol_html in one pass
+            if let Some(rewriter) = &mut self.rewriter {
+                if !self.accumulated_input.is_empty() {
+                    let input = std::mem::take(&mut self.accumulated_input);
+                    rewriter.write(&input).map_err(|e| {
+                        log::error!("Failed to process HTML: {e}");
                         io::Error::other(format!("HTML processing failed: {e}"))
                     })?;
                 }
             }
-            None if !chunk.is_empty() => {
-                log::warn!(
-                    "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
-                    chunk.len()
-                );
+        } else {
+            // Streaming mode: feed chunks to lol_html incrementally.
+            match &mut self.rewriter {
+                Some(rewriter) => {
+                    if !chunk.is_empty() {
+                        rewriter.write(chunk).map_err(|e| {
+                            log::error!("Failed to process HTML chunk: {e}");
+                            io::Error::other(format!("HTML processing failed: {e}"))
+                        })?;
+                    }
+                }
+                None if !chunk.is_empty() => {
+                    log::warn!(
+                        "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
+                        chunk.len()
+                    );
+                }
+                None => {}
             }
-            None => {}
         }
 
         if is_last {
@@ -351,6 +409,59 @@ impl StreamProcessor for StreamingReplacer {
 mod tests {
     use super::*;
     use crate::streaming_replacer::{Replacement, StreamingReplacer};
+
+    /// Verify that `lol_html` fragments text nodes when input chunks split
+    /// mid-text-node. This is critical: if `lol_html` does fragment, then
+    /// script rewriters (`NextJS` `__NEXT_DATA__`, `GTM`) that expect full
+    /// text content will silently miss rewrites when the streaming adapter
+    /// feeds chunks incrementally.
+    #[test]
+    fn lol_html_fragments_text_across_chunk_boundaries() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let fragments: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let fragments_clone = Rc::clone(&fragments);
+
+        let mut rewriter = lol_html::HtmlRewriter::new(
+            lol_html::Settings {
+                element_content_handlers: vec![lol_html::text!("script", move |text| {
+                    fragments_clone
+                        .borrow_mut()
+                        .push((text.as_str().to_string(), text.last_in_text_node()));
+                    Ok(())
+                })],
+                ..lol_html::Settings::default()
+            },
+            |_chunk: &[u8]| {},
+        );
+
+        // Split "googletagmanager.com/gtm.js" across two chunks
+        rewriter
+            .write(b"<script>google")
+            .expect("should write chunk1");
+        rewriter
+            .write(b"tagmanager.com/gtm.js</script>")
+            .expect("should write chunk2");
+        rewriter.end().expect("should end");
+
+        let frags = fragments.borrow();
+        // lol_html should emit at least 2 text fragments since input was split
+        assert!(
+            frags.len() >= 2,
+            "should fragment text across chunk boundaries, got {} fragments: {:?}",
+            frags.len(),
+            *frags
+        );
+        // No single fragment should contain the full domain
+        assert!(
+            !frags
+                .iter()
+                .any(|(text, _)| text.contains("googletagmanager.com")),
+            "no individual fragment should contain the full domain when split across chunks: {:?}",
+            *frags
+        );
+    }
 
     #[test]
     fn test_uncompressed_pipeline() {
