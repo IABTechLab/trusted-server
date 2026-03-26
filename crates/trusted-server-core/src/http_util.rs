@@ -11,14 +11,18 @@ use crate::settings::Settings;
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
 ///
-/// This filters out all headers listed in [`INTERNAL_HEADERS`] to prevent leaking
-/// internal identity, geo-enrichment, and debugging data to downstream third-party
-/// services. Integrations that forward custom headers should use this utility
-/// instead of manually iterating over header names.
+/// This filters out all headers listed in [`INTERNAL_HEADERS`] **and** any header
+/// matching the `x-ts-` prefix (case-insensitive) to prevent leaking internal
+/// identity, geo-enrichment, debugging data, and dynamic `X-ts-<partner_id>`
+/// headers to downstream third-party services. Integrations that forward custom
+/// headers should use this utility instead of manually iterating over header names.
 pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>) {
     for (header_name, value) in from.headers() {
         let name_str = header_name.as_str();
-        if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
+        if name_str.starts_with("x-")
+            && !name_str.starts_with("x-ts-")
+            && !INTERNAL_HEADERS.contains(&name_str)
+        {
             to.headers_mut().append(header_name.clone(), value.clone());
         }
     }
@@ -741,6 +745,9 @@ mod tests {
         set_header(&mut req, "X-Custom-2", "value2");
         set_header(&mut req, "x-ts-ec", "should not copy");
         set_header(&mut req, "x-geo-country", "US");
+        // Dynamic partner header (x-ts-<partner_id>).
+        set_header(&mut req, "x-ts-ssp_x", "partner-uid-123");
+        set_header(&mut req, "x-ts-liveramp", "lr-uid-456");
 
         let mut target = build_request(Method::GET, "https://target.com");
         copy_custom_headers(&req, &mut target);
@@ -772,6 +779,14 @@ mod tests {
         assert!(
             target.headers().get("x-geo-country").is_none(),
             "Should filter x-geo-country"
+        );
+        assert!(
+            target.headers().get("x-ts-ssp_x").is_none(),
+            "Should filter dynamic x-ts-<partner_id> headers"
+        );
+        assert!(
+            target.headers().get("x-ts-liveramp").is_none(),
+            "Should filter dynamic x-ts-<partner_id> headers"
         );
     }
 

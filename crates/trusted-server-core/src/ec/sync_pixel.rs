@@ -34,8 +34,8 @@ pub fn handle_sync(
     let query = SyncQuery::parse(req)?;
 
     let partner = partner_store.get(&query.partner)?.ok_or_else(|| {
-        Report::new(TrustedServerError::BadRequest {
-            message: format!("unknown partner '{}'", query.partner),
+        Report::new(TrustedServerError::PartnerNotFound {
+            partner_id: query.partner.clone(),
         })
     })?;
 
