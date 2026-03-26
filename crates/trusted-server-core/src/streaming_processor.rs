@@ -187,40 +187,13 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     ) -> Result<(), Report<TrustedServerError>> {
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
-        use flate2::Compression;
 
-        // Decompress input
-        let mut decoder = GzDecoder::new(input);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress gzip".to_string(),
-            })?;
-
-        log::info!("Decompressed size: {} bytes", decompressed.len());
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Processed size: {} bytes", processed.len());
-
-        // Recompress the output
-        let mut encoder = GzEncoder::new(output, Compression::default());
-        encoder
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write to gzip encoder".to_string(),
-            })?;
+        let decoder = GzDecoder::new(input);
+        let mut encoder = GzEncoder::new(output, flate2::Compression::default());
+        self.process_through_compression(decoder, &mut encoder)?;
         encoder.finish().change_context(TrustedServerError::Proxy {
-            message: "Failed to finish gzip encoder".to_string(),
+            message: "Failed to finalize gzip encoder".to_string(),
         })?;
-
         Ok(())
     }
 
@@ -699,6 +672,56 @@ mod tests {
             String::from_utf8(decompressed).expect("should be valid UTF-8"),
             "<html><body>hi world</body></html>",
             "should have replaced content through deflate round-trip"
+        );
+    }
+
+    #[test]
+    fn test_gzip_to_gzip_produces_correct_output() {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use std::io::{Read as _, Write as _};
+
+        // Arrange
+        let input_data = b"<html><body>hello world</body></html>";
+
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc =
+                GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        // Act
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process gzip-to-gzip");
+
+        // Assert
+        let mut decompressed = Vec::new();
+        GzDecoder::new(&output[..])
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
+        assert_eq!(
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through gzip round-trip"
         );
     }
 
