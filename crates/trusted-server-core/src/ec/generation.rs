@@ -63,7 +63,7 @@ fn generate_random_suffix(length: usize) -> String {
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::Ec`] if HMAC generation fails
+/// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
 pub fn generate_ec_id(
     settings: &Settings,
     client_ip: &str,
@@ -71,7 +71,7 @@ pub fn generate_ec_id(
     log::trace!("Input for fresh EC ID: client_ip={client_ip}");
 
     let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
-        .change_context(TrustedServerError::Ec {
+        .change_context(TrustedServerError::EdgeCookie {
             message: "Failed to create HMAC instance".to_string(),
         })?;
     mac.update(client_ip.as_bytes());
@@ -92,12 +92,12 @@ pub fn generate_ec_id(
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::Ec`] when the client IP is unavailable
+/// Returns [`TrustedServerError::EdgeCookie`] when the client IP is unavailable
 /// (e.g. in certain test or proxy configurations). EC generation requires
 /// a valid client IP — there is no fallback.
 pub fn extract_client_ip(req: &fastly::Request) -> Result<String, Report<TrustedServerError>> {
     req.get_client_ip_addr().map(normalize_ip).ok_or_else(|| {
-        Report::new(TrustedServerError::Ec {
+        Report::new(TrustedServerError::EdgeCookie {
             message: "Client IP required for EC generation but unavailable".to_string(),
         })
     })

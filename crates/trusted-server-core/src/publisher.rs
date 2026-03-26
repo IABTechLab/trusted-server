@@ -625,16 +625,18 @@ mod tests {
     #[test]
     fn revocation_targets_cookie_ec_id_not_header() {
         let settings = create_test_settings();
+        let header_ec = format!("{}.HdrId1", "a".repeat(64));
+        let cookie_ec = format!("{}.CkId01", "b".repeat(64));
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("x-ts-ec", "header_id");
-        req.set_header("cookie", "ts-ec=cookie_id; other=value");
+        req.set_header("x-ts-ec", &header_ec);
+        req.set_header("cookie", format!("ts-ec={cookie_ec}; other=value"));
 
         let ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
         assert_eq!(
             ec_context.ec_value(),
-            Some("header_id"),
+            Some(header_ec.as_str()),
             "should resolve request EC ID from header precedence"
         );
         assert!(
@@ -643,7 +645,7 @@ mod tests {
         );
         assert_eq!(
             ec_context.existing_cookie_ec_id(),
-            Some("cookie_id"),
+            Some(cookie_ec.as_str()),
             "should return cookie EC value for revocation, not the header value"
         );
     }
