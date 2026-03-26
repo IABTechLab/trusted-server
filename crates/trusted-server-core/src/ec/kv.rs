@@ -14,6 +14,7 @@ use fastly::kv_store::{InsertMode, KVStore};
 
 use crate::error::TrustedServerError;
 
+use super::current_timestamp;
 use super::kv_types::{KvEntry, KvMetadata};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -643,16 +644,6 @@ impl KvIdentityGraph {
                 message: format!("Failed to delete key '{ec_hash}'"),
             })
     }
-}
-
-/// Returns the current Unix timestamp in seconds.
-///
-/// Uses `std::time::SystemTime` which is supported on `wasm32-wasip1`.
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

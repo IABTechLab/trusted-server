@@ -14,7 +14,8 @@ use crate::geo::GeoInfo;
 use crate::settings::Settings;
 
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
-use super::generation::{ec_hash, is_valid_ec_id};
+use super::current_timestamp;
+use super::generation::{ec_hash, is_valid_ec_hash, is_valid_ec_id};
 use super::kv::KvIdentityGraph;
 use super::EcContext;
 
@@ -130,17 +131,6 @@ fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
     hashes
 }
 
-fn is_valid_ec_hash(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,15 +151,13 @@ mod tests {
             ..Default::default()
         };
 
-        EcContext {
-            ec_value: ec_value.map(str::to_owned),
-            cookie_ec_value: cookie_ec_value.map(str::to_owned),
+        EcContext::new_for_test_with_cookie(
+            ec_value.map(str::to_owned),
+            cookie_ec_value.map(str::to_owned),
             ec_was_present,
             ec_generated,
             consent,
-            client_ip: None,
-            geo_info: None,
-        }
+        )
     }
 
     fn sample_ec_id(suffix: &str) -> String {
