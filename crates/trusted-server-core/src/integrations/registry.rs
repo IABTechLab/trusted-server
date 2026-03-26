@@ -1336,8 +1336,10 @@ mod tests {
         let registry = IntegrationRegistry::from_routes(routes);
 
         let mut req = Request::get("https://test.example.com/integrations/test/ec");
-        // Pre-existing cookie, but no geo data → Unknown jurisdiction → consent denied.
-        req.set_header(header::COOKIE, "ts-ec=existing_id_12345");
+        // Pre-existing cookie with valid EC ID format, but no geo data →
+        // Unknown jurisdiction → consent denied.
+        let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
+        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
