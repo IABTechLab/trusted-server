@@ -196,9 +196,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     /// This is the single unified chunk loop used by all compression paths.
     /// The method calls `writer.flush()` before returning. For the `None → None`
     /// path this is the only finalization needed. For compressed paths, the caller
-    /// must still call the encoder's type-specific finalization (e.g., `finish()`
-    /// for flate2, `into_inner()` for brotli) — `flush()` alone does not write
-    /// compression trailers for all codecs.
+    /// must still call the encoder's type-specific finalization after this returns:
+    /// - **flate2** (`GzEncoder`, `ZlibEncoder`): call `finish()` — `flush()` does
+    ///   not write the gzip/deflate trailer.
+    /// - **brotli** (`CompressorWriter`): `flush()` does finalize the stream, so
+    ///   the caller only needs `into_inner()` to reclaim the writer.
     ///
     /// # Errors
     ///

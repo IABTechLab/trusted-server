@@ -1105,4 +1105,66 @@ mod tests {
             "streaming and buffered paths should produce identical output"
         );
     }
+
+    #[test]
+    fn active_post_processor_receives_full_document_and_mutates_output() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        struct AppendCommentProcessor;
+        impl IntegrationHtmlPostProcessor for AppendCommentProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-append"
+            }
+            fn should_process(&self, html: &str, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                html.contains("</html>")
+            }
+            fn post_process(&self, html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                html.push_str("<!-- processed -->");
+                true
+            }
+        }
+
+        let mut processor = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(AppendCommentProcessor)],
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        // Feed multiple chunks
+        let r1 = processor
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let r2 = processor
+            .process_chunk(b"<p>content</p>", false)
+            .expect("should process chunk2");
+        let r3 = processor
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        // Intermediate chunks return empty (buffered for post-processor)
+        assert!(
+            r1.is_empty() && r2.is_empty(),
+            "should buffer intermediate chunks"
+        );
+
+        // Final chunk contains the full document with post-processor mutation
+        let output = String::from_utf8(r3).expect("should be valid UTF-8");
+        assert!(
+            output.contains("<p>content</p>"),
+            "should contain original content"
+        );
+        assert!(
+            output.contains("</html>"),
+            "should contain complete document"
+        );
+        assert!(
+            output.contains("<!-- processed -->"),
+            "should contain post-processor mutation"
+        );
+    }
 }
