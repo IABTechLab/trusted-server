@@ -197,39 +197,58 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         Ok(())
     }
 
-    /// Decompress input, process content, and write uncompressed output.
+    /// Decompress input, process content in chunks, and write uncompressed output.
     fn decompress_and_process<R: Read, W: Write>(
         &mut self,
         mut decoder: R,
         mut output: W,
         codec_name: &str,
     ) -> Result<(), Report<TrustedServerError>> {
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: format!("Failed to decompress {codec_name}"),
-            })?;
+        let mut buffer = vec![0u8; self.config.chunk_size];
 
-        log::info!(
-            "{codec_name} decompressed size: {} bytes",
-            decompressed.len()
-        );
+        loop {
+            match decoder.read(&mut buffer) {
+                Ok(0) => {
+                    let final_chunk = self.processor.process_chunk(&[], true).change_context(
+                        TrustedServerError::Proxy {
+                            message: format!("Failed to process final {codec_name} chunk"),
+                        },
+                    )?;
+                    if !final_chunk.is_empty() {
+                        output.write_all(&final_chunk).change_context(
+                            TrustedServerError::Proxy {
+                                message: format!("Failed to write final {codec_name} chunk"),
+                            },
+                        )?;
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    let processed = self
+                        .processor
+                        .process_chunk(&buffer[..n], false)
+                        .change_context(TrustedServerError::Proxy {
+                            message: format!("Failed to process {codec_name} chunk"),
+                        })?;
+                    if !processed.is_empty() {
+                        output.write_all(&processed).change_context(
+                            TrustedServerError::Proxy {
+                                message: format!("Failed to write {codec_name} chunk"),
+                            },
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to read from {codec_name} decoder: {e}"),
+                    }));
+                }
+            }
+        }
 
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("{codec_name} processed size: {} bytes", processed.len());
-
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
+        output.flush().change_context(TrustedServerError::Proxy {
+            message: format!("Failed to flush {codec_name} output"),
+        })?;
 
         Ok(())
     }
@@ -722,6 +741,51 @@ mod tests {
             String::from_utf8(decompressed).expect("should be valid UTF-8"),
             "<html><body>hi world</body></html>",
             "should have replaced content through gzip round-trip"
+        );
+    }
+
+    #[test]
+    fn test_gzip_to_none_produces_correct_output() {
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        // Arrange
+        let input_data = b"<html><body>hello world</body></html>";
+
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc =
+                GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        // Act
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process gzip-to-none");
+
+        // Assert
+        let result =
+            String::from_utf8(output).expect("should be valid UTF-8 uncompressed output");
+        assert_eq!(
+            result, "<html><body>hi world</body></html>",
+            "should have replaced content after gzip decompression"
         );
     }
 
