@@ -226,19 +226,12 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
-        EcContext {
-            ec_value: ec_value.map(str::to_owned),
-            cookie_ec_value: ec_value.map(str::to_owned),
-            ec_was_present: ec_value.is_some(),
-            ec_generated: false,
-            consent: ConsentContext {
-                jurisdiction,
-                source: ConsentSource::Cookie,
-                ..ConsentContext::default()
-            },
-            client_ip: None,
-            geo_info: None,
-        }
+        let consent = ConsentContext {
+            jurisdiction,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        EcContext::new_for_test(ec_value.map(str::to_owned), consent)
     }
 
     #[test]

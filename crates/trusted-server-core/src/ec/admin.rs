@@ -236,11 +236,9 @@ pub fn handle_register_partner(
         created,
     };
 
-    let body = serde_json::to_string(&response_body).change_context(
-        TrustedServerError::Configuration {
-            message: "Failed to serialize registration response".to_owned(),
-        },
-    )?;
+    let body = serde_json::to_string(&response_body).change_context(TrustedServerError::Ec {
+        message: "Failed to serialize registration response".to_owned(),
+    })?;
 
     Ok(Response::from_status(status)
         .with_content_type(fastly::mime::APPLICATION_JSON)
