@@ -94,6 +94,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
 
     /// Process a stream from input to output
     ///
+    /// Handles all supported compression transformations by wrapping the raw
+    /// reader/writer in the appropriate decoder/encoder, then delegating to
+    /// [`Self::process_chunks`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the compression transformation is unsupported or if reading/writing fails.
@@ -106,44 +110,96 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             self.config.input_compression,
             self.config.output_compression,
         ) {
-            (Compression::None, Compression::None) => self.process_uncompressed(input, output),
-            (Compression::Gzip, Compression::Gzip) => self.process_gzip_to_gzip(input, output),
-            (Compression::Gzip, Compression::None) => self.process_gzip_to_none(input, output),
+            (Compression::None, Compression::None) => self.process_chunks(input, output),
+            (Compression::Gzip, Compression::Gzip) => {
+                use flate2::read::GzDecoder;
+                use flate2::write::GzEncoder;
+
+                let decoder = GzDecoder::new(input);
+                let mut encoder = GzEncoder::new(output, flate2::Compression::default());
+                self.process_chunks(decoder, &mut encoder)?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finalize gzip encoder".to_string(),
+                })?;
+                Ok(())
+            }
+            (Compression::Gzip, Compression::None) => {
+                use flate2::read::GzDecoder;
+
+                self.process_chunks(GzDecoder::new(input), output)
+            }
             (Compression::Deflate, Compression::Deflate) => {
-                self.process_deflate_to_deflate(input, output)
+                use flate2::read::ZlibDecoder;
+                use flate2::write::ZlibEncoder;
+
+                let decoder = ZlibDecoder::new(input);
+                let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
+                self.process_chunks(decoder, &mut encoder)?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finalize deflate encoder".to_string(),
+                })?;
+                Ok(())
             }
             (Compression::Deflate, Compression::None) => {
-                self.process_deflate_to_none(input, output)
+                use flate2::read::ZlibDecoder;
+
+                self.process_chunks(ZlibDecoder::new(input), output)
             }
             (Compression::Brotli, Compression::Brotli) => {
-                self.process_brotli_to_brotli(input, output)
+                use brotli::enc::writer::CompressorWriter;
+                use brotli::enc::BrotliEncoderParams;
+                use brotli::Decompressor;
+
+                let decoder = Decompressor::new(input, 4096);
+                let params = BrotliEncoderParams {
+                    quality: 4,
+                    lgwin: 22,
+                    ..Default::default()
+                };
+                let mut encoder = CompressorWriter::with_params(output, 4096, &params);
+                self.process_chunks(decoder, &mut encoder)?;
+                // CompressorWriter finalizes on flush (already called) and into_inner
+                encoder.into_inner();
+                Ok(())
             }
-            (Compression::Brotli, Compression::None) => self.process_brotli_to_none(input, output),
+            (Compression::Brotli, Compression::None) => {
+                use brotli::Decompressor;
+
+                self.process_chunks(Decompressor::new(input, 4096), output)
+            }
             _ => Err(Report::new(TrustedServerError::Proxy {
                 message: "Unsupported compression transformation".to_string(),
             })),
         }
     }
 
-    /// Process uncompressed stream
-    fn process_uncompressed<R: Read, W: Write>(
+    /// Read chunks from `reader`, pass each through the processor, and write output to `writer`.
+    ///
+    /// This is the single unified chunk loop used by all compression paths.
+    /// The caller is responsible for wrapping `reader`/`writer` in the appropriate
+    /// decoder/encoder and for finalizing the encoder (e.g., calling `finish()`)
+    /// after this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, processing, or writing any chunk fails.
+    fn process_chunks<R: Read, W: Write>(
         &mut self,
-        mut input: R,
-        mut output: W,
+        mut reader: R,
+        mut writer: W,
     ) -> Result<(), Report<TrustedServerError>> {
         let mut buffer = vec![0u8; self.config.chunk_size];
 
         loop {
-            match input.read(&mut buffer) {
+            match reader.read(&mut buffer) {
                 Ok(0) => {
-                    // End of stream - process any remaining data
                     let final_chunk = self.processor.process_chunk(&[], true).change_context(
                         TrustedServerError::Proxy {
                             message: "Failed to process final chunk".to_string(),
                         },
                     )?;
                     if !final_chunk.is_empty() {
-                        output.write_all(&final_chunk).change_context(
+                        writer.write_all(&final_chunk).change_context(
                             TrustedServerError::Proxy {
                                 message: "Failed to write final chunk".to_string(),
                             },
@@ -152,7 +208,6 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                     break;
                 }
                 Ok(n) => {
-                    // Process this chunk
                     let processed = self
                         .processor
                         .process_chunk(&buffer[..n], false)
@@ -160,234 +215,25 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                             message: "Failed to process chunk".to_string(),
                         })?;
                     if !processed.is_empty() {
-                        output
-                            .write_all(&processed)
-                            .change_context(TrustedServerError::Proxy {
+                        writer.write_all(&processed).change_context(
+                            TrustedServerError::Proxy {
                                 message: "Failed to write processed chunk".to_string(),
-                            })?;
+                            },
+                        )?;
                     }
                 }
                 Err(e) => {
                     return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read from input: {}", e),
+                        message: format!("Failed to read: {e}"),
                     }));
                 }
             }
         }
 
-        output.flush().change_context(TrustedServerError::Proxy {
+        writer.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush output".to_string(),
         })?;
 
-        Ok(())
-    }
-
-    /// Process gzip compressed stream
-    fn process_gzip_to_gzip<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-        use flate2::write::GzEncoder;
-
-        let decoder = GzDecoder::new(input);
-        let mut encoder = GzEncoder::new(output, flate2::Compression::default());
-        self.process_through_compression(decoder, &mut encoder)?;
-        encoder.finish().change_context(TrustedServerError::Proxy {
-            message: "Failed to finalize gzip encoder".to_string(),
-        })?;
-        Ok(())
-    }
-
-    /// Decompress input, process content in chunks, and write uncompressed output.
-    fn decompress_and_process<R: Read, W: Write>(
-        &mut self,
-        mut decoder: R,
-        mut output: W,
-        codec_name: &str,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let mut buffer = vec![0u8; self.config.chunk_size];
-
-        loop {
-            match decoder.read(&mut buffer) {
-                Ok(0) => {
-                    let final_chunk = self.processor.process_chunk(&[], true).change_context(
-                        TrustedServerError::Proxy {
-                            message: format!("Failed to process final {codec_name} chunk"),
-                        },
-                    )?;
-                    if !final_chunk.is_empty() {
-                        output.write_all(&final_chunk).change_context(
-                            TrustedServerError::Proxy {
-                                message: format!("Failed to write final {codec_name} chunk"),
-                            },
-                        )?;
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    let processed = self
-                        .processor
-                        .process_chunk(&buffer[..n], false)
-                        .change_context(TrustedServerError::Proxy {
-                            message: format!("Failed to process {codec_name} chunk"),
-                        })?;
-                    if !processed.is_empty() {
-                        output.write_all(&processed).change_context(
-                            TrustedServerError::Proxy {
-                                message: format!("Failed to write {codec_name} chunk"),
-                            },
-                        )?;
-                    }
-                }
-                Err(e) => {
-                    return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read from {codec_name} decoder: {e}"),
-                    }));
-                }
-            }
-        }
-
-        output.flush().change_context(TrustedServerError::Proxy {
-            message: format!("Failed to flush {codec_name} output"),
-        })?;
-
-        Ok(())
-    }
-
-    /// Process gzip compressed input to uncompressed output (decompression only)
-    fn process_gzip_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-
-        self.decompress_and_process(GzDecoder::new(input), output, "gzip")
-    }
-
-    /// Process deflate compressed stream
-    fn process_deflate_to_deflate<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::ZlibDecoder;
-        use flate2::write::ZlibEncoder;
-
-        let decoder = ZlibDecoder::new(input);
-        let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
-        self.process_through_compression(decoder, &mut encoder)?;
-        encoder.finish().change_context(TrustedServerError::Proxy {
-            message: "Failed to finalize deflate encoder".to_string(),
-        })?;
-        Ok(())
-    }
-
-    /// Process deflate compressed input to uncompressed output (decompression only)
-    fn process_deflate_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::ZlibDecoder;
-
-        self.decompress_and_process(ZlibDecoder::new(input), output, "deflate")
-    }
-
-    /// Process brotli compressed stream
-    fn process_brotli_to_brotli<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use brotli::enc::writer::CompressorWriter;
-        use brotli::enc::BrotliEncoderParams;
-        use brotli::Decompressor;
-
-        let decoder = Decompressor::new(input, 4096);
-        let params = BrotliEncoderParams {
-            quality: 4,
-            lgwin: 22,
-            ..Default::default()
-        };
-        let mut encoder = CompressorWriter::with_params(output, 4096, &params);
-        self.process_through_compression(decoder, &mut encoder)?;
-        // CompressorWriter finalizes on flush (already called) and into_inner
-        encoder.into_inner();
-        Ok(())
-    }
-
-    /// Process brotli compressed input to uncompressed output (decompression only)
-    fn process_brotli_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use brotli::Decompressor;
-
-        self.decompress_and_process(Decompressor::new(input, 4096), output, "brotli")
-    }
-
-    /// Generic processing through compression layers
-    ///
-    /// The caller retains ownership of `encoder` and must call its
-    /// type-specific finalization method (e.g., `finish()` or `into_inner()`)
-    /// after this function returns successfully.
-    fn process_through_compression<R: Read, W: Write>(
-        &mut self,
-        mut decoder: R,
-        encoder: &mut W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let mut buffer = vec![0u8; self.config.chunk_size];
-
-        loop {
-            match decoder.read(&mut buffer) {
-                Ok(0) => {
-                    // End of stream
-                    let final_chunk = self.processor.process_chunk(&[], true).change_context(
-                        TrustedServerError::Proxy {
-                            message: "Failed to process final chunk".to_string(),
-                        },
-                    )?;
-                    if !final_chunk.is_empty() {
-                        encoder.write_all(&final_chunk).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write final chunk".to_string(),
-                            },
-                        )?;
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    let processed = self
-                        .processor
-                        .process_chunk(&buffer[..n], false)
-                        .change_context(TrustedServerError::Proxy {
-                            message: "Failed to process chunk".to_string(),
-                        })?;
-                    if !processed.is_empty() {
-                        encoder.write_all(&processed).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write processed chunk".to_string(),
-                            },
-                        )?;
-                    }
-                }
-                Err(e) => {
-                    return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read from decoder: {}", e),
-                    }));
-                }
-            }
-        }
-
-        encoder.flush().change_context(TrustedServerError::Proxy {
-            message: "Failed to flush encoder".to_string(),
-        })?;
-
-        // Caller owns encoder and must call finish() after this returns.
         Ok(())
     }
 }
