@@ -189,6 +189,8 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         mut writer: W,
     ) -> Result<(), Report<TrustedServerError>> {
         let mut buffer = vec![0u8; self.config.chunk_size];
+        let mut total_read: u64 = 0;
+        let mut total_written: u64 = 0;
 
         loop {
             match reader.read(&mut buffer) {
@@ -199,6 +201,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                         },
                     )?;
                     if !final_chunk.is_empty() {
+                        total_written += final_chunk.len() as u64;
                         writer.write_all(&final_chunk).change_context(
                             TrustedServerError::Proxy {
                                 message: "Failed to write final chunk".to_string(),
@@ -208,6 +211,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                     break;
                 }
                 Ok(n) => {
+                    total_read += n as u64;
                     let processed = self
                         .processor
                         .process_chunk(&buffer[..n], false)
@@ -215,6 +219,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                             message: "Failed to process chunk".to_string(),
                         })?;
                     if !processed.is_empty() {
+                        total_written += processed.len() as u64;
                         writer
                             .write_all(&processed)
                             .change_context(TrustedServerError::Proxy {
@@ -233,6 +238,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         writer.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush output".to_string(),
         })?;
+
+        log::debug!(
+            "Streaming pipeline complete: read {total_read} bytes, wrote {total_written} bytes"
+        );
 
         Ok(())
     }
@@ -628,6 +637,54 @@ mod tests {
         assert_eq!(
             result, "<html><body>hi world</body></html>",
             "should have replaced content after gzip decompression"
+        );
+    }
+
+    #[test]
+    fn test_brotli_round_trip_produces_valid_output() {
+        use brotli::enc::writer::CompressorWriter;
+        use brotli::Decompressor;
+        use std::io::{Read as _, Write as _};
+
+        let input_data = b"<html><body>hello world</body></html>";
+
+        // Compress input with brotli
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = CompressorWriter::new(&mut compressed_input, 4096, 4, 22);
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.flush().expect("should flush brotli encoder");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Brotli,
+            output_compression: Compression::Brotli,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process brotli-to-brotli");
+
+        // Decompress output and verify correctness
+        let mut decompressed = Vec::new();
+        Decompressor::new(&output[..], 4096)
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
+        assert_eq!(
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through brotli round-trip"
         );
     }
 

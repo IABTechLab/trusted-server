@@ -1010,4 +1010,89 @@ mod tests {
                 .collect::<String>()
         );
     }
+
+    #[test]
+    fn post_processors_accumulate_while_streaming_path_passes_through() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        // --- Streaming path: no post-processors → output emitted per chunk ---
+        let mut streaming = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: Vec::new(),
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        let chunk1 = streaming
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let chunk2 = streaming
+            .process_chunk(b"<p>hello</p>", false)
+            .expect("should process chunk2");
+        let chunk3 = streaming
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        assert!(
+            !chunk1.is_empty() || !chunk2.is_empty(),
+            "should emit intermediate output on streaming path"
+        );
+
+        let mut streaming_all = chunk1;
+        streaming_all.extend_from_slice(&chunk2);
+        streaming_all.extend_from_slice(&chunk3);
+
+        // --- Buffered path: post-processor registered → accumulates until is_last ---
+        struct NoopPostProcessor;
+        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-noop"
+            }
+            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                false
+            }
+        }
+
+        let mut buffered = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(NoopPostProcessor)],
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        let buf1 = buffered
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let buf2 = buffered
+            .process_chunk(b"<p>hello</p>", false)
+            .expect("should process chunk2");
+        let buf3 = buffered
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        assert!(
+            buf1.is_empty() && buf2.is_empty(),
+            "should return empty for intermediate chunks when post-processors are registered"
+        );
+        assert!(
+            !buf3.is_empty(),
+            "should emit all output in final chunk when post-processors are registered"
+        );
+
+        // Both paths should produce identical output
+        let streaming_str =
+            String::from_utf8(streaming_all).expect("streaming output should be valid UTF-8");
+        let buffered_str = String::from_utf8(buf3).expect("buffered output should be valid UTF-8");
+        assert_eq!(
+            streaming_str, buffered_str,
+            "streaming and buffered paths should produce identical output"
+        );
+    }
 }
