@@ -455,7 +455,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
-    let has_script_rewriters = !script_rewriters.is_empty();
     for script_rewriter in script_rewriters {
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
@@ -493,16 +492,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         ..RewriterSettings::default()
     };
 
-    // Use buffered mode when script rewriters are registered. lol_html fragments
-    // text nodes across input chunk boundaries, breaking rewriters that expect
-    // complete text (e.g., __NEXT_DATA__, GTM). Buffered mode feeds the entire
-    // document in one write() call, preserving text node integrity.
-    // Phase 3 will make rewriters fragment-safe, enabling streaming for all configs.
-    let inner = if has_script_rewriters {
-        HtmlRewriterAdapter::new_buffered(rewriter_settings)
-    } else {
-        HtmlRewriterAdapter::new(rewriter_settings)
-    };
+    let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
     HtmlWithPostProcessing {
         inner,

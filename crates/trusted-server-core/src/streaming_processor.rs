@@ -275,33 +275,19 @@ impl lol_html::OutputSink for RcVecSink {
 
 /// Adapter to use `lol_html` [`HtmlRewriter`](lol_html::HtmlRewriter) as a [`StreamProcessor`].
 ///
-/// Operates in one of two modes:
-///
-/// - **Streaming** ([`new`](Self::new)): output is emitted incrementally on every
-///   [`process_chunk`](StreamProcessor::process_chunk) call. Use when no script
-///   rewriters are registered.
-/// - **Buffered** ([`new_buffered`](Self::new_buffered)): input is accumulated and
-///   processed in a single `write()` call on `is_last`. Use when script rewriters
-///   are registered, because `lol_html` fragments text nodes across chunk boundaries
-///   and rewriters that expect complete text content would silently miss rewrites on
-///   split fragments. (See Phase 3 plan for making rewriters fragment-safe.)
+/// Output is emitted incrementally on every [`process_chunk`](StreamProcessor::process_chunk)
+/// call. Script rewriters that receive text from `lol_html` must be fragment-safe —
+/// they accumulate text fragments internally until `is_last_in_text_node` is true.
 ///
 /// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
 /// is a no-op because the rewriter consumes its settings on construction.
 pub struct HtmlRewriterAdapter {
     rewriter: Option<lol_html::HtmlRewriter<'static, RcVecSink>>,
     output: Rc<RefCell<Vec<u8>>>,
-    /// When true, input is accumulated and fed to `lol_html` in one pass on `is_last`.
-    buffered: bool,
-    /// Accumulated input for the buffered path.
-    accumulated_input: Vec<u8>,
 }
 
 impl HtmlRewriterAdapter {
     /// Create a new HTML rewriter adapter that streams output per chunk.
-    ///
-    /// Use [`Self::new_buffered`] when script rewriters are registered to
-    /// avoid text node fragmentation.
     #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
         let output = Rc::new(RefCell::new(Vec::new()));
@@ -310,75 +296,28 @@ impl HtmlRewriterAdapter {
         Self {
             rewriter: Some(rewriter),
             output,
-            buffered: false,
-            accumulated_input: Vec::new(),
-        }
-    }
-
-    /// Create a new HTML rewriter adapter that buffers all input before processing.
-    ///
-    /// This avoids `lol_html` text node fragmentation that breaks script rewriters
-    /// expecting complete text content. The entire document is fed to the rewriter
-    /// in a single `write()` call when `is_last` is true.
-    #[must_use]
-    pub fn new_buffered(settings: lol_html::Settings<'static, 'static>) -> Self {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        let sink = RcVecSink(Rc::clone(&output));
-        let rewriter = lol_html::HtmlRewriter::new(settings, sink);
-        Self {
-            rewriter: Some(rewriter),
-            output,
-            buffered: true,
-            accumulated_input: Vec::new(),
         }
     }
 }
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        if self.buffered {
-            // Buffered mode: accumulate input, process all at once on is_last.
-            if !chunk.is_empty() {
-                if self.rewriter.is_none() {
-                    log::warn!(
-                        "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
-                        chunk.len()
-                    );
-                } else {
-                    self.accumulated_input.extend_from_slice(chunk);
-                }
-            }
-            if !is_last {
-                return Ok(Vec::new());
-            }
-            if let Some(rewriter) = &mut self.rewriter {
-                if !self.accumulated_input.is_empty() {
-                    let input = std::mem::take(&mut self.accumulated_input);
-                    rewriter.write(&input).map_err(|e| {
-                        log::error!("Failed to process HTML: {e}");
+        match &mut self.rewriter {
+            Some(rewriter) => {
+                if !chunk.is_empty() {
+                    rewriter.write(chunk).map_err(|e| {
+                        log::error!("Failed to process HTML chunk: {e}");
                         io::Error::other(format!("HTML processing failed: {e}"))
                     })?;
                 }
             }
-        } else {
-            // Streaming mode: feed chunks to `lol_html` incrementally.
-            match &mut self.rewriter {
-                Some(rewriter) => {
-                    if !chunk.is_empty() {
-                        rewriter.write(chunk).map_err(|e| {
-                            log::error!("Failed to process HTML chunk: {e}");
-                            io::Error::other(format!("HTML processing failed: {e}"))
-                        })?;
-                    }
-                }
-                None if !chunk.is_empty() => {
-                    log::warn!(
-                        "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
-                        chunk.len()
-                    );
-                }
-                None => {}
+            None if !chunk.is_empty() => {
+                log::warn!(
+                    "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
+                    chunk.len()
+                );
             }
+            None => {}
         }
 
         if is_last {
@@ -417,10 +356,8 @@ mod tests {
     use crate::streaming_replacer::{Replacement, StreamingReplacer};
 
     /// Verify that `lol_html` fragments text nodes when input chunks split
-    /// mid-text-node. This is critical: if `lol_html` does fragment, then
-    /// script rewriters (`NextJS` `__NEXT_DATA__`, `GTM`) that expect full
-    /// text content will silently miss rewrites when the streaming adapter
-    /// feeds chunks incrementally.
+    /// mid-text-node. Script rewriters must be fragment-safe — they accumulate
+    /// text fragments internally until `is_last_in_text_node` is true.
     #[test]
     fn lol_html_fragments_text_across_chunk_boundaries() {
         use std::cell::RefCell;
@@ -465,57 +402,6 @@ mod tests {
                 .iter()
                 .any(|(text, _)| text.contains("googletagmanager.com")),
             "no individual fragment should contain the full domain when split across chunks: {:?}",
-            *frags
-        );
-    }
-
-    /// Companion to [`lol_html_fragments_text_across_chunk_boundaries`]:
-    /// proves that `new_buffered()` prevents fragmentation by feeding the
-    /// entire document to `lol_html` in one `write()` call.
-    #[test]
-    fn buffered_adapter_prevents_text_fragmentation() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let fragments: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
-        let fragments_clone = Rc::clone(&fragments);
-
-        let settings = lol_html::Settings {
-            element_content_handlers: vec![lol_html::text!("script", move |text| {
-                fragments_clone
-                    .borrow_mut()
-                    .push((text.as_str().to_string(), text.last_in_text_node()));
-                Ok(())
-            })],
-            ..lol_html::Settings::default()
-        };
-
-        let mut adapter = HtmlRewriterAdapter::new_buffered(settings);
-
-        // Feed the same split chunks as the fragmentation test
-        let r1 = adapter
-            .process_chunk(b"<script>google", false)
-            .expect("should process chunk1");
-        assert!(
-            r1.is_empty(),
-            "buffered adapter should return empty before is_last"
-        );
-
-        let r2 = adapter
-            .process_chunk(b"tagmanager.com/gtm.js</script>", true)
-            .expect("should process chunk2");
-        assert!(
-            !r2.is_empty(),
-            "buffered adapter should emit output on is_last"
-        );
-
-        let frags = fragments.borrow();
-        // With buffered mode, the text handler should see the complete string
-        assert!(
-            frags
-                .iter()
-                .any(|(text, _)| text.contains("googletagmanager.com")),
-            "buffered adapter should deliver complete text to handler, got: {:?}",
             *frags
         );
     }

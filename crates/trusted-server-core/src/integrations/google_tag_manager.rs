@@ -132,7 +132,7 @@ fn validate_container_id(container_id: &str) -> Result<(), validator::Validation
 
 pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
-    /// Accumulates text fragments when lol_html splits a text node across
+    /// Accumulates text fragments when `lol_html` splits a text node across
     /// chunk boundaries. Drained on `is_last_in_text_node`.
     accumulated_text: Mutex<String>,
 }
