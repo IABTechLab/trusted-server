@@ -70,6 +70,12 @@ pub struct PartnerRecord {
     /// `OpenRTB` `atype` value (typically 3).
     pub openrtb_atype: u8,
     /// Max pixel sync writes per EC hash per partner per hour.
+    ///
+    /// **Note:** Fastly rate counters only expose 60-second windows, so the
+    /// effective enforcement is `sync_rate_limit / 60` per minute. This can
+    /// create bursty behavior for low limits (e.g. a limit of 60 allows
+    /// 1 sync per 60 seconds, not a smooth 1/sec). See `FastlyRateLimiter`
+    /// in `sync_pixel.rs` for details.
     pub sync_rate_limit: u32,
     /// Max batch sync API requests per partner per minute.
     pub batch_rate_limit: u32,
@@ -86,6 +92,12 @@ pub struct PartnerRecord {
     /// Max pull sync calls per EC hash per partner per hour.
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
+    ///
+    /// Stored in plaintext (unlike `api_key_hash`, which is SHA-256 hashed).
+    /// This is intentional: `ts_pull_token` is an *outbound* credential that
+    /// TS sends to the partner's pull sync endpoint, so it must be readable
+    /// at runtime. `api_key_hash` is an *inbound* credential that partners
+    /// send to us, so it only needs hash verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_pull_token: Option<String>,
 }
@@ -254,6 +266,13 @@ impl PartnerStore {
     ///
     /// Scans the partner KV store and returns records for non-index keys.
     /// Secondary index entries (e.g. `apikey:*`) are skipped.
+    ///
+    /// **Scaling note:** This performs O(N) KV reads where N is the number
+    /// of registered partners. Called by `dispatch_pull_sync` on every
+    /// organic request post-send. For large partner counts, consider
+    /// caching the result or maintaining a summary key. The
+    /// `pull_sync_concurrency` setting bounds downstream dispatch but
+    /// does not reduce the enumeration cost.
     ///
     /// # Errors
     ///
