@@ -11,6 +11,7 @@ use matchit::Router;
 use crate::constants::HEADER_X_SYNTHETIC_ID;
 use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::synthetic::get_or_generate_synthetic_id;
 
@@ -258,6 +259,7 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
 
@@ -652,6 +654,7 @@ impl IntegrationRegistry {
         method: &Method,
         path: &str,
         settings: &Settings,
+        services: &RuntimeServices,
         mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
@@ -665,7 +668,7 @@ impl IntegrationRegistry {
                 req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
             }
 
-            let mut result = proxy.handle(settings, req).await;
+            let mut result = proxy.handle(settings, services, req).await;
 
             // Set synthetic ID header on successful responses
             if let Ok(ref mut response) = result {
@@ -943,6 +946,7 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::noop_services;
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -960,6 +964,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
@@ -1243,6 +1248,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             // Return a simple response without the synthetic ID header.
@@ -1272,6 +1278,7 @@ mod tests {
             &Method::GET,
             "/integrations/test/synthetic",
             &settings,
+            &noop_services(),
             req,
         ));
 
@@ -1323,6 +1330,7 @@ mod tests {
             &Method::GET,
             "/integrations/test/synthetic",
             &settings,
+            &noop_services(),
             req,
         ))
         .expect("should handle proxy request");
@@ -1376,6 +1384,7 @@ mod tests {
             &Method::GET,
             "/integrations/test/synthetic",
             &settings,
+            &noop_services(),
             req,
         ))
         .expect("should handle proxy request");
@@ -1426,6 +1435,7 @@ mod tests {
             &Method::POST,
             "/integrations/test/synthetic",
             &settings,
+            &noop_services(),
             req,
         ));
 

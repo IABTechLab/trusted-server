@@ -72,6 +72,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
@@ -405,6 +406,7 @@ impl IntegrationProxy for DataDomeIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();

@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -95,6 +96,110 @@ impl PlatformHttpClient for NoopHttpClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StubBackend
+// ---------------------------------------------------------------------------
+
+/// Test stub for [`PlatformBackend`] that returns `"stub-backend"` for any
+/// spec, allowing callers to proceed past backend registration.
+pub(crate) struct StubBackend;
+
+impl PlatformBackend for StubBackend {
+    fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Ok("stub-backend".to_string())
+    }
+
+    fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Ok("stub-backend".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StubHttpClient
+// ---------------------------------------------------------------------------
+
+/// Test stub for [`PlatformHttpClient`] that records `send` call backend
+/// names and returns pre-queued canned responses.
+///
+/// Responses are stored as `(status_code, body_bytes)` to remain [`Send`].
+/// [`PlatformResponse`] contains [`edgezero_core::body::Body`] which wraps a
+/// `LocalBoxStream` that is `!Send`, so it cannot be stored directly in a
+/// `Mutex` field.
+///
+/// Use [`push_response`](Self::push_response) to enqueue responses before
+/// exercising the code under test, then inspect
+/// [`recorded_backend_names`](Self::recorded_backend_names) to assert call
+/// sites.
+pub(crate) struct StubHttpClient {
+    calls: Mutex<Vec<String>>,
+    // (status_code, body_bytes) — kept Send by avoiding Body::Stream
+    responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+}
+
+impl StubHttpClient {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Queue a canned response by status code and body bytes.
+    pub fn push_response(&self, status: u16, body: Vec<u8>) {
+        self.responses
+            .lock()
+            .expect("should lock responses")
+            .push_back((status, body));
+    }
+
+    /// Return backend names recorded across all `send` calls, in order.
+    pub fn recorded_backend_names(&self) -> Vec<String> {
+        self.calls.lock().expect("should lock calls").clone()
+    }
+}
+
+// ?Send matches PlatformHttpClient. See http.rs for the full rationale.
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for StubHttpClient {
+    async fn send(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.calls
+            .lock()
+            .expect("should lock calls")
+            .push(request.backend_name.clone());
+
+        let (status, body_bytes) = self
+            .responses
+            .lock()
+            .expect("should lock responses")
+            .pop_front()
+            .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+
+        let edge_response = edgezero_core::http::response_builder()
+            .status(status)
+            .body(edgezero_core::body::Body::from(body_bytes))
+            .change_context(PlatformError::HttpClient)?;
+
+        Ok(PlatformResponse::new(edge_response))
+    }
+
+    async fn send_async(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    async fn select(
+        &self,
+        _pending_requests: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
 pub(crate) struct NoopGeo;
 
 impl PlatformGeo for NoopGeo {
@@ -123,4 +228,97 @@ pub(crate) fn build_services_with_config(
 
 pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
+}
+
+/// Build a [`RuntimeServices`] with a [`StubBackend`] and the given HTTP client.
+///
+/// Useful for tests that need to verify `services.http_client()` call sites.
+pub(crate) fn build_services_with_http_client(
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
+        })
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
+    use super::*;
+
+    #[test]
+    fn stub_http_client_records_send_calls_and_returns_canned_response() {
+        let stub = StubHttpClient::new();
+        stub.push_response(200, b"hello".to_vec());
+
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/test")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        );
+        let result = futures::executor::block_on(stub.send(req));
+
+        assert!(result.is_ok(), "should return canned response");
+        let names = stub.recorded_backend_names();
+        assert_eq!(
+            names,
+            vec!["stub-backend"],
+            "should record the backend name"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_returns_error_when_no_response_queued() {
+        let stub = StubHttpClient::new();
+
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        );
+        let result = futures::executor::block_on(stub.send(req));
+
+        assert!(result.is_err(), "should return error when queue is empty");
+        assert!(
+            matches!(
+                result.unwrap_err().current_context(),
+                PlatformError::HttpClient
+            ),
+            "should be HttpClient error"
+        );
+    }
+
+    #[test]
+    fn stub_backend_returns_fixed_name() {
+        let stub = StubBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_secs(15),
+        };
+        let name = stub.ensure(&spec).expect("should return a backend name");
+        assert_eq!(name, "stub-backend", "should return fixed name");
+    }
 }

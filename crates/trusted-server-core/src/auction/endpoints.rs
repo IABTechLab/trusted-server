@@ -8,6 +8,7 @@ use crate::consent;
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::synthetic::get_or_generate_synthetic_id;
 
@@ -31,6 +32,7 @@ use super::AuctionOrchestrator;
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
@@ -78,7 +80,7 @@ pub async fn handle_auction(
 
     // Run the auction
     let result = orchestrator
-        .run_auction(&auction_request, &context)
+        .run_auction(&auction_request, &context, services)
         .await
         .change_context(TrustedServerError::Auction {
             message: "Auction orchestration failed".to_string(),

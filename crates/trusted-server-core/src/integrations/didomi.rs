@@ -11,6 +11,7 @@ use validator::Validate;
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{IntegrationEndpoint, IntegrationProxy, IntegrationRegistration};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
@@ -190,6 +191,7 @@ impl IntegrationProxy for DidomiIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
