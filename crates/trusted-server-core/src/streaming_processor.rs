@@ -215,11 +215,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                             message: "Failed to process chunk".to_string(),
                         })?;
                     if !processed.is_empty() {
-                        writer.write_all(&processed).change_context(
-                            TrustedServerError::Proxy {
+                        writer
+                            .write_all(&processed)
+                            .change_context(TrustedServerError::Proxy {
                                 message: "Failed to write processed chunk".to_string(),
-                            },
-                        )?;
+                            })?;
                     }
                 }
                 Err(e) => {
@@ -502,8 +502,7 @@ mod tests {
         // Compress input
         let mut compressed_input = Vec::new();
         {
-            let mut enc =
-                ZlibEncoder::new(&mut compressed_input, flate2::Compression::default());
+            let mut enc = ZlibEncoder::new(&mut compressed_input, flate2::Compression::default());
             enc.write_all(input_data)
                 .expect("should compress test input");
             enc.finish().expect("should finish compression");
@@ -551,8 +550,7 @@ mod tests {
 
         let mut compressed_input = Vec::new();
         {
-            let mut enc =
-                GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            let mut enc = GzEncoder::new(&mut compressed_input, flate2::Compression::default());
             enc.write_all(input_data)
                 .expect("should compress test input");
             enc.finish().expect("should finish compression");
@@ -600,8 +598,7 @@ mod tests {
 
         let mut compressed_input = Vec::new();
         {
-            let mut enc =
-                GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            let mut enc = GzEncoder::new(&mut compressed_input, flate2::Compression::default());
             enc.write_all(input_data)
                 .expect("should compress test input");
             enc.finish().expect("should finish compression");
@@ -627,8 +624,7 @@ mod tests {
             .expect("should process gzip-to-none");
 
         // Assert
-        let result =
-            String::from_utf8(output).expect("should be valid UTF-8 uncompressed output");
+        let result = String::from_utf8(output).expect("should be valid UTF-8 uncompressed output");
         assert_eq!(
             result, "<html><body>hi world</body></html>",
             "should have replaced content after gzip decompression"
