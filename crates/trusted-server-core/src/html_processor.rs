@@ -17,6 +17,16 @@ use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
+/// Wraps [`HtmlRewriterAdapter`] with optional post-processing.
+///
+/// When `post_processors` is empty (the common streaming path), chunks pass
+/// through immediately with no extra copying. When post-processors are
+/// registered, intermediate output is accumulated in `accumulated_output`
+/// until `is_last`, then post-processors run on the full document. This adds
+/// an extra copy per chunk compared to the pre-streaming adapter (which
+/// accumulated raw input instead of rewriter output). The overhead is
+/// acceptable because the post-processor path is already fully buffered —
+/// the real streaming win comes from the empty-post-processor path in Phase 2.
 struct HtmlWithPostProcessing {
     inner: HtmlRewriterAdapter,
     post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -95,11 +105,10 @@ impl StreamProcessor for HtmlWithPostProcessing {
     }
 
     /// No-op. `HtmlWithPostProcessing` wraps a single-use
-    /// [`HtmlRewriterAdapter`] and cannot be meaningfully reset.
-    fn reset(&mut self) {
-        self.accumulated_output.clear();
-        self.document_state.clear();
-    }
+    /// [`HtmlRewriterAdapter`] that cannot be reset. Clearing auxiliary
+    /// state without resetting the rewriter would leave the processor
+    /// in an inconsistent state, so this method intentionally does nothing.
+    fn reset(&mut self) {}
 }
 
 /// Configuration for HTML processing

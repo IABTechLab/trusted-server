@@ -35,7 +35,7 @@ pub trait StreamProcessor {
 }
 
 /// Compression type for the stream
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
     Gzip,
@@ -172,9 +172,12 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 };
                 let mut encoder = CompressorWriter::with_params(output, 4096, &params);
                 self.process_chunks(decoder, &mut encoder)?;
-                // CompressorWriter writes the brotli stream trailer on drop.
-                // process_chunks already called flush(), so drop finalizes cleanly.
-                drop(encoder);
+                // CompressorWriter emits the brotli stream trailer via flush(),
+                // which process_chunks already called. into_inner() avoids a
+                // redundant flush on drop and makes finalization explicit.
+                // Note: unlike flate2's finish(), CompressorWriter has no
+                // fallible finalization method — flush() is the only option.
+                let _ = encoder.into_inner();
                 Ok(())
             }
             (Compression::Brotli, Compression::None) => {
@@ -191,9 +194,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     /// Read chunks from `reader`, pass each through the processor, and write output to `writer`.
     ///
     /// This is the single unified chunk loop used by all compression paths.
-    /// The caller is responsible for wrapping `reader`/`writer` in the appropriate
-    /// decoder/encoder and for finalizing the encoder (e.g., calling `finish()`)
-    /// after this method returns.
+    /// The method calls `writer.flush()` before returning. For the `None → None`
+    /// path this is the only finalization needed. For compressed paths, the caller
+    /// must still call the encoder's type-specific finalization (e.g., `finish()`
+    /// for flate2, `into_inner()` for brotli) — `flush()` alone does not write
+    /// compression trailers for all codecs.
     ///
     /// # Errors
     ///
@@ -292,13 +297,22 @@ impl HtmlRewriterAdapter {
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        if let Some(rewriter) = &mut self.rewriter {
-            if !chunk.is_empty() {
-                rewriter.write(chunk).map_err(|e| {
-                    log::error!("Failed to process HTML chunk: {e}");
-                    io::Error::other(format!("HTML processing failed: {e}"))
-                })?;
+        match &mut self.rewriter {
+            Some(rewriter) => {
+                if !chunk.is_empty() {
+                    rewriter.write(chunk).map_err(|e| {
+                        log::error!("Failed to process HTML chunk: {e}");
+                        io::Error::other(format!("HTML processing failed: {e}"))
+                    })?;
+                }
             }
+            None if !chunk.is_empty() => {
+                log::warn!(
+                    "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
+                    chunk.len()
+                );
+            }
+            None => {}
         }
 
         if is_last {
@@ -482,7 +496,7 @@ mod tests {
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
-        adapter
+        let result1 = adapter
             .process_chunk(b"<html><body>test</body></html>", false)
             .expect("should process html");
 
@@ -490,13 +504,17 @@ mod tests {
         adapter.reset();
 
         // Finalize still works; the rewriter is still alive
-        let final_output = adapter
+        let result2 = adapter
             .process_chunk(b"", true)
             .expect("should finalize after reset");
 
-        // Output may or may not be empty depending on lol_html buffering,
-        // but it should not error
-        let _ = final_output;
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("test"),
+            "should produce correct output despite no-op reset"
+        );
     }
 
     #[test]
@@ -696,27 +714,27 @@ mod tests {
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
-        // Send three chunks
-        let chunk1 = b"<html><body>";
+        // Send three chunks — lol_html may buffer internally, so individual
+        // chunk outputs may vary by version. The contract is that concatenated
+        // output is correct, and that output is not deferred entirely to is_last.
         let result1 = adapter
-            .process_chunk(chunk1, false)
+            .process_chunk(b"<html><body>", false)
             .expect("should process chunk1");
-        assert!(
-            !result1.is_empty(),
-            "should emit output for first chunk, got empty"
-        );
-
-        let chunk2 = b"<p>hello</p>";
         let result2 = adapter
-            .process_chunk(chunk2, false)
+            .process_chunk(b"<p>hello</p>", false)
             .expect("should process chunk2");
-
-        let chunk3 = b"</body></html>";
         let result3 = adapter
-            .process_chunk(chunk3, true)
+            .process_chunk(b"</body></html>", true)
             .expect("should process final chunk");
 
-        // Concatenate all outputs and verify correctness
+        // At least one intermediate chunk should produce output (verifies
+        // we're not deferring everything to is_last like the old adapter).
+        assert!(
+            !result1.is_empty() || !result2.is_empty(),
+            "should emit some output before is_last"
+        );
+
+        // Concatenated output must be correct
         let mut all_output = result1;
         all_output.extend_from_slice(&result2);
         all_output.extend_from_slice(&result3);
