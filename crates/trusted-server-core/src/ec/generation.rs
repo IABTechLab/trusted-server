@@ -117,6 +117,17 @@ pub fn ec_hash(ec_id: &str) -> &str {
     }
 }
 
+/// Checks whether a string is a valid 64-character hex EC hash prefix.
+///
+/// Used by batch sync, finalize, and other modules that handle the
+/// `{64hex}` portion of an EC ID independently. Accepts both uppercase
+/// and lowercase hex; callers that require a specific case should
+/// normalize before comparison.
+#[must_use]
+pub fn is_valid_ec_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Checks whether a string matches the expected EC ID format.
 ///
 /// The format is `{64hex}.{6alnum}` where the first part is a 64-character
@@ -205,6 +216,34 @@ mod tests {
     #[test]
     fn ec_hash_returns_full_string_without_dot() {
         assert_eq!(ec_hash("nodot"), "nodot");
+    }
+
+    #[test]
+    fn is_valid_ec_hash_accepts_64_hex() {
+        assert!(is_valid_ec_hash(&"a".repeat(64)));
+        assert!(is_valid_ec_hash(&"0123456789abcdef".repeat(4)));
+    }
+
+    #[test]
+    fn is_valid_ec_hash_accepts_uppercase_hex() {
+        assert!(
+            is_valid_ec_hash(&"A".repeat(64)),
+            "should accept uppercase hex (callers normalize before KV lookup)"
+        );
+    }
+
+    #[test]
+    fn is_valid_ec_hash_rejects_wrong_length() {
+        assert!(!is_valid_ec_hash(&"a".repeat(63)));
+        assert!(!is_valid_ec_hash(&"a".repeat(65)));
+        assert!(!is_valid_ec_hash(""));
+    }
+
+    #[test]
+    fn is_valid_ec_hash_rejects_non_hex() {
+        let mut hash = "a".repeat(64);
+        hash.replace_range(0..1, "g");
+        assert!(!is_valid_ec_hash(&hash));
     }
 
     #[test]
