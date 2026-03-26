@@ -54,7 +54,7 @@ use crate::settings::Settings;
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
 
-pub use generation::{ec_hash, generate_ec_id, is_valid_ec_id};
+pub use generation::{ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id};
 
 /// Parsed EC identity from an incoming request.
 ///
@@ -387,9 +387,34 @@ impl EcContext {
             geo_info: None,
         }
     }
+
+    /// Creates a test-only [`EcContext`] with independent cookie and active EC
+    /// values. Use this to test cookie-mismatch and withdrawal scenarios.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_test_with_cookie(
+        ec_value: Option<String>,
+        cookie_ec_value: Option<String>,
+        ec_was_present: bool,
+        ec_generated: bool,
+        consent: ConsentContext,
+    ) -> Self {
+        Self {
+            ec_value,
+            cookie_ec_value,
+            ec_was_present,
+            ec_generated,
+            consent,
+            client_ip: None,
+            geo_info: None,
+        }
+    }
 }
 
-fn current_timestamp() -> u64 {
+/// Returns the current Unix timestamp in seconds.
+///
+/// Uses `std::time::SystemTime` which is supported on `wasm32-wasip1`.
+pub(crate) fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
