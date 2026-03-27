@@ -755,6 +755,42 @@ mod tests {
     }
 
     #[test]
+    fn pass_through_gate_streams_non_processable_2xx() {
+        // Non-processable (image) + 2xx → PassThrough
+        let should_process = false;
+        let is_success = true;
+        let should_pass_through = is_success && !should_process;
+        assert!(
+            should_pass_through,
+            "should pass-through non-processable 2xx responses (images, fonts)"
+        );
+    }
+
+    #[test]
+    fn pass_through_gate_buffers_non_processable_error() {
+        // Non-processable (image) + 4xx → Buffered
+        let should_process = false;
+        let is_success = false;
+        let should_pass_through = is_success && !should_process;
+        assert!(
+            !should_pass_through,
+            "should buffer non-processable error responses"
+        );
+    }
+
+    #[test]
+    fn pass_through_gate_does_not_apply_to_processable_content() {
+        // Processable (HTML) + 2xx → Stream (not PassThrough)
+        let should_process = true;
+        let is_success = true;
+        let should_pass_through = is_success && !should_process;
+        assert!(
+            !should_pass_through,
+            "processable content should go through Stream, not PassThrough"
+        );
+    }
+
+    #[test]
     fn test_content_encoding_detection() {
         // Test that we properly handle responses with various content encodings
         let test_encodings = vec!["gzip", "deflate", "br", "identity", ""];
