@@ -113,7 +113,7 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 
 > **Note:** Paths below use post-rename crate names (`crates/trusted-server-core/`,
 > `crates/trusted-server-adapter-fastly/`). Before PR 1 lands, these correspond to
-> `crates/common/` and `crates/fastly/` respectively.
+> `crates/trusted-server-core/` and `crates/trusted-server-adapter-fastly/` respectively.
 
 | Module                                                                                 | Fastly Imports                                                                           |
 | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -498,8 +498,8 @@ graph TD
 #### PR 1 — Rename crates and add EdgeZero workspace dependencies
 
 **Blocked by:** Nothing
-**Files:** `Cargo.toml` (workspace), `crates/common/` → `crates/trusted-server-core/`,
-`crates/fastly/` → `crates/trusted-server-adapter-fastly/`, all internal path references
+**Files:** `Cargo.toml` (workspace), `crates/trusted-server-core/` → `crates/trusted-server-core/`,
+`crates/trusted-server-adapter-fastly/` → `crates/trusted-server-adapter-fastly/`, all internal path references
 
 Changes:
 
