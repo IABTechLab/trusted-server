@@ -276,12 +276,13 @@ pub enum PublisherResponse {
     },
     /// Non-processable 2xx response (images, fonts, video). The caller must:
     /// 1. Call `finalize_response()` on the response
-    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
-    /// 3. Copy body bytes directly via `io::copy(&mut body, &mut streaming_body)`
-    /// 4. Call `StreamingBody::finish()`
+    /// 2. Reattach the body via `response.set_body(body)`
+    /// 3. Call `response.send_to_client()`
     ///
-    /// `Content-Length` is removed because `stream_to_client()` uses chunked
-    /// transfer encoding. The body content is unmodified.
+    /// `Content-Length` is preserved — the body is unmodified. Using
+    /// `send_to_client()` instead of `stream_to_client()` avoids chunked
+    /// encoding overhead. Fastly streams the body from its internal buffer
+    /// without copying into WASM memory.
     PassThrough {
         /// Response with all headers set but body not yet written.
         response: Response,
@@ -462,12 +463,12 @@ pub fn handle_publisher_request(
 
         // Stream non-processable 2xx responses directly to avoid buffering
         // large binaries (images, fonts, video) in memory.
-        // Exclude 204 No Content — it must not have a message body, and
-        // stream_to_client() would add chunked Transfer-Encoding.
+        // Content-Length is preserved — the body is unmodified, so the
+        // browser knows the exact size for progress/layout.
+        // Exclude 204 No Content — it must not have a message body.
         let status = response.get_status();
         if status.is_success() && status != StatusCode::NO_CONTENT && !should_process {
             let body = response.take_body();
-            response.remove_header(header::CONTENT_LENGTH);
             return Ok(PublisherResponse::PassThrough { response, body });
         }
 
@@ -830,9 +831,9 @@ mod tests {
     }
 
     #[test]
-    fn pass_through_preserves_body_and_removes_content_length() {
-        // Simulate the PassThrough path: take body, remove Content-Length,
-        // io::copy to output. Verify byte-for-byte identity.
+    fn pass_through_preserves_body_and_content_length() {
+        // Simulate the PassThrough path: take body, reattach, send.
+        // Verify byte-for-byte identity and Content-Length preservation.
         let image_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
 
         let mut response = Response::from_status(StatusCode::OK);
@@ -840,22 +841,23 @@ mod tests {
         response.set_header("content-length", image_bytes.len().to_string());
         response.set_body(Body::from(image_bytes.clone()));
 
-        // Simulate PassThrough: take body, remove Content-Length
-        // (stream_to_client uses chunked encoding)
-        let mut body = response.take_body();
-        response.remove_header(header::CONTENT_LENGTH);
+        // Simulate PassThrough: take body then reattach
+        let body = response.take_body();
+        // Body is unmodified — Content-Length stays correct
+        assert_eq!(
+            response
+                .get_header_str("content-length")
+                .expect("should have content-length"),
+            "4096",
+            "Content-Length should be preserved for pass-through"
+        );
 
-        // io::copy into a Vec (simulating StreamingBody)
-        let mut output = Vec::new();
-        std::io::copy(&mut body, &mut output).expect("should copy body");
-
+        // Reattach and verify body content
+        response.set_body(body);
+        let output = response.into_body().into_bytes();
         assert_eq!(
             output, image_bytes,
             "pass-through should preserve body byte-for-byte"
-        );
-        assert!(
-            response.get_header(header::CONTENT_LENGTH).is_none(),
-            "Content-Length should be removed for streaming pass-through"
         );
     }
 

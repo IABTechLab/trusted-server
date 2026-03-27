@@ -238,12 +238,6 @@ async fn route_request(
                             // Response already sent via stream_to_client()
                             return None;
                         }
-                        Ok(PublisherResponse::Buffered(response)) => Ok(response),
-                        Err(e) => {
-                            log::error!("Failed to proxy to publisher origin: {:?}", e);
-                            Err(e)
-                        }
-                    }
                         Ok(PublisherResponse::PassThrough {
                             mut response,
                             body,
