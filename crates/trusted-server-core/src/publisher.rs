@@ -274,6 +274,19 @@ pub enum PublisherResponse {
         /// Parameters for `process_response_streaming`.
         params: OwnedProcessResponseParams,
     },
+    /// Non-processable 2xx response (images, fonts, video). The caller must:
+    /// 1. Call `finalize_response()` on the response
+    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
+    /// 3. Copy body bytes directly via `io::copy(&mut body, &mut streaming_body)`
+    /// 4. Call `StreamingBody::finish()`
+    ///
+    /// `Content-Length` is preserved since the body is unmodified.
+    PassThrough {
+        /// Response with all headers set but body not yet written.
+        response: Response,
+        /// Origin body to stream directly to the client.
+        body: Body,
+    },
 }
 
 /// Owned version of [`ProcessResponseParams`] for returning from
@@ -443,6 +456,14 @@ pub fn handle_publisher_request(
             request_host,
             response.get_status(),
         );
+
+        // Stream non-processable 2xx responses directly to avoid buffering
+        // large binaries (images, fonts, video) in memory.
+        if response.get_status().is_success() && !should_process {
+            let body = response.take_body();
+            return Ok(PublisherResponse::PassThrough { response, body });
+        }
+
         return Ok(PublisherResponse::Buffered(response));
     }
 

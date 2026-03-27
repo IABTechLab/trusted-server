@@ -244,6 +244,23 @@ async fn route_request(
                             Err(e)
                         }
                     }
+                        Ok(PublisherResponse::PassThrough {
+                            mut response,
+                            body,
+                        }) => {
+                            // Binary pass-through: reattach body and send via send_to_client().
+                            // This preserves Content-Length and avoids chunked encoding overhead.
+                            // Fastly streams the body from its internal buffer — no WASM
+                            // memory buffering occurs.
+                            response.set_body(body);
+                            Ok(response)
+                        }
+                        Ok(PublisherResponse::Buffered(response)) => Ok(response),
+                        Err(e) => {
+                            log::error!("Failed to proxy to publisher origin: {:?}", e);
+                            Err(e)
+                        }
+                    }
                 }
                 Err(e) => Err(e),
             }
