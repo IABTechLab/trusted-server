@@ -332,12 +332,14 @@ pub fn stream_publisher_body<W: Write>(
 
 /// Proxies requests to the publisher's origin server.
 ///
-/// Returns a [`PublisherResponse`] indicating whether the response can be
-/// streamed or must be sent buffered. The streaming path is chosen when:
-/// - The backend returns a 2xx status
-/// - The response has a processable content type
-/// - The response uses a supported `Content-Encoding` (gzip, deflate, br)
-/// - No HTML post-processors are registered (the streaming gate)
+/// Returns a [`PublisherResponse`] indicating how the response should be sent:
+/// - [`PassThrough`](PublisherResponse::PassThrough) — 2xx non-processable content
+///   (images, fonts, video). Body reattached unmodified for `send_to_client()`.
+/// - [`Stream`](PublisherResponse::Stream) — 2xx processable content with supported
+///   `Content-Encoding` and no HTML post-processors. Body piped through the
+///   streaming pipeline.
+/// - [`Buffered`](PublisherResponse::Buffered) — non-2xx responses, unsupported
+///   encoding, or HTML with post-processors that need the full document.
 ///
 /// # Errors
 ///
@@ -787,6 +789,38 @@ mod tests {
         assert!(
             !should_pass_through,
             "processable content should go through Stream, not PassThrough"
+        );
+    }
+
+    #[test]
+    fn pass_through_preserves_body_and_content_length() {
+        // Simulate the PassThrough path: take body from response, io::copy to output.
+        // Verify byte-for-byte identity and that Content-Length is preserved.
+        let image_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
+
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header("content-type", "image/png");
+        response.set_header("content-length", image_bytes.len().to_string());
+        response.set_body(Body::from(image_bytes.clone()));
+
+        // Simulate PassThrough: take body, preserve Content-Length
+        let content_length = response
+            .get_header_str("content-length")
+            .map(str::to_string);
+        let mut body = response.take_body();
+
+        // io::copy into a Vec (simulating StreamingBody)
+        let mut output = Vec::new();
+        std::io::copy(&mut body, &mut output).expect("should copy body");
+
+        assert_eq!(
+            output, image_bytes,
+            "pass-through should preserve body byte-for-byte"
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some("4096"),
+            "Content-Length should be preserved for pass-through"
         );
     }
 
