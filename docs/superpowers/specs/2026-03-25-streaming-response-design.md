@@ -373,3 +373,54 @@ hex // compare this between baseline and feature branch
 - Compare against Viceroy results to account for real network conditions.
 - Monitor WASM heap usage via Fastly dashboard.
 - Verify no regressions on static endpoints or auction.
+
+### Results (getpurpose.ai, median over 5 runs, Chrome 1440x900)
+
+Measured via Chrome DevTools Protocol against prod (v135, buffered) and
+staging (v136, streaming). Chrome `--host-resolver-rules` used to route
+`getpurpose.ai` to the staging Fastly edge (167.82.83.52).
+
+| Metric                     | Production (v135, buffered) | Staging (v136, streaming) | Delta              |
+| -------------------------- | --------------------------- | ------------------------- | ------------------ |
+| **TTFB**                   | 54 ms                       | 35 ms                     | **-19 ms (-35%)**  |
+| **First Paint**            | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **First Contentful Paint** | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **DOM Content Loaded**     | 286 ms                      | 282 ms                    | -4 ms (~same)      |
+| **DOM Complete**           | 1060 ms                     | 663 ms                    | **-397 ms (-37%)** |
+
+## Phase 4: Binary Pass-Through Streaming
+
+Non-processable content (images, fonts, video, `application/octet-stream`)
+currently passes through `handle_publisher_request` unchanged via the
+`Buffered` path, buffering the entire body in memory before sending. For
+large binaries (1-10 MB images), this is wasteful.
+
+Phase 4 adds a `PublisherResponse::PassThrough` variant that signals the
+adapter to stream the body directly via `io::copy` into `StreamingBody`
+with no processing pipeline. This eliminates peak memory for binary
+responses and improves DOM Complete for image-heavy pages.
+
+### Streaming gate (updated)
+
+```
+is_success (2xx)
+├── should_process && (!is_html || !has_post_processors) → Stream (pipeline)
+├── should_process && is_html && has_post_processors     → Buffered (post-processors)
+└── !should_process                                      → PassThrough (io::copy)
+
+!is_success
+└── any content type                                     → Buffered (error page)
+```
+
+### `PublisherResponse` enum (updated)
+
+```rust
+pub enum PublisherResponse {
+    Buffered(Response),
+    Stream { response, body, params },
+    PassThrough { response, body },
+}
+```
+
+`Content-Length` is preserved for `PassThrough` since the body is
+unmodified — no need for chunked transfer encoding.

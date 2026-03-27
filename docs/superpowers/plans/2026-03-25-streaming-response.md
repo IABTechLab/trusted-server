@@ -1018,3 +1018,103 @@ Check for:
 - No TTFB regression
 - Identical response body hash (correctness)
 - LCP/Speed Index improvement (secondary)
+
+---
+
+## Phase 3: Make Script Rewriters Fragment-Safe (PR #591)
+
+> **Implementation note (2026-03-27):** All tasks completed. Script rewriters
+> accumulate text fragments via `Mutex<String>` until `last_in_text_node` is
+> true. Buffered mode removed from `HtmlRewriterAdapter`. 2xx streaming gate
+> added. Small-chunk (32 byte) pipeline regression tests added for both
+> NextJS `__NEXT_DATA__` and GTM inline scripts.
+
+### Task 11: Make `NextJsNextDataRewriter` fragment-safe
+
+**Files:** `crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs`
+
+- [x] Add `accumulated_text: Mutex<String>` field
+- [x] Accumulate intermediate fragments, return `RemoveNode`
+- [x] On last fragment, process full accumulated text
+- [x] Handle Keep-after-accumulation (emit `Replace(full_content)`)
+- [x] Add regression tests
+
+### Task 12: Make `GoogleTagManagerIntegration` rewrite fragment-safe
+
+**Files:** `crates/trusted-server-core/src/integrations/google_tag_manager.rs`
+
+- [x] Add `accumulated_text: Mutex<String>` field
+- [x] Accumulate intermediate fragments, return `RemoveNode`
+- [x] On last fragment, match and rewrite on complete text
+- [x] Non-GTM accumulated scripts emitted unchanged via `Replace`
+- [x] Add regression tests
+
+### Task 13: Remove buffered mode from `HtmlRewriterAdapter`
+
+**Files:** `crates/trusted-server-core/src/streaming_processor.rs`
+
+- [x] Delete `new_buffered()`, `buffered` flag, `accumulated_input`
+- [x] Simplify `process_chunk` to streaming-only path
+- [x] Remove `buffered_adapter_prevents_text_fragmentation` test
+- [x] Update doc comments
+
+### Task 14: Always use streaming adapter in `create_html_processor`
+
+**Files:** `crates/trusted-server-core/src/html_processor.rs`
+
+- [x] Remove `has_script_rewriters` check
+- [x] Always call `HtmlRewriterAdapter::new(settings)`
+
+### Task 15: Full verification, regression tests, and performance measurement
+
+- [x] Add 2xx streaming gate (`response.get_status().is_success()`)
+- [x] Add streaming gate unit tests (5 tests)
+- [x] Add `stream_publisher_body` gzip round-trip test
+- [x] Add small-chunk (32 byte) pipeline tests for NextJS and GTM
+- [x] `cargo test --workspace` — 766 passed
+- [x] `cargo clippy` — clean
+- [x] `cargo fmt --check` — clean
+- [x] WASM release build — success
+- [x] Staging performance comparison (see results below)
+
+### Performance Results (getpurpose.ai, median over 5 runs, Chrome 1440x900)
+
+| Metric                     | Production (v135, buffered) | Staging (v136, streaming) | Delta              |
+| -------------------------- | --------------------------- | ------------------------- | ------------------ |
+| **TTFB**                   | 54 ms                       | 35 ms                     | **-19 ms (-35%)**  |
+| **First Paint**            | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **First Contentful Paint** | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **DOM Content Loaded**     | 286 ms                      | 282 ms                    | -4 ms (~same)      |
+| **DOM Complete**           | 1060 ms                     | 663 ms                    | **-397 ms (-37%)** |
+
+---
+
+## Phase 4: Stream Binary Pass-Through Responses
+
+Non-processable content (images, fonts, video, `application/octet-stream`)
+currently passes through `handle_publisher_request` unchanged via the
+`Buffered` path. This buffers the entire response body in memory — wasteful
+for large binaries that need no processing. Phase 4 adds a `PassThrough`
+variant that streams the body directly via `io::copy` into `StreamingBody`.
+
+### Task 16: Stream binary pass-through responses via `io::copy`
+
+**Files:**
+
+- `crates/trusted-server-core/src/publisher.rs`
+- `crates/trusted-server-adapter-fastly/src/main.rs`
+
+- [ ] Add `PublisherResponse::PassThrough { response, body }` variant
+- [ ] Return `PassThrough` when `!should_process` and backend returned 2xx
+- [ ] Handle in `main.rs`: `stream_to_client()` + `io::copy(body, &mut streaming_body)`
+- [ ] Keep `Buffered` for non-2xx responses and `request_host.is_empty()`
+- [ ] Preserve `Content-Length` for pass-through (body is unmodified)
+
+### Task 17: Binary pass-through tests and verification
+
+- [ ] Publisher-level test: image content type returns `PassThrough`
+- [ ] Publisher-level test: 4xx image stays `Buffered`
+- [ ] `cargo test --workspace`
+- [ ] `cargo clippy` + `cargo fmt --check`
+- [ ] WASM release build
+- [ ] Staging performance comparison (DOM Complete for image-heavy pages)
