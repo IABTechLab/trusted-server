@@ -205,6 +205,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        log::warn!("FastlyPlatformHttpClient::send called before #487 lands");
         Err(Report::new(PlatformError::Unsupported)
             .attach("FastlyPlatformHttpClient::send is not yet implemented"))
     }
@@ -213,6 +214,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        log::warn!("FastlyPlatformHttpClient::send_async called before #487 lands");
         Err(Report::new(PlatformError::Unsupported)
             .attach("FastlyPlatformHttpClient::send_async is not yet implemented"))
     }
@@ -221,6 +223,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         _pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        log::warn!("FastlyPlatformHttpClient::select called before #487 lands");
         Err(Report::new(PlatformError::Unsupported)
             .attach("FastlyPlatformHttpClient::select is not yet implemented"))
     }
