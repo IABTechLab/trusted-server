@@ -71,8 +71,8 @@ core by threading existing abstractions to the remaining call sites.
 ### `crates/trusted-server-core/src/synthetic.rs`
 
 **Current:** `generate_synthetic_id(settings, req: &Request)` calls
-`req.get_client_ip_addr()` on line 100. `get_or_generate_synthetic_id` calls
-`generate_synthetic_id`.
+`req.get_client_ip_addr()` on line 100 of `synthetic.rs`.
+`get_or_generate_synthetic_id` calls `generate_synthetic_id`.
 
 **Change:** Add `services: &RuntimeServices` parameter to both functions.
 Replace `req.get_client_ip_addr()` with `services.client_info.client_ip`.
@@ -132,10 +132,19 @@ fn detect_request_scheme(
 ) -> String
 ```
 
-**Test updates:** All `RequestInfo::from_request` call sites in the test
-module pass `noop_services()` (already in `platform/test_support.rs`). Add
-one new test: TLS-detected HTTPS using a `ClientInfo` with
-`tls_protocol: Some("TLSv1.3".to_string())`.
+**Test updates:** There are 8 `RequestInfo::from_request` call sites in the
+`http_util.rs` test module (lines 398, 416, 429, 440, 459, 475, 494, 552).
+All must pass `noop_services()`. Since `http_util.rs` does not currently
+import `noop_services`, add the following to the `#[cfg(test)]` module:
+
+```rust
+use crate::platform::test_support::noop_services;
+```
+
+Add one new test: TLS-detected HTTPS using a `ClientInfo` with
+`tls_protocol: Some("TLSv1.3".to_string())`, confirming that
+`detect_request_scheme` returns `"https"` when the protocol is set in
+`ClientInfo` rather than from the Fastly SDK call.
 
 ---
 
@@ -146,8 +155,9 @@ to set `X-Forwarded-For`. The `handle` method already has `_services:
 &RuntimeServices` (currently unused — note the underscore).
 
 **Change:** `copy_headers` gains `client_ip: Option<IpAddr>` as a parameter.
-`handle` drops the `_` prefix from `_services` and passes
-`services.client_info.client_ip` to `copy_headers`.
+In `handle`, rename the existing `_services` parameter to `services` (remove
+the `_` prefix — do not add a new parameter). Pass `services.client_info.client_ip`
+to `copy_headers`.
 
 `copy_headers` is a private method and only needs the IP value — passing
 `Option<IpAddr>` directly is cleaner than full `services` in an internal
@@ -181,14 +191,22 @@ fn copy_headers(
 ### `crates/trusted-server-core/src/auction/formats.rs`
 
 **Current:** `convert_tsjs_to_auction_request` calls:
-- `generate_synthetic_id(settings, req)` — uses Fastly IP extraction
+- `generate_synthetic_id(settings, req)` at line 91 — produces `fresh_id`
+  for `UserInfo`, uses Fastly IP extraction internally
 - `req.get_client_ip_addr()` (line 140) for `DeviceInfo.ip`
 - `GeoInfo::from_request(req)` (deprecated, line 142) for `DeviceInfo.geo`
 
+Note: `generate_synthetic_id` is called once in `formats.rs`, at line 91, to
+produce `fresh_id` for `UserInfo`. The `DeviceInfo.ip` fix at line 140 is a
+separate `req.get_client_ip_addr()` call that is addressed independently by
+reading `services.client_info.client_ip`.
+
 **Change:** Add `services: &RuntimeServices` and `geo: Option<GeoInfo>`
-parameters. Thread `services` into `generate_synthetic_id`. Read
-`services.client_info.client_ip` for `DeviceInfo.ip`. Use the `geo` parameter
-for `DeviceInfo.geo`. Remove the `#[allow(deprecated)]` annotation.
+parameters. Thread `services` into the `generate_synthetic_id` call at line 91
+to fix `fresh_id` generation. Replace the separate `req.get_client_ip_addr()`
+call at line 140 with `services.client_info.client_ip` for `DeviceInfo.ip`.
+Use the `geo` parameter for `DeviceInfo.geo`. Remove the `#[allow(deprecated)]`
+annotation.
 
 ```rust
 // Before
@@ -345,7 +363,18 @@ Already has `services: &RuntimeServices`.
 
 Two changes:
 
-1. Pass `&runtime_services` to `handle_publisher_request`.
+1. Pass `&runtime_services` to `handle_publisher_request`. The call is inside
+   the `route_request` function's fallback `match` arm; `runtime_services` is
+   already in scope there.
+
+```rust
+// Before (inside route_request fallback arm, line ~195)
+match handle_publisher_request(settings, integration_registry, req) {
+
+// After
+match handle_publisher_request(settings, integration_registry, &runtime_services, req) {
+```
+
 2. No geo lookup changes — already uses `services.geo().lookup(...)`.
 
 ---
@@ -383,7 +412,7 @@ same values).
 - [ ] Zero `req.get_client_ip_addr()` calls in `trusted-server-core`
 - [ ] Zero `req.get_tls_protocol()` calls in `trusted-server-core`
 - [ ] Zero `req.get_tls_cipher_openssl_name()` calls in `trusted-server-core`
-- [ ] Zero `#[allow(deprecated)]` on `GeoInfo::from_request` calls
+- [ ] Zero `#[allow(deprecated)]` on `GeoInfo::from_request` calls (the `#[deprecated]` attribute on `GeoInfo::from_request` itself is preserved — only the call-site suppressors are removed; unrelated `#[allow(deprecated)]` annotations in `nextjs/html_post_process.rs` are for a different deprecated function and are out of scope for this PR)
 - [ ] `ClientInfo` populated at entry point (PR6 ✅, PR7 verifies no regressions)
 - [ ] All geo and client-info reads go through `RuntimeServices`
 - [ ] CI gates pass: `cargo build --workspace`, wasm32 build, `cargo test --workspace`, clippy `-D warnings`, `cargo fmt`
