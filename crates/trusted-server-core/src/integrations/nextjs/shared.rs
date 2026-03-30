@@ -151,36 +151,46 @@ impl RscUrlRewriter {
             return Cow::Borrowed(input);
         }
 
-        // Retrieve a compiled origin-specific pattern from cache, or compile and store one.
+        // Check cache first. Use the regex inside the borrow scope to avoid cloning it.
         // The same origin_host is used for every payload in a request, so this avoids
         // recompiling the pattern on each call. regex::escape() guarantees validity, but
         // treat compilation failure as non-fatal rather than panic.
         let cached = self.cached_pattern.borrow();
-        let origin_pattern = if let Some((ref host, ref regex)) = *cached {
+        if let Some((ref host, ref regex)) = *cached {
             if host == origin_host {
-                Some(regex.clone())
-            } else {
-                None
+                return Self::apply_rewrite(
+                    input,
+                    regex,
+                    origin_host,
+                    request_host,
+                    request_scheme,
+                );
             }
-        } else {
-            None
-        };
+        }
         drop(cached);
-        let origin_pattern = match origin_pattern {
-            Some(p) => p,
-            None => match build_origin_url_pattern(origin_host) {
-                Ok(pattern) => {
-                    let regex = pattern.clone();
-                    *self.cached_pattern.borrow_mut() = Some((origin_host.to_string(), pattern));
-                    regex
-                }
-                Err(e) => {
-                    log::error!("Failed to compile origin URL pattern: {e}");
-                    return Cow::Borrowed(input);
-                }
-            },
-        };
 
+        // Cache miss: compile and store the pattern, then apply.
+        match build_origin_url_pattern(origin_host) {
+            Ok(pattern) => {
+                let result =
+                    Self::apply_rewrite(input, &pattern, origin_host, request_host, request_scheme);
+                *self.cached_pattern.borrow_mut() = Some((origin_host.to_string(), pattern));
+                result
+            }
+            Err(e) => {
+                log::error!("Failed to compile origin URL pattern: {e}");
+                Cow::Borrowed(input)
+            }
+        }
+    }
+
+    fn apply_rewrite<'a>(
+        input: &'a str,
+        origin_pattern: &Regex,
+        origin_host: &str,
+        request_host: &str,
+        request_scheme: &str,
+    ) -> Cow<'a, str> {
         // Phase 1: Regex-based URL pattern rewriting (handles escaped slashes, schemes, etc.)
         let replaced = origin_pattern.replace_all(input, |caps: &regex::Captures<'_>| {
             let host = caps.name("host").map_or("", |m| m.as_str());
