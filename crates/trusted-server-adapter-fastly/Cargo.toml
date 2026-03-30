@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-bytes = { workspace = true }
 chrono = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
 edgezero-core = { workspace = true }

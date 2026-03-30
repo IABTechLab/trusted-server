@@ -12,13 +12,12 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
@@ -43,7 +42,7 @@ enum PayloadSizeError {
 
 /// Regex pattern for validating GTM container IDs.
 /// Format: GTM-XXXXXX where X is alphanumeric.
-static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static GTM_CONTAINER_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^GTM-[A-Z0-9]{4,20}$").expect("GTM container ID regex should compile")
 });
 
@@ -72,7 +71,7 @@ static GTM_CONTAINER_ID_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// on subdomains (e.g., `www.googletagmanager.com.evil.com`).
 ///
 /// The replacement target is `/integrations/google_tag_manager` + the captured delimiter.
-static GTM_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static GTM_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:https?:)?//(?:www\.(googletagmanager|google-analytics)\.com|analytics\.google\.com)([/"])"#)
         .expect("GTM URL regex should compile")
 });
@@ -315,29 +314,37 @@ impl GoogleTagManagerIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<GoogleTagManagerIntegration>> {
-    let config = match settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load GTM integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<GoogleTagManagerIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)?
+    else {
+        return Ok(None);
     };
 
-    Some(GoogleTagManagerIntegration::new(config))
+    Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+/// Register the Google Tag Manager integration when enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager integration is enabled with
+/// invalid configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(GTM_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_script_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
