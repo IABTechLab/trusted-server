@@ -12,7 +12,7 @@ use rand::Rng;
 use sha2::Sha256;
 
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
-use crate::cookies::handle_request_cookies;
+use crate::cookies::{ec_id_has_only_allowed_chars, handle_request_cookies};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -107,17 +107,22 @@ pub fn generate_ec_id(
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(ec_id) = req.get_header(HEADER_X_TS_EC).and_then(|h| h.to_str().ok()) {
-        let id = ec_id.to_string();
-        log::trace!("Using existing EC ID from header: {}", id);
-        return Ok(Some(id));
+        if ec_id_has_only_allowed_chars(ec_id) {
+            log::trace!("Using existing EC ID from header: {}", ec_id);
+            return Ok(Some(ec_id.to_string()));
+        }
+        log::warn!("Rejected EC ID from x-ts-ec header with disallowed characters");
     }
 
     match handle_request_cookies(req)? {
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_TS_EC) {
-                let id = cookie.value().to_string();
-                log::trace!("Using existing EC ID from cookie: {}", id);
-                return Ok(Some(id));
+                let value = cookie.value();
+                if ec_id_has_only_allowed_chars(value) {
+                    log::trace!("Using existing EC ID from cookie: {}", value);
+                    return Ok(Some(value.to_string()));
+                }
+                log::warn!("Rejected EC ID from cookie with disallowed characters");
             }
         }
         None => {
@@ -318,5 +323,54 @@ mod tests {
 
         let ec_id = get_or_generate_ec_id(&settings, &req).expect("should get or generate EC ID");
         assert!(!ec_id.is_empty());
+    }
+
+    #[test]
+    fn test_get_ec_id_rejects_invalid_header_and_falls_back_to_cookie() {
+        let req = create_test_request(vec![
+            (HEADER_X_TS_EC, "evil;injected"),
+            (
+                fastly::http::header::COOKIE,
+                &format!("{}=valid_cookie_id", COOKIE_TS_EC),
+            ),
+        ]);
+
+        let ec_id = get_ec_id(&req).expect("should handle invalid header gracefully");
+        assert_eq!(
+            ec_id,
+            Some("valid_cookie_id".to_string()),
+            "should reject tampered header and fall back to valid cookie"
+        );
+    }
+
+    #[test]
+    fn test_get_or_generate_ec_id_replaces_invalid_header() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![(HEADER_X_TS_EC, "evil;injected")]);
+
+        let ec_id = get_or_generate_ec_id(&settings, &req)
+            .expect("should generate fresh ID on invalid header");
+        assert_ne!(
+            ec_id, "evil;injected",
+            "should not use tampered header value"
+        );
+        assert!(
+            is_ec_id_format(&ec_id),
+            "should generate a valid EC ID format when header is rejected"
+        );
+    }
+
+    #[test]
+    fn test_get_ec_id_rejects_invalid_cookie() {
+        let req = create_test_request(vec![(
+            fastly::http::header::COOKIE,
+            &format!("{}=bad<script>value", COOKIE_TS_EC),
+        )]);
+
+        let ec_id = get_ec_id(&req).expect("should handle invalid cookie gracefully");
+        assert!(
+            ec_id.is_none(),
+            "should reject cookie with disallowed characters"
+        );
     }
 }

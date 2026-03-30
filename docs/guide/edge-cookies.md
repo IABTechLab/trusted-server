@@ -24,7 +24,7 @@ Configure EC secrets in `trusted-server.toml`. See the full [Configuration Refer
 
 ## Privacy Considerations
 
-- EC IDs are generated deterministically from the client IP, but the cookie is only set when storage consent is present
+- EC IDs combine a deterministic HMAC base derived from the client IP with a random suffix for uniqueness. The cookie is only set when storage consent is present
 - No personally identifiable information (PII) is stored in the ID
 - The hash input is the client IP address only
 - IDs can be rotated by changing the secret key
