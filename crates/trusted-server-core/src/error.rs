@@ -33,6 +33,12 @@ pub enum TrustedServerError {
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
+    /// A configuration secret is still set to a known placeholder value.
+    #[display(
+        "Configuration field '{field}' is set to a known placeholder value - this is insecure"
+    )]
+    InsecureDefault { field: String },
+
     /// Invalid UTF-8 data encountered.
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
@@ -97,6 +103,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
+            Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
