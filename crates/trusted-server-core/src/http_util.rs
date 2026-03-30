@@ -675,4 +675,21 @@ mod tests {
             "should detect https from ClientInfo tls_protocol"
         );
     }
+
+    #[test]
+    fn request_info_https_from_client_info_tls_cipher() {
+        let req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
+        let client_info = ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_string()),
+        };
+
+        let info = RequestInfo::from_request(&req, &client_info);
+
+        assert_eq!(
+            info.scheme, "https",
+            "should detect https from ClientInfo tls_cipher"
+        );
+    }
 }

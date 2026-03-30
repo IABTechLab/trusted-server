@@ -256,18 +256,18 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 
 | Route                     | Method | Handler                        | Purpose                                          | Line |
 |---------------------------|--------|--------------------------------|--------------------------------------------------|------|
-| `/auction`                | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 84   |
-| `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
-| `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
-| `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
-| `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
-| `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
-| `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
-| `/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 77   |
-| `/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 78   |
-| `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 92   |
-| `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 108  |
+| `/auction`                | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 162  |
+| `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 167  |
+| `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 170  |
+| `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 173  |
+| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 176  |
+| `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 145  |
+| `/.well-known/trusted-server.json` | GET  | `handle_trusted_server_discovery()` | Public key distribution for request signing | 149  |
+| `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 154  |
+| `/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 158  |
+| `/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 159  |
+| `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 179  |
+| `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 195  |
 
 ### How Routing Works
 
