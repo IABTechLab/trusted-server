@@ -333,18 +333,8 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
 /// always 43 bytes). Do **not** use this function to compare secrets of
 /// variable or confidential length — use a constant-time comparison that
 /// also hides length, such as comparing HMAC outputs.
-///
-/// # Examples
-///
-/// ```
-/// use trusted_server_core::http_util::ct_str_eq;
-///
-/// assert!(ct_str_eq("hello", "hello"));
-/// assert!(!ct_str_eq("hello", "world"));
-/// assert!(!ct_str_eq("hello", "hell"));
-/// ```
 #[must_use]
-pub fn ct_str_eq(a: &str, b: &str) -> bool {
+pub(crate) fn ct_str_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
@@ -621,6 +611,15 @@ mod tests {
             info.scheme, "http",
             "should default to http when forwarded proto is stripped and no TLS"
         );
+    }
+
+    #[test]
+    fn test_ct_str_eq() {
+        assert!(ct_str_eq("hello", "hello"), "should match equal strings");
+        assert!(!ct_str_eq("hello", "world"), "should not match different strings");
+        assert!(!ct_str_eq("hello", "hell"), "should not match different lengths");
+        assert!(!ct_str_eq("hell", "hello"), "should not match when first is shorter");
+        assert!(ct_str_eq("", ""), "should match empty strings");
     }
 
     #[test]
