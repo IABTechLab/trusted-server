@@ -19,7 +19,7 @@ use crate::constants::{
 
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
 ///
-/// Shared by [`GeoInfo::from_request`] and `FastlyPlatformGeo::lookup` in
+/// Shared by `GeoInfo::from_request` (legacy) and `FastlyPlatformGeo::lookup` in
 /// `trusted-server-adapter-fastly` so that field mapping is never duplicated.
 pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
     GeoInfo {
@@ -55,6 +55,7 @@ impl GeoInfo {
     ///     println!("User is in {} ({})", geo_info.city, geo_info.country);
     /// }
     /// ```
+    #[deprecated(note = "Use RuntimeServices::geo().lookup() instead")]
     pub fn from_request(req: &Request) -> Option<Self> {
         req.get_client_ip_addr()
             .and_then(geo_lookup)

@@ -34,6 +34,12 @@ fn is_allowed_synthetic_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
 }
 
+// Outbound allowlist for cookie sanitization: permits [a-zA-Z0-9._-] as a
+// defense-in-depth backstop when setting the Set-Cookie header. This is
+// intentionally broader than the inbound format validator
+// (`synthetic::is_valid_synthetic_id`), which enforces the exact
+// `<64-hex>.<6-alphanumeric>` structure and is used to reject untrusted
+// request values before they enter the system.
 #[must_use]
 pub(crate) fn synthetic_id_has_only_allowed_chars(synthetic_id: &str) -> bool {
     synthetic_id.chars().all(is_allowed_synthetic_id_char)
