@@ -1328,7 +1328,8 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, "synthetic-123");
+        let valid_synthetic_id = crate::test_support::tests::VALID_SYNTHETIC_ID;
+        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, valid_synthetic_id);
 
         let resp = handle_first_party_click(&settings, req)
             .await
@@ -1346,7 +1347,7 @@ mod tests {
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
         assert_eq!(
             pairs.remove("synthetic_id").as_deref(),
-            Some("synthetic-123")
+            Some(valid_synthetic_id)
         );
         assert!(pairs.is_empty());
     }
