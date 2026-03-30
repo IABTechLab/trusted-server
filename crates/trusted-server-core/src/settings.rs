@@ -31,18 +31,6 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Known placeholder values that must not be used in production.
-    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
-
-    /// Returns `true` if `proxy_secret` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
-        Self::PROXY_SECRET_PLACEHOLDERS
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(proxy_secret))
-    }
-
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -137,6 +125,13 @@ impl IntegrationSettings {
         }
     }
 
+    fn is_explicitly_disabled(raw: &JsonValue) -> bool {
+        raw.as_object()
+            .and_then(|map| map.get("enabled"))
+            .and_then(JsonValue::as_bool)
+            == Some(false)
+    }
+
     /// Retrieves and validates a typed configuration for an integration.
     ///
     /// # Errors
@@ -153,6 +148,10 @@ impl IntegrationSettings {
             Some(value) => value,
             None => return Ok(None),
         };
+
+        if Self::is_explicitly_disabled(raw) {
+            return Ok(None);
+        }
 
         let config: T = serde_json::from_value(raw.clone()).change_context(
             TrustedServerError::Configuration {
@@ -204,24 +203,7 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
-    /// Known placeholder values that must not be used in production.
-    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
-
-    /// Returns `true` if `secret_key` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
-        Self::SECRET_KEY_PLACEHOLDERS
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(secret_key))
-    }
-
     /// Validates that the secret key is not empty.
-    ///
-    /// Placeholder detection is intentionally **not** performed here because
-    /// this validator runs at build time (via `from_toml_and_env`) when the
-    /// config legitimately contains placeholder values. Placeholder rejection
-    /// happens at runtime via [`Settings::reject_placeholder_secrets`].
     ///
     /// # Errors
     ///
@@ -280,18 +262,41 @@ pub struct Handler {
     pub password: Redacted<String>,
     #[serde(skip, default)]
     #[validate(skip)]
-    regex: OnceLock<Regex>,
+    regex: OnceLock<Result<Regex, String>>,
 }
 
 impl Handler {
-    fn compiled_regex(&self) -> &Regex {
-        self.regex.get_or_init(|| {
-            Regex::new(&self.path).expect("configuration validation should ensure regex compiles")
-        })
+    fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
+        match self
+            .regex
+            .get_or_init(|| Regex::new(&self.path).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(regex),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Handler path regex `{}` failed to compile: {message}",
+                    self.path
+                ),
+            })),
+        }
     }
 
-    pub fn matches_path(&self, path: &str) -> bool {
-        self.compiled_regex().is_match(path)
+    /// Eagerly compile the handler regex to fail fast during startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the handler path regex does not compile.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        self.compiled_regex().map(|_| ())
+    }
+
+    /// Determine whether this handler applies to the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the handler path regex does not compile.
+    pub fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.compiled_regex().map(|regex| regex.is_match(path))
     }
 }
 
@@ -371,6 +376,7 @@ impl Settings {
             })?;
 
         settings.consent.validate();
+        settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -414,43 +420,41 @@ impl Settings {
             })
         })?;
 
+        settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
 
         Ok(settings)
     }
 
-    /// Checks all secret fields for known placeholder values and returns an
-    /// error listing every offending field. This centralises the placeholder
-    /// policy so callers don't need to know which fields are secrets.
+    /// Eagerly prepare runtime-only settings artifacts.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
-    /// fields still contain a placeholder value.
-    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
-        let mut insecure_fields: Vec<&str> = Vec::new();
-
-        if Synthetic::is_placeholder_secret_key(self.synthetic.secret_key.expose()) {
-            insecure_fields.push("synthetic.secret_key");
-        }
-        if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
-            insecure_fields.push("publisher.proxy_secret");
+    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            handler.prepare_runtime()?;
         }
 
-        if insecure_fields.is_empty() {
-            Ok(())
-        } else {
-            Err(Report::new(TrustedServerError::InsecureDefault {
-                field: insecure_fields.join(", "),
-            }))
-        }
+        Ok(())
     }
 
-    #[must_use]
-    pub fn handler_for_path(&self, path: &str) -> Option<&Handler> {
-        self.handlers
-            .iter()
-            .find(|handler| handler.matches_path(path))
+    /// Resolve the first handler whose regex matches the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any handler regex does not compile.
+    pub fn handler_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<&Handler>, Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            if handler.matches_path(path)? {
+                return Ok(Some(handler));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Known admin endpoint paths that must be covered by a handler.
@@ -467,13 +471,27 @@ impl Settings {
     /// Called by [`from_toml_and_env`](Self::from_toml_and_env) at build time
     /// to enforce that every admin endpoint has a handler. An empty return
     /// value means all admin endpoints are properly covered.
-    #[must_use]
-    pub(crate) fn uncovered_admin_endpoints(&self) -> Vec<&'static str> {
-        Self::ADMIN_ENDPOINTS
-            .iter()
-            .copied()
-            .filter(|path| !self.handlers.iter().any(|h| h.matches_path(path)))
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] if any handler has an invalid path regex.
+    pub(crate) fn uncovered_admin_endpoints(
+        &self,
+    ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
+        let mut uncovered = Vec::new();
+        for &path in Self::ADMIN_ENDPOINTS {
+            let mut covered = false;
+            for h in &self.handlers {
+                if h.matches_path(path)? {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered {
+                uncovered.push(path);
+            }
+        }
+        Ok(uncovered)
     }
 
     /// Validates that every admin endpoint is covered by at least one handler.
@@ -483,7 +501,7 @@ impl Settings {
     /// Returns [`TrustedServerError::Configuration`] listing any uncovered
     /// admin endpoints.
     fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
-        let uncovered = self.uncovered_admin_endpoints();
+        let uncovered = self.uncovered_admin_endpoints()?;
         if uncovered.is_empty() {
             return Ok(());
         }
@@ -550,7 +568,6 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
         validation_error
     })
 }
-
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
 // This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
 // represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
@@ -674,9 +691,10 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
 
+    use crate::auction::build_orchestrator;
     use crate::integrations::{
-        nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
+        gpt::GptConfig, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
+        testlight::TestlightConfig, IntegrationRegistry,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -744,6 +762,18 @@ mod tests {
     }
 
     #[test]
+    fn prepare_runtime_rejects_invalid_handler_regex() {
+        let toml_str = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
+
+        let err = Settings::from_toml(&toml_str).expect_err("should reject invalid handler regex");
+        assert!(
+            err.to_string()
+                .contains("Handler path regex `(` failed to compile"),
+            "should describe the invalid handler regex"
+        );
+    }
+
+    #[test]
     fn test_settings_missing_required_fields() {
         let re = Regex::new(r"origin_url = .*").expect("regex should compile");
 
@@ -754,62 +784,6 @@ mod tests {
         assert!(
             settings.is_err(),
             "Should fail when required fields are missing"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
-        for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
-            assert!(
-                Synthetic::is_placeholder_secret_key(placeholder),
-                "should detect placeholder secret_key '{placeholder}'"
-            );
-        }
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_is_case_insensitive() {
-        assert!(
-            Synthetic::is_placeholder_secret_key("SECRET-KEY"),
-            "should detect case-insensitive placeholder secret_key"
-        );
-        assert!(
-            Synthetic::is_placeholder_secret_key("Trusted-Server"),
-            "should detect mixed-case placeholder secret_key"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_accepts_non_placeholder() {
-        assert!(
-            !Synthetic::is_placeholder_secret_key("test-secret-key"),
-            "should accept non-placeholder secret_key"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_rejects_all_known_placeholders() {
-        for placeholder in Publisher::PROXY_SECRET_PLACEHOLDERS {
-            assert!(
-                Publisher::is_placeholder_proxy_secret(placeholder),
-                "should detect placeholder proxy_secret '{placeholder}'"
-            );
-        }
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_is_case_insensitive() {
-        assert!(
-            Publisher::is_placeholder_proxy_secret("CHANGE-ME-PROXY-SECRET"),
-            "should detect case-insensitive placeholder proxy_secret"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_accepts_non_placeholder() {
-        assert!(
-            !Publisher::is_placeholder_proxy_secret("unit-test-proxy-secret"),
-            "should accept non-placeholder proxy_secret"
         );
     }
 
@@ -1009,6 +983,36 @@ mod tests {
                 assert_eq!(handler.path, "^/env-handler");
                 assert_eq!(handler.username.expose(), "env-user");
                 assert_eq!(handler.password.expose(), "env-pass");
+            },
+        );
+    }
+
+    #[test]
+    fn test_invalid_handler_override_fails_during_runtime_preparation() {
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let path_key = format!(
+            "{}{}HANDLERS{}0{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(path_key, Some("("), || {
+                    let _ = Settings::from_toml_and_env(&toml_str)
+                        .expect_err("should reject invalid handler regex override");
+                });
             },
         );
     }
@@ -1237,6 +1241,142 @@ mod tests {
         assert!(config.is_none(), "Disabled integrations should be skipped");
     }
 
+    #[test]
+    fn disabled_invalid_integration_skips_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &json!({
+                    "enabled": false,
+                    "script_url": "not a url",
+                }),
+            )
+            .expect("should insert GPT config");
+
+        let config = settings
+            .integration_config::<GptConfig>("gpt")
+            .expect("disabled GPT config should be ignored");
+        assert!(config.is_none(), "disabled GPT config should be skipped");
+        IntegrationRegistry::new(&settings)
+            .expect("disabled invalid integration config should not fail registry startup");
+    }
+
+    #[test]
+    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": false,
+                    "server_url": "not a url",
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let config = settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .expect("disabled prebid config should be ignored");
+        assert!(config.is_none(), "disabled prebid config should be skipped");
+        IntegrationRegistry::new(&settings)
+            .expect("disabled default-enabled prebid config should not fail registry startup");
+        build_orchestrator(&settings)
+            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
+    fn enabled_invalid_integration_fails_registry_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &json!({
+                    "enabled": true,
+                    "script_url": "not a url",
+                }),
+            )
+            .expect("should insert GPT config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("enabled invalid integration should fail registry startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Integration 'gpt'"),
+            "should identify the invalid integration config"
+        );
+    }
+
+    #[test]
+    fn disabled_invalid_provider_config_does_not_fail_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &json!({
+                    "enabled": false,
+                    "endpoint": "not a url",
+                }),
+            )
+            .expect("should insert adserver mock config");
+
+        build_orchestrator(&settings).expect("disabled invalid provider config should be ignored");
+    }
+
+    #[test]
+    fn enabled_invalid_provider_config_fails_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &json!({
+                    "enabled": true,
+                    "endpoint": "not a url",
+                }),
+            )
+            .expect("should insert adserver mock config");
+
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("enabled invalid provider config should fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Integration 'adserver_mock'"),
+            "should identify the invalid provider config"
+        );
+    }
+
+    #[test]
+    fn empty_prebid_server_url_fails_orchestrator_startup() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "",
+                }),
+            )
+            .expect("should insert prebid config");
+
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("empty prebid server_url should fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Integration 'prebid' configuration failed validation"),
+            "should surface a validation error for prebid.server_url"
+        );
+    }
+
     /// Tests the full build.rs round-trip: env vars are baked into Settings
     /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
     /// back at runtime via `from_toml`. Verifies that env-sourced integration
@@ -1444,7 +1584,9 @@ mod tests {
         // since this test exercises uncovered_admin_endpoints itself.
         let settings: Settings =
             toml::from_str(&settings_str_without_admin_handler()).expect("should deserialize TOML");
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert_eq!(
             uncovered,
             vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
@@ -1455,7 +1597,9 @@ mod tests {
     #[test]
     fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
         let settings = create_test_settings();
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert!(
             uncovered.is_empty(),
             "should report no uncovered admin endpoints when handler covers /admin"
@@ -1474,7 +1618,9 @@ mod tests {
         // Deserialize directly to bypass from_toml's admin validation,
         // since this test exercises uncovered_admin_endpoints itself.
         let settings: Settings = toml::from_str(&toml_str).expect("should deserialize TOML");
-        let uncovered = settings.uncovered_admin_endpoints();
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
         assert_eq!(
             uncovered,
             vec!["/admin/keys/deactivate"],
