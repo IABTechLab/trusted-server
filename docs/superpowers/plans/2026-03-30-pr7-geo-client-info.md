@@ -453,7 +453,7 @@ These four changes must happen together because:
 
 - [ ] **Step 7: Update all stale Fastly-SDK-specific wording in `http_util.rs` comments**
 
-  There are four locations that describe TLS as coming from "Fastly SDK" rather than `ClientInfo`. Update all of them:
+  There are five locations that describe TLS as coming from "Fastly SDK" rather than `ClientInfo`. Update all of them:
 
   **Location 1 — `SPOOFABLE_FORWARDED_HEADERS` doc (line ~29-33):**
   ```
