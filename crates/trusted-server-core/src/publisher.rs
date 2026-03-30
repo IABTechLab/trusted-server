@@ -7,6 +7,7 @@ use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipeline
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthetic_cookie};
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
@@ -334,13 +335,8 @@ pub fn handle_publisher_request(
     // (for OpenRTB forwarding) and decoded data (for enforcement).
     // When a consent_store is configured, this also persists consent to KV
     // and falls back to stored consent when cookies are absent.
-    let geo = services
-        .geo()
-        .lookup(services.client_info.client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e:?}");
-            None
-        });
+    #[allow(deprecated)]
+    let geo = GeoInfo::from_request(&req);
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
         req: &req,
