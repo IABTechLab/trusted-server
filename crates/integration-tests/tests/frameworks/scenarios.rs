@@ -613,21 +613,19 @@ fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
             .attach("should set ts-ec on organic request for consent-denied test")
     })?;
 
-    // Identify with GPC=1 — if jurisdiction is non-regulated + GPC,
-    // consent may still be denied depending on US-state detection.
-    // Without geo, jurisdiction is Unknown → fail-closed → 403.
+    // Identify with GPC=1 — without geo, jurisdiction is Unknown →
+    // fail-closed → consent denied. Per spec §11.4, consent is evaluated
+    // *before* EC presence, so this must be 403 Forbidden regardless of
+    // whether an EC cookie exists.
     let resp = client.get_with_headers("/identify", &[("sec-gpc", "1")])?;
 
     let status = resp.status().as_u16();
-    // Under Unknown jurisdiction (no geo in Viceroy), EC is denied
-    // so the response may be 403 or 204 depending on whether the EC
-    // context reads the cookie before consent check.
-    if status != 403 && status != 204 {
+    if status != 403 {
         return Err(Report::new(TestError::UnexpectedStatusCode {
             expected: 403,
             actual: status,
         })
-        .attach("identify with consent denied should return 403 or 204"));
+        .attach("identify with consent denied should return 403"));
     }
 
     log::info!("EC identify consent denied: PASSED (status={status})");

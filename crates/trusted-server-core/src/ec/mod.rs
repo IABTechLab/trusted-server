@@ -436,7 +436,10 @@ pub(crate) fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or_else(|err| {
+            log::warn!("SystemTime::now() failed, falling back to epoch 0: {err}");
+            0
+        })
 }
 
 #[cfg(test)]
