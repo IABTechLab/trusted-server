@@ -305,7 +305,7 @@ impl PlatformGeo for FastlyPlatformGeo {
 /// Call this once at the entry point before dispatching to handlers.
 /// `client_info` is populated from TLS and IP metadata available on the
 /// request; geo lookup is deferred to handler time via
-/// `services.geo.lookup(services.client_info.client_ip)`.
+/// `services.geo().lookup(services.client_info().client_ip)`.
 ///
 /// `kv_store` is an [`Arc<dyn PlatformKvStore>`] opened by the caller for
 /// the primary KV store. Use [`open_kv_store`] to construct it.
@@ -483,11 +483,11 @@ mod tests {
         let services = build_runtime_services(&req, noop_kv_store());
 
         assert!(
-            services.client_info.tls_protocol.is_none(),
+            services.client_info().tls_protocol.is_none(),
             "should have no tls_protocol on plain test request"
         );
         assert!(
-            services.client_info.tls_cipher.is_none(),
+            services.client_info().tls_cipher.is_none(),
             "should have no tls_cipher on plain test request"
         );
     }
@@ -499,7 +499,8 @@ mod tests {
         let cloned = services.clone();
 
         assert_eq!(
-            services.client_info.client_ip, cloned.client_info.client_ip,
+            services.client_info().client_ip,
+            cloned.client_info().client_ip,
             "should preserve client_ip through clone"
         );
     }
