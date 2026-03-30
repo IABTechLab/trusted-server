@@ -58,7 +58,7 @@ impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the synthetic ID.
     ///
     /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
-    /// first-party proxy by setting [`allowed_domains`] directly.
+    /// first-party proxy by setting `allowed_domains` directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {

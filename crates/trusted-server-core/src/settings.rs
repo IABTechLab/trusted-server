@@ -375,7 +375,7 @@ impl Default for Proxy {
 }
 
 impl Proxy {
-    /// Normalizes [`allowed_domains`] in place.
+    /// Normalizes `allowed_domains` in place.
     ///
     /// Each entry is trimmed of surrounding whitespace and lowercased.
     /// Empty entries (including those that were only whitespace) are removed.
@@ -400,7 +400,7 @@ impl Proxy {
         }
 
         if self.allowed_domains.is_empty() {
-            log::warn!(
+            log::info!(
                 "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
             );
         }
