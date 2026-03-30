@@ -11,7 +11,7 @@ use super::rsc::rewrite_rsc_scripts_combined_with_limit;
 use super::rsc_placeholders::{
     NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX, RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
 };
-use super::shared::find_rsc_push_payload_range;
+use super::shared::{find_rsc_push_payload_range, RscUrlRewriter};
 use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
 
 pub(crate) struct NextJsHtmlPostProcessor {
@@ -65,9 +65,13 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             })
             .unwrap_or_default();
 
+        // Single rewriter instance shared across both code paths so the compiled
+        // regex is cached and reused regardless of which branch executes.
+        let rsc_rewriter = RscUrlRewriter::new();
+
         if !payloads.is_empty() {
             // Placeholder approach: substitute placeholders with rewritten payloads
-            return self.substitute_placeholders(html, ctx, payloads);
+            return self.substitute_placeholders(html, ctx, payloads, &rsc_rewriter);
         }
 
         // Fallback: re-parse HTML to find RSC scripts that weren't captured during streaming
@@ -78,6 +82,7 @@ impl IntegrationHtmlPostProcessor for NextJsHtmlPostProcessor {
             ctx.request_host,
             ctx.request_scheme,
             self.config.max_combined_payload_bytes,
+            &rsc_rewriter,
         )
     }
 }
@@ -89,10 +94,12 @@ impl NextJsHtmlPostProcessor {
         html: &mut String,
         ctx: &IntegrationHtmlContext<'_>,
         payloads: Vec<String>,
+        rsc_rewriter: &RscUrlRewriter,
     ) -> bool {
         let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
         let mut rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payload_refs.as_slice(),
+            rsc_rewriter,
             ctx.origin_host,
             ctx.request_host,
             ctx.request_scheme,
@@ -366,12 +373,14 @@ pub fn post_process_rsc_html_in_place(
     request_host: &str,
     request_scheme: &str,
 ) -> bool {
+    let rsc_rewriter = RscUrlRewriter::new();
     post_process_rsc_html_in_place_with_limit(
         html,
         origin_host,
         request_host,
         request_scheme,
         super::rsc::DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+        &rsc_rewriter,
     )
 }
 
@@ -381,6 +390,7 @@ fn post_process_rsc_html_in_place_with_limit(
     request_host: &str,
     request_scheme: &str,
     max_combined_payload_bytes: usize,
+    rsc_rewriter: &RscUrlRewriter,
 ) -> bool {
     let mut scripts = find_rsc_push_scripts(html.as_str());
     if scripts.is_empty() {
@@ -455,6 +465,7 @@ fn post_process_rsc_html_in_place_with_limit(
 
         let rewritten_payloads = rewrite_rsc_scripts_combined_with_limit(
             payloads.as_slice(),
+            rsc_rewriter,
             origin_host,
             request_host,
             request_scheme,

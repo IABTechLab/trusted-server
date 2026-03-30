@@ -49,6 +49,7 @@ Using the `.github/pull_request_template.md` structure, draft:
 - **Changes table**: list each file modified and what changed.
 - **Closes**: `Closes #<issue-number>` to auto-close the linked issue.
 - **Test plan**: check off which verification steps were run.
+- **Hardening note**: when config-derived regex or pattern compilation is touched, state how invalid enabled config fails startup and which regression tests cover that path.
 - **Checklist**: verify each item applies.
 
 ### 5. Create the PR
@@ -172,6 +173,7 @@ Do **not** use labels as a substitute for types.
 - Use sentence case for the title.
 - Use imperative mood (e.g., "Add caching to proxy" not "Added caching").
 - The summary should focus on _why_, not just _what_.
+- Do not describe config-derived regex/pattern compilation as safe unless invalid enabled config is handled without `panic!`, `unwrap()`, or `expect()`.
 - Always base PRs against `main` unless told otherwise.
 - Always assign the PR to the current user (`--assignee @me`).
 - Never force-push or rebase without explicit user approval.
