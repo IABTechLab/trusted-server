@@ -47,7 +47,15 @@ The platform-specific extraction never leaves the adapter crate.
 ### Injection pattern
 
 Follows the Phase 1 doc pattern: internal utility functions that currently
-call Fastly SDK methods gain a `services: &RuntimeServices` parameter.
+call Fastly SDK methods gain a `services: &RuntimeServices` parameter where
+possible. Two exceptions:
+
+- `RequestInfo::from_request` takes `&ClientInfo` (not `&RuntimeServices`) so
+  it remains callable from both `publisher.rs` (which has `services`) and
+  `prebid.rs` (which only has `AuctionContext.client_info`).
+- `didomi.rs` `copy_headers` takes `Option<IpAddr>` directly — a private
+  helper only needs the scalar value.
+
 Callers already hold `RuntimeServices` and thread it through — no new
 construction or allocation.
 
@@ -451,7 +459,7 @@ same values).
 - [ ] Zero `req.get_tls_cipher_openssl_name()` calls in active (non-deprecated) code in `trusted-server-core`
 - [ ] Zero `#[allow(deprecated)]` on `GeoInfo::from_request` calls (the `#[deprecated]` attribute on `GeoInfo::from_request` itself is preserved — only the call-site suppressors are removed; unrelated `#[allow(deprecated)]` annotations in `nextjs/html_post_process.rs` are for a different deprecated function and are out of scope for this PR)
 - [ ] `ClientInfo` populated at entry point (PR6 ✅, PR7 verifies no regressions)
-- [ ] All geo and client-info reads go through `RuntimeServices`
+- [ ] All production client metadata originates from `RuntimeServices.client_info` (provider-layer reads happen via `AuctionContext.client_info`, which is populated from `&services.client_info` at the endpoint layer)
 - [ ] CI gates pass: `cargo build --workspace`, wasm32 build, `cargo test --workspace`, clippy `-D warnings`, `cargo fmt`
 
 ---
