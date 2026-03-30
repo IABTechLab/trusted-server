@@ -12,31 +12,31 @@ This document presents a performance analysis and optimization plan for the Trus
 
 ### CPU Breakdown — Top Level
 
-| % CPU | Function | Notes |
-|-------|----------|-------|
-| ~96% | `trusted_server_adapter_fastly::main` | Almost all time is in application code |
-| ~90% | `route_request` → `handle_publisher_request` | Publisher proxy is the hot path |
-| **~76%** | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck** |
-| ~~5-8%~~ → **3.3%** | `get_settings()` | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |
-| ~5-7% | `handle_publisher_request` (non-HTML) | Backend send, cookie handling |
+| % CPU               | Function                                                          | Notes                                                                    |
+| ------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| ~96%                | `trusted_server_adapter_fastly::main`                             | Almost all time is in application code                                   |
+| ~90%                | `route_request` → `handle_publisher_request`                      | Publisher proxy is the hot path                                          |
+| **~76%**            | **HTML processing pipeline** (`streaming_processor` → `lol_html`) | **Dominant bottleneck**                                                  |
+| ~~5-8%~~ → **3.3%** | `get_settings()`                                                  | ~~Redundant config crate parsing~~ **Fixed** — now uses `toml::from_str` |
+| ~5-7%               | `handle_publisher_request` (non-HTML)                             | Backend send, cookie handling                                            |
 
 ### CPU Breakdown — HTML Processing (~76% total)
 
-| % CPU | Function | Notes |
-|-------|----------|-------|
-| **~47%** | `lol_html::parser` state machine | HTML tokenizer/parser — character-by-character parsing |
-| ~11% | `create_html_processor` | Building the lol_html rewriter with all handlers |
-| ~18% | Processing callbacks | URL rewriting, attribute scanning, output sink handling |
+| % CPU    | Function                         | Notes                                                   |
+| -------- | -------------------------------- | ------------------------------------------------------- |
+| **~47%** | `lol_html::parser` state machine | HTML tokenizer/parser — character-by-character parsing  |
+| ~11%     | `create_html_processor`          | Building the lol_html rewriter with all handlers        |
+| ~18%     | Processing callbacks             | URL rewriting, attribute scanning, output sink handling |
 
 ### CPU Breakdown — Other Components
 
-| % CPU | Function | Notes |
-|-------|----------|-------|
-| ~2% | `IntegrationRegistry` | Route lookup + attribute rewriting + initialization |
-| ~0.8% | Memory allocation (`RawVec::reserve`) | Buffer growth during processing |
-| ~0.5% | Logging (`fern` / `log_fastly`) | Minimal overhead |
-| ~0.5% | Synthetic ID generation | HMAC computation |
-| ~0.5% | Header extraction | `fastly::http::handle::get_header_values` |
+| % CPU | Function                              | Notes                                               |
+| ----- | ------------------------------------- | --------------------------------------------------- |
+| ~2%   | `IntegrationRegistry`                 | Route lookup + attribute rewriting + initialization |
+| ~0.8% | Memory allocation (`RawVec::reserve`) | Buffer growth during processing                     |
+| ~0.5% | Logging (`fern` / `log_fastly`)       | Minimal overhead                                    |
+| ~0.5% | Synthetic ID generation               | HMAC computation                                    |
+| ~0.5% | Header extraction                     | `fastly::http::handle::get_header_values`           |
 
 ### Key Takeaways
 
@@ -53,12 +53,12 @@ This document presents a performance analysis and optimization plan for the Trus
 
 Measured on `main` branch. Value is in **relative comparison between branches**, not absolute values.
 
-| Endpoint | P50 | P95 | Req/sec | Notes |
-|---|---|---|---|---|
-| `GET /static/tsjs=tsjs-unified.min.js` | 1.9 ms | 3.1 ms | 4,672 | Pure WASM, no backend |
-| `GET /.well-known/trusted-server.json` | 1.3 ms | 1.4 ms | ~770 | Server-side only |
-| `GET /` (publisher proxy) | 400 ms | 595 ms | 21 | Proxies to golf.com, 222KB HTML |
-| `POST /auction` | 984 ms | 1,087 ms | 9.3 | Calls Prebid + APS backends |
+| Endpoint                               | P50    | P95      | Req/sec | Notes                           |
+| -------------------------------------- | ------ | -------- | ------- | ------------------------------- |
+| `GET /static/tsjs=tsjs-unified.min.js` | 1.9 ms | 3.1 ms   | 4,672   | Pure WASM, no backend           |
+| `GET /.well-known/trusted-server.json` | 1.3 ms | 1.4 ms   | ~770    | Server-side only                |
+| `GET /` (publisher proxy)              | 400 ms | 595 ms   | 21      | Proxies to golf.com, 222KB HTML |
+| `POST /auction`                        | 984 ms | 1,087 ms | 9.3     | Calls Prebid + APS backends     |
 
 - **WASM heap**: 3.0-4.1 MB per request
 - **Init overhead**: <2ms (settings parse + orchestrator + registry)
@@ -68,11 +68,11 @@ Measured on `main` branch. Value is in **relative comparison between branches**,
 
 Measured externally against staging deployment (golf.com proxy), `main` branch.
 
-| Endpoint | TTFB | Total | Size | Notes |
-|---|---|---|---|---|
-| `GET /static/tsjs=tsjs-unified.min.js` | ~204 ms | ~219 ms | 28 KB | No backend; includes client-network + edge path from benchmark vantage |
-| `GET /` (publisher proxy, golf.com) | ~234 ms | ~441 ms | 230 KB | Backend + processing |
-| `GET /.well-known/trusted-server.json` | ~191 ms | - | - | Returns 500 (needs investigation) |
+| Endpoint                               | TTFB    | Total   | Size   | Notes                                                                  |
+| -------------------------------------- | ------- | ------- | ------ | ---------------------------------------------------------------------- |
+| `GET /static/tsjs=tsjs-unified.min.js` | ~204 ms | ~219 ms | 28 KB  | No backend; includes client-network + edge path from benchmark vantage |
+| `GET /` (publisher proxy, golf.com)    | ~234 ms | ~441 ms | 230 KB | Backend + processing                                                   |
+| `GET /.well-known/trusted-server.json` | ~191 ms | -       | -      | Returns 500 (needs investigation)                                      |
 
 **Key insight**: Static JS has ~204ms TTFB with zero backend work **from this specific benchmark vantage point**. That number includes client-to-edge RTT, DNS, TLS/connection state, and edge processing — it is **not** a universal Fastly floor.
 
@@ -153,9 +153,9 @@ fn process_gzip_to_gzip<R: Read, W: Write>(&mut self, input: R, output: W) -> Re
 }
 ```
 
-| Impact | LOC | Risk |
-|--------|-----|------|
-| **High** (most responses are gzip; reduces peak memory) | -15/+3 | Low |
+| Impact                                                  | LOC    | Risk |
+| ------------------------------------------------------- | ------ | ---- |
+| **High** (most responses are gzip; reduces peak memory) | -15/+3 | Low  |
 
 #### 1.2 Fix `HtmlRewriterAdapter` — enable true streaming
 
@@ -197,8 +197,8 @@ impl StreamProcessor for HtmlRewriterAdapter {
 }
 ```
 
-| Impact | LOC | Risk |
-|--------|-----|------|
+| Impact                                                                | LOC            | Risk                         |
+| --------------------------------------------------------------------- | -------------- | ---------------------------- |
 | **High** (HTML is most common content type; eliminates 222KB+ buffer) | ~30 refactored | Medium — needs test coverage |
 
 #### 1.3 ~~Eliminate redundant `config` crate parsing in `get_settings()` — ~5-8% CPU~~ DONE (~3.3% post-fix)
@@ -236,8 +236,8 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 
 **Recommendation**: Start with the `toml::from_str()` fix (1-line change, no new deps). If profiling still shows meaningful time in TOML parsing, upgrade to `postcard`.
 
-| Impact | LOC | Risk |
-|--------|-----|------|
+| Impact                                   | LOC | Risk                                         |
+| ---------------------------------------- | --- | -------------------------------------------- |
 | **Medium** (~5-8% → ~3.3% CPU, verified) | 1-3 | Low — `build.rs` already resolves everything |
 
 **Status**: Done. Replaced `Settings::from_toml()` with `toml::from_str()` + explicit `normalize()` + `validate()`. Profiling confirmed: **~5-8% → ~3.3% CPU per request**.
@@ -258,21 +258,21 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 .max_level(log::LevelFilter::Info)
 ```
 
-| Impact | LOC | Risk |
-|--------|-----|------|
-| Low (~0.5% CPU) | ~3 | None |
+| Impact          | LOC | Risk |
+| --------------- | --- | ---- |
+| Low (~0.5% CPU) | ~3  | None |
 
 #### 1.5 Trivial fixes batch
 
-| Fix | File | LOC |
-|-----|------|-----|
-| Const cookie prefix instead of `format!()` | `publisher.rs:207-210` | 2 |
-| `mem::take` instead of `clone` for overlap buffer | `streaming_replacer.rs:63` | 1 |
-| `eq_ignore_ascii_case` for compression detection | `streaming_processor.rs:47` | 5 |
-| `Cow<str>` for string replacements | `streaming_replacer.rs:120-125` | 5-10 |
-| Remove base64 roundtrip in token computation | `http_util.rs:286-294` | 10-15 |
-| Replace Handlebars with manual interpolation | `synthetic.rs:82-99` | ~20 |
-| Cache `origin_host()` result per-request | `settings.rs` | 5-10 |
+| Fix                                               | File                            | LOC   |
+| ------------------------------------------------- | ------------------------------- | ----- |
+| Const cookie prefix instead of `format!()`        | `publisher.rs:207-210`          | 2     |
+| `mem::take` instead of `clone` for overlap buffer | `streaming_replacer.rs:63`      | 1     |
+| `eq_ignore_ascii_case` for compression detection  | `streaming_processor.rs:47`     | 5     |
+| `Cow<str>` for string replacements                | `streaming_replacer.rs:120-125` | 5-10  |
+| Remove base64 roundtrip in token computation      | `http_util.rs:286-294`          | 10-15 |
+| Replace Handlebars with manual interpolation      | `synthetic.rs:82-99`            | ~20   |
+| Cache `origin_host()` result per-request          | `settings.rs`                   | 5-10  |
 
 ---
 
@@ -285,6 +285,7 @@ The high-impact architectural change. Uses Fastly's `stream_to_client()` API to 
 **Files**: `crates/trusted-server-core/src/publisher.rs`, `crates/trusted-server-adapter-fastly/src/main.rs`
 
 **Current flow** (fully buffered):
+
 ```
 req.send() → wait for full response → take_body()
   → process_response_streaming() → collects into Vec<u8>
@@ -292,6 +293,7 @@ req.send() → wait for full response → take_body()
 ```
 
 **New flow** (streaming):
+
 ```
 req.send() → take_body() → set response headers
   → stream_to_client() → returns StreamingBody (headers sent immediately)
@@ -300,6 +302,7 @@ req.send() → take_body() → set response headers
 ```
 
 **Key enablers**:
+
 - `StreamingPipeline.process()` already accepts `W: Write` — `StreamingBody` implements `Write`
 - With Phase 1 fixes (gzip streaming + HTML rewriter streaming), the pipeline is already chunk-based
 - Non-text responses can use `streaming_body.append(body)` for O(1) pass-through
@@ -307,6 +310,7 @@ req.send() → take_body() → set response headers
 **Architecture change in `main.rs`**: The publisher proxy path calls `stream_to_client()` directly instead of returning a `Response`. Other endpoints (static, auction, discovery) continue returning `Response` as before.
 
 **Error handling for streaming**: Once `stream_to_client()` is called, response headers (including status 200) are already sent. If processing fails mid-stream:
+
 - We cannot change the status code — the client already received 200
 - The `StreamingBody` will be aborted on drop (client sees incomplete response)
 - We should log the error server-side for debugging
@@ -339,8 +343,8 @@ match pipeline.process(backend_body, &mut client_body) {
 }
 ```
 
-| Impact | LOC | Risk |
-|--------|-----|------|
+| Impact                                                                     | LOC     | Risk                                            |
+| -------------------------------------------------------------------------- | ------- | ----------------------------------------------- |
 | **High** — reduces time-to-last-byte and peak memory for all proxied pages | ~80-120 | Medium — error handling requires careful design |
 
 #### 2.2 Concurrent origin fetch + auction (future)
@@ -353,8 +357,8 @@ This would overlap origin fetch time with auction execution, so the browser star
 
 **Note**: This requires significant refactoring of the auction orchestrator and HTML processor to support async injection.
 
-| Impact | LOC | Risk |
-|--------|-----|------|
+| Impact                                                                  | LOC      | Risk                        |
+| ----------------------------------------------------------------------- | -------- | --------------------------- |
 | **Very High** for auction pages — browser starts loading ~400ms earlier | ~150-200 | High — complex coordination |
 
 ---
@@ -371,6 +375,7 @@ After implementing Phases 1-2:
 6. If improvement is marginal, don't ship the streaming architecture (Phase 2)
 
 **Success criteria**:
+
 - Peak memory per request reduced by 30%+ (measurable via Fastly logs)
 - Time-to-last-byte reduced for large HTML pages
 - No regression on static endpoints or auction
@@ -380,15 +385,15 @@ After implementing Phases 1-2:
 
 ## Optimization Summary Table
 
-| # | Optimization | Measured CPU | Impact | LOC | Risk | Phase |
-|---|---|---|---|---|---|---|
-| **1.1** | Gzip streaming fix | Part of ~76% HTML pipeline | **High** (memory) | -15/+3 | Low | 1 |
-| **1.2** | HTML rewriter streaming | Part of ~76% HTML pipeline | **High** (memory) | ~30 | Medium | 1 |
-| **1.3** | ~~Eliminate redundant `config` crate~~ | ~~5-8%~~ → **3.3%** | **Done** | 1-3 | Low | 1 |
-| **1.4** | Reduce verbose logging | ~0.5% | Low | ~3 | None | 1 |
-| **1.5** | Trivial fixes batch | <1% combined | Low | ~50 | None | 1 |
-| **2.1** | `stream_to_client()` integration | N/A (architectural) | **High** (TTLB) | ~80-120 | Medium | 2 |
-| **2.2** | Concurrent origin + auction | N/A (architectural) | **Very High** | ~150-200 | High | 2 (future) |
+| #       | Optimization                           | Measured CPU               | Impact            | LOC      | Risk   | Phase      |
+| ------- | -------------------------------------- | -------------------------- | ----------------- | -------- | ------ | ---------- |
+| **1.1** | Gzip streaming fix                     | Part of ~76% HTML pipeline | **High** (memory) | -15/+3   | Low    | 1          |
+| **1.2** | HTML rewriter streaming                | Part of ~76% HTML pipeline | **High** (memory) | ~30      | Medium | 1          |
+| **1.3** | ~~Eliminate redundant `config` crate~~ | ~~5-8%~~ → **3.3%**        | **Done**          | 1-3      | Low    | 1          |
+| **1.4** | Reduce verbose logging                 | ~0.5%                      | Low               | ~3       | None   | 1          |
+| **1.5** | Trivial fixes batch                    | <1% combined               | Low               | ~50      | None   | 1          |
+| **2.1** | `stream_to_client()` integration       | N/A (architectural)        | **High** (TTLB)   | ~80-120  | Medium | 2          |
+| **2.2** | Concurrent origin + auction            | N/A (architectural)        | **Very High**     | ~150-200 | High   | 2 (future) |
 
 ---
 
@@ -473,13 +478,13 @@ The script builds, starts the profiling server, fires requests, stops the server
 
 ### What the Tools Measure
 
-| Tool | What it tells you |
-|---|---|
-| `benchmark.sh` — TTFB analysis | 20 sequential requests — detects cold start patterns |
-| `benchmark.sh` — Cold start | First vs subsequent request latency |
-| `benchmark.sh` — Endpoint latency | Per-endpoint timing breakdown (DNS, connect, TTFB, total) |
-| `benchmark.sh` — Load test (hey) | Throughput (req/sec), latency distribution (P50/P95/P99) |
-| `profile.sh` | Per-function CPU time inside WASM — flame graph via `--profile-guest` |
+| Tool                              | What it tells you                                                     |
+| --------------------------------- | --------------------------------------------------------------------- |
+| `benchmark.sh` — TTFB analysis    | 20 sequential requests — detects cold start patterns                  |
+| `benchmark.sh` — Cold start       | First vs subsequent request latency                                   |
+| `benchmark.sh` — Endpoint latency | Per-endpoint timing breakdown (DNS, connect, TTFB, total)             |
+| `benchmark.sh` — Load test (hey)  | Throughput (req/sec), latency distribution (P50/P95/P99)              |
+| `profile.sh`                      | Per-function CPU time inside WASM — flame graph via `--profile-guest` |
 
 **Use `profile.sh` first** to identify which functions are bottlenecks, then use `benchmark.sh` to measure the impact of fixes on external timing.
 
@@ -516,6 +521,7 @@ A teammate has prepared changes to `streaming_processor.rs` that address items 1
 - **HTML rewriter fix**: `HtmlRewriterAdapter` rewritten to use `lol_html::OutputSink` trait with `Rc<RefCell<Vec<u8>>>` for incremental streaming
 
 **Review notes on the HTML rewriter change**:
+
 - `lol_html::OutputSink` is a public trait (verified in lol_html 2.7.1)
 - The `Rc<RefCell>` pattern is necessary because `HtmlRewriter::new()` takes ownership of the sink, but we need to read output in `process_chunk()`
 - `Option<HtmlRewriter>` with `.take()` is correct — `end()` consumes self
