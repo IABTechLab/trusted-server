@@ -245,7 +245,6 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 **Security**:
 
 - Keep confidential and secure
-- Cannot be the placeholder `"change-me-proxy-secret"` (case-insensitive) — startup will fail
 - Rotate periodically (90 days recommended)
 - Use cryptographically random values (32+ bytes)
 - Never commit to version control
@@ -361,7 +360,6 @@ fastly kv-store create --name=opid_store
 **Security**:
 
 - Must be non-empty
-- Cannot be a known placeholder: `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - Rotate periodically for security
 - Store securely (environment variable recommended)
 
@@ -375,7 +373,6 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
-- Exactly `"secret-key"`, `"secret_key"`, or `"trusted-server"` (known placeholders, case-insensitive)
 
 #### `template`
 
@@ -997,12 +994,10 @@ Configuration is validated at startup:
 
 - All fields non-empty
 - `origin_url` is valid URL
-- `proxy_secret` ≠ known placeholder (`"change-me-proxy-secret"` — case-insensitive)
 
 **Synthetic Validation**:
 
 - `secret_key` ≥ 1 character
-- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 - `template` non-empty
 
 **Handler Validation**:
@@ -1111,13 +1106,6 @@ trusted-server.dev.toml      # Development overrides
 - Check TOML syntax (trailing commas, quotes)
 - Verify all required fields present
 - Check environment variable format
-
-**"Configuration field '...' is set to a known placeholder value"**:
-
-- `synthetic.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
-- `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
-- Must be non-empty
-- Change to a secure random value (see generation commands above)
 
 **"Invalid regex"**:
 

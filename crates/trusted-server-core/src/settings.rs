@@ -31,18 +31,6 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Known placeholder values that must not be used in production.
-    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret"];
-
-    /// Returns `true` if `proxy_secret` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_proxy_secret(proxy_secret: &str) -> bool {
-        Self::PROXY_SECRET_PLACEHOLDERS
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(proxy_secret))
-    }
-
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -215,24 +203,7 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
-    /// Known placeholder values that must not be used in production.
-    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
-
-    /// Returns `true` if `secret_key` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
-        Self::SECRET_KEY_PLACEHOLDERS
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(secret_key))
-    }
-
     /// Validates that the secret key is not empty.
-    ///
-    /// Placeholder detection is intentionally **not** performed here because
-    /// this validator runs at build time (via `from_toml_and_env`) when the
-    /// config legitimately contains placeholder values. Placeholder rejection
-    /// happens at runtime via [`Settings::reject_placeholder_secrets`].
     ///
     /// # Errors
     ///
@@ -531,33 +502,6 @@ impl Settings {
         }
 
         Ok(None)
-    }
-
-    /// Checks all secret fields for known placeholder values and returns an
-    /// error listing every offending field. This centralises the placeholder
-    /// policy so callers don't need to know which fields are secrets.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
-    /// fields still contain a placeholder value.
-    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
-        let mut insecure_fields: Vec<&str> = Vec::new();
-
-        if Synthetic::is_placeholder_secret_key(self.synthetic.secret_key.expose()) {
-            insecure_fields.push("synthetic.secret_key");
-        }
-        if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
-            insecure_fields.push("publisher.proxy_secret");
-        }
-
-        if insecure_fields.is_empty() {
-            Ok(())
-        } else {
-            Err(Report::new(TrustedServerError::InsecureDefault {
-                field: insecure_fields.join(", "),
-            }))
-        }
     }
 
     /// Known admin endpoint paths that must be covered by a handler.
@@ -887,62 +831,6 @@ mod tests {
         assert!(
             settings.is_err(),
             "Should fail when required fields are missing"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
-        for placeholder in Synthetic::SECRET_KEY_PLACEHOLDERS {
-            assert!(
-                Synthetic::is_placeholder_secret_key(placeholder),
-                "should detect placeholder secret_key '{placeholder}'"
-            );
-        }
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_is_case_insensitive() {
-        assert!(
-            Synthetic::is_placeholder_secret_key("SECRET-KEY"),
-            "should detect case-insensitive placeholder secret_key"
-        );
-        assert!(
-            Synthetic::is_placeholder_secret_key("Trusted-Server"),
-            "should detect mixed-case placeholder secret_key"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_secret_key_accepts_non_placeholder() {
-        assert!(
-            !Synthetic::is_placeholder_secret_key("test-secret-key"),
-            "should accept non-placeholder secret_key"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_rejects_all_known_placeholders() {
-        for placeholder in Publisher::PROXY_SECRET_PLACEHOLDERS {
-            assert!(
-                Publisher::is_placeholder_proxy_secret(placeholder),
-                "should detect placeholder proxy_secret '{placeholder}'"
-            );
-        }
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_is_case_insensitive() {
-        assert!(
-            Publisher::is_placeholder_proxy_secret("CHANGE-ME-PROXY-SECRET"),
-            "should detect case-insensitive placeholder proxy_secret"
-        );
-    }
-
-    #[test]
-    fn is_placeholder_proxy_secret_accepts_non_placeholder() {
-        assert!(
-            !Publisher::is_placeholder_proxy_secret("unit-test-proxy-secret"),
-            "should accept non-placeholder proxy_secret"
         );
     }
 

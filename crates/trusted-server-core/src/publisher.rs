@@ -13,7 +13,7 @@ use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
-use crate::synthetic::get_or_generate_synthetic_id;
+use crate::synthetic::{get_or_generate_synthetic_id, is_valid_synthetic_id};
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
@@ -455,14 +455,23 @@ pub fn handle_publisher_request(
         // characters. The header is still emitted when consent allows it.
         set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
     } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
-        log::info!(
-            "SSC revoked for '{}': consent withdrawn (jurisdiction={})",
-            cookie_synthetic_id,
-            consent_context.jurisdiction,
-        );
+        // Always expire the cookie — consent is withdrawn regardless of whether the
+        // stored value is well-formed.
         expire_synthetic_cookie(settings, &mut response);
-        if let Some(store_name) = &settings.consent.consent_store {
-            crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+        if is_valid_synthetic_id(cookie_synthetic_id) {
+            log::info!(
+                "SSC revoked: consent withdrawn (jurisdiction={})",
+                consent_context.jurisdiction,
+            );
+            if let Some(store_name) = &settings.consent.consent_store {
+                crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+            }
+        } else {
+            log::warn!(
+                "SSC cookie has invalid format, skipping KV deletion (len={}, jurisdiction={})",
+                cookie_synthetic_id.len(),
+                consent_context.jurisdiction,
+            );
         }
     } else {
         log::debug!(
@@ -478,7 +487,7 @@ pub fn handle_publisher_request(
 mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
     use fastly::http::{header, Method, StatusCode};
 
     #[test]
@@ -666,9 +675,14 @@ mod tests {
     #[test]
     fn revocation_targets_cookie_synthetic_id_not_header() {
         let settings = create_test_settings();
+        let cookie_synthetic_id =
+            "b2a1c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0b1a2.Zx98y7";
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("x-synthetic-id", "header_id");
-        req.set_header("cookie", "synthetic_id=cookie_id; other=value");
+        req.set_header(HEADER_X_SYNTHETIC_ID, VALID_SYNTHETIC_ID);
+        req.set_header(
+            header::COOKIE,
+            format!("synthetic_id={cookie_synthetic_id}; other=value"),
+        );
 
         let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
         let existing_ssc_cookie = cookie_jar
@@ -681,11 +695,11 @@ mod tests {
 
         assert_eq!(
             existing_ssc_cookie.as_deref(),
-            Some("cookie_id"),
+            Some(cookie_synthetic_id),
             "should read revocation target from cookie value"
         );
         assert_eq!(
-            resolved_synthetic_id, "header_id",
+            resolved_synthetic_id, VALID_SYNTHETIC_ID,
             "should still resolve request synthetic ID from header precedence"
         );
     }
