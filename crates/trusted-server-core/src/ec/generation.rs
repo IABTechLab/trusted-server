@@ -24,6 +24,14 @@ const ALPHANUMERIC_CHARSET: &[u8] =
 /// where devices rotate their interface identifier (lower 64 bits).
 /// The first 4 segments are hex-encoded without separators.
 /// IPv4 addresses are returned unchanged.
+///
+/// # Stability
+///
+/// The output format is a stable contract — EC hashes stored in KV depend
+/// on it. Changing the format would invalidate all existing EC identities.
+/// - **IPv4:** decimal-dotted notation (e.g. `"192.168.1.1"`)
+/// - **IPv6:** first 4 segments as zero-padded lowercase hex without
+///   separators (e.g. `"20010db885a30000"`)
 fn normalize_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ipv4) => ipv4.to_string(),
