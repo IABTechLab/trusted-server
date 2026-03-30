@@ -236,8 +236,8 @@ mod tests {
     use fastly::http::{HeaderName, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
     use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
 
     #[test]
     fn test_normalize_ip_ipv4_unchanged() {

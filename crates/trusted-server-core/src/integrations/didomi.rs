@@ -218,7 +218,12 @@ impl IntegrationProxy for DidomiIntegration {
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        self.copy_headers(&backend, services.client_info.client_ip, &req, &mut proxy_req);
+        self.copy_headers(
+            &backend,
+            services.client_info.client_ip,
+            &req,
+            &mut proxy_req,
+        );
 
         if matches!(req.get_method(), &Method::POST | &Method::PUT) {
             if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
@@ -242,10 +247,10 @@ impl IntegrationProxy for DidomiIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {

@@ -699,9 +699,8 @@ mod tests {
             .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
             .map(|cookie| cookie.value().to_owned());
 
-        let resolved_synthetic_id =
-            get_or_generate_synthetic_id(&settings, &noop_services(), &req)
-                .expect("should resolve synthetic id");
+        let resolved_synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
+            .expect("should resolve synthetic id");
 
         assert_eq!(
             existing_ssc_cookie.as_deref(),
