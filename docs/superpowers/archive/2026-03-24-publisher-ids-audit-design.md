@@ -24,7 +24,7 @@ This document lists all publisher-specific IDs and configurations found in the c
 - `origin_url = "https://origin.test-publisher.com"` (line 4)
 
 **KV Store Names:**
-*(Removed — `counter_store` and `opid_store` were removed in the EC rename; they were vestigial from the template-based SyntheticID generation.)*
+_(Removed — `counter_store` and `opid_store` were removed in the EC rename; they were vestigial from the template-based SyntheticID generation.)_
 
 ## Hardcoded in Source Code
 
