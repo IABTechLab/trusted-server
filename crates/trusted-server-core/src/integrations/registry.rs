@@ -659,7 +659,7 @@ impl IntegrationRegistry {
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Generate synthetic ID before consuming request
-            let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
+            let synthetic_id_result = get_or_generate_synthetic_id(settings, services, &req);
 
             // Set synthetic ID header on the request so integrations can read it.
             // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,

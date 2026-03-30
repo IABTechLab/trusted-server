@@ -16,8 +16,8 @@ use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
 use crate::creative;
 use crate::error::TrustedServerError;
-use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::platform::{GeoInfo, RuntimeServices};
 use crate::settings::Settings;
 use crate::synthetic::generate_synthetic_id;
 
@@ -82,15 +82,18 @@ pub struct BannerUnit {
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
+    services: &RuntimeServices,
     req: &Request,
     consent: ConsentContext,
     synthetic_id: &str,
+    geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let synthetic_id = synthetic_id.to_owned();
-    let fresh_id =
-        generate_synthetic_id(settings, req).change_context(TrustedServerError::Auction {
+    let fresh_id = generate_synthetic_id(settings, services, req).change_context(
+        TrustedServerError::Auction {
             message: "Failed to generate fresh ID".to_string(),
-        })?;
+        },
+    )?;
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -137,9 +140,8 @@ pub fn convert_tsjs_to_auction_request(
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
-        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        #[allow(deprecated)]
-        geo: GeoInfo::from_request(req),
+        ip: services.client_info.client_ip.map(|ip| ip.to_string()),
+        geo,
     });
 
     // Forward allowed config entries from the JS request into the context map.

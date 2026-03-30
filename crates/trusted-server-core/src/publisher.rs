@@ -327,15 +327,20 @@ pub fn handle_publisher_request(
     // Generate synthetic identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    let synthetic_id = get_or_generate_synthetic_id(settings, services, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
     // (for OpenRTB forwarding) and decoded data (for enforcement).
     // When a consent_store is configured, this also persists consent to KV
     // and falls back to stored consent when cookies are absent.
-    #[allow(deprecated)]
-    let geo = crate::geo::GeoInfo::from_request(&req);
+    let geo = services
+        .geo()
+        .lookup(services.client_info.client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e:?}");
+            None
+        });
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
         req: &req,
@@ -490,6 +495,7 @@ pub fn handle_publisher_request(
 mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
     use fastly::http::{header, Method, StatusCode};
 
@@ -694,7 +700,8 @@ mod tests {
             .map(|cookie| cookie.value().to_owned());
 
         let resolved_synthetic_id =
-            get_or_generate_synthetic_id(&settings, &req).expect("should resolve synthetic id");
+            get_or_generate_synthetic_id(&settings, &noop_services(), &req)
+                .expect("should resolve synthetic id");
 
         assert_eq!(
             existing_ssc_cookie.as_deref(),

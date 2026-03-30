@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -95,9 +96,10 @@ fn generate_random_suffix(length: usize) -> String {
 /// - [`TrustedServerError::SyntheticId`] if HMAC generation fails
 pub fn generate_synthetic_id(
     settings: &Settings,
+    services: &RuntimeServices,
     req: &Request,
 ) -> Result<String, Report<TrustedServerError>> {
-    let client_ip = req.get_client_ip_addr().map(normalize_ip);
+    let client_ip = services.client_info.client_ip.map(normalize_ip);
     let user_agent = req
         .get_header(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
@@ -215,6 +217,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 /// - [`TrustedServerError::SyntheticId`] if HMAC generation fails
 pub fn get_or_generate_synthetic_id(
     settings: &Settings,
+    services: &RuntimeServices,
     req: &Request,
 ) -> Result<String, Report<TrustedServerError>> {
     if let Some(id) = get_synthetic_id(req)? {
@@ -222,7 +225,7 @@ pub fn get_or_generate_synthetic_id(
     }
 
     // If no existing Synthetic ID found, generate a fresh one
-    let synthetic_id = generate_synthetic_id(settings, req)?;
+    let synthetic_id = generate_synthetic_id(settings, services, req)?;
     log::debug!("No existing synthetic ID found, generated a fresh one");
     Ok(synthetic_id)
 }
@@ -234,6 +237,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
+    use crate::platform::test_support::noop_services;
 
     #[test]
     fn test_normalize_ip_ipv4_unchanged() {
@@ -286,8 +290,8 @@ mod tests {
             (header::ACCEPT_ENCODING, "gzip, deflate, br"),
         ]);
 
-        let synthetic_id =
-            generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
+        let synthetic_id = generate_synthetic_id(&settings, &noop_services(), &req)
+            .expect("should generate synthetic ID");
         assert!(
             is_valid_synthetic_id(&synthetic_id),
             "should match synthetic ID format"
@@ -364,7 +368,7 @@ mod tests {
             "should return the valid header ID"
         );
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should reuse header synthetic ID");
         assert_eq!(
             synthetic_id, VALID_SYNTHETIC_ID,
@@ -387,7 +391,7 @@ mod tests {
             "should return the valid cookie ID"
         );
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should reuse cookie synthetic ID");
         assert_eq!(
             synthetic_id, VALID_SYNTHETIC_ID,
@@ -474,7 +478,7 @@ mod tests {
             "should ignore invalid header and reuse valid cookie"
         );
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should reuse valid cookie synthetic ID");
         assert_eq!(synthetic_id, VALID_SYNTHETIC_ID);
     }
@@ -495,7 +499,7 @@ mod tests {
         // A string that is clearly not a valid synthetic ID (wrong format, wrong length)
         let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "totally-invalid-id-value")]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should generate when header ID is invalid");
         assert!(
             is_valid_synthetic_id(&synthetic_id),
@@ -508,7 +512,7 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should get or generate synthetic ID");
         assert!(
             is_valid_synthetic_id(&synthetic_id),
@@ -521,7 +525,7 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "evil;injected")]);
 
-        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
             .expect("should replace invalid header synthetic ID");
 
         assert!(
