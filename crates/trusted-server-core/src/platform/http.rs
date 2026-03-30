@@ -146,10 +146,11 @@ pub struct PlatformSelectResult {
 
 /// Outbound HTTP client abstraction.
 ///
-/// This extends `EdgeZero`'s current `ProxyClient` shape so the core platform
-/// surface can support both single-request sends and Fastly-style async
-/// fan-out (`send_async` + `select`) without keeping parallel abstractions
-/// alive. Object safety is provided by `async_trait`, which boxes the returned
+/// Supports both single-request sends ([`Self::send`]) and async fan-out
+/// ([`Self::send_async`] + [`Self::select`]) so adapters can drive parallel
+/// upstream requests without additional abstractions.
+///
+/// Object safety is provided by `async_trait`, which boxes the returned
 /// futures behind `dyn PlatformHttpClient`.
 ///
 /// Uses `?Send` on all targets because [`edgezero_core::body::Body`] contains

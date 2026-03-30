@@ -555,7 +555,7 @@ impl IntegrationRegistry {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
-            if let Some(registration) = builder(settings) {
+            if let Some(registration) = builder(settings)? {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
                         let value = (proxy.clone(), registration.integration_id);
@@ -1377,8 +1377,15 @@ mod tests {
         let registry = IntegrationRegistry::from_routes(routes);
 
         let mut req = Request::get("https://test.example.com/integrations/test/synthetic");
-        // Pre-existing cookie
-        req.set_header(header::COOKIE, "synthetic_id=existing_id_12345");
+        // Pre-existing cookie with a valid-format synthetic ID
+        req.set_header(
+            header::COOKIE,
+            format!(
+                "{}={}",
+                crate::constants::COOKIE_SYNTHETIC_ID,
+                crate::test_support::tests::VALID_SYNTHETIC_ID
+            ),
+        );
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,

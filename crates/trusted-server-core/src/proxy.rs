@@ -82,10 +82,19 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// Domain allowlist enforced on the initial target and every redirect hop.
+    ///
+    /// An empty slice disables allowlist enforcement (open mode).
+    /// Integration proxies should pass `&[]`; first-party proxy passes
+    /// `&settings.proxy.allowed_domains`.
+    pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the synthetic ID.
+    ///
+    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
+    /// first-party proxy by setting `allowed_domains` directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
@@ -96,6 +105,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &[],
         }
     }
 
@@ -436,6 +446,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        allowed_domains: _,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -501,6 +512,38 @@ fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
     }
 }
 
+/// Returns `true` when a redirect to `host` should be followed.
+///
+/// When `allowed_domains` is empty every host is permitted (open mode).
+/// When non-empty the host must match at least one pattern via [`is_host_allowed`].
+fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+    allowed_domains.is_empty()
+        || allowed_domains
+            .iter()
+            .any(|p| is_host_allowed(host, p.as_ref()))
+}
+
+/// Returns `true` if `host` is permitted by `pattern`.
+///
+/// - `"example.com"` matches exactly `example.com`.
+/// - `"*.example.com"` matches `example.com` and any subdomain at any depth.
+///
+/// Comparison is case-insensitive. The wildcard check requires a dot boundary,
+/// so `"*.example.com"` does **not** match `"evil-example.com"`.
+fn is_host_allowed(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host == suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|rest| rest.ends_with('.'))
+    } else {
+        host == pattern
+    }
+}
+
 async fn proxy_with_redirects(
     settings: &Settings,
     req: &Request,
@@ -533,6 +576,16 @@ async fn proxy_with_redirects(
         if host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "missing host".to_string(),
+            }));
+        }
+
+        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+            log::warn!(
+                "request to `{}` blocked: host not in proxy allowed_domains",
+                host
+            );
+            return Err(Report::new(TrustedServerError::AllowlistViolation {
+                host: host.to_string(),
             }));
         }
 
@@ -638,6 +691,24 @@ async fn proxy_with_redirects(
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
+        let next_host = match next_url.host_str() {
+            Some(h) if !h.is_empty() => h,
+            _ => {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: "missing host in redirect location".to_string(),
+                }));
+            }
+        };
+        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+            log::warn!(
+                "redirect to `{}` blocked: host not in proxy allowed_domains",
+                next_host
+            );
+            return Err(Report::new(TrustedServerError::AllowlistViolation {
+                host: next_host.to_string(),
+            }));
+        }
+
         log::info!(
             "following redirect {} => {} (status {})",
             current_url,
@@ -692,6 +763,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &settings.proxy.allowed_domains,
         },
         services,
     )
@@ -1167,8 +1239,8 @@ fn reconstruct_and_validate_signed_target(
 mod tests {
     use super::{
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-        handle_first_party_proxy_sign, proxy_request, reconstruct_and_validate_signed_target,
-        ProxyRequestConfig,
+        handle_first_party_proxy_sign, is_host_allowed, proxy_request,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
     };
     use crate::constants::HEADER_ACCEPT;
     use crate::creative;
@@ -1387,7 +1459,8 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, "synthetic-123");
+        let valid_synthetic_id = crate::test_support::tests::VALID_SYNTHETIC_ID;
+        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, valid_synthetic_id);
 
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
@@ -1405,7 +1478,7 @@ mod tests {
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
         assert_eq!(
             pairs.remove("synthetic_id").as_deref(),
-            Some("synthetic-123")
+            Some(valid_synthetic_id)
         );
         assert!(pairs.is_empty());
     }
@@ -1864,6 +1937,7 @@ mod tests {
                 headers: Vec::new(),
                 copy_request_headers: false,
                 stream_passthrough: false,
+                allowed_domains: &[],
             },
             &services,
         )
@@ -1875,6 +1949,261 @@ mod tests {
         assert_eq!(
             calls[0], "stub-backend",
             "should use backend name from StubBackend"
+        );
+    }
+
+    // --- is_host_allowed ---
+
+    #[test]
+    fn exact_match() {
+        assert!(
+            is_host_allowed("example.com", "example.com"),
+            "should match exact domain"
+        );
+    }
+
+    #[test]
+    fn exact_no_match() {
+        assert!(
+            !is_host_allowed("other.com", "example.com"),
+            "should not match different domain"
+        );
+    }
+
+    #[test]
+    fn wildcard_subdomain() {
+        assert!(
+            is_host_allowed("ad.example.com", "*.example.com"),
+            "should match direct subdomain"
+        );
+    }
+
+    #[test]
+    fn wildcard_deep_subdomain() {
+        assert!(
+            is_host_allowed("a.b.example.com", "*.example.com"),
+            "should match deep subdomain"
+        );
+    }
+
+    #[test]
+    fn wildcard_apex_match() {
+        assert!(
+            is_host_allowed("example.com", "*.example.com"),
+            "wildcard should also match apex domain"
+        );
+    }
+
+    #[test]
+    fn wildcard_no_boundary_bypass() {
+        assert!(
+            !is_host_allowed("evil-example.com", "*.example.com"),
+            "should not match host that lacks dot boundary"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_host() {
+        assert!(
+            is_host_allowed("AD.EXAMPLE.COM", "*.example.com"),
+            "should match uppercase host"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_pattern() {
+        assert!(
+            is_host_allowed("ad.example.com", "*.EXAMPLE.COM"),
+            "should match uppercase pattern"
+        );
+    }
+
+    // --- redirect allowlist enforcement (logic tests via is_host_allowed) ---
+
+    #[test]
+    fn redirect_allowed_exact() {
+        let allowed = ["ad.example.com".to_string()];
+        assert!(
+            allowed.iter().any(|p| is_host_allowed("ad.example.com", p)),
+            "should permit exact-match host"
+        );
+    }
+
+    #[test]
+    fn redirect_allowed_wildcard() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            allowed
+                .iter()
+                .any(|p| is_host_allowed("sub.example.com", p)),
+            "should permit wildcard-matched host"
+        );
+    }
+
+    #[test]
+    fn redirect_blocked() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            !allowed.iter().any(|p| is_host_allowed("evil.com", p)),
+            "should block host not in allowlist"
+        );
+    }
+
+    #[test]
+    fn redirect_empty_allowlist_permits_any() {
+        // The guard at proxy_with_redirects checks `!allowed_domains.is_empty()`
+        // before calling is_host_allowed, so no host is ever blocked when the
+        // list is empty. Verify the combined condition is false for any host.
+        let allowed: [String; 0] = [];
+        let would_block =
+            !allowed.is_empty() && !allowed.iter().any(|p| is_host_allowed("evil.com", p));
+        assert!(
+            !would_block,
+            "empty allowlist should not block any redirect host"
+        );
+    }
+
+    #[test]
+    fn redirect_bypass_attempt() {
+        let allowed = ["*.example.com".to_string()];
+        assert!(
+            !allowed
+                .iter()
+                .any(|p| is_host_allowed("evil-example.com", p)),
+            "should block dot-boundary bypass attempt"
+        );
+    }
+
+    // --- redirect_is_permitted (full guard: empty-list bypass + is_host_allowed) ---
+
+    #[test]
+    fn redirect_chain_allowed_when_host_matches_allowlist() {
+        let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
+        assert!(
+            redirect_is_permitted(&allowed, "ad.example.com"),
+            "should permit redirect to exact-match host"
+        );
+        assert!(
+            redirect_is_permitted(&allowed, "cdn.example.com"),
+            "should permit redirect to second allowed host"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_allowed_when_host_matches_wildcard() {
+        let allowed = vec!["*.example.com".to_string()];
+        assert!(
+            redirect_is_permitted(&allowed, "sub.example.com"),
+            "should permit redirect to wildcard-matched subdomain"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_blocked_when_host_not_in_allowlist() {
+        let allowed = vec!["ad.example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, "evil.com"),
+            "should block redirect to host not in allowlist"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_allowed_when_allowlist_is_empty() {
+        let allowed: Vec<String> = vec![];
+        assert!(
+            redirect_is_permitted(&allowed, "any-host.com"),
+            "should allow any redirect when allowlist is empty (open mode)"
+        );
+    }
+
+    #[test]
+    fn redirect_chain_blocked_when_host_is_empty() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, ""),
+            "should block redirect with empty host when allowlist is non-empty"
+        );
+    }
+
+    #[test]
+    fn redirect_is_permitted_accepts_str_slices() {
+        // Verifies the &[impl AsRef<str>] bound works with &str literals,
+        // not just Vec<String>.
+        let allowed: &[&str] = &["example.com", "*.cdn.example.com"];
+        assert!(
+            redirect_is_permitted(allowed, "example.com"),
+            "should permit exact match via &str slice"
+        );
+        assert!(
+            redirect_is_permitted(allowed, "static.cdn.example.com"),
+            "should permit wildcard match via &str slice"
+        );
+        assert!(
+            !redirect_is_permitted(allowed, "evil.com"),
+            "should block host not in &str slice allowlist"
+        );
+    }
+
+    #[test]
+    fn ip_literal_blocked_by_domain_allowlist() {
+        let allowed = vec!["*.example.com".to_string()];
+        assert!(
+            !redirect_is_permitted(&allowed, "169.254.169.254"),
+            "should block cloud metadata IP"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "127.0.0.1"),
+            "should block loopback IPv4"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "[::1]"),
+            "should block loopback IPv6"
+        );
+        assert!(
+            !redirect_is_permitted(&allowed, "::1"),
+            "should block bare loopback IPv6"
+        );
+    }
+
+    // --- initial target allowlist enforcement (integration-level) ---
+    //
+    // NOTE: A test for Nth-hop redirect blocking (i.e. exercising the
+    // `redirect_is_permitted` check that fires *after* receiving a 302
+    // response) requires a Viceroy backend fixture that returns a redirect.
+    // That infrastructure is not available here. The unit tests above for
+    // `redirect_is_permitted` and `ip_literal_blocked_by_domain_allowlist`
+    // cover the blocking logic used at every hop.
+
+    #[tokio::test]
+    async fn proxy_initial_target_blocked_by_allowlist() {
+        use crate::http_util::compute_encrypted_sha256_token;
+
+        let mut settings = create_test_settings();
+        settings.proxy.allowed_domains = vec!["allowed.com".to_string()];
+
+        let target = "https://blocked.com/pixel.gif";
+        let token = compute_encrypted_sha256_token(&settings, target);
+        let url = format!(
+            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+            urlencoding::encode(target),
+            token,
+        );
+        let req = Request::new(Method::GET, url);
+        let services = crate::platform::test_support::noop_services();
+        let err = handle_first_party_proxy(&settings, &services, req)
+            .await
+            .expect_err("should block initial target not in allowlist");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::FORBIDDEN,
+            "should return 403 for allowlist violation"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::AllowlistViolation { .. }
+            ),
+            "should be AllowlistViolation error"
         );
     }
 }

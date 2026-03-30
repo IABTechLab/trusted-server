@@ -7,6 +7,9 @@
 //! Note: Individual auction providers are located in the `integrations` module
 //! (e.g., `crate::integrations::aps`, `crate::integrations::prebid`).
 
+use error_stack::Report;
+
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use std::sync::Arc;
 
@@ -27,7 +30,8 @@ pub use types::{
 };
 
 /// Type alias for provider builder functions.
-type ProviderBuilder = fn(&Settings) -> Vec<Arc<dyn AuctionProvider>>;
+type ProviderBuilder =
+    fn(&Settings) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>>;
 
 /// Returns the list of all available provider builder functions.
 ///
@@ -49,15 +53,20 @@ fn provider_builders() -> &'static [ProviderBuilder] {
 ///
 /// # Arguments
 /// * `settings` - Application settings used to configure the orchestrator and providers
-#[must_use]
-pub fn build_orchestrator(settings: &Settings) -> AuctionOrchestrator {
+///
+/// # Errors
+///
+/// Returns an error when an enabled auction provider has invalid configuration.
+pub fn build_orchestrator(
+    settings: &Settings,
+) -> Result<AuctionOrchestrator, Report<TrustedServerError>> {
     log::info!("Building auction orchestrator");
 
     let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
 
     // Auto-discover and register all auction providers from settings
     for builder in provider_builders() {
-        for provider in builder(settings) {
+        for provider in builder(settings)? {
             orchestrator.register_provider(provider);
         }
     }
@@ -67,5 +76,5 @@ pub fn build_orchestrator(settings: &Settings) -> AuctionOrchestrator {
         orchestrator.provider_count()
     );
 
-    orchestrator
+    Ok(orchestrator)
 }
