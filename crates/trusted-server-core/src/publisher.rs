@@ -15,6 +15,82 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 use crate::streaming_replacer::create_url_replacer;
 use crate::synthetic::get_or_generate_synthetic_id;
 
+const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
+
+fn restrict_accept_encoding(req: &mut Request) {
+    // If the client sent no Accept-Encoding, leave the request unchanged so the
+    // origin responds without compression. Adding encodings here would cause the
+    // origin to compress its response even though the client never asked for it,
+    // and the client would then receive content it cannot decode.
+    let Some(current) = req
+        .get_header(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    req.set_header(
+        header::ACCEPT_ENCODING,
+        select_supported_accept_encoding(current),
+    );
+}
+
+fn select_supported_accept_encoding(client_accept_encoding: &str) -> String {
+    let supported_subset = SUPPORTED_ENCODING_VALUES
+        .into_iter()
+        .filter(|encoding| client_accepts_content_encoding(client_accept_encoding, encoding))
+        .collect::<Vec<_>>();
+
+    if supported_subset.is_empty() {
+        return "identity".to_string();
+    }
+
+    supported_subset.join(", ")
+}
+
+fn client_accepts_content_encoding(header_value: &str, encoding: &str) -> bool {
+    accept_encoding_qvalue(header_value, encoding)
+        .or_else(|| accept_encoding_qvalue(header_value, "*"))
+        .is_some_and(|qvalue| qvalue > 0.0)
+}
+
+fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
+    let mut matched_qvalue = None;
+
+    for item in header_value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        let mut parts = item.split(';');
+        let Some(token) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if !token.eq_ignore_ascii_case(target) {
+            continue;
+        }
+
+        let mut qvalue = 1.0;
+        for parameter in parts {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                if let Ok(parsed_qvalue) = value.trim().parse::<f32>() {
+                    qvalue = parsed_qvalue;
+                }
+            }
+        }
+
+        // First match wins per RFC 7231 — duplicate tokens are non-normative,
+        // but using first-match is the conventional interpretation.
+        matched_qvalue = Some(qvalue);
+        break;
+    }
+
+    matched_qvalue
+}
+
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
 /// Serves two types of bundles:
@@ -282,6 +358,8 @@ pub fn handle_publisher_request(
         backend_name,
         settings.publisher.origin_url
     );
+    // Only advertise encodings the rewrite pipeline can decode and re-encode.
+    restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
     let mut response = req
@@ -401,7 +479,7 @@ mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::{Method, StatusCode};
+    use fastly::http::{header, Method, StatusCode};
 
     #[test]
     fn test_content_type_detection() {
@@ -513,6 +591,76 @@ mod tests {
 
             assert_eq!(content_encoding, encoding);
         }
+    }
+
+    #[test]
+    fn publisher_proxy_does_not_add_accept_encoding_when_absent() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        // No Accept-Encoding header set by the client.
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            None,
+            "publisher proxy should not inject Accept-Encoding when the client sent none"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_limits_accept_encoding_to_supported_values() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("gzip, deflate, br"),
+            "publisher fallback should only advertise encodings the rewrite pipeline supports"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_preserves_identity_only_accept_encoding() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "identity");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("identity"),
+            "publisher fallback should preserve identity-only clients"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_respects_supported_client_subset() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "br, gzip;q=0, zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("br"),
+            "publisher fallback should only advertise the supported encodings the client accepts"
+        );
+    }
+
+    #[test]
+    fn publisher_proxy_falls_back_to_identity_for_unsupported_client_encodings() {
+        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        req.set_header(header::ACCEPT_ENCODING, "zstd");
+
+        restrict_accept_encoding(&mut req);
+
+        assert_eq!(
+            req.get_header_str(header::ACCEPT_ENCODING),
+            Some("identity"),
+            "publisher fallback should request identity when the client only accepts unsupported encodings"
+        );
     }
 
     #[test]
