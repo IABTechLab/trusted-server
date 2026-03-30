@@ -55,13 +55,12 @@
 //!   `<script src="https://publisher.com/integrations/datadome/tags.js">`
 //! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use validator::Validate;
@@ -93,7 +92,7 @@ const DATADOME_INTEGRATION_ID: &str = "datadome";
 /// - `'//js.datadome.co/js/check'`
 /// - `"api-js.datadome.co/js/check"`
 /// - `"js.datadome.co"`
-static DATADOME_URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
         .expect("DataDome URL rewrite regex should compile")
 });
@@ -461,17 +460,13 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<DataDomeIntegration>> {
-    let config = match settings.integration_config::<DataDomeConfig>(DATADOME_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            log::debug!("[datadome] Integration disabled or not configured");
-            return None;
-        }
-        Err(err) => {
-            log::error!("[datadome] Failed to load integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<DataDomeIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<DataDomeConfig>(DATADOME_INTEGRATION_ID)?
+    else {
+        log::debug!("[datadome] Integration disabled or not configured");
+        return Ok(None);
     };
 
     log::info!(
@@ -480,20 +475,28 @@ fn build(settings: &Settings) -> Option<Arc<DataDomeIntegration>> {
         config.rewrite_sdk
     );
 
-    Some(DataDomeIntegration::new(config))
+    Ok(Some(DataDomeIntegration::new(config)))
 }
 
 /// Register the `DataDome` integration with Trusted Server.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
+///
+/// # Errors
+///
+/// Returns an error when the `DataDome` integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
 
-    Some(
+    Ok(Some(
         IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[cfg(test)]
