@@ -27,6 +27,9 @@ const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
 
+/// Maximum allowed length (in bytes) for a partner UID.
+const MAX_UID_LENGTH: usize = 512;
+
 trait BatchSyncWriter {
     fn upsert_partner_id_if_exists(
         &self,
@@ -203,7 +206,7 @@ fn process_mappings(
             continue;
         }
 
-        if mapping.partner_uid.is_empty() {
+        if mapping.partner_uid.is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_PARTNER_UID,

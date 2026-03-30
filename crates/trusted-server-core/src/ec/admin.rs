@@ -150,8 +150,17 @@ pub fn handle_register_partner(
     partner_store: &PartnerStore,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Parse request body.
+    // Parse request body with size limit to prevent memory abuse.
+    const MAX_BODY_SIZE: usize = 64 * 1024; // 64 KiB
     let body_bytes = req.take_body_bytes();
+    if body_bytes.len() > MAX_BODY_SIZE {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!(
+                "Request body too large ({} bytes, max {MAX_BODY_SIZE})",
+                body_bytes.len()
+            ),
+        }));
+    }
     let request: RegisterPartnerRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
             message: "Invalid JSON in request body".to_owned(),

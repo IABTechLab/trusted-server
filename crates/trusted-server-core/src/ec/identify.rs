@@ -214,6 +214,7 @@ fn apply_cors_headers(response: &mut Response, origin: &str) {
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         "Cookie, X-ts-ec, X-consent-advertising",
     );
+    response.set_header(header::ACCESS_CONTROL_MAX_AGE, "600");
     response.set_header(header::VARY, "Origin");
 }
 
