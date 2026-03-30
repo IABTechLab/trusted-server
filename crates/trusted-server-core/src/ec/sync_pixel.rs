@@ -18,6 +18,9 @@ use super::EcContext;
 /// Name of the Fastly rate counter resource used by sync rate limiting.
 pub const RATE_COUNTER_NAME: &str = "counter_store";
 
+/// Maximum allowed length (in bytes) for a partner UID.
+const MAX_UID_LENGTH: usize = 512;
+
 /// Handles `GET /sync` pixel sync requests.
 ///
 /// # Errors
@@ -32,6 +35,12 @@ pub fn handle_sync(
     ec_context: &mut EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
     let query = SyncQuery::parse(req)?;
+
+    if query.uid.len() > MAX_UID_LENGTH {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("uid exceeds maximum length of {MAX_UID_LENGTH} bytes"),
+        }));
+    }
 
     let partner = partner_store.get(&query.partner)?.ok_or_else(|| {
         Report::new(TrustedServerError::PartnerNotFound {
