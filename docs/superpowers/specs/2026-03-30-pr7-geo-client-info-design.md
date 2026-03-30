@@ -106,19 +106,23 @@ pub fn generate_synthetic_id(
 `detect_request_scheme(req)`, which calls `req.get_tls_protocol()` (line 168)
 and `req.get_tls_cipher_openssl_name()` (line 174) to determine HTTPS.
 
-**Change:** `RequestInfo::from_request(req, services)` — `detect_request_scheme`
+**Change:** `RequestInfo::from_request(req, client_info)` — `detect_request_scheme`
 gains `tls_protocol: Option<&str>` and `tls_cipher: Option<&str>` parameters
 instead of calling the SDK. The `req: &Request` parameter stays for host
 extraction and the forwarded/`X-Forwarded-Proto`/`Fastly-SSL` header fallbacks.
+
+Taking `&ClientInfo` (not `&RuntimeServices`) keeps the signature usable from
+both `publisher.rs` (which has `&services.client_info`) and `prebid.rs`
+(which only has `context.client_info: &ClientInfo`).
 
 ```rust
 // Before
 pub fn from_request(req: &Request) -> Self
 
 // After
-pub fn from_request(req: &Request, services: &RuntimeServices) -> Self
-// passes services.client_info.tls_protocol.as_deref()
-//         services.client_info.tls_cipher.as_deref()
+pub fn from_request(req: &Request, client_info: &ClientInfo) -> Self
+// passes client_info.tls_protocol.as_deref()
+//         client_info.tls_cipher.as_deref()
 // into detect_request_scheme
 ```
 
@@ -134,11 +138,17 @@ fn detect_request_scheme(
 
 **Test updates:** There are 8 `RequestInfo::from_request` call sites in the
 `http_util.rs` test module (lines 398, 416, 429, 440, 459, 475, 494, 552).
-All must pass `noop_services()`. Since `http_util.rs` does not currently
-import `noop_services`, add the following to the `#[cfg(test)]` module:
+All must pass a zero-filled `ClientInfo`. Add the following import to the
+`#[cfg(test)]` module if `ClientInfo` is not already in scope:
 
 ```rust
-use crate::platform::test_support::noop_services;
+use crate::platform::ClientInfo;
+```
+
+Each call site becomes:
+
+```rust
+RequestInfo::from_request(&req, &ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None })
 ```
 
 Add one new test: TLS-detected HTTPS using a `ClientInfo` with
@@ -272,8 +282,17 @@ calls:
 - `GeoInfo::from_request(&req)` (deprecated, line 336)
 
 **Change:** Add `services: &RuntimeServices` parameter. Thread to all three
-call sites. Replace deprecated geo call with
-`services.geo().lookup(services.client_info.client_ip)`.
+call sites:
+
+1. `RequestInfo::from_request(&req)` → `RequestInfo::from_request(&req, &services.client_info)`
+2. `get_or_generate_synthetic_id(settings, &req)` → `get_or_generate_synthetic_id(settings, services, &req)`
+3. Replace deprecated geo call with `services.geo().lookup(services.client_info.client_ip)`.
+   Handle the `Result` with warn-and-continue — same pattern as `main.rs`:
+   ```rust
+   let geo = services.geo().lookup(services.client_info.client_ip)
+       .unwrap_or_else(|e| { log::warn!("geo lookup failed: {e:?}"); None });
+   ```
+   Remove `#[allow(deprecated)]`.
 
 ```rust
 // Before
@@ -319,7 +338,23 @@ pub struct AuctionContext<'a> {
 }
 ```
 
-Set in `auction/endpoints.rs`:
+**All `AuctionContext` construction sites** — every site must add
+`client_info: &services.client_info` (production) or propagate an existing
+`client_info` reference (derived contexts):
+
+| File | Line | Type | Change |
+|------|------|------|--------|
+| `auction/endpoints.rs` | ~75 | production | `client_info: &services.client_info` |
+| `auction/orchestrator.rs` | ~145 | production | `client_info: context.client_info` (copy from incoming `context`) |
+| `auction/orchestrator.rs` | ~321 | production | `client_info: context.client_info` (copy from incoming `context`) |
+| `auction/orchestrator.rs` | ~677 | test helper `create_test_context` | add `client_info: &ClientInfo` param, thread through |
+| `integrations/prebid.rs` | ~1287 | test helper `create_test_auction_context` | add `client_info: &ClientInfo` param, thread through |
+| `integrations/prebid.rs` | ~2671 | test helper `call_to_openrtb` | add `client_info: &ClientInfo` param, thread through |
+
+The three test helpers need a `client_info: &ClientInfo` parameter added, and
+all callers of those helpers must pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }`.
+
+Example for `auction/endpoints.rs`:
 
 ```rust
 let context = AuctionContext {
@@ -394,12 +429,14 @@ match handle_publisher_request(settings, integration_registry, &runtime_services
 
 | File | Test change |
 |------|------------|
-| `synthetic.rs` | Pass `noop_services()` to existing tests; tests still pass `req` |
-| `http_util.rs` | Pass `noop_services()` to all `RequestInfo::from_request` tests; add one new test for TLS-detected HTTPS via `ClientInfo { tls_protocol: Some(...), .. }` |
-| `auction/formats.rs` | Pass `noop_services()` + `geo: None` to existing tests |
+| `synthetic.rs` | Pass `noop_services()` to existing tests; add `use crate::platform::test_support::noop_services;` to `#[cfg(test)]` module; tests still pass `req` |
+| `http_util.rs` | Pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` to all `RequestInfo::from_request` calls (8 sites); add one new test for TLS-detected HTTPS via `ClientInfo { tls_protocol: Some("TLSv1.3".to_string()), .. }` |
+| `auction/formats.rs` | **No test module exists** — no test updates needed in this file |
 | `didomi.rs` | Pass `client_ip: None` to `copy_headers` in any existing tests |
-| `auction/endpoints.rs` | Thread `services` through; existing test coverage covers the geo path |
+| `auction/endpoints.rs` | **No test module exists** — no test updates needed in this file |
 | `publisher.rs` | Pass `noop_services()` to existing publisher tests |
+| `auction/orchestrator.rs` | Update `create_test_context` helper to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` |
+| `integrations/prebid.rs` | Update `create_test_auction_context` and `call_to_openrtb` test helpers to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` |
 
 All existing tests must continue to pass. No behavior changes — only extraction
 source changes (from Fastly SDK calls to `ClientInfo` fields that contain the
@@ -409,9 +446,9 @@ same values).
 
 ## Acceptance Criteria
 
-- [ ] Zero `req.get_client_ip_addr()` calls in `trusted-server-core`
-- [ ] Zero `req.get_tls_protocol()` calls in `trusted-server-core`
-- [ ] Zero `req.get_tls_cipher_openssl_name()` calls in `trusted-server-core`
+- [ ] Zero `req.get_client_ip_addr()` calls in active (non-deprecated) code in `trusted-server-core` (the deprecated body of `GeoInfo::from_request` in `geo.rs` is excluded — that body stays and is covered by the `#[deprecated]` marker itself)
+- [ ] Zero `req.get_tls_protocol()` calls in active (non-deprecated) code in `trusted-server-core`
+- [ ] Zero `req.get_tls_cipher_openssl_name()` calls in active (non-deprecated) code in `trusted-server-core`
 - [ ] Zero `#[allow(deprecated)]` on `GeoInfo::from_request` calls (the `#[deprecated]` attribute on `GeoInfo::from_request` itself is preserved — only the call-site suppressors are removed; unrelated `#[allow(deprecated)]` annotations in `nextjs/html_post_process.rs` are for a different deprecated function and are out of scope for this PR)
 - [ ] `ClientInfo` populated at entry point (PR6 ✅, PR7 verifies no regressions)
 - [ ] All geo and client-info reads go through `RuntimeServices`
