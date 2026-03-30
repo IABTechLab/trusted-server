@@ -242,6 +242,7 @@ impl IntegrationProxy for DidomiIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
@@ -292,7 +293,6 @@ mod tests {
 
     #[test]
     fn copy_headers_sets_x_forwarded_for_from_client_ip() {
-        use std::net::{IpAddr, Ipv4Addr};
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let backend = DidomiBackend::Sdk;
         let original_req = Request::new(Method::GET, "https://example.com/test");
