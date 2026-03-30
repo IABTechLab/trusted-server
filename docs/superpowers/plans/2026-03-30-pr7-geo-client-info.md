@@ -449,20 +449,71 @@ These four changes must happen together because:
   let request_info = RequestInfo::from_request(context.request, context.client_info);
   ```
 
-- [ ] **Step 7: Run tests to verify Task 2 compiles and passes**
+- [ ] **Step 7: Update `http_util.rs` doc comment on `from_request`**
+
+  The existing doc comment (lines ~72-88) references "Fastly SDK TLS detection". Update it to reflect that TLS info now comes from `ClientInfo`:
+
+  ```rust
+  // Before (line ~80-88):
+  /// Scheme fallback order:
+  /// 1. Fastly SDK TLS detection
+  /// 2. `Forwarded` header (`proto=...`)
+  /// 3. `X-Forwarded-Proto`
+  /// 4. `Fastly-SSL`
+  /// 5. Default `http`
+  ///
+  /// In production the forwarded headers are stripped by
+  /// [`sanitize_forwarded_headers`] at the edge, so `Host` and SDK TLS
+  /// detection are the only sources that fire.
+  pub fn from_request(req: &Request) -> Self {
+
+  // After:
+  /// Scheme fallback order:
+  /// 1. [`ClientInfo`] TLS fields populated at the adapter entry point
+  /// 2. `Forwarded` header (`proto=...`)
+  /// 3. `X-Forwarded-Proto`
+  /// 4. `Fastly-SSL`
+  /// 5. Default `http`
+  ///
+  /// In production the forwarded headers are stripped by
+  /// [`sanitize_forwarded_headers`] at the edge, so `Host` and `ClientInfo`
+  /// TLS detection are the only sources that fire.
+  pub fn from_request(req: &Request, client_info: &ClientInfo) -> Self {
+  ```
+
+  Also update the first line of the doc comment:
+  ```
+  // Before: "Extract request info from a Fastly request."
+  // After:  "Extract request info from an incoming request."
+  ```
+
+- [ ] **Step 8: Update stale `handle_publisher_request` signature in `crates/trusted-server-core/src/auction/README.md`**
+
+  Around line 291 of `crates/trusted-server-core/src/auction/README.md`, the code snippet shows the old three-argument signature:
+  ```
+  _ => handle_publisher_request(&settings, &integration_registry, req),
+  ```
+
+  Update it to reflect the new signature:
+  ```
+  _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
+  ```
+
+- [ ] **Step 9: Run tests to verify Task 2 compiles and passes**
 
   ```bash
   cargo test --workspace
   ```
   Expected: all tests pass including the new TLS test.
 
-- [ ] **Step 8: Commit Task 2**
+- [ ] **Step 10: Commit Task 2**
 
   ```bash
   git add crates/trusted-server-core/src/http_util.rs \
           crates/trusted-server-core/src/publisher.rs \
           crates/trusted-server-core/src/integrations/prebid.rs \
-          crates/trusted-server-adapter-fastly/src/main.rs
+          crates/trusted-server-adapter-fastly/src/main.rs \
+          crates/trusted-server-core/src/auction/README.md
   git commit -m "Change RequestInfo::from_request to take &ClientInfo, thread services into handle_publisher_request"
   ```
 
@@ -638,10 +689,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 
   In `crates/trusted-server-core/src/auction/endpoints.rs`:
 
-  Remove deprecated geo import — `GeoInfo` is still needed for the `geo` local, update its import path if needed. Check the existing `use crate::geo::GeoInfo;` at line 10 — change to:
-  ```rust
-  use crate::platform::GeoInfo;
-  ```
+  Remove the `use crate::geo::GeoInfo;` import at line 10. After the change `GeoInfo` is no longer referenced by name in this file (the `geo` local's type is inferred from `services.geo().lookup()`). Leaving the import causes a clippy unused-import error.
 
   Update `get_or_generate_synthetic_id` call (line ~52):
   ```rust
@@ -692,13 +740,29 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 
 - [ ] **Step 6: Update `publisher.rs` — thread `services` to `get_or_generate_synthetic_id`**
 
-  In `crates/trusted-server-core/src/publisher.rs`, line ~328:
+  In `crates/trusted-server-core/src/publisher.rs`, line ~328 (production call):
   ```rust
   // Before:
   let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
 
   // After:
   let synthetic_id = get_or_generate_synthetic_id(settings, services, &req)?;
+  ```
+
+  Also update the test call site at line ~695. Add `noop_services` to the `#[cfg(test)]` module imports if not already present:
+  ```rust
+  use crate::platform::test_support::noop_services;
+  ```
+
+  Then fix the test call:
+  ```rust
+  // Before:
+  let resolved_synthetic_id =
+      get_or_generate_synthetic_id(&settings, &req).expect("should resolve synthetic id");
+
+  // After:
+  let resolved_synthetic_id =
+      get_or_generate_synthetic_id(&settings, &noop_services(), &req).expect("should resolve synthetic id");
   ```
 
 - [ ] **Step 7: Run tests to verify Task 3 compiles and passes**
@@ -937,9 +1001,12 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 
 - [ ] **Step 4: Commit final verification result**
 
-  No code changes expected in this step. If clippy or fmt found issues, fix them and include in a final commit:
+  No code changes expected in this step. If clippy or fmt flagged specific files, fix them and commit only those files:
 
   ```bash
-  git add -p  # stage only the clippy/fmt fixes
+  # Example — replace with the actual files that needed changes:
+  git add crates/trusted-server-core/src/some_file.rs
   git commit -m "Fix clippy and fmt issues from PR7 threading changes"
   ```
+
+  If no changes are needed, no commit is required.
