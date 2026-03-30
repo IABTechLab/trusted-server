@@ -416,7 +416,9 @@ These four changes must happen together because:
   let request_info = RequestInfo::from_request(&req, &services.client_info);
   ```
 
-- [ ] **Step 5: Update `main.rs` to pass `&runtime_services` to `handle_publisher_request`**
+- [ ] **Step 5: Update `main.rs` to pass `runtime_services` to `handle_publisher_request`**
+
+  `runtime_services` is already `&RuntimeServices` in `route_request` (line ~102), so no extra borrow is needed.
 
   In `crates/trusted-server-adapter-fastly/src/main.rs`, around line 195:
   ```rust
@@ -424,7 +426,7 @@ These four changes must happen together because:
   match handle_publisher_request(settings, integration_registry, req) {
 
   // After:
-  match handle_publisher_request(settings, integration_registry, &runtime_services, req) {
+  match handle_publisher_request(settings, integration_registry, runtime_services, req) {
   ```
 
 - [ ] **Step 6: Update `prebid.rs` two `RequestInfo::from_request` call sites**
@@ -459,7 +461,13 @@ These four changes must happen together because:
   // After:  "to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection."
   ```
 
-  **Location 2 — `RequestInfo` struct doc (line ~55-62):**
+  **Location 2 — `RequestInfo` `scheme` field doc (line ~67):**
+  ```
+  // Before: "The effective scheme (typically from Fastly SDK TLS detection after edge sanitization)."
+  // After:  "The effective scheme (typically from [`ClientInfo`] TLS detection after edge sanitization)."
+  ```
+
+  **Location 3 — `RequestInfo` struct doc (line ~55-62):**
   The doc mentions "on the Fastly edge [`sanitize_forwarded_headers`] strips those headers before this method is called, so the `Host` header and Fastly SDK TLS detection are the effective sources in production." Update to:
   ```
   // Before: "so the `Host` header and Fastly SDK TLS detection are the effective
@@ -468,7 +476,7 @@ These four changes must happen together because:
   //          sources in production."
   ```
 
-  **Location 3 — `from_request` doc (lines ~72-88):**
+  **Location 4 — `from_request` doc (lines ~72-88):**
   ```
   // Before first line: "Extract request info from a Fastly request."
   // After:             "Extract request info from an incoming request."
@@ -480,7 +488,7 @@ These four changes must happen together because:
   // After:                "so `Host` and [`ClientInfo`] TLS detection are the only sources that fire."
   ```
 
-  **Location 4 — `detect_request_scheme` doc (line ~158-161):**
+  **Location 5 — `detect_request_scheme` doc (line ~158-161):**
   ```
   // Before: "/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
   //          ///
@@ -517,7 +525,7 @@ These four changes must happen together because:
               // ...
       }
       _ => {
-          handle_publisher_request(settings, integration_registry, &runtime_services, req)
+          handle_publisher_request(settings, integration_registry, runtime_services, req)
       }
   }
   ```
