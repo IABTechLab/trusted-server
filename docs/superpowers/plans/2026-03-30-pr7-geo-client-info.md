@@ -449,54 +449,77 @@ These four changes must happen together because:
   let request_info = RequestInfo::from_request(context.request, context.client_info);
   ```
 
-- [ ] **Step 7: Update `http_util.rs` doc comment on `from_request`**
+- [ ] **Step 7: Update all stale Fastly-SDK-specific wording in `http_util.rs` comments**
 
-  The existing doc comment (lines ~72-88) references "Fastly SDK TLS detection". Update it to reflect that TLS info now comes from `ClientInfo`:
+  There are four locations that describe TLS as coming from "Fastly SDK" rather than `ClientInfo`. Update all of them:
 
-  ```rust
-  // Before (line ~80-88):
-  /// Scheme fallback order:
-  /// 1. Fastly SDK TLS detection
-  /// 2. `Forwarded` header (`proto=...`)
-  /// 3. `X-Forwarded-Proto`
-  /// 4. `Fastly-SSL`
-  /// 5. Default `http`
-  ///
-  /// In production the forwarded headers are stripped by
-  /// [`sanitize_forwarded_headers`] at the edge, so `Host` and SDK TLS
-  /// detection are the only sources that fire.
-  pub fn from_request(req: &Request) -> Self {
+  **Location 1 — `SPOOFABLE_FORWARDED_HEADERS` doc (line ~29-33):**
+  ```
+  // Before: "to fall back to the trustworthy `Host` header and Fastly SDK TLS detection."
+  // After:  "to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection."
+  ```
+
+  **Location 2 — `RequestInfo` struct doc (line ~55-62):**
+  The doc mentions "on the Fastly edge [`sanitize_forwarded_headers`] strips those headers before this method is called, so the `Host` header and Fastly SDK TLS detection are the effective sources in production." Update to:
+  ```
+  // Before: "so the `Host` header and Fastly SDK TLS detection are the effective
+  //          sources in production."
+  // After:  "so the `Host` header and [`ClientInfo`] TLS detection are the effective
+  //          sources in production."
+  ```
+
+  **Location 3 — `from_request` doc (lines ~72-88):**
+  ```
+  // Before first line: "Extract request info from a Fastly request."
+  // After:             "Extract request info from an incoming request."
+
+  // Before scheme list item 1: "1. Fastly SDK TLS detection"
+  // After:                     "1. [`ClientInfo`] TLS fields populated at the adapter entry point"
+
+  // Before last sentence: "so `Host` and SDK TLS detection are the only sources that fire."
+  // After:                "so `Host` and [`ClientInfo`] TLS detection are the only sources that fire."
+  ```
+
+  **Location 4 — `detect_request_scheme` doc (line ~158-161):**
+  ```
+  // Before: "/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
+  //          ///
+  //          /// Tries multiple methods in order of reliability:
+  //          /// 1. Fastly SDK TLS detection methods (most reliable)"
+  // After:  "/// Detects the request scheme (HTTP or HTTPS) from ClientInfo TLS fields and headers.
+  //          ///
+  //          /// Tries multiple sources in order of reliability:
+  //          /// 1. [`ClientInfo`] TLS fields populated at the adapter entry point (most reliable)"
+  ```
+
+- [ ] **Step 8: Update the stale routing snippet in `crates/trusted-server-core/src/auction/README.md`**
+
+  The entire routing snippet at lines ~277-292 is conceptually stale — `handle_auction`, `integration_registry.handle_proxy`, and `handle_publisher_request` all have different signatures than shown. Replace the whole block to match the current `main.rs` structure:
+
+  ```
+  // Before (lines ~277-292):
+  let result = match (method, path.as_str()) {
+      (Method::POST, "/auction") => handle_auction(&settings, req).await,
+      (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
+      (m, path) if integration_registry.has_route(&m, path) => {
+          integration_registry.handle_proxy(&m, path, &settings, req).await
+      },
+      _ => handle_publisher_request(&settings, &integration_registry, req),
+  }
 
   // After:
-  /// Scheme fallback order:
-  /// 1. [`ClientInfo`] TLS fields populated at the adapter entry point
-  /// 2. `Forwarded` header (`proto=...`)
-  /// 3. `X-Forwarded-Proto`
-  /// 4. `Fastly-SSL`
-  /// 5. Default `http`
-  ///
-  /// In production the forwarded headers are stripped by
-  /// [`sanitize_forwarded_headers`] at the edge, so `Host` and `ClientInfo`
-  /// TLS detection are the only sources that fire.
-  pub fn from_request(req: &Request, client_info: &ClientInfo) -> Self {
-  ```
-
-  Also update the first line of the doc comment:
-  ```
-  // Before: "Extract request info from a Fastly request."
-  // After:  "Extract request info from an incoming request."
-  ```
-
-- [ ] **Step 8: Update stale `handle_publisher_request` signature in `crates/trusted-server-core/src/auction/README.md`**
-
-  Around line 291 of `crates/trusted-server-core/src/auction/README.md`, the code snippet shows the old three-argument signature:
-  ```
-  _ => handle_publisher_request(&settings, &integration_registry, req),
-  ```
-
-  Update it to reflect the new signature:
-  ```
-  _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
+  let result = match (method, path.as_str()) {
+      (Method::POST, "/auction") => {
+          handle_auction(settings, orchestrator, runtime_services, req).await
+      }
+      (m, path) if integration_registry.has_route(&m, path) => {
+          integration_registry.handle_proxy(&m, path, settings, runtime_services, req).await
+              // ...
+      }
+      _ => {
+          handle_publisher_request(settings, integration_registry, &runtime_services, req)
+      }
+  }
   ```
 
 - [ ] **Step 9: Run tests to verify Task 2 compiles and passes**
