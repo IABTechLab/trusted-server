@@ -616,9 +616,18 @@ mod tests {
     #[test]
     fn test_ct_str_eq() {
         assert!(ct_str_eq("hello", "hello"), "should match equal strings");
-        assert!(!ct_str_eq("hello", "world"), "should not match different strings");
-        assert!(!ct_str_eq("hello", "hell"), "should not match different lengths");
-        assert!(!ct_str_eq("hell", "hello"), "should not match when first is shorter");
+        assert!(
+            !ct_str_eq("hello", "world"),
+            "should not match different strings"
+        );
+        assert!(
+            !ct_str_eq("hello", "hell"),
+            "should not match different lengths"
+        );
+        assert!(
+            !ct_str_eq("hell", "hello"),
+            "should not match when first is shorter"
+        );
         assert!(ct_str_eq("", ""), "should match empty strings");
     }
 
