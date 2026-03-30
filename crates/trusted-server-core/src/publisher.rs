@@ -9,6 +9,7 @@ use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthe
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
+use crate::platform::RuntimeServices;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -290,6 +291,7 @@ fn create_html_stream_processor(
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -298,7 +300,7 @@ pub fn handle_publisher_request(
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req);
+    let request_info = RequestInfo::from_request(&req, &services.client_info);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 

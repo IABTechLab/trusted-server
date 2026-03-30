@@ -276,20 +276,40 @@ The Fastly Compute entrypoint uses pattern matching on `(Method, path)` tuples:
 
 ```rust
 let result = match (method, path.as_str()) {
-    // Auction endpoint
-    (Method::POST, "/auction") => handle_auction(&settings, req).await,
-    
-    // First-party endpoints
-    (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
-    
-    // Integration registry (dynamic routes)
-    (m, path) if integration_registry.has_route(&m, path) => {
-        integration_registry.handle_proxy(&m, path, &settings, req).await
-    },
-    
-    // Fallback to publisher origin
-    _ => handle_publisher_request(&settings, &integration_registry, req),
-}
+    (Method::GET, path) if path.starts_with("/static/tsjs=") => {
+        handle_tsjs_dynamic(&req, integration_registry)
+    }
+    (Method::GET, "/.well-known/trusted-server.json") => {
+        handle_trusted_server_discovery(settings, runtime_services, req)
+    }
+    (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
+    (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
+    (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
+    (Method::POST, "/auction") => {
+        handle_auction(settings, orchestrator, runtime_services, req).await
+    }
+    (Method::GET, "/first-party/proxy") => {
+        handle_first_party_proxy(settings, runtime_services, req).await
+    }
+    (Method::GET, "/first-party/click") => {
+        handle_first_party_click(settings, runtime_services, req).await
+    }
+    (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
+        handle_first_party_proxy_sign(settings, runtime_services, req).await
+    }
+    (Method::POST, "/first-party/proxy-rebuild") => {
+        handle_first_party_proxy_rebuild(settings, runtime_services, req).await
+    }
+    (m, path) if integration_registry.has_route(&m, path) => integration_registry
+        .handle_proxy(&m, path, settings, runtime_services, req)
+        .await
+        .unwrap_or_else(|| {
+            Err(Report::new(TrustedServerError::BadRequest {
+                message: format!("Unknown integration route: {path}"),
+            }))
+        }),
+    _ => handle_publisher_request(settings, integration_registry, runtime_services, req),
+};
 ```
 
 #### 2. Integration Registry (Dynamic Routes)

@@ -192,7 +192,7 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(settings, integration_registry, req) {
+            match handle_publisher_request(settings, integration_registry, runtime_services, req) {
                 Ok(response) => Ok(response),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);

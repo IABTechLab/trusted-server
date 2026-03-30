@@ -710,7 +710,7 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let request_info = RequestInfo::from_request(context.request);
+        let request_info = RequestInfo::from_request(context.request, context.client_info);
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (
@@ -1008,7 +1008,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             &context.settings.request_signing
         {
             if request_signing_config.enabled {
-                let request_info = RequestInfo::from_request(context.request);
+                let request_info = RequestInfo::from_request(context.request, context.client_info);
                 let signer = RequestSigner::from_config()?;
                 let params =
                     SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
