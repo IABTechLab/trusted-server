@@ -659,8 +659,8 @@ impl PartnerStore {
         };
 
         // Verify the stored hash matches — guards against stale index from
-        // key rotation.
-        if record.api_key_hash != hash {
+        // key rotation. Uses constant-time comparison to prevent timing attacks.
+        if !bool::from(record.api_key_hash.as_bytes().ct_eq(hash.as_bytes())) {
             log::warn!(
                 "API key hash mismatch for partner '{}' (stale index after key rotation)",
                 record.id,
@@ -669,31 +669,6 @@ impl PartnerStore {
         }
 
         Ok(Some(record))
-    }
-
-    /// Verifies an API key against the stored hash for a given partner.
-    ///
-    /// Uses SHA-256 hashing and constant-time comparison to prevent
-    /// timing attacks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] if the partner lookup fails.
-    pub fn verify_api_key(
-        &self,
-        partner_id: &str,
-        api_key: &str,
-    ) -> Result<bool, Report<TrustedServerError>> {
-        let record = match self.get(partner_id)? {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-
-        let incoming_hash = hash_api_key(api_key);
-        let stored_bytes = record.api_key_hash.as_bytes();
-        let incoming_bytes = incoming_hash.as_bytes();
-
-        Ok(stored_bytes.ct_eq(incoming_bytes).into())
     }
 }
 

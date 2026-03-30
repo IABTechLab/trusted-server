@@ -114,20 +114,39 @@ pub fn build_eids_header(
 ///
 /// Returns an error if JSON serialization fails.
 pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<TrustedServerError>> {
-    for size in (0..=eids.len()).rev() {
+    let try_encode = |size: usize| -> Result<String, Report<TrustedServerError>> {
         let json = serde_json::to_vec(&eids[..size]).change_context(
             TrustedServerError::Configuration {
                 message: "Failed to serialize eids header payload".to_owned(),
             },
         )?;
-        let encoded = BASE64.encode(json);
+        Ok(BASE64.encode(json))
+    };
 
+    // Fast path: try the full slice first (common case — no truncation).
+    let encoded = try_encode(eids.len())?;
+    if encoded.len() <= MAX_EIDS_HEADER_BYTES {
+        return Ok((encoded, false));
+    }
+
+    // Binary search for the largest count that fits within the limit.
+    // Invariant: lo always fits, hi never fits.
+    let mut lo: usize = 0;
+    let mut hi: usize = eids.len();
+
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let encoded = try_encode(mid)?;
         if encoded.len() <= MAX_EIDS_HEADER_BYTES {
-            return Ok((encoded, size != eids.len()));
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
 
-    Ok((BASE64.encode("[]"), true))
+    // `lo` is the largest size that fits. Re-encode it for the final value.
+    let encoded = try_encode(lo)?;
+    Ok((encoded, true))
 }
 
 #[cfg(test)]

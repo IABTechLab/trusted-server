@@ -75,10 +75,6 @@ pub enum TrustedServerError {
     /// Requested partner was not found in the partner registry.
     #[display("Partner not found: {partner_id}")]
     PartnerNotFound { partner_id: String },
-
-    /// Partner authentication failed (invalid or missing credentials).
-    #[display("Partner auth failed: {partner_id}")]
-    PartnerAuthFailed { partner_id: String },
 }
 
 impl Error for TrustedServerError {}
@@ -109,7 +105,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::PartnerNotFound { .. } => StatusCode::BAD_REQUEST,
+            Self::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
             Self::PartnerAuthFailed { .. } => StatusCode::UNAUTHORIZED,
         }
     }
