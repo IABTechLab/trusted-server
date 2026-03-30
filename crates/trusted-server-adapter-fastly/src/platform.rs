@@ -256,6 +256,10 @@ fn edge_request_to_fastly(request: edgezero_core::http::Request) -> fastly::Requ
     // because all outbound proxy bodies are built from Vec<u8> via EdgeBody::from()
     // and are therefore always Once. When this conversion moves to edgezero-adapter-fastly
     // it can use send_async_streaming() to handle Stream bodies properly.
+    debug_assert!(
+        matches!(&body, edgezero_core::body::Body::Once(_)),
+        "unexpected Body::Stream in edge_request_to_fastly: body will be empty"
+    );
     if let edgezero_core::body::Body::Once(bytes) = body {
         if !bytes.is_empty() {
             fastly_req.set_body(bytes.to_vec());
@@ -336,33 +340,72 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
+        let mut saved_names: Vec<String> = Vec::with_capacity(pending_requests.len());
+
         for platform_req in pending_requests {
+            let name = platform_req.backend_name().unwrap_or("").to_string();
             let inner = platform_req.downcast::<PendingRequest>().map_err(|_| {
                 Report::new(PlatformError::HttpClient)
                     .attach("PlatformPendingRequest inner type is not fastly::PendingRequest")
             })?;
             fastly_pending.push(inner);
+            saved_names.push(name);
         }
 
         let (result, remaining_fastly) = select(fastly_pending);
 
-        let remaining = remaining_fastly
-            .into_iter()
-            .map(PlatformPendingRequest::new)
-            .collect();
+        // Re-attach saved backend names to the remaining pending requests.
+        // Identify which request completed by matching the response backend name
+        // to the saved names, then skip that index when rebuilding remaining.
+        let completed_name = match &result {
+            Ok(resp) => resp.get_backend_name().map(str::to_string),
+            Err(_) => None,
+        };
+        let completed_idx = completed_name
+            .as_deref()
+            .and_then(|name| saved_names.iter().position(|n| n == name));
+        if completed_name.is_some() && completed_idx.is_none() {
+            log::warn!(
+                "select: completed backend name not found in saved names; \
+                 remaining requests will lose backend correlation"
+            );
+        }
 
-        let ready =
-            match result {
-                Ok(fastly_resp) => {
-                    let backend_name = fastly_resp
-                        .get_backend_name()
-                        .unwrap_or_default()
-                        .to_string();
-                    fastly_response_to_platform(fastly_resp, backend_name)
-                }
-                Err(e) => Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("fastly select error: {e}"))),
-            };
+        let remaining: Vec<PlatformPendingRequest> = if let Some(idx) = completed_idx {
+            remaining_fastly
+                .into_iter()
+                .zip(
+                    saved_names
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, name)| name),
+                )
+                .map(|(req, name)| PlatformPendingRequest::new(req).with_backend_name(name))
+                .collect()
+        } else {
+            remaining_fastly
+                .into_iter()
+                .map(PlatformPendingRequest::new)
+                .collect()
+        };
+
+        let ready = match result {
+            Ok(fastly_resp) => {
+                let backend_name = fastly_resp
+                    .get_backend_name()
+                    .unwrap_or_else(|| {
+                        log::warn!("select: response has no backend name, correlation will fail");
+                        ""
+                    })
+                    .to_string();
+                fastly_response_to_platform(fastly_resp, backend_name)
+            }
+            Err(e) => {
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("fastly select error: {e}")))
+            }
+        };
 
         Ok(PlatformSelectResult { ready, remaining })
     }

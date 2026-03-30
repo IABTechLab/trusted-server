@@ -118,8 +118,16 @@ impl PlatformBackend for StubBackend {
 // StubHttpClient
 // ---------------------------------------------------------------------------
 
-/// Test stub for [`PlatformHttpClient`] that records `send` call backend
-/// names and returns pre-queued canned responses.
+/// Canned response carried by a [`StubPendingResponse`] through `send_async`
+/// and resolved by [`StubHttpClient::select`].
+struct StubPendingResponse {
+    backend_name: String,
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// Test stub for [`PlatformHttpClient`] that records call backend names and
+/// returns pre-queued canned responses for `send`, `send_async`, and `select`.
 ///
 /// Responses are stored as `(status_code, body_bytes)` to remain [`Send`].
 /// [`PlatformResponse`] contains [`edgezero_core::body::Body`] which wraps a
@@ -187,16 +195,57 @@ impl PlatformHttpClient for StubHttpClient {
 
     async fn send_async(
         &self,
-        _request: PlatformHttpRequest,
+        request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        let backend_name = request.backend_name.clone();
+        self.calls
+            .lock()
+            .expect("should lock calls")
+            .push(backend_name.clone());
+
+        let (status, body_bytes) = self
+            .responses
+            .lock()
+            .expect("should lock responses")
+            .pop_front()
+            .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+
+        let pending = StubPendingResponse {
+            backend_name: backend_name.clone(),
+            status,
+            body: body_bytes,
+        };
+        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
     async fn select(
         &self,
-        _pending_requests: Vec<PlatformPendingRequest>,
+        mut pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select called with empty pending_requests list"));
+        }
+
+        let ready_platform = pending_requests.remove(0);
+        let stub = ready_platform
+            .downcast::<StubPendingResponse>()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected inner type in StubHttpClient::select")
+            })?;
+
+        let edge_response = edgezero_core::http::response_builder()
+            .status(stub.status)
+            .body(edgezero_core::body::Body::from(stub.body))
+            .change_context(PlatformError::HttpClient)?;
+
+        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(stub.backend_name));
+
+        Ok(PlatformSelectResult {
+            ready,
+            remaining: pending_requests,
+        })
     }
 }
 
@@ -304,6 +353,78 @@ mod tests {
                 result.unwrap_err().current_context(),
                 PlatformError::HttpClient
             ),
+            "should be HttpClient error"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_send_async_and_select_fan_out() {
+        let stub = StubHttpClient::new();
+        stub.push_response(200, b"provider-a".to_vec());
+        stub.push_response(201, b"provider-b".to_vec());
+
+        let make_req = |backend: &str| {
+            PlatformHttpRequest::new(
+                request_builder()
+                    .method("GET")
+                    .uri("https://example.com/bid")
+                    .body(Body::empty())
+                    .expect("should build request"),
+                backend,
+            )
+        };
+
+        let pending_a = futures::executor::block_on(stub.send_async(make_req("backend-a")))
+            .expect("should start request a");
+        let pending_b = futures::executor::block_on(stub.send_async(make_req("backend-b")))
+            .expect("should start request b");
+
+        assert_eq!(
+            pending_a.backend_name(),
+            Some("backend-a"),
+            "should attach backend name to pending request a"
+        );
+        assert_eq!(
+            pending_b.backend_name(),
+            Some("backend-b"),
+            "should attach backend name to pending request b"
+        );
+
+        let result = futures::executor::block_on(stub.select(vec![pending_a, pending_b]))
+            .expect("should select first ready request");
+
+        let ready_resp = result.ready.expect("should have a ready response");
+        assert_eq!(
+            ready_resp.backend_name.as_deref(),
+            Some("backend-a"),
+            "should correlate ready response to backend-a"
+        );
+        assert_eq!(
+            result.remaining.len(),
+            1,
+            "should have one remaining request"
+        );
+        assert_eq!(
+            result.remaining[0].backend_name(),
+            Some("backend-b"),
+            "should preserve backend name on remaining request"
+        );
+
+        let names = stub.recorded_backend_names();
+        assert_eq!(
+            names,
+            vec!["backend-a", "backend-b"],
+            "should record both send_async calls in order"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_select_returns_error_when_empty() {
+        let stub = StubHttpClient::new();
+        let err = futures::executor::block_on(stub.select(vec![]))
+            .expect_err("should return error for empty list");
+        assert!(
+            matches!(err.current_context(), PlatformError::HttpClient),
             "should be HttpClient error"
         );
     }

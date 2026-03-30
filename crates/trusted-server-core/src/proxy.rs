@@ -34,15 +34,24 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
 
 /// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
 ///
-/// An identical copy exists in `auction/orchestrator.rs`. Both are private and
-/// intentionally local — a shared helper will land when these files migrate off
-/// `fastly::Response` entirely in Phase 2.
-fn platform_response_to_fastly(platform_resp: PlatformResponse) -> Response {
+/// Shared with `auction/orchestrator.rs`. Both files will migrate off `fastly::Response`
+/// entirely in Phase 2, at which point this conversion helper will be removed.
+///
+/// # Panics (debug builds only)
+///
+/// Panics when `platform_resp` carries a `Body::Stream` body, which indicates a
+/// programming error — all outbound proxy bodies are built from byte slices and
+/// are therefore always `Body::Once`.
+pub(crate) fn platform_response_to_fastly(platform_resp: PlatformResponse) -> Response {
     let (parts, body) = platform_resp.response.into_parts();
+    debug_assert!(
+        matches!(&body, EdgeBody::Once(_)),
+        "unexpected Body::Stream in platform response conversion: body will be empty"
+    );
     let body_bytes = match body {
         EdgeBody::Once(bytes) => bytes.to_vec(),
         EdgeBody::Stream(_) => {
-            log::warn!("streaming platform response body in proxy; body will be empty");
+            log::warn!("streaming platform response body; body will be empty");
             vec![]
         }
     };

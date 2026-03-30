@@ -1,14 +1,13 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
-use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::Response as FastlyResponse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformPendingRequest, PlatformResponse, RuntimeServices};
+use crate::platform::{PlatformPendingRequest, RuntimeServices};
+use crate::proxy::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
@@ -22,28 +21,6 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
     let elapsed = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
     timeout_ms.saturating_sub(elapsed)
-}
-
-/// Convert a platform-neutral response to a [`FastlyResponse`] for provider parsing.
-///
-/// An identical copy exists in `proxy.rs`. Both are private and intentionally
-/// local — a shared helper will land when these files migrate off `fastly::Response`
-/// entirely in Phase 2.
-fn platform_response_to_fastly(platform_resp: PlatformResponse) -> FastlyResponse {
-    let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
-            log::warn!("streaming platform response body in auction; body will be empty");
-            vec![]
-        }
-    };
-    let mut resp = FastlyResponse::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.set_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    resp
 }
 
 /// Manages auction execution across multiple providers.
