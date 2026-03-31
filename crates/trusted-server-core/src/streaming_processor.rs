@@ -5,6 +5,18 @@
 //! - Pluggable content processors (text replacement, HTML rewriting, etc.)
 //! - Memory-efficient streaming
 //! - UTF-8 boundary handling
+//!
+//! # Platform notes
+//!
+//! This module is **platform-agnostic** (verified in PR 8). It has zero
+//! `fastly` imports. [`StreamingPipeline::process`] is generic over
+//! `R: Read + W: Write` — any reader or writer works, including
+//! `fastly::Body` (which implements `std::io::Read`) or standard
+//! `std::io::Cursor<&[u8]>`.
+//!
+//! Future adapters (PR 16/17) do not need to implement any compression or
+//! streaming interface. See `crate::platform` module doc for the
+//! authoritative note.
 
 use error_stack::{Report, ResultExt};
 use std::io::{self, Read, Write};
