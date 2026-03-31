@@ -279,12 +279,12 @@ pub enum PublisherResponse {
 /// Owned version of [`ProcessResponseParams`] for returning from
 /// `handle_publisher_request` without lifetime issues.
 pub struct OwnedProcessResponseParams {
-    pub content_encoding: String,
-    pub origin_host: String,
-    pub origin_url: String,
-    pub request_host: String,
-    pub request_scheme: String,
-    pub content_type: String,
+    pub(crate) content_encoding: String,
+    pub(crate) origin_host: String,
+    pub(crate) origin_url: String,
+    pub(crate) request_host: String,
+    pub(crate) request_scheme: String,
+    pub(crate) content_type: String,
 }
 
 /// Stream the publisher response body through the processing pipeline.
@@ -428,9 +428,7 @@ pub fn handle_publisher_request(
         .unwrap_or_default()
         .to_string();
 
-    let should_process = content_type.contains("text/")
-        || content_type.contains("application/javascript")
-        || content_type.contains("application/json");
+    let should_process = is_processable_content_type(&content_type);
 
     if !should_process || request_host.is_empty() {
         log::debug!(
@@ -451,7 +449,7 @@ pub fn handle_publisher_request(
     // - No HTML post-processors registered (they need the full document)
     // - Non-HTML content always streams (post-processors only apply to HTML)
     let is_html = content_type.contains("text/html");
-    let has_post_processors = !integration_registry.html_post_processors().is_empty();
+    let has_post_processors = integration_registry.has_html_post_processors();
     let can_stream = !is_html || !has_post_processors;
 
     if can_stream {
@@ -497,10 +495,20 @@ pub fn handle_publisher_request(
     let mut output = Vec::new();
     process_response_streaming(body, &mut output, &params)?;
 
+    response.set_header(header::CONTENT_LENGTH, output.len().to_string());
     response.set_body(Body::from(output));
-    response.remove_header(header::CONTENT_LENGTH);
 
     Ok(PublisherResponse::Buffered(response))
+}
+
+/// Whether the content type requires processing (URL rewriting, HTML injection).
+///
+/// Text-based and JavaScript/JSON responses are processable; binary types
+/// (images, fonts, video, etc.) pass through unchanged.
+fn is_processable_content_type(content_type: &str) -> bool {
+    content_type.contains("text/")
+        || content_type.contains("application/javascript")
+        || content_type.contains("application/json")
 }
 
 /// Apply synthetic ID and cookie headers to the response.
@@ -574,17 +582,11 @@ mod tests {
             ("application/octet-stream", false),
         ];
 
-        for (content_type, should_process) in test_cases {
-            let result = content_type.contains("text/html")
-                || content_type.contains("text/css")
-                || content_type.contains("text/javascript")
-                || content_type.contains("application/javascript")
-                || content_type.contains("application/json");
-
+        for (content_type, expected) in test_cases {
             assert_eq!(
-                result, should_process,
-                "Content-Type '{}' should_process: expected {}, got {}",
-                content_type, should_process, result
+                is_processable_content_type(content_type),
+                expected,
+                "Content-Type '{content_type}' should_process: expected {expected}",
             );
         }
     }
