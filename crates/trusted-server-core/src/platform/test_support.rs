@@ -257,6 +257,29 @@ impl PlatformGeo for NoopGeo {
     }
 }
 
+/// Build a [`RuntimeServices`] instance with a custom config store and a custom secret store.
+///
+/// Use this when a test exercises code that reads from config AND secret stores,
+/// such as `request_signing::signing` and `request_signing::rotation`.
+pub(crate) fn build_services_with_config_and_secret(
+    config_store: impl PlatformConfigStore + 'static,
+    secret_store: impl PlatformSecretStore + 'static,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
+        })
+        .build()
+}
+
 pub(crate) fn build_services_with_config(
     config_store: impl PlatformConfigStore + 'static,
 ) -> RuntimeServices {
@@ -457,5 +480,18 @@ mod tests {
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");
+    }
+
+    #[test]
+    fn build_services_with_config_and_secret_uses_provided_stores() {
+        // Arrange: noop stores
+        let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
+
+        // Act: both stores return Unsupported (confirming the injected impls are active)
+        let config_result = services.config_store().get(&StoreName::from("s"), "k");
+        let secret_result = services.secret_store().get_bytes(&StoreName::from("s"), "k");
+
+        assert!(config_result.is_err(), "should delegate to injected config store");
+        assert!(secret_result.is_err(), "should delegate to injected secret store");
     }
 }
