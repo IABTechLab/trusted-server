@@ -240,12 +240,11 @@ remains in place — no need to bypass it.
 
 Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 `html_post_processors`. Script rewriters run inside `lol_html` element handlers
-and currently require buffered mode because `lol_html` fragments text nodes
-across chunk boundaries (see [Phase 3](#text-node-fragmentation-phase-3)).
-`html_post_processors` require the full document for post-processing.
-The streaming gate checks `has_html_post_processors()` for the
-post-processor path; `create_html_processor` separately gates the adapter mode
-on `script_rewriters`. Currently only Next.js registers a post-processor.
+during streaming and are now fragment-safe (resolved in
+[Phase 3](#text-node-fragmentation-phase-3)). `html_post_processors` require
+the full document for post-processing. The streaming gate checks
+`has_html_post_processors()` for the post-processor path. Currently only
+Next.js registers a post-processor.
 
 ## Text Node Fragmentation (Phase 3)
 

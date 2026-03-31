@@ -16,6 +16,9 @@ pub(super) struct NextJsNextDataRewriter {
     rewriter: UrlRewriter,
     /// Accumulates text fragments when `lol_html` splits a text node across
     /// chunk boundaries. Drained on `is_last_in_text_node`.
+    ///
+    /// `lol_html` delivers text chunks sequentially per element — the buffer
+    /// is always empty when a new element's text begins.
     accumulated_text: Mutex<String>,
 }
 
@@ -452,7 +455,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn url_rewriter_does_not_rewrite_partial_hostname_matches() {
         let rewriter = UrlRewriter::new(&["url".into(), "siteProductionDomain".into()])
             .expect("should build URL rewriter");
@@ -498,8 +500,7 @@ mod tests {
 
     #[test]
     fn fragmented_next_data_is_accumulated_and_rewritten() {
-        let rewriter = NextJsNextDataRewriter::new(test_config())
-            .expect("should build rewriter");
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
         let document_state = IntegrationDocumentState::default();
 
         let fragment1 = r#"{"props":{"pageProps":{"href":"https://origin."#;
@@ -547,8 +548,7 @@ mod tests {
 
     #[test]
     fn unfragmented_next_data_works_without_accumulation() {
-        let rewriter = NextJsNextDataRewriter::new(test_config())
-            .expect("should build rewriter");
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
         let document_state = IntegrationDocumentState::default();
         let payload = r#"{"props":{"pageProps":{"href":"https://origin.example.com/page"}}}"#;
 
@@ -575,8 +575,7 @@ mod tests {
 
     #[test]
     fn fragmented_next_data_without_rewritable_urls_preserves_content() {
-        let rewriter = NextJsNextDataRewriter::new(test_config())
-            .expect("should build rewriter");
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
         let document_state = IntegrationDocumentState::default();
 
         // __NEXT_DATA__ JSON with no origin URLs — rewrite_structured returns Keep.

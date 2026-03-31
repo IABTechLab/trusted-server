@@ -134,6 +134,9 @@ pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
     /// Accumulates text fragments when `lol_html` splits a text node across
     /// chunk boundaries. Drained on `is_last_in_text_node`.
+    ///
+    /// `lol_html` delivers text chunks sequentially per element — the buffer
+    /// is always empty when a new element's text begins.
     accumulated_text: Mutex<String>,
 }
 
@@ -506,15 +509,14 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             return ScriptRewriteAction::RemoveNode;
         }
 
-        // Last fragment. Determine the full content to inspect.
-        let full_content;
-        let text = if buf.is_empty() {
-            content
+        // Last fragment. If we accumulated prior fragments, combine them.
+        let full_content: Option<String> = if buf.is_empty() {
+            None
         } else {
             buf.push_str(content);
-            full_content = std::mem::take(&mut *buf);
-            &full_content
+            Some(std::mem::take(&mut *buf))
         };
+        let text = full_content.as_deref().unwrap_or(content);
 
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
@@ -526,7 +528,8 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         }
 
         // No GTM content — if we accumulated fragments, emit them unchanged.
-        if text.len() != content.len() {
+        // Intermediate fragments were already suppressed via RemoveNode.
+        if full_content.is_some() {
             return ScriptRewriteAction::replace(text.to_string());
         }
 

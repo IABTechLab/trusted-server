@@ -686,38 +686,23 @@ mod tests {
         }
     }
 
-    /// Test the streaming gate logic in isolation. The gate decides whether
-    /// a response can be streamed or must be buffered based on:
-    /// - Backend status (2xx only)
-    /// - Content type (processable text types)
-    /// - Post-processors (none registered for streaming)
     #[test]
     fn streaming_gate_allows_2xx_html_without_post_processors() {
-        let is_success = true;
         let is_html = true;
         let has_post_processors = false;
-        let can_stream = is_success && (!is_html || !has_post_processors);
-        assert!(can_stream, "should stream 2xx HTML without post-processors");
-    }
-
-    #[test]
-    fn streaming_gate_blocks_non_2xx_responses() {
-        let is_success = false;
-        let is_html = true;
-        let has_post_processors = false;
-        let can_stream = is_success && (!is_html || !has_post_processors);
+        let encoding_supported = is_supported_content_encoding("gzip");
         assert!(
-            !can_stream,
-            "should not stream error responses even without post-processors"
+            encoding_supported && (!is_html || !has_post_processors),
+            "should stream 2xx HTML without post-processors"
         );
     }
 
     #[test]
     fn streaming_gate_blocks_html_with_post_processors() {
-        let is_success = true;
         let is_html = true;
         let has_post_processors = true;
-        let can_stream = is_success && (!is_html || !has_post_processors);
+        let encoding_supported = is_supported_content_encoding("gzip");
+        let can_stream = encoding_supported && (!is_html || !has_post_processors);
         assert!(
             !can_stream,
             "should not stream HTML when post-processors are registered"
@@ -726,10 +711,10 @@ mod tests {
 
     #[test]
     fn streaming_gate_allows_non_html_with_post_processors() {
-        let is_success = true;
         let is_html = false;
         let has_post_processors = true;
-        let can_stream = is_success && (!is_html || !has_post_processors);
+        let encoding_supported = is_supported_content_encoding("gzip");
+        let can_stream = encoding_supported && (!is_html || !has_post_processors);
         assert!(
             can_stream,
             "should stream non-HTML even with post-processors (they only apply to HTML)"
@@ -737,12 +722,15 @@ mod tests {
     }
 
     #[test]
-    fn streaming_gate_blocks_non_2xx_json() {
-        let is_success = false;
+    fn streaming_gate_blocks_unsupported_encoding() {
         let is_html = false;
         let has_post_processors = false;
-        let can_stream = is_success && (!is_html || !has_post_processors);
-        assert!(!can_stream, "should not stream 4xx/5xx JSON responses");
+        let encoding_supported = is_supported_content_encoding("zstd");
+        let can_stream = encoding_supported && (!is_html || !has_post_processors);
+        assert!(
+            !can_stream,
+            "should not stream when content-encoding is unsupported"
+        );
     }
 
     #[test]
