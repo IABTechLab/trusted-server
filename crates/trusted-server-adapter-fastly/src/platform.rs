@@ -242,7 +242,7 @@ impl PlatformBackend for FastlyPlatformBackend {
 // FastlyPlatformHttpClient — helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a platform-neutral [`EdgeRequest`] to a [`fastly::Request`].
+/// Convert a platform-neutral [`edgezero_core::http::Request`] to a [`fastly::Request`].
 ///
 /// Only `Body::Once` bodies are forwarded; `Body::Stream` bodies are not
 /// used on this path (proxy.rs builds bodies from byte slices).
