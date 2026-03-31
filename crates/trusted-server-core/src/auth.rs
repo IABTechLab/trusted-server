@@ -2,6 +2,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use error_stack::Report;
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;

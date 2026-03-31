@@ -75,7 +75,8 @@ fn main() -> Result<(), Error> {
         Ok(orchestrator) => orchestrator,
         Err(e) => {
             log::error!("Failed to build auction orchestrator: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return Ok(());
         }
     };
 
