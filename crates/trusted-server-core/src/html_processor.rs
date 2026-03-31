@@ -1,6 +1,20 @@
-//! Simplified HTML processor that combines URL replacement and integration injection
+//! Simplified HTML processor that combines URL replacement and integration injection.
 //!
-//! This module provides a `StreamProcessor` implementation for HTML content.
+//! This module provides a [`StreamProcessor`] implementation for HTML content.
+//! It handles `<script>` tag injection at `<head>`, attribute URL rewriting
+//! (`href`, `src`, `action`, `srcset`, `imagesrcset`), and post-processing
+//! hooks for enabled integrations.
+//!
+//! # Platform notes
+//!
+//! This module is **platform-agnostic** (verified in PR 8). It has zero
+//! `fastly` imports and depends only on `lol_html`, `std`, and crate-internal
+//! types. [`create_html_processor`] returns an `impl `[`StreamProcessor`]
+//! whose `process_chunk` method operates on `&[u8]` slices with no
+//! platform body type involved.
+//!
+//! Future adapters (PR 16/17) do not need to implement any content-rewriting
+//! interface. See `crate::platform` module doc for the authoritative note.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
