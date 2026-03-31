@@ -2820,7 +2820,6 @@ dependencies = [
  "log-fastly",
  "lol_html",
  "matchit",
- "once_cell",
  "pin-project-lite",
  "rand",
  "regex",

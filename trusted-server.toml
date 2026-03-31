@@ -148,10 +148,25 @@ rewrite_script = true
 
 
 # Proxy configuration
-# [proxy]
+[proxy]
 # Enable TLS certificate verification when proxying to HTTPS origins.
 # Defaults to true. Set to false only for local development with self-signed certificates.
 # certificate_check = true
+
+# Restrict redirect destinations for the first-party proxy to an explicit domain allowlist.
+# Supports exact match ("example.com") and subdomain wildcard prefix ("*.example.com").
+# Wildcard prefix also matches the apex domain ("*.example.com" matches "example.com").
+# Matching is case-insensitive. A dot-boundary check prevents "*.example.com" from
+# matching "evil-example.com".
+# When omitted or empty, redirect destinations are unrestricted — configure this in
+# production to prevent SSRF via signed URLs that redirect to internal services.
+# Note: this list governs only the first-party proxy redirect chain, not integration
+# endpoints defined under [integrations.*].
+# allowed_domains = [
+    # "ad.example.com",
+    # "*.doubleclick.net",
+    # "*.googlesyndication.com",
+# ]
 
 [auction]
 enabled = true

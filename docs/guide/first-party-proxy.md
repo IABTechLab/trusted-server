@@ -425,6 +425,52 @@ proxy_secret = "your-secure-random-secret"
 cookie_domain = ".publisher.com"  # For synthetic_id cookies
 ```
 
+### Proxy Allowlist
+
+Restrict which domains the proxy may redirect to via the `[proxy]` section:
+
+```toml
+[proxy]
+allowed_domains = [
+  "tracker.com",           # Exact match
+  "*.adserver.com",        # Wildcard: adserver.com and all subdomains
+  "*.trusted-cdn.net",
+]
+```
+
+**Semantics**: When a proxied request receives an HTTP redirect (301/302/303/307/308), the redirect target host is checked against `allowed_domains`. If the host does not match any pattern the redirect is blocked and a 403 error is returned.
+
+**Wildcard matching**:
+
+| Pattern         | Matches                                             | Does not match     |
+| --------------- | --------------------------------------------------- | ------------------ |
+| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
+| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+
+- The `*` prefix matches the base domain and any subdomain at any depth.
+- Matching is case-insensitive; entries are normalized to lowercase on startup.
+- The wildcard requires a dot boundary — `*.example.com` will **not** match `evil-example.com`.
+- A bare `"*"` entry is **not** valid and will be removed at startup with a warning. Use an empty list for open mode.
+
+:::note Unicode / Internationalized Domain Names
+Matching uses ASCII case-folding (`to_ascii_lowercase`). Internationalized domain names (IDNs) in Punycode form (e.g., `xn--nxasmq6b.com`) are matched literally — the Unicode label and its Punycode equivalent are treated as different strings. If your ad network uses IDN domains, add the Punycode form to `allowed_domains`.
+:::
+
+**Default behavior**: When `allowed_domains` is omitted (or set to an empty list) every redirect destination is permitted. This default exists solely for development convenience and **must be overridden in production**.
+
+::: danger Production Recommendation
+Always set `allowed_domains` explicitly in production deployments. Without an allowlist, a signed proxy URL that follows redirects could be used to reach internal or unintended hosts (SSRF).
+
+```toml
+[proxy]
+allowed_domains = [
+  "*.your-ad-network.com",
+  "tracker.your-partner.com",
+]
+```
+
+:::
+
 ### URL Rewrite Exclusions
 
 Exclude specific domains from rewriting:
@@ -521,7 +567,7 @@ Only essential headers are forwarded to reduce overhead:
 **Invalid Signature**:
 
 ```
-HTTP 403 Forbidden
+HTTP 502 Bad Gateway
 tstoken validation failed: signature mismatch
 ```
 
@@ -534,7 +580,7 @@ tstoken validation failed: signature mismatch
 **Expired URL**:
 
 ```
-HTTP 403 Forbidden
+HTTP 502 Bad Gateway
 tstoken expired
 ```
 
@@ -599,7 +645,7 @@ Attacker tries:
 Trusted Server:
   1. Computes expected token for https://evil.com
   2. Compares with provided token
-  3. Rejects if mismatch (403 Forbidden)
+  3. Rejects if mismatch (502 Bad Gateway)
 ```
 
 ### Content Security

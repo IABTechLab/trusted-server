@@ -36,12 +36,12 @@ find, and key rotation writes to the wrong store.
 
 **Refs:**
 
-- [signing.rs:20](crates/common/src/request_signing/signing.rs#L20) -- `FastlyConfigStore::new("jwks_store")` hardcoded
-- [signing.rs:122](crates/common/src/request_signing/signing.rs#L122) -- `FastlyConfigStore::new("jwks_store")` hardcoded
-- [signing.rs:130](crates/common/src/request_signing/signing.rs#L130) -- `FastlySecretStore::new("signing_keys")` hardcoded
-- [jwks.rs:63](crates/common/src/request_signing/jwks.rs#L63) -- `FastlyConfigStore::new("jwks_store")` hardcoded
-- [rotation.rs:44](crates/common/src/request_signing/rotation.rs#L44) -- `FastlyConfigStore::new("jwks_store")` hardcoded, ignores `config_store_id` constructor arg
-- [endpoints.rs:151](crates/common/src/request_signing/endpoints.rs#L151) -- reads `config_store_id`/`secret_store_id` from settings
+- `signing.rs:20` -- `FastlyConfigStore::new("jwks_store")` hardcoded
+- `signing.rs:122` -- `FastlyConfigStore::new("jwks_store")` hardcoded
+- `signing.rs:130` -- `FastlySecretStore::new("signing_keys")` hardcoded
+- `jwks.rs:63` -- `FastlyConfigStore::new("jwks_store")` hardcoded
+- `rotation.rs:44` -- `FastlyConfigStore::new("jwks_store")` hardcoded, ignores `config_store_id` constructor arg
+- `endpoints.rs:151` -- reads `config_store_id`/`secret_store_id` from settings
 
 **Recommendation:** Single source of truth -- either always read store IDs from
 `Settings` and thread them through, or document + assert the hardcoded names
@@ -59,10 +59,10 @@ match config.
 
 **Refs:**
 
-- [main.rs:97-98](crates/fastly/src/main.rs#L97-L98) -- admin route matching
-- [auth.rs:10](crates/common/src/auth.rs#L10) -- `enforce_basic_auth` checks `handlers` list
-- [settings.rs:381](crates/common/src/settings.rs#L381) -- `handlers` parsing
-- [trusted-server.toml:1](trusted-server.toml#L1) -- default handler only covers `^/secure`
+- `main.rs:97-98` -- admin route matching
+- `auth.rs:10` -- `enforce_basic_auth` checks `handlers` list
+- `settings.rs:381` -- `handlers` parsing
+- `trusted-server.toml:1` -- default handler only covers `^/secure`
 
 **Recommendation:** Either hard-require auth for `/admin/*` paths regardless of
 handler config, or validate at startup that an admin handler exists.
@@ -79,10 +79,10 @@ publisher's page context, cookies, and localStorage.
 
 **Refs:**
 
-- [request.ts:77-102](crates/js/lib/src/core/request.ts#L77-L102) -- `iframe.srcdoc = buildCreativeDocument(creativeHtml)`
-- [render.ts:104-111](crates/js/lib/src/core/render.ts#L104-L111) -- sandbox with `allow-scripts` + `allow-same-origin`
-- [render.ts:133-137](crates/js/lib/src/core/render.ts#L133-L137) -- `buildCreativeDocument` does raw string replace
-- [auction.ts:141-172](crates/js/lib/src/core/auction.ts#L141-L172) -- `parseAuctionResponse` passes `adm` straight through
+- `request.ts:77-102` -- `iframe.srcdoc = buildCreativeDocument(creativeHtml)`
+- `render.ts:104-111` -- sandbox with `allow-scripts` + `allow-same-origin`
+- `render.ts:133-137` -- `buildCreativeDocument` does raw string replace
+- `auction.ts:141-172` -- `parseAuctionResponse` passes `adm` straight through
 
 **Recommendation:** Either (a) remove `allow-same-origin` if creatives don't
 need it, (b) serve creatives from a separate origin, or (c) sanitize `adm` with
@@ -104,9 +104,9 @@ original prototype methods, so SPA contexts and test runs accumulate wrappers.
 
 **Refs:**
 
-- [shared/script_guard.ts:155-191](crates/js/lib/src/shared/script_guard.ts#L155-L191) -- shared factory patches
-- [gpt/script_guard.ts:432-450](crates/js/lib/src/integrations/gpt/script_guard.ts#L432-L450) -- independent GPT patch
-- [shared/script_guard.ts:197-199](crates/js/lib/src/shared/script_guard.ts#L197-L199) -- `reset()` doesn't restore originals
+- `shared/script_guard.ts:155-191` -- shared factory patches
+- `gpt/script_guard.ts:432-450` -- independent GPT patch
+- `shared/script_guard.ts:197-199` -- `reset()` doesn't restore originals
 
 **Recommendation:** Use a centralized dispatcher -- single prototype patch,
 register per-integration handlers. Implement proper `reset()` that restores
@@ -123,10 +123,10 @@ TOML edit), the service crashes on first matching request.
 
 **Refs:**
 
-- [settings.rs:255](crates/common/src/settings.rs#L255) -- `Regex::new(&self.path).expect(...)`
-- [script_rewriter.rs:125](crates/common/src/integrations/nextjs/script_rewriter.rs#L125) -- `Regex::new(&pattern).expect(...)`
-- [script_rewriter.rs:141](crates/common/src/integrations/nextjs/script_rewriter.rs#L141) -- `Regex::new(&pattern).expect(...)`
-- [shared.rs:83](crates/common/src/integrations/nextjs/shared.rs#L83) -- `Regex::new(...).expect(...)`
+- `settings.rs:255` -- `Regex::new(&self.path).expect(...)`
+- `script_rewriter.rs:125` -- `Regex::new(&pattern).expect(...)`
+- `script_rewriter.rs:141` -- `Regex::new(&pattern).expect(...)`
+- `shared.rs:83` -- `Regex::new(...).expect(...)`
 
 **Recommendation:** Return `Result` from these constructors; catch at startup
 with a descriptive error message.
@@ -145,13 +145,13 @@ globally set to debug level.
 
 **Refs:**
 
-- [main.rs:42](crates/fastly/src/main.rs#L42) -- `log::info!("Settings {settings:?}")`
-- [main.rs:177](crates/fastly/src/main.rs#L177) -- logger level set to debug
-- [synthetic.rs:99](crates/common/src/synthetic.rs#L99) -- logs HMAC input (IP, UA)
-- [synthetic.rs:112](crates/common/src/synthetic.rs#L112) -- logs synthetic ID details
-- [prebid.rs:832](crates/common/src/integrations/prebid.rs#L832) -- logs full bid response
-- [aps.rs:444](crates/common/src/integrations/aps.rs#L444) -- logs APS response
-- [adserver_mock.rs:284](crates/common/src/integrations/adserver_mock.rs#L284) -- logs mock response
+- `main.rs:42` -- `log::info!("Settings {settings:?}")`
+- `main.rs:177` -- logger level set to debug
+- `synthetic.rs:99` -- logs HMAC input (IP, UA)
+- `synthetic.rs:112` -- logs synthetic ID details
+- `prebid.rs:832` -- logs full bid response
+- `aps.rs:444` -- logs APS response
+- `adserver_mock.rs:284` -- logs mock response
 
 **Recommendation:** Implement a `Redacted<T>` wrapper for secret fields that
 prints `[REDACTED]` in `Debug`/`Display`. Set production log level to `INFO` or
@@ -168,10 +168,10 @@ requests when the auction timeout is reached.
 
 **Refs:**
 
-- [endpoints.rs:51](crates/common/src/auction/endpoints.rs#L51) -- `timeout_ms: settings.auction.timeout_ms`
-- [provider.rs:54](crates/common/src/auction/provider.rs#L54) -- `fn timeout_ms(&self) -> u32`
-- [orchestrator.rs:287](crates/common/src/auction/orchestrator.rs#L287) -- `while !remaining.is_empty() { select(remaining) }`
-- [backend.rs:118-119](crates/common/src/backend.rs#L118-L119) -- hardcoded 15s first_byte_timeout
+- `endpoints.rs:51` -- `timeout_ms: settings.auction.timeout_ms`
+- `provider.rs:54` -- `fn timeout_ms(&self) -> u32`
+- `orchestrator.rs:287` -- `while !remaining.is_empty() { select(remaining) }`
+- `backend.rs:118-119` -- hardcoded 15s first_byte_timeout
 
 **Recommendation:** Implement a deadline-based loop that drops remaining pending
 requests when `timeout_ms` elapses, returning partial results.
@@ -187,10 +187,10 @@ the single check. A deployment using defaults has predictable encryption keys.
 
 **Refs:**
 
-- [trusted-server.toml:10](trusted-server.toml#L10) -- `proxy_secret = "change-me-proxy-secret"`
-- [trusted-server.toml:15](trusted-server.toml#L15) -- `secret_key = "trusted-server"`
-- [settings.rs:197](crates/common/src/settings.rs#L197) -- `Settings::validate()` -- no proxy_secret check
-- [settings_data.rs:37](crates/common/src/settings_data.rs#L37) -- only checks `== "secret-key"`
+- `trusted-server.toml:10` -- `proxy_secret = "change-me-proxy-secret"`
+- `trusted-server.toml:15` -- `secret_key = "trusted-server"`
+- `settings.rs:197` -- `Settings::validate()` -- no proxy_secret check
+- `settings_data.rs:37` -- only checks `== "secret-key"`
 
 **Recommendation:** Reject all known placeholder values for both secrets.
 Consider minimum entropy requirements.
@@ -207,7 +207,7 @@ through the first-party proxy.
 
 **Refs:**
 
-- [gpt/script_guard.ts:206-230](crates/js/lib/src/integrations/gpt/script_guard.ts#L206-L230) -- `rewriteHtmlString` regex
+- `gpt/script_guard.ts:206-230` -- `rewriteHtmlString` regex
 
 **Recommendation:** Use DOM-based parsing (`DOMParser`) instead of regex, or
 fail-closed (block unmatched URLs rather than passing through).
@@ -222,11 +222,11 @@ converts it to `None`, making the integration appear "not configured" rather tha
 
 **Refs:**
 
-- [prebid.rs:211-212](crates/common/src/integrations/prebid.rs#L211-L212) -- `.ok().flatten()?`
-- [nextjs/mod.rs:97-99](crates/common/src/integrations/nextjs/mod.rs#L97-L99) -- `.ok().flatten()?`
-- [adserver_mock.rs:373](crates/common/src/integrations/adserver_mock.rs#L373) -- `BackendConfig::from_url(...).ok()`
-- [aps.rs:521](crates/common/src/integrations/aps.rs#L521) -- `BackendConfig::from_url(...).ok()`
-- [prebid.rs:950](crates/common/src/integrations/prebid.rs#L950) -- `BackendConfig::from_url(...).ok()`
+- `prebid.rs:211-212` -- `.ok().flatten()?`
+- `nextjs/mod.rs:97-99` -- `.ok().flatten()?`
+- `adserver_mock.rs:373` -- `BackendConfig::from_url(...).ok()`
+- `aps.rs:521` -- `BackendConfig::from_url(...).ok()`
+- `prebid.rs:950` -- `BackendConfig::from_url(...).ok()`
 
 **Recommendation:** Log a warning with the error before converting to `None`, or
 fail the integration registration with a clear message.
@@ -244,7 +244,7 @@ with `evil.com`.
 
 **Refs:**
 
-- [http_util.rs:55-75](crates/common/src/http_util.rs#L55-L75) -- `extract_request_host` trusts forwarded headers
+- `http_util.rs:55-75` -- `extract_request_host` trusts forwarded headers
 
 **Recommendation:** Strip or validate forwarded headers at the Fastly VCL layer,
 or validate against a configured allowlist.
@@ -258,9 +258,9 @@ standard `==` comparison, enabling timing side-channel attacks.
 
 **Refs:**
 
-- [proxy.rs:1054-1058](crates/common/src/proxy.rs#L1054-L1058) -- `expected != sig`
-- [http_util.rs:289-291](crates/common/src/http_util.rs#L289-L291) -- `sign_clear_url(...) == token`
-- [auth.rs:17-18](crates/common/src/auth.rs#L17-L18) -- `password == handler.password`
+- `proxy.rs:1054-1058` -- `expected != sig`
+- `http_util.rs:289-291` -- `sign_clear_url(...) == token`
+- `auth.rs:17-18` -- `password == handler.password`
 
 **Recommendation:** Use `subtle::ConstantTimeEq` (already in dependency tree via
 crypto crates).
@@ -275,7 +275,7 @@ Any XSS on the publisher's page can exfiltrate this tracking identifier via
 
 **Refs:**
 
-- [cookies.rs:67-72](crates/common/src/cookies.rs#L67-L72) -- `create_synthetic_cookie` format string
+- `cookies.rs:67-72` -- `create_synthetic_cookie` format string
 
 **Recommendation:** Add `HttpOnly` if client-side JS doesn't need to read this
 cookie directly (it already gets the value via the `x-synthetic-id` header).
@@ -291,9 +291,9 @@ third-party APIs.
 
 **Refs:**
 
-- [synthetic.rs:129-153](crates/common/src/synthetic.rs#L129-L153) -- `get_synthetic_id` accepts any string
-- [publisher.rs:336](crates/common/src/publisher.rs#L336) -- set as response header
-- [proxy.rs:442](crates/common/src/proxy.rs#L442) -- forwarded as query parameter
+- `synthetic.rs:129-153` -- `get_synthetic_id` accepts any string
+- `publisher.rs:336` -- set as response header
+- `proxy.rs:442` -- forwarded as query parameter
 
 **Recommendation:** Validate against the expected format (64 hex + dot + 6
 alphanumeric) in production code, not just tests.
@@ -308,7 +308,7 @@ cookie attributes (e.g., `evil; Domain=.attacker.com`).
 
 **Refs:**
 
-- [cookies.rs:67-72](crates/common/src/cookies.rs#L67-L72) -- `format!("...={}; Domain=...", synthetic_id, ...)`
+- `cookies.rs:67-72` -- `format!("...={}; Domain=...", synthetic_id, ...)`
 
 **Recommendation:** Validate/sanitize the value before interpolation, or use a
 cookie builder library.
@@ -324,8 +324,8 @@ URL redirects.
 
 **Refs:**
 
-- [proxy.rs:600-621](crates/common/src/proxy.rs#L600-L621) -- `handle_first_party_proxy`
-- [proxy.rs:463-582](crates/common/src/proxy.rs#L463-L582) -- `proxy_with_redirects` follows redirects
+- `proxy.rs:600-621` -- `handle_first_party_proxy`
+- `proxy.rs:463-582` -- `proxy_with_redirects` follows redirects
 
 **Recommendation:** Validate redirect targets against an allowlist or block
 private IP ranges.
@@ -340,9 +340,9 @@ The gzip+HTML path reads the entire decompressed body into memory, then the
 
 **Refs:**
 
-- [streaming_processor.rs:196](crates/common/src/streaming_processor.rs#L196) -- `decoder.read_to_end(&mut decompressed)`
-- [streaming_processor.rs:398](crates/common/src/streaming_processor.rs#L398) -- `HtmlRewriterAdapter::accumulated_input`
-- [publisher.rs:129](crates/common/src/publisher.rs#L129) -- `process_response_streaming` collects into `Vec<u8>`
+- `streaming_processor.rs:196` -- `decoder.read_to_end(&mut decompressed)`
+- `streaming_processor.rs:398` -- `HtmlRewriterAdapter::accumulated_input`
+- `publisher.rs:129` -- `process_response_streaming` collects into `Vec<u8>`
 
 **Recommendation:** Feed chunks incrementally to `lol_html::HtmlRewriter`
 instead of accumulating. Use the streaming `process_through_compression` path
@@ -358,10 +358,10 @@ are repeated for every incoming request.
 
 **Refs:**
 
-- [main.rs:35](crates/fastly/src/main.rs#L35) -- `get_settings()` per request
-- [main.rs:45](crates/fastly/src/main.rs#L45) -- `build_orchestrator()` per request
-- [main.rs:47](crates/fastly/src/main.rs#L47) -- `IntegrationRegistry::new()` per request
-- [settings_data.rs:28-32](crates/common/src/settings_data.rs#L28-L32) -- TOML parsing + validation
+- `main.rs:35` -- `get_settings()` per request
+- `main.rs:45` -- `build_orchestrator()` per request
+- `main.rs:47` -- `IntegrationRegistry::new()` per request
+- `settings_data.rs:28-32` -- TOML parsing + validation
 
 **Recommendation:** Cache parsed settings and registry in `OnceLock` or
 equivalent per-instance state (Fastly Compute instances can reuse across
@@ -378,9 +378,9 @@ host/scheme values.
 
 **Refs:**
 
-- [prebid.rs:904](crates/common/src/integrations/prebid.rs#L904) -- reads `request_host` from response JSON
-- [prebid.rs:911](crates/common/src/integrations/prebid.rs#L911) -- reads `request_scheme` from response JSON
-- [prebid.rs:922](crates/common/src/integrations/prebid.rs#L922) -- passes them to `transform_prebid_response`
+- `prebid.rs:904` -- reads `request_host` from response JSON
+- `prebid.rs:911` -- reads `request_scheme` from response JSON
+- `prebid.rs:922` -- passes them to `transform_prebid_response`
 
 **Recommendation:** Use the local request's host/scheme from `RequestInfo`
 instead of the bidder's response body.
@@ -396,8 +396,8 @@ should be computed once.
 
 **Refs:**
 
-- [bundle.rs:50-55](crates/js/src/bundle.rs#L50-L55) -- `concatenated_hash` allocates full bundle
-- [tsjs.rs:7](crates/common/src/tsjs.rs#L7) -- called on every HTML response
+- `bundle.rs:50-55` -- `concatenated_hash` allocates full bundle
+- `tsjs.rs:7` -- called on every HTML response
 
 **Recommendation:** Hash modules incrementally without concatenation, and cache
 the result in a `OnceLock`.
@@ -412,7 +412,7 @@ dozens to hundreds of these.
 
 **Refs:**
 
-- [html_processor.rs:128-177](crates/common/src/html_processor.rs#L128-L177) -- 5 methods each allocating a String
+- `html_processor.rs:128-177` -- 5 methods each allocating a String
 
 **Recommendation:** Pre-compute these strings once and store as fields in
 `UrlPatterns`.
@@ -426,8 +426,8 @@ Bid width/height from external bidder responses are cast from `u64` to `u32` via
 
 **Refs:**
 
-- [prebid.rs:751-755](crates/common/src/integrations/prebid.rs#L751-L755) -- `as u32` truncation
-- [adserver_mock.rs:235-236](crates/common/src/integrations/adserver_mock.rs#L235-L236) -- `as u32` truncation
+- `prebid.rs:751-755` -- `as u32` truncation
+- `adserver_mock.rs:235-236` -- `as u32` truncation
 
 **Recommendation:** Use `u32::try_from()` or `.min(u32::MAX as u64) as u32`.
 
@@ -441,9 +441,9 @@ on each bundle re-evaluation, creating memory leaks and callback overhead.
 
 **Refs:**
 
-- [creative/click.ts:355-359](crates/js/lib/src/integrations/creative/click.ts#L355-L359)
-- [creative/dynamic_src_guard.ts:160-165](crates/js/lib/src/integrations/creative/dynamic_src_guard.ts#L160-L165)
-- [gpt/script_guard.ts:499-504](crates/js/lib/src/integrations/gpt/script_guard.ts#L499-L504)
+- `creative/click.ts:355-359`
+- `creative/dynamic_src_guard.ts:160-165`
+- `gpt/script_guard.ts:499-504`
 
 **Recommendation:** Expose `disconnect()` APIs. Consider a shared observer with
 multiple handlers. Only install when needed.
@@ -458,8 +458,8 @@ closes, and the shim is silently skipped.
 
 **Refs:**
 
-- [lockr/index.ts:82-101](crates/js/lib/src/integrations/lockr/index.ts#L82-L101)
-- [permutive/index.ts:81-100](crates/js/lib/src/integrations/permutive/index.ts#L81-L100)
+- `lockr/index.ts:82-101`
+- `permutive/index.ts:81-100`
 
 **Recommendation:** Increase timeout, use exponential backoff, or add
 event-based detection (MutationObserver on script insertion).
@@ -474,7 +474,7 @@ semantics will find an empty bid state.
 
 **Refs:**
 
-- [core/request.ts:15-60](crates/js/lib/src/core/request.ts#L15-L60) -- callback at line 55
+- `core/request.ts:15-60` -- callback at line 55
 
 **Recommendation:** Fire callback inside `.then()` after rendering, or document
 the difference from Prebid's contract.
@@ -489,7 +489,7 @@ All JSON API responses chain `.with_content_type(APPLICATION_JSON)` then
 
 **Refs:**
 
-- [endpoints.rs:49-51](crates/common/src/request_signing/endpoints.rs#L49-L51) -- repeated across 6 endpoints
+- `endpoints.rs:49-51` -- repeated across 6 endpoints
 
 **Recommendation:** Use `.with_body()` instead of `.with_body_text_plain()`.
 
@@ -499,84 +499,84 @@ All JSON API responses chain `.with_content_type(APPLICATION_JSON)` then
 
 ### L-1: Lockr regex compiled per request
 
-**Ref:** [lockr.rs:123-126](crates/common/src/integrations/lockr.rs#L123-L126)
+**Ref:** `lockr.rs:123-126`
 
 Should use `Lazy<Regex>` like other integrations (datadome, nextjs).
 
 ### L-2: `serve_static_with_etag` rehashes body already hashed for URL
 
-**Ref:** [http_util.rs:182-186](crates/common/src/http_util.rs#L182-L186)
+**Ref:** `http_util.rs:182-186`
 
 The SHA-256 hash is computed twice for the same static content.
 
 ### L-3: Handlebars engine created per request in synthetic ID generation
 
-**Ref:** [synthetic.rs:84](crates/common/src/synthetic.rs#L84)
+**Ref:** `synthetic.rs:84`
 
 Template engine should be initialized once.
 
 ### L-4: ETag comparison doesn't handle multi-value `If-None-Match`
 
-**Ref:** [http_util.rs:188-192](crates/common/src/http_util.rs#L188-L192)
+**Ref:** `http_util.rs:188-192`
 
 Per RFC 7232, `If-None-Match` can contain comma-separated ETags.
 
 ### L-5: `image/*` is not a valid Content-Type
 
-**Ref:** [proxy.rs:247-248](crates/common/src/proxy.rs#L247-L248)
+**Ref:** `proxy.rs:247-248`
 
 Wildcard MIME types are only valid in Accept headers. Use
 `application/octet-stream`.
 
 ### L-6: Proxy errors return 502 for client-caused failures
 
-**Ref:** [error.rs:107](crates/common/src/error.rs#L107)
+**Ref:** `error.rs:107`
 
 "Missing tsurl", "invalid tstoken", "expired tsexp" should be 400/403.
 
 ### L-7: Body re-sent on 301/302 redirects
 
-**Ref:** [proxy.rs:503-506](crates/common/src/proxy.rs#L503-L506)
+**Ref:** `proxy.rs:503-506`
 
 Per HTTP spec, only 307/308 should preserve body.
 
 ### L-8: `rewrite_attribute` allocates String even when no rewriters match
 
-**Ref:** [registry.rs:696](crates/common/src/integrations/registry.rs#L696)
+**Ref:** `registry.rs:696`
 
 Use `Cow<str>` to avoid allocation on the common no-match path.
 
 ### L-9: `StreamingReplacer` clones overlap buffer + N+1 String allocs per chunk
 
-**Ref:** [streaming_replacer.rs:63](crates/common/src/streaming_replacer.rs#L63)
+**Ref:** `streaming_replacer.rs:63`
 
 Clone on empty buffer and chained `String::replace()` per replacement pattern.
 
 ### L-10: `Compression::from_content_encoding` allocates String for case comparison
 
-**Ref:** [streaming_processor.rs:46-53](crates/common/src/streaming_processor.rs#L46-L53)
+**Ref:** `streaming_processor.rs:46-53`
 
 Use `eq_ignore_ascii_case` instead of `.to_lowercase()`.
 
 ### L-11: `all_module_ids()` allocates Vec on every call
 
-**Ref:** [bundle.rs:17-19](crates/js/src/bundle.rs#L17-L19)
+**Ref:** `bundle.rs:17-19`
 
 Return from a `OnceLock` or return an iterator.
 
 ### L-12: No `X-Content-Type-Options: nosniff` on server-generated responses
 
-**Refs:** [http_util.rs:204](crates/common/src/http_util.rs#L204), [error.rs:18](crates/fastly/src/error.rs#L18)
+**Refs:** `http_util.rs:204`, `error.rs:18`
 
 ### L-13: Error responses expose internal error context to clients
 
-**Ref:** [error.rs:17-18](crates/fastly/src/error.rs#L17-L18)
+**Ref:** `error.rs:17-18`
 
 `user_message()` includes configuration/proxy error strings.
 
 ### L-14: Static JS bundles cached for only 300 seconds despite cache-busting hash
 
-**Ref:** [http_util.rs:207-208](crates/common/src/http_util.rs#L207-L208)
+**Ref:** `http_util.rs:207-208`
 
 With `?v={hash}` query strings, `max-age` could be much longer (1 year).
 
@@ -587,7 +587,7 @@ With `?v={hash}` query strings, `max-age` could be much longer (1 year).
 1. Assumes `handlers` are the only auth gate for admin endpoints (C-2).
 2. If Fastly reuses instances, repeated logger init via `.apply()` could become
    a runtime foot-gun; worth validating in the runtime model
-   ([main.rs:197](crates/fastly/src/main.rs#L197)).
+   (`main.rs:197`).
 3. The creative HTML injection (C-3) severity depends on whether upstream bidder
    responses are already considered trusted. In an open RTB context they are not.
 4. Per-request settings parsing (M-8) may be inherent to Fastly Compute's
