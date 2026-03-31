@@ -496,13 +496,19 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
             if ctx.gpc {
                 return false;
             }
+            // When a CMP uses TCF in the US (e.g. Didomi), respect the
+            // TCF Purpose 1 decision — this is an explicit opt-in signal.
+            if let Some(tcf) = effective_tcf(ctx) {
+                return tcf.has_storage_consent();
+            }
             // Check US Privacy string for explicit opt-out.
             if let Some(usp) = &ctx.us_privacy {
-                usp.opt_out_sale != PrivacyFlag::Yes
-            } else {
-                // No opt-out signals present — allow under opt-out model.
-                true
+                return usp.opt_out_sale != PrivacyFlag::Yes;
             }
+            // Spec §6.1.1: "In regulated jurisdictions (GDPR, US state),
+            // consent cookies/headers must be present for
+            // allows_ec_creation() to return true." No signals = block.
+            false
         }
         jurisdiction::Jurisdiction::NonRegulated => true,
         // No geolocation data — cannot determine jurisdiction.
@@ -1014,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn ec_allowed_us_state_no_signals() {
+    fn ec_blocked_us_state_no_signals() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: None,
@@ -1022,8 +1028,8 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "US state + no opt-out signals should allow EC (opt-out model)"
+            !allows_ec_creation(&ctx),
+            "US state + no consent signals should block EC (spec §6.1.1: fail-closed)"
         );
     }
 
@@ -1085,6 +1091,65 @@ mod tests {
         assert!(
             allows_ec_creation(&ctx),
             "US Privacy with opt_out=N/A should allow EC"
+        );
+    }
+
+    #[test]
+    fn ec_allowed_us_state_tcf_with_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "US state + TCF Purpose 1 consented should allow EC (Didomi-style CMP)"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_tcf_without_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(false)),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US state + TCF Purpose 1 denied should block EC"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_tcf() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC should block EC even when TCF grants storage consent in US state"
+        );
+    }
+
+    #[test]
+    fn ec_allowed_us_state_tcf_takes_priority_over_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::Yes,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "TCF consent should take priority over US Privacy opt-out when both present"
         );
     }
 }
