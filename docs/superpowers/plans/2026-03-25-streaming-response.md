@@ -821,7 +821,20 @@ In `main.rs`, make `finalize_response` callable from the publisher path.
 Either make it `pub` and move to `trusted-server-core`, or pass a
 pre-finalized response to the streaming path.
 
-- [ ] **Step 2: Add streaming gate check**
+- [ ] **Step 2: Add `has_html_post_processors()` to `IntegrationRegistry`**
+
+Add a method that returns `bool` to avoid the allocation that
+`html_post_processors()` incurs (cloning `Vec<Arc<dyn ...>>`):
+
+```rust
+pub fn has_html_post_processors(&self) -> bool {
+    !self.inner.html_post_processors.is_empty()
+}
+```
+
+**File:** `crates/trusted-server-core/src/integrations/registry.rs`
+
+- [ ] **Step 3: Add streaming gate check**
 
 Add a helper in `publisher.rs`:
 
@@ -834,19 +847,25 @@ fn should_stream(
     if !(200..300).contains(&status) {
         return false;
     }
+    // Use has_html_post_processors() to avoid allocating a Vec<Arc<...>>
+    // just to check emptiness.
     // Only html_post_processors gate streaming — NOT script_rewriters.
     // Script rewriters (Next.js, GTM) run inside lol_html element handlers
     // during streaming and do not require full-document buffering.
     // Currently only Next.js registers a post-processor.
     let is_html = content_type.contains("text/html");
-    if is_html && !integration_registry.html_post_processors().is_empty() {
+    if is_html && integration_registry.has_html_post_processors() {
         return false;
     }
     true
 }
 ```
 
-- [ ] **Step 3: Restructure `handle_publisher_request` to support streaming**
+- [ ] **Step 4: Restructure `handle_publisher_request` to support streaming**
+
+> **Note:** This step may need adjustment to align with the EC (Edge Compute)
+> implementation. Coordinate with the EC work before finalizing the
+> restructuring approach.
 
 Split the function into:
 1. Pre-processing: request info, cookies, synthetic ID, consent, backend
@@ -879,7 +898,7 @@ if should_stream {
 }
 ```
 
-- [ ] **Step 4: Handle binary pass-through in streaming path**
+- [ ] **Step 5: Handle binary pass-through in streaming path**
 
 For non-text content when streaming is enabled:
 
@@ -895,19 +914,19 @@ if !should_process {
 }
 ```
 
-- [ ] **Step 5: Run all tests**
+- [ ] **Step 6: Run all tests**
 
 Run: `cargo test --workspace`
 
 Expected: All tests pass.
 
-- [ ] **Step 6: Build for WASM target**
+- [ ] **Step 7: Build for WASM target**
 
 Run: `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
 
 Expected: Builds successfully.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```
 git add crates/trusted-server-core/src/publisher.rs \

@@ -27,10 +27,12 @@ JS, auction, discovery).
 Before committing to `stream_to_client()`, check:
 
 1. Backend status is success (2xx).
-2. For HTML content: `html_post_processors()` is empty — no registered
-   post-processors. Non-HTML content types (text/JSON, RSC Flight, binary) can
-   always stream regardless of post-processor registration, since
-   post-processors only apply to HTML.
+2. For HTML content: `has_html_post_processors()` returns false — no registered
+   post-processors. This method returns a `bool` directly, avoiding the
+   allocation of cloning the `Vec<Arc<dyn IntegrationHtmlPostProcessor>>` that
+   `html_post_processors()` performs. Non-HTML content types (text/JSON, RSC
+   Flight, binary) can always stream regardless of post-processor registration,
+   since post-processors only apply to HTML.
 
 If either check fails for the given content type, fall back to the current
 buffered path. This keeps the optimization transparent: same behavior for all
@@ -100,8 +102,8 @@ Change the publisher proxy path to use Fastly's `StreamingBody` API:
 1. Fetch from origin, receive response headers.
 2. Validate status — if backend error, return buffered error response via
    `send_to_client()`.
-3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
-   to buffered path.
+3. Check streaming gate — if `has_html_post_processors()` returns true, fall
+   back to buffered path.
 4. Finalize all response headers. This requires reordering two things:
    - **Synthetic ID/cookie headers**: today set _after_ body processing in
      `handle_publisher_request`. Since they are body-independent (computed from
@@ -186,7 +188,7 @@ No decompression, no processing. Body streams through as read.
 ### Buffered fallback path (error responses or post-processors present)
 
 ```
-Origin returns 4xx/5xx OR html_post_processors() is non-empty
+Origin returns 4xx/5xx OR has_html_post_processors() is true
   → Current buffered path unchanged
   → send_to_client() with proper status and full body
 ```
@@ -236,8 +238,8 @@ remains in place — no need to bypass it.
 Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 `html_post_processors`. Script rewriters run inside `lol_html` element handlers
 during streaming — they do not require buffering and are unaffected by this
-change. The streaming gate checks only `html_post_processors().is_empty()`, not
-script rewriters. Currently only Next.js registers a post-processor.
+change. The streaming gate checks only `has_html_post_processors()`, not script
+rewriters. Currently only Next.js registers a post-processor.
 
 ## Rollback Strategy
 
@@ -260,9 +262,9 @@ improvements.
 
 ### Integration tests (publisher.rs)
 
-- Streaming gate: when `html_post_processors()` is non-empty, response is
+- Streaming gate: when `has_html_post_processors()` is true, response is
   buffered.
-- Streaming gate: when `html_post_processors()` is empty, response streams.
+- Streaming gate: when `has_html_post_processors()` is false, response streams.
 - Backend error (4xx/5xx) returns buffered error response with correct status.
 - Binary content passes through without processing.
 
