@@ -652,6 +652,9 @@ Expected: Builds successfully.
 
 ## Phase 2: Stream Response to Client
 
+> **Note:** Phase 2 may need adjustment to align with the EC (Edge Compute)
+> implementation. Coordinate with the EC work before finalizing the approach.
+
 ### Task 6: Migrate entry point from `#[fastly::main]` to raw `main()`
 
 **Files:**
@@ -862,10 +865,6 @@ fn should_stream(
 ```
 
 - [ ] **Step 4: Restructure `handle_publisher_request` to support streaming**
-
-> **Note:** This step may need adjustment to align with the EC (Edge Compute)
-> implementation. Coordinate with the EC work before finalizing the
-> restructuring approach.
 
 Split the function into:
 1. Pre-processing: request info, cookies, synthetic ID, consent, backend

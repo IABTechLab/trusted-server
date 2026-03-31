@@ -97,6 +97,9 @@ before or with Step 1B.
 
 ### Step 2: Stream response to client
 
+> **Note:** Step 2 may need adjustment to align with the EC (Edge Compute)
+> implementation. Coordinate with the EC work before finalizing the approach.
+
 Change the publisher proxy path to use Fastly's `StreamingBody` API:
 
 1. Fetch from origin, receive response headers.
