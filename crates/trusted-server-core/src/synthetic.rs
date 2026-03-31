@@ -236,7 +236,7 @@ mod tests {
     use fastly::http::{HeaderName, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
     use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
 
     #[test]
@@ -295,6 +295,37 @@ mod tests {
         assert!(
             is_valid_synthetic_id(&synthetic_id),
             "should match synthetic ID format"
+        );
+    }
+
+    #[test]
+    fn test_generate_synthetic_id_uses_client_ip() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![(header::USER_AGENT, "Mozilla/5.0")]);
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+
+        // Arrange: two service instances — one with a real IP, one without
+        let id_with_ip = generate_synthetic_id(&settings, &noop_services_with_client_ip(ip), &req)
+            .expect("should generate synthetic ID with client IP");
+        let id_without_ip = generate_synthetic_id(&settings, &noop_services(), &req)
+            .expect("should generate synthetic ID without client IP");
+
+        // Assert: both produce valid format
+        assert!(
+            is_valid_synthetic_id(&id_with_ip),
+            "should produce valid format when client IP is present"
+        );
+        assert!(
+            is_valid_synthetic_id(&id_without_ip),
+            "should produce valid format when client IP is absent"
+        );
+
+        // Assert: HMAC parts differ because client_ip changes the template input
+        let hmac_with_ip = id_with_ip.split_once('.').expect("should contain dot").0;
+        let hmac_without_ip = id_without_ip.split_once('.').expect("should contain dot").0;
+        assert_ne!(
+            hmac_with_ip, hmac_without_ip,
+            "should produce different HMAC when client IP differs"
         );
     }
 

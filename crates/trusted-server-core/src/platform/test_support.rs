@@ -279,6 +279,22 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(ip),
+            tls_protocol: None,
+            tls_cipher: None,
+        })
+        .build()
+}
+
 /// Build a [`RuntimeServices`] with a [`StubBackend`] and the given HTTP client.
 ///
 /// Useful for tests that need to verify `services.http_client()` call sites.
