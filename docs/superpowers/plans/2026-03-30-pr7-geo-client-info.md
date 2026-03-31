@@ -12,25 +12,26 @@
 
 ## File Map
 
-| File | Change |
-|------|--------|
-| `crates/trusted-server-core/src/auction/types.rs` | Add `client_info: &'a ClientInfo` to `AuctionContext<'a>` |
-| `crates/trusted-server-core/src/auction/endpoints.rs` | Fix `AuctionContext` construction; thread `services` to `generate_synthetic_id`; replace `GeoInfo::from_request` with `services.geo().lookup()`; update `convert_tsjs_to_auction_request` call |
-| `crates/trusted-server-core/src/auction/orchestrator.rs` | Fix 2 production `AuctionContext` constructions + 1 test helper |
-| `crates/trusted-server-core/src/integrations/prebid.rs` | Update 2 `RequestInfo::from_request` call sites; update 2 test helpers |
-| `crates/trusted-server-core/src/http_util.rs` | Change `from_request` to `(req: &Request, client_info: &ClientInfo)`; update `detect_request_scheme`; update 8 test call sites; add 1 new TLS test |
-| `crates/trusted-server-core/src/publisher.rs` | Add `services: &RuntimeServices` param; update `from_request`, `get_or_generate_synthetic_id`, and geo call sites |
-| `crates/trusted-server-core/src/synthetic.rs` | Add `services: &RuntimeServices` to `generate_synthetic_id` and `get_or_generate_synthetic_id`; update tests |
-| `crates/trusted-server-core/src/auction/formats.rs` | Add `services: &RuntimeServices, geo: Option<GeoInfo>` params; thread services to `generate_synthetic_id`; replace `DeviceInfo.ip` and `DeviceInfo.geo` Fastly calls |
-| `crates/trusted-server-core/src/integrations/registry.rs` | Thread `services` to `get_or_generate_synthetic_id` |
-| `crates/trusted-server-core/src/integrations/didomi.rs` | Rename `_services` → `services`; add `client_ip: Option<IpAddr>` to `copy_headers` |
-| `crates/trusted-server-adapter-fastly/src/main.rs` | Pass `&runtime_services` to `handle_publisher_request` |
+| File                                                      | Change                                                                                                                                                                                         |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/auction/types.rs`         | Add `client_info: &'a ClientInfo` to `AuctionContext<'a>`                                                                                                                                      |
+| `crates/trusted-server-core/src/auction/endpoints.rs`     | Fix `AuctionContext` construction; thread `services` to `generate_synthetic_id`; replace `GeoInfo::from_request` with `services.geo().lookup()`; update `convert_tsjs_to_auction_request` call |
+| `crates/trusted-server-core/src/auction/orchestrator.rs`  | Fix 2 production `AuctionContext` constructions + 1 test helper                                                                                                                                |
+| `crates/trusted-server-core/src/integrations/prebid.rs`   | Update 2 `RequestInfo::from_request` call sites; update 2 test helpers                                                                                                                         |
+| `crates/trusted-server-core/src/http_util.rs`             | Change `from_request` to `(req: &Request, client_info: &ClientInfo)`; update `detect_request_scheme`; update 8 test call sites; add 1 new TLS test                                             |
+| `crates/trusted-server-core/src/publisher.rs`             | Add `services: &RuntimeServices` param; update `from_request`, `get_or_generate_synthetic_id`, and geo call sites                                                                              |
+| `crates/trusted-server-core/src/synthetic.rs`             | Add `services: &RuntimeServices` to `generate_synthetic_id` and `get_or_generate_synthetic_id`; update tests                                                                                   |
+| `crates/trusted-server-core/src/auction/formats.rs`       | Add `services: &RuntimeServices, geo: Option<GeoInfo>` params; thread services to `generate_synthetic_id`; replace `DeviceInfo.ip` and `DeviceInfo.geo` Fastly calls                           |
+| `crates/trusted-server-core/src/integrations/registry.rs` | Thread `services` to `get_or_generate_synthetic_id`                                                                                                                                            |
+| `crates/trusted-server-core/src/integrations/didomi.rs`   | Rename `_services` → `services`; add `client_ip: Option<IpAddr>` to `copy_headers`                                                                                                             |
+| `crates/trusted-server-adapter-fastly/src/main.rs`        | Pass `&runtime_services` to `handle_publisher_request`                                                                                                                                         |
 
 ---
 
 ## Task 1: Add `client_info` to `AuctionContext` and fix all construction sites
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/types.rs:102-109`
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs:74-80`
 - Modify: `crates/trusted-server-core/src/auction/orchestrator.rs:145-150`
@@ -49,6 +50,7 @@
   ```
 
   Change the `AuctionContext` struct (around line 102):
+
   ```rust
   // Before:
   pub struct AuctionContext<'a> {
@@ -73,6 +75,7 @@
 - [ ] **Step 2: Fix `endpoints.rs` construction site (line ~75)**
 
   In `crates/trusted-server-core/src/auction/endpoints.rs`, update the `AuctionContext` struct literal:
+
   ```rust
   // Before:
   let context = AuctionContext {
@@ -97,6 +100,7 @@
   In `crates/trusted-server-core/src/auction/orchestrator.rs`:
 
   Line ~145 (mediator context):
+
   ```rust
   // Before:
   let mediator_context = AuctionContext {
@@ -117,6 +121,7 @@
   ```
 
   Line ~321 (provider context):
+
   ```rust
   // Before:
   let provider_context = AuctionContext {
@@ -171,6 +176,7 @@
   ```
 
   Then update every call site of `create_test_context` in the same file to pass:
+
   ```rust
   &crate::platform::ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }
   ```
@@ -210,6 +216,7 @@
   ```
 
   Update every `create_test_auction_context(settings, req)` call in `prebid.rs` to pass:
+
   ```rust
   create_test_auction_context(settings, req, &crate::platform::ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None })
   ```
@@ -263,6 +270,7 @@
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass.
 
 - [ ] **Step 8: Commit Task 1**
@@ -280,11 +288,13 @@
 ## Task 2: Change `RequestInfo::from_request` to take `&ClientInfo`, add `services` to `handle_publisher_request`, update `main.rs`
 
 These four changes must happen together because:
+
 - `publisher.rs` needs `services` to supply `&services.client_info` to `from_request`
 - `main.rs` must be updated when `publisher.rs` signature changes
 - `prebid.rs` can now use `context.client_info` (available since Task 1)
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/http_util.rs:89-94, 166-212, 393-562` (tests)
 - Modify: `crates/trusted-server-core/src/publisher.rs:290-294, 301`
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs:713, 1011`
@@ -293,11 +303,13 @@ These four changes must happen together because:
 - [ ] **Step 1: Update `http_util.rs` — change `from_request` signature and `detect_request_scheme`**
 
   Add `ClientInfo` to the imports in `crates/trusted-server-core/src/http_util.rs`. Look at the existing `use crate::` lines at the top and add:
+
   ```rust
   use crate::platform::ClientInfo;
   ```
 
   Change `RequestInfo::from_request` (line ~89):
+
   ```rust
   // Before:
   pub fn from_request(req: &Request) -> Self {
@@ -315,6 +327,7 @@ These four changes must happen together because:
   ```
 
   Change `detect_request_scheme` (line ~166):
+
   ```rust
   // Before:
   fn detect_request_scheme(req: &Request) -> String {
@@ -348,11 +361,13 @@ These four changes must happen together because:
 - [ ] **Step 2: Update `http_util.rs` tests — replace 8 `from_request` call sites**
 
   Add `ClientInfo` import to the `#[cfg(test)]` module. Look for the existing `use super::*;` line and add below it:
+
   ```rust
   use crate::platform::ClientInfo;
   ```
 
   Replace every `RequestInfo::from_request(&req)` in the test module with:
+
   ```rust
   RequestInfo::from_request(&req, &ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None })
   ```
@@ -385,11 +400,13 @@ These four changes must happen together because:
 - [ ] **Step 4: Add `services: &RuntimeServices` to `handle_publisher_request` in `publisher.rs`**
 
   In `crates/trusted-server-core/src/publisher.rs`, add the import (check if already imported):
+
   ```rust
   use crate::platform::RuntimeServices;
   ```
 
   Change the function signature (line ~290):
+
   ```rust
   // Before:
   pub fn handle_publisher_request(
@@ -408,6 +425,7 @@ These four changes must happen together because:
   ```
 
   Update the `RequestInfo::from_request` call (line ~301):
+
   ```rust
   // Before:
   let request_info = RequestInfo::from_request(&req);
@@ -421,6 +439,7 @@ These four changes must happen together because:
   `runtime_services` is already `&RuntimeServices` in `route_request` (line ~102), so no extra borrow is needed.
 
   In `crates/trusted-server-adapter-fastly/src/main.rs`, around line 195:
+
   ```rust
   // Before:
   match handle_publisher_request(settings, integration_registry, req) {
@@ -434,6 +453,7 @@ These four changes must happen together because:
   In `crates/trusted-server-core/src/integrations/prebid.rs`:
 
   Line ~713:
+
   ```rust
   // Before:
   let request_info = RequestInfo::from_request(context.request);
@@ -443,6 +463,7 @@ These four changes must happen together because:
   ```
 
   Line ~1011:
+
   ```rust
   // Before:
   let request_info = RequestInfo::from_request(context.request);
@@ -456,12 +477,14 @@ These four changes must happen together because:
   There are five locations that describe TLS as coming from "Fastly SDK" rather than `ClientInfo`. Update all of them:
 
   **Location 1 — `SPOOFABLE_FORWARDED_HEADERS` doc (line ~29-33):**
+
   ```
   // Before: "to fall back to the trustworthy `Host` header and Fastly SDK TLS detection."
   // After:  "to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection."
   ```
 
   **Location 2 — `RequestInfo` `scheme` field doc (line ~67):**
+
   ```
   // Before: "The effective scheme (typically from Fastly SDK TLS detection after edge sanitization)."
   // After:  "The effective scheme (typically from [`ClientInfo`] TLS detection after edge sanitization)."
@@ -469,6 +492,7 @@ These four changes must happen together because:
 
   **Location 3 — `RequestInfo` struct doc (line ~55-62):**
   The doc mentions "on the Fastly edge [`sanitize_forwarded_headers`] strips those headers before this method is called, so the `Host` header and Fastly SDK TLS detection are the effective sources in production." Update to:
+
   ```
   // Before: "so the `Host` header and Fastly SDK TLS detection are the effective
   //          sources in production."
@@ -477,6 +501,7 @@ These four changes must happen together because:
   ```
 
   **Location 4 — `from_request` doc (lines ~72-88):**
+
   ```
   // Before first line: "Extract request info from a Fastly request."
   // After:             "Extract request info from an incoming request."
@@ -489,6 +514,7 @@ These four changes must happen together because:
   ```
 
   **Location 5 — `detect_request_scheme` doc (line ~158-161):**
+
   ```
   // Before: "/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
   //          ///
@@ -535,6 +561,7 @@ These four changes must happen together because:
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass including the new TLS test.
 
 - [ ] **Step 10: Commit Task 2**
@@ -555,6 +582,7 @@ These four changes must happen together because:
 This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `formats.rs` also gets the `geo` parameter so DeviceInfo.geo no longer uses the deprecated call.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/synthetic.rs:96-99, 216-218`
 - Modify: `crates/trusted-server-core/src/auction/formats.rs:82-88, 91, 136-143`
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs:10-13, 52, 61-68, 71-72`
@@ -564,11 +592,13 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 1: Update `synthetic.rs` — add `services: &RuntimeServices` to both functions**
 
   In `crates/trusted-server-core/src/synthetic.rs`, add `RuntimeServices` to imports:
+
   ```rust
   use crate::platform::RuntimeServices;
   ```
 
   Change `generate_synthetic_id` (line ~96):
+
   ```rust
   // Before:
   pub fn generate_synthetic_id(
@@ -585,6 +615,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Inside the function, replace line ~100:
+
   ```rust
   // Before:
   let client_ip = req.get_client_ip_addr().map(normalize_ip);
@@ -594,6 +625,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Change `get_or_generate_synthetic_id` (line ~216):
+
   ```rust
   // Before:
   pub fn get_or_generate_synthetic_id(
@@ -610,6 +642,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Inside `get_or_generate_synthetic_id`, update the `generate_synthetic_id` call:
+
   ```rust
   // Before:
   let synthetic_id = generate_synthetic_id(settings, req)?;
@@ -621,11 +654,13 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 2: Update `synthetic.rs` tests — add `noop_services` import and thread to test calls**
 
   In the `#[cfg(test)]` module of `synthetic.rs`, add:
+
   ```rust
   use crate::platform::test_support::noop_services;
   ```
 
   Update every `generate_synthetic_id(&settings, &req)` call in the test module:
+
   ```rust
   // Before:
   generate_synthetic_id(&settings, &req)
@@ -635,6 +670,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Update every `get_or_generate_synthetic_id(&settings, &req)` call:
+
   ```rust
   // Before:
   get_or_generate_synthetic_id(&settings, &req)
@@ -646,17 +682,21 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 3: Update `formats.rs` — add `services` and `geo` params, fix IP and geo extraction**
 
   In `crates/trusted-server-core/src/auction/formats.rs`, add imports:
+
   ```rust
   use crate::platform::{GeoInfo, RuntimeServices};
   ```
+
   (Remove the existing `use crate::geo::GeoInfo;` if present — `GeoInfo` is re-exported from `platform`.)
 
   Actually check: `formats.rs` currently imports `use crate::geo::GeoInfo;` at line 19. Change to:
+
   ```rust
   use crate::platform::{GeoInfo, RuntimeServices};
   ```
 
   Change `convert_tsjs_to_auction_request` signature:
+
   ```rust
   // Before:
   pub fn convert_tsjs_to_auction_request(
@@ -680,6 +720,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Update the `generate_synthetic_id` call (line ~91):
+
   ```rust
   // Before:
   let fresh_id =
@@ -695,6 +736,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Replace `DeviceInfo` construction (lines ~136-143):
+
   ```rust
   // Before:
   let device = Some(DeviceInfo {
@@ -723,6 +765,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   Remove the `use crate::geo::GeoInfo;` import at line 10. After the change `GeoInfo` is no longer referenced by name in this file (the `geo` local's type is inferred from `services.geo().lookup()`). Leaving the import causes a clippy unused-import error.
 
   Update `get_or_generate_synthetic_id` call (line ~52):
+
   ```rust
   // Before:
   let synthetic_id = get_or_generate_synthetic_id(settings, &req).change_context(
@@ -732,6 +775,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Replace the deprecated `GeoInfo::from_request` call (lines ~60-61) with geo lookup:
+
   ```rust
   // Before:
   #[allow(deprecated)]
@@ -748,6 +792,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Update `convert_tsjs_to_auction_request` call (line ~71):
+
   ```rust
   // Before:
   let auction_request =
@@ -761,6 +806,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 5: Update `registry.rs` — thread `services` to `get_or_generate_synthetic_id`**
 
   In `crates/trusted-server-core/src/integrations/registry.rs`, line ~662:
+
   ```rust
   // Before:
   let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
@@ -772,6 +818,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 6: Update `publisher.rs` — thread `services` to `get_or_generate_synthetic_id`**
 
   In `crates/trusted-server-core/src/publisher.rs`, line ~328 (production call):
+
   ```rust
   // Before:
   let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
@@ -781,11 +828,13 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Also update the test call site at line ~695. Add `noop_services` to the `#[cfg(test)]` module imports if not already present:
+
   ```rust
   use crate::platform::test_support::noop_services;
   ```
 
   Then fix the test call:
+
   ```rust
   // Before:
   let resolved_synthetic_id =
@@ -801,6 +850,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass.
 
 - [ ] **Step 8: Commit Task 3**
@@ -821,11 +871,13 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 `publisher.rs` now has `services` (from Task 2) so this is a straightforward swap.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs:335-336`
 
 - [ ] **Step 1: Replace `GeoInfo::from_request` in `publisher.rs`**
 
   In `crates/trusted-server-core/src/publisher.rs`, around line 335:
+
   ```rust
   // Before:
   #[allow(deprecated)]
@@ -842,6 +894,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Verify the existing `use crate::platform::GeoInfo` is present or the type is not needed by name in `publisher.rs` (the `geo` variable is `Option<GeoInfo>` but GeoInfo may not be used by name). If `GeoInfo` is referenced by name, add the import:
+
   ```rust
   use crate::platform::GeoInfo;
   ```
@@ -855,6 +908,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass.
 
 - [ ] **Step 4: Commit Task 4**
@@ -869,11 +923,13 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 ## Task 5: Fix `integrations/didomi.rs` — rename `_services`, update `copy_headers`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs:101-128, 199-220`
 
 - [ ] **Step 1: Update `copy_headers` signature**
 
   In `crates/trusted-server-core/src/integrations/didomi.rs`, change the `copy_headers` method:
+
   ```rust
   // Before:
   fn copy_headers(
@@ -904,6 +960,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
 - [ ] **Step 2: Rename `_services` to `services` and update the `copy_headers` call in `handle`**
 
   In the `handle` method (around line 199), rename `_services` to `services`:
+
   ```rust
   // Before:
   async fn handle(
@@ -923,6 +980,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```
 
   Update the `copy_headers` call inside `handle` (around line 220):
+
   ```rust
   // Before:
   self.copy_headers(&backend, &req, &mut proxy_req);
@@ -977,6 +1035,7 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass including the two new `copy_headers` tests.
 
 - [ ] **Step 5: Commit Task 5**
@@ -1013,21 +1072,25 @@ This task changes `synthetic.rs` and simultaneously fixes all 4 callers. `format
   ```bash
   cargo fmt --all -- --check
   ```
+
   Expected: no formatting issues.
 
   ```bash
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   ```
+
   Expected: no warnings.
 
   ```bash
   cargo test --workspace
   ```
+
   Expected: all tests pass.
 
   ```bash
   cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
   ```
+
   Expected: wasm32 build succeeds.
 
 - [ ] **Step 4: Commit final verification result**

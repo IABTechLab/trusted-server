@@ -209,6 +209,7 @@ fn copy_headers(
 ### `crates/trusted-server-core/src/auction/formats.rs`
 
 **Current:** `convert_tsjs_to_auction_request` calls:
+
 - `generate_synthetic_id(settings, req)` at line 91 — produces `fresh_id`
   for `UserInfo`, uses Fastly IP extraction internally
 - `req.get_client_ip_addr()` (line 140) for `DeviceInfo.ip`
@@ -257,6 +258,7 @@ avoids a second geo lookup inside `formats.rs`.
 ### `crates/trusted-server-core/src/auction/endpoints.rs`
 
 **Current:** Already has `services: &RuntimeServices`. Calls:
+
 - `get_or_generate_synthetic_id(settings, &req)` — Fastly IP extraction
 - `GeoInfo::from_request(&req)` (deprecated, line 61)
 - `convert_tsjs_to_auction_request(body, settings, &req, consent, &synthetic_id)`
@@ -285,6 +287,7 @@ and `convert_tsjs_to_auction_request` — no double lookup.
 
 **Current:** `handle_publisher_request(settings, integration_registry, req)`
 calls:
+
 - `RequestInfo::from_request(&req)` — TLS SDK extraction
 - `get_or_generate_synthetic_id(settings, &req)` — IP SDK extraction
 - `GeoInfo::from_request(&req)` (deprecated, line 336)
@@ -350,14 +353,14 @@ pub struct AuctionContext<'a> {
 `client_info: &services.client_info` (production) or propagate an existing
 `client_info` reference (derived contexts):
 
-| File | Line | Type | Change |
-|------|------|------|--------|
-| `auction/endpoints.rs` | ~75 | production | `client_info: &services.client_info` |
-| `auction/orchestrator.rs` | ~145 | production | `client_info: context.client_info` (copy from incoming `context`) |
-| `auction/orchestrator.rs` | ~321 | production | `client_info: context.client_info` (copy from incoming `context`) |
-| `auction/orchestrator.rs` | ~677 | test helper `create_test_context` | add `client_info: &ClientInfo` param, thread through |
-| `integrations/prebid.rs` | ~1287 | test helper `create_test_auction_context` | add `client_info: &ClientInfo` param, thread through |
-| `integrations/prebid.rs` | ~2671 | test helper `call_to_openrtb` | add `client_info: &ClientInfo` param, thread through |
+| File                      | Line  | Type                                      | Change                                                            |
+| ------------------------- | ----- | ----------------------------------------- | ----------------------------------------------------------------- |
+| `auction/endpoints.rs`    | ~75   | production                                | `client_info: &services.client_info`                              |
+| `auction/orchestrator.rs` | ~145  | production                                | `client_info: context.client_info` (copy from incoming `context`) |
+| `auction/orchestrator.rs` | ~321  | production                                | `client_info: context.client_info` (copy from incoming `context`) |
+| `auction/orchestrator.rs` | ~677  | test helper `create_test_context`         | add `client_info: &ClientInfo` param, thread through              |
+| `integrations/prebid.rs`  | ~1287 | test helper `create_test_auction_context` | add `client_info: &ClientInfo` param, thread through              |
+| `integrations/prebid.rs`  | ~2671 | test helper `call_to_openrtb`             | add `client_info: &ClientInfo` param, thread through              |
 
 The three test helpers need a `client_info: &ClientInfo` parameter added, and
 all callers of those helpers must pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }`.
@@ -384,6 +387,7 @@ keeps PR 7 minimal and avoids overlap.
 ### `crates/trusted-server-core/src/integrations/prebid.rs`
 
 **Current:** Two call sites:
+
 - Line 713: `RequestInfo::from_request(context.request)`
 - Line 1011: `RequestInfo::from_request(context.request)`
 
@@ -435,16 +439,16 @@ match handle_publisher_request(settings, integration_registry, &runtime_services
 
 ## Testing
 
-| File | Test change |
-|------|------------|
-| `synthetic.rs` | Pass `noop_services()` to existing tests; add `use crate::platform::test_support::noop_services;` to `#[cfg(test)]` module; tests still pass `req` |
-| `http_util.rs` | Pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` to all `RequestInfo::from_request` calls (8 sites); add one new test for TLS-detected HTTPS via `ClientInfo { tls_protocol: Some("TLSv1.3".to_string()), .. }` |
-| `auction/formats.rs` | **No test module exists** — no test updates needed in this file |
-| `didomi.rs` | Pass `client_ip: None` to `copy_headers` in any existing tests |
-| `auction/endpoints.rs` | **No test module exists** — no test updates needed in this file |
-| `publisher.rs` | Pass `noop_services()` to existing publisher tests |
-| `auction/orchestrator.rs` | Update `create_test_context` helper to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` |
-| `integrations/prebid.rs` | Update `create_test_auction_context` and `call_to_openrtb` test helpers to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` |
+| File                      | Test change                                                                                                                                                                                                                                 |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `synthetic.rs`            | Pass `noop_services()` to existing tests; add `use crate::platform::test_support::noop_services;` to `#[cfg(test)]` module; tests still pass `req`                                                                                          |
+| `http_util.rs`            | Pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }` to all `RequestInfo::from_request` calls (8 sites); add one new test for TLS-detected HTTPS via `ClientInfo { tls_protocol: Some("TLSv1.3".to_string()), .. }` |
+| `auction/formats.rs`      | **No test module exists** — no test updates needed in this file                                                                                                                                                                             |
+| `didomi.rs`               | Pass `client_ip: None` to `copy_headers` in any existing tests                                                                                                                                                                              |
+| `auction/endpoints.rs`    | **No test module exists** — no test updates needed in this file                                                                                                                                                                             |
+| `publisher.rs`            | Pass `noop_services()` to existing publisher tests                                                                                                                                                                                          |
+| `auction/orchestrator.rs` | Update `create_test_context` helper to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }`                                                               |
+| `integrations/prebid.rs`  | Update `create_test_auction_context` and `call_to_openrtb` test helpers to accept and thread `client_info: &ClientInfo`; all callers pass `&ClientInfo { client_ip: None, tls_protocol: None, tls_cipher: None }`                           |
 
 All existing tests must continue to pass. No behavior changes — only extraction
 source changes (from Fastly SDK calls to `ClientInfo` fields that contain the
