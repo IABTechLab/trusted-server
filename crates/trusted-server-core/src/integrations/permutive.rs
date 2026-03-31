@@ -498,29 +498,36 @@ impl PermutiveIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<PermutiveIntegration>> {
-    let config = match settings.integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load Permutive integration config: {err:?}");
-            return None;
-        }
+fn build(
+    settings: &Settings,
+) -> Result<Option<Arc<PermutiveIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID)?
+    else {
+        return Ok(None);
     };
 
-    Some(PermutiveIntegration::new(config))
+    Ok(Some(PermutiveIntegration::new(config)))
 }
 
 /// Register the Permutive integration.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
-    Some(
+///
+/// # Errors
+///
+/// Returns an error when the Permutive integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         IntegrationRegistration::builder(PERMUTIVE_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -749,7 +756,9 @@ mod tests {
         let settings = create_test_settings();
         // Without [integrations.permutive] config, should not build
         assert!(
-            build(&settings).is_none(),
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
             "Should not build without integration config"
         );
     }

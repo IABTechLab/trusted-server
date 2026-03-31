@@ -12,9 +12,11 @@ Trusted Server surfaces the current synthetic ID via response headers and a firs
 
 ### HMAC-Based Generation
 
-Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate a deterministic base from a configurable template, then append a short random suffix.
+Synthetic IDs use HMAC (Hash-based Message Authentication Code) to generate a base from a configurable template, then append a short random alphanumeric suffix. The HMAC base is deterministic for a given set of template inputs; templates that include the built-in `{{random_uuid}}` variable produce a unique ID on every generation.
 
 **Format**: `64-hex-hmac`.`6-alphanumeric-suffix`
+
+Inbound IDs (from the `x-synthetic-id` header or `synthetic_id` cookie) are validated against this format before use. Values that do not match — including oversized strings, special characters, or wrong structure — are discarded and a fresh ID is generated in their place.
 
 **IP normalization**: IPv6 addresses are normalized to a /64 prefix before templating.
 
