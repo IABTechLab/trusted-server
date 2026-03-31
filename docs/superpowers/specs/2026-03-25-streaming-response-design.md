@@ -27,10 +27,12 @@ JS, auction, discovery).
 Before committing to `stream_to_client()`, check:
 
 1. Backend status is success (2xx).
-2. For HTML content: `html_post_processors()` is empty — no registered
-   post-processors. Non-HTML content types (text/JSON, RSC Flight, binary) can
-   always stream regardless of post-processor registration, since
-   post-processors only apply to HTML.
+2. For HTML content: `has_html_post_processors()` returns false — no registered
+   post-processors. This method returns a `bool` directly, avoiding the
+   allocation of cloning the `Vec<Arc<dyn IntegrationHtmlPostProcessor>>` that
+   `html_post_processors()` performs. Non-HTML content types (text/JSON, RSC
+   Flight, binary) can always stream regardless of post-processor registration,
+   since post-processors only apply to HTML.
 
 If either check fails for the given content type, fall back to the current
 buffered path. This keeps the optimization transparent: same behavior for all
@@ -95,13 +97,16 @@ before or with Step 1B.
 
 ### Step 2: Stream response to client
 
+> **Note:** Step 2 may need adjustment to align with the EC (Edge Compute)
+> implementation. Coordinate with the EC work before finalizing the approach.
+
 Change the publisher proxy path to use Fastly's `StreamingBody` API:
 
 1. Fetch from origin, receive response headers.
 2. Validate status — if backend error, return buffered error response via
    `send_to_client()`.
-3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
-   to buffered path.
+3. Check streaming gate — if `has_html_post_processors()` returns true, fall
+   back to buffered path.
 4. Finalize all response headers. This requires reordering two things:
    - **Synthetic ID/cookie headers**: today set _after_ body processing in
      `handle_publisher_request`. Since they are body-independent (computed from
@@ -186,7 +191,7 @@ No decompression, no processing. Body streams through as read.
 ### Buffered fallback path (error responses or post-processors present)
 
 ```
-Origin returns 4xx/5xx OR html_post_processors() is non-empty
+Origin returns 4xx/5xx OR has_html_post_processors() is true
   → Current buffered path unchanged
   → send_to_client() with proper status and full body
 ```
@@ -218,11 +223,11 @@ headers are sent, we are committed.
 
 ## Files Changed
 
-| File                                                    | Change                                                                                                                                                                                                | Risk   |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); convert all compression paths to chunk-based processing (`process_gzip_to_gzip` and `decompress_and_process`); fix `process_through_compression` to call `finish()` explicitly | High |
-| `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming | Medium |
-| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming | Medium |
+| File                                                    | Change                                                                                                                                                                                                                                                     | Risk   |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); convert all compression paths to chunk-based processing (`process_gzip_to_gzip` and `decompress_and_process`); fix `process_through_compression` to call `finish()` explicitly | High   |
+| `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming                                          | Medium |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming                                                      | Medium |
 
 **Minimal changes**: `html_processor.rs` now selects `HtmlRewriterAdapter` mode
 based on script rewriter presence (see [Text Node Fragmentation](#text-node-fragmentation-phase-3)),
@@ -239,7 +244,7 @@ Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 and currently require buffered mode because `lol_html` fragments text nodes
 across chunk boundaries (see [Phase 3](#text-node-fragmentation-phase-3)).
 `html_post_processors` require the full document for post-processing.
-The streaming gate checks `html_post_processors().is_empty()` for the
+The streaming gate checks `has_html_post_processors()` for the
 post-processor path; `create_html_processor` separately gates the adapter mode
 on `script_rewriters`. Currently only Next.js registers a post-processor.
 
@@ -280,9 +285,9 @@ improvements.
 
 ### Integration tests (publisher.rs)
 
-- Streaming gate: when `html_post_processors()` is non-empty, response is
+- Streaming gate: when `has_html_post_processors()` is true, response is
   buffered.
-- Streaming gate: when `html_post_processors()` is empty, response streams.
+- Streaming gate: when `has_html_post_processors()` is false, response streams.
 - Backend error (4xx/5xx) returns buffered error response with correct status.
 - Binary content passes through without processing.
 
@@ -324,14 +329,14 @@ branch, then compare.
 
 Repeat the same steps on the feature branch. Compare:
 
-| Metric | Source | Expected change |
-|--------|--------|-----------------|
-| TTFB (document) | Network timing | Minimal change (gated by backend response time) |
-| Time to last byte | Network timing (`responseEnd`) | Reduced — body streams incrementally |
-| LCP | Lighthouse | Improved — browser receives `<head>` resources sooner |
-| Speed Index | Lighthouse | Improved — progressive rendering starts earlier |
-| Transfer size | Network timing | Unchanged (same content, same compression) |
-| Response body hash | `evaluate_script` with hash | Identical — correctness check |
+| Metric             | Source                         | Expected change                                       |
+| ------------------ | ------------------------------ | ----------------------------------------------------- |
+| TTFB (document)    | Network timing                 | Minimal change (gated by backend response time)       |
+| Time to last byte  | Network timing (`responseEnd`) | Reduced — body streams incrementally                  |
+| LCP                | Lighthouse                     | Improved — browser receives `<head>` resources sooner |
+| Speed Index        | Lighthouse                     | Improved — progressive rendering starts earlier       |
+| Transfer size      | Network timing                 | Unchanged (same content, same compression)            |
+| Response body hash | `evaluate_script` with hash    | Identical — correctness check                         |
 
 #### Automated comparison script
 
@@ -340,11 +345,13 @@ correctness verification:
 
 ```js
 // Run via evaluate_script after page load
-const response = await fetch(location.href);
-const buffer = await response.arrayBuffer();
-const hash = await crypto.subtle.digest('SHA-256', buffer);
-const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
-hex; // compare this between baseline and feature branch
+const response = await fetch(location.href)
+const buffer = await response.arrayBuffer()
+const hash = await crypto.subtle.digest('SHA-256', buffer)
+const hex = [...new Uint8Array(hash)]
+  .map((b) => b.toString(16).padStart(2, '0'))
+  .join('')
+hex // compare this between baseline and feature branch
 ```
 
 #### What to watch for
