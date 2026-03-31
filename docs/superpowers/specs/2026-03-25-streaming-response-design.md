@@ -223,11 +223,11 @@ headers are sent, we are committed.
 
 ## Files Changed
 
-| File                                                    | Change                                                                                                                                                                                                | Risk   |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); convert all compression paths to chunk-based processing (`process_gzip_to_gzip` and `decompress_and_process`); fix `process_through_compression` to call `finish()` explicitly | High |
-| `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming | Medium |
-| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming | Medium |
+| File                                                    | Change                                                                                                                                                                                                                                                     | Risk   |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `crates/trusted-server-core/src/streaming_processor.rs` | Rewrite `HtmlRewriterAdapter` to stream incrementally (becomes single-use); convert all compression paths to chunk-based processing (`process_gzip_to_gzip` and `decompress_and_process`); fix `process_through_compression` to call `finish()` explicitly | High   |
+| `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming                                          | Medium |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming                                                      | Medium |
 
 **Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
 `HtmlRewriterAdapter`, works as-is), integration registration, JS build
@@ -309,14 +309,14 @@ branch, then compare.
 
 Repeat the same steps on the feature branch. Compare:
 
-| Metric | Source | Expected change |
-|--------|--------|-----------------|
-| TTFB (document) | Network timing | Minimal change (gated by backend response time) |
-| Time to last byte | Network timing (`responseEnd`) | Reduced — body streams incrementally |
-| LCP | Lighthouse | Improved — browser receives `<head>` resources sooner |
-| Speed Index | Lighthouse | Improved — progressive rendering starts earlier |
-| Transfer size | Network timing | Unchanged (same content, same compression) |
-| Response body hash | `evaluate_script` with hash | Identical — correctness check |
+| Metric             | Source                         | Expected change                                       |
+| ------------------ | ------------------------------ | ----------------------------------------------------- |
+| TTFB (document)    | Network timing                 | Minimal change (gated by backend response time)       |
+| Time to last byte  | Network timing (`responseEnd`) | Reduced — body streams incrementally                  |
+| LCP                | Lighthouse                     | Improved — browser receives `<head>` resources sooner |
+| Speed Index        | Lighthouse                     | Improved — progressive rendering starts earlier       |
+| Transfer size      | Network timing                 | Unchanged (same content, same compression)            |
+| Response body hash | `evaluate_script` with hash    | Identical — correctness check                         |
 
 #### Automated comparison script
 
@@ -325,11 +325,13 @@ correctness verification:
 
 ```js
 // Run via evaluate_script after page load
-const response = await fetch(location.href);
-const buffer = await response.arrayBuffer();
-const hash = await crypto.subtle.digest('SHA-256', buffer);
-const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
-hex; // compare this between baseline and feature branch
+const response = await fetch(location.href)
+const buffer = await response.arrayBuffer()
+const hash = await crypto.subtle.digest('SHA-256', buffer)
+const hex = [...new Uint8Array(hash)]
+  .map((b) => b.toString(16).padStart(2, '0'))
+  .join('')
+hex // compare this between baseline and feature branch
 ```
 
 #### What to watch for

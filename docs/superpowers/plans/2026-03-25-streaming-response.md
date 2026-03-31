@@ -25,11 +25,11 @@ rewriting), `flate2` (gzip/deflate), `brotli` (brotli compression).
 
 ## File Map
 
-| File | Role | Phase |
-|------|------|-------|
-| `crates/trusted-server-core/src/streaming_processor.rs` | `HtmlRewriterAdapter` rewrite, compression path fixes, encoder finalization | 1 |
-| `crates/trusted-server-core/src/publisher.rs` | `process_response_streaming` refactor to `W: Write`, streaming gate, header reordering | 2 |
-| `crates/trusted-server-adapter-fastly/src/main.rs` | Entry point migration from `#[fastly::main]` to raw `main()`, response routing | 2 |
+| File                                                    | Role                                                                                   | Phase |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------- | ----- |
+| `crates/trusted-server-core/src/streaming_processor.rs` | `HtmlRewriterAdapter` rewrite, compression path fixes, encoder finalization            | 1     |
+| `crates/trusted-server-core/src/publisher.rs`           | `process_response_streaming` refactor to `W: Write`, streaming gate, header reordering | 2     |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Entry point migration from `#[fastly::main]` to raw `main()`, response routing         | 2     |
 
 ---
 
@@ -42,6 +42,7 @@ This is the prerequisite for Task 2. The current code calls `flush()` then
 moving gzip to this path.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/streaming_processor.rs:334-393`
 - Test: `crates/trusted-server-core/src/streaming_processor.rs` (test module)
 
@@ -202,6 +203,7 @@ git commit -m "Fix encoder finalization: explicit finish instead of drop"
 ### Task 2: Convert `process_gzip_to_gzip` to chunk-based processing
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/streaming_processor.rs:183-225`
 - Test: `crates/trusted-server-core/src/streaming_processor.rs` (test module)
 
@@ -303,6 +305,7 @@ git commit -m "Convert process_gzip_to_gzip to chunk-based processing"
 ### Task 3: Convert `decompress_and_process` to chunk-based processing
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/streaming_processor.rs:227-262`
 - Test: `crates/trusted-server-core/src/streaming_processor.rs` (test module)
 
@@ -441,6 +444,7 @@ git commit -m "Convert decompress_and_process to chunk-based processing"
 ### Task 4: Rewrite `HtmlRewriterAdapter` for incremental streaming
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/streaming_processor.rs:396-472`
 - Test: `crates/trusted-server-core/src/streaming_processor.rs` (test module)
 
@@ -658,6 +662,7 @@ Expected: Builds successfully.
 ### Task 6: Migrate entry point from `#[fastly::main]` to raw `main()`
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs:32-68`
 
 - [ ] **Step 1: Rewrite `main` function**
@@ -737,6 +742,7 @@ git commit -m "Migrate entry point from #[fastly::main] to raw main()"
 ### Task 7: Refactor `process_response_streaming` to accept `W: Write`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs:97-180`
 
 - [ ] **Step 1: Change signature to accept generic writer**
@@ -792,6 +798,7 @@ git commit -m "Refactor process_response_streaming to accept generic writer"
 ### Task 8: Add streaming path to publisher proxy
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 
@@ -867,6 +874,7 @@ fn should_stream(
 - [ ] **Step 4: Restructure `handle_publisher_request` to support streaming**
 
 Split the function into:
+
 1. Pre-processing: request info, cookies, synthetic ID, consent, backend
    request — everything before `response.take_body()`
 2. Header finalization: synthetic ID/cookie headers, `finalize_response()`
@@ -875,6 +883,7 @@ Split the function into:
    (`StreamingBody`)
 
 The streaming path in the fastly adapter:
+
 ```rust
 // After header finalization, before body processing:
 if should_stream {
@@ -964,6 +973,7 @@ Expected: Builds.
 Run: `fastly compute serve`
 
 Test:
+
 - `curl -s http://localhost:7676/ | sha256sum` — compare with baseline
 - `curl -sI http://localhost:7676/` — verify headers present (geo, version,
   synthetic ID cookie if consent configured)
@@ -995,6 +1005,7 @@ Repeat the same measurements after building the feature branch.
 
 Create a comparison table and save to PR description or a results file.
 Check for:
+
 - TTLB improvement (primary goal)
 - No TTFB regression
 - Identical response body hash (correctness)
