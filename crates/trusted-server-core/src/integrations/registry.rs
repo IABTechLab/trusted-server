@@ -12,6 +12,7 @@ use crate::constants::HEADER_X_TS_EC;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::http_util::is_navigation_request;
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -658,8 +659,17 @@ impl IntegrationRegistry {
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
-            if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-                log::warn!("EC generation failed for integration proxy: {err:?}");
+            // Only generate for document navigations — subresource requests
+            // may lack consent signals such as the Sec-GPC header.
+            if is_navigation_request(&req) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+                    log::warn!("EC generation failed for integration proxy: {err:?}");
+                }
+            } else {
+                log::debug!(
+                    "EC generation skipped for integration proxy: non-document request (path={})",
+                    path,
+                );
             }
 
             // Set EC ID header on the request so integrations can read it.

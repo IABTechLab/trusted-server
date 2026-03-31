@@ -7,7 +7,7 @@ use crate::constants::HEADER_X_COMPRESS_HINT;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
-use crate::http_util::{serve_static_with_etag, RequestInfo};
+use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
 use crate::rsc_flight::RscFlightUrlRewriter;
@@ -312,10 +312,19 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Generate a new EC ID if none exists and consent allows it.
-    // This is an organic handler, so generation is permitted here.
-    if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-        log::warn!("EC generation failed: {err:?}");
+    // Generate a new EC ID only for document navigations. Subresource
+    // requests (fonts, images, CSS) may lack consent signals such as the
+    // Sec-GPC header, so we skip generation to avoid setting identity
+    // cookies when the user's consent preference is unknown.
+    if is_navigation_request(&req) {
+        if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+            log::warn!("EC generation failed: {err:?}");
+        }
+    } else {
+        log::debug!(
+            "EC generation skipped: non-document request (path={})",
+            req.get_path(),
+        );
     }
 
     let ec_allowed = ec_context.ec_allowed();

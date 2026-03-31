@@ -57,6 +57,40 @@ pub fn sanitize_forwarded_headers(req: &mut Request) {
     }
 }
 
+/// Returns `true` when the request looks like a top-level document navigation.
+///
+/// Uses [`Sec-Fetch-Dest`] when available (preferred — it is a forbidden
+/// header that cannot be spoofed by client-side JS). Falls back to checking
+/// the `Accept` header for an explicit `text/html` MIME type.
+///
+/// This distinction prevents EC identity cookies from being generated on
+/// subresource requests (fonts, images, scripts) where browsers may omit
+/// consent signals such as `Sec-GPC`.
+///
+/// [`Sec-Fetch-Dest`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Dest
+#[must_use]
+pub fn is_navigation_request(req: &Request) -> bool {
+    // Prefer Sec-Fetch-Dest (reliable, unspoofable by JS). All modern
+    // browsers send this header on every request.
+    if let Some(dest) = req
+        .get_header("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+    {
+        return dest.trim().eq_ignore_ascii_case("document");
+    }
+
+    // Fallback for clients that don't send Fetch Metadata headers:
+    // only match an explicit text/html (not */* which fonts also send).
+    req.get_header(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|part| {
+                let mime = part.split(';').next().unwrap_or("").trim();
+                mime.eq_ignore_ascii_case("text/html")
+            })
+        })
+}
+
 /// Extracted request information for host rewriting.
 ///
 /// This struct captures the effective host and scheme from an incoming request.
@@ -675,6 +709,122 @@ mod tests {
         assert!(
             target.get_header("x-ts-liveramp").is_none(),
             "Should filter dynamic x-ts-<partner_id> headers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_navigation_request
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn navigation_true_for_sec_fetch_dest_document() {
+        let req = Request::get("https://example.com").with_header("sec-fetch-dest", "document");
+        assert!(
+            is_navigation_request(&req),
+            "should detect Sec-Fetch-Dest: document as navigation"
+        );
+    }
+
+    #[test]
+    fn navigation_false_for_sec_fetch_dest_font() {
+        let req = Request::get("https://example.com/font.woff2")
+            .with_header("sec-fetch-dest", "font")
+            .with_header(header::ACCEPT, "*/*");
+        assert!(
+            !is_navigation_request(&req),
+            "should reject font even when Accept is */*"
+        );
+    }
+
+    #[test]
+    fn navigation_false_for_sec_fetch_dest_script() {
+        let req = Request::get("https://example.com/app.js")
+            .with_header("sec-fetch-dest", "script")
+            .with_header(header::ACCEPT, "*/*");
+        assert!(
+            !is_navigation_request(&req),
+            "should reject script even when Accept is */*"
+        );
+    }
+
+    #[test]
+    fn navigation_false_for_sec_fetch_dest_style() {
+        let req = Request::get("https://example.com/style.css")
+            .with_header("sec-fetch-dest", "style")
+            .with_header(header::ACCEPT, "text/css,*/*;q=0.1");
+        assert!(
+            !is_navigation_request(&req),
+            "should reject style subresource"
+        );
+    }
+
+    #[test]
+    fn navigation_false_for_sec_fetch_dest_image() {
+        let req = Request::get("https://example.com/logo.png")
+            .with_header("sec-fetch-dest", "image")
+            .with_header(header::ACCEPT, "image/webp,image/png,*/*;q=0.8");
+        assert!(
+            !is_navigation_request(&req),
+            "should reject image subresource"
+        );
+    }
+
+    #[test]
+    fn navigation_false_for_sec_fetch_dest_empty() {
+        let req = Request::get("https://example.com/api/data")
+            .with_header("sec-fetch-dest", "empty")
+            .with_header(header::ACCEPT, "*/*");
+        assert!(
+            !is_navigation_request(&req),
+            "should reject fetch/XHR requests (dest=empty)"
+        );
+    }
+
+    #[test]
+    fn navigation_sec_fetch_dest_case_insensitive() {
+        let req = Request::get("https://example.com").with_header("sec-fetch-dest", "Document");
+        assert!(
+            is_navigation_request(&req),
+            "should match Sec-Fetch-Dest case-insensitively"
+        );
+    }
+
+    #[test]
+    fn navigation_fallback_accept_text_html() {
+        let req = Request::get("https://example.com").with_header(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        );
+        assert!(
+            is_navigation_request(&req),
+            "should fall back to Accept: text/html when Sec-Fetch-Dest is absent"
+        );
+    }
+
+    #[test]
+    fn navigation_fallback_wildcard_only_is_false() {
+        let req = Request::get("https://example.com").with_header(header::ACCEPT, "*/*");
+        assert!(
+            !is_navigation_request(&req),
+            "should not treat bare */* as navigation in fallback path"
+        );
+    }
+
+    #[test]
+    fn navigation_false_when_no_headers() {
+        let req = Request::get("https://example.com/resource");
+        assert!(
+            !is_navigation_request(&req),
+            "should return false when no Accept or Sec-Fetch-Dest headers are present"
+        );
+    }
+
+    #[test]
+    fn navigation_fallback_accept_case_insensitive() {
+        let req = Request::get("https://example.com").with_header(header::ACCEPT, "TEXT/HTML");
+        assert!(
+            is_navigation_request(&req),
+            "should match text/html case-insensitively in fallback"
         );
     }
 }
