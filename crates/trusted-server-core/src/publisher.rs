@@ -326,7 +326,7 @@ pub fn handle_publisher_request(
     // requests (fonts, images, CSS) may lack consent signals such as the
     // Sec-GPC header, so we skip generation to avoid setting identity
     // cookies when the user's consent preference is unknown.
-    if is_navigation_request(&req) {
+    if is_navigation_request(&http_req) {
         if let Err(err) = ec_context.generate_if_needed(settings, kv) {
             log::warn!("EC generation failed: {err:?}");
         }
