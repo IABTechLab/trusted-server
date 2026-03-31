@@ -338,7 +338,7 @@ pub fn handle_publisher_request(
         .geo()
         .lookup(services.client_info.client_ip)
         .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e:?}");
+            log::warn!("geo lookup failed: {e}");
             None
         });
     let consent_context = build_consent_context(&ConsentPipelineInput {

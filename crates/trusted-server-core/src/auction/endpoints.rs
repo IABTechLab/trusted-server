@@ -60,7 +60,7 @@ pub async fn handle_auction(
         .geo()
         .lookup(services.client_info.client_ip)
         .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e:?}");
+            log::warn!("geo lookup failed: {e}");
             None
         });
     let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
