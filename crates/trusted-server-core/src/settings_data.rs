@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::settings::{EdgeCookie, Publisher, Settings};
+use crate::settings::Settings;
 
 pub use crate::auction_config_types::AuctionConfig;
 
