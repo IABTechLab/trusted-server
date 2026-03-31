@@ -22,6 +22,7 @@ pub struct Publisher {
     pub domain: String,
     /// Domain for non-EC cookies. EC cookies use a separate computed domain
     /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
+    #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
@@ -534,6 +535,19 @@ impl Settings {
     ///
     /// # Errors
     ///
+    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            handler.prepare_runtime()?;
+        }
+
+        Ok(())
+    }
+
+    /// Reject settings that still contain known placeholder secrets.
+    ///
+    /// # Errors
+    ///
     /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
     /// fields still contain a placeholder value.
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
@@ -546,7 +560,13 @@ impl Settings {
             insecure_fields.push("publisher.proxy_secret");
         }
 
-        Ok(())
+        if insecure_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::InsecureDefault {
+                field: insecure_fields.join(", "),
+            }))
+        }
     }
 
     /// Resolve the first handler whose regex matches the request path.
@@ -643,6 +663,18 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_cookie_domain(value: &str) -> Result<(), ValidationError> {
+    // `=` is excluded: it only has special meaning in the name=value pair,
+    // not within the Domain attribute value.
+    if value.contains([';', '\n', '\r']) {
+        let mut err = ValidationError::new("cookie_metacharacters");
+        err.message =
+            Some("cookie_domain must not contain cookie metacharacters (;, \\n, \\r)".into());
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
@@ -1684,7 +1716,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     // --- Proxy::normalize ---
 
     #[test]

@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::settings::{EdgeCookie, Publisher, Settings};
+use crate::settings::Settings;
 
 pub use crate::auction_config_types::AuctionConfig;
 
@@ -40,21 +40,7 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         );
     }
 
-    if EdgeCookie::is_placeholder_secret_key(settings.edge_cookie.secret_key.expose()) {
-        log::warn!(
-            "INSECURE: edge_cookie.secret_key is set to a default placeholder — \
-             HMAC-SHA256 signatures can be forged. \
-             Override via TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY at build time"
-        );
-    }
-
-    if Publisher::is_placeholder_proxy_secret(settings.publisher.proxy_secret.expose()) {
-        log::warn!(
-            "INSECURE: publisher.proxy_secret is set to a default placeholder — \
-             XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone. \
-             Override via TRUSTED_SERVER__PUBLISHER__PROXY_SECRET at build time"
-        );
-    }
+    settings.reject_placeholder_secrets()?;
 
     Ok(settings)
 }

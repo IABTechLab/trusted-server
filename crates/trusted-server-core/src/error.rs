@@ -75,6 +75,10 @@ pub enum TrustedServerError {
     /// Requested partner was not found in the partner registry.
     #[display("Partner not found: {partner_id}")]
     PartnerNotFound { partner_id: String },
+
+    /// A secret field still contains a known placeholder/default value.
+    #[display("Insecure default value for: {field}")]
+    InsecureDefault { field: String },
 }
 
 impl Error for TrustedServerError {}
@@ -104,9 +108,9 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
-            Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
-            Self::PartnerAuthFailed { .. } => StatusCode::UNAUTHORIZED,
+            Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

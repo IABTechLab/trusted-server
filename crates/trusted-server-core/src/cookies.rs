@@ -23,50 +23,6 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_US_PRIVACY,
 ];
 
-const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60; // 1 year
-
-fn is_allowed_ec_id_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
-}
-
-// Outbound allowlist for cookie sanitization: permits [a-zA-Z0-9._-] as a
-// defense-in-depth backstop when setting the Set-Cookie header. This is
-// intentionally broader than the inbound format validator
-// (`synthetic::is_valid_synthetic_id`), which enforces the exact
-// `<64-hex>.<6-alphanumeric>` structure and is used to reject untrusted
-// request values before they enter the system.
-#[must_use]
-pub(crate) fn ec_id_has_only_allowed_chars(ec_id: &str) -> bool {
-    ec_id.chars().all(is_allowed_ec_id_char)
-}
-
-fn sanitize_ec_id_for_cookie(ec_id: &str) -> Cow<'_, str> {
-    if ec_id_has_only_allowed_chars(ec_id) {
-        return Cow::Borrowed(ec_id);
-    }
-
-    let safe_id = ec_id
-        .chars()
-        .filter(|c| is_allowed_ec_id_char(*c))
-        .collect::<String>();
-
-    log::warn!(
-        "Stripped disallowed characters from EC ID before setting cookie (len {} -> {}); \
-         callers should reject invalid request IDs before cookie creation",
-        ec_id.len(),
-        safe_id.len(),
-    );
-
-    Cow::Owned(safe_id)
-}
-
-fn ec_cookie_attributes(settings: &Settings, max_age: i32) -> String {
-    format!(
-        "Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}",
-        settings.publisher.cookie_domain,
-    )
-}
-
 /// Parses a cookie string into a [`CookieJar`].
 ///
 /// Returns an empty jar if the cookie string is unparseable.
