@@ -229,10 +229,9 @@ headers are sent, we are committed.
 | `crates/trusted-server-core/src/publisher.rs`           | Refactor `process_response_streaming` to accept `W: Write` instead of hardcoding `Vec<u8>`; split `handle_publisher_request` into streaming vs buffered paths; reorder synthetic ID/cookie logic before streaming                                          | Medium |
 | `crates/trusted-server-adapter-fastly/src/main.rs`      | Migrate from `#[fastly::main]` to undecorated `main()` with `Request::from_client()`; explicit error handling via `to_error_response().send_to_client()`; call `finalize_response()` before streaming                                                      | Medium |
 
-**Minimal changes**: `html_processor.rs` now selects `HtmlRewriterAdapter` mode
-based on script rewriter presence (see [Text Node Fragmentation](#text-node-fragmentation-phase-3)),
-but is otherwise unchanged. Integration registration, JS build pipeline, tsjs
-module serving, auction handler, cookie/synthetic ID logic are not changed.
+**Not changed**: `html_processor.rs` (builds lol_html `Settings` passed to
+`HtmlRewriterAdapter`, works as-is), integration registration, JS build
+pipeline, tsjs module serving, auction handler, cookie/synthetic ID logic.
 
 Note: `HtmlWithPostProcessing` wraps `HtmlRewriterAdapter` and applies
 post-processors on `is_last`. In the streaming path the post-processor list is
