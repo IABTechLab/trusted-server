@@ -28,6 +28,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod error;
+mod management_api;
 mod platform;
 
 use crate::error::to_error_response;
