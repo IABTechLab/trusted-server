@@ -111,7 +111,7 @@ async fn route_request(
     // already captured in RuntimeServices at the entry point.
     let geo_info = runtime_services
         .geo()
-        .lookup(runtime_services.client_info.client_ip)
+        .lookup(runtime_services.client_info().client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
@@ -147,7 +147,7 @@ async fn route_request(
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, req)
+            handle_trusted_server_discovery(settings, runtime_services, req)
         }
 
         // Signature verification endpoint

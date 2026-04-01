@@ -3,6 +3,8 @@
 //! This module provides functionality for generating, storing, and retrieving
 //! Ed25519 keypairs in JWK format for request signing.
 
+use std::sync::LazyLock;
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use error_stack::{Report, ResultExt};
 use jose_jwk::{
@@ -12,16 +14,20 @@ use jose_jwk::{
 use rand::rngs::OsRng;
 
 use crate::error::TrustedServerError;
-#[allow(deprecated)]
-use crate::fastly_storage::FastlyConfigStore;
+use crate::platform::{RuntimeServices, StoreName};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
 
+static JWKS_STORE_NAME: LazyLock<StoreName> =
+    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
+
+/// An Ed25519 keypair used for request signing.
 pub struct Keypair {
     pub signing_key: SigningKey,
     pub verifying_key: VerifyingKey,
 }
 
 impl Keypair {
+    /// Generate a new random Ed25519 keypair.
     #[must_use]
     pub fn generate() -> Self {
         let mut csprng = OsRng;
@@ -35,6 +41,7 @@ impl Keypair {
         }
     }
 
+    /// Produce a public JWK from the verifying key, tagged with the given `kid`.
     #[must_use]
     pub fn get_jwk(&self, kid: String) -> Jwk {
         let public_key_bytes = self.verifying_key.as_bytes();
@@ -42,7 +49,7 @@ impl Keypair {
         let okp = Okp {
             crv: OkpCurves::Ed25519,
             x: public_key_bytes.to_vec().into(),
-            d: None, // No private key in JWK (public only)
+            d: None,
         };
 
         Jwk {
@@ -58,14 +65,22 @@ impl Keypair {
 
 /// Retrieves active JSON Web Keys from the config store.
 ///
+/// Reads the `active-kids` entry from the platform config store, then fetches
+/// each referenced JWK and assembles a JWKS JSON document.
+///
 /// # Errors
 ///
-/// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
-#[allow(deprecated)]
-pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
-    let active_kids_str = store
-        .get("active-kids")
+/// Returns [`TrustedServerError::Configuration`] if the config store is
+/// unavailable, the `active-kids` key is missing, or any referenced JWK entry
+/// cannot be read. The underlying [`crate::platform::PlatformError`] is
+/// preserved as context in the error chain.
+pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<TrustedServerError>> {
+    let active_kids_str = services
+        .config_store()
+        .get(&JWKS_STORE_NAME, "active-kids")
+        .change_context(TrustedServerError::Configuration {
+            message: "failed to read active-kids from config store".into(),
+        })
         .attach("while fetching active kids list")?;
 
     let active_kids: Vec<&str> = active_kids_str
@@ -76,9 +91,12 @@ pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
 
     let mut jwks = Vec::new();
     for kid in active_kids {
-        let jwk = store
-            .get(kid)
-            .attach(format!("Failed to get JWK for kid: {}", kid))?;
+        let jwk = services
+            .config_store()
+            .get(&JWKS_STORE_NAME, kid)
+            .change_context(TrustedServerError::Configuration {
+                message: format!("failed to get JWK for kid: {}", kid),
+            })?;
         jwks.push(jwk);
     }
 
@@ -88,41 +106,107 @@ pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ed25519_dalek::{Signer, Verifier};
+    use error_stack::Report;
     use jose_jwk::Key;
 
+    use crate::platform::{
+        test_support::build_services_with_config, PlatformConfigStore, PlatformError, StoreId,
+        StoreName,
+    };
+
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Test doubles
+    // ---------------------------------------------------------------------------
+
+    struct FailingConfigStore;
+
+    impl PlatformConfigStore for FailingConfigStore {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests
+    // ---------------------------------------------------------------------------
+
     #[test]
-    fn test_key_pair_generation() {
+    fn get_active_jwks_fails_with_configuration_error_when_store_unavailable() {
+        let services = build_services_with_config(FailingConfigStore);
+        let result = get_active_jwks(&services);
+
+        assert!(
+            result.is_err(),
+            "should fail when config store is unavailable"
+        );
+        let err = result.expect_err("should be an error");
+        assert!(
+            err.contains::<TrustedServerError>(),
+            "should surface as TrustedServerError"
+        );
+        assert!(
+            err.contains::<PlatformError>(),
+            "should preserve platform error context in the error chain"
+        );
+    }
+
+    #[test]
+    fn key_pair_generates_valid_signing_key() {
         let keypair = Keypair::generate();
 
         let message = b"test message";
         let signature = keypair.signing_key.sign(message);
 
-        assert!(keypair.verifying_key.verify(message, &signature).is_ok());
+        assert!(
+            keypair.verifying_key.verify(message, &signature).is_ok(),
+            "should verify signature produced by generated key"
+        );
     }
 
     #[test]
-    fn test_create_jwk_from_verifying_key() {
+    fn get_jwk_produces_correct_structure() {
         let jwk = Keypair::generate().get_jwk("test-kid".to_string());
 
-        // Verify JWK structure
-        assert_eq!(jwk.prm.kid, Some("test-kid".to_string()));
+        assert_eq!(
+            jwk.prm.kid,
+            Some("test-kid".to_string()),
+            "should set kid parameter"
+        );
         assert_eq!(
             jwk.prm.alg,
             Some(jose_jwk::jose_jwa::Algorithm::Signing(
                 jose_jwk::jose_jwa::Signing::EdDsa
-            ))
+            )),
+            "should set EdDSA algorithm"
         );
 
-        // Verify it's an OKP key with Ed25519 curve
         match jwk.key {
             Key::Okp(okp) => {
-                assert_eq!(okp.crv, OkpCurves::Ed25519);
-                assert_eq!(okp.x.len(), 32); // Ed25519 public keys are 32 bytes
-                assert!(okp.d.is_none()); // No private key component
+                assert_eq!(okp.crv, OkpCurves::Ed25519, "should use Ed25519 curve");
+                assert_eq!(okp.x.len(), 32, "should be 32-byte Ed25519 public key");
+                assert!(okp.d.is_none(), "should have no private key component");
             }
-            _ => panic!("Expected OKP key type"),
+            _ => panic!("should be OKP key type"),
         }
     }
 }

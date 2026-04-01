@@ -15,7 +15,6 @@ use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
-use trusted_server_core::fastly_storage::FastlyApiClient;
 use trusted_server_core::geo::geo_from_fastly;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -23,6 +22,7 @@ use trusted_server_core::platform::{
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
+use trusted_server_core::storage::FastlyApiClient;
 
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 
@@ -34,7 +34,7 @@ pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 ///
 /// Stateless — the store name is supplied per call, matching the trait
 /// signature. This replaces the store-name-at-construction pattern of
-/// [`trusted_server_core::fastly_storage::FastlyConfigStore`].
+/// [`trusted_server_core::storage::FastlyConfigStore`].
 ///
 /// # Write cost
 ///
@@ -91,7 +91,7 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 ///
 /// Stateless — the store name is supplied per call. This replaces the
 /// store-name-at-construction pattern of
-/// [`trusted_server_core::fastly_storage::FastlySecretStore`].
+/// [`trusted_server_core::storage::FastlySecretStore`].
 ///
 /// # Write cost
 ///
@@ -256,7 +256,7 @@ impl PlatformGeo for FastlyPlatformGeo {
 /// Call this once at the entry point before dispatching to handlers.
 /// `client_info` is populated from TLS and IP metadata available on the
 /// request; geo lookup is deferred to handler time via
-/// `services.geo.lookup(services.client_info.client_ip)`.
+/// `services.geo().lookup(services.client_info().client_ip)`.
 ///
 /// `kv_store` is an [`Arc<dyn PlatformKvStore>`] opened by the caller for
 /// the primary KV store. Use [`open_kv_store`] to construct it.
@@ -396,11 +396,11 @@ mod tests {
         let services = build_runtime_services(&req, noop_kv_store());
 
         assert!(
-            services.client_info.tls_protocol.is_none(),
+            services.client_info().tls_protocol.is_none(),
             "should have no tls_protocol on plain test request"
         );
         assert!(
-            services.client_info.tls_cipher.is_none(),
+            services.client_info().tls_cipher.is_none(),
             "should have no tls_cipher on plain test request"
         );
     }
@@ -412,7 +412,8 @@ mod tests {
         let cloned = services.clone();
 
         assert_eq!(
-            services.client_info.client_ip, cloned.client_info.client_ip,
+            services.client_info().client_ip,
+            cloned.client_info().client_ip,
             "should preserve client_ip through clone"
         );
     }

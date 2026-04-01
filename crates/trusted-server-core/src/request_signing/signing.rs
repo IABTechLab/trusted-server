@@ -9,9 +9,8 @@ use error_stack::{Report, ResultExt};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
-#[allow(deprecated)]
-use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
+use crate::storage::{FastlyConfigStore, FastlySecretStore};
 
 /// Retrieves the current active key ID from the config store.
 ///

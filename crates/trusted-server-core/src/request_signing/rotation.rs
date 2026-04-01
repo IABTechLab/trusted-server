@@ -9,9 +9,8 @@ use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
 use crate::error::TrustedServerError;
-#[allow(deprecated)]
-use crate::fastly_storage::{FastlyApiClient, FastlyConfigStore};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
+use crate::storage::{FastlyApiClient, FastlyConfigStore};
 
 use super::Keypair;
 
