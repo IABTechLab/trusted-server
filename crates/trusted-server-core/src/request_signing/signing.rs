@@ -151,11 +151,12 @@ impl RequestSigner {
                 })?;
 
         let secret_store = FastlySecretStore::new(SIGNING_SECRET_STORE_NAME);
-        let key_bytes = secret_store
-            .get(&key_id)
-            .change_context(TrustedServerError::Configuration {
-                message: format!("failed to get signing key for kid: {}", key_id),
-            })?;
+        let key_bytes =
+            secret_store
+                .get(&key_id)
+                .change_context(TrustedServerError::Configuration {
+                    message: format!("failed to get signing key for kid: {}", key_id),
+                })?;
 
         let signing_key = parse_ed25519_signing_key(key_bytes)?;
 
@@ -170,9 +171,7 @@ impl RequestSigner {
     /// # Errors
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
-    pub fn from_services(
-        services: &RuntimeServices,
-    ) -> Result<Self, Report<TrustedServerError>> {
+    pub fn from_services(services: &RuntimeServices) -> Result<Self, Report<TrustedServerError>> {
         let key_id = services
             .config_store()
             .get(&JWKS_STORE_NAME, "current-kid")
@@ -300,7 +299,9 @@ mod tests {
     use error_stack::Report;
 
     use crate::platform::test_support::build_services_with_config_and_secret;
-    use crate::platform::{PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName};
+    use crate::platform::{
+        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+    };
 
     use super::*;
 
@@ -376,8 +377,8 @@ mod tests {
     #[test]
     fn from_services_loads_kid_from_config_store() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
         assert_eq!(signer.kid, "test-kid", "should load kid from config store");
     }
@@ -385,22 +386,25 @@ mod tests {
     #[test]
     fn sign_produces_non_empty_url_safe_base64_signature() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
         let signature = signer
             .sign(b"these pretzels are making me thirsty")
             .expect("should sign payload");
 
         assert!(!signature.is_empty(), "should produce non-empty signature");
-        assert!(signature.len() > 32, "should produce a full-length signature");
+        assert!(
+            signature.len() > 32,
+            "should produce a full-length signature"
+        );
     }
 
     #[test]
     fn sign_and_verify_roundtrip_succeeds() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let payload = b"test payload for verification";
 
         let signature = signer.sign(payload).expect("should sign payload");
@@ -413,8 +417,8 @@ mod tests {
     #[test]
     fn verify_returns_false_for_wrong_payload() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let signature = signer.sign(b"original").expect("should sign");
 
         let verified = verify_signature(b"wrong payload", &signature, &signer.kid, &services)
@@ -426,8 +430,8 @@ mod tests {
     #[test]
     fn verify_errors_for_unknown_kid() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let signature = signer.sign(b"payload").expect("should sign");
 
         let result = verify_signature(b"payload", &signature, "nonexistent-kid", &services);
@@ -438,8 +442,8 @@ mod tests {
     #[test]
     fn verify_errors_for_malformed_signature() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
         let result = verify_signature(b"payload", "not-valid-base64!!!", &signer.kid, &services);
 
@@ -455,7 +459,9 @@ mod tests {
             timestamp: 1706900000,
         };
 
-        let payload = params.build_payload("kid-abc").expect("should build payload");
+        let payload = params
+            .build_payload("kid-abc")
+            .expect("should build payload");
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("should be valid JSON");
 
@@ -493,8 +499,8 @@ mod tests {
     #[test]
     fn sign_request_enhanced_produces_verifiable_signature() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let params = SigningParams::new(
             "auction-123".to_string(),
             "publisher.com".to_string(),
@@ -502,11 +508,12 @@ mod tests {
         );
 
         let signature = signer.sign_request(&params).expect("should sign request");
-        let payload = params.build_payload(&signer.kid).expect("should build payload");
+        let payload = params
+            .build_payload(&signer.kid)
+            .expect("should build payload");
 
-        let verified =
-            verify_signature(payload.as_bytes(), &signature, &signer.kid, &services)
-                .expect("should verify");
+        let verified = verify_signature(payload.as_bytes(), &signature, &signer.kid, &services)
+            .expect("should verify");
 
         assert!(verified, "enhanced request signature should be verifiable");
     }
@@ -514,8 +521,8 @@ mod tests {
     #[test]
     fn sign_request_different_hosts_produce_different_signatures() {
         let services = build_signing_services();
-        let signer = RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
         let params1 = SigningParams {
             request_id: "req-1".to_string(),

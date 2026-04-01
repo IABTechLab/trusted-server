@@ -19,8 +19,8 @@
 use std::io::Read;
 
 use error_stack::{Report, ResultExt};
-use fastly::{Request, Response};
 use fastly::http::StatusCode;
+use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
 
 use crate::platform::FastlyPlatformSecretStore;
@@ -284,8 +284,7 @@ mod tests {
 
     #[test]
     fn build_config_item_payload_url_encodes_reserved_characters() {
-        let payload =
-            build_config_item_payload(r#"value with spaces + symbols &= {"kid":"a+b"}"#);
+        let payload = build_config_item_payload(r#"value with spaces + symbols &= {"kid":"a+b"}"#);
 
         assert_eq!(
             payload,

@@ -47,10 +47,7 @@ impl KeyRotationManager {
     /// defined in [`JWKS_CONFIG_STORE_NAME`] and
     /// [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
     #[must_use]
-    pub fn new(
-        config_store_id: impl Into<String>,
-        secret_store_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(config_store_id: impl Into<String>, secret_store_id: impl Into<String>) -> Self {
         Self {
             config_store_id: StoreId::from(config_store_id.into()),
             secret_store_id: StoreId::from(secret_store_id.into()),
@@ -309,10 +306,7 @@ mod tests {
                 .lock()
                 .expect("should lock deletes")
                 .push((store_id.to_string(), key.to_string()));
-            self.data
-                .lock()
-                .expect("should lock data")
-                .remove(key);
+            self.data.lock().expect("should lock data").remove(key);
             Ok(())
         }
     }
@@ -392,8 +386,7 @@ mod tests {
     fn rotate_key_stores_private_key_via_secret_store_create() {
         let config_store = SpyConfigStore::new(HashMap::new());
         let secret_store = SpySecretStore::new();
-        let services =
-            build_services_with_config_and_secret(config_store, secret_store);
+        let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
         let result = manager.rotate_key(&services, Some("new-kid".to_string()));
@@ -413,8 +406,7 @@ mod tests {
         data.insert("active-kids".to_string(), "only-key".to_string());
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
-        let services =
-            build_services_with_config_and_secret(config_store, secret_store);
+        let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
         let result = manager.deactivate_key(&services, "only-key");
@@ -431,10 +423,7 @@ mod tests {
         let result = KeyRotationResult {
             new_kid: "ts-2024-01-01".to_string(),
             previous_kid: Some("ts-2023-12-31".to_string()),
-            active_kids: vec![
-                "ts-2023-12-31".to_string(),
-                "ts-2024-01-01".to_string(),
-            ],
+            active_kids: vec!["ts-2023-12-31".to_string(), "ts-2024-01-01".to_string()],
             jwk: jwk.clone(),
         };
 

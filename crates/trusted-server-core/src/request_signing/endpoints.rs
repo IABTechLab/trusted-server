@@ -341,7 +341,9 @@ mod tests {
     use error_stack::Report;
 
     use crate::platform::{
-        test_support::{build_services_with_config, build_services_with_config_and_secret, noop_services},
+        test_support::{
+            build_services_with_config, build_services_with_config_and_secret, noop_services,
+        },
         PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
     };
 
@@ -358,7 +360,10 @@ mod tests {
         struct MapConfigStore(HashMap<String, String>);
         impl PlatformConfigStore for MapConfigStore {
             fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-                self.0.get(key).cloned().ok_or_else(|| Report::new(PlatformError::ConfigStore))
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| Report::new(PlatformError::ConfigStore))
             }
             fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
                 Err(Report::new(PlatformError::Unsupported))
@@ -370,8 +375,15 @@ mod tests {
 
         struct MapSecretStore(HashMap<String, Vec<u8>>);
         impl PlatformSecretStore for MapSecretStore {
-            fn get_bytes(&self, _: &StoreName, key: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-                self.0.get(key).cloned().ok_or_else(|| Report::new(PlatformError::SecretStore))
+            fn get_bytes(
+                &self,
+                _: &StoreName,
+                key: &str,
+            ) -> Result<Vec<u8>, Report<PlatformError>> {
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| Report::new(PlatformError::SecretStore))
             }
             fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
                 Err(Report::new(PlatformError::Unsupported))
@@ -498,7 +510,10 @@ mod tests {
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
-        assert!(!verify_resp.verified, "should not verify an invalid signature");
+        assert!(
+            !verify_resp.verified,
+            "should not verify an invalid signature"
+        );
         assert_eq!(verify_resp.kid, signer.kid);
         assert!(verify_resp.error.is_some());
     }

@@ -16,13 +16,13 @@ use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
 use trusted_server_core::geo::geo_from_fastly;
+pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
-pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore

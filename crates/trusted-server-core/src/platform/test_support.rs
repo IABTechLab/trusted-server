@@ -489,9 +489,17 @@ mod tests {
 
         // Act: both stores return Unsupported (confirming the injected impls are active)
         let config_result = services.config_store().get(&StoreName::from("s"), "k");
-        let secret_result = services.secret_store().get_bytes(&StoreName::from("s"), "k");
+        let secret_result = services
+            .secret_store()
+            .get_bytes(&StoreName::from("s"), "k");
 
-        assert!(config_result.is_err(), "should delegate to injected config store");
-        assert!(secret_result.is_err(), "should delegate to injected secret store");
+        assert!(
+            config_result.is_err(),
+            "should delegate to injected config store"
+        );
+        assert!(
+            secret_result.is_err(),
+            "should delegate to injected secret store"
+        );
     }
 }
