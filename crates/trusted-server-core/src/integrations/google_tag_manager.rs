@@ -253,7 +253,7 @@ impl GoogleTagManagerIntegration {
         target_url: &'a str,
     ) -> Result<ProxyRequestConfig<'a>, PayloadSizeError> {
         let mut proxy_config = ProxyRequestConfig::new(target_url);
-        proxy_config.forward_synthetic_id = false;
+        proxy_config.forward_ec_id = false;
 
         // If it's a POST request (e.g. /collect beacon), we must manually attach the body
         // because ProxyRequestConfig doesn't automatically copy it from the source request.
@@ -1315,11 +1315,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1351,11 +1348,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"
