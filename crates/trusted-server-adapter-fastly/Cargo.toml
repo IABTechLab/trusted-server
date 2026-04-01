@@ -7,8 +7,10 @@ edition = "2021"
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
-edgezero-adapter-fastly = { workspace = true }
+edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
+edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 fastly = { workspace = true }
 fern = { workspace = true }
@@ -19,3 +21,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../js" }
+
+[dev-dependencies]
+edgezero-core = { workspace = true, features = ["test-utils"] }

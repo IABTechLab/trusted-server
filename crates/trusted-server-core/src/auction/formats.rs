@@ -138,6 +138,7 @@ pub fn convert_tsjs_to_auction_request(
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
+        #[allow(deprecated)]
         geo: GeoInfo::from_request(req),
     });
 

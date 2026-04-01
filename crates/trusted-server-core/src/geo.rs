@@ -1,48 +1,48 @@
 //! Geographic location utilities for the trusted server.
 //!
-//! This module provides functions for extracting and handling geographic
-//! information from incoming requests, particularly DMA (Designated Market Area) codes.
+//! This module provides Fastly-specific helpers for extracting geographic
+//! information from incoming requests and writing geo headers to responses.
+//!
+//! The [`GeoInfo`] data type is defined in [`crate::platform`] as platform-
+//! neutral data; this module re-exports it and adds Fastly-coupled `impl`
+//! blocks for construction and response header injection.
 
-use fastly::geo::geo_lookup;
+use fastly::geo::{geo_lookup, Geo};
 use fastly::{Request, Response};
+
+pub use crate::platform::GeoInfo;
 
 use crate::constants::{
     HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
 
-/// Geographic information extracted from a request.
+/// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
 ///
-/// Contains all available geographic data from Fastly's geolocation service,
-/// including city, country, continent, coordinates, and DMA/metro code.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GeoInfo {
-    /// City name
-    pub city: String,
-    /// Two-letter country code (e.g., "US", "GB")
-    pub country: String,
-    /// Continent name
-    pub continent: String,
-    /// Latitude coordinate
-    pub latitude: f64,
-    /// Longitude coordinate
-    pub longitude: f64,
-    /// DMA (Designated Market Area) / metro code
-    pub metro_code: i64,
-    /// Region code
-    pub region: Option<String>,
+/// Shared by `GeoInfo::from_request` (legacy) and `FastlyPlatformGeo::lookup` in
+/// `trusted-server-adapter-fastly` so that field mapping is never duplicated.
+pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
+    GeoInfo {
+        city: geo.city().to_string(),
+        country: geo.country_code().to_string(),
+        continent: format!("{:?}", geo.continent()),
+        latitude: geo.latitude(),
+        longitude: geo.longitude(),
+        metro_code: geo.metro_code(),
+        region: geo.region().map(str::to_string),
+    }
 }
 
 impl GeoInfo {
     /// Creates a new `GeoInfo` from a request by performing a geo lookup.
     ///
-    /// This constructor performs a geo lookup based on the client's IP address and returns
-    /// all available geographic data in a structured format. It does not modify the request
-    /// or set headers.
+    /// # Legacy
     ///
-    /// # Arguments
-    ///
-    /// * `req` - The request to extract geographic information from
+    /// This is a Fastly-coupled convenience method that predates the
+    /// `platform` abstraction. New code should use
+    /// `RuntimeServices::geo.lookup(client_info.client_ip)` instead, which
+    /// goes through [`crate::platform::PlatformGeo`] and does not require
+    /// direct access to the Fastly request.
     ///
     /// # Returns
     ///
@@ -53,33 +53,13 @@ impl GeoInfo {
     /// ```ignore
     /// if let Some(geo_info) = GeoInfo::from_request(&req) {
     ///     println!("User is in {} ({})", geo_info.city, geo_info.country);
-    ///     println!("Coordinates: {}", geo_info.coordinates_string());
     /// }
     /// ```
+    #[deprecated(note = "Use RuntimeServices::geo().lookup() instead")]
     pub fn from_request(req: &Request) -> Option<Self> {
         req.get_client_ip_addr()
             .and_then(geo_lookup)
-            .map(|geo| GeoInfo {
-                city: geo.city().to_string(),
-                country: geo.country_code().to_string(),
-                continent: format!("{:?}", geo.continent()),
-                latitude: geo.latitude(),
-                longitude: geo.longitude(),
-                metro_code: geo.metro_code(),
-                region: geo.region().map(str::to_string),
-            })
-    }
-
-    /// Returns coordinates as a formatted string "latitude,longitude"
-    #[must_use]
-    pub fn coordinates_string(&self) -> String {
-        format!("{},{}", self.latitude, self.longitude)
-    }
-
-    /// Checks if a valid metro code is available (non-zero)
-    #[must_use]
-    pub fn has_metro_code(&self) -> bool {
-        self.metro_code > 0
+            .map(|geo| geo_from_fastly(&geo))
     }
 
     /// Sets geo information headers on the response.
@@ -291,7 +271,6 @@ mod tests {
             response.get_header(HEADER_X_GEO_REGION).is_none(),
             "should not set region header when region is None"
         );
-        // Other headers should still be present
         assert!(
             response.get_header(HEADER_X_GEO_CITY).is_some(),
             "should still set city header"
