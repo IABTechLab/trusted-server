@@ -60,6 +60,10 @@ pub enum TrustedServerError {
     #[display("Proxy error: {message}")]
     Proxy { message: String },
 
+    /// Request understood but not permitted — results in a 403 Forbidden response.
+    #[display("Forbidden: {message}")]
+    Forbidden { message: String },
+
     /// A redirect destination was blocked by the proxy allowlist.
     #[display("Redirect to `{host}` blocked: host not in proxy allowed_domains")]
     AllowlistViolation { host: String },
@@ -99,6 +103,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }

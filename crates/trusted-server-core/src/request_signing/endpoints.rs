@@ -8,6 +8,7 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
@@ -24,31 +25,31 @@ use crate::settings::Settings;
 /// Returns an error if JWKS cannot be retrieved, parsed, or serialized.
 pub fn handle_trusted_server_discovery(
     _settings: &Settings,
+    services: &RuntimeServices,
     _req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Get JWKS
-    let jwks_json = crate::request_signing::jwks::get_active_jwks().change_context(
+    let jwks_json = crate::request_signing::jwks::get_active_jwks(services).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to retrieve JWKS".into(),
+            message: "failed to retrieve JWKS".into(),
         },
     )?;
 
     let jwks_value: serde_json::Value =
         serde_json::from_str(&jwks_json).change_context(TrustedServerError::Configuration {
-            message: "Failed to parse JWKS JSON".into(),
+            message: "failed to parse JWKS JSON".into(),
         })?;
 
     let discovery = TrustedServerDiscovery::new(jwks_value);
 
     let json = serde_json::to_string_pretty(&discovery).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to serialize discovery document".into(),
+            message: "failed to serialize discovery document".into(),
         },
     )?;
 
     Ok(Response::from_status(200)
         .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body_text_plain(&json))
+        .with_body(json))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,7 +81,7 @@ pub fn handle_verify_signature(
     let body = req.take_body_str();
     let verify_req: VerifySignatureRequest =
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?;
 
     let verification_result = signing::verify_signature(
@@ -112,13 +113,13 @@ pub fn handle_verify_signature(
 
     let response_json = serde_json::to_string(&response).map_err(|e| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("Failed to serialize response: {}", e),
+            message: format!("failed to serialize response: {}", e),
         })
     })?;
 
     Ok(Response::from_status(200)
         .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body_text_plain(&response_json))
+        .with_body(response_json))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -152,7 +153,7 @@ pub fn handle_rotate_key(
         Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
         None => {
             return Err(TrustedServerError::Configuration {
-                message: "Missing signing storage configuration.".to_string(),
+                message: "missing signing storage configuration".to_string(),
             }
             .into());
         }
@@ -163,13 +164,13 @@ pub fn handle_rotate_key(
         RotateKeyRequest { kid: None }
     } else {
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?
     };
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to create KeyRotationManager".into(),
+            message: "failed to create KeyRotationManager".into(),
         },
     )?;
 
@@ -177,7 +178,7 @@ pub fn handle_rotate_key(
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize JWK: {}", e),
+                    message: format!("failed to serialize JWK: {}", e),
                 })
             })?;
 
@@ -193,13 +194,13 @@ pub fn handle_rotate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
             Ok(Response::from_status(200)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
-                .with_body_text_plain(&response_json))
+                .with_body(response_json))
         }
         Err(e) => {
             let response = RotateKeyResponse {
@@ -214,13 +215,13 @@ pub fn handle_rotate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
             Ok(Response::from_status(500)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
-                .with_body_text_plain(&response_json))
+                .with_body(response_json))
         }
     }
 }
@@ -256,7 +257,7 @@ pub fn handle_deactivate_key(
         Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
         None => {
             return Err(TrustedServerError::Configuration {
-                message: "Missing signing storage configuration.".to_string(),
+                message: "missing signing storage configuration".to_string(),
             }
             .into());
         }
@@ -265,12 +266,12 @@ pub fn handle_deactivate_key(
     let body = req.take_body_str();
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
-            message: "Invalid JSON request body".into(),
+            message: "invalid JSON request body".into(),
         })?;
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
         TrustedServerError::Configuration {
-            message: "Failed to create KeyRotationManager".into(),
+            message: "failed to create KeyRotationManager".into(),
         },
     )?;
 
@@ -282,7 +283,10 @@ pub fn handle_deactivate_key(
 
     match result {
         Ok(()) => {
-            let remaining_keys = manager.list_active_keys().unwrap_or_else(|_| vec![]);
+            let remaining_keys = manager.list_active_keys().unwrap_or_else(|e| {
+                log::warn!("failed to list active keys after deactivation: {}", e);
+                vec![]
+            });
 
             let response = DeactivateKeyResponse {
                 success: true,
@@ -299,13 +303,13 @@ pub fn handle_deactivate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
             Ok(Response::from_status(200)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
-                .with_body_text_plain(&response_json))
+                .with_body(response_json))
         }
         Err(e) => {
             let response = DeactivateKeyResponse {
@@ -323,22 +327,52 @@ pub fn handle_deactivate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("Failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {}", e),
                 })
             })?;
 
             Ok(Response::from_status(500)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
-                .with_body_text_plain(&response_json))
+                .with_body(response_json))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use error_stack::Report;
+
+    use crate::platform::{
+        test_support::{build_services_with_config, noop_services},
+        PlatformConfigStore, PlatformError, StoreId, StoreName,
+    };
+
     use super::*;
     use fastly::http::{Method, StatusCode};
 
+    /// Config store stub that returns a minimal JWKS with one Ed25519 key.
+    struct StubJwksConfigStore;
+
+    impl PlatformConfigStore for StubJwksConfigStore {
+        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            match key {
+                "active-kids" => Ok("test-kid-1".to_string()),
+                "test-kid-1" => Ok(
+                    r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#
+                        .to_string(),
+                ),
+                _ => Err(Report::new(PlatformError::ConfigStore)),
+            }
+        }
+
+        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
     #[test]
     fn test_handle_verify_signature_valid() {
         let settings = crate::test_support::tests::create_test_settings();
@@ -366,6 +400,11 @@ mod tests {
         let mut resp =
             handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_content_type(),
+            Some(fastly::mime::APPLICATION_JSON),
+            "should return application/json content type"
+        );
 
         // Parse response
         let resp_body = resp.take_body_str();
@@ -403,6 +442,11 @@ mod tests {
         let mut resp =
             handle_verify_signature(&settings, req).expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_content_type(),
+            Some(fastly::mime::APPLICATION_JSON),
+            "should return application/json content type"
+        );
 
         // Parse response
         let resp_body = resp.take_body_str();
@@ -580,10 +624,16 @@ mod tests {
             "https://test.com/.well-known/trusted-server.json",
         );
 
-        let result = handle_trusted_server_discovery(&settings, req);
+        let services = noop_services();
+        let result = handle_trusted_server_discovery(&settings, &services, req);
         match result {
             Ok(mut resp) => {
                 assert_eq!(resp.get_status(), StatusCode::OK);
+                assert_eq!(
+                    resp.get_content_type(),
+                    Some(fastly::mime::APPLICATION_JSON),
+                    "should return application/json content type"
+                );
                 let body = resp.take_body_str();
 
                 // Parse the discovery document
@@ -600,5 +650,36 @@ mod tests {
             }
             Err(e) => log::debug!("Expected error in test environment: {}", e),
         }
+    }
+
+    #[test]
+    fn test_handle_trusted_server_discovery_returns_jwks_document() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = Request::new(
+            Method::GET,
+            "https://test.com/.well-known/trusted-server.json",
+        );
+
+        let services = build_services_with_config(StubJwksConfigStore);
+        let mut resp = handle_trusted_server_discovery(&settings, &services, req)
+            .expect("should return discovery document when config store is populated");
+
+        assert_eq!(resp.get_status(), StatusCode::OK, "should return 200 OK");
+
+        let body = resp.take_body_str();
+        let discovery: serde_json::Value =
+            serde_json::from_str(&body).expect("should parse discovery document as JSON");
+
+        assert_eq!(discovery["version"], "1.0", "should return version 1.0");
+
+        let keys = discovery["jwks"]["keys"]
+            .as_array()
+            .expect("should have jwks.keys array");
+        assert_eq!(keys.len(), 1, "should contain exactly one key");
+        assert_eq!(
+            keys[0]["kid"], "test-kid-1",
+            "should include the active key ID"
+        );
+        assert_eq!(keys[0]["crv"], "Ed25519", "should be an Ed25519 key");
     }
 }

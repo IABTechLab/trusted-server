@@ -90,7 +90,8 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
-    /// Compute the deterministic backend name without registering anything.
+    /// Compute the deterministic backend name and resolved port without
+    /// registering anything.
     ///
     /// The name encodes scheme, host, port, certificate setting, and
     /// first-byte timeout so that backends with different configurations
@@ -101,6 +102,16 @@ impl<'a> BackendConfig<'a> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "missing host".to_string(),
+            }));
+        }
+        if self.host.chars().any(char::is_control) {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "host contains control characters".to_string(),
+            }));
+        }
+        if self.scheme.chars().any(char::is_control) {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "scheme contains control characters".to_string(),
             }));
         }
 
@@ -123,6 +134,19 @@ impl<'a> BackendConfig<'a> {
         );
 
         Ok((backend_name, target_port))
+    }
+
+    /// Return the deterministic backend name without registering anything.
+    ///
+    /// Convenience wrapper over [`Self::compute_name`] that discards the
+    /// resolved port, used by [`crate::platform::PlatformBackend`]
+    /// implementations that only need the name for correlation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host is empty.
+    pub fn predict_name(self) -> Result<String, Report<TrustedServerError>> {
+        self.compute_name().map(|(name, _)| name)
     }
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
@@ -374,6 +398,17 @@ mod tests {
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
         assert_eq!(name, "backend_http_example_org_80_t15000");
+    }
+
+    #[test]
+    fn error_on_host_with_control_characters() {
+        let err = BackendConfig::new("https", "evil.com\nINFO fake log entry")
+            .predict_name()
+            .expect_err("should reject host containing newline");
+        assert!(
+            err.to_string().contains("control characters"),
+            "should report control characters in error message"
+        );
     }
 
     #[test]

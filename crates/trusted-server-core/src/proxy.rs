@@ -1,4 +1,4 @@
-use crate::http_util::compute_encrypted_sha256_token;
+use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
@@ -1129,8 +1129,11 @@ fn reconstruct_and_validate_signed_target(
     };
 
     let expected = compute_encrypted_sha256_token(settings, &full_for_token);
-    if expected != sig {
-        return Err(Report::new(TrustedServerError::Proxy {
+    // Constant-time comparison to prevent timing side-channel attacks on the token.
+    // Length is not secret (always 43 bytes for base64url-encoded SHA-256),
+    // but we check explicitly to document the invariant.
+    if !ct_str_eq(&expected, &sig) {
+        return Err(Report::new(TrustedServerError::Forbidden {
             message: "invalid tstoken".to_string(),
         }));
     }
@@ -1326,6 +1329,29 @@ mod tests {
             reconstruct_and_validate_signed_target(&settings, &url)
                 .expect_err("expected expiration failure");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rejects_tampered_tstoken() {
+        let settings = create_test_settings();
+        let tsurl = "https://cdn.example/asset.js";
+        let tsurl_encoded =
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>();
+        // Syntactically valid base64url token of the right length, but not the correct signature
+        let bad_token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let url = format!(
+            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+            tsurl_encoded, bad_token
+        );
+
+        let err: Report<TrustedServerError> =
+            reconstruct_and_validate_signed_target(&settings, &url)
+                .expect_err("should reject tampered token");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::FORBIDDEN,
+            "should return 403 for invalid tstoken"
+        );
     }
 
     #[tokio::test]

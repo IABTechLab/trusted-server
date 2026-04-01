@@ -70,6 +70,7 @@ default = []
 
 [dev-dependencies]
 criterion = { workspace = true }
+edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
 tokio-test = { workspace = true }
 

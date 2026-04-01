@@ -331,6 +331,7 @@ pub fn handle_publisher_request(
     // (for OpenRTB forwarding) and decoded data (for enforcement).
     // When a consent_store is configured, this also persists consent to KV
     // and falls back to stored consent when cookies are absent.
+    #[allow(deprecated)]
     let geo = crate::geo::GeoInfo::from_request(&req);
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),

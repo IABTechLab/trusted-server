@@ -54,6 +54,7 @@ pub async fn handle_auction(
 
     // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&req)?;
+    #[allow(deprecated)]
     let geo = GeoInfo::from_request(&req);
     let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
         jar: cookie_jar.as_ref(),

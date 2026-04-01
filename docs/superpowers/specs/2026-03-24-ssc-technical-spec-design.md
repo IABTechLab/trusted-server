@@ -106,10 +106,10 @@ EC state flows through an `EcContext` struct created once per request and passed
 
 ## 3. Module Structure
 
-New files in `crates/common/src/`:
+New files in `crates/trusted-server-core/src/`:
 
 ```
-crates/common/src/
+crates/trusted-server-core/src/
   ec/
     mod.rs          — EcContext, pub re-exports
     identity.rs     — EC generation (HMAC-SHA256, IP normalization)
@@ -126,13 +126,13 @@ crates/common/src/
 
 Existing files modified:
 
-| File                             | Change                                                |
-| -------------------------------- | ----------------------------------------------------- |
-| `crates/common/src/settings.rs`  | Add `EdgeCookie` settings struct                      |
-| `crates/common/src/constants.rs` | Add EC header/cookie name constants                   |
-| `crates/common/src/error.rs`     | Add `EdgeCookie` error variant                        |
-| `crates/common/src/auction/`     | Inject EC into `user.id`, `user.eids`, `user.consent` |
-| `crates/fastly/src/main.rs`      | Register new routes, run EC middleware                |
+| File                                               | Change                                                |
+| -------------------------------------------------- | ----------------------------------------------------- |
+| `crates/trusted-server-core/src/settings.rs`       | Add `EdgeCookie` settings struct                      |
+| `crates/trusted-server-core/src/constants.rs`      | Add EC header/cookie name constants                   |
+| `crates/trusted-server-core/src/error.rs`          | Add `EdgeCookie` error variant                        |
+| `crates/trusted-server-core/src/auction/`          | Inject EC into `user.id`, `user.eids`, `user.consent` |
+| `crates/trusted-server-adapter-fastly/src/main.rs` | Register new routes, run EC middleware                |
 
 ---
 
@@ -1143,7 +1143,7 @@ Browser `fetch()` with `credentials: "include"` sends an `OPTIONS` preflight. Th
 
 ### 12.1 Changes to existing auction path
 
-The auction handler (`crates/common/src/auction/`) is modified to inject EC identity into outbound OpenRTB requests. This is **not** a builder tweak — it requires explicit schema additions across multiple files. SyntheticID is fully removed from the auction path — no fallback, no `X-Synthetic-*` headers, no `get_or_generate_synthetic_id()`.
+The auction handler (`crates/trusted-server-core/src/auction/`) is modified to inject EC identity into outbound OpenRTB requests. This is **not** a builder tweak — it requires explicit schema additions across multiple files. SyntheticID is fully removed from the auction path — no fallback, no `X-Synthetic-*` headers, no `get_or_generate_synthetic_id()`.
 
 | Concern                               | Behavior                                                                                                    |
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -1388,7 +1388,7 @@ The response confirms the registration succeeded and echoes key fields. `api_key
 
 ### 14.1 New `EdgeCookie` settings struct
 
-Added to `crates/common/src/settings.rs`:
+Added to `crates/trusted-server-core/src/settings.rs`:
 
 ```rust
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -1475,7 +1475,7 @@ Engineering must confirm `fastly::erl::RateCounter` availability in the target b
 
 ## 15. Constants and Header Names
 
-New constants in `crates/common/src/constants.rs`:
+New constants in `crates/trusted-server-core/src/constants.rs`:
 
 ```rust
 // EC cookie name
@@ -1510,7 +1510,7 @@ The following EC headers must be added to `INTERNAL_HEADERS` in `constants.rs` t
 
 ## 16. Error Handling
 
-New error variants in `crates/common/src/error.rs`:
+New error variants in `crates/trusted-server-core/src/error.rs`:
 
 ```rust
 pub enum TrustedServerError {
@@ -1541,7 +1541,7 @@ pub enum TrustedServerError {
 
 ## 17. Request Routing
 
-New routes added to `route_request()` in `crates/fastly/src/main.rs`:
+New routes added to `route_request()` in `crates/trusted-server-adapter-fastly/src/main.rs`:
 
 ```rust
 // EC sync pixel — no auth required (partner validation is internal)
