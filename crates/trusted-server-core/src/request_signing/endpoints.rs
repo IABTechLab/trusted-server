@@ -147,6 +147,7 @@ pub struct RotateKeyResponse {
 /// Returns an error if the request signing settings are missing, JSON parsing fails, or key rotation fails.
 pub fn handle_rotate_key(
     settings: &Settings,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let (config_store_id, secret_store_id) = match &settings.request_signing {
@@ -168,13 +169,9 @@ pub fn handle_rotate_key(
         })?
     };
 
-    let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
-        TrustedServerError::Configuration {
-            message: "failed to create KeyRotationManager".into(),
-        },
-    )?;
+    let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    match manager.rotate_key(rotate_req.kid) {
+    match manager.rotate_key(services, rotate_req.kid) {
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
@@ -251,6 +248,7 @@ pub struct DeactivateKeyResponse {
 /// Returns an error if the request signing settings are missing, JSON parsing fails, or key deactivation fails.
 pub fn handle_deactivate_key(
     settings: &Settings,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let (config_store_id, secret_store_id) = match &settings.request_signing {
@@ -269,21 +267,17 @@ pub fn handle_deactivate_key(
             message: "invalid JSON request body".into(),
         })?;
 
-    let manager = KeyRotationManager::new(config_store_id, secret_store_id).change_context(
-        TrustedServerError::Configuration {
-            message: "failed to create KeyRotationManager".into(),
-        },
-    )?;
+    let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
     let result = if deactivate_req.delete {
-        manager.delete_key(&deactivate_req.kid)
+        manager.delete_key(services, &deactivate_req.kid)
     } else {
-        manager.deactivate_key(&deactivate_req.kid)
+        manager.deactivate_key(services, &deactivate_req.kid)
     };
 
     match result {
         Ok(()) => {
-            let remaining_keys = manager.list_active_keys().unwrap_or_else(|e| {
+            let remaining_keys = manager.list_active_keys(services).unwrap_or_else(|e| {
                 log::warn!("failed to list active keys after deactivation: {}", e);
                 vec![]
             });
@@ -475,7 +469,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
 
-        let result = handle_rotate_key(&settings, req);
+        let result = handle_rotate_key(&settings, &noop_services(), req);
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
@@ -503,7 +497,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
         req.set_body(body_json);
 
-        let result = handle_rotate_key(&settings, req);
+        let result = handle_rotate_key(&settings, &noop_services(), req);
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
@@ -525,7 +519,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
         req.set_body("invalid json");
 
-        let result = handle_rotate_key(&settings, req);
+        let result = handle_rotate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 
@@ -543,7 +537,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
-        let result = handle_deactivate_key(&settings, req);
+        let result = handle_deactivate_key(&settings, &noop_services(), req);
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
@@ -573,7 +567,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
-        let result = handle_deactivate_key(&settings, req);
+        let result = handle_deactivate_key(&settings, &noop_services(), req);
         match result {
             Ok(mut resp) => {
                 let body = resp.take_body_str();
@@ -595,7 +589,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body("invalid json");
 
-        let result = handle_deactivate_key(&settings, req);
+        let result = handle_deactivate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 

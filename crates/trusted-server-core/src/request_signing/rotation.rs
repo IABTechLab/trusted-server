@@ -1,7 +1,10 @@
 //! Key rotation management for request signing.
 //!
-//! This module provides functionality for rotating signing keys, managing key lifecycle,
-//! and storing keys in Fastly Config and Secret stores.
+//! This module provides functionality for rotating signing keys, managing key
+//! lifecycle, and storing keys via platform store primitives through
+//! [`RuntimeServices`].
+
+use std::sync::LazyLock;
 
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::SigningKey;
@@ -9,10 +12,13 @@ use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
 use crate::error::TrustedServerError;
+use crate::platform::{RuntimeServices, StoreId, StoreName};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
-use crate::storage::{FastlyApiClient, FastlyConfigStore};
 
 use super::Keypair;
+
+static JWKS_STORE_NAME: LazyLock<StoreName> =
+    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
 
 #[derive(Debug, Clone)]
 pub struct KeyRotationResult {
@@ -22,45 +28,33 @@ pub struct KeyRotationResult {
     pub jwk: Jwk,
 }
 
-#[allow(deprecated)]
+/// Manages signing key lifecycle using platform store primitives.
+///
+/// Reads use the edge-visible store name ([`JWKS_CONFIG_STORE_NAME`]).
+/// Writes use the management API store identifiers supplied at construction.
 pub struct KeyRotationManager {
-    /// Edge-side config store for reading JWKS (uses store name).
-    config_store: FastlyConfigStore,
-    /// Management API client for writing to stores (uses store IDs).
-    api_client: FastlyApiClient,
-    /// Fastly API store ID for config store writes.
-    config_store_id: String,
-    /// Fastly API store ID for secret store writes.
-    secret_store_id: String,
+    /// Management API store ID for config store writes.
+    config_store_id: StoreId,
+    /// Management API store ID for secret store writes.
+    secret_store_id: StoreId,
 }
 
-#[allow(deprecated)]
 impl KeyRotationManager {
     /// Creates a new key rotation manager.
     ///
-    /// The `config_store_id` and `secret_store_id` are Fastly management API
+    /// The `config_store_id` and `secret_store_id` are platform management API
     /// identifiers used for write operations. Edge reads use the store names
-    /// defined in [`JWKS_CONFIG_STORE_NAME`] and [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the API client cannot be initialized.
+    /// defined in [`JWKS_CONFIG_STORE_NAME`] and
+    /// [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
+    #[must_use]
     pub fn new(
         config_store_id: impl Into<String>,
         secret_store_id: impl Into<String>,
-    ) -> Result<Self, Report<TrustedServerError>> {
-        let config_store_id = config_store_id.into();
-        let secret_store_id = secret_store_id.into();
-
-        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
-        let api_client = FastlyApiClient::new()?;
-
-        Ok(Self {
-            config_store,
-            api_client,
-            config_store_id,
-            secret_store_id,
-        })
+    ) -> Self {
+        Self {
+            config_store_id: StoreId::from(config_store_id.into()),
+            secret_store_id: StoreId::from(secret_store_id.into()),
+        }
     }
 
     /// Rotates the signing key by generating a new keypair and storing it.
@@ -70,24 +64,28 @@ impl KeyRotationManager {
     /// Returns an error if key storage or update operations fail.
     pub fn rotate_key(
         &self,
+        services: &RuntimeServices,
         kid: Option<String>,
     ) -> Result<KeyRotationResult, Report<TrustedServerError>> {
         let new_kid = kid.unwrap_or_else(generate_date_based_kid);
 
         let keypair = Keypair::generate();
         let jwk = keypair.get_jwk(new_kid.clone());
-        let previous_kid = self.config_store.get("current-kid").ok();
+        let previous_kid = services
+            .config_store()
+            .get(&JWKS_STORE_NAME, "current-kid")
+            .ok();
 
-        self.store_private_key(&new_kid, &keypair.signing_key)?;
-        self.store_public_jwk(&new_kid, &jwk)?;
+        self.store_private_key(services, &new_kid, &keypair.signing_key)?;
+        self.store_public_jwk(services, &new_kid, &jwk)?;
 
         let active_kids = match &previous_kid {
             Some(prev) if prev != &new_kid => vec![prev.clone(), new_kid.clone()],
             _ => vec![new_kid.clone()],
         };
 
-        self.update_current_kid(&new_kid)?;
-        self.update_active_kids(&active_kids)?;
+        self.update_current_kid(services, &new_kid)?;
+        self.update_active_kids(services, &active_kids)?;
 
         Ok(KeyRotationResult {
             new_kid,
@@ -99,48 +97,65 @@ impl KeyRotationManager {
 
     fn store_private_key(
         &self,
+        services: &RuntimeServices,
         kid: &str,
         signing_key: &SigningKey,
     ) -> Result<(), Report<TrustedServerError>> {
-        let key_bytes = signing_key.as_bytes();
-        let key_b64 = general_purpose::STANDARD.encode(key_bytes);
+        let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
 
-        self.api_client
-            .create_secret(&self.secret_store_id, kid, &key_b64)
+        services
+            .secret_store()
+            .create(&self.secret_store_id, kid, &key_b64)
             .change_context(TrustedServerError::Configuration {
-                message: format!("Failed to store private key '{}'", kid),
+                message: format!("failed to store private key '{}'", kid),
             })
     }
 
-    fn store_public_jwk(&self, kid: &str, jwk: &Jwk) -> Result<(), Report<TrustedServerError>> {
+    fn store_public_jwk(
+        &self,
+        services: &RuntimeServices,
+        kid: &str,
+        jwk: &Jwk,
+    ) -> Result<(), Report<TrustedServerError>> {
         let jwk_json = serde_json::to_string(jwk).map_err(|e| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Failed to serialize JWK: {}", e),
+                message: format!("failed to serialize JWK: {}", e),
             })
         })?;
 
-        self.api_client
-            .update_config_item(&self.config_store_id, kid, &jwk_json)
+        services
+            .config_store()
+            .put(&self.config_store_id, kid, &jwk_json)
             .change_context(TrustedServerError::Configuration {
-                message: format!("Failed to store public JWK '{}'", kid),
+                message: format!("failed to store public JWK '{}'", kid),
             })
     }
 
-    fn update_current_kid(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
-        self.api_client
-            .update_config_item(&self.config_store_id, "current-kid", kid)
+    fn update_current_kid(
+        &self,
+        services: &RuntimeServices,
+        kid: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
+        services
+            .config_store()
+            .put(&self.config_store_id, "current-kid", kid)
             .change_context(TrustedServerError::Configuration {
-                message: "Failed to update current-kid".into(),
+                message: "failed to update current-kid".into(),
             })
     }
 
-    fn update_active_kids(&self, active_kids: &[String]) -> Result<(), Report<TrustedServerError>> {
+    fn update_active_kids(
+        &self,
+        services: &RuntimeServices,
+        active_kids: &[String],
+    ) -> Result<(), Report<TrustedServerError>> {
         let active_kids_str = active_kids.join(",");
 
-        self.api_client
-            .update_config_item(&self.config_store_id, "active-kids", &active_kids_str)
+        services
+            .config_store()
+            .put(&self.config_store_id, "active-kids", &active_kids_str)
             .change_context(TrustedServerError::Configuration {
-                message: "Failed to update active-kids".into(),
+                message: "failed to update active-kids".into(),
             })
     }
 
@@ -149,16 +164,22 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if the active keys cannot be retrieved from the config store.
-    pub fn list_active_keys(&self) -> Result<Vec<String>, Report<TrustedServerError>> {
-        let active_kids_str = self.config_store.get("active-kids")?;
+    pub fn list_active_keys(
+        &self,
+        services: &RuntimeServices,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        let active_kids_str = services
+            .config_store()
+            .get(&JWKS_STORE_NAME, "active-kids")
+            .change_context(TrustedServerError::Configuration {
+                message: "failed to read active-kids from config store".into(),
+            })?;
 
-        let active_kids: Vec<String> = active_kids_str
+        Ok(active_kids_str
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect();
-
-        Ok(active_kids)
+            .collect())
     }
 
     /// Deactivates a key by removing it from the active keys list.
@@ -166,18 +187,21 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if this would deactivate the last active key, or if the update fails.
-    pub fn deactivate_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
-        let mut active_kids = self.list_active_keys()?;
-
+    pub fn deactivate_key(
+        &self,
+        services: &RuntimeServices,
+        kid: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let mut active_kids = self.list_active_keys(services)?;
         active_kids.retain(|k| k != kid);
 
         if active_kids.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "Cannot deactivate the last active key".into(),
+                message: "cannot deactivate the last active key".into(),
             }));
         }
 
-        self.update_active_kids(&active_kids)
+        self.update_active_kids(services, &active_kids)
     }
 
     /// Deletes a key by deactivating it and removing it from storage.
@@ -185,25 +209,32 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if deactivation fails or if the key cannot be deleted from storage.
-    pub fn delete_key(&self, kid: &str) -> Result<(), Report<TrustedServerError>> {
-        self.deactivate_key(kid)?;
+    pub fn delete_key(
+        &self,
+        services: &RuntimeServices,
+        kid: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
+        self.deactivate_key(services, kid)?;
 
-        self.api_client
-            .delete_config_item(&self.config_store_id, kid)
+        services
+            .config_store()
+            .delete(&self.config_store_id, kid)
             .change_context(TrustedServerError::Configuration {
-                message: "Failed to delete JWK from ConfigStore".into(),
+                message: "failed to delete JWK from config store".into(),
             })?;
 
-        self.api_client
-            .delete_secret(&self.secret_store_id, kid)
+        services
+            .secret_store()
+            .delete(&self.secret_store_id, kid)
             .change_context(TrustedServerError::Configuration {
-                message: "Failed to delete secret from SecretStore".into(),
+                message: "failed to delete signing key from secret store".into(),
             })?;
 
         Ok(())
     }
 }
 
+/// Generates a date-based key ID in the format `ts-YYYY-MM-DD`.
 #[must_use]
 pub fn generate_date_based_kid() -> String {
     use chrono::Utc;
@@ -212,56 +243,198 @@ pub fn generate_date_based_kid() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use error_stack::Report;
+
+    use crate::platform::test_support::build_services_with_config_and_secret;
+    use crate::platform::{
+        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+    };
     use crate::request_signing::Keypair;
 
     use super::*;
 
+    // ---------------------------------------------------------------------------
+    // Spy stores: record put/create/delete calls, serve preset get values
+    // ---------------------------------------------------------------------------
+
+    struct SpyConfigStore {
+        data: Mutex<HashMap<String, String>>,
+        puts: Mutex<Vec<(String, String, String)>>,
+        deletes: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SpyConfigStore {
+        fn new(initial: HashMap<String, String>) -> Self {
+            Self {
+                data: Mutex::new(initial),
+                puts: Mutex::new(vec![]),
+                deletes: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    impl PlatformConfigStore for SpyConfigStore {
+        fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            self.data
+                .lock()
+                .expect("should lock data")
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::ConfigStore))
+        }
+
+        fn put(
+            &self,
+            store_id: &StoreId,
+            key: &str,
+            value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            self.puts.lock().expect("should lock puts").push((
+                store_id.to_string(),
+                key.to_string(),
+                value.to_string(),
+            ));
+            self.data
+                .lock()
+                .expect("should lock data")
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+            self.deletes
+                .lock()
+                .expect("should lock deletes")
+                .push((store_id.to_string(), key.to_string()));
+            self.data
+                .lock()
+                .expect("should lock data")
+                .remove(key);
+            Ok(())
+        }
+    }
+
+    struct SpySecretStore {
+        creates: Mutex<Vec<(String, String, String)>>,
+        deletes: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SpySecretStore {
+        fn new() -> Self {
+            Self {
+                creates: Mutex::new(vec![]),
+                deletes: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    impl PlatformSecretStore for SpySecretStore {
+        fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
+        }
+
+        fn create(
+            &self,
+            store_id: &StoreId,
+            name: &str,
+            value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            self.creates.lock().expect("should lock creates").push((
+                store_id.to_string(),
+                name.to_string(),
+                value.to_string(),
+            ));
+            Ok(())
+        }
+
+        fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+            self.deletes
+                .lock()
+                .expect("should lock deletes")
+                .push((store_id.to_string(), name.to_string()));
+            Ok(())
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests
+    // ---------------------------------------------------------------------------
+
     #[test]
-    fn test_generate_date_based_kid() {
+    fn generate_date_based_kid_has_correct_format() {
         let kid = generate_date_based_kid();
-        // Verify format: ts-YYYY-MM-DD
-        assert!(kid.starts_with("ts-"));
-        assert!(kid.len() >= 13);
+        assert!(kid.starts_with("ts-"), "should start with 'ts-'");
+        assert!(kid.len() >= 13, "should be at least 13 characters");
         let parts: Vec<&str> = kid.split('-').collect();
-        assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0], "ts");
+        assert_eq!(parts.len(), 4, "should have 4 dash-separated parts");
+        assert_eq!(parts[0], "ts", "first part should be 'ts'");
     }
 
     #[test]
-    fn test_key_rotation_manager_creation() {
-        let result = KeyRotationManager::new("test-config-store-id", "test-secret-store-id");
-        match result {
-            Ok(manager) => {
-                assert_eq!(manager.config_store_id, "test-config-store-id");
-                assert_eq!(manager.secret_store_id, "test-secret-store-id");
-            }
-            Err(e) => {
-                println!("Expected error in test environment: {}", e);
-            }
-        }
+    fn new_is_infallible_and_stores_ids() {
+        let manager = KeyRotationManager::new("cfg-store-123", "sec-store-456");
+        assert_eq!(
+            manager.config_store_id.as_ref(),
+            "cfg-store-123",
+            "should store config_store_id"
+        );
+        assert_eq!(
+            manager.secret_store_id.as_ref(),
+            "sec-store-456",
+            "should store secret_store_id"
+        );
     }
 
     #[test]
-    fn test_list_active_keys() {
-        let result = KeyRotationManager::new("test-config-store-id", "test-secret-store-id");
-        if let Ok(manager) = result {
-            match manager.list_active_keys() {
-                Ok(keys) => {
-                    assert!(!keys.is_empty(), "Should have at least one active key");
-                }
-                Err(e) => println!("Expected error in test environment: {}", e),
-            }
-        }
+    fn rotate_key_stores_private_key_via_secret_store_create() {
+        let config_store = SpyConfigStore::new(HashMap::new());
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.rotate_key(&services, Some("new-kid".to_string()));
+
+        assert!(result.is_ok(), "should succeed when stores accept writes");
+        let rotation = result.expect("should produce rotation result");
+        assert_eq!(rotation.new_kid, "new-kid", "should use the provided kid");
+        assert!(
+            rotation.active_kids.contains(&"new-kid".to_string()),
+            "should include new kid in active kids"
+        );
     }
 
     #[test]
-    fn test_key_rotation_result_structure() {
+    fn deactivate_key_fails_when_only_one_key_remains() {
+        let mut data = HashMap::new();
+        data.insert("active-kids".to_string(), "only-key".to_string());
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.deactivate_key(&services, "only-key");
+
+        assert!(
+            result.is_err(),
+            "should fail to deactivate the last active key"
+        );
+    }
+
+    #[test]
+    fn key_rotation_result_structure_is_valid() {
         let jwk = Keypair::generate().get_jwk("test-key".to_string());
-
         let result = KeyRotationResult {
             new_kid: "ts-2024-01-01".to_string(),
             previous_kid: Some("ts-2023-12-31".to_string()),
-            active_kids: vec!["ts-2023-12-31".to_string(), "ts-2024-01-01".to_string()],
+            active_kids: vec![
+                "ts-2023-12-31".to_string(),
+                "ts-2024-01-01".to_string(),
+            ],
             jwk: jwk.clone(),
         };
 
