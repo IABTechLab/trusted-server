@@ -26,9 +26,6 @@ pub enum PlatformError {
     /// Operation is not supported by this platform adapter.
     #[display("unsupported platform operation")]
     Unsupported,
-    /// Operation is defined by the trait but not yet implemented in this adapter.
-    #[display("not yet implemented")]
-    NotImplemented,
 }
 
 impl core::error::Error for PlatformError {}

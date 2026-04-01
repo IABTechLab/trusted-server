@@ -60,11 +60,11 @@ mod tests {
         let cloned = services.clone();
 
         assert!(
-            cloned.client_info.client_ip.is_none(),
+            cloned.client_info().client_ip.is_none(),
             "should preserve client_ip through clone"
         );
         assert!(
-            cloned.client_info.tls_protocol.is_none(),
+            cloned.client_info().tls_protocol.is_none(),
             "should preserve tls_protocol through clone"
         );
     }
@@ -73,8 +73,8 @@ mod tests {
     fn runtime_services_geo_lookup_returns_none_for_no_ip() {
         let services = noop_services();
         let result = services
-            .geo
-            .lookup(services.client_info.client_ip)
+            .geo()
+            .lookup(services.client_info().client_ip)
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
     }
