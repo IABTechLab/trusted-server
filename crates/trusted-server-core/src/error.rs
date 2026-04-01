@@ -151,11 +151,8 @@ mod tests {
             TrustedServerError::Proxy {
                 message: "upstream 10.0.0.1 refused".into(),
             },
-            TrustedServerError::SyntheticId {
+            TrustedServerError::Ec {
                 message: "seed file missing".into(),
-            },
-            TrustedServerError::Template {
-                message: "render failed".into(),
             },
             TrustedServerError::Auction {
                 message: "bid timeout".into(),
@@ -172,9 +169,6 @@ mod tests {
             },
             TrustedServerError::Settings {
                 message: "parse failed".into(),
-            },
-            TrustedServerError::InsecureDefault {
-                field: "api_key".into(),
             },
             TrustedServerError::InvalidUtf8 {
                 message: "byte 0xff".into(),
