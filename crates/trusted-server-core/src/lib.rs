@@ -50,6 +50,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;
+pub mod platform;
 pub mod proxy;
 pub mod publisher;
 pub mod redacted;

@@ -12,6 +12,7 @@ use jose_jwk::{
 use rand::rngs::OsRng;
 
 use crate::error::TrustedServerError;
+#[allow(deprecated)]
 use crate::fastly_storage::FastlyConfigStore;
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
 
@@ -60,6 +61,7 @@ impl Keypair {
 /// # Errors
 ///
 /// Returns an error if the config store cannot be accessed or if active keys cannot be retrieved.
+#[allow(deprecated)]
 pub fn get_active_jwks() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     let active_kids_str = store

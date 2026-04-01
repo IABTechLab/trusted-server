@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
+#[allow(deprecated)]
 use crate::fastly_storage::{FastlyConfigStore, FastlySecretStore};
 use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
 
@@ -17,6 +18,7 @@ use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
 /// # Errors
 ///
 /// Returns an error if the config store cannot be accessed or the current-kid key is not found.
+#[allow(deprecated)]
 pub fn get_current_key_id() -> Result<String, Report<TrustedServerError>> {
     let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
     store.get("current-kid")
@@ -119,6 +121,7 @@ impl RequestSigner {
     /// # Errors
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
+    #[allow(deprecated)]
     pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
         let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
         let key_id =
@@ -173,6 +176,7 @@ impl RequestSigner {
 /// # Errors
 ///
 /// Returns an error if the JWK cannot be retrieved, parsed, or if signature verification fails.
+#[allow(deprecated)]
 pub fn verify_signature(
     payload: &[u8],
     signature_b64: &str,
