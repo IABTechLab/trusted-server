@@ -197,6 +197,7 @@ pub struct ApsConfig {
 
     /// APS API endpoint
     #[serde(default = "default_endpoint")]
+    #[validate(url)]
     pub endpoint: String,
 
     /// Timeout in milliseconds
@@ -597,8 +598,14 @@ use std::sync::Arc;
 /// Auto-register APS provider based on settings configuration.
 ///
 /// Returns the APS provider if enabled in settings.
-#[must_use]
-pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> {
+///
+/// # Errors
+///
+/// Returns an error when the APS provider is enabled with invalid
+/// configuration.
+pub fn register_providers(
+    settings: &Settings,
+) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
     // Check for real APS provider configuration
@@ -615,11 +622,11 @@ pub fn register_providers(settings: &Settings) -> Vec<Arc<dyn AuctionProvider>> 
             log::debug!("APS integration config found but is disabled");
         }
         Err(e) => {
-            log::error!("Failed to load APS configuration: {:?}", e);
+            return Err(e);
         }
     }
 
-    providers
+    Ok(providers)
 }
 
 // ============================================================================

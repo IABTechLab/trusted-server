@@ -788,11 +788,13 @@ dependencies = [
  "bytes",
  "chrono",
  "edgezero-core",
+ "fastly",
  "fern",
  "flate2",
  "futures",
  "futures-util",
  "log",
+ "log-fastly",
 ]
 
 [[package]]
@@ -2776,8 +2778,10 @@ dependencies = [
 name = "trusted-server-adapter-fastly"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "edgezero-adapter-fastly",
+ "edgezero-core",
  "error-stack",
  "fastly",
  "fern",
@@ -2820,13 +2824,13 @@ dependencies = [
  "log-fastly",
  "lol_html",
  "matchit",
- "once_cell",
  "pin-project-lite",
  "rand",
  "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "temp-env",
  "tokio",
  "tokio-test",

@@ -33,12 +33,6 @@ pub enum TrustedServerError {
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
-    /// A configuration secret is still set to a known placeholder value.
-    #[display(
-        "Configuration field '{field}' is set to a known placeholder value - this is insecure"
-    )]
-    InsecureDefault { field: String },
-
     /// Invalid UTF-8 data encountered.
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
@@ -65,6 +59,14 @@ pub enum TrustedServerError {
     /// Proxy error.
     #[display("Proxy error: {message}")]
     Proxy { message: String },
+
+    /// Request understood but not permitted — results in a 403 Forbidden response.
+    #[display("Forbidden: {message}")]
+    Forbidden { message: String },
+
+    /// A redirect destination was blocked by the proxy allowlist.
+    #[display("Redirect to `{host}` blocked: host not in proxy allowed_domains")]
+    AllowlistViolation { host: String },
 
     /// Settings parsing or validation failed.
     #[display("Settings error: {message}")]
@@ -99,13 +101,14 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
-            Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
+            Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }

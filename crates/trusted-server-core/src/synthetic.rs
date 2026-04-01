@@ -25,6 +25,35 @@ type HmacSha256 = Hmac<Sha256>;
 const ALPHANUMERIC_CHARSET: &[u8] =
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
+/// Expected byte length of a valid synthetic ID: 64 hex chars + '.' + 6 alphanumeric chars.
+const SYNTHETIC_ID_LEN: usize = 71;
+
+/// Validates that `value` matches the canonical synthetic ID format.
+///
+/// The format is `<hmac>.<suffix>` where `<hmac>` is exactly 64 **lowercase** hex
+/// characters (HMAC-SHA256 output via [`hex::encode`]) and `<suffix>` is exactly
+/// 6 ASCII alphanumeric characters. Uppercase hex is rejected — the generator
+/// never produces it and intermediaries that normalise case would produce an ID
+/// that no longer matches its HMAC.
+///
+/// The total length is checked first so that oversized attacker-supplied
+/// strings are rejected in O(1) before any character scanning occurs.
+pub(crate) fn is_valid_synthetic_id(value: &str) -> bool {
+    if value.len() != SYNTHETIC_ID_LEN {
+        return false;
+    }
+    match value.split_once('.') {
+        Some((hmac_part, suffix_part)) => {
+            hmac_part.len() == 64
+                && hmac_part
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                && suffix_part.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
 /// Normalizes an IP address for stable synthetic ID generation.
 ///
 /// For IPv6 addresses, masks to /64 prefix to handle Privacy Extensions
@@ -96,7 +125,7 @@ pub fn generate_synthetic_id(
             message: "Failed to render synthetic ID template".to_string(),
         })?;
 
-    log::trace!("Input string for fresh ID: {} {}", input_string, data);
+    log::debug!("Generating fresh synthetic ID from template inputs");
 
     let mut mac = HmacSha256::new_from_slice(settings.synthetic.secret_key.expose().as_bytes())
         .change_context(TrustedServerError::SyntheticId {
@@ -109,39 +138,60 @@ pub fn generate_synthetic_id(
     let random_suffix = generate_random_suffix(6);
     let synthetic_id = format!("{}.{}", hmac_hash, random_suffix);
 
-    log::trace!("Generated fresh ID: {}", synthetic_id);
+    debug_assert!(
+        is_valid_synthetic_id(&synthetic_id),
+        "should generate a synthetic ID matching the expected format"
+    );
+
+    log::debug!("Generated fresh synthetic ID");
 
     Ok(synthetic_id)
 }
 
-/// Gets or creates a synthetic ID from the request.
+/// Reads a validated synthetic ID from the request, if one is present.
 ///
-/// Attempts to retrieve an existing synthetic ID from:
-/// 1. The `x-synthetic-id` header
-/// 2. The `synthetic_id` cookie
+/// Checks the `x-synthetic-id` header first, then the `synthetic_id` cookie.
+/// Values that do not match the canonical format (`<64-hex>.<6-alphanumeric>`)
+/// are discarded and a warning is logged — the raw invalid value is never
+/// included in log output.
 ///
-/// If neither exists, generates a new synthetic ID.
+/// Note: a non-UTF-8 `x-synthetic-id` header value is silently discarded and
+/// the cookie is checked next, whereas a non-UTF-8 `Cookie` header propagates
+/// as an error.
+///
+/// Returns `Ok(None)` when no valid ID is found, allowing the caller to
+/// generate a fresh one.
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::Template`] if template rendering fails during generation
-/// - [`TrustedServerError::SyntheticId`] if ID generation fails
+/// - [`TrustedServerError::InvalidHeaderValue`] if the Cookie header contains invalid UTF-8
 pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(synthetic_id) = req
+    if let Some(raw) = req
         .get_header(HEADER_X_SYNTHETIC_ID)
         .and_then(|h| h.to_str().ok())
     {
-        let id = synthetic_id.to_string();
-        log::trace!("Using existing Synthetic ID from header: {}", id);
-        return Ok(Some(id));
+        if is_valid_synthetic_id(raw) {
+            log::debug!("Using existing synthetic ID from header");
+            return Ok(Some(raw.to_string()));
+        }
+        log::warn!(
+            "Rejecting synthetic ID from header: invalid format (len={})",
+            raw.len()
+        );
     }
 
     match handle_request_cookies(req)? {
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_SYNTHETIC_ID) {
-                let id = cookie.value().to_string();
-                log::trace!("Using existing Trusted Server ID from cookie: {}", id);
-                return Ok(Some(id));
+                let raw = cookie.value();
+                if is_valid_synthetic_id(raw) {
+                    log::debug!("Using existing synthetic ID from cookie");
+                    return Ok(Some(raw.to_string()));
+                }
+                log::warn!(
+                    "Rejecting synthetic ID from cookie: invalid format (len={})",
+                    raw.len()
+                );
             }
         }
         None => {
@@ -152,17 +202,17 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
     Ok(None)
 }
 
-/// Gets or creates a synthetic ID from the request.
+/// Gets a validated synthetic ID from the request, or generates a fresh one.
 ///
-/// Attempts to retrieve an existing synthetic ID from:
-/// 1. The `x-synthetic-id` header
-/// 2. The `synthetic_id` cookie
-///
-/// If neither exists, generates a new synthetic ID.
+/// Checks the `x-synthetic-id` header then the `synthetic_id` cookie via
+/// [`get_synthetic_id`]. Values that fail format validation are discarded — a
+/// warning is logged and a fresh ID is generated in their place,
+/// identical to the no-ID-present path.
 ///
 /// # Errors
 ///
-/// Returns an error if template rendering fails during generation or if ID generation fails.
+/// - [`TrustedServerError::Template`] if template rendering fails during generation
+/// - [`TrustedServerError::SyntheticId`] if HMAC generation fails
 pub fn get_or_generate_synthetic_id(
     settings: &Settings,
     req: &Request,
@@ -173,7 +223,7 @@ pub fn get_or_generate_synthetic_id(
 
     // If no existing Synthetic ID found, generate a fresh one
     let synthetic_id = generate_synthetic_id(settings, req)?;
-    log::trace!("No existing synthetic_id, generated: {}", synthetic_id);
+    log::debug!("No existing synthetic ID found, generated a fresh one");
     Ok(synthetic_id)
 }
 
@@ -183,7 +233,7 @@ mod tests {
     use fastly::http::{HeaderName, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
 
     #[test]
     fn test_normalize_ip_ipv4_unchanged() {
@@ -227,31 +277,6 @@ mod tests {
         req
     }
 
-    fn is_synthetic_id_format(value: &str) -> bool {
-        let mut parts = value.split('.');
-        let hmac_part = match parts.next() {
-            Some(part) => part,
-            None => return false,
-        };
-        let suffix_part = match parts.next() {
-            Some(part) => part,
-            None => return false,
-        };
-        if parts.next().is_some() {
-            return false;
-        }
-        if hmac_part.len() != 64 || suffix_part.len() != 6 {
-            return false;
-        }
-        if !hmac_part.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-        if !suffix_part.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return false;
-        }
-        true
-    }
-
     #[test]
     fn test_generate_synthetic_id() {
         let settings: Settings = create_test_settings();
@@ -263,60 +288,88 @@ mod tests {
 
         let synthetic_id =
             generate_synthetic_id(&settings, &req).expect("should generate synthetic ID");
-        log::trace!("Generated synthetic ID: {}", synthetic_id);
         assert!(
-            is_synthetic_id_format(&synthetic_id),
+            is_valid_synthetic_id(&synthetic_id),
             "should match synthetic ID format"
         );
     }
 
     #[test]
-    fn test_is_synthetic_id_format_accepts_valid_value() {
-        let value = format!("{}.{}", "a".repeat(64), "Ab12z9");
+    fn test_is_valid_synthetic_id_accepts_valid_value() {
         assert!(
-            is_synthetic_id_format(&value),
-            "should accept a valid synthetic ID format"
+            is_valid_synthetic_id(VALID_SYNTHETIC_ID),
+            "should accept a well-formed synthetic ID"
         );
     }
 
     #[test]
-    fn test_is_synthetic_id_format_rejects_invalid_values() {
+    fn test_is_valid_synthetic_id_rejects_invalid_values() {
         let missing_suffix = "a".repeat(64);
         assert!(
-            !is_synthetic_id_format(&missing_suffix),
+            !is_valid_synthetic_id(&missing_suffix),
             "should reject missing suffix"
         );
 
         let invalid_hex = format!("{}.{}", "a".repeat(63) + "g", "Ab12z9");
         assert!(
-            !is_synthetic_id_format(&invalid_hex),
+            !is_valid_synthetic_id(&invalid_hex),
             "should reject non-hex HMAC content"
         );
 
         let invalid_suffix = format!("{}.{}", "a".repeat(64), "ab-129");
         assert!(
-            !is_synthetic_id_format(&invalid_suffix),
+            !is_valid_synthetic_id(&invalid_suffix),
             "should reject non-alphanumeric suffix"
         );
 
+        // 74 bytes — caught by the length guard before any scan.
         let extra_segment = format!("{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
         assert!(
-            !is_synthetic_id_format(&extra_segment),
+            !is_valid_synthetic_id(&extra_segment),
             "should reject extra segments"
         );
+
+        // 71 bytes, dot at position 64 (correct), but suffix contains a dot — caught by
+        // the suffix alphanumeric scan, not the length guard.
+        let dot_in_suffix = format!("{}.Ab12.z", "a".repeat(64));
+        assert!(
+            !is_valid_synthetic_id(&dot_in_suffix),
+            "should reject dot within suffix"
+        );
+
+        let uppercase_hex = format!("{}.{}", "A".repeat(64), "Ab12z9");
+        assert!(
+            !is_valid_synthetic_id(&uppercase_hex),
+            "should reject uppercase hex in HMAC part"
+        );
+
+        let oversized = "a".repeat(1000);
+        assert!(
+            !is_valid_synthetic_id(&oversized),
+            "should reject oversized input"
+        );
+
+        assert!(!is_valid_synthetic_id(""), "should reject empty string");
     }
 
     #[test]
     fn test_get_synthetic_id_with_header() {
         let settings = create_test_settings();
-        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "existing_synthetic_id")]);
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, VALID_SYNTHETIC_ID)]);
 
         let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
-        assert_eq!(synthetic_id, Some("existing_synthetic_id".to_string()));
+        assert_eq!(
+            synthetic_id,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should return the valid header ID"
+        );
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
             .expect("should reuse header synthetic ID");
-        assert_eq!(synthetic_id, "existing_synthetic_id");
+        assert_eq!(
+            synthetic_id, VALID_SYNTHETIC_ID,
+            "should reuse the valid header ID"
+        );
     }
 
     #[test]
@@ -324,22 +377,130 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![(
             header::COOKIE,
-            &format!("{}=existing_cookie_id", COOKIE_SYNTHETIC_ID),
+            &format!("{}={}", COOKIE_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
         )]);
 
         let synthetic_id = get_synthetic_id(&req).expect("should get synthetic ID");
-        assert_eq!(synthetic_id, Some("existing_cookie_id".to_string()));
+        assert_eq!(
+            synthetic_id,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should return the valid cookie ID"
+        );
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
             .expect("should reuse cookie synthetic ID");
-        assert_eq!(synthetic_id, "existing_cookie_id");
+        assert_eq!(
+            synthetic_id, VALID_SYNTHETIC_ID,
+            "should reuse the valid cookie ID"
+        );
+    }
+
+    #[test]
+    fn test_get_synthetic_id_rejects_invalid_header() {
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "not-a-valid-id")]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should not error on invalid header ID");
+        assert!(
+            synthetic_id.is_none(),
+            "should discard invalid synthetic ID from header"
+        );
+    }
+
+    #[test]
+    fn test_get_synthetic_id_rejects_invalid_cookie() {
+        let req = create_test_request(vec![(
+            header::COOKIE,
+            &format!("{}=not-a-valid-id", COOKIE_SYNTHETIC_ID),
+        )]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should not error on invalid cookie ID");
+        assert!(
+            synthetic_id.is_none(),
+            "should discard invalid synthetic ID from cookie"
+        );
+    }
+
+    #[test]
+    fn test_get_synthetic_id_invalid_header_falls_through_to_valid_cookie() {
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, "not-a-valid-id"),
+            (
+                header::COOKIE,
+                &format!("{}={}", COOKIE_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
+            ),
+        ]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should not error when cookie is valid");
+        assert_eq!(
+            synthetic_id,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should fall through to valid cookie when header ID is invalid"
+        );
+    }
+
+    #[test]
+    fn test_get_synthetic_id_header_takes_precedence_over_cookie() {
+        let cookie_id = "b2a1c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0b1a2.Zx98y7";
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
+            (
+                header::COOKIE,
+                &format!("{}={}", COOKIE_SYNTHETIC_ID, cookie_id),
+            ),
+        ]);
+        let result = get_synthetic_id(&req).expect("should succeed");
+        assert_eq!(
+            result,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should prefer header over cookie"
+        );
+    }
+
+    #[test]
+    fn test_get_synthetic_id_rejects_invalid_header_and_falls_back_to_cookie() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![
+            (HEADER_X_SYNTHETIC_ID, "evil;injected"),
+            (
+                header::COOKIE,
+                &format!("{}={}", COOKIE_SYNTHETIC_ID, VALID_SYNTHETIC_ID),
+            ),
+        ]);
+
+        let synthetic_id = get_synthetic_id(&req).expect("should resolve synthetic ID");
+        assert_eq!(
+            synthetic_id,
+            Some(VALID_SYNTHETIC_ID.to_string()),
+            "should ignore invalid header and reuse valid cookie"
+        );
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should reuse valid cookie synthetic ID");
+        assert_eq!(synthetic_id, VALID_SYNTHETIC_ID);
     }
 
     #[test]
     fn test_get_synthetic_id_none() {
         let req = create_test_request(vec![]);
         let synthetic_id = get_synthetic_id(&req).expect("should handle missing ID");
-        assert!(synthetic_id.is_none());
+        assert!(
+            synthetic_id.is_none(),
+            "should return None when no ID present"
+        );
+    }
+
+    #[test]
+    fn test_get_or_generate_synthetic_id_generates_when_invalid_header() {
+        let settings = create_test_settings();
+        // A string that is clearly not a valid synthetic ID (wrong format, wrong length)
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "totally-invalid-id-value")]);
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should generate when header ID is invalid");
+        assert!(
+            is_valid_synthetic_id(&synthetic_id),
+            "should generate a fresh valid ID when inbound ID is invalid"
+        );
     }
 
     #[test]
@@ -349,6 +510,27 @@ mod tests {
 
         let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
             .expect("should get or generate synthetic ID");
-        assert!(!synthetic_id.is_empty());
+        assert!(
+            is_valid_synthetic_id(&synthetic_id),
+            "should generate a valid synthetic ID"
+        );
+    }
+
+    #[test]
+    fn test_get_or_generate_synthetic_id_replaces_invalid_header() {
+        let settings = create_test_settings();
+        let req = create_test_request(vec![(HEADER_X_SYNTHETIC_ID, "evil;injected")]);
+
+        let synthetic_id = get_or_generate_synthetic_id(&settings, &req)
+            .expect("should replace invalid header synthetic ID");
+
+        assert!(
+            is_valid_synthetic_id(&synthetic_id),
+            "should generate a fresh synthetic ID when the header is invalid"
+        );
+        assert_ne!(
+            synthetic_id, "evil;injected",
+            "should not reuse a tampered synthetic ID value"
+        );
     }
 }

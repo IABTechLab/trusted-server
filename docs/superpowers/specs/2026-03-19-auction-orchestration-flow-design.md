@@ -50,7 +50,7 @@ sequenceDiagram
     activate TS
     Client->>TS: POST /auction<br/>AdRequest with adUnits[]
     Note right of Client: { "adUnits": [{ "code": "header-banner",<br/>  "mediaTypes": { "banner": { "sizes": [[728,90]] } } }] }
-    
+
     TS->>TS: 🔧 Parse AdRequest<br/>🔄 Transform to AuctionRequest<br/>🆔 Generate user IDs<br/>📊 Build context
     deactivate Client
     deactivate TS
@@ -64,7 +64,7 @@ sequenceDiagram
     TS->>Orch: orchestrator.run_auction()
     Orch->>Orch: 🔍 Detect strategy<br/>mediator? parallel_mediation : parallel_only
     deactivate TS
-    
+
     Note over Orch: Strategy determined by config:<br/>[auction]<br/>mediator = "adserver_mock" → parallel_mediation<br/>No mediator → parallel_only
   end
 
@@ -74,27 +74,27 @@ sequenceDiagram
     activate APS
     activate Prebid
     activate Mock
-    
+
     par Parallel Provider Calls
       Orch->>APS: POST /e/dtb/bid<br/>APS TAM format
       Note right of Orch: { "pubId": "5128",<br/>  "slots": [{ "slotID": "header-banner",<br/>    "sizes": [[728,90]] }] }
-      
+
       APS->>Mock: APS TAM request
       Mock-->>APS: APS bid response<br/>(encoded prices, no creative)
       Note right of Mock: { "contextual": { "slots": [{<br/>  "slotID": "header-banner",<br/>  "amznbid": "Mi41MA==", // "2.50"<br/>  "fif": "1" }] } }
-      
+
       APS-->>Orch: AuctionResponse<br/>(APS bids)
     and
       Orch->>Prebid: POST /openrtb2/auction<br/>OpenRTB 2.x format
       Note right of Orch: { "id": "request",<br/>  "imp": [{ "id": "header-banner",<br/>    "banner": { "w": 728, "h": 90 } }] }
-      
+
       Prebid->>Mock: OpenRTB request
       Mock-->>Prebid: OpenRTB response<br/>(clear prices, with creative)
       Note right of Mock: { "seatbid": [{ "seat": "prebid",<br/>  "bid": [{ "price": 2.00, "adm": "<html>..." }] }] }
-      
+
       Prebid-->>Orch: AuctionResponse<br/>(Prebid bids)
     end
-    
+
     Note over Orch: 📊 Collected bids from all providers<br/>APS: encoded prices, no creative<br/>Prebid: clear prices, with creative
     deactivate Mock
     deactivate APS
@@ -108,10 +108,10 @@ sequenceDiagram
       activate Med
       Orch->>Med: POST /adserver/mediate<br/>All bids for final selection
       Note right of Orch: { "id": "auction-123",<br/>  "imp": [...],<br/>  "ext": { "bidder_responses": [<br/>    { "bidder": "amazon-aps",<br/>      "bids": [{ "encoded_price": "Mi41MA==" }] },<br/>    { "bidder": "prebid",<br/>      "bids": [{ "price": 2.00 }] }] } }
-      
+
       Med->>Med: 🔓 Decode APS encoded prices<br/>📏 Apply floor prices<br/>🏆 Select highest CPM per slot
       Note right of Med: Base64 decode: "Mi41MA==" → "2.50"<br/>Winner: APS at $2.50 vs Prebid at $2.00
-      
+
       Med-->>Orch: OpenRTB response with winners
       Note right of Med: { "seatbid": [{ "seat": "amazon-aps",<br/>  "bid": [{ "price": 2.50, "impid": "header-banner" }] }] }
       deactivate Med
@@ -121,7 +121,7 @@ sequenceDiagram
       Note over Client,Mock: 🏆 Direct Winner Selection
       Orch->>Orch: 📏 Compare clear prices only<br/>⚠️  Skip APS (encoded prices)<br/>🏆 Select highest CPM
       Note right of Orch: APS bids skipped (encoded prices)<br/>Winner: Prebid at $2.00 (only clear price)
-      
+
       Note over Orch: 📝 Results: Limited winner selection<br/>Cannot compare encoded APS prices<br/>Prebid wins by default
     end
   end
@@ -132,10 +132,10 @@ sequenceDiagram
     activate TS
     activate Client
     Orch->>Orch: 🔄 Transform to OpenRTB response<br/>🖼️ Generate iframe creatives<br/>🔏 Rewrite creative URLs<br/>📊 Add orchestrator metadata
-    
+
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
-    
+
     TS-->>Client: 200 OpenRTB response<br/>with winning creative
     deactivate Orch
     deactivate TS
@@ -154,42 +154,49 @@ sequenceDiagram
 ## 📋 Flow Summary
 
 ### **Phase 1: Request Initiation**
+
 - **Browser** sends `POST /auction` with ad units in Prebid.js format
 - **Trusted Server** parses and transforms to internal `AuctionRequest`
 - Generates user IDs (persistent + fresh) and builds auction context
 
 ### **Phase 2: Strategy Detection**
+
 - **Orchestrator** checks configuration for mediator
 - **With mediator** → `parallel_mediation` strategy
 - **Without mediator** → `parallel_only` strategy
 
 ### **Phase 3: Parallel Execution**
+
 - **APS Provider** receives APS TAM format request
   - Mocktioneer returns APS response with **encoded prices** (`amznbid: "Mi41MA=="`)
   - **No creative HTML** provided (typical for real APS)
-- **Prebid Provider** receives OpenRTB 2.x request  
+- **Prebid Provider** receives OpenRTB 2.x request
   - Mocktioneer returns OpenRTB response with **clear prices**
   - **Includes creative HTML** in `adm` field
 
 ### **Phase 4: Winner Selection**
 
 #### **🔄 With Mediator (Recommended)**
+
 1. **AdServer Mediator** receives all bids
 2. **Decodes APS prices** (base64 → actual CPM)
 3. **Applies floor prices** and selects highest CPM per slot
 4. **Returns OpenRTB response** with proper winner selection
 
 #### **⚡ Without Mediator (Limited)**
+
 1. **Orchestrator** compares only clear prices
 2. **APS bids skipped** (encoded prices can't be compared)
 3. **Prebid wins by default** if no other clear-price bidders
 
 ### **Phase 5: Response Assembly**
+
 - **Creative HTML** rewritten with first-party proxy URLs
 - **Orchestrator metadata** added (strategy, timing, bid counts)
 - **OpenRTB response** returned to browser
 
 ### **Phase 6: Creative Rendering**
+
 - **Winning creative** injected into iframe
 - **Resources proxied** through first-party domain
 - **Privacy & security** maintained throughout
@@ -197,22 +204,26 @@ sequenceDiagram
 ## 🔑 Key Technical Details
 
 ### **Price Encoding**
+
 - **APS Mock**: Uses base64 encoding (`"Mi41MA=="` → `"2.50"`)
 - **Real APS**: Uses proprietary encoding (only Amazon/GAM can decode)
 - **Prebid**: Uses clear decimal prices (`2.50`)
 
 ### **Request Formats**
+
 - **APS TAM**: `{ "pubId": "...", "slots": [...] }`
-- **OpenRTB 2.x**: `{ "imp": [...] }` 
+- **OpenRTB 2.x**: `{ "imp": [...] }`
 - **AdRequest**: `{ "adUnits": [...] }`
 
 ### **Response Formats**
+
 - **APS**: `{ "contextual": { "slots": [...] } }` (no `adm`)
 - **OpenRTB**: `{ "seatbid": [{ "seat": "...", "bid": [...] }] }`
 
 ### **Configuration Examples**
 
 #### **Parallel Mediation**
+
 ```toml
 [auction]
 enabled = true
@@ -222,6 +233,7 @@ timeout_ms = 2000
 ```
 
 #### **Parallel Only**
+
 ```toml
 [auction]
 enabled = true
@@ -231,12 +243,14 @@ timeout_ms = 2000
 ```
 
 ### **Advantages of Mediation**
+
 - ✅ **Proper APS integration** - Can decode and compare APS bids
 - ✅ **Fair competition** - All bidders compete on equal footing
 - ✅ **Floor pricing** - Configurable minimum bid thresholds
 - ✅ **Flexibility** - Easy to add new providers
 
 ### **Limitations Without Mediation**
+
 - ❌ **APS bids ignored** - Can't compare encoded prices
 - ❌ **Unfair competition** - Only clear-price bidders compete
 - ❌ **Reduced revenue** - May miss higher APS bids

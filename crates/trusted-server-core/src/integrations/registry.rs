@@ -553,7 +553,7 @@ impl IntegrationRegistry {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
-            if let Some(registration) = builder(settings) {
+            if let Some(registration) = builder(settings)? {
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
                         let value = (proxy.clone(), registration.integration_id);
@@ -658,7 +658,9 @@ impl IntegrationRegistry {
             // Generate synthetic ID before consuming request
             let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
 
-            // Set synthetic ID header on the request so integrations can read it
+            // Set synthetic ID header on the request so integrations can read it.
+            // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
+            // so a crafted synthetic_id cannot inject additional request headers.
             if let Ok(ref synthetic_id) = synthetic_id_result {
                 req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
             }
@@ -669,7 +671,13 @@ impl IntegrationRegistry {
             if let Ok(ref mut response) = result {
                 match synthetic_id_result {
                     Ok(ref synthetic_id) => {
+                        // Response-header injection: Fastly's HeaderValue API rejects values
+                        // containing \r, \n, or \0, so a crafted synthetic_id cannot inject
+                        // additional response headers.
                         response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                        // Cookie is intentionally not set when synthetic_id contains RFC 6265-illegal
+                        // characters (e.g. a crafted x-synthetic-id header value). The response header
+                        // is still emitted; only cookie persistence is skipped.
                         set_synthetic_cookie(settings, response, synthetic_id.as_str());
                     }
                     Err(ref err) => {
@@ -1296,6 +1304,57 @@ mod tests {
     }
 
     #[test]
+    fn handle_proxy_replaces_invalid_request_header_with_matching_response_cookie() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/synthetic",
+            (
+                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
+                "synthetic_id_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+        req.set_header(HEADER_X_SYNTHETIC_ID, "evil;injected");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/synthetic",
+            &settings,
+            req,
+        ))
+        .expect("should handle proxy request");
+
+        let response = result.expect("handler should succeed");
+        let response_header = response
+            .get_header(HEADER_X_SYNTHETIC_ID)
+            .expect("response should have x-synthetic-id header")
+            .to_str()
+            .expect("header should be valid UTF-8")
+            .to_string();
+        let cookie_header = response
+            .get_header(header::SET_COOKIE)
+            .expect("response should have Set-Cookie header")
+            .to_str()
+            .expect("header should be valid UTF-8");
+        let cookie_value = cookie_header
+            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .and_then(|s| s.split_once(';').map(|(value, _)| value))
+            .expect("should contain the synthetic_id cookie value");
+
+        assert_ne!(
+            response_header, "evil;injected",
+            "should not reflect the tampered request header"
+        );
+        assert_eq!(
+            response_header, cookie_value,
+            "response header and cookie should carry the same effective synthetic ID"
+        );
+    }
+
+    #[test]
     fn handle_proxy_always_sets_cookie() {
         let settings = create_test_settings();
         let routes = vec![(
@@ -1310,8 +1369,15 @@ mod tests {
         let registry = IntegrationRegistry::from_routes(routes);
 
         let mut req = Request::get("https://test.example.com/integrations/test/synthetic");
-        // Pre-existing cookie
-        req.set_header(header::COOKIE, "synthetic_id=existing_id_12345");
+        // Pre-existing cookie with a valid-format synthetic ID
+        req.set_header(
+            header::COOKIE,
+            format!(
+                "{}={}",
+                crate::constants::COOKIE_SYNTHETIC_ID,
+                crate::test_support::tests::VALID_SYNTHETIC_ID
+            ),
+        );
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,

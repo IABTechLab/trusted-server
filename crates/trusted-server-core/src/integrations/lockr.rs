@@ -251,23 +251,27 @@ impl LockrIntegration {
     }
 }
 
-fn build(settings: &Settings) -> Option<Arc<LockrIntegration>> {
-    let config = match settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID) {
-        Ok(Some(config)) => config,
-        Ok(None) => return None,
-        Err(err) => {
-            log::error!("Failed to load Lockr integration config: {err:?}");
-            return None;
-        }
+fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)? else {
+        return Ok(None);
     };
 
-    Some(LockrIntegration::new(config))
+    Ok(Some(LockrIntegration::new(config)))
 }
 
 /// Register the Lockr integration.
-#[must_use]
-pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
-    let integration = build(settings)?;
+///
+/// # Errors
+///
+/// Returns an error when the Lockr integration is enabled with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
     if integration.config.rewrite_sdk_host.is_some() {
         log::warn!(
             "lockr: `rewrite_sdk_host` is deprecated and ignored; \
@@ -278,12 +282,13 @@ pub fn register(settings: &Settings) -> Option<IntegrationRegistration> {
         "Registering Lockr integration (rewrite_sdk={})",
         integration.config.rewrite_sdk
     );
-    Some(
+
+    Ok(Some(
         IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
-    )
+    ))
 }
 
 #[async_trait(?Send)]
@@ -371,6 +376,9 @@ fn default_rewrite_sdk() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> LockrConfig {
         LockrConfig {
@@ -534,6 +542,28 @@ mod tests {
                 .iter()
                 .any(|r| r.path == "/integrations/lockr/api/*" && r.method == Method::GET),
             "should register API GET route"
+        );
+    }
+
+    #[test]
+    fn disabled_invalid_config_does_not_error() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                LOCKR_INTEGRATION_ID,
+                &json!({
+                    "enabled": false,
+                    "app_id": "",
+                    "sdk_url": "not a url",
+                }),
+            )
+            .expect("should insert disabled invalid Lockr config");
+
+        let registration = register(&settings).expect("disabled invalid Lockr config should skip");
+        assert!(
+            registration.is_none(),
+            "disabled invalid Lockr config should not register"
         );
     }
 }
