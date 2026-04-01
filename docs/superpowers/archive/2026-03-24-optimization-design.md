@@ -35,7 +35,7 @@ This document presents a performance analysis and optimization plan for the Trus
 | ~2%   | `IntegrationRegistry`                 | Route lookup + attribute rewriting + initialization |
 | ~0.8% | Memory allocation (`RawVec::reserve`) | Buffer growth during processing                     |
 | ~0.5% | Logging (`fern` / `log_fastly`)       | Minimal overhead                                    |
-| ~0.5% | Synthetic ID generation               | HMAC computation                                    |
+| ~0.5% | EC ID generation                      | HMAC computation                                    |
 | ~0.5% | Header extraction                     | `fastly::http::handle::get_header_values`           |
 
 ### Key Takeaways
@@ -271,7 +271,6 @@ let settings: Settings = postcard::from_bytes(SETTINGS_DATA)
 | `eq_ignore_ascii_case` for compression detection  | `streaming_processor.rs:47`     | 5     |
 | `Cow<str>` for string replacements                | `streaming_replacer.rs:120-125` | 5-10  |
 | Remove base64 roundtrip in token computation      | `http_util.rs:286-294`          | 10-15 |
-| Replace Handlebars with manual interpolation      | `synthetic.rs:82-99`            | ~20   |
 | Cache `origin_host()` result per-request          | `settings.rs`                   | 5-10  |
 
 ---

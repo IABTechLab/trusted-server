@@ -14,6 +14,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -27,7 +28,10 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod error;
+mod platform;
+
 use crate::error::to_error_response;
+use crate::platform::{build_runtime_services, UnavailableKvStore};
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
@@ -65,10 +69,18 @@ fn main(req: Request) -> Result<Response, Error> {
         }
     };
 
+    // No KV store is currently required — Edge Cookie generation no longer
+    // uses one. When a feature needs a KV store, add a config field and call
+    // `open_kv_store` here.
+    let kv_store = std::sync::Arc::new(UnavailableKvStore)
+        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
+    let runtime_services = build_runtime_services(&req, kv_store);
+
     futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
+        &runtime_services,
         req,
     ))
 }
@@ -77,6 +89,7 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
+    runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Error> {
     // Strip client-spoofable forwarded headers at the edge.
@@ -84,8 +97,15 @@ async fn route_request(
     // clients are untrusted and can hijack URL rewriting (see #409).
     sanitize_forwarded_headers(&mut req);
 
-    // Extract geo info before auth check or routing consumes the request
-    let geo_info = GeoInfo::from_request(&req);
+    // Look up geo info via the platform abstraction using the client IP
+    // already captured in RuntimeServices at the entry point.
+    let geo_info = runtime_services
+        .geo()
+        .lookup(runtime_services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
@@ -117,7 +137,7 @@ async fn route_request(
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, req)
+            handle_trusted_server_discovery(settings, runtime_services, req)
         }
 
         // Signature verification endpoint

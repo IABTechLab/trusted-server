@@ -3,6 +3,7 @@ use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::settings::Settings;
@@ -318,10 +319,34 @@ pub fn sign_clear_url(settings: &Settings, clear_url: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Constant-time string comparison.
+///
+/// The explicit length check documents the invariant that both values have known,
+/// non-secret lengths. Both checks always run — the short-circuit `&&` is safe
+/// here because token lengths are public information, not secrets.
+///
+/// # Security
+///
+/// The length equality check short-circuits (via `&&`), which reveals whether the
+/// two strings have equal length via timing. This is safe when both strings have
+/// **publicly known, fixed lengths** (e.g. base64url-encoded SHA-256 digests are
+/// always 43 bytes). Do **not** use this function to compare secrets of
+/// variable or confidential length — use a constant-time comparison that
+/// also hides length, such as comparing HMAC outputs.
+#[must_use]
+pub(crate) fn ct_str_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 /// Verify a `tstoken` for the given clear-text URL.
+///
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+/// Length is not secret (always 43 bytes for base64url-encoded SHA-256),
+/// but we check explicitly to document the invariant.
 #[must_use]
 pub fn verify_clear_url_signature(settings: &Settings, clear_url: &str, token: &str) -> bool {
-    sign_clear_url(settings, clear_url) == token
+    let expected = sign_clear_url(settings, clear_url);
+    ct_str_eq(&expected, token)
 }
 
 /// Compute tstoken for the new proxy scheme: SHA-256 of the encrypted full URL (including query).
@@ -386,6 +411,33 @@ mod tests {
             "https://cdn.example/a.png?x=2",
             &t1
         ));
+    }
+
+    #[test]
+    fn verify_clear_url_rejects_tampered_token() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let url = "https://cdn.example/a.png?x=1";
+        let valid_token = sign_clear_url(&settings, url);
+
+        // Flip one bit in the first byte — same URL, same length, wrong bytes
+        let mut tampered = valid_token.into_bytes();
+        tampered[0] ^= 0x01;
+        let tampered =
+            String::from_utf8(tampered).expect("should be valid utf8 after single-bit flip");
+
+        assert!(
+            !verify_clear_url_signature(&settings, url, &tampered),
+            "should reject token with tampered bytes"
+        );
+    }
+
+    #[test]
+    fn verify_clear_url_rejects_empty_token() {
+        let settings = crate::test_support::tests::create_test_settings();
+        assert!(
+            !verify_clear_url_signature(&settings, "https://cdn.example/a.png", ""),
+            "should reject empty token"
+        );
     }
 
     // RequestInfo tests
@@ -562,12 +614,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ct_str_eq() {
+        assert!(ct_str_eq("hello", "hello"), "should match equal strings");
+        assert!(
+            !ct_str_eq("hello", "world"),
+            "should not match different strings"
+        );
+        assert!(
+            !ct_str_eq("hello", "hell"),
+            "should not match different lengths"
+        );
+        assert!(
+            !ct_str_eq("hell", "hello"),
+            "should not match when first is shorter"
+        );
+        assert!(ct_str_eq("", ""), "should match empty strings");
+    }
+
+    #[test]
     fn test_copy_custom_headers_filters_internal() {
         let mut req = Request::new(fastly::http::Method::GET, "https://example.com");
         req.set_header("x-custom-1", "value1");
         // HeaderName is case-insensitive and always lowercase, but set_header accepts strings
         req.set_header("X-Custom-2", "value2");
-        req.set_header("x-synthetic-id", "should not copy");
+        req.set_header("x-ts-ec", "should not copy");
         req.set_header("x-geo-country", "US");
 
         let mut target = Request::new(fastly::http::Method::GET, "https://target.com");
@@ -584,8 +654,8 @@ mod tests {
             "Should copy arbitrary X-header (case insensitive)"
         );
         assert!(
-            target.get_header("x-synthetic-id").is_none(),
-            "Should filter x-synthetic-id"
+            target.get_header("x-ts-ec").is_none(),
+            "Should filter x-ts-ec"
         );
         assert!(
             target.get_header("x-geo-country").is_none(),

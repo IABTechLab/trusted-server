@@ -68,6 +68,10 @@ pub enum TrustedServerError {
     #[display("Proxy error: {message}")]
     Proxy { message: String },
 
+    /// Request understood but not permitted — results in a 403 Forbidden response.
+    #[display("Forbidden: {message}")]
+    Forbidden { message: String },
+
     /// A redirect destination was blocked by the proxy allowlist.
     #[display("Redirect to `{host}` blocked: host not in proxy allowed_domains")]
     AllowlistViolation { host: String },
@@ -76,13 +80,9 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
-    /// Synthetic ID generation or validation failed.
-    #[display("Synthetic ID error: {message}")]
-    SyntheticId { message: String },
-
-    /// Template rendering error.
-    #[display("Template error: {message}")]
-    Template { message: String },
+    /// EC ID generation or validation failed.
+    #[display("EC error: {message}")]
+    Ec { message: String },
 }
 
 impl Error for TrustedServerError {}
@@ -114,9 +114,9 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
-            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

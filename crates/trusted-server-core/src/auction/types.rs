@@ -69,7 +69,7 @@ pub struct PublisherInfo {
 /// Privacy-preserving user information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    /// Synthetic/hashed user ID
+    /// Stable EC ID (from cookie or freshly generated)
     pub id: String,
     /// Fresh ID for this session
     pub fresh_id: String,
