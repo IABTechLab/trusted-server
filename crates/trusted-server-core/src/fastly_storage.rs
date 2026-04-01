@@ -17,10 +17,12 @@ const FASTLY_API_HOST: &str = "https://api.fastly.com";
 /// [`crate::platform::PlatformConfigStore`] via [`crate::platform::RuntimeServices`]
 /// instead. `FastlyConfigStore` will be removed once all call sites have
 /// migrated.
+#[deprecated(note = "Use PlatformConfigStore via RuntimeServices instead")]
 pub struct FastlyConfigStore {
     store_name: String,
 }
 
+#[allow(deprecated)]
 impl FastlyConfigStore {
     pub fn new(store_name: impl Into<String>) -> Self {
         Self {
@@ -55,10 +57,12 @@ impl FastlyConfigStore {
 /// [`crate::platform::PlatformSecretStore`] via [`crate::platform::RuntimeServices`]
 /// instead. `FastlySecretStore` will be removed once all call sites have
 /// migrated.
+#[deprecated(note = "Use PlatformSecretStore via RuntimeServices instead")]
 pub struct FastlySecretStore {
     store_name: String,
 }
 
+#[allow(deprecated)]
 impl FastlySecretStore {
     pub fn new(store_name: impl Into<String>) -> Self {
         Self {
@@ -132,6 +136,7 @@ impl FastlyApiClient {
     /// # Errors
     ///
     /// Returns an error if the API backend cannot be ensured or the API key cannot be retrieved.
+    #[allow(deprecated)]
     pub fn from_secret_store(
         store_name: &str,
         key_name: &str,
@@ -361,6 +366,7 @@ impl FastlyApiClient {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

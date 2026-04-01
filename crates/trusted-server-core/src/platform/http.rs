@@ -71,6 +71,10 @@ impl PlatformResponse {
 /// wasm32 targets are single-threaded and cannot use `Send` futures.
 /// Adapter crates targeting a multi-threaded runtime (e.g. Axum with tokio)
 /// would need to wrap state in `Arc` rather than relying on `Send` here.
+///
+/// See [`PlatformHttpClient`] for the trait-level `?Send` design rationale,
+/// including why `Send + Sync` bounds on the trait type are compatible with
+/// `?Send` futures.
 pub struct PlatformPendingRequest {
     inner: Box<dyn Any>,
     backend_name: Option<String>,

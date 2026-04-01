@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
 use crate::error::TrustedServerError;
+#[allow(deprecated)]
 use crate::fastly_storage::{FastlyApiClient, FastlyConfigStore};
 use crate::request_signing::JWKS_CONFIG_STORE_NAME;
 
@@ -22,6 +23,7 @@ pub struct KeyRotationResult {
     pub jwk: Jwk,
 }
 
+#[allow(deprecated)]
 pub struct KeyRotationManager {
     /// Edge-side config store for reading JWKS (uses store name).
     config_store: FastlyConfigStore,
@@ -33,6 +35,7 @@ pub struct KeyRotationManager {
     secret_store_id: String,
 }
 
+#[allow(deprecated)]
 impl KeyRotationManager {
     /// Creates a new key rotation manager.
     ///
