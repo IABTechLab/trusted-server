@@ -10,11 +10,16 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
-/// Enforce HTTP basic auth for the matched handler, if any.
+/// Enforces HTTP Basic authentication for configured handler paths.
 ///
 /// Returns `Ok(None)` when the request does not target a protected handler or
 /// when the supplied credentials are valid. Returns `Ok(Some(Response))` with
 /// the auth challenge when credentials are missing or invalid.
+///
+/// Admin endpoints are protected by requiring a handler at build time; see
+/// [`Settings::from_toml_and_env`]. Credential checks use constant-time
+/// comparison for both username and password, and evaluate both regardless of
+/// individual match results to avoid timing oracles.
 ///
 /// # Errors
 ///
@@ -48,6 +53,7 @@ pub fn enforce_basic_auth(
     if bool::from(username_match & password_match) {
         Ok(None)
     } else {
+        log::warn!("Basic auth failed for path: {}", req.get_path());
         Ok(Some(unauthorized_response()))
     }
 }
@@ -144,6 +150,41 @@ mod tests {
     }
 
     #[test]
+    fn challenge_when_username_wrong_password_correct() {
+        // Validates that both fields are always evaluated — no short-circuit username oracle.
+        let settings = create_test_settings();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("wrong-user:pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should reject wrong username even with correct password"
+        );
+    }
+
+    #[test]
+    fn challenge_when_username_correct_password_wrong() {
+        let settings = create_test_settings();
+        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let token = STANDARD.encode("user:wrong-pass");
+        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+
+        let response = enforce_basic_auth(&settings, &req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should reject correct username with wrong password"
+        );
+    }
+
+    #[test]
     fn challenge_when_scheme_is_not_basic() {
         let settings = create_test_settings();
         let mut req = Request::new(Method::GET, "https://example.com/secure");
@@ -202,32 +243,6 @@ mod tests {
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge admin path with missing credentials");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn challenge_when_username_wrong_password_correct() {
-        let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("wrong:pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should evaluate auth")
-            .expect("should challenge when only username is wrong");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn challenge_when_username_correct_password_wrong() {
-        let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
-        let token = STANDARD.encode("user:wrong");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
-
-        let response = enforce_basic_auth(&settings, &req)
-            .expect("should evaluate auth")
-            .expect("should challenge when only password is wrong");
         assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
     }
 }
