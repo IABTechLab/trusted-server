@@ -152,7 +152,9 @@ async fn route_request(
         }
 
         // Signature verification endpoint
-        (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
+        (Method::POST, "/verify-signature") => {
+            handle_verify_signature(settings, runtime_services, req)
+        }
 
         // Key rotation admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs

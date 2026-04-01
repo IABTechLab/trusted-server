@@ -1009,6 +1009,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         {
             if request_signing_config.enabled {
                 let request_info = RequestInfo::from_request(context.request, context.client_info);
+                #[allow(deprecated)]
                 let signer = RequestSigner::from_config()?;
                 let params =
                     SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);

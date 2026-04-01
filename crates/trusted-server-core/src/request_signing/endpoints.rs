@@ -76,6 +76,7 @@ pub struct VerifySignatureResponse {
 /// Returns an error if the request body cannot be parsed as JSON or if verification fails.
 pub fn handle_verify_signature(
     _settings: &Settings,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let body = req.take_body_str();
@@ -88,6 +89,7 @@ pub fn handle_verify_signature(
         verify_req.payload.as_bytes(),
         &verify_req.signature,
         &verify_req.kid,
+        services,
     );
 
     let response = match verification_result {
@@ -334,15 +336,68 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use error_stack::Report;
 
     use crate::platform::{
-        test_support::{build_services_with_config, noop_services},
-        PlatformConfigStore, PlatformError, StoreId, StoreName,
+        test_support::{build_services_with_config, build_services_with_config_and_secret, noop_services},
+        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
     };
 
     use super::*;
     use fastly::http::{Method, StatusCode};
+
+    /// Build `RuntimeServices` pre-loaded with a real Ed25519 keypair for
+    /// testing signature creation and verification in endpoint handlers.
+    fn build_signing_services_for_test() -> crate::platform::RuntimeServices {
+        use base64::{engine::general_purpose, Engine};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        struct MapConfigStore(HashMap<String, String>);
+        impl PlatformConfigStore for MapConfigStore {
+            fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+                self.0.get(key).cloned().ok_or_else(|| Report::new(PlatformError::ConfigStore))
+            }
+            fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+                Err(Report::new(PlatformError::Unsupported))
+            }
+            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+                Err(Report::new(PlatformError::Unsupported))
+            }
+        }
+
+        struct MapSecretStore(HashMap<String, Vec<u8>>);
+        impl PlatformSecretStore for MapSecretStore {
+            fn get_bytes(&self, _: &StoreName, key: &str) -> Result<Vec<u8>, Report<PlatformError>> {
+                self.0.get(key).cloned().ok_or_else(|| Report::new(PlatformError::SecretStore))
+            }
+            fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+                Err(Report::new(PlatformError::Unsupported))
+            }
+            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+                Err(Report::new(PlatformError::Unsupported))
+            }
+        }
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
+        let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+        let jwk_json = format!(
+            r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
+            x_b64
+        );
+
+        let mut cfg = HashMap::new();
+        cfg.insert("current-kid".to_string(), "test-kid".to_string());
+        cfg.insert("test-kid".to_string(), jwk_json);
+
+        let mut sec = HashMap::new();
+        sec.insert("test-kid".to_string(), key_b64.into_bytes());
+
+        build_services_with_config_and_secret(MapConfigStore(cfg), MapSecretStore(sec))
+    }
 
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
@@ -367,19 +422,19 @@ mod tests {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
+
     #[test]
     fn test_handle_verify_signature_valid() {
         let settings = crate::test_support::tests::create_test_settings();
+        let services = build_signing_services_for_test();
 
-        // First, create a valid signature
         let payload = "test message";
-        let signer = crate::request_signing::RequestSigner::from_config()
-            .expect("should create signer from config");
+        let signer = crate::request_signing::RequestSigner::from_services(&services)
+            .expect("should create signer from services");
         let signature = signer
             .sign(payload.as_bytes())
             .expect("should sign payload");
 
-        // Create verification request
         let verify_req = VerifySignatureRequest {
             payload: payload.to_string(),
             signature,
@@ -390,9 +445,8 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
         req.set_body(body);
 
-        // Handle the request
-        let mut resp =
-            handle_verify_signature(&settings, req).expect("should handle verification request");
+        let mut resp = handle_verify_signature(&settings, &services, req)
+            .expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
             resp.get_content_type(),
@@ -400,12 +454,11 @@ mod tests {
             "should return application/json content type"
         );
 
-        // Parse response
         let resp_body = resp.take_body_str();
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
-        assert!(verify_resp.verified, "Signature should be verified");
+        assert!(verify_resp.verified, "should verify a valid signature");
         assert_eq!(verify_resp.kid, signer.kid);
         assert!(verify_resp.error.is_none());
     }
@@ -413,15 +466,15 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_invalid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let signer = crate::request_signing::RequestSigner::from_config()
-            .expect("should create signer from config");
+        let services = build_signing_services_for_test();
 
-        // Create a signature for a different payload
+        let signer = crate::request_signing::RequestSigner::from_services(&services)
+            .expect("should create signer from services");
+
         let wrong_signature = signer
             .sign(b"different payload")
             .expect("should sign different payload");
 
-        // Create request with signature that does not match the payload
         let verify_req = VerifySignatureRequest {
             payload: "test message".to_string(),
             signature: wrong_signature,
@@ -432,9 +485,8 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
         req.set_body(body);
 
-        // Handle the request
-        let mut resp =
-            handle_verify_signature(&settings, req).expect("should handle verification request");
+        let mut resp = handle_verify_signature(&settings, &services, req)
+            .expect("should handle verification request");
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
             resp.get_content_type(),
@@ -442,12 +494,11 @@ mod tests {
             "should return application/json content type"
         );
 
-        // Parse response
         let resp_body = resp.take_body_str();
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
-        assert!(!verify_resp.verified, "Invalid signature should not verify");
+        assert!(!verify_resp.verified, "should not verify an invalid signature");
         assert_eq!(verify_resp.kid, signer.kid);
         assert!(verify_resp.error.is_some());
     }
@@ -459,8 +510,7 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
         req.set_body("not valid json");
 
-        // Should return an error response
-        let result = handle_verify_signature(&settings, req);
+        let result = handle_verify_signature(&settings, &noop_services(), req);
         assert!(result.is_err(), "Malformed JSON should error");
     }
 
