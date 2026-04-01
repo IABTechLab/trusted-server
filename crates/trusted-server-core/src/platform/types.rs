@@ -146,7 +146,7 @@ pub struct RuntimeServices {
     /// Geographic information lookup.
     pub(crate) geo: Arc<dyn PlatformGeo>,
     /// Per-request client metadata extracted at the entry point.
-    pub client_info: ClientInfo,
+    pub(crate) client_info: ClientInfo,
 }
 
 impl RuntimeServices {
@@ -202,6 +202,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn geo(&self) -> &dyn PlatformGeo {
         &*self.geo
+    }
+
+    /// Returns per-request client metadata (IP address, TLS details).
+    #[must_use]
+    pub fn client_info(&self) -> &ClientInfo {
+        &self.client_info
     }
 
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to

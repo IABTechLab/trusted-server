@@ -22,6 +22,7 @@ pub struct KeyRotationResult {
     pub jwk: Jwk,
 }
 
+#[allow(deprecated)]
 pub struct KeyRotationManager {
     /// Edge-side config store for reading JWKS (uses store name).
     config_store: FastlyConfigStore,
@@ -33,6 +34,7 @@ pub struct KeyRotationManager {
     secret_store_id: String,
 }
 
+#[allow(deprecated)]
 impl KeyRotationManager {
     /// Creates a new key rotation manager.
     ///
