@@ -28,6 +28,7 @@ The plan intentionally avoids any core logging trait or shared abstraction. Futu
 ### Task 1: Extract Fastly logger helper and initializer into an adapter-local module
 
 **Files:**
+
 - Create: `crates/trusted-server-adapter-fastly/src/logging.rs`
 
 - [ ] **Step 1: Write a failing unit test for a non-allocating formatting helper**
@@ -128,6 +129,7 @@ git commit -m "Extract Fastly logging initialization into adapter module"
 ### Task 2: Wire `main.rs` to the adapter-local logging module
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 
 - [ ] **Step 1: Write a failing compile-time integration step for the new module wiring**
@@ -171,6 +173,7 @@ git commit -m "Wire Fastly main.rs to adapter-local logging module"
 ### Task 3: Remove `log-fastly` from core
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/Cargo.toml`
 - Modify: `Cargo.lock`
 
@@ -226,6 +229,7 @@ git commit -m "Remove log-fastly from trusted-server-core"
 ### Task 4: Run project verification gates
 
 **Files:**
+
 - Verify the whole workspace after the logging extraction and dependency cleanup
 
 - [ ] **Step 1: Format check**
