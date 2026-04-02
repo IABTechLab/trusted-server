@@ -2349,7 +2349,11 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate",],
+            vec![
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/partners/register",
+            ],
             "should report all admin endpoints as uncovered"
         );
     }
@@ -2383,7 +2387,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate"],
+            vec!["/_ts/admin/keys/deactivate", "/_ts/admin/partners/register",],
             "should detect endpoints not covered by the rotate-only handler"
         );
     }
