@@ -51,7 +51,7 @@ pub enum UpsertResult {
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
-/// Each EC hash (64-char hex prefix) maps to a JSON-encoded [`KvEntry`]
+/// Each EC ID (`{64hex}.{6alnum}`) maps to a JSON-encoded [`KvEntry`]
 /// containing consent state, geo location, and accumulated partner IDs.
 ///
 /// Methods use optimistic concurrency (generation markers) for safe
@@ -115,16 +115,16 @@ impl KvIdentityGraph {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
-    pub fn get(&self, ec_hash: &str) -> Result<Option<(KvEntry, u64)>, Report<TrustedServerError>> {
+    pub fn get(&self, ec_id: &str) -> Result<Option<(KvEntry, u64)>, Report<TrustedServerError>> {
         let store = self.open_store()?;
-        let mut response = match store.lookup(ec_hash) {
+        let mut response = match store.lookup(ec_id) {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return Ok(None),
             Err(err) => {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
                         store_name: self.store_name.clone(),
-                        message: format!("Failed to read key '{ec_hash}'"),
+                        message: format!("Failed to read key '{ec_id}'"),
                     }),
                 );
             }
@@ -135,13 +135,13 @@ impl KvIdentityGraph {
         let entry: KvEntry =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to deserialize entry for key '{ec_hash}'"),
+                message: format!("Failed to deserialize entry for key '{ec_id}'"),
             })?;
 
         Ok(Some((entry, generation)))
     }
 
-    /// Reads only the metadata for an EC hash (no body streaming).
+    /// Reads only the metadata for an EC ID key (no body streaming).
     ///
     /// Returns `Ok(None)` when the key does not exist or has no metadata.
     ///
@@ -150,17 +150,17 @@ impl KvIdentityGraph {
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
     pub fn get_metadata(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
     ) -> Result<Option<KvMetadata>, Report<TrustedServerError>> {
         let store = self.open_store()?;
-        let response = match store.lookup(ec_hash) {
+        let response = match store.lookup(ec_id) {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return Ok(None),
             Err(err) => {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
                         store_name: self.store_name.clone(),
-                        message: format!("Failed to read metadata for key '{ec_hash}'"),
+                        message: format!("Failed to read metadata for key '{ec_id}'"),
                     }),
                 );
             }
@@ -174,7 +174,7 @@ impl KvIdentityGraph {
         let meta: KvMetadata =
             serde_json::from_slice(&meta_bytes).change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to deserialize metadata for key '{ec_hash}'"),
+                message: format!("Failed to deserialize metadata for key '{ec_id}'"),
             })?;
 
         Ok(Some(meta))
@@ -182,23 +182,23 @@ impl KvIdentityGraph {
 
     /// Creates a new entry. Fails if the key already exists.
     ///
-    /// Uses `InsertMode::Add` so concurrent creates for the same EC hash
+    /// Uses `InsertMode::Add` so concurrent creates for the same EC ID
     /// are safely rejected (only one wins).
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store error or if the
     /// key already exists (`ItemPreconditionFailed`).
-    pub fn create(&self, ec_hash: &str, entry: &KvEntry) -> Result<(), Report<TrustedServerError>> {
+    pub fn create(&self, ec_id: &str, entry: &KvEntry) -> Result<(), Report<TrustedServerError>> {
         let store = self.open_store()?;
         let (body, meta_str) = Self::serialize_entry(entry, &self.store_name)?;
-        let created = Self::try_insert_add(&store, ec_hash, &body, &meta_str, &self.store_name)?;
+        let created = Self::try_insert_add(&store, ec_id, &body, &meta_str, &self.store_name)?;
         if created {
             Ok(())
         } else {
             Err(Report::new(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Key '{ec_hash}' already exists"),
+                message: format!("Key '{ec_id}' already exists"),
             }))
         }
     }
@@ -209,7 +209,7 @@ impl KvIdentityGraph {
     /// exists (`ItemPreconditionFailed`). Other errors are propagated.
     fn try_insert_add(
         store: &KVStore,
-        ec_hash: &str,
+        ec_id: &str,
         body: &str,
         meta_str: &str,
         store_name: &str,
@@ -219,14 +219,14 @@ impl KvIdentityGraph {
             .mode(InsertMode::Add)
             .metadata(meta_str)
             .time_to_live(ENTRY_TTL)
-            .execute(ec_hash, body)
+            .execute(ec_id, body)
         {
             Ok(()) => Ok(true),
             Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => Ok(false),
             Err(err) => Err(
                 Report::new(err).change_context(TrustedServerError::KvStore {
                     store_name: store_name.to_owned(),
-                    message: format!("Failed to create entry for key '{ec_hash}'"),
+                    message: format!("Failed to create entry for key '{ec_id}'"),
                 }),
             ),
         }
@@ -250,7 +250,7 @@ impl KvIdentityGraph {
     /// exhaustion.
     pub fn create_or_revive(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         entry: &KvEntry,
     ) -> Result<(), Report<TrustedServerError>> {
         // Serialize once and reuse across the fast path and CAS loop.
@@ -258,25 +258,25 @@ impl KvIdentityGraph {
         let (body, meta_str) = Self::serialize_entry(entry, &self.store_name)?;
 
         // Try create first — fast path for new entries.
-        if Self::try_insert_add(&store, ec_hash, &body, &meta_str, &self.store_name)? {
+        if Self::try_insert_add(&store, ec_id, &body, &meta_str, &self.store_name)? {
             return Ok(());
         }
 
         // Key exists — read it to determine if it's live or a tombstone.
-        let (existing, generation) = match self.get(ec_hash)? {
+        let (existing, generation) = match self.get(ec_id)? {
             Some(pair) => pair,
             // Raced with a delete — try create again.
-            None => return self.create(ec_hash, entry),
+            None => return self.create(ec_id, entry),
         };
 
         // Live entry — nothing to do.
         if existing.consent.ok {
-            log::debug!("create_or_revive: live entry exists for '{ec_hash}', no-op");
+            log::debug!("create_or_revive: live entry exists for '{ec_id}', no-op");
             return Ok(());
         }
 
         // Tombstone — CAS overwrite to revive.
-        log::info!("create_or_revive: reviving tombstone for '{ec_hash}'");
+        log::info!("create_or_revive: reviving tombstone for '{ec_id}'");
 
         let mut current_gen = generation;
         for attempt in 0..MAX_CAS_RETRIES {
@@ -285,16 +285,16 @@ impl KvIdentityGraph {
                 .if_generation_match(current_gen)
                 .metadata(&meta_str)
                 .time_to_live(ENTRY_TTL)
-                .execute(ec_hash, body.as_str())
+                .execute(ec_id, body.as_str())
             {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_hash}'",
+                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
                         attempt + 1,
                     );
                     // Re-read to get fresh generation.
-                    match self.get(ec_hash)? {
+                    match self.get(ec_id)? {
                         Some((refreshed, gen)) => {
                             if refreshed.consent.ok {
                                 // Someone else revived it — done.
@@ -302,7 +302,7 @@ impl KvIdentityGraph {
                             }
                             current_gen = gen;
                         }
-                        None => return self.create(ec_hash, entry),
+                        None => return self.create(ec_id, entry),
                     }
                 }
                 Err(err) => {
@@ -310,7 +310,7 @@ impl KvIdentityGraph {
                         Report::new(err).change_context(TrustedServerError::KvStore {
                             store_name: self.store_name.clone(),
                             message: format!(
-                                "Failed to revive tombstone for key '{ec_hash}' on attempt {}",
+                                "Failed to revive tombstone for key '{ec_id}' on attempt {}",
                                 attempt + 1,
                             ),
                         }),
@@ -322,7 +322,7 @@ impl KvIdentityGraph {
         Err(Report::new(TrustedServerError::KvStore {
             store_name: self.store_name.clone(),
             message: format!(
-                "CAS conflict after {MAX_CAS_RETRIES} retries reviving tombstone for '{ec_hash}'"
+                "CAS conflict after {MAX_CAS_RETRIES} retries reviving tombstone for '{ec_id}'"
             ),
         }))
     }
@@ -342,7 +342,7 @@ impl KvIdentityGraph {
     /// exhaustion after [`MAX_CAS_RETRIES`] attempts.
     pub fn upsert_partner_id(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         partner_id: &str,
         uid: &str,
         synced: u64,
@@ -354,27 +354,20 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
 
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match self.get(ec_hash)? {
+            let (mut entry, generation) = match self.get(ec_id)? {
                 Some(pair) => pair,
                 None => {
                     // Root entry missing — create a minimal entry.
-                    log::info!(
-                        "upsert_partner_id: no entry for '{ec_hash}', creating minimal entry"
-                    );
+                    log::info!("upsert_partner_id: no entry for '{ec_id}', creating minimal entry");
                     let minimal = KvEntry::minimal(partner_id, uid, synced);
                     let (min_body, min_meta) = Self::serialize_entry(&minimal, &self.store_name)?;
-                    if Self::try_insert_add(
-                        &store,
-                        ec_hash,
-                        &min_body,
-                        &min_meta,
-                        &self.store_name,
-                    )? {
+                    if Self::try_insert_add(&store, ec_id, &min_body, &min_meta, &self.store_name)?
+                    {
                         return Ok(());
                     }
                     // Key appeared between get() and create — re-read on next iteration.
                     log::debug!(
-                        "upsert_partner_id: minimal create raced for '{ec_hash}', retrying (attempt {}/{})",
+                        "upsert_partner_id: minimal create raced for '{ec_id}', retrying (attempt {}/{})",
                         attempt + 1,
                         MAX_CAS_RETRIES,
                     );
@@ -386,12 +379,12 @@ impl KvIdentityGraph {
             // repopulate partner IDs after consent withdrawal.
             if !entry.consent.ok {
                 log::info!(
-                    "upsert_partner_id: entry for '{ec_hash}' is a tombstone, rejecting upsert"
+                    "upsert_partner_id: entry for '{ec_id}' is a tombstone, rejecting upsert"
                 );
                 return Err(Report::new(TrustedServerError::KvStore {
                     store_name: self.store_name.clone(),
                     message: format!(
-                        "Cannot upsert partner '{partner_id}' for withdrawn key '{ec_hash}'"
+                        "Cannot upsert partner '{partner_id}' for withdrawn key '{ec_id}'"
                     ),
                 }));
             }
@@ -412,12 +405,12 @@ impl KvIdentityGraph {
                 .if_generation_match(generation)
                 .metadata(&meta_str)
                 .time_to_live(ENTRY_TTL)
-                .execute(ec_hash, body.as_str())
+                .execute(ec_id, body.as_str())
             {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_hash}'",
+                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
                         attempt + 1,
                     );
                     // Loop will re-read on next iteration.
@@ -427,7 +420,7 @@ impl KvIdentityGraph {
                         Report::new(err).change_context(TrustedServerError::KvStore {
                             store_name: self.store_name.clone(),
                             message: format!(
-                                "Failed to upsert partner '{partner_id}' for key '{ec_hash}'"
+                                "Failed to upsert partner '{partner_id}' for key '{ec_id}'"
                             ),
                         }),
                     );
@@ -438,7 +431,7 @@ impl KvIdentityGraph {
         Err(Report::new(TrustedServerError::KvStore {
             store_name: self.store_name.clone(),
             message: format!(
-                "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_hash}'"
+                "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_id}'"
             ),
         }))
     }
@@ -458,7 +451,7 @@ impl KvIdentityGraph {
     /// exhaustion errors.
     pub fn upsert_partner_id_if_exists(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         partner_id: &str,
         uid: &str,
         synced: u64,
@@ -466,7 +459,7 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
 
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match self.get(ec_hash)? {
+            let (mut entry, generation) = match self.get(ec_id)? {
                 Some(pair) => pair,
                 None => return Ok(UpsertResult::NotFound),
             };
@@ -497,12 +490,12 @@ impl KvIdentityGraph {
                 .if_generation_match(generation)
                 .metadata(&meta_str)
                 .time_to_live(ENTRY_TTL)
-                .execute(ec_hash, body.as_str())
+                .execute(ec_id, body.as_str())
             {
                 Ok(()) => return Ok(UpsertResult::Written),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_hash}'",
+                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
                         attempt + 1,
                     );
                 }
@@ -511,7 +504,7 @@ impl KvIdentityGraph {
                         Report::new(err).change_context(TrustedServerError::KvStore {
                             store_name: self.store_name.clone(),
                             message: format!(
-                                "Failed to upsert partner '{partner_id}' for key '{ec_hash}'"
+                                "Failed to upsert partner '{partner_id}' for key '{ec_id}'"
                             ),
                         }),
                     );
@@ -522,7 +515,7 @@ impl KvIdentityGraph {
         Err(Report::new(TrustedServerError::KvStore {
             store_name: self.store_name.clone(),
             message: format!(
-                "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_hash}'"
+                "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_id}'"
             ),
         }))
     }
@@ -542,13 +535,13 @@ impl KvIdentityGraph {
     /// conflict.
     pub fn update_last_seen(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         timestamp: u64,
     ) -> Result<(), Report<TrustedServerError>> {
-        let (mut entry, generation) = match self.get(ec_hash)? {
+        let (mut entry, generation) = match self.get(ec_id)? {
             Some(pair) => pair,
             None => {
-                log::debug!("update_last_seen: no entry for '{ec_hash}', skipping");
+                log::debug!("update_last_seen: no entry for '{ec_id}', skipping");
                 return Ok(());
             }
         };
@@ -556,14 +549,14 @@ impl KvIdentityGraph {
         // Skip tombstones — a stale cookie should not extend a 24h tombstone
         // back to 1-year TTL.
         if !entry.consent.ok {
-            log::debug!("update_last_seen: entry for '{ec_hash}' is a tombstone, skipping");
+            log::debug!("update_last_seen: entry for '{ec_id}' is a tombstone, skipping");
             return Ok(());
         }
 
         // Guard against stale/out-of-order timestamps.
         if timestamp <= entry.last_seen {
             log::trace!(
-                "update_last_seen: stale timestamp for '{ec_hash}' (stored={}, incoming={timestamp})",
+                "update_last_seen: stale timestamp for '{ec_id}' (stored={}, incoming={timestamp})",
                 entry.last_seen,
             );
             return Ok(());
@@ -572,7 +565,7 @@ impl KvIdentityGraph {
         // Debounce: skip if the stored value is recent enough.
         if timestamp - entry.last_seen < LAST_SEEN_DEBOUNCE_SECS {
             log::trace!(
-                "update_last_seen: debounced for '{ec_hash}' (delta={}s)",
+                "update_last_seen: debounced for '{ec_id}' (delta={}s)",
                 timestamp - entry.last_seen,
             );
             return Ok(());
@@ -587,10 +580,10 @@ impl KvIdentityGraph {
             .if_generation_match(generation)
             .metadata(&meta_str)
             .time_to_live(ENTRY_TTL)
-            .execute(ec_hash, body)
+            .execute(ec_id, body)
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to update last_seen for key '{ec_hash}'"),
+                message: format!("Failed to update last_seen for key '{ec_id}'"),
             })
     }
 
@@ -601,7 +594,7 @@ impl KvIdentityGraph {
     /// entry is being withdrawn regardless of concurrent state.
     ///
     /// The tombstone allows batch sync clients (`POST /_ts/api/v1/sync`) to
-    /// distinguish `consent_withdrawn` from `ec_hash_not_found` for 24 hours.
+    /// distinguish `consent_withdrawn` from `ec_id_not_found` for 24 hours.
     ///
     /// # Errors
     ///
@@ -610,7 +603,7 @@ impl KvIdentityGraph {
     /// deletion is the primary enforcement mechanism.
     pub fn write_withdrawal_tombstone(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
     ) -> Result<(), Report<TrustedServerError>> {
         let store = self.open_store()?;
         let entry = KvEntry::tombstone(current_timestamp());
@@ -620,10 +613,10 @@ impl KvIdentityGraph {
             .build_insert()
             .metadata(&meta_str)
             .time_to_live(TOMBSTONE_TTL)
-            .execute(ec_hash, body)
+            .execute(ec_id, body)
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to write tombstone for key '{ec_hash}'"),
+                message: format!("Failed to write tombstone for key '{ec_id}'"),
             })
     }
 
@@ -635,13 +628,13 @@ impl KvIdentityGraph {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store error.
-    pub fn delete(&self, ec_hash: &str) -> Result<(), Report<TrustedServerError>> {
+    pub fn delete(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>> {
         let store = self.open_store()?;
         store
-            .delete(ec_hash)
+            .delete(ec_id)
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to delete key '{ec_hash}'"),
+                message: format!("Failed to delete key '{ec_id}'"),
             })
     }
 }

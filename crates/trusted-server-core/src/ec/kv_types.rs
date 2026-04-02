@@ -1,7 +1,7 @@
 //! KV identity graph schema types.
 //!
 //! These types define the JSON schema stored in the Fastly KV Store for the
-//! EC identity graph. Each EC hash (64-char hex prefix) maps to a [`KvEntry`]
+//! EC identity graph. Each EC ID (`{64hex}.{6alnum}`) maps to a [`KvEntry`]
 //! containing consent state, geo location, and accumulated partner IDs.
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
@@ -18,7 +18,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
-/// **KV key:** 64-character hex hash (the stable prefix from the EC ID).
+/// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
 /// **KV value:** JSON-serialized `KvEntry` (max ~5KB).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {

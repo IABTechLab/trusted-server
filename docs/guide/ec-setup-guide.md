@@ -49,7 +49,6 @@ PARTNER_API_KEY="test-batch-sync-key-2026"
 
 # Optional: use a real browser EC if already present
 EC_ID="<64hex.6chars>"
-EC_HASH="${EC_ID%%.*}"
 
 TCF_CONSENT="<euconsent-v2-string>"
 PARTNER_UID="mock-user-$(date +%s)"
@@ -146,7 +145,7 @@ Expected shape:
 
 Endpoint: `POST /_ts/api/v1/sync`
 
-Important: request field is `ec_hash` (not `ssc_hash`).
+Important: request field is `ec_id` (full `{64hex}.{6alnum}` value).
 
 ```bash
 BATCH_UID="${PARTNER_UID}-batch"
@@ -157,7 +156,7 @@ curl -X POST "${TS_BASE_URL}/_ts/api/v1/sync" \
   -H "Content-Type: application/json" \
   -d "{
     \"mappings\": [{
-      \"ec_hash\": \"${EC_HASH}\",
+      \"ec_id\": \"${EC_ID}\",
       \"partner_uid\": \"${BATCH_UID}\",
       \"timestamp\": ${NOW_TS}
     }]
@@ -226,7 +225,7 @@ fastly kv-store-entry get --store-id <partner-store-id> --key "${PARTNER_ID}"
 Inspect EC identity entry:
 
 ```bash
-fastly kv-store-entry get --store-id <identity-store-id> --key "${EC_HASH}"
+fastly kv-store-entry get --store-id <identity-store-id> --key "${EC_ID}"
 ```
 
 If pixel sync returns `write_failed`, check whether KV entry has:
@@ -238,7 +237,7 @@ If pixel sync returns `write_failed`, check whether KV entry has:
 | Symptom                                    | Likely Cause                           | Check                                     |
 | ------------------------------------------ | -------------------------------------- | ----------------------------------------- |
 | `invalid_token` on batch sync              | Wrong partner API key                  | Re-register partner with known API key    |
-| `missing field ec_hash`                    | Wrong request schema                   | Use `ec_hash` field                       |
+| `missing field ec_id`                      | Wrong request schema                   | Use `ec_id` field                         |
 | `ts_reason=no_consent`                     | Missing/invalid consent cookie         | Include valid `euconsent-v2`              |
 | `ts_reason=write_failed`                   | KV write blocked (often consent state) | Inspect identity KV entry and store links |
 | `/identify` returns `{"consent":"denied"}` | No consent for current request         | Send consent cookie                       |

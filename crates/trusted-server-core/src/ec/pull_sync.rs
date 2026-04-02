@@ -23,15 +23,15 @@ use super::EcContext;
 /// Inputs needed to dispatch pull sync after response flush.
 #[derive(Debug, Clone)]
 pub struct PullSyncContext {
-    ec_hash: String,
+    ec_id: String,
     client_ip: String,
 }
 
 impl PullSyncContext {
-    /// Returns the stable EC hash for the request.
+    /// Returns the EC ID for the request.
     #[must_use]
-    pub fn ec_hash(&self) -> &str {
-        &self.ec_hash
+    pub fn ec_id(&self) -> &str {
+        &self.ec_id
     }
 
     /// Returns the normalized client IP for pull endpoint query parameters.
@@ -53,7 +53,7 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC, there is no active EC hash, or no
+/// Returns `None` when consent denies EC, there is no active EC ID, or no
 /// client IP is available.
 #[must_use]
 pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
@@ -67,9 +67,9 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
         return None;
     }
 
-    let ec_hash = ec_context.ec_hash()?.to_owned();
+    let ec_id = ec_context.ec_value()?.to_owned();
     let client_ip = ec_context.client_ip()?.to_owned();
-    Some(PullSyncContext { ec_hash, client_ip })
+    Some(PullSyncContext { ec_id, client_ip })
 }
 
 /// Dispatches partner pull-sync requests in the background.
@@ -83,12 +83,12 @@ pub fn dispatch_pull_sync(
     context: &PullSyncContext,
 ) {
     let now = current_timestamp();
-    let kv_entry = match kv.get(context.ec_hash()) {
+    let kv_entry = match kv.get(context.ec_id()) {
         Ok(entry) => entry.map(|(entry, _)| entry),
         Err(err) => {
             log::warn!(
                 "Pull sync: failed to read identity graph for '{}': {err:?}",
-                context.ec_hash()
+                context.ec_id()
             );
             return;
         }
@@ -136,13 +136,13 @@ pub fn dispatch_pull_sync(
             continue;
         };
 
-        let rate_key = format!("pull:{}:{}", partner.id, context.ec_hash());
+        let rate_key = format!("pull:{}:{}", partner.id, context.ec_id());
         match rate_limiter.exceeded(&rate_key, partner.pull_sync_rate_limit) {
             Ok(true) => {
                 log::debug!(
-                    "Pull sync: rate-limited partner '{}' for hash '{}'",
+                    "Pull sync: rate-limited partner '{}' for ec_id '{}'",
                     partner.id,
-                    context.ec_hash()
+                    context.ec_id()
                 );
                 continue;
             }
@@ -164,7 +164,7 @@ pub fn dispatch_pull_sync(
             continue;
         };
 
-        let request_url = build_pull_request_url(url, context.ec_hash(), context.client_ip());
+        let request_url = build_pull_request_url(url, context.ec_id(), context.client_ip());
         let mut request = Request::new(Method::GET, request_url.as_str());
         request.set_header("authorization", format!("Bearer {token}"));
 
@@ -197,11 +197,11 @@ pub fn dispatch_pull_sync(
         });
 
         if in_flight.len() >= max_concurrency {
-            drain_pull_batch(kv, context.ec_hash(), &mut in_flight);
+            drain_pull_batch(kv, context.ec_id(), &mut in_flight);
         }
     }
 
-    drain_pull_batch(kv, context.ec_hash(), &mut in_flight);
+    drain_pull_batch(kv, context.ec_id(), &mut in_flight);
 }
 
 fn is_partner_pull_eligible(partner: &PartnerRecord, kv_entry: Option<&KvEntry>, now: u64) -> bool {
@@ -266,15 +266,15 @@ fn validated_pull_sync_url(partner: &PartnerRecord) -> Option<Url> {
     Some(parsed)
 }
 
-fn build_pull_request_url(mut base_url: Url, ec_hash: &str, client_ip: &str) -> Url {
+fn build_pull_request_url(mut base_url: Url, ec_id: &str, client_ip: &str) -> Url {
     base_url
         .query_pairs_mut()
-        .append_pair("ec_hash", ec_hash)
+        .append_pair("ec_id", ec_id)
         .append_pair("ip", client_ip);
     base_url
 }
 
-fn drain_pull_batch(kv: &KvIdentityGraph, ec_hash: &str, in_flight: &mut Vec<InFlightPull>) {
+fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFlightPull>) {
     for pending in in_flight.drain(..) {
         let partner_id = pending.partner_id;
         let response = match pending.pending.wait() {
@@ -292,11 +292,11 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_hash: &str, in_flight: &mut Vec<InF
             continue;
         };
 
-        if let Err(err) = kv.upsert_partner_id(ec_hash, &partner_id, &uid, current_timestamp()) {
+        if let Err(err) = kv.upsert_partner_id(ec_id, &partner_id, &uid, current_timestamp()) {
             log::warn!(
-                "Pull sync: failed to upsert partner '{}' for hash '{}': {err:?}",
+                "Pull sync: failed to upsert partner '{}' for ec_id '{}': {err:?}",
                 partner_id,
-                ec_hash
+                ec_id
             );
         }
     }
@@ -412,7 +412,10 @@ mod tests {
 
         let context = build_pull_sync_context(&ec_context)
             .expect("should build pull sync context for valid EC with IP");
-        assert_eq!(context.ec_hash(), "a".repeat(64).as_str());
+        assert_eq!(
+            context.ec_id(),
+            ec_context.ec_value().expect("ec should be present")
+        );
         assert_eq!(context.client_ip(), "1.2.3.4");
     }
 
@@ -497,11 +500,11 @@ mod tests {
     #[test]
     fn build_pull_request_url_appends_query_pairs() {
         let url = Url::parse("https://sync.partner.test/pull?x=1").expect("should parse URL");
-        let result = build_pull_request_url(url, "hash123", "1.2.3.4");
+        let result = build_pull_request_url(url, "ecid123", "1.2.3.4");
 
         let query = result.query().expect("should have query string");
         assert!(query.contains("x=1"), "should preserve existing query");
-        assert!(query.contains("ec_hash=hash123"), "should append ec_hash");
+        assert!(query.contains("ec_id=ecid123"), "should append ec_id");
         assert!(query.contains("ip=1.2.3.4"), "should append ip");
     }
 

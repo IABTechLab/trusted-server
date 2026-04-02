@@ -10,7 +10,7 @@ use crate::consent::{allows_ec_creation, gpp, tcf, ConsentContext};
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
-use super::generation::{ec_hash, is_valid_ec_id};
+use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::partner::{PartnerRecord, PartnerStore};
 use super::EcContext;
@@ -72,19 +72,21 @@ pub fn handle_sync(
         return Ok(redirect_with_status(&return_url, "0", Some("no_consent")));
     }
 
-    let hash = ec_hash(&cookie_ec_id);
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    if limiter.exceeded(&format!("{}:{hash}", partner.id), partner.sync_rate_limit)? {
+    if limiter.exceeded(
+        &format!("{}:{cookie_ec_id}", partner.id),
+        partner.sync_rate_limit,
+    )? {
         return Ok(Response::from_status(StatusCode::TOO_MANY_REQUESTS)
             .with_body_text_plain("rate_limit_exceeded"));
     }
 
     let now = current_timestamp();
-    if let Err(err) = kv.upsert_partner_id(hash, &partner.id, &query.uid, now) {
+    if let Err(err) = kv.upsert_partner_id(&cookie_ec_id, &partner.id, &query.uid, now) {
         log::warn!(
-            "Pixel sync write failed for partner '{}' and hash '{}': {err:?}",
+            "Pixel sync write failed for partner '{}' and ec_id '{}': {err:?}",
             partner.id,
-            hash,
+            cookie_ec_id,
         );
         return Ok(redirect_with_status(&return_url, "0", Some("write_failed")));
     }
