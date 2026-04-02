@@ -5,6 +5,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 ## Endpoint Categories
 
 - [First-Party Endpoints](#first-party-endpoints) - Core ad serving and proxying
+- [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -44,6 +45,121 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 - Server-side ad rendering
 - Direct iframe embedding
 - First-party ad delivery
+
+---
+
+## Edge Cookie Endpoints
+
+### POST /\_ts/admin/partners/register
+
+Registers or updates a partner used for EC sync and bidstream enrichment.
+
+**Auth:** Basic auth (admin credentials)
+
+**Request Body:**
+
+```json
+{
+  "id": "mocktioneer",
+  "name": "Mocktioneer SSP",
+  "api_key": "partner-secret-key",
+  "allowed_return_domains": ["formally-vital-lion.edgecompute.app"],
+  "source_domain": "formally-vital-lion.edgecompute.app",
+  "bidstream_enabled": true
+}
+```
+
+**Response:**
+
+- `201 Created` when newly created
+- `200 OK` when existing partner is updated
+
+---
+
+### GET /sync
+
+Browser pixel sync endpoint. Associates an EC ID with a partner UID.
+
+**Query Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `partner` | string | Yes | Registered partner id |
+| `uid` | string | Yes | Partner's user id |
+| `return` | string (URL) | Yes | Redirect URL after sync |
+
+**Request Requirements:**
+
+- `ts-ec` cookie present
+- valid consent signal (`euconsent-v2`) for consent-required jurisdictions
+
+**Response:**
+
+- `302 Found` redirect
+- Success: `Location: <return>?ts_synced=1`
+- Failure: `Location: <return>?ts_synced=0&ts_reason=<reason>`
+
+Common `ts_reason` values: `no_ec`, `no_consent`, `write_failed`, `rate_limited`.
+
+---
+
+### GET /identify
+
+Returns EC identity plus resolved partner IDs and EIDs for the current user.
+
+**Request:**
+
+- Uses `ts-ec` cookie and consent signals
+
+**Response (example):**
+
+```json
+{
+  "ec": "954d...e0c3.nZ1GxL",
+  "consent": "ok",
+  "degraded": false,
+  "uids": {
+    "mocktioneer": "mock-user-123"
+  },
+  "eids": [
+    {
+      "source": "formally-vital-lion.edgecompute.app",
+      "uids": [{ "id": "mock-user-123", "atype": 3 }]
+    }
+  ]
+}
+```
+
+---
+
+### POST /\_ts/api/v1/sync
+
+Server-to-server batch sync endpoint for writing EC hash to partner UID mappings.
+
+**Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
+
+**Request Body:**
+
+```json
+{
+  "mappings": [
+    {
+      "ec_hash": "954d8e7398dd993f78e3875ca1ef7841249781240e913157c1f2d6a6c960e0c3",
+      "partner_uid": "mock-user-123",
+      "timestamp": 1775147300
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "accepted": 1,
+  "rejected": 0,
+  "errors": []
+}
+```
 
 ---
 
@@ -329,7 +445,7 @@ curl -X POST https://edge.example.com/verify-signature \
 
 ---
 
-### POST /_ts/admin/keys/rotate
+### POST /\_ts/admin/keys/rotate
 
 Generates and activates a new signing key.
 
@@ -374,7 +490,7 @@ See [Key Rotation Guide](./key-rotation.md) for workflow details.
 
 ---
 
-### POST /_ts/admin/keys/deactivate
+### POST /\_ts/admin/keys/deactivate
 
 Deactivates or deletes a signing key.
 
