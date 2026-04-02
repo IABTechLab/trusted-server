@@ -118,7 +118,7 @@ TS Lite is a runtime configuration of the existing Trusted Server binary. It is 
 | GTM integration                        | Enabled  | Disabled                |
 | `GET /sync`                            | Disabled | **Enabled**             |
 | `GET /identify`                        | Disabled | **Enabled**             |
-| `POST /api/v1/sync`                    | Disabled | **Enabled**             |
+| `POST /_ts/api/v1/sync`                    | Disabled | **Enabled**             |
 | `GET /.well-known/trusted-server.json` | Enabled  | Enabled                 |
 
 When a disabled route is requested, TS returns `404` with the header `X-ts-error: feature-disabled`.
@@ -343,7 +343,7 @@ The EC cookie is deterministic (derived from IP + publisher salt) and lives in t
 | EC cookie refresh (existing user) | Refresh the cookie. Skip the KV `last_seen` update silently. Log at `warn`.                                                       | Same as above — the cookie continues working. Stale `last_seen` is acceptable.                                                                                                                                                                                    |
 | `/sync` KV write                  | Redirect to `return` with `ts_synced=0&ts_reason=write_failed`.                                                                   | The browser redirect must not be blocked by KV availability. This case is already specified in Section 9.4.                                                                                                                                                       |
 | `/identify` KV read               | Return `200` with `ec` hash (from cookie) and `degraded: true`. Set `uids: {}` and `eids: []`.                                    | The EC hash is still valid and useful for attribution and analytics. Empty uids signal that enrichment is unavailable, not that the user has no synced partners. `degraded: true` lets callers distinguish transient KV failure from a genuinely unenriched user. |
-| S2S batch write (`/api/v1/sync`)  | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                                                              | The request was valid; the failure is infrastructure. Partners should retry the batch.                                                                                                                                                                            |
+| S2S batch write (`/_ts/api/v1/sync`)  | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                                                              | The request was valid; the failure is infrastructure. Partners should retry the batch.                                                                                                                                                                            |
 | S2S pull sync write (async)       | Discard the resolved uid. Log at `warn`. Retry will occur on the next qualifying request per the `pull_sync_ttl_sec` window.      | Async path — no user-facing impact.                                                                                                                                                                                                                               |
 | Consent withdrawal KV delete      | Expire the cookie immediately. Log the KV delete failure at `error` level. Retry the KV delete on the next request for this user. | Cookie deletion is the primary enforcement mechanism. KV delete failure must not block or delay the cookie expiry.                                                                                                                                                |
 
@@ -524,7 +524,7 @@ The S2S batch sync API allows partners to push ID mappings to Trusted Server in 
 ### 10.2 Endpoint
 
 ```
-POST /api/v1/sync
+POST /_ts/api/v1/sync
 ```
 
 ### 10.3 Authentication
@@ -534,7 +534,7 @@ Partners authenticate with a rotatable API key. Key rotation must not require re
 ### 10.4 Request
 
 ```
-POST /api/v1/sync
+POST /_ts/api/v1/sync
 Content-Type: application/json
 Authorization: Bearer <api_key>
 
@@ -593,7 +593,7 @@ Before writing a mapping, Trusted Server checks the KV metadata for the given EC
 
 **Acceptance criteria:**
 
-- [ ] `POST /api/v1/sync` with a valid Bearer token and a batch of up to 1000 mappings returns a response within 5 seconds
+- [ ] `POST /_ts/api/v1/sync` with a valid Bearer token and a batch of up to 1000 mappings returns a response within 5 seconds
 - [ ] Accepted mappings are written to the corresponding KV identity graph entries within 1 second
 - [ ] Mappings for unknown `ec_hash` values are rejected with `ec_hash_not_found`
 - [ ] Mappings for users with withdrawn consent are rejected with `consent_withdrawn`
@@ -949,7 +949,7 @@ The following documentation changes are required alongside the EC feature:
   - SSP: pixel sync integration guide, sync pixel URL format, callback handling, optional pull resolution endpoint
   - DSP: S2S batch API reference, authentication, conflict resolution behavior, optional pull resolution endpoint
   - Identity Provider: registering as a partner, `source_domain` and `openrtb_atype` configuration, sync patterns
-- **API reference** for the four new endpoints: `GET /sync`, `GET /identify`, `POST /api/v1/sync`, and the partner-side pull resolution contract
+- **API reference** for the four new endpoints: `GET /sync`, `GET /identify`, `POST /_ts/api/v1/sync`, and the partner-side pull resolution contract
 - **Pull sync integration guide**: partner requirements for exposing a resolution endpoint, authentication, expected response shape, rate limit behavior
 - **Consent enforcement guide**: how TCF and GPP signals are read, precedence rules, what happens on withdrawal
 
