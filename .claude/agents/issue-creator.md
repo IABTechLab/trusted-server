@@ -79,7 +79,7 @@ Output the issue URL and type.
 - Use issue **types**, not labels, for categorization.
 - Every issue should have clear done-when / acceptance criteria.
 - Use the affected area dropdown values from the templates:
-  - Core (synthetic IDs, cookies, GDPR)
+  - Core (Edge Cookies, GDPR)
   - Integrations (prebid, lockr, permutive, etc.)
   - HTML processing / JS injection
   - Ad serving (Equativ)

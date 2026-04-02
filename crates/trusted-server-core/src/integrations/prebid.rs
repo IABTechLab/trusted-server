@@ -620,7 +620,7 @@ impl PrebidAuctionProvider {
                 // EIDs will be populated by identity providers; consent gating
                 // is applied via `gate_eids_by_consent` before they are set here.
                 eids: None,
-                synthetic_fresh: Some(request.user.fresh_id.clone()),
+                ec_fresh: Some(request.user.fresh_id.clone()),
             }
             .to_ext(),
             ..Default::default()
@@ -1307,7 +1307,7 @@ mod tests {
         )
     }
 
-    /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
+    /// Shared TOML prefix for config-parsing tests (publisher + ec sections).
     const TOML_BASE: &str = r#"
 [[handlers]]
 path = "^/admin"
@@ -1320,11 +1320,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section

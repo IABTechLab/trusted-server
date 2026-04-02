@@ -1,7 +1,7 @@
 //! KV Store consent persistence.
 //!
 //! Stores and retrieves consent data from a Fastly KV Store, keyed by
-//! Synthetic ID. This provides consent continuity for returning users
+//! EC ID. This provides consent continuity for returning users
 //! whose browsers may not have consent cookies on every request.
 //!
 //! # Storage layout
@@ -248,13 +248,9 @@ fn open_store(store_name: &str) -> Option<fastly::kv_store::KVStore> {
 /// Entries written by older code versions may lack metadata, in which case
 /// this returns `false` and the entry will be unconditionally re-written
 /// with the current fingerprint (self-healing migration).
-fn fingerprint_unchanged(
-    store: &fastly::kv_store::KVStore,
-    synthetic_id: &str,
-    new_fp: &str,
-) -> bool {
+fn fingerprint_unchanged(store: &fastly::kv_store::KVStore, ec_id: &str, new_fp: &str) -> bool {
     let stored_fp = store
-        .lookup(synthetic_id)
+        .lookup(ec_id)
         .ok()
         .and_then(|resp| resp.metadata())
         .and_then(|bytes| serde_json::from_slice::<ConsentKvMetadata>(&bytes).ok())
@@ -263,7 +259,7 @@ fn fingerprint_unchanged(
     stored_fp.as_deref() == Some(new_fp)
 }
 
-/// Loads consent data from the KV Store for a given Synthetic ID.
+/// Loads consent data from the KV Store for a given EC ID.
 ///
 /// Returns `Some(ConsentContext)` if a valid entry is found, [`None`] if the
 /// key does not exist or deserialization fails. Errors are logged but never
@@ -272,15 +268,15 @@ fn fingerprint_unchanged(
 /// # Arguments
 ///
 /// * `store_name` — The KV Store name (from `consent.consent_store` config).
-/// * `synthetic_id` — The Synthetic ID used as the KV Store key.
+/// * `ec_id` — The EC ID used as the KV Store key.
 #[must_use]
-pub fn load_consent_from_kv(store_name: &str, synthetic_id: &str) -> Option<ConsentContext> {
+pub fn load_consent_from_kv(store_name: &str, ec_id: &str) -> Option<ConsentContext> {
     let store = open_store(store_name)?;
 
-    let mut response = match store.lookup(synthetic_id) {
+    let mut response = match store.lookup(ec_id) {
         Ok(resp) => resp,
         Err(e) => {
-            log::debug!("Consent KV lookup miss for '{synthetic_id}': {e}");
+            log::debug!("Consent KV lookup miss for '{ec_id}': {e}");
             return None;
         }
     };
@@ -289,13 +285,13 @@ pub fn load_consent_from_kv(store_name: &str, synthetic_id: &str) -> Option<Cons
     match serde_json::from_slice::<KvConsentEntry>(&body_bytes) {
         Ok(entry) => {
             log::info!(
-                "Loaded consent from KV store for '{synthetic_id}' (stored_at_ds={})",
+                "Loaded consent from KV store for '{ec_id}' (stored_at_ds={})",
                 entry.stored_at_ds
             );
             Some(context_from_entry(&entry))
         }
         Err(e) => {
-            log::warn!("Failed to deserialize consent KV entry for '{synthetic_id}': {e}");
+            log::warn!("Failed to deserialize consent KV entry for '{ec_id}': {e}");
             None
         }
     }
@@ -310,15 +306,10 @@ pub fn load_consent_from_kv(store_name: &str, synthetic_id: &str) -> Option<Cons
 /// # Arguments
 ///
 /// * `store_name` — The KV Store name (from `consent.consent_store` config).
-/// * `synthetic_id` — The Synthetic ID used as the KV Store key.
+/// * `ec_id` — The EC ID used as the KV Store key.
 /// * `ctx` — The current request's consent context.
 /// * `max_age_days` — TTL for the entry, matching `max_consent_age_days`.
-pub fn save_consent_to_kv(
-    store_name: &str,
-    synthetic_id: &str,
-    ctx: &ConsentContext,
-    max_age_days: u32,
-) {
+pub fn save_consent_to_kv(store_name: &str, ec_id: &str, ctx: &ConsentContext, max_age_days: u32) {
     if ctx.is_empty() {
         log::debug!("Skipping consent KV write: consent is empty");
         return;
@@ -330,9 +321,9 @@ pub fn save_consent_to_kv(
 
     let metadata = metadata_from_context(ctx);
 
-    if fingerprint_unchanged(&store, synthetic_id, &metadata.fp) {
+    if fingerprint_unchanged(&store, ec_id, &metadata.fp) {
         log::debug!(
-            "Consent unchanged for '{synthetic_id}' (fp={}), skipping write",
+            "Consent unchanged for '{ec_id}' (fp={}), skipping write",
             metadata.fp
         );
         return;
@@ -341,11 +332,11 @@ pub fn save_consent_to_kv(
     let entry = entry_from_context(ctx, super::now_deciseconds());
 
     let Ok(body) = serde_json::to_string(&entry) else {
-        log::warn!("Failed to serialize consent entry for '{synthetic_id}'");
+        log::warn!("Failed to serialize consent entry for '{ec_id}'");
         return;
     };
     let Ok(meta_str) = serde_json::to_string(&metadata) else {
-        log::warn!("Failed to serialize consent metadata for '{synthetic_id}'");
+        log::warn!("Failed to serialize consent metadata for '{ec_id}'");
         return;
     };
 
@@ -355,38 +346,38 @@ pub fn save_consent_to_kv(
         .build_insert()
         .metadata(&meta_str)
         .time_to_live(ttl)
-        .execute(synthetic_id, body)
+        .execute(ec_id, body)
     {
         Ok(()) => {
             log::info!(
-                "Saved consent to KV store for '{synthetic_id}' (fp={}, ttl={max_age_days}d)",
+                "Saved consent to KV store for '{ec_id}' (fp={}, ttl={max_age_days}d)",
                 metadata.fp
             );
         }
         Err(e) => {
-            log::warn!("Failed to write consent to KV store for '{synthetic_id}': {e}");
+            log::warn!("Failed to write consent to KV store for '{ec_id}': {e}");
         }
     }
 }
 
-/// Deletes a consent entry from the KV Store for a given Synthetic ID.
+/// Deletes a consent entry from the KV Store for a given EC ID.
 ///
-/// Used when a user revokes consent — the existing SSC cookie is being
+/// Used when a user revokes consent — the existing EC cookie is being
 /// expired, so the persisted consent data must also be removed.
 ///
 /// Errors are logged but never propagated — KV Store failures must not
 /// break the request pipeline.
-pub fn delete_consent_from_kv(store_name: &str, synthetic_id: &str) {
+pub fn delete_consent_from_kv(store_name: &str, ec_id: &str) {
     let Some(store) = open_store(store_name) else {
         return;
     };
 
-    match store.delete(synthetic_id) {
+    match store.delete(ec_id) {
         Ok(()) => {
-            log::info!("Deleted consent KV entry for '{synthetic_id}' (consent revoked)");
+            log::info!("Deleted consent KV entry for '{ec_id}' (consent revoked)");
         }
         Err(e) => {
-            log::warn!("Failed to delete consent KV entry for '{synthetic_id}': {e}");
+            log::warn!("Failed to delete consent KV entry for '{ec_id}': {e}");
         }
     }
 }

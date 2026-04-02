@@ -22,7 +22,7 @@
 //!     req: &req,
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
-//!     synthetic_id: Some("sid_abc123"),
+//!     ec_id: Some("ec_abc123"),
 //! });
 //! ```
 
@@ -66,12 +66,12 @@ pub struct ConsentPipelineInput<'a> {
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
     pub geo: Option<&'a GeoInfo>,
-    /// Synthetic ID for KV Store consent persistence.
+    /// EC ID for KV Store consent persistence.
     ///
     /// When set along with `config.consent_store`, enables:
     /// - **Read fallback**: loads consent from KV when cookies are absent.
     /// - **Write-on-change**: persists cookie-sourced consent to KV.
-    pub synthetic_id: Option<&'a str>,
+    pub ec_id: Option<&'a str>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -463,22 +463,22 @@ pub fn gate_eids_by_consent<T>(
 }
 
 // ---------------------------------------------------------------------------
-// SSC consent gating
+// EC consent gating
 // ---------------------------------------------------------------------------
 
-/// Determines whether SSC (Synthetic Session Cookie) creation is permitted
-/// based on the user's consent and detected jurisdiction.
+/// Determines whether Edge Cookie (EC) creation is permitted based on the
+/// user's consent and detected jurisdiction.
 ///
 /// The decision follows the jurisdiction's consent model:
 ///
 /// - **GDPR (EU/UK)**: opt-in required — TCF Purpose 1 (store/access
 ///   information on a device) must be explicitly consented. If no TCF data is
-///   available under GDPR, consent is assumed absent and SSC is blocked.
-/// - **US state privacy**: opt-out model — SSC is allowed unless the user has
+///   available under GDPR, consent is assumed absent and EC is blocked.
+/// - **US state privacy**: opt-out model — EC is allowed unless the user has
 ///   explicitly opted out via the US Privacy string or Global Privacy Control.
-/// - **Non-regulated / Unknown**: SSC is allowed (no consent requirement).
+/// - **Non-regulated / Unknown**: EC is allowed (no consent requirement).
 #[must_use]
-pub fn allows_ssc_creation(ctx: &ConsentContext) -> bool {
+pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
     match &ctx.jurisdiction {
         jurisdiction::Jurisdiction::Gdpr => {
             // EU/UK: explicit opt-in required (TCF Purpose 1 = store/access device).
@@ -516,14 +516,14 @@ fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
 /// Attempts to load consent from the KV Store when cookie signals are empty.
 ///
 /// Returns `Some(ConsentContext)` if a valid entry was found and decoded,
-/// `None` otherwise. Requires both `consent_store` and `synthetic_id` to
+/// `None` otherwise. Requires both `consent_store` and `ec_id` to
 /// be configured.
 fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
     let store_name = input.config.consent_store.as_deref()?;
-    let synthetic_id = input.synthetic_id?;
+    let ec_id = input.ec_id?;
 
-    log::debug!("No cookie consent signals, trying KV fallback for '{synthetic_id}'");
-    let mut ctx = kv::load_consent_from_kv(store_name, synthetic_id)?;
+    log::debug!("No cookie consent signals, trying KV fallback for '{ec_id}'");
+    let mut ctx = kv::load_consent_from_kv(store_name, ec_id)?;
 
     // Re-detect jurisdiction from current geo (may differ from stored value).
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
@@ -542,16 +542,11 @@ fn try_kv_write(input: &ConsentPipelineInput<'_>, ctx: &ConsentContext) {
     let Some(store_name) = input.config.consent_store.as_deref() else {
         return;
     };
-    let Some(synthetic_id) = input.synthetic_id else {
+    let Some(ec_id) = input.ec_id else {
         return;
     };
 
-    kv::save_consent_to_kv(
-        store_name,
-        synthetic_id,
-        ctx,
-        input.config.max_consent_age_days,
-    );
+    kv::save_consent_to_kv(store_name, ec_id, ctx, input.config.max_consent_age_days);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +610,7 @@ mod tests {
     use fastly::Request;
 
     use super::{
-        allows_ssc_creation, apply_expiration_check, apply_tcf_conflict_resolution,
+        allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
         build_consent_context, build_context_from_signals, should_try_kv_fallback,
         ConsentPipelineInput,
     };
@@ -750,7 +745,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            synthetic_id: None,
+            ec_id: None,
         });
 
         assert!(
@@ -779,7 +774,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            synthetic_id: None,
+            ec_id: None,
         });
 
         assert!(
@@ -887,7 +882,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // allows_ssc_creation tests
+    // allows_ec_creation tests
     // -----------------------------------------------------------------------
 
     /// Helper: builds a TCF consent with configurable Purpose 1 (storage).
@@ -896,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn ssc_allowed_gdpr_with_storage_consent() {
+    fn ec_allowed_gdpr_with_storage_consent() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(make_tcf_with_storage(true)),
@@ -904,13 +899,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "GDPR + TCF Purpose 1 consented should allow SSC"
+            allows_ec_creation(&ctx),
+            "GDPR + TCF Purpose 1 consented should allow EC"
         );
     }
 
     #[test]
-    fn ssc_blocked_gdpr_without_storage_consent() {
+    fn ec_blocked_gdpr_without_storage_consent() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(make_tcf_with_storage(false)),
@@ -918,13 +913,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            !allows_ssc_creation(&ctx),
-            "GDPR + TCF Purpose 1 not consented should block SSC"
+            !allows_ec_creation(&ctx),
+            "GDPR + TCF Purpose 1 not consented should block EC"
         );
     }
 
     #[test]
-    fn ssc_blocked_gdpr_no_tcf_data() {
+    fn ec_blocked_gdpr_no_tcf_data() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: None,
@@ -933,13 +928,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            !allows_ssc_creation(&ctx),
-            "GDPR with no TCF data should block SSC"
+            !allows_ec_creation(&ctx),
+            "GDPR with no TCF data should block EC"
         );
     }
 
     #[test]
-    fn ssc_allowed_gdpr_via_gpp_embedded_tcf() {
+    fn ec_allowed_gdpr_via_gpp_embedded_tcf() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: None,
@@ -952,13 +947,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "GDPR + GPP embedded TCF with P1 consent should allow SSC"
+            allows_ec_creation(&ctx),
+            "GDPR + GPP embedded TCF with P1 consent should allow EC"
         );
     }
 
     #[test]
-    fn ssc_allowed_us_state_no_optout() {
+    fn ec_allowed_us_state_no_optout() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: Some(UsPrivacy {
@@ -970,13 +965,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "US state + no opt-out should allow SSC"
+            allows_ec_creation(&ctx),
+            "US state + no opt-out should allow EC"
         );
     }
 
     #[test]
-    fn ssc_blocked_us_state_opted_out() {
+    fn ec_blocked_us_state_opted_out() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: Some(UsPrivacy {
@@ -988,13 +983,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            !allows_ssc_creation(&ctx),
-            "US state + opt-out should block SSC"
+            !allows_ec_creation(&ctx),
+            "US state + opt-out should block EC"
         );
     }
 
     #[test]
-    fn ssc_blocked_us_state_gpc_implies_optout() {
+    fn ec_blocked_us_state_gpc_implies_optout() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: None,
@@ -1002,13 +997,13 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            !allows_ssc_creation(&ctx),
-            "US state + GPC=true with no US Privacy string should block SSC"
+            !allows_ec_creation(&ctx),
+            "US state + GPC=true with no US Privacy string should block EC"
         );
     }
 
     #[test]
-    fn ssc_allowed_us_state_no_signals() {
+    fn ec_allowed_us_state_no_signals() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: None,
@@ -1016,37 +1011,37 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "US state + no opt-out signals should allow SSC (opt-out model)"
+            allows_ec_creation(&ctx),
+            "US state + no opt-out signals should allow EC (opt-out model)"
         );
     }
 
     #[test]
-    fn ssc_allowed_non_regulated() {
+    fn ec_allowed_non_regulated() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "non-regulated jurisdiction should always allow SSC"
+            allows_ec_creation(&ctx),
+            "non-regulated jurisdiction should always allow EC"
         );
     }
 
     #[test]
-    fn ssc_allowed_unknown_jurisdiction() {
+    fn ec_allowed_unknown_jurisdiction() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Unknown,
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "unknown jurisdiction should allow SSC (no geo data available)"
+            allows_ec_creation(&ctx),
+            "unknown jurisdiction should allow EC (no geo data available)"
         );
     }
 
     #[test]
-    fn ssc_us_privacy_not_applicable_allows_ssc() {
+    fn ec_us_privacy_not_applicable_allows_ec() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("VA".to_owned()),
             us_privacy: Some(UsPrivacy {
@@ -1058,8 +1053,8 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ssc_creation(&ctx),
-            "US Privacy with opt_out=N/A should allow SSC"
+            allows_ec_creation(&ctx),
+            "US Privacy with opt_out=N/A should allow EC"
         );
     }
 }

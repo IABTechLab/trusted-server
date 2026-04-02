@@ -111,12 +111,12 @@ Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
-- Adds synthetic ID for privacy-safe tracking
+- Adds EC ID for privacy-safe tracking
 - Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
-### Synthetic ID Injection
+### EC ID Injection
 
-Automatically injects privacy-preserving synthetic ID into bid requests for user recognition without cookies.
+Automatically injects privacy-preserving EC ID into bid requests for user recognition without cookies.
 
 ### Request Signing
 
@@ -289,7 +289,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Marks impressions as `secure: 1` (HTTPS-only creatives)
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
-- Injects synthetic ID in the user object
+- Injects EC ID in the user object
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields
@@ -313,4 +313,4 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Review [Ad Serving Guide](/guide/ad-serving) for general concepts
 - Check [OpenRTB Support](/roadmap) on the roadmap for enhancements
 - Explore [Request Signing](/guide/request-signing) for authentication
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-safe tracking
+- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-safe tracking

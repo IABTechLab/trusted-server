@@ -377,7 +377,7 @@ impl fmt::Display for UsPrivacy {
 pub enum ConsentSource {
     /// Read from cookies on the incoming request.
     Cookie,
-    /// Loaded from KV store via `SyntheticID` lookup.
+    /// Loaded from KV store via Edge Cookie (EC) ID lookup.
     KvStore,
     /// Applied from explicit publisher policy defaults.
     PolicyDefault,
