@@ -1,7 +1,6 @@
 use error_stack::Report;
 use fastly::http::Method;
 use fastly::{Error, Request, Response};
-use log_fastly::Logger;
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -37,7 +36,7 @@ use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore}
 
 #[fastly::main]
 fn main(req: Request) -> Result<Response, Error> {
-    init_logger();
+    logging::init_logger();
 
     // Keep the health probe independent from settings loading and routing so
     // readiness checks still get a cheap liveness response during startup.
@@ -241,31 +240,4 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
     }
-}
-
-fn init_logger() {
-    let logger = Logger::builder()
-        .default_endpoint("tslog")
-        .echo_stdout(true)
-        .max_level(log::LevelFilter::Info)
-        .build()
-        .expect("should build Logger");
-
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} {} [{}] {}",
-                chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                record.level(),
-                record
-                    .target()
-                    .split("::")
-                    .last()
-                    .unwrap_or(record.target()),
-                message
-            ))
-        })
-        .chain(Box::new(logger) as Box<dyn log::Log>)
-        .apply()
-        .expect("should initialize logger");
 }
