@@ -134,7 +134,7 @@ async fn route_request(
 
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
-    if req.get_method() == Method::POST && req.get_path() == "/api/v1/sync" {
+    if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/sync" {
         let mut response = require_identity_graph(settings)
             .and_then(|kv| {
                 require_partner_store(settings).and_then(|partner_store| {

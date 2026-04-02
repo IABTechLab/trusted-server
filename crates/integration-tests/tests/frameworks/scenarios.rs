@@ -436,7 +436,7 @@ impl CustomScenario {
 ///
 /// These run against the Viceroy runtime directly without a frontend
 /// framework container — they exercise EC-specific endpoints (`/sync`,
-/// `/identify`, `/api/v1/sync`, `/_ts/admin/partners/register`).
+/// `/identify`, `/_ts/api/v1/sync`, `/_ts/admin/partners/register`).
 #[derive(Debug, Clone)]
 pub enum EcScenario {
     /// Full flow: organic request generates EC → pixel sync writes partner
