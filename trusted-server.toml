@@ -4,7 +4,7 @@ username = "user"
 password = "pass"
 
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "changeme"
 
@@ -192,4 +192,3 @@ timeout_ms = 1000
 # query parameter name. Arrays are joined with commas.
 [integrations.adserver_mock.context_query_params]
 permutive_segments = "permutive"
-

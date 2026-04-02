@@ -329,7 +329,7 @@ curl -X POST https://edge.example.com/verify-signature \
 
 ---
 
-### POST /admin/keys/rotate
+### POST /_ts/admin/keys/rotate
 
 Generates and activates a new signing key.
 
@@ -359,7 +359,7 @@ If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
 **Example:**
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password \
   -H "Content-Type: application/json"
 ```
@@ -374,7 +374,7 @@ See [Key Rotation Guide](./key-rotation.md) for workflow details.
 
 ---
 
-### POST /admin/keys/deactivate
+### POST /_ts/admin/keys/deactivate
 
 Deactivates or deletes a signing key.
 
@@ -407,7 +407,7 @@ Deactivates or deletes a signing key.
 **Example:**
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/deactivate \
+curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
   -u admin:password \
   -H "Content-Type: application/json" \
   -d '{"kid":"ts-2025-01-14-A","delete":true}'
@@ -588,7 +588,7 @@ Endpoints under protected paths require HTTP Basic Authentication:
 
 ```toml
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "secure-password"
 ```
@@ -596,13 +596,13 @@ password = "secure-password"
 **Usage:**
 
 ```bash
-curl -u admin:secure-password https://edge.example.com/admin/keys/rotate
+curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
 ```
 
 **Protected Endpoints:**
 
-- `/admin/keys/rotate`
-- `/admin/keys/deactivate`
+- `/_ts/admin/keys/rotate`
+- `/_ts/admin/keys/deactivate`
 - Any paths matching configured `handlers` patterns
 
 ---

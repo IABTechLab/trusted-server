@@ -1308,7 +1308,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_config_parsing() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1341,7 +1341,7 @@ upstream_url = "https://custom.gtm.example"
     fn test_config_defaults() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
