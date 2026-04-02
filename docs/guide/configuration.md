@@ -445,7 +445,7 @@ Path-based HTTP Basic Authentication.
 ```toml
 # Single handler
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "secure-password"
 
@@ -465,7 +465,7 @@ password = "api-pass"
 
 ```bash
 # Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/admin"
+TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
 TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
 TRUSTED_SERVER__HANDLERS__0__PASSWORD="secure-password"
 
@@ -483,10 +483,10 @@ TRUSTED_SERVER__HANDLERS__1__PASSWORD="api-pass"
 
 ```toml
 # Exact path
-path = "^/admin$"  # Only /admin
+path = "^/_ts/admin$"  # Only /_ts/admin
 
 # Prefix match
-path = "^/admin"   # /admin, /admin/users, /admin/settings
+path = "^/_ts/admin"   # /_ts/admin, /_ts/admin/users, /_ts/admin/settings
 
 # Multiple paths
 path = "^/(admin|secure|private)"
@@ -1015,7 +1015,7 @@ trusted-server.dev.toml      # Development overrides
 **"Invalid regex"**:
 
 - Handler `path` must be valid regex
-- Test pattern: `echo "^/admin" | grep -E "^/admin"`
+- Test pattern: `echo "^/_ts/admin" | grep -E "^/_ts/admin"`
 - Escape special characters: `\.`, `\$`, etc.
 
 **"Integration configuration could not be parsed"**:

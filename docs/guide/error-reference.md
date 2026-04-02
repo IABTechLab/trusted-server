@@ -404,7 +404,7 @@ Signing key not found: ts-2025-01-A
 3. Run key rotation to generate new key:
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password
 ```
 
@@ -427,7 +427,7 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 1. Initialize keys using rotation endpoint:
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password
 ```
 
