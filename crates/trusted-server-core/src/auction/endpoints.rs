@@ -135,13 +135,13 @@ fn resolve_auction_eids(
         return None;
     }
 
-    let ec_hash = ec_context.ec_hash()?;
+    let ec_id = ec_context.ec_value()?;
 
-    let entry = match kv.get(ec_hash) {
+    let entry = match kv.get(ec_id) {
         Ok(Some((entry, _generation))) => entry,
         Ok(None) => return Some(Vec::new()),
         Err(err) => {
-            log::warn!("Auction KV read failed for EC hash '{ec_hash}': {err:?}");
+            log::warn!("Auction KV read failed for EC ID '{ec_id}': {err:?}");
             return Some(Vec::new());
         }
     };

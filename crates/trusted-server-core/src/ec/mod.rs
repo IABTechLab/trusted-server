@@ -275,12 +275,11 @@ impl EcContext {
         if let (Some(graph), Some(ec_value)) = (kv, self.ec_value.as_deref()) {
             let now = current_timestamp();
             let entry = KvEntry::new(&self.consent, self.geo_info.as_ref(), now);
-            let ec_hash = generation::ec_hash(ec_value);
 
-            if let Err(err) = graph.create_or_revive(ec_hash, &entry) {
+            if let Err(err) = graph.create_or_revive(ec_value, &entry) {
                 log::error!(
-                    "Failed to create or revive EC entry for hash '{}' after generation: {err:?}",
-                    ec_hash,
+                    "Failed to create or revive EC entry for id '{}' after generation: {err:?}",
+                    ec_value,
                 );
             }
         }
