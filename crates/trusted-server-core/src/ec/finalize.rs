@@ -75,10 +75,9 @@ pub fn ec_finalize_response(
             }
         }
 
-        // If header/cookie were mismatched, rewrite cookie to active EC value.
-        if ec_context.has_cookie_mismatch() {
-            set_ec_on_response(settings, ec_context, response);
-        }
+        // Always set the EC header and refresh the cookie so downstream
+        // consumers (Prebid, frontend JS) can read it on every response.
+        set_ec_on_response(settings, ec_context, response);
 
         return;
     }
@@ -294,6 +293,39 @@ mod tests {
         assert!(
             set_cookie.contains(&format!("ts-ec={active_ec}")),
             "cookie should be rewritten to active EC"
+        );
+    }
+
+    #[test]
+    fn finalize_returning_user_refreshes_cookie_and_header_when_matching() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("MATCH01");
+        let ec_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+        );
+        let mut response = Response::new();
+
+        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+
+        let header = response
+            .get_header("x-ts-ec")
+            .expect("returning user should set x-ts-ec")
+            .to_str()
+            .expect("x-ts-ec should be utf-8");
+        assert_eq!(header, ec_id, "header should contain active EC");
+
+        let set_cookie = response
+            .get_header("set-cookie")
+            .expect("returning user should refresh cookie")
+            .to_str()
+            .expect("set-cookie should be utf-8");
+        assert!(
+            set_cookie.contains(&format!("ts-ec={ec_id}")),
+            "cookie should be refreshed to active EC"
         );
     }
 
