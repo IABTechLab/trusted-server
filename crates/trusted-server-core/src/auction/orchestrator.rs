@@ -148,6 +148,7 @@ impl AuctionOrchestrator {
                 client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
+                services: context.services,
             };
 
             let start_time = Instant::now();
@@ -325,6 +326,7 @@ impl AuctionOrchestrator {
                 client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
+                services: context.services,
             };
 
             log::info!(
@@ -677,12 +679,15 @@ mod tests {
         req: &'a Request,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
+        let services: &'static crate::platform::RuntimeServices =
+            Box::leak(Box::new(noop_services()));
         AuctionContext {
             settings,
             request: req,
             client_info,
             timeout_ms: 2000,
             provider_responses: None,
+            services,
         }
     }
 

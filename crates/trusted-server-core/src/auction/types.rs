@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
-use crate::platform::ClientInfo;
+use crate::platform::{ClientInfo, RuntimeServices};
 use crate::settings::Settings;
 
 /// Represents a unified auction request across all providers.
@@ -108,6 +108,8 @@ pub struct AuctionContext<'a> {
     /// Provider responses from the bidding phase, used by mediators.
     /// This is `None` for regular bidders and `Some` when calling a mediator.
     pub provider_responses: Option<&'a [AuctionResponse]>,
+    /// Platform services (config store, secret store, etc.) for use by providers.
+    pub services: &'a RuntimeServices,
 }
 
 /// Response from a single auction provider.

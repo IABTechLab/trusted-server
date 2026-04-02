@@ -128,44 +128,6 @@ impl SigningParams {
 }
 
 impl RequestSigner {
-    /// Creates a `RequestSigner` from the current key ID stored in config.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
-    ///
-    /// # Deprecation
-    ///
-    /// Use [`Self::from_services`] instead. This method will be removed when
-    /// [`crate::auction::types::AuctionContext`] gains a `RuntimeServices` field.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.1.0", note = "use from_services instead")]
-    pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
-        use crate::storage::{FastlyConfigStore, FastlySecretStore};
-        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
-        let key_id =
-            config_store
-                .get("current-kid")
-                .change_context(TrustedServerError::Configuration {
-                    message: "failed to get current-kid".into(),
-                })?;
-
-        let secret_store = FastlySecretStore::new(SIGNING_SECRET_STORE_NAME);
-        let key_bytes =
-            secret_store
-                .get(&key_id)
-                .change_context(TrustedServerError::Configuration {
-                    message: format!("failed to get signing key for kid: {}", key_id),
-                })?;
-
-        let signing_key = parse_ed25519_signing_key(key_bytes)?;
-
-        Ok(Self {
-            key: signing_key,
-            kid: key_id,
-        })
-    }
-
     /// Creates a `RequestSigner` from the current key ID stored in platform stores.
     ///
     /// # Errors
