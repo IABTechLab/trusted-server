@@ -33,7 +33,6 @@ iab_gpp = { workspace = true }
 jose-jwk = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
-log-fastly = { workspace = true }
 lol_html = { workspace = true }
 matchit = { workspace = true }
 pin-project-lite = { workspace = true }

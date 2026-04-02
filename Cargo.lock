@@ -2822,7 +2822,6 @@ dependencies = [
  "iab_gpp",
  "jose-jwk",
  "log",
- "log-fastly",
  "lol_html",
  "matchit",
  "pin-project-lite",
