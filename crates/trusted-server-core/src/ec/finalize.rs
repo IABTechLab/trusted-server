@@ -15,7 +15,7 @@ use crate::settings::Settings;
 
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::current_timestamp;
-use super::generation::{ec_hash, is_valid_ec_hash, is_valid_ec_id};
+use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::EcContext;
 
@@ -51,11 +51,11 @@ pub fn ec_finalize_response(
         }
 
         if let Some(graph) = kv {
-            for hash in withdrawal_hashes(ec_context) {
-                if let Err(err) = graph.write_withdrawal_tombstone(&hash) {
+            for ec_id in withdrawal_ec_ids(ec_context) {
+                if let Err(err) = graph.write_withdrawal_tombstone(&ec_id) {
                     log::error!(
-                        "Failed to write withdrawal tombstone for hash '{}': {err:?}",
-                        hash,
+                        "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
+                        ec_id,
                     );
                 }
             }
@@ -67,11 +67,8 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            let hash = ec_hash(ec_id);
-            if is_valid_ec_hash(hash) {
-                if let Err(err) = graph.update_last_seen(hash, current_timestamp()) {
-                    log::error!("Failed to update last_seen for hash '{}': {err:?}", hash,);
-                }
+            if let Err(err) = graph.update_last_seen(ec_id, current_timestamp()) {
+                log::error!("Failed to update last_seen for EC ID '{}': {err:?}", ec_id,);
             }
         }
 
@@ -125,13 +122,6 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
     for header in &dynamic_ts_headers {
         response.remove_header(header.as_str());
     }
-}
-
-fn withdrawal_hashes(ec_context: &EcContext) -> HashSet<String> {
-    withdrawal_ec_ids(ec_context)
-        .into_iter()
-        .map(|ec_id| ec_hash(&ec_id).to_owned())
-        .collect()
 }
 
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {

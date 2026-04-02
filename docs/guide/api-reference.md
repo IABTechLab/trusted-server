@@ -133,7 +133,7 @@ Returns EC identity plus resolved partner IDs and EIDs for the current user.
 
 ### POST /\_ts/api/v1/sync
 
-Server-to-server batch sync endpoint for writing EC hash to partner UID mappings.
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings.
 
 **Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
 
@@ -143,7 +143,7 @@ Server-to-server batch sync endpoint for writing EC hash to partner UID mappings
 {
   "mappings": [
     {
-      "ec_hash": "954d8e7398dd993f78e3875ca1ef7841249781240e913157c1f2d6a6c960e0c3",
+      "ec_id": "954d8e7398dd993f78e3875ca1ef7841249781240e913157c1f2d6a6c960e0c3.nZ1GxL",
       "partner_uid": "mock-user-123",
       "timestamp": 1775147300
     }
