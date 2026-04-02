@@ -609,9 +609,9 @@ impl Settings {
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
-        "/admin/keys/rotate",
-        "/admin/keys/deactivate",
-        "/admin/partners/register",
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/partners/register",
     ];
 
     /// Returns admin endpoint paths that no configured handler covers.
@@ -656,7 +656,7 @@ impl Settings {
         Err(Report::new(TrustedServerError::Configuration {
             message: format!(
                 "No handler covers admin endpoint(s): {}. \
-                 Add a [[handlers]] entry with a path regex matching /admin/ \
+                 Add a [[handlers]] entry with a path regex matching /_ts/admin/ \
                  to protect admin access.",
                 uncovered.join(", ")
             ),
@@ -1284,7 +1284,7 @@ mod tests {
                 (path_key_0, Some("^/env-handler")),
                 (username_key_0, Some("env-user")),
                 (password_key_0, Some("env-pass")),
-                (path_key_1, Some("^/admin")),
+                (path_key_1, Some("^/_ts/admin")),
                 (username_key_1, Some("admin")),
                 (password_key_1, Some("admin-pass")),
             ],
@@ -2029,9 +2029,9 @@ mod tests {
         assert_eq!(
             uncovered,
             vec![
-                "/admin/keys/rotate",
-                "/admin/keys/deactivate",
-                "/admin/partners/register",
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/partners/register",
             ],
             "should report all admin endpoints as uncovered"
         );
@@ -2045,7 +2045,7 @@ mod tests {
             .expect("should check admin coverage");
         assert!(
             uncovered.is_empty(),
-            "should report no uncovered admin endpoints when handler covers /admin"
+            "should report no uncovered admin endpoints when handler covers /_ts/admin"
         );
     }
 
@@ -2054,7 +2054,7 @@ mod tests {
         let toml_str = settings_str_without_admin_handler()
             + r#"
             [[handlers]]
-            path = "^/admin/keys/rotate$"
+            path = "^/_ts/admin/keys/rotate$"
             username = "admin"
             password = "secret"
             "#;
@@ -2066,7 +2066,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/admin/keys/deactivate", "/admin/partners/register"],
+            vec!["/_ts/admin/keys/deactivate", "/_ts/admin/partners/register"],
             "should detect endpoints not covered by the rotate-only handler"
         );
     }
@@ -2137,9 +2137,9 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                // Match arms look like: (Method::POST, "/admin/...") => ...
-                if trimmed.starts_with('(') && trimmed.contains("\"/admin/") {
-                    let start = trimmed.find("\"/admin/")?;
+                // Match arms look like: (Method::POST, "/_ts/admin/...") => ...
+                if trimmed.starts_with('(') && trimmed.contains("\"/_ts/admin/") {
+                    let start = trimmed.find("\"/_ts/admin/")?;
                     let rest = &trimmed[start + 1..];
                     let end = rest.find('"')?;
                     Some(&rest[..end])
