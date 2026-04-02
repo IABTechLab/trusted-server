@@ -25,37 +25,26 @@ The plan intentionally avoids any core logging trait or shared abstraction. Futu
 
 ## Tasks
 
-### Task 1: Extract Fastly logger formatting into an adapter-local module
+### Task 1: Extract Fastly logger helper and initializer into an adapter-local module
 
 **Files:**
 - Create: `crates/trusted-server-adapter-fastly/src/logging.rs`
 
-- [ ] **Step 1: Write a failing unit test for the extracted formatting helper**
+- [ ] **Step 1: Write a failing unit test for a non-allocating formatting helper**
 
-Create `crates/trusted-server-adapter-fastly/src/logging.rs` with a test-first skeleton. Add a helper test that defines the intended log line shape without trying to install a global logger:
+Create `crates/trusted-server-adapter-fastly/src/logging.rs` with a test-first skeleton. Add a helper test for the target-label extraction logic without trying to install a global logger:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::{Level, Record};
 
     #[test]
-    fn format_log_line_uses_last_target_segment_and_message() {
-        let record = Record::builder()
-            .args(format_args!("hello world"))
-            .level(Level::Info)
-            .target("trusted_server_adapter_fastly::proxy")
-            .build();
-
-        let line = format_log_line(
-            "2026-04-02T00:00:00.000Z",
-            &record,
-        );
-
-        assert!(
-            line.contains("INFO [proxy] hello world"),
-            "should use the final target segment and message text"
+    fn target_label_uses_last_target_segment() {
+        assert_eq!(
+            target_label("trusted_server_adapter_fastly::proxy"),
+            "proxy",
+            "should use the final target segment"
         );
     }
 }
@@ -64,8 +53,8 @@ mod tests {
 Also add a production skeleton so the file compiles but the test fails:
 
 ```rust
-pub(crate) fn format_log_line(_timestamp: &str, _record: &log::Record<'_>) -> String {
-    String::new()
+pub(crate) fn target_label(target: &str) -> &str {
+    target
 }
 ```
 
@@ -77,9 +66,9 @@ Run:
 cargo test --package trusted-server-adapter-fastly logging -- --nocapture
 ```
 
-Expected: FAIL because `format_log_line()` returns the wrong string.
+Expected: FAIL because `target_label()` returns the full target instead of the final segment.
 
-- [ ] **Step 3: Implement the minimal formatting helper and adapter logger initializer**
+- [ ] **Step 3: Implement the minimal helper and adapter logger initializer**
 
 Replace the skeleton with the real adapter-local module:
 
@@ -87,14 +76,8 @@ Replace the skeleton with the real adapter-local module:
 use chrono::{Local, SecondsFormat};
 use log_fastly::Logger;
 
-pub(crate) fn format_log_line(timestamp: &str, record: &log::Record<'_>) -> String {
-    format!(
-        "{} {} [{}] {}",
-        timestamp,
-        record.level(),
-        record.target().split("::").last().unwrap_or(record.target()),
-        record.args()
-    )
+pub(crate) fn target_label(target: &str) -> &str {
+    target.split("::").last().unwrap_or(target)
 }
 
 pub(crate) fn init_logger() {
@@ -107,9 +90,13 @@ pub(crate) fn init_logger() {
 
     fern::Dispatch::new()
         .format(|out, _message, record| {
-            let timestamp =
-                Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-            out.finish(format_args!("{}", format_log_line(&timestamp, record)));
+            out.finish(format_args!(
+                "{} {} [{}] {}",
+                Local::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                record.level(),
+                target_label(record.target()),
+                record.args()
+            ));
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
@@ -117,7 +104,7 @@ pub(crate) fn init_logger() {
 }
 ```
 
-Keep the logic semantically equivalent to the current `main.rs` formatting.
+Keep the logic semantically equivalent to the current `main.rs` formatting and avoid introducing a new heap allocation on each log call.
 
 - [ ] **Step 4: Run the adapter test to verify it passes**
 
