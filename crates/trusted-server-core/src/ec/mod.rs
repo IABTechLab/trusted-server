@@ -23,7 +23,7 @@
 //! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
 //! - [`identify`] — Browser identity read endpoint (`GET /identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
-//! - [`batch_sync`] — S2S batch sync endpoint (`POST /api/v1/sync`)
+//! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
 pub mod admin;

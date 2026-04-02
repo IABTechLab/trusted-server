@@ -1,4 +1,4 @@
-//! Server-to-server batch sync endpoint (`POST /api/v1/sync`).
+//! Server-to-server batch sync endpoint (`POST /_ts/api/v1/sync`).
 //!
 //! Partners send authenticated batch ID sync requests via Bearer token.
 //! Each mapping associates an `ec_hash` (the 64-char hex EC hash prefix)
@@ -124,7 +124,7 @@ fn parse_bearer_token(header_value: &str) -> Option<&str> {
 // Handler
 // ---------------------------------------------------------------------------
 
-/// Handles `POST /api/v1/sync`.
+/// Handles `POST /_ts/api/v1/sync`.
 ///
 /// # Errors
 ///
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn authenticate_bearer_returns_none_for_missing_header() {
         let partner_store = PartnerStore::new("test_store");
-        let req = Request::new("POST", "https://edge.example.com/api/v1/sync");
+        let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/sync");
 
         let result =
             authenticate_bearer(&partner_store, &req).expect("should not error on missing header");
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn authenticate_bearer_returns_none_for_malformed_header() {
         let partner_store = PartnerStore::new("test_store");
-        let mut req = Request::new("POST", "https://edge.example.com/api/v1/sync");
+        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/sync");
         req.set_header("authorization", "Basic dXNlcjpwYXNz");
 
         let result = authenticate_bearer(&partner_store, &req)
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn authenticate_bearer_returns_none_for_empty_token() {
         let partner_store = PartnerStore::new("test_store");
-        let mut req = Request::new("POST", "https://edge.example.com/api/v1/sync");
+        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/sync");
         req.set_header("authorization", "Bearer ");
 
         let result =
@@ -463,7 +463,7 @@ mod tests {
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
-        let req = Request::new("POST", "https://edge.example.com/api/v1/sync");
+        let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/sync");
 
         let response =
             handle_batch_sync(&kv, &partner_store, &limiter, req).expect("should return response");
