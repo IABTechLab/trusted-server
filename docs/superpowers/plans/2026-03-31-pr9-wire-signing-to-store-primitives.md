@@ -14,22 +14,24 @@
 
 Before touching anything, read these files to understand the current state:
 
-| File | Status | Notes |
-|------|--------|-------|
-| `crates/trusted-server-core/src/storage/api_client.rs` | **Delete** | Contains `FastlyApiClient` — HTTP calls to `api.fastly.com`. Used only by `rotation.rs`. |
-| `crates/trusted-server-core/src/request_signing/rotation.rs` | **Migrate** | Uses `FastlyConfigStore` (reads) + `FastlyApiClient` (writes). Main migration target. |
-| `crates/trusted-server-core/src/request_signing/signing.rs` | **Migrate** | Uses `FastlyConfigStore` + `FastlySecretStore` in 3 places. |
-| `crates/trusted-server-core/src/request_signing/endpoints.rs` | **Update** | `handle_verify_signature`, `handle_rotate_key`, `handle_deactivate_key` don't receive `&RuntimeServices`. |
-| `crates/trusted-server-core/src/request_signing/jwks.rs` | Already migrated ✓ | Uses `RuntimeServices`. No changes needed. |
-| `crates/trusted-server-adapter-fastly/src/platform.rs` | **Update** | `FastlyPlatformConfigStore::put/delete` and `FastlyPlatformSecretStore::create/delete` return `PlatformError::NotImplemented`. |
-| `crates/trusted-server-adapter-fastly/src/main.rs` | **Update** | Three call sites pass handlers without `runtime_services`. |
+| File                                                          | Status             | Notes                                                                                                                          |
+| ------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/trusted-server-core/src/storage/api_client.rs`        | **Delete**         | Contains `FastlyApiClient` — HTTP calls to `api.fastly.com`. Used only by `rotation.rs`.                                       |
+| `crates/trusted-server-core/src/request_signing/rotation.rs`  | **Migrate**        | Uses `FastlyConfigStore` (reads) + `FastlyApiClient` (writes). Main migration target.                                          |
+| `crates/trusted-server-core/src/request_signing/signing.rs`   | **Migrate**        | Uses `FastlyConfigStore` + `FastlySecretStore` in 3 places.                                                                    |
+| `crates/trusted-server-core/src/request_signing/endpoints.rs` | **Update**         | `handle_verify_signature`, `handle_rotate_key`, `handle_deactivate_key` don't receive `&RuntimeServices`.                      |
+| `crates/trusted-server-core/src/request_signing/jwks.rs`      | Already migrated ✓ | Uses `RuntimeServices`. No changes needed.                                                                                     |
+| `crates/trusted-server-adapter-fastly/src/platform.rs`        | **Update**         | `FastlyPlatformConfigStore::put/delete` and `FastlyPlatformSecretStore::create/delete` return `PlatformError::NotImplemented`. |
+| `crates/trusted-server-adapter-fastly/src/main.rs`            | **Update**         | Three call sites pass handlers without `runtime_services`.                                                                     |
 
 ## File Map
 
 ### Delete
+
 - `crates/trusted-server-core/src/storage/api_client.rs`
 
 ### Modify (core)
+
 - `crates/trusted-server-core/src/storage/mod.rs` — remove `api_client` submodule + re-export
 - `crates/trusted-server-core/src/platform/test_support.rs` — add `build_services_with_config_and_secret`
 - `crates/trusted-server-core/src/request_signing/rotation.rs` — replace `FastlyConfigStore`/`FastlyApiClient` with `RuntimeServices`
@@ -37,9 +39,11 @@ Before touching anything, read these files to understand the current state:
 - `crates/trusted-server-core/src/request_signing/endpoints.rs` — add `&RuntimeServices` to three handlers
 
 ### Create (adapter)
+
 - `crates/trusted-server-adapter-fastly/src/management_api.rs` — Fastly management API transport (absorbs `api_client.rs` logic, returns `PlatformError`)
 
 ### Modify (adapter)
+
 - `crates/trusted-server-adapter-fastly/src/platform.rs` — implement `put`/`delete` for config, `create`/`delete` for secrets
 - `crates/trusted-server-adapter-fastly/src/main.rs` — pass `runtime_services` to three handlers
 
@@ -52,6 +56,7 @@ Before touching anything, read these files to understand the current state:
 **Why:** Tasks 4 and 5 need a `RuntimeServices` with both a custom config store AND a custom secret store. The current `build_services_with_config` only customises the config store.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/test_support.rs`
 
 - [ ] **Step 1: Write a failing test that calls `build_services_with_config_and_secret`**
@@ -132,6 +137,7 @@ git commit -m "Add build_services_with_config_and_secret to test_support"
 **Credential security note (from spec):** The Fastly API token is read from the `api-keys` secret store, key `api_key`. Log store IDs and operation names only — never the token or secret value.
 
 **Files:**
+
 - Create: `crates/trusted-server-adapter-fastly/src/management_api.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs` — add `mod management_api;`
 
@@ -467,11 +473,13 @@ git commit -m "Add FastlyManagementApiClient to adapter"
 **Why:** Replace the `NotImplemented` stubs in `platform.rs` with real calls to `FastlyManagementApiClient`. The existing `NotImplemented` test for secret store (`fastly_platform_secret_store_create_returns_not_implemented`, `fastly_platform_secret_store_delete_returns_not_implemented`) must be deleted now that the real implementation lands. Check if there are equivalent config store tests to delete too.
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
 
 - [ ] **Step 1: Delete `NotImplemented` tests for secret store writes**
 
 In `platform.rs` tests, find and delete these two tests (they assert the old stub behavior that no longer holds):
+
 - `fastly_platform_secret_store_create_returns_not_implemented`
 - `fastly_platform_secret_store_delete_returns_not_implemented`
 
@@ -575,6 +583,7 @@ git commit -m "Implement FastlyPlatformConfigStore and FastlyPlatformSecretStore
 **Why:** `KeyRotationManager` currently holds `FastlyConfigStore` (reads) and `FastlyApiClient` (writes) as fields. Replace both with `&RuntimeServices` passed to each method.
 
 **New design:**
+
 - Drop `config_store: FastlyConfigStore` and `api_client: FastlyApiClient` fields
 - Keep `config_store_id: StoreId` and `secret_store_id: StoreId` (passed to write methods)
 - `new()` is now infallible (no API key fetch at construction time)
@@ -582,6 +591,7 @@ git commit -m "Implement FastlyPlatformConfigStore and FastlyPlatformSecretStore
 - Reads use `JWKS_STORE_NAME` (edge-visible name); writes use the stored `StoreId` values
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/request_signing/rotation.rs`
 
 - [ ] **Step 1: Write failing tests that define the new API**
@@ -1074,11 +1084,13 @@ git commit -m "Migrate KeyRotationManager from FastlyApiClient to RuntimeService
 **Why:** Three items in `signing.rs` still construct `FastlyConfigStore`/`FastlySecretStore` directly. Replace all three with `RuntimeServices`. The existing viceroy-dependent tests are replaced with proper unit tests using stub stores.
 
 **Changed signatures:**
+
 - `get_current_key_id()` → `get_current_key_id(services: &RuntimeServices)`
 - `RequestSigner::from_config()` → `RequestSigner::from_services(services: &RuntimeServices)` (rename to make the break explicit)
 - `verify_signature(payload, sig, kid)` → `verify_signature(payload, sig, kid, services: &RuntimeServices)`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/request_signing/signing.rs`
 
 - [ ] **Step 1: Write failing tests for the new API**
@@ -1353,10 +1365,13 @@ Expected: compile error — `from_services`, `verify_signature` with 4 args not 
 Replace the imports, `LazyLock` statics, and function bodies. Key changes:
 
 **Imports — replace:**
+
 ```rust
 use crate::storage::{FastlyConfigStore, FastlySecretStore};
 ```
+
 **With:**
+
 ```rust
 use std::sync::LazyLock;
 
@@ -1364,6 +1379,7 @@ use crate::platform::{RuntimeServices, StoreName};
 ```
 
 **Add after imports:**
+
 ```rust
 static JWKS_STORE_NAME: LazyLock<StoreName> =
     LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
@@ -1373,6 +1389,7 @@ static SIGNING_STORE_NAME: LazyLock<StoreName> =
 ```
 
 **Replace `get_current_key_id`:**
+
 ```rust
 pub fn get_current_key_id(
     services: &RuntimeServices,
@@ -1387,6 +1404,7 @@ pub fn get_current_key_id(
 ```
 
 **Replace `RequestSigner::from_config` with `from_services`:**
+
 ```rust
 pub fn from_services(
     services: &RuntimeServices,
@@ -1417,6 +1435,7 @@ pub fn from_services(
 **Replace `verify_signature` — add `services: &RuntimeServices` parameter and replace `FastlyConfigStore::new(...)` with `services.config_store().get(&JWKS_STORE_NAME, kid)`.**
 
 Full new signature:
+
 ```rust
 pub fn verify_signature(
     payload: &[u8],
@@ -1458,11 +1477,13 @@ git commit -m "Migrate signing.rs from FastlyConfigStore/FastlySecretStore to Ru
 **Note:** `fastly::{Request, Response}` and `fastly::mime` remain — type migration is Phase 2 (PR 12).
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/request_signing/endpoints.rs`
 
 - [ ] **Step 1: Update `handle_verify_signature` signature and body**
 
 Change:
+
 ```rust
 pub fn handle_verify_signature(
     _settings: &Settings,
@@ -1471,6 +1492,7 @@ pub fn handle_verify_signature(
 ```
 
 To:
+
 ```rust
 pub fn handle_verify_signature(
     _settings: &Settings,
@@ -1480,6 +1502,7 @@ pub fn handle_verify_signature(
 ```
 
 Update the `verify_signature` call:
+
 ```rust
 let verification_result = signing::verify_signature(
     verify_req.payload.as_bytes(),
@@ -1510,6 +1533,7 @@ Remove the `.change_context(...)` on `KeyRotationManager::new(...)` — it's now
 - [ ] **Step 3: Update `handle_deactivate_key` signature and body**
 
 Same pattern: add `services: &RuntimeServices`, update all `manager.*` calls to pass `services`:
+
 - `manager.delete_key(&deactivate_req.kid)` → `manager.delete_key(services, &deactivate_req.kid)`
 - `manager.deactivate_key(&deactivate_req.kid)` → `manager.deactivate_key(services, &deactivate_req.kid)`
 - `manager.list_active_keys()` → `manager.list_active_keys(services)`
@@ -1586,6 +1610,7 @@ fn build_signing_services_for_test() -> crate::platform::RuntimeServices {
 ```
 
 Pattern for verify tests:
+
 ```rust
 // In test_handle_verify_signature_valid:
 let services = build_signing_services_for_test();
@@ -1597,6 +1622,7 @@ let mut resp = handle_verify_signature(&settings, &services, req)
 ```
 
 For rotation/deactivation tests, `noop_services()` is fine — these tests use the `match result { Ok => log, Err => log }` pattern and do not assert against store state. The `noop_services()` causes `KeyRotationManager` methods to fail at the store read/write level, which is the expected behavior in a test environment without real stores:
+
 ```rust
 let services = noop_services();
 let result = handle_rotate_key(&settings, &services, req);
@@ -1625,6 +1651,7 @@ git commit -m "Add RuntimeServices parameter to handle_verify_signature, handle_
 **Why:** The adapter `main.rs` calls the three handlers without `runtime_services`. Add it. `runtime_services` is already in scope in all call sites.
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 
 - [ ] **Step 1: Update the three handler call sites**
@@ -1673,6 +1700,7 @@ git commit -m "Pass runtime_services to signing endpoint handlers in main.rs"
 **Why:** `api_client.rs` is now fully superseded by `management_api.rs` in the adapter. No core code references `FastlyApiClient` anymore (verified by rotation.rs migration).
 
 **Files:**
+
 - Delete: `crates/trusted-server-core/src/storage/api_client.rs`
 - Modify: `crates/trusted-server-core/src/storage/mod.rs`
 
