@@ -181,11 +181,11 @@ impl EcTestClient {
 // Partner registration
 // ---------------------------------------------------------------------------
 
-/// Admin credentials matching `trusted-server.toml` `[[handlers]]` for `/admin`.
+/// Admin credentials matching `trusted-server.toml` `[[handlers]]` for `/_ts/admin`.
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASS: &str = "changeme";
 
-/// Registers a test partner via `POST /admin/partners/register`.
+/// Registers a test partner via `POST /_ts/admin/partners/register`.
 pub fn register_test_partner(
     client: &EcTestClient,
     partner_id: &str,
@@ -202,7 +202,7 @@ pub fn register_test_partner(
     });
 
     let resp = client.post_json_with_basic_auth(
-        "/admin/partners/register",
+        "/_ts/admin/partners/register",
         &body,
         ADMIN_USER,
         ADMIN_PASS,

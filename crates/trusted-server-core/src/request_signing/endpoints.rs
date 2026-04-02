@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn test_handle_rotate_key_with_empty_body() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
+        let req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
 
         let mut resp = handle_rotate_key(&settings, &noop_services(), req)
             .expect("should return a response even when stores are unavailable");
@@ -635,7 +635,7 @@ mod tests {
         };
 
         let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
+        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
         req.set_body(body_json);
 
         let mut resp = handle_rotate_key(&settings, &noop_services(), req)
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn test_handle_rotate_key_invalid_json() {
         let settings = crate::test_support::tests::create_test_settings();
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
+        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
         req.set_body("invalid json");
 
         let result = handle_rotate_key(&settings, &noop_services(), req);
@@ -720,7 +720,7 @@ mod tests {
 
         let body_json =
             serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
+        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
         req.set_body(body_json);
 
         let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
@@ -757,7 +757,7 @@ mod tests {
 
         let body_json =
             serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
+        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
         req.set_body(body_json);
 
         let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn test_handle_deactivate_key_invalid_json() {
         let settings = crate::test_support::tests::create_test_settings();
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
+        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
         req.set_body("invalid json");
 
         let result = handle_deactivate_key(&settings, &noop_services(), req);

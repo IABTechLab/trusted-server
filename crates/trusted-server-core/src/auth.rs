@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn allow_admin_path_with_valid_credentials() {
         let settings = settings_with_handlers();
-        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = Request::new(Method::POST, "https://example.com/_ts/admin/keys/rotate");
         let token = STANDARD.encode("admin:admin-pass");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
         let settings = settings_with_handlers();
-        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = Request::new(Method::POST, "https://example.com/_ts/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
         req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
 
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
         let settings = settings_with_handlers();
-        let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let req = Request::new(Method::POST, "https://example.com/_ts/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
