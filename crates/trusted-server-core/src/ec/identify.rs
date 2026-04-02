@@ -61,8 +61,8 @@ pub fn handle_identify(
     let mut degraded = false;
     let mut resolved = Vec::new();
 
-    if let Some(ec_hash) = ec_context.ec_hash() {
-        match kv.get(ec_hash) {
+    if let Some(ec_id) = ec_context.ec_value() {
+        match kv.get(ec_id) {
             Ok(Some((entry, _generation))) => match resolve_partner_ids(partner_store, &entry) {
                 Ok(values) => {
                     resolved = values;
@@ -74,7 +74,7 @@ pub fn handle_identify(
             },
             Ok(None) => {}
             Err(err) => {
-                log::warn!("Identify KV read failed for hash '{ec_hash}': {err:?}");
+                log::warn!("Identify KV read failed for EC ID '{ec_id}': {err:?}");
                 degraded = true;
             }
         }
