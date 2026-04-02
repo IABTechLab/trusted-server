@@ -245,7 +245,7 @@ fn decode_query_fallback_consent(
 
 /// Rate limiter abstraction for sync endpoints.
 ///
-/// Used by both pixel sync (`/sync`) and batch sync (`/api/v1/sync`)
+/// Used by both pixel sync (`/sync`) and batch sync (`/_ts/api/v1/sync`)
 /// for per-partner request rate enforcement.
 pub trait RateLimiter {
     /// Returns `true` when the rate limit has been exceeded for the given key.
