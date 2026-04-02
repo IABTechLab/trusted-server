@@ -17,7 +17,7 @@
 6. [Consent Enforcement](#6-consent-enforcement)
 7. [KV Store Identity Graph](#7-kv-store-identity-graph)
 8. [Pixel Sync Endpoint (`GET /sync`)](#8-pixel-sync-endpoint-get-sync)
-9. [S2S Batch Sync API (`POST /api/v1/sync`)](#9-s2s-batch-sync-api-post-apiv1sync)
+9. [S2S Batch Sync API (`POST /_ts/api/v1/sync`)](#9-s2s-batch-sync-api-post-apiv1sync)
 10. [S2S Pull Sync (TS-Initiated)](#10-s2s-pull-sync-ts-initiated)
 11. [Identity Resolution Endpoint (`GET /identify`)](#11-identity-resolution-endpoint-get-identify)
 12. [Bidstream Decoration (`/auction` Mode B)](#12-bidstream-decoration-auction-mode-b)
@@ -85,8 +85,8 @@ handle_publisher_request()     integration_registry.handle_proxy()
 calls ec_context.generate_if_needed()   calls ec_context.generate_if_needed()
 
 EC route handlers (GET /sync, GET /identify, POST /auction,
-POST /api/v1/sync, POST /_ts/admin/*) NEVER call generate_if_needed().
-`/identify`, `/auction`, `POST /api/v1/sync`, and `POST /_ts/admin/*`
+POST /_ts/api/v1/sync, POST /_ts/admin/*) NEVER call generate_if_needed().
+`/identify`, `/auction`, `POST /_ts/api/v1/sync`, and `POST /_ts/admin/*`
 use `EcContext` in read-only form. `GET /sync` is the one exception:
 it never bootstraps an EC, but it may replace `ec_context.consent`
 with a locally-decoded fallback consent context for that request only
@@ -421,7 +421,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
           → set_ec_on_response()        (Set-Cookie + X-ts-ec on response)
 ```
 
-EC route handlers (`GET /sync`, `GET /identify`, `POST /api/v1/sync`, `POST /_ts/admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
+EC route handlers (`GET /sync`, `GET /identify`, `POST /_ts/api/v1/sync`, `POST /_ts/admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
 
 **Cookie write rule:** `Set-Cookie` is written in exactly two cases: (1) `ec_generated == true` (first-time generation), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch — reconcile cookie to match the header-derived identity). There is no cookie refresh or Max-Age reset on ordinary returning users where cookie already matches. The PRD defers a blanket refresh-on-every-request strategy to a future iteration.
 
@@ -525,7 +525,7 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 { "ok": true, "country": "US", "v": 1 }
 ```
 
-The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /api/v1/sync`) can return `consent_withdrawn` rather than `ec_hash_not_found` during the 24-hour tombstone TTL.
+The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /_ts/api/v1/sync`) can return `consent_withdrawn` rather than `ec_hash_not_found` during the 24-hour tombstone TTL.
 
 **`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Consent withdrawal is determined entirely from `allows_ec_creation(&ec_context.consent)` on the current request. When withdrawal is detected, the cookie is deleted and `write_withdrawal_tombstone()` is called in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
 
@@ -633,7 +633,7 @@ impl KvIdentityGraph {
     /// This recovery path is intentional: it materializes the graph later when
     /// the initial best-effort `create_or_revive()` on EC generation failed.
     /// Batch sync still performs its explicit existence/tombstone check before
-    /// calling this method, so `POST /api/v1/sync` retains its `ec_hash_not_found`
+    /// calling this method, so `POST /_ts/api/v1/sync` retains its `ec_hash_not_found`
     /// contract.
     pub fn upsert_partner_id(
         &self,
@@ -657,7 +657,7 @@ impl KvIdentityGraph {
     ///
     /// Instead of hard-deleting the KV entry, this overwrites it with
     /// `consent.ok = false`, clears all partner IDs, and sets a 24-hour TTL.
-    /// The tombstone allows batch sync clients (`POST /api/v1/sync`) to return
+    /// The tombstone allows batch sync clients (`POST /_ts/api/v1/sync`) to return
     /// `consent_withdrawn` rather than `ec_hash_not_found` for the tombstone TTL.
     ///
     /// After the 24-hour TTL expires, the entry is gone. Any subsequent `get()`
@@ -685,7 +685,7 @@ impl KvIdentityGraph {
 | EC cookie creation                 | KV error       | Set cookie. Skip KV create. Log `warn`.                                                        |
 | `/sync` KV write                   | KV error       | Redirect with `ts_synced=0&ts_reason=write_failed`.                                            |
 | `/identify` KV read                | KV error       | Return `200` with `ec` set, `degraded: true`, empty `uids`/`eids`.                             |
-| `POST /api/v1/sync`                | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
+| `POST /_ts/api/v1/sync`                | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
 | Pull sync KV write                 | KV error       | Discard uid. Log `warn`. Retry on next qualifying request.                                     |
 | Consent withdrawal tombstone write | KV error       | Delete cookie (primary enforcement). Log `error`. Next request: no cookie → no EC regenerated. |
 
@@ -793,7 +793,7 @@ Do not modify any other query parameters on the `return` URL.
 
 ---
 
-## 9. S2S Batch Sync API (`POST /api/v1/sync`)
+## 9. S2S Batch Sync API (`POST /_ts/api/v1/sync`)
 
 ### 9.1 Module: `ec/sync_batch.rs`
 
@@ -827,7 +827,7 @@ Exceeded → `429 Too Many Requests` with body `{ "error": "rate_limit_exceeded"
 ### 9.3 Request format
 
 ```
-POST /api/v1/sync
+POST /_ts/api/v1/sync
 Content-Type: application/json
 Authorization: Bearer <api_key>
 
@@ -951,7 +951,7 @@ fn pull_one_partner(
 
 A pull sync is dispatched for a partner when all of the following are true on a request:
 
-1. The request was routed to an **organic handler** (`handle_publisher_request` or `integration_registry.handle_proxy`). Pull sync never fires on EC route handlers (`/sync`, `/identify`, `/api/v1/sync`, `/_ts/admin/*`) or `/auction`. This matches the PRD requirement that pull calls must not happen during the pixel sync flow.
+1. The request was routed to an **organic handler** (`handle_publisher_request` or `integration_registry.handle_proxy`). Pull sync never fires on EC route handlers (`/sync`, `/identify`, `/_ts/api/v1/sync`, `/_ts/admin/*`) or `/auction`. This matches the PRD requirement that pull calls must not happen during the pixel sync flow.
 2. A valid EC is present (`ec_context.ec_hash().is_some()`). This includes an EC
    newly generated on the current organic request — pull sync may run immediately
    after first-page EC creation because the response cookie is flushed before the
@@ -1554,7 +1554,7 @@ New routes added to `route_request()` in `crates/fastly/src/main.rs`:
 (OPTIONS, "/identify") → cors_preflight_identify(settings, &req)
 
 // S2S batch sync — partner API key auth (internal to handler)
-(POST, "/api/v1/sync") → handle_batch_sync(settings, &kv, &partner_store, req)
+(POST, "/_ts/api/v1/sync") → handle_batch_sync(settings, &kv, &partner_store, req)
 
 // Partner registration — publisher admin auth enforced in-handler (Bearer token)
 (POST, "/_ts/admin/partners/register") → handle_register_partner(settings, &partner_store, req)
@@ -1615,7 +1615,7 @@ async fn route_request(...) -> Result<(), Error> {
         (GET, "/sync")              => handle_sync(settings, &kv, &partner_store, &req, &mut ec_context).await,
         (GET, "/identify")          => handle_identify(settings, &kv, &partner_store, &req, &ec_context).await,
         (OPTIONS, "/identify")      => cors_preflight_identify(settings, &req),
-        (POST, "/api/v1/sync")      => handle_batch_sync(settings, &kv, &partner_store, req).await,
+        (POST, "/_ts/api/v1/sync")      => handle_batch_sync(settings, &kv, &partner_store, req).await,
         (POST, "/_ts/admin/partners/register") => handle_register_partner(settings, &partner_store, req).await,
 
         // /auction — EC-read-only; never generates EC.
@@ -1647,7 +1647,7 @@ async fn route_request(...) -> Result<(), Error> {
     response.send_to_client();
 
     // Background pull sync — organic routes only (§10.2). Never fires on /sync,
-    // /identify, /auction, /api/v1/sync, or /_ts/admin/* routes.
+    // /identify, /auction, /_ts/api/v1/sync, or /_ts/admin/* routes.
     // Fires outbound HTTP calls via send_async(), blocks on PendingRequest::wait().
     if is_organic {
         if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
@@ -1716,7 +1716,7 @@ Suggested order to minimize risk and allow incremental testing. Each step should
 | 6    | EC middleware in `main.rs`, `publisher.rs`, `registry.rs` | `EcContext::read_from_request()` pre-routing, `generate_if_needed()`, `ec_finalize_response()` |
 | 7    | `ec/sync_pixel.rs`                                        | `GET /sync` handler + route                                                                    |
 | 8    | `ec/identify.rs`                                          | `GET /identify` handler + route                                                                |
-| 9    | `ec/sync_batch.rs`                                        | `POST /api/v1/sync` handler + route                                                            |
+| 9    | `ec/sync_batch.rs`                                        | `POST /_ts/api/v1/sync` handler + route                                                            |
 | 10   | `ec/pull_sync.rs`                                         | Background pull sync dispatch (blocking, after `send_to_client()`)                             |
 | 11   | Auction integration                                       | EC injection into `user.id`, `user.eids`, `user.consent`                                       |
 | 12   | End-to-end integration tests                              | Viceroy-based flow tests                                                                       |
@@ -1926,7 +1926,7 @@ Wire `EcContext` into the request pipeline following the two-phase model
 - `EcContext::read_from_request()` is called before the route match on every
   request, passed the existing `geo_info` (no duplicate geo header parsing).
 - EC route handlers receive `ec_context` without EC generation. `/identify`,
-  `/auction`, `/api/v1/sync`, and `/_ts/admin/*` use read-only `&EcContext` and
+  `/auction`, `/_ts/api/v1/sync`, and `/_ts/admin/*` use read-only `&EcContext` and
   never mutate it. **Exception:** `/sync` receives `&mut EcContext`; when the
   consent query-param fallback applies (`ec_context.consent.is_empty()`), it
   assigns the locally-decoded consent into `ec_context.consent` so that both
@@ -2042,7 +2042,7 @@ hash and synced partner UIDs for the current user.
 
 ---
 
-### Story 9 — S2S batch sync (`POST /api/v1/sync`)
+### Story 9 — S2S batch sync (`POST /_ts/api/v1/sync`)
 
 Implement the server-to-server batch sync endpoint for partners to bulk-write
 their UIDs against a list of EC hashes.
@@ -2100,7 +2100,7 @@ runtime). Only fires on organic routes (§10.2).
 - Dispatch runs after `send_to_client()` — does not add latency to the
   user-facing response. Uses `send_async()` + `PendingRequest::wait()` (blocking).
 - Only fires on organic routes (`handle_publisher_request`, `handle_proxy`) —
-  never on `/sync`, `/identify`, `/auction`, `/api/v1/sync`, or `/_ts/admin/*`.
+  never on `/sync`, `/identify`, `/auction`, `/_ts/api/v1/sync`, or `/_ts/admin/*`.
 - Unit tests cover trigger conditions, null/404 no-op, domain allowlist check,
   dispatch limit enforcement.
 

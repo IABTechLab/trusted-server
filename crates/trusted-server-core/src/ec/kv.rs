@@ -600,7 +600,7 @@ impl KvIdentityGraph {
     /// and a 24-hour TTL. Uses unconditional overwrite (no CAS) since the
     /// entry is being withdrawn regardless of concurrent state.
     ///
-    /// The tombstone allows batch sync clients (`POST /api/v1/sync`) to
+    /// The tombstone allows batch sync clients (`POST /_ts/api/v1/sync`) to
     /// distinguish `consent_withdrawn` from `ec_hash_not_found` for 24 hours.
     ///
     /// # Errors
