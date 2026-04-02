@@ -69,7 +69,7 @@ Today, regular cookies don't suffice for publisher and partner needs. Additional
 - Build a server-side identity graph in Fastly KV Store that accumulates resolved partner IDs over time
 - Provide three KV write paths: real-time pixel sync redirects, S2S batch push from partners, and TS-initiated S2S pull from partner resolution endpoints
 - Expose two bidstream integration modes: header decoration (`/identify`) and full auction orchestration (`/auction`)
-- Expose a publisher-authenticated `/admin/partners/register` endpoint for partner provisioning without direct KV access
+- Expose a publisher-authenticated `/_ts/admin/partners/register` endpoint for partner provisioning without direct KV access
 
 ### Non-Goals
 
@@ -529,7 +529,7 @@ POST /api/v1/sync
 
 ### 10.3 Authentication
 
-Partners authenticate with a rotatable API key. Key rotation must not require redeploying the binary. Partner provisioning is handled via the `/admin/partners/register` endpoint (see Section 15, Open Questions).
+Partners authenticate with a rotatable API key. Key rotation must not require redeploying the binary. Partner provisioning is handled via the `/_ts/admin/partners/register` endpoint (see Section 15, Open Questions).
 
 ### 10.4 Request
 
@@ -933,7 +933,7 @@ The following capabilities must be configurable without redeploying the binary:
 - **Publisher passphrase** — the HMAC key used for EC hash generation; same value across all of the publisher's domains; shared with trusted partners to form an identity-federated consortium
 - **Identity graph store** — the KV store backing the EC hash → identity graph
 - **Partner registry store** — the KV store backing partner configuration and API key validation
-- **Partner records** — each partner's allowed sync domains, bidstream settings, pull sync configuration, and API credentials; managed via `/admin/partners/register` without redeployment
+- **Partner records** — each partner's allowed sync domains, bidstream settings, pull sync configuration, and API credentials; managed via `/_ts/admin/partners/register` without redeployment
 
 The exact configuration format (TOML keys, KV schema, JSON field names) is an engineering decision and will be documented in the technical design doc.
 
@@ -945,7 +945,7 @@ The following documentation changes are required alongside the EC feature:
 
 - **Rename SyntheticID → Edge Cookie** across the entire `docs/` GitHub Pages site. The underlying concept is the same but the product name changes.
 - **New integration guides**, one per customer type:
-  - Publisher (full TS): enabling EC in `trusted-server.toml`, partner onboarding via `/admin/partners/register`
+  - Publisher (full TS): enabling EC in `trusted-server.toml`, partner onboarding via `/_ts/admin/partners/register`
   - SSP: pixel sync integration guide, sync pixel URL format, callback handling, optional pull resolution endpoint
   - DSP: S2S batch API reference, authentication, conflict resolution behavior, optional pull resolution endpoint
   - Identity Provider: registering as a partner, `source_domain` and `openrtb_atype` configuration, sync patterns
@@ -959,7 +959,7 @@ The following documentation changes are required alongside the EC feature:
 
 | #   | Question                                                                                                                                                                                                                                                                                     | Owner       | Status                                                                      |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------- |
-| 1   | Partner provisioning: TS will expose a `/admin/partners/register` endpoint authenticated at the publisher level (bearer token issued per publisher Fastly service), so publishers can onboard SSP/DSP partners without touching KV directly. Engineering to define the exact auth mechanism. | Engineering | **Resolved** — `/admin/partners/register` endpoint, publisher-authenticated |
+| 1   | Partner provisioning: TS will expose a `/_ts/admin/partners/register` endpoint authenticated at the publisher level (bearer token issued per publisher Fastly service), so publishers can onboard SSP/DSP partners without touching KV directly. Engineering to define the exact auth mechanism. | Engineering | **Resolved** — `/_ts/admin/partners/register` endpoint, publisher-authenticated |
 | 2   | Should TS Lite expose a `GET /health` endpoint so partners can programmatically verify their service is running and their partner config is active in KV?                                                                                                                                    | Product     | **N/A** — TS Lite deferred (see Section 5)                                  |
 
 ---
