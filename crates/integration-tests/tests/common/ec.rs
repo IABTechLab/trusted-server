@@ -272,7 +272,7 @@ pub fn batch_sync_no_auth(
 
 /// Single mapping in a batch sync request.
 pub struct BatchMapping {
-    pub ec_hash: String,
+    pub ec_id: String,
     pub partner_uid: String,
     pub timestamp: u64,
 }
@@ -282,7 +282,7 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
         .iter()
         .map(|m| {
             serde_json::json!({
-                "ec_hash": m.ec_hash,
+                "ec_id": m.ec_id,
                 "partner_uid": m.partner_uid,
                 "timestamp": m.timestamp,
             })
@@ -360,12 +360,14 @@ pub fn is_ec_cookie_expired(resp: &Response) -> bool {
     false
 }
 
-/// Extracts the stable 64-char hex prefix from an EC ID (`{64hex}.{6alnum}`).
-pub fn ec_hash(ec_id: &str) -> &str {
-    match ec_id.find('.') {
-        Some(pos) => &ec_id[..pos],
-        None => ec_id,
-    }
+/// Normalizes an EC ID for KV key usage.
+///
+/// Lowercases the 64-char hex hash prefix and preserves the 6-char suffix.
+pub fn normalize_ec_id(ec_id: &str) -> String {
+    let mut parts = ec_id.splitn(2, '.');
+    let hash = parts.next().unwrap_or_default();
+    let suffix = parts.next().unwrap_or_default();
+    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
 }
 
 // ---------------------------------------------------------------------------

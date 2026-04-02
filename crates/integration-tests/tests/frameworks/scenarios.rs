@@ -1,7 +1,7 @@
 use crate::common::assertions;
 use crate::common::ec::{
-    assert_json_response, assert_status, batch_sync, batch_sync_no_auth, ec_hash,
-    extract_ec_cookie_from_response, identify, is_ec_cookie_expired, pixel_sync,
+    assert_json_response, assert_status, batch_sync, batch_sync_no_auth,
+    extract_ec_cookie_from_response, identify, is_ec_cookie_expired, normalize_ec_id, pixel_sync,
     register_test_partner, BatchMapping, EcTestClient,
 };
 use crate::common::runtime::{origin_port, TestError, TestResult};
@@ -692,21 +692,21 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
 fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
 
-    // Generate EC to get a valid hash
+    // Generate EC to get a valid EC ID
     let resp = client.get("/")?;
     let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
         Report::new(TestError::EcCookieNotSet).attach("batch sync: need EC cookie")
     })?;
-    let hash = ec_hash(&ec_id).to_owned();
-    log::info!("EC batch sync happy path: hash = {hash}");
+    let ec_id = normalize_ec_id(&ec_id);
+    log::info!("EC batch sync happy path: ec_id = {ec_id}");
 
     // Register partner with known API key
     register_test_partner(&client, "batchssp", "batch-api-key-1", "sync.example.com")
         .attach("register batch sync partner")?;
 
-    // Batch sync writes a UID for this hash
+    // Batch sync writes a UID for this EC ID
     let mappings = vec![BatchMapping {
-        ec_hash: hash.clone(),
+        ec_id: ec_id.clone(),
         partner_uid: "batch-uid-99".to_owned(),
         timestamp: 1_700_000_000,
     }];
@@ -751,7 +751,7 @@ fn ec_batch_sync_auth_rejection(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
 
     let dummy_mappings = vec![BatchMapping {
-        ec_hash: "a".repeat(64),
+        ec_id: format!("{}.ABC123", "a".repeat(64)),
         partner_uid: "uid-1".to_owned(),
         timestamp: 1_700_000_000,
     }];
