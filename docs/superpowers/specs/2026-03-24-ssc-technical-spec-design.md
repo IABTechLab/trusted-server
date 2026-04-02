@@ -353,7 +353,7 @@ pub fn clear_ec_on_response(response: &mut Response, cookie_domain: &str);
 
 ### 5.3 Response header
 
-`X-ts-ec: {ec_hash.suffix}` is set by `set_ec_on_response()`, which is called by `ec_finalize_response()` in two cases: (1) `ec_generated == true` (new EC minted this request), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch reconciliation — overwrites cookie to match header). It is also set explicitly by `/identify` and `/auction` handlers on their own response paths when an EC is present. It is **not** set on ordinary returning-user requests where the cookie already matches the header (or no header is present).
+`X-ts-ec: {ec_hash.suffix}` is set by `set_ec_on_response()` when an EC is available. In current behavior, `ec_finalize_response()` calls `set_ec_on_response()` for returning users (`ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`) and for newly generated ECs (`ec_generated == true`). `/identify` and `/auction` also set EC-related headers on their response paths.
 
 This header is added to `INTERNAL_HEADERS` in `constants.rs` so it is stripped before proxying to downstream backends, consistent with existing `X-ts-*` handling.
 
@@ -411,11 +411,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
   │
   ├── ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)?
   │       → kv.update_last_seen(ec_hash, now())   (returning user — debounced at 300s)
-  │       → if cookie_ec_value.is_some():
-  │           // Header and cookie disagree — reconcile by overwriting cookie with header value.
-  │           // Prevents persistent split identity where user oscillates between two ECs
-  │           // depending on whether the forwarded header is present on subsequent requests.
-  │           set_ec_on_response()   (Set-Cookie with ec_value, the header-derived identity)
+  │       → set_ec_on_response()   (Set-Cookie + X-ts-ec refresh on returning user)
   │
   └── ec_generated == true?
           → set_ec_on_response()        (Set-Cookie + X-ts-ec on response)
@@ -423,7 +419,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
 
 EC route handlers (`GET /sync`, `GET /identify`, `POST /_ts/api/v1/sync`, `POST /_ts/admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
 
-**Cookie write rule:** `Set-Cookie` is written in exactly two cases: (1) `ec_generated == true` (first-time generation), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch — reconcile cookie to match the header-derived identity). There is no cookie refresh or Max-Age reset on ordinary returning users where cookie already matches. The PRD defers a blanket refresh-on-every-request strategy to a future iteration.
+**Cookie write rule:** `Set-Cookie` is written when `set_ec_on_response()` is called. In current behavior this includes returning-user requests (consent allowed + EC present) and first-time generation (`ec_generated == true`), so `Max-Age` is refreshed on ordinary returning requests.
 
 ---
 
@@ -685,7 +681,7 @@ impl KvIdentityGraph {
 | EC cookie creation                 | KV error       | Set cookie. Skip KV create. Log `warn`.                                                        |
 | `/sync` KV write                   | KV error       | Redirect with `ts_synced=0&ts_reason=write_failed`.                                            |
 | `/identify` KV read                | KV error       | Return `200` with `ec` set, `degraded: true`, empty `uids`/`eids`.                             |
-| `POST /_ts/api/v1/sync`                | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
+| `POST /_ts/api/v1/sync`            | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
 | Pull sync KV write                 | KV error       | Discard uid. Log `warn`. Retry on next qualifying request.                                     |
 | Consent withdrawal tombstone write | KV error       | Delete cookie (primary enforcement). Log `error`. Next request: no cookie → no EC regenerated. |
 
@@ -1712,11 +1708,11 @@ Suggested order to minimize risk and allow incremental testing. Each step should
 | 2    | `ec/finalize.rs`                                          | `ec_finalize_response()` (cookie write, deletion, tombstone, last_seen)                        |
 | 3    | `ec/cookie.rs`                                            | Cookie creation, deletion, response header                                                     |
 | 4    | `ec/kv.rs`                                                | `KvIdentityGraph` CRUD with CAS                                                                |
-| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/_ts/admin/partners/register`                                                     |
+| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/_ts/admin/partners/register`                                                 |
 | 6    | EC middleware in `main.rs`, `publisher.rs`, `registry.rs` | `EcContext::read_from_request()` pre-routing, `generate_if_needed()`, `ec_finalize_response()` |
 | 7    | `ec/sync_pixel.rs`                                        | `GET /sync` handler + route                                                                    |
 | 8    | `ec/identify.rs`                                          | `GET /identify` handler + route                                                                |
-| 9    | `ec/sync_batch.rs`                                        | `POST /_ts/api/v1/sync` handler + route                                                            |
+| 9    | `ec/sync_batch.rs`                                        | `POST /_ts/api/v1/sync` handler + route                                                        |
 | 10   | `ec/pull_sync.rs`                                         | Background pull sync dispatch (blocking, after `send_to_client()`)                             |
 | 11   | Auction integration                                       | EC injection into `user.id`, `user.eids`, `user.consent`                                       |
 | 12   | End-to-end integration tests                              | Viceroy-based flow tests                                                                       |

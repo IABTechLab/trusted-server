@@ -94,8 +94,46 @@ fastly secret-store create --name signing_keys
 
 Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
 
+## Create EC KV Stores
+
+Edge Cookie flows require two KV stores:
+
+- Identity graph store (`ec_store`) - EC hash to partner IDs
+- Partner registry store (`partner_store`) - partner records and API-key hashes
+
+Create them:
+
+```bash
+fastly kv-store create --name ec_identity_store
+fastly kv-store create --name ec_partner_store
+```
+
+Configure in `trusted-server.toml`:
+
+```toml
+[ec]
+passphrase = "your-hmac-secret"
+ec_store = "ec_identity_store"
+partner_store = "ec_partner_store"
+```
+
+Verify stores exist:
+
+```bash
+fastly kv-store list
+```
+
+Verify stores are linked to your active service version:
+
+```bash
+fastly resource-link list --service-id <service-id> --version <active-version>
+```
+
+If EC sync returns `write_failed`, first check that both stores are present and linked to the active version.
+
 ## Next Steps
 
 - Return to [Getting Started](/guide/getting-started) to continue setup
 - See [Configuration](/guide/configuration) for detailed configuration options
+- See [EC Setup Guide](/guide/ec-setup-guide) for end-to-end EC verification
 - See [Request Signing](/guide/request-signing) for setting up cryptographic signing
