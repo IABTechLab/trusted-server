@@ -15,7 +15,7 @@ pub mod tests {
             password = "pass"
 
             [[handlers]]
-            path = "^/admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 

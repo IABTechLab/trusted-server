@@ -264,8 +264,8 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 | `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
 | `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
 | `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
-| `/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 77   |
-| `/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 78   |
+| `/_ts/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 77   |
+| `/_ts/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 78   |
 | `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 92   |
 | `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 108  |
 
@@ -315,7 +315,7 @@ The integration registry checks if a route matches any registered integration ro
 #### 3. Route Priority
 Routes are matched in this order:
 1. **Exact top-level routes** (`/auction`, `/first-party/proxy`, etc.)
-2. **Admin routes** (`/admin/*`)
+2. **Admin routes** (`/_ts/admin/*`)
 3. **Integration routes** (`/integrations/*`)
 4. **Fallback to publisher origin** (all other paths)
 

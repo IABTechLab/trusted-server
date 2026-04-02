@@ -46,7 +46,7 @@ These decisions are finalized and reflected in this plan:
 2. **Migrate all integrations** including GPT and Google Tag Manager as
    first-class scope.
 3. **Admin key routes must be supported on all adapters** —
-   `/admin/keys/rotate` and `/admin/keys/deactivate` are required on Fastly,
+   `/_ts/admin/keys/rotate` and `/_ts/admin/keys/deactivate` are required on Fastly,
    Axum, and Cloudflare (no disabled-route mode).
 4. **Temporary Fastly compatibility adapter is required** — `compat.rs` lives in
    trusted-server during migration (created in PR 11, deleted in PR 15),
@@ -1354,7 +1354,7 @@ Changes:
 - Local development without Viceroy
 - Mock stores for local KV/config/secret
 - Implement required admin key routes
-  (`/admin/keys/rotate`, `/admin/keys/deactivate`) — core signing logic
+  (`/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`) — core signing logic
   composes the Axum store primitives (local config/secret providers)
 - Add `.env.dev` or local config file for Axum-specific **non-secret**
   settings only (listen address, mock store paths, log level).
@@ -1384,7 +1384,7 @@ Changes:
 - Construct `RuntimeServices` with Cloudflare-backed trait implementations
 - Wrangler configuration
 - Implement required admin key routes
-  (`/admin/keys/rotate`, `/admin/keys/deactivate`) — core signing logic
+  (`/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`) — core signing logic
   composes the Cloudflare store primitives (Workers API bindings)
 - Add `wrangler.toml` with bindings for KV, secrets, and config
 - Add integration tests: route smoke tests, admin key route tests,
@@ -1418,7 +1418,7 @@ Changes:
 
 - Route parity validation for all routes currently in `crates/trusted-server-adapter-fastly/src/main.rs`
   (`/static/tsjs=*`, `/.well-known/trusted-server.json`,
-  `/verify-signature`, `/admin/keys/rotate`, `/admin/keys/deactivate`,
+  `/verify-signature`, `/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`,
   `/auction`, `/first-party/*`, integration routes, and publisher fallback)
 - Cross-adapter behavior parity tests (Fastly vs Axum vs Cloudflare) for:
   response status/body, required headers, cookie behavior, and request-signing

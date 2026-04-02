@@ -85,8 +85,8 @@ handle_publisher_request()     integration_registry.handle_proxy()
 calls ec_context.generate_if_needed()   calls ec_context.generate_if_needed()
 
 EC route handlers (GET /sync, GET /identify, POST /auction,
-POST /api/v1/sync, POST /admin/*) NEVER call generate_if_needed().
-`/identify`, `/auction`, `POST /api/v1/sync`, and `POST /admin/*`
+POST /api/v1/sync, POST /_ts/admin/*) NEVER call generate_if_needed().
+`/identify`, `/auction`, `POST /api/v1/sync`, and `POST /_ts/admin/*`
 use `EcContext` in read-only form. `GET /sync` is the one exception:
 it never bootstraps an EC, but it may replace `ec_context.consent`
 with a locally-decoded fallback consent context for that request only
@@ -421,7 +421,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
           → set_ec_on_response()        (Set-Cookie + X-ts-ec on response)
 ```
 
-EC route handlers (`GET /sync`, `GET /identify`, `POST /api/v1/sync`, `POST /admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
+EC route handlers (`GET /sync`, `GET /identify`, `POST /api/v1/sync`, `POST /_ts/admin/*`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
 
 **Cookie write rule:** `Set-Cookie` is written in exactly two cases: (1) `ec_generated == true` (first-time generation), or (2) `cookie_ec_value.is_some()` (header/cookie mismatch — reconcile cookie to match the header-derived identity). There is no cookie refresh or Max-Age reset on ordinary returning users where cookie already matches. The PRD defers a blanket refresh-on-every-request strategy to a future iteration.
 
@@ -816,7 +816,7 @@ pub async fn handle_batch_sync(
 4. If no match or verification fails → `401 Unauthorized` with no body processing.
 5. If KV lookup fails (store unavailable) → `503 Service Unavailable`.
 
-Key rotation does not require binary redeployment — partners update via `/admin/partners/register`, which handles old API-key index cleanup (§13.1).
+Key rotation does not require binary redeployment — partners update via `/_ts/admin/partners/register`, which handles old API-key index cleanup (§13.1).
 
 ### 9.2.1 API-key rate limiting
 
@@ -951,7 +951,7 @@ fn pull_one_partner(
 
 A pull sync is dispatched for a partner when all of the following are true on a request:
 
-1. The request was routed to an **organic handler** (`handle_publisher_request` or `integration_registry.handle_proxy`). Pull sync never fires on EC route handlers (`/sync`, `/identify`, `/api/v1/sync`, `/admin/*`) or `/auction`. This matches the PRD requirement that pull calls must not happen during the pixel sync flow.
+1. The request was routed to an **organic handler** (`handle_publisher_request` or `integration_registry.handle_proxy`). Pull sync never fires on EC route handlers (`/sync`, `/identify`, `/api/v1/sync`, `/_ts/admin/*`) or `/auction`. This matches the PRD requirement that pull calls must not happen during the pixel sync flow.
 2. A valid EC is present (`ec_context.ec_hash().is_some()`). This includes an EC
    newly generated on the current organic request — pull sync may run immediately
    after first-page EC creation because the response cookie is flushed before the
@@ -1305,17 +1305,17 @@ impl PartnerStore {
 - `pull_enabled_partners()`: if a listed partner ID returns `None` from `get()`, skip it silently. If the fetched record has `pull_sync_enabled == false`, also skip it silently — that is a stale `_pull_enabled` index entry.
 - The `_pull_enabled` list is vulnerable to lost updates under concurrent registrations. This is accepted — partner registration is a low-frequency admin operation (not a hot path). If lost updates become an issue, a CAS-based read-modify-write can be added later.
 
-### 13.2 Admin endpoint (`POST /admin/partners/register`)
+### 13.2 Admin endpoint (`POST /_ts/admin/partners/register`)
 
 **Module:** `ec/admin.rs`
 
-> **Codebase invariant — requires test update:** `Settings::ADMIN_ENDPOINTS` in `settings.rs` lists routes that must be covered by a `[[handlers]]` Basic Auth entry. The existing test at `settings.rs:1504-1530` scans `main.rs` for **every** `/admin/` route string and asserts it appears in `ADMIN_ENDPOINTS`. When `/admin/partners/register` is added to `main.rs`, this test will fail.
+> **Codebase invariant — requires test update:** `Settings::ADMIN_ENDPOINTS` in `settings.rs` lists routes that must be covered by a `[[handlers]]` Basic Auth entry. The existing test at `settings.rs:1504-1530` scans `main.rs` for **every** `/_ts/admin/` route string and asserts it appears in `ADMIN_ENDPOINTS`. When `/_ts/admin/partners/register` is added to `main.rs`, this test will fail.
 >
 > **Required changes:**
 >
-> 1. Do **NOT** add `/admin/partners/register` to `ADMIN_ENDPOINTS` — it uses bearer-token-in-handler auth.
-> 2. Update the admin-route-scan test (`settings.rs:1504-1530`) to maintain an exclusion list of bearer-token-authed admin routes (e.g., `const BEARER_AUTH_ADMIN_ROUTES: &[&str] = &["/admin/partners/register"]`) and skip those when asserting `ADMIN_ENDPOINTS` coverage.
-> 3. Narrow the `[[handlers]]` pattern in `trusted-server.toml` from `"^/admin"` to `"^/admin/keys"` so that `/admin/partners/register` is not intercepted by `enforce_basic_auth()` before reaching its bearer-token handler.
+> 1. Do **NOT** add `/_ts/admin/partners/register` to `ADMIN_ENDPOINTS` — it uses bearer-token-in-handler auth.
+> 2. Update the admin-route-scan test (`settings.rs:1504-1530`) to maintain an exclusion list of bearer-token-authed admin routes (e.g., `const BEARER_AUTH_ADMIN_ROUTES: &[&str] = &["/_ts/admin/partners/register"]`) and skip those when asserting `ADMIN_ENDPOINTS` coverage.
+> 3. Narrow the `[[handlers]]` pattern in `trusted-server.toml` from `"^/_ts/admin"` to `"^/_ts/admin/keys"` so that `/_ts/admin/partners/register` is not intercepted by `enforce_basic_auth()` before reaching its bearer-token handler.
 
 ```rust
 pub async fn handle_register_partner(
@@ -1330,7 +1330,7 @@ Authentication: `Authorization: Bearer <token>` header, validated inside the han
 **Request:**
 
 ```
-POST /admin/partners/register
+POST /_ts/admin/partners/register
 Authorization: Bearer <admin_token>
 Content-Type: application/json
 
@@ -1407,7 +1407,7 @@ pub struct EdgeCookie {
     #[validate(length(min = 1))]
     pub partner_store: String,
 
-    /// SHA-256 hex of the publisher admin token for `POST /admin/partners/register`.
+    /// SHA-256 hex of the publisher admin token for `POST /_ts/admin/partners/register`.
     /// The plaintext token is provided in the `Authorization: Bearer` header;
     /// it is never stored in plaintext.
     #[validate(custom(function = EdgeCookie::validate_sha256_hex))]
@@ -1504,7 +1504,7 @@ The following EC headers must be added to `INTERNAL_HEADERS` in `constants.rs` t
 - `HEADER_X_TS_EIDS` (`x-ts-eids`)
 - `HEADER_X_TS_EC_CONSENT` (`x-ts-ec-consent`)
 - `HEADER_X_TS_EIDS_TRUNCATED` (`x-ts-eids-truncated`)
-- Dynamic `X-ts-<partner_id>` headers — these cannot be registered statically because partners are added at runtime via `/admin/partners/register`. The `INTERNAL_HEADERS` filter **must use prefix stripping** (`x-ts-` prefix match) rather than enumerating partner IDs. A startup snapshot would miss partners registered after deployment. The current filter in `http_util.rs` uses explicit header names — extend it to also strip any header matching the `x-ts-` prefix pattern.
+- Dynamic `X-ts-<partner_id>` headers — these cannot be registered statically because partners are added at runtime via `/_ts/admin/partners/register`. The `INTERNAL_HEADERS` filter **must use prefix stripping** (`x-ts-` prefix match) rather than enumerating partner IDs. A startup snapshot would miss partners registered after deployment. The current filter in `http_util.rs` uses explicit header names — extend it to also strip any header matching the `x-ts-` prefix pattern.
 
 ---
 
@@ -1557,10 +1557,10 @@ New routes added to `route_request()` in `crates/fastly/src/main.rs`:
 (POST, "/api/v1/sync") → handle_batch_sync(settings, &kv, &partner_store, req)
 
 // Partner registration — publisher admin auth enforced in-handler (Bearer token)
-(POST, "/admin/partners/register") → handle_register_partner(settings, &partner_store, req)
+(POST, "/_ts/admin/partners/register") → handle_register_partner(settings, &partner_store, req)
 ```
 
-Route ordering: EC routes are inserted before the fallback `handle_publisher_request()`. The `/admin/partners/register` route uses bearer-token auth in-handler (not `[[handlers]]` Basic Auth). The current `trusted-server.toml` has `path = "^/admin"` which catches **all** `/admin/*` paths via `enforce_basic_auth()` before routing — this would block bearer-token requests to `/admin/partners/register`. **Required change:** narrow the existing `[[handlers]]` pattern from `"^/admin"` to `"^/admin/keys"` so it covers only `/admin/keys/rotate` and `/admin/keys/deactivate` (the routes in `Settings::ADMIN_ENDPOINTS`). `/admin/partners/register` then passes through `enforce_basic_auth()` unchallenged and reaches the bearer-token handler.
+Route ordering: EC routes are inserted before the fallback `handle_publisher_request()`. The `/_ts/admin/partners/register` route uses bearer-token auth in-handler (not `[[handlers]]` Basic Auth). The current `trusted-server.toml` has `path = "^/_ts/admin"` which catches **all** `/_ts/admin/*` paths via `enforce_basic_auth()` before routing — this would block bearer-token requests to `/_ts/admin/partners/register`. **Required change:** narrow the existing `[[handlers]]` pattern from `"^/_ts/admin"` to `"^/_ts/admin/keys"` so it covers only `/_ts/admin/keys/rotate` and `/_ts/admin/keys/deactivate` (the routes in `Settings::ADMIN_ENDPOINTS`). `/_ts/admin/partners/register` then passes through `enforce_basic_auth()` unchallenged and reaches the bearer-token handler.
 
 ### 17.1 EC integration in `main.rs`
 
@@ -1616,7 +1616,7 @@ async fn route_request(...) -> Result<(), Error> {
         (GET, "/identify")          => handle_identify(settings, &kv, &partner_store, &req, &ec_context).await,
         (OPTIONS, "/identify")      => cors_preflight_identify(settings, &req),
         (POST, "/api/v1/sync")      => handle_batch_sync(settings, &kv, &partner_store, req).await,
-        (POST, "/admin/partners/register") => handle_register_partner(settings, &partner_store, req).await,
+        (POST, "/_ts/admin/partners/register") => handle_register_partner(settings, &partner_store, req).await,
 
         // /auction — EC-read-only; never generates EC.
         // NOTE: handle_auction signature changes from (settings, orchestrator, req) to
@@ -1647,7 +1647,7 @@ async fn route_request(...) -> Result<(), Error> {
     response.send_to_client();
 
     // Background pull sync — organic routes only (§10.2). Never fires on /sync,
-    // /identify, /auction, /api/v1/sync, or /admin/* routes.
+    // /identify, /auction, /api/v1/sync, or /_ts/admin/* routes.
     // Fires outbound HTTP calls via send_async(), blocks on PendingRequest::wait().
     if is_organic {
         if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
@@ -1712,7 +1712,7 @@ Suggested order to minimize risk and allow incremental testing. Each step should
 | 2    | `ec/finalize.rs`                                          | `ec_finalize_response()` (cookie write, deletion, tombstone, last_seen)                        |
 | 3    | `ec/cookie.rs`                                            | Cookie creation, deletion, response header                                                     |
 | 4    | `ec/kv.rs`                                                | `KvIdentityGraph` CRUD with CAS                                                                |
-| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/admin/partners/register`                                                     |
+| 5    | `ec/partner.rs` + `ec/admin.rs`                           | `PartnerStore`, `/_ts/admin/partners/register`                                                     |
 | 6    | EC middleware in `main.rs`, `publisher.rs`, `registry.rs` | `EcContext::read_from_request()` pre-routing, `generate_if_needed()`, `ec_finalize_response()` |
 | 7    | `ec/sync_pixel.rs`                                        | `GET /sync` handler + route                                                                    |
 | 8    | `ec/identify.rs`                                          | `GET /identify` handler + route                                                                |
@@ -1892,7 +1892,7 @@ that operators use to onboard ID sync partners.
   records so stale `_pull_enabled` index entries do not dispatch disabled partners.
 - API key stored as SHA-256 hex; plaintext never written to KV.
 - `verify_api_key()` uses constant-time comparison.
-- `POST /admin/partners/register` validates `Authorization: Bearer <token>` inside
+- `POST /_ts/admin/partners/register` validates `Authorization: Bearer <token>` inside
   the handler against `settings.ec.admin_token_hash` (constant-time SHA-256 comparison).
   Returns `401` if missing or invalid — before any request body is read.
 - Admin endpoint validates: `pull_sync_url` hostname must be in
@@ -1900,13 +1900,13 @@ that operators use to onboard ID sync partners.
 - Returns `201 Created` on new partner or `200 OK` on update, with an explicit
   response DTO (see §13.2 step 6 — do NOT serialize full `PartnerRecord`).
   Returns `400` on validation failure; `503` on KV failure.
-- `/admin/partners/register` is **NOT** added to `Settings::ADMIN_ENDPOINTS` —
+- `/_ts/admin/partners/register` is **NOT** added to `Settings::ADMIN_ENDPOINTS` —
   it uses bearer-token-in-handler auth, not `[[handlers]]` Basic Auth.
 - The admin-route-scan test (`settings.rs:1504-1530`) must be updated to exclude
   bearer-token-authed routes from its `ADMIN_ENDPOINTS` assertion. Add an exclusion
   list (see §13.2 codebase invariant note).
 - The `[[handlers]]` pattern in `trusted-server.toml` must be narrowed from
-  `"^/admin"` to `"^/admin/keys"` (see §13.2).
+  `"^/_ts/admin"` to `"^/_ts/admin/keys"` (see §13.2).
 - Unit tests cover API key hash verification and record serialization.
 
 **Spec ref:** §13
@@ -1926,7 +1926,7 @@ Wire `EcContext` into the request pipeline following the two-phase model
 - `EcContext::read_from_request()` is called before the route match on every
   request, passed the existing `geo_info` (no duplicate geo header parsing).
 - EC route handlers receive `ec_context` without EC generation. `/identify`,
-  `/auction`, `/api/v1/sync`, and `/admin/*` use read-only `&EcContext` and
+  `/auction`, `/api/v1/sync`, and `/_ts/admin/*` use read-only `&EcContext` and
   never mutate it. **Exception:** `/sync` receives `&mut EcContext`; when the
   consent query-param fallback applies (`ec_context.consent.is_empty()`), it
   assigns the locally-decoded consent into `ec_context.consent` so that both
@@ -2100,7 +2100,7 @@ runtime). Only fires on organic routes (§10.2).
 - Dispatch runs after `send_to_client()` — does not add latency to the
   user-facing response. Uses `send_async()` + `PendingRequest::wait()` (blocking).
 - Only fires on organic routes (`handle_publisher_request`, `handle_proxy`) —
-  never on `/sync`, `/identify`, `/auction`, `/api/v1/sync`, or `/admin/*`.
+  never on `/sync`, `/identify`, `/auction`, `/api/v1/sync`, or `/_ts/admin/*`.
 - Unit tests cover trigger conditions, null/404 no-op, domain allowlist check,
   dispatch limit enforcement.
 

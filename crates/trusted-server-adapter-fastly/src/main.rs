@@ -208,9 +208,11 @@ async fn route_request(
 
         // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") => (handle_rotate_key(settings, req), false),
-        (Method::POST, "/admin/keys/deactivate") => (handle_deactivate_key(settings, req), false),
-        (Method::POST, "/admin/partners/register") => (
+        (Method::POST, "/_ts/admin/keys/rotate") => (handle_rotate_key(settings, req), false),
+        (Method::POST, "/_ts/admin/keys/deactivate") => {
+            (handle_deactivate_key(settings, req), false)
+        }
+        (Method::POST, "/_ts/admin/partners/register") => (
             require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
             false,
         ),
