@@ -8,6 +8,8 @@ Edge Cookies (EC) are privacy-safe identifiers generated on a first site visit u
 
 Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
+For full operational onboarding (partner registration, pixel sync, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
+
 ## How They Work
 
 ### HMAC-Based Generation
@@ -35,8 +37,17 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 2. Rotate secret keys periodically
 3. Monitor ID collision rates
 
+## Runtime Behavior Notes
+
+- Returning requests with consent and an existing `ts-ec` receive both:
+  - `x-ts-ec` response header
+  - refreshed `Set-Cookie: ts-ec=...`
+- `/identify` is read-only and returns identity enrichment (`uids` and `eids`)
+- `/sync` and `/_ts/api/v1/sync` write mappings into the EC identity graph
+
 ## Next Steps
 
+- Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - Learn about [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)
 - Learn about [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams
