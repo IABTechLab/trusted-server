@@ -1941,7 +1941,7 @@ mod tests {
             ProxyRequestConfig {
                 target_url: "https://example.com/resource",
                 follow_redirects: false,
-                forward_synthetic_id: false,
+                forward_ec_id: false,
                 body: None,
                 headers: Vec::new(),
                 copy_request_headers: false,

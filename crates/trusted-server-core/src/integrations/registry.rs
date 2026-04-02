@@ -1309,24 +1309,24 @@ mod tests {
     }
 
     #[test]
-    fn handle_proxy_replaces_invalid_request_header_with_matching_response_cookie() {
+    fn handle_proxy_replaces_invalid_ec_request_header_with_matching_response_cookie() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             (
-                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
-                "synthetic_id_test",
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
             ),
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
-        req.set_header(HEADER_X_SYNTHETIC_ID, "evil;injected");
+        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
+        req.set_header(HEADER_X_TS_EC, "evil;injected");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             &settings,
             &noop_services(),
             req,
@@ -1335,8 +1335,8 @@ mod tests {
 
         let response = result.expect("handler should succeed");
         let response_header = response
-            .get_header(HEADER_X_SYNTHETIC_ID)
-            .expect("response should have x-synthetic-id header")
+            .get_header(HEADER_X_TS_EC)
+            .expect("response should have x-ts-ec header")
             .to_str()
             .expect("header should be valid UTF-8")
             .to_string();
@@ -1346,9 +1346,9 @@ mod tests {
             .to_str()
             .expect("header should be valid UTF-8");
         let cookie_value = cookie_header
-            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
             .and_then(|s| s.split_once(';').map(|(value, _)| value))
-            .expect("should contain the synthetic_id cookie value");
+            .expect("should contain the ts-ec cookie value");
 
         assert_ne!(
             response_header, "evil;injected",
@@ -1356,7 +1356,7 @@ mod tests {
         );
         assert_eq!(
             response_header, cookie_value,
-            "response header and cookie should carry the same effective synthetic ID"
+            "response header and cookie should carry the same effective EC ID"
         );
     }
 
