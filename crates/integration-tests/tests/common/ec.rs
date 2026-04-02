@@ -251,23 +251,23 @@ pub fn identify(client: &EcTestClient) -> TestResult<Response> {
 // Batch sync
 // ---------------------------------------------------------------------------
 
-/// Calls `POST /api/v1/sync` with bearer auth and the given mappings.
+/// Calls `POST /_ts/api/v1/sync` with bearer auth and the given mappings.
 pub fn batch_sync(
     client: &EcTestClient,
     api_key: &str,
     mappings: &[BatchMapping],
 ) -> TestResult<Response> {
     let body = serde_json::json!({ "mappings": mappings_to_json(mappings) });
-    client.post_json_with_bearer("/api/v1/sync", &body, api_key)
+    client.post_json_with_bearer("/_ts/api/v1/sync", &body, api_key)
 }
 
-/// Calls `POST /api/v1/sync` without any auth header.
+/// Calls `POST /_ts/api/v1/sync` without any auth header.
 pub fn batch_sync_no_auth(
     client: &EcTestClient,
     mappings: &[BatchMapping],
 ) -> TestResult<Response> {
     let body = serde_json::json!({ "mappings": mappings_to_json(mappings) });
-    client.post_json("/api/v1/sync", &body)
+    client.post_json("/_ts/api/v1/sync", &body)
 }
 
 /// Single mapping in a batch sync request.
