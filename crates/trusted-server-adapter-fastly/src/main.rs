@@ -30,6 +30,7 @@ use trusted_server_core::settings_data::get_settings;
 mod error;
 mod management_api;
 mod platform;
+mod logging;
 
 use crate::error::to_error_response;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
