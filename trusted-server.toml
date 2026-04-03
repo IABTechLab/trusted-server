@@ -50,6 +50,13 @@ client_side_bidders = ["rubicon"]
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
 # and includes it in the request. The server maps zone → s2s placementId here.
+[integrations.prebid.bidder_param_overrides]
+# Static per-bidder params merged into every outgoing PBS request.
+# Example:
+# [integrations.prebid.bidder_param_overrides.criteo]
+# networkId = 112141
+# pubid = "112141"
+
 [integrations.prebid.bid_param_zone_overrides.kargo]
 # header = {placementId = "_abc"}
 
@@ -189,5 +196,4 @@ timeout_ms = 1000
 # query parameter name. Arrays are joined with commas.
 [integrations.adserver_mock.context_query_params]
 permutive_segments = "permutive"
-
 

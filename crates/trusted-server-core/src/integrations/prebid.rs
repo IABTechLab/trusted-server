@@ -111,6 +111,26 @@ pub struct PrebidIntegrationConfig {
     /// ```
     #[serde(default)]
     pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
+    /// Static per-bidder parameter overrides merged into every outgoing
+    /// `OpenRTB` imp `ext.prebid.bidder.{bidder}` object before zone-specific
+    /// overrides are applied.
+    ///
+    /// These are useful when server-side bidder IDs should be enforced from
+    /// Trusted Server regardless of the page's client-side Prebid config.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bidder_param_overrides.criteo]
+    /// networkId = 112141
+    /// pubid = "112141"
+    /// ```
+    ///
+    /// Example via environment variable:
+    /// ```text
+    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDER_PARAM_OVERRIDES='{"criteo":{"networkId":112141,"pubid":"112141"}}'
+    /// ```
+    #[serde(default)]
+    pub bidder_param_overrides: HashMap<String, Json>,
     /// How consent signals are forwarded to Prebid Server.
     ///
     /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
@@ -418,6 +438,18 @@ fn expand_trusted_server_bidders(
         })
         .collect()
 }
+
+fn merge_bidder_param_object(params: &mut Json, override_obj: &serde_json::Map<String, Json>) {
+    match params {
+        Json::Object(base) => {
+            base.extend(override_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        _ => {
+            *params = Json::Object(override_obj.clone());
+        }
+    }
+}
+
 /// Copies browser headers to the outgoing Prebid Server request.
 ///
 /// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
@@ -540,6 +572,21 @@ impl PrebidAuctionProvider {
                     }
                 }
 
+                // Apply static bidder param overrides before the more specific
+                // zone-based overrides below.
+                for (name, params) in &mut bidder {
+                    if let Some(Json::Object(ovr)) =
+                        self.config.bidder_param_overrides.get(name.as_str())
+                    {
+                        log::debug!(
+                            "prebid: bidder override for '{}': keys {:?}",
+                            name,
+                            ovr.keys().collect::<Vec<_>>()
+                        );
+                        merge_bidder_param_object(params, ovr);
+                    }
+                }
+
                 // Apply zone-specific bid param overrides when configured.
                 for (name, params) in &mut bidder {
                     let zone_override = zone.and_then(|z| {
@@ -550,15 +597,13 @@ impl PrebidAuctionProvider {
                     });
 
                     if let Some(Json::Object(ovr)) = zone_override {
-                        if let Json::Object(base) = params {
-                            log::debug!(
-                                "prebid: zone override for '{}' zone '{}': keys {:?}",
-                                name,
-                                zone.unwrap_or(""),
-                                ovr.keys().collect::<Vec<_>>()
-                            );
-                            base.extend(ovr.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        }
+                        log::debug!(
+                            "prebid: zone override for '{}' zone '{}': keys {:?}",
+                            name,
+                            zone.unwrap_or(""),
+                            ovr.keys().collect::<Vec<_>>()
+                        );
+                        merge_bidder_param_object(params, ovr);
                     }
                 }
 
@@ -1245,6 +1290,7 @@ mod tests {
             script_patterns: default_script_patterns(),
             client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::new(),
+            bidder_param_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
     }
@@ -2686,6 +2732,55 @@ server_url = "https://prebid.example"
     fn get_prebid_ext(req: &OpenRtbRequest) -> PrebidExt {
         let ext = req.ext.as_ref().expect("should have request ext");
         serde_json::from_value(ext["prebid"].clone()).expect("should deserialise ext.prebid")
+    }
+
+    // ========================================================================
+    // bidder_param_overrides tests
+    // ========================================================================
+
+    #[test]
+    fn bidder_param_override_replaces_and_merges_client_params() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[integrations.prebid.bidder_param_overrides.criteo]
+networkId = 112141
+pubid = "112141"
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "criteo": {
+                    "networkId": 11048,
+                    "pubid": "5254_4YG1PB",
+                    "keep": "present"
+                }
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["criteo"]["networkId"], 112141,
+            "override should replace the client-side networkId"
+        );
+        assert_eq!(
+            params["criteo"]["pubid"], "112141",
+            "override should replace the client-side pubid"
+        );
+        assert_eq!(
+            params["criteo"]["keep"], "present",
+            "override should preserve unrelated bidder params"
+        );
     }
 
     // ========================================================================

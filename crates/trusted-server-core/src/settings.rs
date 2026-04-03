@@ -1032,6 +1032,56 @@ mod tests {
     }
 
     #[test]
+    fn test_prebid_bidder_param_overrides_override_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let env_key = format!(
+            "{}{}INTEGRATIONS{}PREBID{}BIDDER_PARAM_OVERRIDES",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(
+                    env_key,
+                    Some(r#"{"criteo":{"networkId":112141,"pubid":"112141"}}"#),
+                    || {
+                        let settings = Settings::from_toml_and_env(&toml_str)
+                            .expect("Settings should parse with bidder param override env");
+                        let cfg = settings
+                            .integration_config::<PrebidIntegrationConfig>("prebid")
+                            .expect("Prebid config query should succeed")
+                            .expect("Prebid config should exist with env override");
+                        let cfg_json =
+                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
+
+                        assert_eq!(
+                            cfg_json["bidder_param_overrides"]["criteo"]["networkId"],
+                            json!(112141),
+                            "should deserialize networkId override from env JSON"
+                        );
+                        assert_eq!(
+                            cfg_json["bidder_param_overrides"]["criteo"]["pubid"],
+                            json!("112141"),
+                            "should deserialize pubid override from env JSON"
+                        );
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_handlers_override_with_env() {
         let toml_str = crate_test_settings_str();
 
