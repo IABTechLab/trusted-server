@@ -50,7 +50,7 @@ client_side_bidders = ["rubicon"]
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
 # and includes it in the request. The server maps zone → s2s placementId here.
-[integrations.prebid.bidder_param_overrides]
+# [integrations.prebid.bidder_param_overrides]
 # Static per-bidder params merged into every outgoing PBS request.
 # Example:
 # [integrations.prebid.bidder_param_overrides.criteo]
