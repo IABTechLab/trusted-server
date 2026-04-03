@@ -85,6 +85,32 @@ fn main(req: Request) -> Result<Response, Error> {
     ))
 }
 
+fn build_ja4_debug_response(req: &Request) -> Response {
+    let ja4 = req.get_tls_ja4().unwrap_or("unavailable");
+    let h2 = req.get_client_h2_fingerprint().unwrap_or("unavailable");
+    let cipher = req.get_tls_cipher_openssl_name().unwrap_or("unavailable");
+    let tls_version = req.get_tls_protocol().unwrap_or("unavailable");
+    let ua = req.get_header_str("user-agent").unwrap_or("none");
+    let ch_mobile = req.get_header_str("sec-ch-ua-mobile").unwrap_or("not sent");
+    let ch_platform = req
+        .get_header_str("sec-ch-ua-platform")
+        .unwrap_or("not sent");
+
+    let body = format!(
+        "ja4:         {ja4}\n\
+         h2_fp:       {h2}\n\
+         cipher:      {cipher}\n\
+         tls_version: {tls_version}\n\
+         user-agent:  {ua}\n\
+         ch-mobile:   {ch_mobile}\n\
+         ch-platform: {ch_platform}\n"
+    );
+
+    Response::from_status(fastly::http::StatusCode::OK)
+        .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
+        .with_body(body)
+}
+
 async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
@@ -150,6 +176,9 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
+
+        // Temporary JA4/TLS debug endpoint for browser fingerprint inspection.
+        (Method::GET, "/_ts/debug/ja4") => Ok(build_ja4_debug_response(&req)),
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
@@ -246,4 +275,59 @@ fn init_logger() {
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
         .expect("should initialize logger");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::mime;
+
+    #[test]
+    fn ja4_debug_response_uses_plain_text_and_fallback_values() {
+        let req = Request::get("https://example.com/_ts/debug/ja4");
+
+        let mut response = build_ja4_debug_response(&req);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should return 200 OK"
+        );
+        assert_eq!(
+            response.get_content_type(),
+            Some(mime::TEXT_PLAIN_UTF_8),
+            "should return plain text content"
+        );
+
+        let body = response.take_body_str();
+
+        assert!(
+            body.contains("ja4:         unavailable"),
+            "should include JA4 fallback"
+        );
+        assert!(
+            body.contains("h2_fp:       unavailable"),
+            "should include H2 fingerprint fallback"
+        );
+        assert!(
+            body.contains("cipher:      unavailable"),
+            "should include cipher fallback"
+        );
+        assert!(
+            body.contains("tls_version: unavailable"),
+            "should include TLS version fallback"
+        );
+        assert!(
+            body.contains("user-agent:  none"),
+            "should include user-agent fallback"
+        );
+        assert!(
+            body.contains("ch-mobile:   not sent"),
+            "should include sec-ch-ua-mobile fallback"
+        );
+        assert!(
+            body.contains("ch-platform: not sent"),
+            "should include sec-ch-ua-platform fallback"
+        );
+    }
 }
