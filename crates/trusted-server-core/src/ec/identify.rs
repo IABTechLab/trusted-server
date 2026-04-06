@@ -60,10 +60,12 @@ pub fn handle_identify(
 
     let mut degraded = false;
     let mut resolved = Vec::new();
+    let mut cluster_size: Option<u32> = None;
 
-    if let Some(ec_id) = ec_context.ec_value() {
-        match kv.get(ec_id) {
-            Ok(Some((entry, _generation))) => match resolve_partner_ids(partner_store, &entry) {
+    match kv.get(ec_id) {
+        Ok(Some((entry, generation))) => {
+            // Resolve partner IDs.
+            match resolve_partner_ids(partner_store, &entry) {
                 Ok(values) => {
                     resolved = values;
                 }
@@ -71,12 +73,23 @@ pub fn handle_identify(
                     log::warn!("Identify partner resolution failed: {err:?}");
                     degraded = true;
                 }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!("Identify KV read failed for EC ID '{ec_id}': {err:?}");
-                degraded = true;
             }
+
+            // Evaluate cluster size (lazy, TTL-gated).
+            match kv.evaluate_cluster(ec_id, &entry, generation, settings.ec.cluster_recheck_secs) {
+                Ok(size) => {
+                    cluster_size = size;
+                }
+                Err(err) => {
+                    log::warn!("Cluster evaluation failed for '{ec_id}': {err:?}");
+                    // Non-fatal — cluster_size stays None, response is still useful.
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            log::warn!("Identify KV read failed for EC ID '{ec_id}': {err:?}");
+            degraded = true;
         }
     }
 
@@ -92,6 +105,7 @@ pub fn handle_identify(
         degraded,
         uids,
         eids,
+        cluster_size,
     };
 
     let mut response = json_response(StatusCode::OK, &body)?;
@@ -115,6 +129,11 @@ pub fn handle_identify(
     response.set_header(HEADER_X_TS_EIDS, encoded_eids);
     if truncated {
         response.set_header(HEADER_X_TS_EIDS_TRUNCATED, "true");
+    }
+
+    if let Some(size) = cluster_size {
+        response.set_header("x-ts-cluster-size", size.to_string());
+        expose_headers.push("x-ts-cluster-size".to_owned());
     }
 
     if let CorsDecision::Allowed(origin) = cors {
@@ -158,6 +177,9 @@ struct IdentifyResponse {
     degraded: bool,
     uids: HashMap<String, String>,
     eids: Vec<Eid>,
+    /// Network cluster size. `None` when not yet evaluated or unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_size: Option<u32>,
 }
 
 fn json_response<T: serde::Serialize>(
@@ -390,6 +412,10 @@ mod tests {
             body["eids"],
             serde_json::json!([]),
             "should emit empty eids"
+        );
+        assert!(
+            body.get("cluster_size").is_none(),
+            "cluster_size should be omitted when KV read fails"
         );
     }
 
