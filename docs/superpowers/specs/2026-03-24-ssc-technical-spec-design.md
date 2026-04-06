@@ -161,9 +161,12 @@ pub fn generate_ec(passphrase: &str, ip: IpAddr) -> Result<String, Report<Truste
 ///   not choose between them.
 pub fn normalize_ip(ip: IpAddr) -> String;
 
-/// Extracts the stable 64-character hex prefix from a full EC value.
+/// Extracts the stable 64-character hex prefix from a full EC ID.
 ///
-/// The prefix is used as the KV store key. The `.suffix` is discarded.
+/// This is primarily used for logging and debugging. Both the EC identity
+/// KV store and the consent KV store use the **full EC ID** (including the
+/// `.suffix`) as the key, not just this prefix. The suffix provides uniqueness
+/// for users behind the same NAT/proxy infrastructure.
 ///
 /// Returns `None` if the value is not in `{64-hex}.{6-alnum}` format.
 pub fn ec_hash(ec_value: &str) -> Option<&str>;
@@ -179,7 +182,7 @@ pub fn ec_hash(ec_value: &str) -> Option<&str>;
 
 **Output format:** `{64-char lowercase hex}.{6-char random alphanumeric}`
 
-The random suffix is generated with `fastly::rand` (same approach as SyntheticID). Once set in a cookie the full value is preserved; only the hash prefix is used as the KV key.
+The random suffix is generated with `fastly::rand` (same approach as SyntheticID). Once set in a cookie, the full value (hash + suffix) is preserved and used as the KV store key for both the EC identity graph and the consent store. The suffix provides uniqueness for users behind the same NAT/proxy who share the same IP-derived hash.
 
 **IPv6 /64 prefix:** Split on `:`, take first 4 groups, join with `:`. Example:
 `2001:db8:85a3:0000:0000:8a2e:0370:7334` → `2001:db8:85a3:0`.
@@ -224,14 +227,14 @@ Generation (step 3 above becoming a new EC) happens only inside organic handlers
 /// one EC route that may replace `consent` with a locally-decoded fallback for
 /// the remainder of that request only.
 pub struct EcContext {
-    /// Full EC value (`hash.suffix`), if present on request or generated this request.
+    /// Full EC ID (`{64-hex}.{6-alnum}`), if present on request or generated this request.
     pub ec_value: Option<String>,
     /// Whether the `ts-ec` **cookie** was present on the inbound request.
     /// This is the only field that gates consent-withdrawal cookie deletion —
     /// the PRD's delete branch is conditioned on the cookie, not on X-ts-ec header.
     pub cookie_was_present: bool,
     /// The cookie's EC value, if different from `ec_value` (header won priority).
-    /// Used only for withdrawal: tombstone targets the cookie-derived hash to match
+    /// Used only for withdrawal: tombstone targets the cookie-derived EC ID to match
     /// existing SyntheticID revocation behavior (`publisher.rs:515`).
     /// `None` when cookie absent or cookie == header value.
     pub cookie_ec_value: Option<String>,
@@ -256,13 +259,13 @@ impl EcContext {
     /// Does not write to the **EC identity KV store**. Called pre-routing, like
     /// `GeoInfo::from_request()` in the current `main.rs`.
     ///
-    /// Calls `build_consent_context()` with the EC hash (when present) passed
+    /// Calls `build_consent_context()` with the full EC ID (when present) passed
     /// via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id`
     /// in PR #479).
     ///
-    /// When an EC hash is available (returning user), this enables the consent
+    /// When an EC ID is available (returning user), this enables the consent
     /// pipeline's KV fallback (read) and KV persistence (write to the
-    /// **consent** KV store). On a first visit (no EC cookie), `ec_hash` is
+    /// **consent** KV store). On a first visit (no EC cookie), `ec_id` is
     /// `None` and no consent KV interaction occurs; consent is evaluated purely
     /// from request cookies/headers. This means consent is not persisted to
     /// consent KV until the user's second request. See §6.1.1.
@@ -293,13 +296,16 @@ impl EcContext {
     );
 
     /// Returns the stable 64-char hex prefix, or `None` if no EC.
+    /// 
+    /// Note: This extracts only the prefix for display/logging purposes. All KV
+    /// operations use the full EC ID (via `ec_value()`), not just this hash.
     pub fn ec_hash(&self) -> Option<&str>;
 }
 ```
 
 **`ec_finalize_response()` behavior** (signature: `ec_finalize_response(settings, geo, ec_context, kv, response)`):
 
-1. If `!allows_ec_creation(&consent) && cookie_was_present`: call `clear_ec_on_response()` (deletes cookie **and** strips any handler-built `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`, and `X-ts-<partner_id>` response headers) and write withdrawal tombstones for each valid known EC hash (cookie-derived and, when different, header-derived). This runs on **every route** — consent withdrawal is always real-time enforced. Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser. When the cookie is malformed and there is no valid header-derived hash, no tombstone is written.
+1. If `!allows_ec_creation(&consent) && cookie_was_present`: call `clear_ec_on_response()` (deletes cookie **and** strips any handler-built `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`, and `X-ts-<partner_id>` response headers) and write withdrawal tombstones for each valid known EC ID (cookie-derived and, when different, header-derived). This runs on **every route** — consent withdrawal is always real-time enforced. Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser. When the cookie is malformed and there is no valid header-derived EC ID, no tombstone is written.
 2. If `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`: call `kv.update_last_seen()` (debounced). If `cookie_ec_value.is_some()`, also call `set_ec_on_response()` to reconcile the browser cookie to the authoritative header-derived EC.
 3. If `ec_generated == true`: call `set_ec_on_response()` — sets `Set-Cookie` and `X-ts-ec`. KV create already happened inside `generate_if_needed()`; `ec_finalize_response()` does NOT write KV beyond tombstones and `last_seen`.
 4. Handler-built response headers (`X-ts-ec`, `X-ts-eids` set directly by `/identify`) are preserved on non-withdrawal paths only.
@@ -353,7 +359,7 @@ pub fn clear_ec_on_response(response: &mut Response, cookie_domain: &str);
 
 ### 5.3 Response header
 
-`X-ts-ec: {ec_hash.suffix}` is set by `set_ec_on_response()` when an EC is available. In current behavior, `ec_finalize_response()` calls `set_ec_on_response()` for returning users (`ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`) and for newly generated ECs (`ec_generated == true`). `/identify` and `/auction` also set EC-related headers on their response paths.
+`X-ts-ec: {64-hex}.{6-alnum}` is set by `set_ec_on_response()` when an EC is available. In current behavior, `ec_finalize_response()` calls `set_ec_on_response()` for returning users (`ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`) and for newly generated ECs (`ec_generated == true`). `/identify` and `/auction` also set EC-related headers on their response paths.
 
 This header is added to `INTERNAL_HEADERS` in `constants.rs` so it is stripped before proxying to downstream backends, consistent with existing `X-ts-*` handling.
 
@@ -371,11 +377,11 @@ EcContext::read_from_request()
   If neither valid: ec_value = None
   ec_was_present = ec_value.is_some()
   cookie_was_present = ts-ec cookie raw key exists (regardless of validity)
-  ec_hash = ec_value.as_deref().and_then(ec_hash)   // None on first visit or malformed
-  build_consent_context(jar, req, config, geo, ec_hash) → consent: ConsentContext
-  // ec_hash is the identity key for consent KV (renamed from synthetic_id in PR #479).
-  // When ec_hash is Some: consent KV fallback read + consent KV write (to consent store, not EC store).
-  // When ec_hash is None (first visit): no consent KV interaction — cookies/headers only.
+  ec_id = ec_value.as_deref()   // None on first visit or malformed
+  build_consent_context(jar, req, config, geo, ec_id) → consent: ConsentContext
+  // ec_id (full value including suffix) is the identity key for consent KV (renamed from synthetic_id in PR #479).
+  // When ec_id is Some: consent KV fallback read + consent KV write (to consent store, not EC store).
+  // When ec_id is None (first visit): no consent KV interaction — cookies/headers only.
   ec_generated = false
 ```
 
@@ -389,7 +395,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
           → generate_ec(passphrase, ip)
           → ec_value = Some(new_ec)
           → ec_generated = true
-          → kv.create_or_revive(ec_hash, &entry)   (best-effort, log warn if fails)
+          → kv.create_or_revive(new_ec, &entry)   (best-effort, log warn if fails)
             // create_or_revive overwrites a tombstone (ok=false) on re-consent
             // no-ops if a live entry (ok=true) already exists
 ```
@@ -399,18 +405,18 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
 ```
   ├── !allows_ec_creation(&consent) && cookie_was_present?
   │       → clear_ec_on_response()             (delete cookie + strip ALL EC headers from response)
-  │       → // Tombstone all known valid EC hashes. May be 0, 1, or 2 hashes.
-  │         if let Some(cookie_hash) = cookie_ec_value.and_then(|v| ec_hash(&v)):
-  │           kv.write_withdrawal_tombstone(cookie_hash)       // cookie-derived hash
-  │         if let Some(header_hash) = ec_value.and_then(|v| ec_hash(&v)):
-  │           if Some(header_hash) != cookie_hash:
-  │             kv.write_withdrawal_tombstone(header_hash)     // header-derived hash (if different)
+  │       → // Tombstone all known valid EC IDs. May be 0, 1, or 2 IDs.
+  │         if let Some(cookie_ec_id) = cookie_ec_value.filter(|v| is_valid_ec_id(v)):
+  │           kv.write_withdrawal_tombstone(cookie_ec_id)       // cookie-derived EC ID
+  │         if let Some(header_ec_id) = ec_value.filter(|v| is_valid_ec_id(v)):
+  │           if Some(header_ec_id) != cookie_ec_id:
+  │             kv.write_withdrawal_tombstone(header_ec_id)     // header-derived EC ID (if different)
   │         // When cookie is malformed and no valid header exists: no tombstone written.
   │         // Cookie deletion is still the authoritative enforcement mechanism.
   │         // Tombstone fails? log error, do NOT block — no retry possible on browser path.
   │
   ├── ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)?
-  │       → kv.update_last_seen(ec_hash, now())   (returning user — debounced at 300s)
+  │       → kv.update_last_seen(ec_id, now())   (returning user — debounced at 300s)
   │       → set_ec_on_response()   (Set-Cookie + X-ts-ec refresh on returning user)
   │
   └── ec_generated == true?
@@ -448,14 +454,14 @@ the consent module; EC only consumes that existing decision.
 
 **Consent pipeline integration:**
 
-`EcContext::read_from_request()` calls `build_consent_context()` with the EC hash as the identity key, passed via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id` in PR #479). The consent pipeline's KV persistence and fallback behavior works with EC hashes:
+`EcContext::read_from_request()` calls `build_consent_context()` with the full EC ID as the identity key, passed via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id` in PR #479). The consent pipeline's KV persistence and fallback behavior works with full EC IDs:
 
-- **Returning user** (EC cookie present → `ec_hash` is `Some`): consent KV fallback read is available when consent cookies are absent; consent KV write persists cookie-sourced consent for future requests. Note: `build_consent_context()` calls `try_kv_write()` internally, so phase 1 writes to the **consent** KV store (not the EC identity store).
-- **First visit** (no EC cookie → `ec_hash` is `None`): no consent KV interaction. Consent is evaluated purely from request cookies/headers. The gap: consent is not persisted to consent KV on the first request. This is accepted — in regulated jurisdictions (GDPR, US state), consent cookies/headers must be present for `allows_ec_creation()` to return `true`, so there is always a signal to persist on the next request. In non-regulated jurisdictions, `allows_ec_creation()` returns `true` without consent signals, so there is nothing to persist anyway. Consent KV persistence begins on the second request when the EC cookie is present.
+- **Returning user** (EC cookie present → `ec_id` is `Some`): consent KV fallback read is available when consent cookies are absent; consent KV write persists cookie-sourced consent for future requests. Note: `build_consent_context()` calls `try_kv_write()` internally, so phase 1 writes to the **consent** KV store (not the EC identity store).
+- **First visit** (no EC cookie → `ec_id` is `None`): no consent KV interaction. Consent is evaluated purely from request cookies/headers. The gap: consent is not persisted to consent KV on the first request. This is accepted — in regulated jurisdictions (GDPR, US state), consent cookies/headers must be present for `allows_ec_creation()` to return `true`, so there is always a signal to persist on the next request. In non-regulated jurisdictions, `allows_ec_creation()` returns `true` without consent signals, so there is nothing to persist anyway. Consent KV persistence begins on the second request when the EC cookie is present.
 
-**Consent store keying:** Old consent KV entries under SyntheticID keys become orphaned after PR #479 ships. New entries are keyed by EC hash. Orphaned entries expire via TTL — no explicit migration is performed.
+**Consent store keying:** Old consent KV entries under SyntheticID keys become orphaned after PR #479 ships. New entries are keyed by full EC ID (including suffix). Orphaned entries expire via TTL — no explicit migration is performed.
 
-**Rollout impact:** At cutover, returning users who relied on consent KV fallback (consent cookies absent, consent loaded from KV under SyntheticID key) will lose that fallback until a new EC-keyed consent entry is written on a subsequent request where consent cookies are present. This is a one-time window: once the EC cookie is set and a request with consent cookies arrives, the consent KV entry is written under the EC hash and fallback works again. The window duration depends on how quickly users return with consent cookies. This is accepted — consent cookies are the primary signal; KV fallback is a secondary mechanism for when cookies are blocked or absent.
+**Rollout impact:** At cutover, returning users who relied on consent KV fallback (consent cookies absent, consent loaded from KV under SyntheticID key) will lose that fallback until a new EC-keyed consent entry is written on a subsequent request where consent cookies are present. This is a one-time window: once the EC cookie is set and a request with consent cookies arrives, the consent KV entry is written under the full EC ID and fallback works again. The window duration depends on how quickly users return with consent cookies. This is accepted — consent cookies are the primary signal; KV fallback is a secondary mechanism for when cookies are blocked or absent.
 
 All downstream EC logic calls `allows_ec_creation(&self.consent)`. No consent decoding or gating logic is added in this epic.
 
@@ -464,15 +470,15 @@ All downstream EC logic calls `allows_ec_creation(&self.consent)`. No consent de
 When `allows_ec_creation(&consent)` returns `false` for a user whose **`ts-ec` cookie** is present (`cookie_was_present == true`). A user identified only by the `X-ts-ec` request header is not subject to cookie deletion — there is no cookie to expire.
 
 1. Issue `Set-Cookie: ts-ec=; Max-Age=0; ...` and strip all EC response headers (synchronous — must not fail silently). This always happens when `cookie_was_present == true`.
-2. Write tombstone for each valid EC hash available (`cookie_ec_value` and/or `ec_value`). When neither is valid (malformed cookie, no header), **no tombstone is written** — cookie deletion alone is the enforcement mechanism. When at least one valid hash exists: `kv.write_withdrawal_tombstone(hash)` sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms per write.
+2. Write tombstone for each valid EC ID available (`cookie_ec_value` and/or `ec_value`). When neither is valid (malformed cookie, no header), **no tombstone is written** — cookie deletion alone is the enforcement mechanism. When at least one valid EC ID exists: `kv.write_withdrawal_tombstone(ec_id)` sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms per write.
 
 The tombstone write runs in the request path (not async) to ensure real-time enforcement. Using a tombstone rather than a hard delete preserves the `consent_withdrawn` signal for batch sync clients for 24 hours — otherwise batch sync cannot distinguish consent withdrawal from an EC that never existed.
 
 If the tombstone write fails:
 
-- Log at `error` level with EC hash
+- Log at `error` level with EC ID
 - Do not block the response — cookie deletion is the primary enforcement mechanism
-- **No retry is possible on the browser path.** Once the cookie is deleted, subsequent browser requests carry no EC value (`ec_hash()` returns `None`), so there is no hash to tombstone. A failed tombstone means batch sync clients may see `ec_hash_not_found` (after TTL expiry) rather than `consent_withdrawn` — this is accepted degradation. The cookie deletion remains the authoritative enforcement mechanism.
+- **No retry is possible on the browser path.** Once the cookie is deleted, subsequent browser requests carry no EC value (`ec_value` returns `None`), so there is no EC ID to tombstone. A failed tombstone means batch sync clients may see `ec_id_not_found` (after TTL expiry) rather than `consent_withdrawn` — this is accepted degradation. The cookie deletion remains the authoritative enforcement mechanism.
 
 ---
 
@@ -484,12 +490,12 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 
 | Store            | TOML key           | Purpose                            |
 | ---------------- | ------------------ | ---------------------------------- |
-| Identity graph   | `ec.ec_store`      | EC hash → identity JSON            |
+| Identity graph   | `ec.ec_store`      | EC ID → identity JSON              |
 | Partner registry | `ec.partner_store` | Partner ID → config + API key hash |
 
 ### 7.2 Identity graph schema
 
-**KV key:** 64-character hex hash (the stable prefix from `ec_value`, without `.suffix`).
+**KV key:** Full EC ID in `{64-char hex}.{6-char alphanumeric}` format. The random suffix is intentionally included to provide uniqueness for users behind the same NAT/proxy infrastructure who would otherwise share identical IP-derived hash prefixes.
 
 **KV value (JSON, max ~5KB):**
 
@@ -521,7 +527,7 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 { "ok": true, "country": "US", "v": 1 }
 ```
 
-The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /_ts/api/v1/sync`) can return `consent_withdrawn` rather than `ec_hash_not_found` during the 24-hour tombstone TTL.
+The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /_ts/api/v1/sync`) can return `consent_withdrawn` rather than `ec_id_not_found` during the 24-hour tombstone TTL.
 
 **`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Consent withdrawal is determined entirely from `allows_ec_creation(&ec_context.consent)` on the current request. When withdrawal is detected, the cookie is deleted and `write_withdrawal_tombstone()` is called in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
 
@@ -580,22 +586,34 @@ impl KvIdentityGraph {
     pub fn new(store_name: impl Into<String>) -> Self;
 
     /// Reads the full entry, returning the generation marker for CAS writes.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn get(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
     ) -> Result<Option<(KvEntry, u64)>, Report<TrustedServerError>>;
 
     /// Reads only the metadata fields (consent flag, country).
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn get_metadata(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
     ) -> Result<Option<KvMetadata>, Report<TrustedServerError>>;
 
     /// Creates a new entry. Returns `Ok(())` if successful, `Err` if the key
     /// already exists (concurrent create) or on KV error.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn create(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         entry: &KvEntry,
     ) -> Result<(), Report<TrustedServerError>>;
 
@@ -611,9 +629,13 @@ impl KvIdentityGraph {
     /// Called by `generate_if_needed()` instead of `create()`. This ensures that
     /// re-consent recovery is immediate — a user who withdraws and then re-consents
     /// within the 24-hour tombstone window gets a fresh identity entry without delay.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn create_or_revive(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         entry: &KvEntry,
     ) -> Result<(), Report<TrustedServerError>>;
 
@@ -629,11 +651,15 @@ impl KvIdentityGraph {
     /// This recovery path is intentional: it materializes the graph later when
     /// the initial best-effort `create_or_revive()` on EC generation failed.
     /// Batch sync still performs its explicit existence/tombstone check before
-    /// calling this method, so `POST /_ts/api/v1/sync` retains its `ec_hash_not_found`
+    /// calling this method, so `POST /_ts/api/v1/sync` retains its `ec_id_not_found`
     /// contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn upsert_partner_id(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         partner_id: &str,
         uid: &str,
         synced: u64,
@@ -643,9 +669,13 @@ impl KvIdentityGraph {
     /// 300 seconds older than `timestamp`. This debounce prevents KV write
     /// thrashing under bursty traffic — Fastly KV enforces a 1 write/sec limit
     /// per key. Callers should log `warn` on failure and continue.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn update_last_seen(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
         timestamp: u64,
     ) -> Result<(), Report<TrustedServerError>>;
 
@@ -654,21 +684,29 @@ impl KvIdentityGraph {
     /// Instead of hard-deleting the KV entry, this overwrites it with
     /// `consent.ok = false`, clears all partner IDs, and sets a 24-hour TTL.
     /// The tombstone allows batch sync clients (`POST /_ts/api/v1/sync`) to return
-    /// `consent_withdrawn` rather than `ec_hash_not_found` for the tombstone TTL.
+    /// `consent_withdrawn` rather than `ec_id_not_found` for the tombstone TTL.
     ///
     /// After the 24-hour TTL expires, the entry is gone. Any subsequent `get()`
-    /// returns `None` (`ec_hash_not_found`) — the distinction is time-bounded.
+    /// returns `None` (`ec_id_not_found`) — the distinction is time-bounded.
     ///
     /// Caller must handle `Err` by logging at `error` level; the cookie deletion
     /// in `ec_finalize_response()` is the primary enforcement mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
     pub fn write_withdrawal_tombstone(
         &self,
-        ec_hash: &str,
+        ec_id: &str,
     ) -> Result<(), Report<TrustedServerError>>;
 
     /// Hard-deletes the entry. Used only for data deletion requests (IAB deletion
     /// framework — deferred). For consent withdrawal, use `write_withdrawal_tombstone()`.
-    pub fn delete(&self, ec_hash: &str) -> Result<(), Report<TrustedServerError>>;
+    ///
+    /// # Arguments
+    ///
+    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
+    pub fn delete(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>>;
 }
 ```
 
@@ -748,10 +786,10 @@ pub async fn handle_sync(
 
    `!allows_ec_creation(...)` → redirect to {return}?ts_synced=0&ts_reason=no_consent
 
-6. Check anti-stuffing rate limit (sync_rate_limit per EC hash per partner per hour).
+6. Check anti-stuffing rate limit (sync_rate_limit per EC ID per partner per hour).
    Exceeded → `429 Too Many Requests` (no redirect — the `return` URL is never called).
 
-7. kv.upsert_partner_id(ec_hash, partner_id, uid, now())
+7. kv.upsert_partner_id(ec_id, partner_id, uid, now())
    If the root KV entry is missing (e.g. initial `create_or_revive()` failed on
    the organic page load), `upsert_partner_id()` creates a minimal live entry and
    then writes `ids[partner_id]`. This is the recovery path for best-effort EC
@@ -785,7 +823,7 @@ Do not modify any other query parameters on the `return` URL.
 
 - `return` URL validated by exact hostname match against `partner.allowed_return_domains`. No subdomain wildcard matching.
 - No HMAC signature required on inbound sync request.
-- Rate limit: `partner.sync_rate_limit` writes per EC hash per partner per hour. Default: 100. Configurable per partner in `partner_store`.
+- Rate limit: `partner.sync_rate_limit` writes per EC ID per partner per hour. Default: 100. Configurable per partner in `partner_store`.
 
 ---
 
@@ -830,7 +868,7 @@ Authorization: Bearer <api_key>
 {
   "mappings": [
     {
-      "ec_hash": "<64-character hex hash>",
+      "ec_id": "<full EC ID: {64-hex}.{6-alnum}>",
       "partner_uid": "abc123",
       "timestamp": 1741824000
     }
@@ -846,9 +884,9 @@ The authenticated partner's ID (from the `PartnerRecord` resolved via API key in
 
 For each mapping:
 
-1. Validate `ec_hash` format (must be exactly 64 lowercase hex characters). Invalid format → reject with `reason: "invalid_ec_hash"`.
-2. Read KV metadata for `ec_hash`. If not found → reject with `reason: "ec_hash_not_found"`. If `consent.ok = false` → reject with `reason: "consent_withdrawn"`.
-3. `kv.upsert_partner_id(ec_hash, partner_id, partner_uid, timestamp)`. The upsert internally skips the write if the existing `ids[partner_id].synced ≥ timestamp` (idempotent — counted as accepted, no error). On KV failure → reject all remaining mappings with `reason: "kv_unavailable"`, return `207`.
+1. Validate `ec_id` format (must match `{64-hex}.{6-alnum}` pattern). Invalid format → reject with `reason: "invalid_ec_id"`.
+2. Read KV metadata for `ec_id`. If not found → reject with `reason: "ec_id_not_found"`. If `consent.ok = false` → reject with `reason: "consent_withdrawn"`.
+3. `kv.upsert_partner_id(ec_id, partner_id, partner_uid, timestamp)`. The upsert internally skips the write if the existing `ids[partner_id].synced ≥ timestamp` (idempotent — counted as accepted, no error). On KV failure → reject all remaining mappings with `reason: "kv_unavailable"`, return `207`.
 
 ### 9.5 Response format
 
@@ -857,7 +895,7 @@ For each mapping:
   "accepted": 998,
   "rejected": 2,
   "errors": [
-    { "index": 45, "reason": "ec_hash_not_found" },
+    { "index": 45, "reason": "ec_id_not_found" },
     { "index": 72, "reason": "consent_withdrawn" }
   ]
 }
@@ -889,10 +927,10 @@ pub struct BatchSyncError {
 
 #[derive(Debug, derive_more::Display)]
 pub enum BatchSyncRejection {
-    #[display("invalid_ec_hash")]
-    InvalidEcHash,
-    #[display("ec_hash_not_found")]
-    EcHashNotFound,
+    #[display("invalid_ec_id")]
+    InvalidEcId,
+    #[display("ec_id_not_found")]
+    EcIdNotFound,
     #[display("consent_withdrawn")]
     ConsentWithdrawn,
     #[display("kv_unavailable")]
@@ -936,7 +974,7 @@ impl PullSyncDispatcher {
 /// Fires a single partner pull request via `send_async()`, waits for the
 /// response via `PendingRequest::wait()`, and writes the result to KV.
 fn pull_one_partner(
-    ec_hash: &str,
+    ec_id: &str,
     ip: IpAddr,
     partner: &PartnerRecord,
     kv: &KvIdentityGraph,
@@ -955,7 +993,7 @@ A pull sync is dispatched for a partner when all of the following are true on a 
 3. `allows_ec_creation(&ec_context.consent) == true`
 4. `partner.pull_sync_enabled == true`
 5. Either: no entry exists for this partner in the KV graph, or the existing `synced` timestamp is older than `partner.pull_sync_ttl_sec` (default 86400 seconds)
-6. Rate limit not exceeded: `partner.pull_sync_rate_limit` calls per EC hash per partner per hour (default 10)
+6. Rate limit not exceeded: `partner.pull_sync_rate_limit` calls per EC ID per partner per hour (default 10)
 
 ### 10.3 Execution model
 
@@ -968,13 +1006,13 @@ Maximum concurrent pull calls per request: `settings.ec.pull_sync_concurrency` (
 ### 10.4 Outbound request
 
 ```
-GET {partner.pull_sync_url}?ec_hash={64-char-hex}&ip={ip_address}
+GET {partner.pull_sync_url}?ec_id={64-hex}.{6-alnum}&ip={ip_address}
 Authorization: Bearer {partner.ts_pull_token}
 ```
 
 Before dispatching, `pull_sync.rs` validates that `pull_sync_url`'s hostname is present in `partner.pull_sync_allowed_domains`. If not, the call is skipped and an `error` is logged — this is a configuration error that should not occur at runtime if admin validation is working correctly (§13.2 step 3).
 
-Only the EC hash and IP are sent. No consent strings, geo data, or other partner IDs are included.
+Only the full EC ID and IP are sent. No consent strings, geo data, or other partner IDs are included.
 
 **Expected partner responses:**
 
@@ -989,7 +1027,7 @@ Any other non-200 response is treated as a transient failure. No retry. The next
 
 ### 10.5 KV write on success
 
-On a non-null `uid`: call `kv.upsert_partner_id(ec_hash, partner_id, uid, now())`. If the root entry is missing, the upsert creates a minimal live entry first (same recovery path as `/sync`). On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request.
+On a non-null `uid`: call `kv.upsert_partner_id(ec_id, partner_id, uid, now())`. If the root entry is missing, the upsert creates a minimal live entry first (same recovery path as `/sync`). On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request.
 
 The write updates `ids[partner_id].synced` to the current timestamp, resetting the `pull_sync_ttl_sec` window.
 
@@ -1097,7 +1135,7 @@ Set on `200` responses only:
 
 | Header              | Value                                                                                                                                                                                                                                                                                                                           |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `X-ts-ec`           | `{ec_hash.suffix}`                                                                                                                                                                                                                                                                                                              |
+| `X-ts-ec`           | `{64-hex}.{6-alnum}` — full EC ID                                                                                                                                                                                                                                                                                              |
 | `X-ts-eids`         | Standard base64 (RFC 4648, with `=` padding) of the JSON array of OpenRTB 2.6 `user.eids` objects. Capped at **4 KB** after encoding. If the encoded value exceeds 4 KB, the array is truncated (fewest partners first — highest `synced` timestamp retained) until it fits, and a `x-ts-eids-truncated: true` header is added. |
 | `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`). One header per partner with a resolved UID. **Capped at 20 partners** — partners sorted by most-recently synced; excess partners are omitted silently.                                                                                                                            |
 | `X-ts-ec-consent`   | `ok` (always — denied consent returns `403`, not `200`)                                                                                                                                                                                                                                                                         |
@@ -1220,7 +1258,7 @@ The current `/auction` path returns a JSON response inline to the JS caller (`en
 
 | Header                | Value                                                                                                              |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `X-ts-ec`             | `{ec_hash.suffix}` — when EC is present                                                                            |
+| `X-ts-ec`             | `{64-hex}.{6-alnum}` — full EC ID, when EC is present                                                              |
 | `X-ts-eids`           | Standard base64 (RFC 4648) of OpenRTB 2.6 `user.eids` JSON array. Capped at 4 KB — same truncation rules as §11.5. |
 | `X-ts-eids-truncated` | `true` — present only when `X-ts-eids` was truncated                                                               |
 | `X-ts-ec-consent`     | `ok` — only present when consent granted; on withdrawal `ec_finalize_response()` strips all EC headers             |
@@ -2053,7 +2091,7 @@ their UIDs against a list of EC hashes.
 - API-key rate limit exceeded (`batch_rate_limit` per partner per minute) → `429`
   with `{ "error": "rate_limit_exceeded" }`.
 - More than 1000 mappings → `400`.
-- Per-mapping rejections: `invalid_ec_hash`, `ec_hash_not_found`,
+- Per-mapping rejections: `invalid_ec_id`, `ec_id_not_found`,
   `consent_withdrawn`, `kv_unavailable`.
 - KV write failure aborts remaining mappings with `kv_unavailable`; partial
   results returned as `207`.
