@@ -19,6 +19,8 @@ passphrase = "trusted-server"
 ec_store = "ec_identity_store"
 partner_store = "ec_partner_store"
 pull_sync_concurrency = 3
+# cluster_trust_threshold = 10   # Entries with cluster_size <= this are individual users
+# cluster_recheck_secs = 3600    # Re-evaluate cluster_size after this many seconds
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
