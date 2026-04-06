@@ -12,6 +12,7 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -132,6 +133,20 @@ async fn route_request(
     // Extract geo info before auth check or routing consumes the request.
     let geo_info = GeoInfo::from_request(&req);
 
+    // Derive device signals from TLS/H2/UA for bot detection.
+    // This is pure in-memory computation — no KV I/O.
+    let device_signals = derive_device_signals(&req);
+    let is_known_browser = device_signals.known_browser == Some(true);
+
+    if !is_known_browser {
+        log::debug!(
+            "Bot gate: blocking EC operations (known_browser={:?}, ja4={:?}, platform={:?})",
+            device_signals.known_browser,
+            device_signals.ja4_class,
+            device_signals.platform_class,
+        );
+    }
+
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
     if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/sync" {
@@ -163,20 +178,32 @@ async fn route_request(
             }
         };
 
-    let kv_graph = maybe_identity_graph(settings);
+    // Pass device signals to EcContext so they are stored on new entries.
+    ec_context.set_device_signals(device_signals);
+
+    // Bot gate: suppress all KV operations for unrecognized clients.
+    // The request is still proxied normally — the bot receives valid
+    // HTML but leaves no trace in the identity graph.
+    let kv_graph = if is_known_browser {
+        maybe_identity_graph(settings)
+    } else {
+        None
+    };
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
-            ec_finalize_response(
-                settings,
-                geo_info.as_ref(),
-                &ec_context,
-                kv_graph.as_ref(),
-                &mut response,
-            );
+            if is_known_browser {
+                ec_finalize_response(
+                    settings,
+                    geo_info.as_ref(),
+                    &ec_context,
+                    kv_graph.as_ref(),
+                    &mut response,
+                );
+            }
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
                 response,
@@ -314,17 +341,20 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
-    ec_finalize_response(
-        settings,
-        geo_info.as_ref(),
-        &ec_context,
-        kv_graph.as_ref(),
-        &mut response,
-    );
+    // Bot gate: skip EC cookie writes and pull sync for unrecognized clients.
+    if is_known_browser {
+        ec_finalize_response(
+            settings,
+            geo_info.as_ref(),
+            &ec_context,
+            kv_graph.as_ref(),
+            &mut response,
+        );
+    }
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
-    let pull_sync_context = if organic_route && route_succeeded {
+    let pull_sync_context = if is_known_browser && organic_route && route_succeeded {
         build_pull_sync_context(&ec_context)
     } else {
         None
@@ -439,4 +469,16 @@ fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(store_name))
+}
+
+/// Derives device signals from TLS, H2, and UA request data.
+///
+/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
+/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
+fn derive_device_signals(req: &Request) -> DeviceSignals {
+    let ua = req.get_header_str("user-agent").unwrap_or("");
+    let ja4 = req.get_tls_ja4();
+    let h2_fp = req.get_client_h2_fingerprint();
+
+    DeviceSignals::derive(ua, ja4, h2_fp)
 }
