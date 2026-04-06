@@ -32,7 +32,7 @@ use super::AuctionOrchestrator;
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
+    runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
@@ -64,6 +64,11 @@ pub async fn handle_auction(
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| runtime_services.kv_store()),
     });
 
     // Convert tsjs request format to auction request
@@ -80,7 +85,7 @@ pub async fn handle_auction(
 
     // Run the auction
     let result = orchestrator
-        .run_auction(&auction_request, &context, services)
+        .run_auction(&auction_request, &context, runtime_services)
         .await
         .change_context(TrustedServerError::Auction {
             message: "Auction orchestration failed".to_string(),
