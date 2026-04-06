@@ -16,23 +16,16 @@
 //! ## Platform-Agnostic Components
 //!
 //! The following components were evaluated for platform-specific behavior
-//! (PR 8) and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (PR 16/17) need not provide
+//! (the content rewriting verification) and found to have a platform-agnostic rewriting pipeline. No
+//! platform trait is required; future adapters (subsequent adapter migrations) need not provide
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
-//!   is accessed via `StreamingPipeline::process<R: Read, W: Write>` which
+//!   is accessed via [`StreamingPipeline::process`] which
 //!   accepts any reader, including `fastly::Body` (which implements
 //!   `std::io::Read`).
-//!
-//!   The `publisher.rs` handler module is platform-coupled at its handler
-//!   layer — it accepts and returns `fastly::Body` in function signatures
-//!   such as `process_response_streaming`. This is an HTTP-type coupling
-//!   that will be addressed in Phase 2 (PR 11) alongside all other
-//!   `fastly::Request`/`Response`/`Body` migrations. It is not a
-//!   content-rewriting concern.
 //!
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!

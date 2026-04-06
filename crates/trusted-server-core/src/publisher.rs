@@ -1,3 +1,11 @@
+//! The publisher handler module.
+//!
+//! **Note on platform coupling:** The `publisher.rs` handler module is currently platform-coupled
+//! at its handler layer — it accepts and returns `fastly::Body` in function signatures
+//! such as `process_response_streaming`. This is an HTTP-type coupling
+//! that will be addressed in the HTTP-type migration alongside all other
+//! `fastly::Request`/`Response`/`Body` migrations. It is not a content-rewriting concern.
+
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
