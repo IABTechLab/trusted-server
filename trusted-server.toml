@@ -47,16 +47,16 @@ debug = false
 # be statically imported in the JS bundle.
 client_side_bidders = ["rubicon"]
 
+# [integrations.prebid.bid_param_overrides]
+# Static per-bidder params merged into every outgoing PBS request.
+# Example:
+# [integrations.prebid.bid_param_overrides.criteo]
+# networkId = 12345
+# pubid = "233422"
+
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
 # and includes it in the request. The server maps zone → s2s placementId here.
-# [integrations.prebid.bidder_param_overrides]
-# Static per-bidder params merged into every outgoing PBS request.
-# Example:
-# [integrations.prebid.bidder_param_overrides.criteo]
-# networkId = 112141
-# pubid = "112141"
-
 [integrations.prebid.bid_param_zone_overrides.kargo]
 # header = {placementId = "_abc"}
 

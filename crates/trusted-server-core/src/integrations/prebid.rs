@@ -120,17 +120,17 @@ pub struct PrebidIntegrationConfig {
     ///
     /// Example in TOML:
     /// ```toml
-    /// [integrations.prebid.bidder_param_overrides.criteo]
+    /// [integrations.prebid.bid_param_overrides.criteo]
     /// networkId = 112141
     /// pubid = "112141"
     /// ```
     ///
     /// Example via environment variable:
     /// ```text
-    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDER_PARAM_OVERRIDES='{"criteo":{"networkId":112141,"pubid":"112141"}}'
+    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":112141,"pubid":"112141"}}'
     /// ```
     #[serde(default)]
-    pub bidder_param_overrides: HashMap<String, Json>,
+    pub bid_param_overrides: HashMap<String, Json>,
     /// How consent signals are forwarded to Prebid Server.
     ///
     /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
@@ -576,7 +576,7 @@ impl PrebidAuctionProvider {
                 // zone-based overrides below.
                 for (name, params) in &mut bidder {
                     if let Some(Json::Object(ovr)) =
-                        self.config.bidder_param_overrides.get(name.as_str())
+                        self.config.bid_param_overrides.get(name.as_str())
                     {
                         log::debug!(
                             "prebid: bidder override for '{}': keys {:?}",
@@ -1290,7 +1290,7 @@ mod tests {
             script_patterns: default_script_patterns(),
             client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::new(),
-            bidder_param_overrides: HashMap::new(),
+            bid_param_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
     }
@@ -2735,7 +2735,7 @@ server_url = "https://prebid.example"
     }
 
     // ========================================================================
-    // bidder_param_overrides tests
+    // bid_param_overrides tests
     // ========================================================================
 
     #[test]
@@ -2747,7 +2747,7 @@ enabled = true
 server_url = "https://prebid.example"
 bidders = ["criteo"]
 
-[integrations.prebid.bidder_param_overrides.criteo]
+[integrations.prebid.bid_param_overrides.criteo]
 networkId = 112141
 pubid = "112141"
 "#,

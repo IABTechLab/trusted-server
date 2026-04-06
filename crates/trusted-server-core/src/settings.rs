@@ -1032,10 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn test_prebid_bidder_param_overrides_override_with_json_env() {
+    fn test_prebid_bid_param_overrides_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDER_PARAM_OVERRIDES",
+            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDES",
             ENVIRONMENT_VARIABLE_PREFIX,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
@@ -1066,12 +1066,12 @@ mod tests {
                             serde_json::to_value(&cfg).expect("should serialize config to JSON");
 
                         assert_eq!(
-                            cfg_json["bidder_param_overrides"]["criteo"]["networkId"],
+                            cfg_json["bid_param_overrides"]["criteo"]["networkId"],
                             json!(112141),
                             "should deserialize networkId override from env JSON"
                         );
                         assert_eq!(
-                            cfg_json["bidder_param_overrides"]["criteo"]["pubid"],
+                            cfg_json["bid_param_overrides"]["criteo"]["pubid"],
                             json!("112141"),
                             "should deserialize pubid override from env JSON"
                         );
