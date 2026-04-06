@@ -2095,6 +2095,7 @@ server_url = "https://prebid.example"
                 longitude: 13.405,
                 metro_code: 0,
                 region: None,
+                asn: None,
             }),
         });
 
@@ -2140,6 +2141,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 
@@ -2173,6 +2175,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 
@@ -2558,6 +2561,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 

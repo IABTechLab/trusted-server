@@ -15,7 +15,8 @@ use fastly::kv_store::{InsertMode, KVStore};
 use crate::error::TrustedServerError;
 
 use super::current_timestamp;
-use super::kv_types::{KvEntry, KvMetadata};
+use super::generation::ec_hash;
+use super::kv_types::{KvDomainVisit, KvEntry, KvMetadata, KvNetwork, MAX_SEEN_DOMAINS};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 3;
@@ -24,6 +25,11 @@ const MAX_CAS_RETRIES: u32 = 3;
 /// Prevents write thrashing under bursty traffic — Fastly KV enforces a
 /// 1 write/sec limit per key.
 const LAST_SEEN_DEBOUNCE_SECS: u64 = 300;
+
+/// Maximum number of keys to request when counting hash-prefix matches
+/// for cluster size evaluation. Anything above this is clearly a large
+/// shared network; the exact count doesn't matter.
+const CLUSTER_LIST_LIMIT: u32 = 100;
 
 /// TTL for live entries (1 year), matching the EC cookie `Max-Age`.
 const ENTRY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -522,6 +528,11 @@ impl KvIdentityGraph {
 
     /// Updates the `last_seen` timestamp with a 300-second debounce.
     ///
+    /// Also updates the [`KvPubProperties::seen_domains`] entry for the
+    /// given `domain`, incrementing visits and updating the `last` timestamp.
+    /// New domains are added if the [`MAX_SEEN_DOMAINS`] cap has not been
+    /// reached; otherwise the new domain is silently dropped.
+    ///
     /// Skips the write if the stored `last_seen` is within
     /// [`LAST_SEEN_DEBOUNCE_SECS`] of the new timestamp, or if the entry
     /// does not exist.
@@ -537,6 +548,7 @@ impl KvIdentityGraph {
         &self,
         ec_id: &str,
         timestamp: u64,
+        domain: &str,
     ) -> Result<(), Report<TrustedServerError>> {
         let (mut entry, generation) = match self.get(ec_id)? {
             Some(pair) => pair,
@@ -572,6 +584,34 @@ impl KvIdentityGraph {
         }
 
         entry.last_seen = timestamp;
+
+        // Update publisher domain visit history.
+        if let Some(ref mut props) = entry.pub_properties {
+            match props.seen_domains.get_mut(domain) {
+                Some(visit) => {
+                    visit.last = timestamp;
+                    visit.visits = visit.visits.saturating_add(1);
+                }
+                None => {
+                    if props.seen_domains.len() < MAX_SEEN_DOMAINS {
+                        props.seen_domains.insert(
+                            domain.to_owned(),
+                            KvDomainVisit {
+                                first: timestamp,
+                                last: timestamp,
+                                visits: 1,
+                            },
+                        );
+                    } else {
+                        log::debug!(
+                            "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
+                             for '{ec_id}', dropping domain '{domain}'"
+                        );
+                    }
+                }
+            }
+        }
+
         let store = self.open_store()?;
         let (body, meta_str) = Self::serialize_entry(&entry, &self.store_name)?;
 
@@ -620,6 +660,120 @@ impl KvIdentityGraph {
             })
     }
 
+    /// Counts the number of keys sharing the same EC hash prefix.
+    ///
+    /// Uses the Fastly KV list API with a prefix filter, limited to
+    /// [`CLUSTER_LIST_LIMIT`] keys. If the limit is reached, the count
+    /// is capped — the exact number beyond the limit is not meaningful
+    /// for disambiguation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store error.
+    pub fn count_hash_prefix_keys(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<u32, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+
+        // Request a single page of up to CLUSTER_LIST_LIMIT keys.
+        // The prefix ensures we only match EC IDs derived from the same
+        // IP+passphrase (i.e. same 64-hex hash).
+        let page = store
+            .build_list()
+            .prefix(hash_prefix)
+            .limit(CLUSTER_LIST_LIMIT)
+            .execute()
+            .change_context(TrustedServerError::KvStore {
+                store_name: self.store_name.clone(),
+                message: format!(
+                    "Failed to list keys with prefix '{}'",
+                    &hash_prefix[..hash_prefix.len().min(8)],
+                ),
+            })?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let count = page.keys().len() as u32;
+        Ok(count)
+    }
+
+    /// Evaluates and caches the cluster size for an EC entry.
+    ///
+    /// If the entry already has a `cluster_checked` timestamp within
+    /// `recheck_secs` of now, the cached `cluster_size` is returned
+    /// without performing a list API call.
+    ///
+    /// Otherwise, counts the number of keys sharing the same hash prefix
+    /// via [`count_hash_prefix_keys`](Self::count_hash_prefix_keys) and
+    /// writes the result back to the entry via CAS. The CAS write is
+    /// best-effort — on conflict, the computed value is still returned;
+    /// it will simply be re-evaluated on the next call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store or list failure.
+    pub fn evaluate_cluster(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        generation: u64,
+        recheck_secs: u64,
+    ) -> Result<Option<u32>, Report<TrustedServerError>> {
+        let now = current_timestamp();
+
+        // Check TTL — skip re-evaluation if the cached value is fresh enough.
+        if let Some(ref network) = entry.network {
+            if let Some(checked) = network.cluster_checked {
+                if now.saturating_sub(checked) < recheck_secs {
+                    log::trace!(
+                        "evaluate_cluster: cached cluster_size for '{ec_id}' \
+                         (age={}s, ttl={recheck_secs}s)",
+                        now.saturating_sub(checked),
+                    );
+                    return Ok(network.cluster_size);
+                }
+            }
+        }
+
+        // Compute cluster size via prefix list.
+        let hash_prefix = ec_hash(ec_id);
+        let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
+
+        log::debug!("evaluate_cluster: computed cluster_size={cluster_size} for '{ec_id}'");
+
+        // Best-effort CAS write-back — update the network field.
+        let mut updated_entry = entry.clone();
+        updated_entry.network = Some(KvNetwork {
+            cluster_size: Some(cluster_size),
+            cluster_checked: Some(now),
+        });
+
+        let store = self.open_store()?;
+        let (body, meta_str) = Self::serialize_entry(&updated_entry, &self.store_name)?;
+
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .metadata(&meta_str)
+            .time_to_live(ENTRY_TTL)
+            .execute(ec_id, body.as_str())
+        {
+            Ok(()) => {}
+            Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
+                log::debug!(
+                    "evaluate_cluster: CAS conflict writing cluster_size for '{ec_id}', \
+                     returning computed value anyway"
+                );
+            }
+            Err(err) => {
+                // Log but don't fail — the computed value is still valid.
+                log::warn!("evaluate_cluster: failed to write cluster_size for '{ec_id}': {err}");
+            }
+        }
+
+        Ok(Some(cluster_size))
+    }
+
     /// Hard-deletes the entry.
     ///
     /// Reserved for the IAB data deletion framework (deferred). For consent
@@ -649,6 +803,7 @@ mod tests {
         assert_eq!(LAST_SEEN_DEBOUNCE_SECS, 300);
         assert_eq!(ENTRY_TTL, Duration::from_secs(31_536_000));
         assert_eq!(TOMBSTONE_TTL, Duration::from_secs(86_400));
+        assert_eq!(CLUSTER_LIST_LIMIT, 100);
     }
 
     #[test]
@@ -670,5 +825,56 @@ mod tests {
         // Verify metadata is valid JSON.
         let _: KvMetadata =
             serde_json::from_str(&meta).expect("should deserialize metadata back to KvMetadata");
+    }
+
+    #[test]
+    fn evaluate_cluster_returns_cached_value_when_ttl_fresh() {
+        // When the entry has a recent cluster_checked timestamp, evaluate_cluster
+        // should return the cached value without touching the KV store.
+        // We verify this by using a non-existent store — if it tried to open
+        // the store, it would fail. The TTL-skip path exits before any store I/O.
+        let kv = KvIdentityGraph::new("nonexistent_store_for_ttl_test");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let now = current_timestamp();
+
+        let mut entry = KvEntry::tombstone(now);
+        entry.consent.ok = true;
+        entry.network = Some(KvNetwork {
+            cluster_size: Some(5),
+            cluster_checked: Some(now), // just checked
+        });
+
+        // With a 3600s TTL, the cached value (checked just now) should be returned.
+        let result = kv.evaluate_cluster(&ec_id, &entry, 0, 3600);
+        let cluster_size = result.expect("should return cached value without store I/O");
+        assert_eq!(
+            cluster_size,
+            Some(5),
+            "should return cached cluster_size when within TTL"
+        );
+    }
+
+    #[test]
+    fn evaluate_cluster_requires_recheck_when_ttl_expired() {
+        // When cluster_checked is older than the TTL, evaluate_cluster must
+        // perform a list API call. Since the store doesn't exist, this should
+        // fail — confirming it didn't take the cached path.
+        let kv = KvIdentityGraph::new("nonexistent_store_for_ttl_test");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.network = Some(KvNetwork {
+            cluster_size: Some(5),
+            cluster_checked: Some(1000), // very old timestamp
+        });
+
+        // With a 3600s TTL, the old timestamp should trigger re-evaluation,
+        // which will fail because the store doesn't exist.
+        let result = kv.evaluate_cluster(&ec_id, &entry, 0, 3600);
+        assert!(
+            result.is_err(),
+            "should attempt store I/O when TTL expired, failing on missing store"
+        );
     }
 }
