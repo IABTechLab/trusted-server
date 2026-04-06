@@ -41,6 +41,10 @@ pub struct KvEntry {
     /// Publisher domain history for consortium-level identity sharing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pub_properties: Option<KvPubProperties>,
+    /// Device class signals (TLS fingerprint, UA platform).
+    /// Written once on creation — never updated after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<KvDevice>,
     /// Network cluster disambiguation data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<KvNetwork>,
@@ -119,6 +123,40 @@ pub struct KvPubProperties {
     pub seen_domains: HashMap<String, KvDomainVisit>,
 }
 
+/// Coarse, non-PII device signals derived from TLS handshake and UA.
+///
+/// Used by the `/identify` endpoint for cross-suffix propagation decisions
+/// and buyer-facing device quality scoring. Written once on
+/// [`KvEntry`] creation — never updated after.
+///
+/// **Privacy:** `ja4_class` (Section 1 only) and `platform_class` are
+/// category signals, not unique device identifiers. The full JA4
+/// fingerprint (Sections 2–3) is never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvDevice {
+    /// Mobile signal: `0` = confirmed desktop, `1` = confirmed mobile,
+    /// `2` = genuinely unknown (non-standard client).
+    /// Derived from UA platform string — no Client Hints required.
+    pub is_mobile: u8,
+    /// JA4 Section 1 only — browser family class identifier.
+    /// e.g. `"t13d1516h2"` = Chrome, `"t13d2013h2"` = Safari.
+    /// Never stores the full JA4 fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_class: Option<String>,
+    /// Coarse OS family from UA: `"mac"`, `"windows"`, `"ios"`,
+    /// `"android"`, `"linux"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_class: Option<String>,
+    /// SHA256 prefix (12 hex chars) of the HTTP/2 SETTINGS fingerprint.
+    /// Used alongside `ja4_class` for browser confirmation and bot detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_fp_hash: Option<String>,
+    /// `true` = known legitimate browser; `false` = known bot/scraper;
+    /// `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_browser: Option<bool>,
+}
+
 /// Network cluster disambiguation data.
 ///
 /// Tracks how many distinct EC entries share the same hash prefix. A high
@@ -154,6 +192,13 @@ pub struct KvMetadata {
     /// Mirrors [`KvNetwork::cluster_size`]. `None` = not yet evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_size: Option<u32>,
+    /// Mirrors [`KvDevice::is_mobile`]. Enables propagation gating without
+    /// body read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_mobile: Option<u8>,
+    /// Mirrors [`KvDevice::known_browser`]. Buyer-facing quality signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_browser: Option<bool>,
 }
 
 impl KvEntry {
@@ -188,6 +233,7 @@ impl KvEntry {
                 origin_domain: domain.to_owned(),
                 seen_domains,
             }),
+            device: None,
             network: None,
             ids: HashMap::new(),
         }
@@ -225,6 +271,7 @@ impl KvEntry {
                 dma: None,
             },
             pub_properties: None,
+            device: None,
             network: None,
             ids,
         }
@@ -257,6 +304,7 @@ impl KvEntry {
                 dma: None,
             },
             pub_properties: None,
+            device: None,
             network: None,
             ids: HashMap::new(),
         }
@@ -272,6 +320,8 @@ impl KvMetadata {
             country: entry.geo.country.clone(),
             v: entry.v,
             cluster_size: entry.network.as_ref().and_then(|n| n.cluster_size),
+            is_mobile: entry.device.as_ref().map(|d| d.is_mobile),
+            known_browser: entry.device.as_ref().and_then(|d| d.known_browser),
         }
     }
 }
@@ -373,6 +423,8 @@ mod tests {
             country: "US".to_owned(),
             v: 1,
             cluster_size: None,
+            is_mobile: None,
+            known_browser: None,
         };
 
         let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
@@ -392,6 +444,8 @@ mod tests {
             country: "US".to_owned(),
             v: 1,
             cluster_size: Some(3),
+            is_mobile: None,
+            known_browser: None,
         };
 
         let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
@@ -418,6 +472,8 @@ mod tests {
             country: "XX".to_owned(),
             v: SCHEMA_VERSION,
             cluster_size: Some(u32::MAX),
+            is_mobile: Some(2),
+            known_browser: Some(true),
         };
         let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
         assert!(
@@ -738,6 +794,112 @@ mod tests {
         assert!(
             meta.cluster_size.is_none(),
             "metadata should have None cluster_size when entry has no network"
+        );
+    }
+
+    #[test]
+    fn device_roundtrip() {
+        let device = KvDevice {
+            is_mobile: 0,
+            ja4_class: Some("t13d1516h2".to_owned()),
+            platform_class: Some("mac".to_owned()),
+            h2_fp_hash: Some("a3f9d21c8b04".to_owned()),
+            known_browser: Some(true),
+        };
+        let json = serde_json::to_string(&device).expect("should serialize KvDevice");
+        let deserialized: KvDevice =
+            serde_json::from_str(&json).expect("should deserialize KvDevice");
+
+        assert_eq!(deserialized.is_mobile, 0);
+        assert_eq!(deserialized.ja4_class.as_deref(), Some("t13d1516h2"));
+        assert_eq!(deserialized.platform_class.as_deref(), Some("mac"));
+        assert_eq!(deserialized.h2_fp_hash.as_deref(), Some("a3f9d21c8b04"));
+        assert_eq!(deserialized.known_browser, Some(true));
+    }
+
+    #[test]
+    fn device_none_fields_omitted_from_json() {
+        let device = KvDevice {
+            is_mobile: 2,
+            ja4_class: None,
+            platform_class: None,
+            h2_fp_hash: None,
+            known_browser: None,
+        };
+        let json = serde_json::to_string(&device).expect("should serialize");
+        assert!(
+            !json.contains("\"ja4_class\""),
+            "None ja4_class should be omitted, got: {json}"
+        );
+        assert!(
+            !json.contains("\"known_browser\""),
+            "None known_browser should be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn none_device_omitted_from_entry_json() {
+        let entry = KvEntry::tombstone(1000);
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        assert!(
+            !json.contains("\"device\""),
+            "None device should be omitted from JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn entry_without_device_deserializes() {
+        let json = r#"{
+            "v": 1,
+            "created": 1000,
+            "last_seen": 1000,
+            "consent": { "ok": true, "updated": 1000 },
+            "geo": { "country": "US" }
+        }"#;
+        let entry: KvEntry =
+            serde_json::from_str(json).expect("should deserialize entry without device");
+
+        assert!(
+            entry.device.is_none(),
+            "missing device should deserialize as None"
+        );
+    }
+
+    #[test]
+    fn metadata_from_entry_mirrors_device_fields() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
+        entry.device = Some(KvDevice {
+            is_mobile: 1,
+            ja4_class: Some("t13d2013h2".to_owned()),
+            platform_class: Some("ios".to_owned()),
+            h2_fp_hash: None,
+            known_browser: Some(true),
+        });
+
+        let meta = KvMetadata::from_entry(&entry);
+        assert_eq!(
+            meta.is_mobile,
+            Some(1),
+            "metadata should mirror device is_mobile"
+        );
+        assert_eq!(
+            meta.known_browser,
+            Some(true),
+            "metadata should mirror device known_browser"
+        );
+    }
+
+    #[test]
+    fn metadata_without_device_fields_deserializes() {
+        let json = r#"{"ok":true,"country":"US","v":1}"#;
+        let meta: KvMetadata = serde_json::from_str(json).expect("should deserialize old metadata");
+
+        assert!(meta.is_mobile.is_none(), "is_mobile should default to None");
+        assert!(
+            meta.known_browser.is_none(),
+            "known_browser should default to None"
         );
     }
 }
