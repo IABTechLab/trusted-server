@@ -52,9 +52,10 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs:84)                    │
+│  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs)│
 │     - Pattern: (Method::POST, "/auction")                            │
-│     - Handler: handle_auction(settings, &orchestrator, &storage, req)│
+│     - Handler: handle_auction(settings, &orchestrator,               │
+│       &runtime_services, req)                                        │
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -277,7 +278,9 @@ The Fastly Compute entrypoint uses pattern matching on `(Method, path)` tuples:
 ```rust
 let result = match (method, path.as_str()) {
     // Auction endpoint
-    (Method::POST, "/auction") => handle_auction(&settings, req).await,
+    (Method::POST, "/auction") => {
+        handle_auction(&settings, &orchestrator, &runtime_services, req).await
+    },
     
     // First-party endpoints
     (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
@@ -288,7 +291,7 @@ let result = match (method, path.as_str()) {
     },
     
     // Fallback to publisher origin
-    _ => handle_publisher_request(&settings, &integration_registry, req),
+    _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
 }
 ```
 

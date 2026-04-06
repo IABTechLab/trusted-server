@@ -9,6 +9,7 @@ use crate::cookies::handle_request_cookies;
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
@@ -31,6 +32,7 @@ use super::AuctionOrchestrator;
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
+    runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
@@ -62,6 +64,11 @@ pub async fn handle_auction(
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| runtime_services.kv_store()),
     });
 
     // Convert tsjs request format to auction request
