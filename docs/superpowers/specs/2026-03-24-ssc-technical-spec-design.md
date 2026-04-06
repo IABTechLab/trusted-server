@@ -3,7 +3,7 @@
 **Status:** Draft
 **Author:** Engineering
 **PRD reference:** `docs/internal/ssc-prd.md`
-**Last updated:** 2026-03-18
+**Last updated:** 2026-04-06
 
 ---
 
@@ -16,6 +16,7 @@
 5. [Cookie and Header Handling](#5-cookie-and-header-handling)
 6. [Consent Enforcement](#6-consent-enforcement)
 7. [KV Store Identity Graph](#7-kv-store-identity-graph)
+   7A. [Device Signals and Bot Gate](#7a-device-signals-and-bot-gate)
 8. [Pixel Sync Endpoint (`GET /sync`)](#8-pixel-sync-endpoint-get-sync)
 9. [S2S Batch Sync API (`POST /_ts/api/v1/sync`)](#9-s2s-batch-sync-api-post-apiv1sync)
 10. [S2S Pull Sync (TS-Initiated)](#10-s2s-pull-sync-ts-initiated)
@@ -66,8 +67,21 @@ Browser Request
 │  extract GeoInfo → enforce auth → route_request │
 └──────────┬──────────────────────────────────────┘
            │
-Two-phase model (matches existing codebase pattern):
-
+Phase 0 — bot gate (pure in-memory, no KV I/O):
+    ┌─────────────────────────────────────────────────┐
+    │  derive_device_signals(req)                      │
+    │  - UA → is_mobile, platform_class                │
+    │  - req.get_tls_ja4() → ja4_class (Section 1)    │
+    │  - req.get_client_h2_fingerprint() → h2_fp_hash  │
+    │  - (ja4_class, h2_fp_hash) → known_browser       │
+    │                                                   │
+    │  known_browser != Some(true)?                     │
+    │    → suppress KV graph (None), skip ec_finalize,  │
+    │      skip pull sync. Request still proxied to     │
+    │      origin — bot receives valid HTML but leaves   │
+    │      no trace in the identity graph.              │
+    └──────┬────────────────────────────────────────────┘
+           │
 Phase 1 — pre-routing (like `GeoInfo::from_request()`):
     ┌─────────────────────────────────────────┐
     │  EcContext::read_from_request()          │
@@ -75,6 +89,9 @@ Phase 1 — pre-routing (like `GeoInfo::from_request()`):
     │  - build_consent_context() → ConsentContext  │
     │  - allows_ec_creation(consent)               │
     │  No generation. No cookie writes.       │
+    │                                              │
+    │  ec_context.set_device_signals(signals)      │
+    │  (passed through to KvEntry on creation)     │
     └──────┬──────────────────────────────────┘
            │
 Phase 2 — inside organic handlers only:
@@ -114,8 +131,10 @@ crates/trusted-server-core/src/
     mod.rs          — EcContext, pub re-exports
     identity.rs     — EC generation (HMAC-SHA256, IP normalization)
     cookie.rs       — create_ec_cookie(), delete_ec_cookie(), set_ec_on_response()
+    device.rs       — DeviceSignals derivation, UA/JA4/H2 parsing, known browser allowlist
     finalize.rs     — ec_finalize_response() (cookie write/delete, last_seen, tombstone)
-    kv.rs           — KvIdentityGraph, read/write/delete identity entries
+    kv.rs           — KvIdentityGraph, read/write/delete identity entries, cluster evaluation
+    kv_types.rs     — KvEntry, KvGeo, KvConsent, KvPubProperties, KvNetwork, KvDevice, KvMetadata
     partner.rs      — PartnerRecord, PartnerStore, load_partner()
     sync_pixel.rs   — handle_sync() handler
     sync_batch.rs   — handle_batch_sync() handler
@@ -252,6 +271,11 @@ pub struct EcContext {
     /// Stored here so pull sync can use it after `req` has been consumed by routing.
     /// `None` only if Fastly's `get_client_ip_addr()` returns `None`.
     pub client_ip: Option<IpAddr>,
+    /// Device signals derived from TLS/H2/UA in the adapter layer.
+    /// Set via `set_device_signals()` after `read_from_request()` returns.
+    /// Converted to `KvDevice` and stored on new entries in `generate_if_needed()`.
+    /// `None` when the adapter does not provide signals (e.g., test environments).
+    pub device_signals: Option<DeviceSignals>,
 }
 
 impl EcContext {
@@ -294,6 +318,13 @@ impl EcContext {
         settings: &Settings,
         kv: &KvIdentityGraph,
     );
+
+    /// Sets device signals derived from the adapter layer (TLS/H2/UA).
+    /// Must be called before `generate_if_needed()` so new entries include `KvDevice`.
+    pub fn set_device_signals(&mut self, signals: DeviceSignals);
+
+    /// Returns the device signals, if set.
+    pub fn device_signals(&self) -> Option<&DeviceSignals>;
 
     /// Returns the stable 64-char hex prefix, or `None` if no EC.
     /// 
@@ -365,6 +396,31 @@ This header is added to `INTERNAL_HEADERS` in `constants.rs` so it is stripped b
 
 ### 5.4 Per-request EC lifecycle
 
+**Phase 0 — bot gate** (always runs, all routes — pure in-memory, no KV I/O):
+
+```
+derive_device_signals(req)
+  ua = req.get_header_str("user-agent")
+  ja4 = req.get_tls_ja4()                   // Fastly SDK — full JA4 hash
+  h2_fp = req.get_client_h2_fingerprint()    // Fastly SDK — raw H2 SETTINGS string
+
+  DeviceSignals::derive(ua, ja4, h2_fp)
+    is_mobile = parse_is_mobile(ua)          // 0=desktop, 1=mobile, 2=unknown
+    ja4_class = extract_ja4_section1(ja4)    // split on '_', take [0]
+    platform_class = parse_platform_class(ua) // mac/windows/ios/android/linux/None
+    h2_fp_hash = sha256(h2_fp)[..6].hex()   // 12 hex chars
+    known_browser = evaluate_known_browser(ja4_class, h2_fp_hash) // allowlist match
+
+  is_known_browser = (known_browser == Some(true))
+
+  if !is_known_browser:
+    log::debug("Bot gate: blocking EC operations")
+    kv_graph = None                          // suppress all KV operations
+    // ec_finalize_response() will be skipped
+    // pull sync will be skipped
+    // request still proxied to origin normally
+```
+
 **Phase 1 — pre-routing** (always runs, all routes):
 
 ```
@@ -383,6 +439,8 @@ EcContext::read_from_request()
   // When ec_id is Some: consent KV fallback read + consent KV write (to consent store, not EC store).
   // When ec_id is None (first visit): no consent KV interaction — cookies/headers only.
   ec_generated = false
+
+  ec_context.set_device_signals(device_signals) // for KvDevice on creation
 ```
 
 **Phase 2 — inside organic handlers only** (`handle_publisher_request`, `handle_proxy`):
@@ -400,9 +458,12 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
             // no-ops if a live entry (ok=true) already exists
 ```
 
-**`ec_finalize_response(settings, geo, ec_context, &kv, response)` — always runs, all routes:**
+**`ec_finalize_response(settings, geo, ec_context, &kv, response)` — runs only when `is_known_browser == true`:**
 
 ```
+  // Bot gate: when known_browser != Some(true), this entire block is skipped.
+  // The response is proxied to origin without any cookie writes or KV operations.
+
   ├── !allows_ec_creation(&consent) && cookie_was_present?
   │       → clear_ec_on_response()             (delete cookie + strip ALL EC headers from response)
   │       → // Tombstone all known valid EC IDs. May be 0, 1, or 2 IDs.
@@ -502,21 +563,41 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 ```json
 {
   "v": 1,
-  "created": 1741824000,
-  "last_seen": 1741910400,
+  "created": 1775162556,
+  "last_seen": 1775162556,
   "consent": {
     "tcf": "CP...",
     "gpp": "DBA...",
     "ok": true,
-    "updated": 1741910400
+    "updated": 1775162556
   },
   "geo": {
     "country": "US",
-    "region": "CA"
+    "region": "TN",
+    "asn": 7922,
+    "dma": 659
+  },
+  "device": {
+    "is_mobile": 0,
+    "ja4_class": "t13d1516h2",
+    "platform_class": "mac",
+    "h2_fp_hash": "a3f9d21c8b04",
+    "known_browser": true
+  },
+  "pub_properties": {
+    "origin_domain": "autoblog.com",
+    "seen_domains": {
+      "autoblog.com": { "first": 1775162556, "last": 1775162556, "visits": 1 }
+    }
+  },
+  "network": {
+    "cluster_size": 2,
+    "cluster_checked": 1775162556
   },
   "ids": {
-    "ssp_x": { "uid": "abc123", "synced": 1741824000 },
-    "liveramp": { "uid": "LR_xyz", "synced": 1741890000 }
+    "id5": { "uid": "ID5*qe8VHv...", "synced": 1775162556 },
+    "trade_desk": { "uid": "226fb4b3-...", "synced": 1775162556 },
+    "liveramp_ats": { "uid": "Ag2z1TDA...", "synced": 1775162556 }
   }
 }
 ```
@@ -524,7 +605,14 @@ Two KV stores are used. Their names are configured in `trusted-server.toml`:
 **KV metadata (max 2048 bytes, readable without streaming body):**
 
 ```json
-{ "ok": true, "country": "US", "v": 1 }
+{
+  "ok": true,
+  "country": "US",
+  "v": 1,
+  "cluster_size": 2,
+  "is_mobile": 0,
+  "known_browser": true
+}
 ```
 
 The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /_ts/api/v1/sync`) can return `consent_withdrawn` rather than `ec_id_not_found` during the 24-hour tombstone TTL.
@@ -540,6 +628,16 @@ pub struct KvEntry {
     pub last_seen: u64,
     pub consent: KvConsent,
     pub geo: KvGeo,
+    /// Publisher domain history. Written on create; updated on organic requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pub_properties: Option<KvPubProperties>,
+    /// Device class signals. Written once on creation — never updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<KvDevice>,
+    /// Network cluster disambiguation. Written only by /identify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<KvNetwork>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ids: HashMap<String, KvPartnerId>,
 }
 
@@ -552,7 +650,15 @@ pub struct KvConsent {
 
 pub struct KvGeo {
     pub country: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Autonomous System Number (e.g. 7922 = Comcast).
+    /// Primary signal for distinguishing home ISP vs. corporate VPN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    /// DMA/metro code (e.g. 807 = San Francisco).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dma: Option<i64>,
 }
 
 pub struct KvPartnerId {
@@ -560,12 +666,71 @@ pub struct KvPartnerId {
     pub synced: u64,
 }
 
+/// Publisher domain history for consortium-level identity sharing.
+pub struct KvPubProperties {
+    /// Apex domain where this EC entry was first created.
+    pub origin_domain: String,
+    /// Per-domain visit history, keyed by apex domain.
+    /// Capped at 50 entries; new domains silently dropped at cap.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub seen_domains: HashMap<String, KvDomainVisit>,
+}
+
+pub struct KvDomainVisit {
+    pub first: u64,
+    pub last: u64,
+    pub visits: u32,
+}
+
+/// Coarse device signals derived from TLS handshake and UA.
+/// Written once on creation — never updated after.
+pub struct KvDevice {
+    /// 0 = desktop, 1 = mobile, 2 = unknown (non-standard client).
+    pub is_mobile: u8,
+    /// JA4 Section 1 only (e.g. "t13d1516h2" = Chrome).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_class: Option<String>,
+    /// Coarse OS family: "mac", "windows", "ios", "android", "linux".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_class: Option<String>,
+    /// SHA256 prefix (12 hex chars) of H2 SETTINGS fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_fp_hash: Option<String>,
+    /// true = known browser, false = known bot, None = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_browser: Option<bool>,
+}
+
+/// Network cluster disambiguation data.
+/// Written only by /identify — too expensive for organic hot path.
+pub struct KvNetwork {
+    /// Number of distinct EC suffixes sharing this hash prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_size: Option<u32>,
+    /// Unix timestamp of last cluster evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_checked: Option<u64>,
+}
+
 pub struct KvMetadata {
     pub ok: bool,
     pub country: String,
     pub v: u8,
+    /// Mirrors KvNetwork::cluster_size. None = not yet evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_size: Option<u32>,
+    /// Mirrors KvDevice::is_mobile. Enables propagation gating without body read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_mobile: Option<u8>,
+    /// Mirrors KvDevice::known_browser. Buyer-facing quality signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_browser: Option<bool>,
 }
 ```
+
+All new fields use `Option` types or `serde(default)`, so existing entries
+deserialize without error. No schema version bump is needed — v1 has not
+shipped yet.
 
 ### 7.3 TTL
 
@@ -665,19 +830,39 @@ impl KvIdentityGraph {
         synced: u64,
     ) -> Result<(), Report<TrustedServerError>>;
 
-    /// Updates `last_seen` timestamp, but only if the stored value is more than
-    /// 300 seconds older than `timestamp`. This debounce prevents KV write
-    /// thrashing under bursty traffic — Fastly KV enforces a 1 write/sec limit
-    /// per key. Callers should log `warn` on failure and continue.
-    ///
-    /// # Arguments
-    ///
-    /// * `ec_id` — The full EC ID (`{64-hex}.{6-alnum}`) used as the KV key.
+    /// Updates `last_seen` timestamp and publisher domain visit history.
+    /// Only writes if the stored `last_seen` is more than 300 seconds older
+    /// than `timestamp` (debounce to avoid 1 write/sec KV limit). When the
+    /// debounce fires, also updates `pub_properties.seen_domains` for the
+    /// given domain (incrementing `visits` and `last`, or inserting a new
+    /// entry up to the 50-domain cap). Callers should log `warn` on failure
+    /// and continue.
     pub fn update_last_seen(
         &self,
         ec_id: &str,
         timestamp: u64,
+        domain: &str,
     ) -> Result<(), Report<TrustedServerError>>;
+
+    /// Counts the number of KV keys sharing a hash prefix via the list API.
+    /// Uses a single-page list with `limit(100)`. Returns the count, or
+    /// `None` if the list exceeds 100 keys (clearly a large network).
+    pub fn count_hash_prefix_keys(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<Option<u32>, Report<TrustedServerError>>;
+
+    /// Evaluates the network cluster size for an EC entry.
+    ///
+    /// Skips evaluation if `cluster_checked` is within `cluster_recheck_secs`.
+    /// Otherwise calls `count_hash_prefix_keys()` and writes the result to
+    /// `entry.network` via CAS. Returns the cluster size for inclusion in
+    /// the `/identify` response.
+    pub fn evaluate_cluster(
+        &self,
+        ec_id: &str,
+        settings: &Settings,
+    ) -> Result<Option<u32>, Report<TrustedServerError>>;
 
     /// Writes a withdrawal tombstone for consent enforcement.
     ///
@@ -722,6 +907,266 @@ impl KvIdentityGraph {
 | `POST /_ts/api/v1/sync`            | KV error       | Return `207` with all mappings rejected, `reason: "kv_unavailable"`.                           |
 | Pull sync KV write                 | KV error       | Discard uid. Log `warn`. Retry on next qualifying request.                                     |
 | Consent withdrawal tombstone write | KV error       | Delete cookie (primary enforcement). Log `error`. Next request: no cookie → no EC regenerated. |
+
+---
+
+## 7A. Device Signals and Bot Gate
+
+### 7A.1 Overview
+
+Device signals provide coarse, non-PII browser classification derived from
+the TLS handshake and User-Agent header at the Fastly edge. They serve two
+purposes:
+
+1. **Bot gate** — block all KV identity operations for unrecognized clients
+   (bots, scrapers, non-standard HTTP clients). The request is still proxied
+   to the publisher origin normally — the bot receives valid HTML but leaves
+   no trace in the identity graph.
+2. **Device class record** — store a write-once `KvDevice` on each EC entry
+   for future cross-browser propagation decisions and buyer-facing device
+   quality scoring.
+
+All signal derivation is pure in-memory computation — no KV I/O. It runs on
+every request before EC context creation.
+
+### 7A.2 Signal derivation
+
+No Client Hints are used — JA4 and UA platform parsing provide equivalent or
+superior signal for every browser including Safari and Firefox, which do not
+send Client Hints.
+
+**`is_mobile`** — derived in priority order:
+
+| Condition                                      | Value                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------- |
+| UA contains `iPhone`, `iPad`, or `Android`     | `1` — confirmed mobile                                                     |
+| UA contains `Macintosh`, `Windows`, or `Linux` | `0` — confirmed desktop                                                    |
+| Neither pattern matches                        | `2` — genuinely unknown (rare; typically bots or heavily hardened clients) |
+
+Note: `is_mobile: 2` in practice signals a non-standard client rather than
+Safari, since Safari always produces a recognizable UA platform string.
+
+**`platform_class`** — coarse OS family parsed from UA (checked in order):
+
+| UA segment                         | `platform_class` |
+| ---------------------------------- | ---------------- |
+| `iPhone` or `iPad`                 | `ios`            |
+| `Android` (checked before `Linux`) | `android`        |
+| `Macintosh`                        | `mac`            |
+| `Windows NT`                       | `windows`        |
+| `Linux` (non-Android)              | `linux`          |
+| No match                           | `None`           |
+
+**`ja4_class`** — Section 1 of the JA4 fingerprint only (e.g. `t13d1516h2`).
+Available via `req.get_tls_ja4()` in the Fastly Compute Rust SDK. The full
+JA4 format is `section1_section2_section3` separated by underscores; we split
+on `_` and take `[0]`. Section 1 identifies browser family (cipher count,
+extension count, ALPN) without uniquely fingerprinting a device. The full JA4
+is never stored.
+
+**`h2_fp_hash`** — first 12 hex characters of SHA256 of the raw HTTP/2
+SETTINGS fingerprint string, available via `req.get_client_h2_fingerprint()`.
+Used alongside `ja4_class` to confirm browser family and detect bots.
+
+**`known_browser`** — set `true` when `ja4_class` + `h2_fp_hash` match a
+known legitimate browser pattern from the allowlist below. `None` when
+unknown. Both signals must be present for a match — if either is `None`,
+returns `None`.
+
+### 7A.3 Known browser fingerprint allowlist
+
+Empirically derived from Fastly Compute production responses (2026-04-03):
+
+| Browser                             | `ja4_class`  | `h2_fp` raw string               | `known_browser` |
+| ----------------------------------- | ------------ | -------------------------------- | --------------- |
+| Chrome/Mac (v146)                   | `t13d1516h2` | `1:65536;2:0;4:6291456;6:262144` | `true`          |
+| Safari/Mac (v26) + Safari/iOS (v26) | `t13d2013h2` | `2:0;3:100;4:2097152`            | `true`          |
+| Firefox/Mac (v149)                  | `t13d1717h2` | `1:65536;2:0;4:131072;5:16384`   | `true`          |
+
+Safari Mac and Safari iOS share identical TLS/H2 stacks — distinguished only
+by `platform_class` (`mac` vs `ios`) and `is_mobile` (`0` vs `1`).
+
+This allowlist will expand as new browser versions are observed in production.
+Entries not matching any allowlist row get `known_browser: None` (not `false`)
+unless they match a confirmed bot pattern.
+
+The allowlist comparison works by hashing the known raw H2 SETTINGS strings
+at evaluation time and comparing against the request's `h2_fp_hash`. The list
+is small (3 entries) so the cost is negligible.
+
+### 7A.4 Bot gate behavior
+
+Device signals gate all downstream KV and cookie operations:
+
+| `known_browser`  | KV entry created | Cookie set | Partner IDs written | Pull sync |
+| ---------------- | ---------------- | ---------- | ------------------- | --------- |
+| `true`           | Yes              | Yes        | Yes                 | Yes       |
+| `false`          | **No**           | **No**     | **No**              | **No**    |
+| `None` (unknown) | **No**           | **No**     | **No**              | **No**    |
+
+`None` (unrecognized client) is treated the same as `false`. An advertiser
+cannot bid on a session we cannot verify as human — allowing `None` entries
+into the identity graph would degrade buyer trust with no offsetting benefit.
+
+**Implementation in the Fastly adapter:**
+
+1. After `GeoInfo::from_request()`, call `derive_device_signals(req)` which
+   reads `User-Agent`, `req.get_tls_ja4()`, and
+   `req.get_client_h2_fingerprint()`.
+2. If `known_browser != Some(true)`:
+   - `kv_graph` is set to `None` (suppresses all KV reads and writes)
+   - `ec_finalize_response()` is skipped (no cookie set/deleted)
+   - Pull sync is skipped
+   - The request proceeds through normal routing — organic requests are
+     proxied to publisher origin, API endpoints respond normally (but
+     without EC identity data)
+3. If `known_browser == Some(true)`: proceed normally. Device signals are set
+   on `EcContext` via `set_device_signals()` so they flow through to
+   `KvEntry` creation.
+
+**Current bot response:** the request is served normally (proxied to origin)
+without any KV operations or cookie writes. The bot receives a valid HTML
+response but leaves no trace in the identity graph.
+
+### 7A.5 `DeviceSignals` struct
+
+```rust
+/// Device signals derived from a single request.
+/// Computed in the Fastly adapter from raw TLS/H2/UA data.
+pub struct DeviceSignals {
+    pub is_mobile: u8,
+    pub ja4_class: Option<String>,
+    pub platform_class: Option<String>,
+    pub h2_fp_hash: Option<String>,
+    pub known_browser: Option<bool>,
+}
+
+impl DeviceSignals {
+    /// Derives all device signals from raw request data.
+    pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self;
+
+    /// Converts to KvDevice for KV storage.
+    pub fn to_kv_device(&self) -> KvDevice;
+}
+```
+
+### 7A.6 `KvDevice` write policy
+
+`KvDevice` is written to `KvEntry.device` only during `generate_if_needed()`
+(new EC creation). It is never updated after creation — device signals are a
+first-seen record of how this EC entry was established.
+
+Existing entries (created before device signals were implemented) will have
+`device: None`. Downstream consumers must handle `None` as "pre-device-signals
+entry" rather than "unknown device."
+
+### 7A.7 Publisher domain history (`KvPubProperties`)
+
+Tracks which publisher properties a user has been seen on, keyed by apex domain.
+Enables consortium-level identity sharing without cross-site tracking: history
+only accumulates within a shared-passphrase group (same EC hash).
+
+```rust
+pub struct KvPubProperties {
+    pub origin_domain: String,
+    pub seen_domains: HashMap<String, KvDomainVisit>,
+}
+
+pub struct KvDomainVisit {
+    pub first: u64,
+    pub last: u64,
+    pub visits: u32,
+}
+```
+
+**Written:** on `create_or_revive` (sets `origin_domain`, adds first
+`seen_domains` entry). Updated on `update_last_seen` — the existing 300-second
+debounce applies, so `visits` and `last` are incremented at most once per 5
+minutes per key.
+
+**Cap:** `seen_domains` is capped at 50 entries (`MAX_SEEN_DOMAINS`). If the
+cap is reached, new domains are silently dropped (log at `debug`). This prevents
+unbounded growth for shared-passphrase consortiums with many properties.
+
+### 7A.8 Network cluster disambiguation (`KvNetwork`)
+
+Tracks how many distinct EC entries share the same hash prefix. A high count
+indicates a shared network (corporate VPN, campus); a low count indicates an
+individual or household.
+
+```rust
+pub struct KvNetwork {
+    pub cluster_size: Option<u32>,
+    pub cluster_checked: Option<u64>,
+}
+```
+
+**Written:** only by the `/identify` endpoint, never on the organic proxy path.
+The prefix-match list API call required to compute `cluster_size` is too
+expensive for the hot path.
+
+**Evaluation:** `evaluate_cluster()` on `KvIdentityGraph`:
+
+- Skips if `cluster_checked` is within `cluster_recheck_secs` (default 3600s)
+- Calls `count_hash_prefix_keys()` with `limit(100)` — a single list-page call
+- If the list exceeds 100 keys, `cluster_size` is `None` (clearly a large network)
+- Writes result to `entry.network` via CAS
+
+**Threshold guidance:**
+
+| Cluster size | Likely scenario                           |
+| ------------ | ----------------------------------------- |
+| 1–3          | Individual / household                    |
+| 4–10         | Small shared space (family, small office) |
+| 11–50        | Medium office, hotel, coworking           |
+| 50+          | Corporate VPN, university, campus         |
+
+**Default trust threshold:** entries with `cluster_size <= 10` are treated as
+individual users for identity resolution purposes. Configurable per publisher
+via `trusted-server.toml`:
+
+```toml
+[ec]
+cluster_trust_threshold = 10  # default
+cluster_recheck_secs = 3600   # default, 1 hour
+```
+
+### 7A.9 Geo extensions (`KvGeo`)
+
+`KvGeo` is extended with two non-PII network signals available from Fastly's
+`geo_lookup()` on the client IP:
+
+- **`asn: Option<u32>`** — Autonomous System Number (e.g. `7922` = Comcast).
+  Primary signal for distinguishing home ISP vs. corporate VPN. Populated from
+  `GeoInfo::asn` which reads `fastly::geo::Geo::as_number()`. A value of `0`
+  from the Fastly API is mapped to `None`.
+- **`dma: Option<i64>`** — DMA/metro code (e.g. `807` = San Francisco).
+  Market-level targeting signal; not personal data. Populated from
+  `GeoInfo::metro_code` when non-zero.
+
+Both fields are written on initial `KvEntry::new()` from `GeoInfo`. Never
+updated after creation — geo is a first-seen signal, not a real-time one.
+
+### 7A.10 IP address storage policy
+
+Raw IP addresses are personal data under GDPR (CJEU _Breyer v. Germany_, 2016)
+and must not be stored in KV entries. The EC hash already derives from the IP
+without persisting it.
+
+Permitted IP-derived signals (written at creation time):
+
+- `geo.country` — ISO 3166-1 alpha-2
+- `geo.region` — ISO 3166-2 subdivision
+- `geo.asn` — ASN number (network identifier, not personal data)
+- `geo.dma` — DMA/metro code (market identifier, not personal data)
+
+### 7A.11 Privacy rationale
+
+`ja4_class` (Section 1 only) and `platform_class` are category signals, not
+unique device identifiers. They are equivalent in precision to `geo.country`
+— they identify a class of client, not an individual. The full JA4 fingerprint
+(Sections 2 and 3) is never stored, as it approaches unique device
+identification and would require explicit consent basis under GDPR Art. 4(1).
 
 ---
 
@@ -1078,6 +1523,7 @@ Consent is evaluated using the same logic as Section 6.
   "ec": "a1b2c3...AbC123",
   "consent": "ok",
   "degraded": false,
+  "cluster_size": 2,
   "uids": {
     "uid2": "A4A...",
     "liveramp": "LR_xyz"
@@ -1089,6 +1535,11 @@ Consent is evaluated using the same logic as Section 6.
 }
 ```
 
+`cluster_size` is included when the network cluster has been evaluated (see
+§7A.8). `null` or absent when not yet evaluated.
+
+````
+
 `uids` contains one key per partner with `bidstream_enabled: true` and a resolved UID in the KV graph. Partners with no resolved UID for this user are omitted.
 
 **`200 OK` — KV unavailable (degraded):**
@@ -1098,10 +1549,11 @@ Consent is evaluated using the same logic as Section 6.
   "ec": "a1b2c3...AbC123",
   "consent": "ok",
   "degraded": true,
+  "cluster_size": null,
   "uids": {},
   "eids": []
 }
-```
+````
 
 **`200 OK` — EC present, KV entry missing (no synced partners yet):**
 
@@ -1112,6 +1564,7 @@ This case occurs by design when `create_or_revive()` fails on EC generation (bes
   "ec": "a1b2c3...AbC123",
   "consent": "ok",
   "degraded": false,
+  "cluster_size": null,
   "uids": {},
   "eids": []
 }
@@ -1139,6 +1592,7 @@ Set on `200` responses only:
 | `X-ts-eids`         | Standard base64 (RFC 4648, with `=` padding) of the JSON array of OpenRTB 2.6 `user.eids` objects. Capped at **4 KB** after encoding. If the encoded value exceeds 4 KB, the array is truncated (fewest partners first — highest `synced` timestamp retained) until it fits, and a `x-ts-eids-truncated: true` header is added. |
 | `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`). One header per partner with a resolved UID. **Capped at 20 partners** — partners sorted by most-recently synced; excess partners are omitted silently.                                                                                                                            |
 | `X-ts-ec-consent`   | `ok` (always — denied consent returns `403`, not `200`)                                                                                                                                                                                                                                                                         |
+| `x-ts-cluster-size` | The network cluster size as a decimal integer (e.g. `2`). Present only when `cluster_size` has been evaluated (see §7A.8). Enables proxy-layer trust decisions without parsing the JSON body.                                                                                                                                   |
 
 These are supplementary — callers should read the JSON body as the primary contract. The 4 KB cap on `X-ts-eids` and the 20-partner cap on `X-ts-<partner_id>` headers reflect typical proxy and browser total-header-budget constraints. Both caps apply independently.
 
@@ -1451,6 +1905,17 @@ pub struct EdgeCookie {
     #[validate(range(min = 1))]
     #[serde(default = "EdgeCookie::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
+
+    /// Network cluster trust threshold. Entries with `cluster_size <= threshold`
+    /// are treated as individual users for identity resolution purposes.
+    /// B2B publishers should raise this to 50+ for office-heavy audiences.
+    #[serde(default = "EdgeCookie::default_cluster_trust_threshold")]
+    pub cluster_trust_threshold: u32,
+
+    /// Seconds between cluster size re-evaluations per entry.
+    /// Avoids repeated list-prefix API calls on every /identify request.
+    #[serde(default = "EdgeCookie::default_cluster_recheck_secs")]
+    pub cluster_recheck_secs: u64,
 }
 
 impl EdgeCookie {
@@ -1461,6 +1926,8 @@ impl EdgeCookie {
     // Requires exactly 64 lowercase hex characters.
 
     fn default_pull_sync_concurrency() -> usize { 3 }
+    fn default_cluster_trust_threshold() -> u32 { 10 }
+    fn default_cluster_recheck_secs() -> u64 { 3600 }
 }
 ```
 
@@ -1485,6 +1952,8 @@ ec_store = "ec_identity_store"
 partner_store = "ec_partner_store"
 admin_token_hash = "sha256-hex-of-publisher-admin-token"
 pull_sync_concurrency = 3
+# cluster_trust_threshold = 10  # raise to 50+ for B2B publishers
+# cluster_recheck_secs = 3600   # 1 hour between cluster re-evaluations
 ```
 
 ### 14.3 Rate Limit Storage
@@ -1611,6 +2080,14 @@ This is a supported Fastly Compute pattern — `Response::send_to_client()` flus
 async fn route_request(...) -> Result<(), Error> {
     let geo_info = GeoInfo::from_request(&req);
 
+    // Phase 0 — bot gate (pure in-memory, no KV I/O). See §7A.
+    let device_signals = derive_device_signals(&req);
+    let is_known_browser = device_signals.known_browser == Some(true);
+    if !is_known_browser {
+        log::debug!("Bot gate: blocking EC operations (known_browser={:?})",
+            device_signals.known_browser);
+    }
+
     // Pre-routing — read only, no generation (matches GeoInfo pattern).
     // EcContext stores client_ip internally (same req.get_client_ip_addr()
     // already called by GeoInfo::from_request() above).
@@ -1618,20 +2095,30 @@ async fn route_request(...) -> Result<(), Error> {
     let mut ec_context = match ec_context_result {
         Ok(ctx) => ctx,
         Err(e) => {
-            // Pre-routing failure — no route matched yet, but we still need to
-            // send an HTTP error response. Construct one and flush immediately.
             log::error!("EcContext initialization failed: {e:?}");
             let mut response = to_error_response(&e);
             response.send_to_client();
             return Ok(());
         }
     };
-    let kv = KvIdentityGraph::new(&settings.ec.ec_store);
+
+    // Pass device signals through for KvDevice on creation.
+    ec_context.set_device_signals(device_signals);
+
+    // Bot gate: suppress all KV operations for unrecognized clients.
+    let kv = if is_known_browser {
+        Some(KvIdentityGraph::new(&settings.ec.ec_store))
+    } else {
+        None
+    };
     let partner_store = PartnerStore::new(&settings.ec.partner_store);
     let pull_sync_dispatcher = PullSyncDispatcher::new(settings.ec.pull_sync_concurrency);
 
     if let Some(mut response) = enforce_basic_auth(settings, &req) {
-        ec_finalize_response(settings, geo_info.as_ref(), &ec_context, &kv, &mut response);
+        // Bot gate: skip EC cookie writes for unrecognized clients.
+        if is_known_browser {
+            ec_finalize_response(settings, geo_info.as_ref(), &ec_context, kv.as_ref(), &mut response);
+        }
         response.send_to_client();
         return Ok(());
     }
@@ -1643,49 +2130,38 @@ async fn route_request(...) -> Result<(), Error> {
     // is_organic tracks whether pull sync should fire (organic routes only — §10.2).
     let mut is_organic = false;
     let result = match (method, path.as_str()) {
-        // EC-specific routes — all read-only except /sync which takes &mut.
-        // /sync may assign fallback consent into ec_context.consent when the
-        // query param is the only signal — see §8.3.
-        (GET, "/sync")              => handle_sync(settings, &kv, &partner_store, &req, &mut ec_context).await,
-        (GET, "/identify")          => handle_identify(settings, &kv, &partner_store, &req, &ec_context).await,
+        (GET, "/sync")              => handle_sync(settings, kv.as_ref(), &partner_store, &req, &mut ec_context).await,
+        (GET, "/identify")          => handle_identify(settings, kv.as_ref(), &partner_store, &req, &ec_context).await,
         (OPTIONS, "/identify")      => cors_preflight_identify(settings, &req),
-        (POST, "/_ts/api/v1/sync")      => handle_batch_sync(settings, &kv, &partner_store, req).await,
+        (POST, "/_ts/api/v1/sync")      => handle_batch_sync(settings, kv.as_ref(), &partner_store, req).await,
         (POST, "/_ts/admin/partners/register") => handle_register_partner(settings, &partner_store, req).await,
+        (POST, "/auction")          => handle_auction(settings, orchestrator, kv.as_ref(), req, &ec_context).await,
 
-        // /auction — EC-read-only; never generates EC.
-        // NOTE: handle_auction signature changes from (settings, orchestrator, req) to
-        // (settings, orchestrator, &kv, req, &ec_context) — this is a call-graph change,
-        // not just wiring. See §12 for the full auction integration.
-        (POST, "/auction")          => handle_auction(settings, orchestrator, &kv, req, &ec_context).await,
-
-        // Organic routes — generate EC if needed (best-effort, never 500s), then dispatch
         (m, path) if integration_registry.has_route(&m, path) => {
             is_organic = true;
-            ec_context.generate_if_needed(settings, &kv);
+            ec_context.generate_if_needed(settings, kv.as_ref());
             integration_registry.handle_proxy(&m, path, settings, req, &ec_context).await
         },
         _ => {
             is_organic = true;
-            ec_context.generate_if_needed(settings, &kv);
+            ec_context.generate_if_needed(settings, kv.as_ref());
             handle_publisher_request(settings, integration_registry, req, &ec_context)
         },
     };
 
-    // Unwrap result — errors become error responses (matches existing pattern)
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
-    // finalize_response runs on every route — enforces cookie write/deletion/last_seen
-    ec_finalize_response(settings, geo_info.as_ref(), &ec_context, &kv, &mut response);
+    // Bot gate: skip EC cookie writes and finalize for unrecognized clients.
+    if is_known_browser {
+        ec_finalize_response(settings, geo_info.as_ref(), &ec_context, kv.as_ref(), &mut response);
+    }
 
-    // Flush response to client; WASM continues for background pull sync.
     response.send_to_client();
 
-    // Background pull sync — organic routes only (§10.2). Never fires on /sync,
-    // /identify, /auction, /_ts/api/v1/sync, or /_ts/admin/* routes.
-    // Fires outbound HTTP calls via send_async(), blocks on PendingRequest::wait().
-    if is_organic {
+    // Background pull sync — organic routes only, known browsers only (§7A.4, §10.2).
+    if is_known_browser && is_organic {
         if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
-            pull_sync_dispatcher.dispatch_background(&ec_context, ip, &pull_partners, &kv);
+            pull_sync_dispatcher.dispatch_background(&ec_context, ip, &pull_partners, kv.as_ref());
         }
     }
 
