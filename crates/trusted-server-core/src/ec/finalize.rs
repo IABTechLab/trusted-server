@@ -67,7 +67,9 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            if let Err(err) = graph.update_last_seen(ec_id, current_timestamp()) {
+            if let Err(err) =
+                graph.update_last_seen(ec_id, current_timestamp(), &settings.publisher.domain)
+            {
                 log::error!("Failed to update last_seen for EC ID '{}': {err:?}", ec_id,);
             }
         }
