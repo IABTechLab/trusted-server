@@ -336,28 +336,29 @@ pub fn delete_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+fn make_test_context() -> ConsentContext {
+    ConsentContext {
+        raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
+        raw_gpp_string: Some("DBACNYA~CPXxGfA".to_owned()),
+        gpp_section_ids: Some(vec![2, 6]),
+        raw_us_privacy: Some("1YNN".to_owned()),
+        raw_ac_string: None,
+        gdpr_applies: true,
+        tcf: None,
+        gpp: None,
+        us_privacy: None,
+        expired: false,
+        gpc: false,
+        jurisdiction: Jurisdiction::Gdpr,
+        source: ConsentSource::Cookie,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-
-    fn make_test_context() -> ConsentContext {
-        ConsentContext {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            raw_gpp_string: Some("DBACNYA~CPXxGfA".to_owned()),
-            gpp_section_ids: Some(vec![2, 6]),
-            raw_us_privacy: Some("1YNN".to_owned()),
-            raw_ac_string: None,
-            gdpr_applies: true,
-            tcf: None,
-            gpp: None,
-            us_privacy: None,
-            expired: false,
-            gpc: false,
-            jurisdiction: Jurisdiction::Gdpr,
-            source: ConsentSource::Cookie,
-        }
-    }
 
     #[test]
     fn entry_roundtrip() {
@@ -536,27 +537,6 @@ mod new_api_tests {
 
     fn noop() -> NoopKvStore {
         NoopKvStore
-    }
-
-    fn make_test_context() -> ConsentContext {
-        use crate::consent::jurisdiction::Jurisdiction;
-        use crate::consent::types::ConsentSource;
-
-        ConsentContext {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            raw_gpp_string: Some("DBACNYA~CPXxGfA".to_owned()),
-            gpp_section_ids: Some(vec![2, 6]),
-            raw_us_privacy: Some("1YNN".to_owned()),
-            raw_ac_string: None,
-            gdpr_applies: true,
-            tcf: None,
-            gpp: None,
-            us_privacy: None,
-            expired: false,
-            gpc: false,
-            jurisdiction: Jurisdiction::Gdpr,
-            source: ConsentSource::Cookie,
-        }
     }
 
     #[test]
