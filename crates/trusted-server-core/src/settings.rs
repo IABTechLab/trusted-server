@@ -240,6 +240,17 @@ pub struct Ec {
     /// Maximum number of concurrent pull-sync requests.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
+
+    /// Entries with `cluster_size` at or below this value are treated as
+    /// individual users for identity resolution. B2B publishers should
+    /// raise this to 50+ since readers are frequently on office networks.
+    #[serde(default = "Ec::default_cluster_trust_threshold")]
+    pub cluster_trust_threshold: u32,
+
+    /// Seconds before re-evaluating an entry's `cluster_size`.
+    /// Re-check occurs only in the `/identify` endpoint.
+    #[serde(default = "Ec::default_cluster_recheck_secs")]
+    pub cluster_recheck_secs: u64,
 }
 
 impl Ec {
@@ -250,6 +261,18 @@ impl Ec {
     #[must_use]
     pub const fn default_pull_sync_concurrency() -> usize {
         3
+    }
+
+    /// Default cluster trust threshold.
+    #[must_use]
+    pub const fn default_cluster_trust_threshold() -> u32 {
+        10
+    }
+
+    /// Default cluster re-check interval (1 hour).
+    #[must_use]
+    pub const fn default_cluster_recheck_secs() -> u64 {
+        3600
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
