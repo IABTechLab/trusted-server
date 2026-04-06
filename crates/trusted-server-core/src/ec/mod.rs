@@ -18,6 +18,7 @@
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_types`] — Schema types for KV identity graph entries
+//! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
 //! - [`partner`] — Partner registry (`PartnerRecord`, `PartnerStore`)
 //! - [`admin`] — Admin endpoints for partner management
 //! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
@@ -30,6 +31,7 @@ pub mod admin;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
+pub mod device;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
@@ -52,6 +54,7 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::settings::Settings;
+use device::DeviceSignals;
 
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
@@ -154,6 +157,10 @@ pub struct EcContext {
     client_ip: Option<String>,
     /// Geo information captured pre-routing for downstream KV writes.
     geo_info: Option<GeoInfo>,
+    /// Device signals derived from TLS/H2/UA in the adapter layer.
+    /// Set via [`EcContext::set_device_signals`] before
+    /// [`EcContext::generate_if_needed`] is called.
+    device_signals: Option<DeviceSignals>,
 }
 
 impl EcContext {
@@ -228,6 +235,7 @@ impl EcContext {
             consent,
             client_ip,
             geo_info: geo_info.cloned(),
+            device_signals: None,
         })
     }
 
@@ -274,12 +282,16 @@ impl EcContext {
 
         if let (Some(graph), Some(ec_value)) = (kv, self.ec_value.as_deref()) {
             let now = current_timestamp();
-            let entry = KvEntry::new(
+            let mut entry = KvEntry::new(
                 &self.consent,
                 self.geo_info.as_ref(),
                 now,
                 &settings.publisher.domain,
             );
+            entry.device = self
+                .device_signals
+                .as_ref()
+                .map(DeviceSignals::to_kv_device);
 
             if let Err(err) = graph.create_or_revive(ec_value, &entry) {
                 log::error!(
@@ -330,6 +342,24 @@ impl EcContext {
     /// context.
     pub fn consent_mut(&mut self) -> &mut ConsentContext {
         &mut self.consent
+    }
+
+    /// Sets the device signals derived from the adapter layer.
+    ///
+    /// Must be called before [`generate_if_needed`] so that new entries
+    /// include the [`KvDevice`] record. The adapter derives these from
+    /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
+    ///
+    /// [`KvDevice`]: super::kv_types::KvDevice
+    /// [`generate_if_needed`]: Self::generate_if_needed
+    pub fn set_device_signals(&mut self, signals: DeviceSignals) {
+        self.device_signals = Some(signals);
+    }
+
+    /// Returns the device signals, if set.
+    #[must_use]
+    pub fn device_signals(&self) -> Option<&DeviceSignals> {
+        self.device_signals.as_ref()
     }
 
     /// Returns the normalized client IP, if available.
@@ -388,6 +418,7 @@ impl EcContext {
             consent,
             client_ip: None,
             geo_info: None,
+            device_signals: None,
         }
     }
 
@@ -407,6 +438,7 @@ impl EcContext {
             consent,
             client_ip,
             geo_info: None,
+            device_signals: None,
         }
     }
 
@@ -429,6 +461,7 @@ impl EcContext {
             consent,
             client_ip: None,
             geo_info: None,
+            device_signals: None,
         }
     }
 }
