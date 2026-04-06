@@ -1054,7 +1054,7 @@ mod tests {
             || {
                 temp_env::with_var(
                     env_key,
-                    Some(r#"{"criteo":{"networkId":112141,"pubid":"112141"}}"#),
+                    Some(r#"{"criteo":{"networkId":99999,"pubid":"server-pub"}}"#),
                     || {
                         let settings = Settings::from_toml_and_env(&toml_str)
                             .expect("Settings should parse with bidder param override env");
@@ -1067,12 +1067,12 @@ mod tests {
 
                         assert_eq!(
                             cfg_json["bid_param_overrides"]["criteo"]["networkId"],
-                            json!(112141),
+                            json!(99999),
                             "should deserialize networkId override from env JSON"
                         );
                         assert_eq!(
                             cfg_json["bid_param_overrides"]["criteo"]["pubid"],
-                            json!("112141"),
+                            json!("server-pub"),
                             "should deserialize pubid override from env JSON"
                         );
                     },

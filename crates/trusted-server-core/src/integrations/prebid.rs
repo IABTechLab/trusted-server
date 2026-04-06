@@ -120,14 +120,14 @@ pub struct PrebidIntegrationConfig {
     ///
     /// Example in TOML:
     /// ```toml
-    /// [integrations.prebid.bid_param_overrides.criteo]
-    /// networkId = 112141
-    /// pubid = "112141"
+    /// [integrations.prebid.bid_param_overrides.bidder-name]
+    /// param1 = 12345
+    /// param2 = "value"
     /// ```
     ///
     /// Example via environment variable:
     /// ```text
-    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":112141,"pubid":"112141"}}'
+    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"bidder-name":{"param1":12345,"param2":"value"}}'
     /// ```
     #[serde(default)]
     pub bid_param_overrides: HashMap<String, Json>,
@@ -2748,8 +2748,8 @@ server_url = "https://prebid.example"
 bidders = ["criteo"]
 
 [integrations.prebid.bid_param_overrides.criteo]
-networkId = 112141
-pubid = "112141"
+networkId = 99999
+pubid = "server-pub"
 "#,
         );
 
@@ -2757,8 +2757,8 @@ pubid = "112141"
             "ad-header-0",
             &json!({
                 "criteo": {
-                    "networkId": 11048,
-                    "pubid": "5254_4YG1PB",
+                    "networkId": 11111,
+                    "pubid": "client-pub",
                     "keep": "present"
                 }
             }),
@@ -2770,11 +2770,11 @@ pubid = "112141"
         let params = bidder_params(&ortb);
 
         assert_eq!(
-            params["criteo"]["networkId"], 112141,
+            params["criteo"]["networkId"], 99999,
             "override should replace the client-side networkId"
         );
         assert_eq!(
-            params["criteo"]["pubid"], "112141",
+            params["criteo"]["pubid"], "server-pub",
             "override should replace the client-side pubid"
         );
         assert_eq!(
