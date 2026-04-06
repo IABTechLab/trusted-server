@@ -264,7 +264,12 @@ impl EcContext {
 
         if let (Some(graph), Some(ec_value)) = (kv, self.ec_value.as_deref()) {
             let now = current_timestamp();
-            let entry = KvEntry::new(&self.consent, self.geo_info.as_ref(), now);
+            let entry = KvEntry::new(
+                &self.consent,
+                self.geo_info.as_ref(),
+                now,
+                &settings.publisher.domain,
+            );
 
             if let Err(err) = graph.create_or_revive(ec_value, &entry) {
                 log::error!(
