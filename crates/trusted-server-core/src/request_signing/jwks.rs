@@ -3,8 +3,6 @@
 //! This module provides functionality for generating, storing, and retrieving
 //! Ed25519 keypairs in JWK format for request signing.
 
-use std::sync::LazyLock;
-
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use error_stack::{Report, ResultExt};
 use jose_jwk::{
@@ -14,11 +12,8 @@ use jose_jwk::{
 use rand::rngs::OsRng;
 
 use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreName};
-use crate::request_signing::JWKS_CONFIG_STORE_NAME;
-
-static JWKS_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
+use crate::platform::RuntimeServices;
+use crate::request_signing::JWKS_STORE_NAME;
 
 /// An Ed25519 keypair used for request signing.
 pub struct Keypair {

@@ -1280,14 +1280,15 @@ mod tests {
         }
     }
 
+    static TEST_SERVICES: std::sync::LazyLock<crate::platform::RuntimeServices> =
+        std::sync::LazyLock::new(crate::platform::test_support::noop_services);
+
     fn create_test_auction_context<'a>(
         settings: &'a Settings,
         request: &'a Request,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
-        use crate::platform::test_support::noop_services;
-        let services: &'static crate::platform::RuntimeServices =
-            Box::leak(Box::new(noop_services()));
+        let services: &'static crate::platform::RuntimeServices = &TEST_SERVICES;
         AuctionContext {
             settings,
             request,

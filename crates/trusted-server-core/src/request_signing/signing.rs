@@ -3,22 +3,14 @@
 //! This module provides Ed25519-based signing and verification of HTTP requests
 //! using keys stored via platform store primitives.
 
-use std::sync::LazyLock;
-
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
 use error_stack::{Report, ResultExt};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreName};
-use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
-
-static JWKS_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
-
-static SIGNING_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(SIGNING_SECRET_STORE_NAME));
+use crate::platform::RuntimeServices;
+use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
 /// Retrieves the current active key ID from the config store.
 ///

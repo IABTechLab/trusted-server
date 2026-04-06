@@ -19,7 +19,6 @@
 use std::io::Read;
 
 use error_stack::{Report, ResultExt};
-use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
 
@@ -38,7 +37,7 @@ pub(crate) fn build_config_item_payload(value: &str) -> String {
 /// Backs the `put`/`delete` methods of [`FastlyPlatformConfigStore`] and
 /// the `create`/`delete` methods of [`FastlyPlatformSecretStore`].
 pub(crate) struct FastlyManagementApiClient {
-    api_key: Vec<u8>,
+    api_key: String,
     base_url: &'static str,
     backend_name: String,
 }
@@ -59,7 +58,7 @@ impl FastlyManagementApiClient {
             .attach("failed to register Fastly management API backend")?;
 
         let api_key = FastlyPlatformSecretStore
-            .get_bytes(&StoreName::from(API_KEYS_STORE), API_KEY_ENTRY)
+            .get_string(&StoreName::from(API_KEYS_STORE), API_KEY_ENTRY)
             .change_context(PlatformError::SecretStore)
             .attach("failed to read Fastly API key from secret store")?;
 
@@ -80,7 +79,6 @@ impl FastlyManagementApiClient {
         content_type: &str,
     ) -> Result<Response, Report<PlatformError>> {
         let url = format!("{}{}", self.base_url, path);
-        let api_key_str = String::from_utf8_lossy(&self.api_key).to_string();
 
         let mut request = match method {
             "GET" => Request::get(&url),
@@ -94,7 +92,7 @@ impl FastlyManagementApiClient {
         };
 
         request = request
-            .with_header("Fastly-Key", api_key_str)
+            .with_header("Fastly-Key", &self.api_key)
             .with_header("Accept", "application/json");
 
         if let Some(body_content) = body {
@@ -136,7 +134,7 @@ impl FastlyManagementApiClient {
             .read_to_string(&mut buf)
             .change_context(PlatformError::ConfigStore)?;
 
-        if response.get_status() == StatusCode::OK {
+        if response.get_status().is_success() {
             log::debug!(
                 "FastlyManagementApiClient: updated config key '{}' in store '{}'",
                 key,
@@ -145,8 +143,9 @@ impl FastlyManagementApiClient {
             Ok(())
         } else {
             Err(Report::new(PlatformError::ConfigStore).attach(format!(
-                "config item update failed with HTTP {} for key '{}' in store '{}'",
+                "config item update failed with HTTP {} - {} for key '{}' in store '{}'",
                 response.get_status(),
+                buf.trim(),
                 key,
                 store_id
             )))
@@ -173,9 +172,7 @@ impl FastlyManagementApiClient {
             .read_to_string(&mut buf)
             .change_context(PlatformError::ConfigStore)?;
 
-        if response.get_status() == StatusCode::OK
-            || response.get_status() == StatusCode::NO_CONTENT
-        {
+        if response.get_status().is_success() {
             log::debug!(
                 "FastlyManagementApiClient: deleted config key '{}' from store '{}'",
                 key,
@@ -184,8 +181,9 @@ impl FastlyManagementApiClient {
             Ok(())
         } else {
             Err(Report::new(PlatformError::ConfigStore).attach(format!(
-                "config item delete failed with HTTP {} for key '{}' in store '{}'",
+                "config item delete failed with HTTP {} - {} for key '{}' in store '{}'",
                 response.get_status(),
+                buf.trim(),
                 key,
                 store_id
             )))
@@ -218,7 +216,7 @@ impl FastlyManagementApiClient {
             .read_to_string(&mut buf)
             .change_context(PlatformError::SecretStore)?;
 
-        if response.get_status() == StatusCode::OK {
+        if response.get_status().is_success() {
             log::debug!(
                 "FastlyManagementApiClient: created secret '{}' in store '{}'",
                 secret_name,
@@ -227,8 +225,9 @@ impl FastlyManagementApiClient {
             Ok(())
         } else {
             Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret create failed with HTTP {} for name '{}' in store '{}'",
+                "secret create failed with HTTP {} - {} for name '{}' in store '{}'",
                 response.get_status(),
+                buf.trim(),
                 secret_name,
                 store_id
             )))
@@ -258,9 +257,7 @@ impl FastlyManagementApiClient {
             .read_to_string(&mut buf)
             .change_context(PlatformError::SecretStore)?;
 
-        if response.get_status() == StatusCode::OK
-            || response.get_status() == StatusCode::NO_CONTENT
-        {
+        if response.get_status().is_success() {
             log::debug!(
                 "FastlyManagementApiClient: deleted secret '{}' from store '{}'",
                 secret_name,
@@ -269,8 +266,9 @@ impl FastlyManagementApiClient {
             Ok(())
         } else {
             Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret delete failed with HTTP {} for name '{}' in store '{}'",
+                "secret delete failed with HTTP {} - {} for name '{}' in store '{}'",
                 response.get_status(),
+                buf.trim(),
                 secret_name,
                 store_id
             )))

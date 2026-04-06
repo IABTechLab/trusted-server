@@ -33,6 +33,15 @@ pub const JWKS_CONFIG_STORE_NAME: &str = "jwks_store";
 /// `[local_server.secret_stores]`.
 pub const SIGNING_SECRET_STORE_NAME: &str = "signing_keys";
 
+use crate::platform::StoreName;
+use std::sync::LazyLock;
+
+pub static JWKS_STORE_NAME: LazyLock<StoreName> =
+    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
+
+pub static SIGNING_STORE_NAME: LazyLock<StoreName> =
+    LazyLock::new(|| StoreName::from(SIGNING_SECRET_STORE_NAME));
+
 pub use discovery::*;
 pub use endpoints::*;
 pub use jwks::*;

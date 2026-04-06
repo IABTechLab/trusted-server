@@ -4,21 +4,15 @@
 //! lifecycle, and storing keys via platform store primitives through
 //! [`RuntimeServices`].
 
-use std::sync::LazyLock;
-
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
-use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreId, StoreName};
-use crate::request_signing::JWKS_CONFIG_STORE_NAME;
-
 use super::Keypair;
-
-static JWKS_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
+use crate::error::TrustedServerError;
+use crate::platform::{RuntimeServices, StoreId};
+use crate::request_signing::JWKS_STORE_NAME;
 
 #[derive(Debug, Clone)]
 pub struct KeyRotationResult {
