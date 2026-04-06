@@ -16,6 +16,10 @@ use crate::geo::GeoInfo;
 /// Current schema version for KV entries.
 pub const SCHEMA_VERSION: u8 = 1;
 
+/// Maximum number of domains tracked in [`KvPubProperties::seen_domains`].
+/// When the cap is reached, new domains are silently dropped.
+pub const MAX_SEEN_DOMAINS: usize = 50;
+
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
@@ -34,6 +38,12 @@ pub struct KvEntry {
     pub consent: KvConsent,
     /// Geo location sub-object.
     pub geo: KvGeo,
+    /// Publisher domain history for consortium-level identity sharing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pub_properties: Option<KvPubProperties>,
+    /// Network cluster disambiguation data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<KvNetwork>,
     /// Map of partner ID namespace → synced UID record.
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -63,6 +73,14 @@ pub struct KvGeo {
     /// ISO 3166-2 region code (e.g. `"CA"` for California).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Autonomous System Number (e.g. `7922` = Comcast).
+    /// Primary signal for distinguishing home ISP vs. corporate VPN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    /// DMA/metro code (e.g. `807` = San Francisco).
+    /// Market-level targeting signal; not personal data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dma: Option<i64>,
 }
 
 /// A synced partner user ID within a KV entry.
@@ -72,6 +90,53 @@ pub struct KvPartnerId {
     pub uid: String,
     /// Unix timestamp (seconds) when this UID was written/updated.
     pub synced: u64,
+}
+
+/// A single domain visit record within [`KvPubProperties::seen_domains`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvDomainVisit {
+    /// Unix timestamp (seconds) of first visit to this domain.
+    pub first: u64,
+    /// Unix timestamp (seconds) of most recent visit to this domain.
+    pub last: u64,
+    /// Lifetime visit count for this domain.
+    pub visits: u32,
+}
+
+/// Publisher domain history for consortium-level identity sharing.
+///
+/// Tracks which publisher properties a user has been seen on, keyed by apex
+/// domain. History only accumulates within a shared-passphrase group (same
+/// EC hash), so this does not enable cross-site tracking across unrelated
+/// publishers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvPubProperties {
+    /// Apex domain where this EC entry was first created.
+    pub origin_domain: String,
+    /// Per-domain visit history, keyed by apex domain.
+    /// Updated on each organic request; capped at [`MAX_SEEN_DOMAINS`] entries.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub seen_domains: HashMap<String, KvDomainVisit>,
+}
+
+/// Network cluster disambiguation data.
+///
+/// Tracks how many distinct EC entries share the same hash prefix. A high
+/// count indicates a shared network (corporate VPN, campus); a low count
+/// indicates an individual or household.
+///
+/// Written only by the `/identify` endpoint — the prefix-match list API
+/// call required to compute `cluster_size` is too expensive for the
+/// organic proxy hot path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvNetwork {
+    /// Number of distinct EC suffixes matching this hash prefix.
+    /// `None` = not yet evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_size: Option<u32>,
+    /// Unix timestamp (seconds) of last cluster check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_checked: Option<u64>,
 }
 
 /// Compact metadata stored alongside the KV entry body.
@@ -86,12 +151,28 @@ pub struct KvMetadata {
     pub country: String,
     /// Mirrors [`KvEntry::v`].
     pub v: u8,
+    /// Mirrors [`KvNetwork::cluster_size`]. `None` = not yet evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_size: Option<u32>,
 }
 
 impl KvEntry {
     /// Creates a new live entry from the current request context.
+    ///
+    /// `domain` is the publisher's apex domain (e.g. `"autoblog.com"`),
+    /// used to initialize the [`KvPubProperties`] origin and first visit.
     #[must_use]
-    pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64) -> Self {
+    pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
+        let mut seen_domains = HashMap::new();
+        seen_domains.insert(
+            domain.to_owned(),
+            KvDomainVisit {
+                first: now,
+                last: now,
+                visits: 1,
+            },
+        );
+
         Self {
             v: SCHEMA_VERSION,
             created: now,
@@ -103,6 +184,11 @@ impl KvEntry {
                 updated: now,
             },
             geo: KvGeo::from_geo_info(geo),
+            pub_properties: Some(KvPubProperties {
+                origin_domain: domain.to_owned(),
+                seen_domains,
+            }),
+            network: None,
             ids: HashMap::new(),
         }
     }
@@ -135,7 +221,11 @@ impl KvEntry {
             geo: KvGeo {
                 country: "ZZ".to_owned(),
                 region: None,
+                asn: None,
+                dma: None,
             },
+            pub_properties: None,
+            network: None,
             ids,
         }
     }
@@ -163,7 +253,11 @@ impl KvEntry {
             geo: KvGeo {
                 country: "ZZ".to_owned(),
                 region: None,
+                asn: None,
+                dma: None,
             },
+            pub_properties: None,
+            network: None,
             ids: HashMap::new(),
         }
     }
@@ -177,6 +271,7 @@ impl KvMetadata {
             ok: entry.consent.ok,
             country: entry.geo.country.clone(),
             v: entry.v,
+            cluster_size: entry.network.as_ref().and_then(|n| n.cluster_size),
         }
     }
 }
@@ -188,13 +283,24 @@ impl KvGeo {
     #[must_use]
     pub fn from_geo_info(geo: Option<&GeoInfo>) -> Self {
         match geo {
-            Some(info) => Self {
-                country: info.country.clone(),
-                region: info.region.clone(),
-            },
+            Some(info) => {
+                let dma = if info.metro_code > 0 {
+                    Some(info.metro_code)
+                } else {
+                    None
+                };
+                Self {
+                    country: info.country.clone(),
+                    region: info.region.clone(),
+                    asn: info.asn,
+                    dma,
+                }
+            }
             None => Self {
                 country: "ZZ".to_owned(),
                 region: None,
+                asn: None,
+                dma: None,
             },
         }
     }
@@ -221,6 +327,7 @@ mod tests {
             longitude: -122.4194,
             metro_code: 807,
             region: Some("CA".to_owned()),
+            asn: Some(7922),
         }
     }
 
@@ -228,7 +335,7 @@ mod tests {
     fn entry_serialization_roundtrip() {
         let geo = sample_geo_info();
         let consent = sample_consent_context();
-        let mut entry = KvEntry::new(&consent, Some(&geo), 1741824000);
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1741824000, "example.com");
         entry.ids.insert(
             "liveramp".to_owned(),
             KvPartnerId {
@@ -251,6 +358,8 @@ mod tests {
         assert!(deserialized.consent.ok, "should be a live entry");
         assert_eq!(deserialized.geo.country, "US");
         assert_eq!(deserialized.geo.region.as_deref(), Some("CA"));
+        assert_eq!(deserialized.geo.asn, Some(7922));
+        assert_eq!(deserialized.geo.dma, Some(807));
         assert_eq!(
             deserialized.ids.get("liveramp").map(|p| p.uid.as_str()),
             Some("LR_xyz"),
@@ -263,6 +372,7 @@ mod tests {
             ok: true,
             country: "US".to_owned(),
             v: 1,
+            cluster_size: None,
         };
 
         let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
@@ -272,15 +382,42 @@ mod tests {
         assert!(deserialized.ok, "should be ok=true");
         assert_eq!(deserialized.country, "US");
         assert_eq!(deserialized.v, 1);
+        assert!(deserialized.cluster_size.is_none());
+    }
+
+    #[test]
+    fn metadata_with_cluster_size_roundtrip() {
+        let meta = KvMetadata {
+            ok: true,
+            country: "US".to_owned(),
+            v: 1,
+            cluster_size: Some(3),
+        };
+
+        let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
+        let deserialized: KvMetadata =
+            serde_json::from_str(&json).expect("should deserialize KvMetadata");
+
+        assert_eq!(deserialized.cluster_size, Some(3));
+    }
+
+    #[test]
+    fn metadata_without_cluster_size_deserializes() {
+        // Simulates metadata stored before cluster_size was added.
+        let json = r#"{"ok":true,"country":"US","v":1}"#;
+        let meta: KvMetadata = serde_json::from_str(json).expect("should deserialize old metadata");
+
+        assert!(meta.cluster_size.is_none(), "should default to None");
     }
 
     #[test]
     fn metadata_fits_in_2048_bytes() {
-        // Worst case: long country code (though ISO 3166-1 is always 2 chars)
+        // Worst case: all fields populated.
         let meta = KvMetadata {
             ok: false,
             country: "XX".to_owned(),
             v: SCHEMA_VERSION,
+            cluster_size: Some(u32::MAX),
         };
         let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
         assert!(
@@ -294,7 +431,7 @@ mod tests {
     fn new_entry_has_correct_initial_state() {
         let consent = sample_consent_context();
         let geo = sample_geo_info();
-        let entry = KvEntry::new(&consent, Some(&geo), 1000);
+        let entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
 
         assert_eq!(entry.v, SCHEMA_VERSION);
         assert_eq!(entry.created, 1000);
@@ -303,17 +440,33 @@ mod tests {
         assert_eq!(entry.consent.updated, 1000);
         assert_eq!(entry.geo.country, "US");
         assert!(entry.ids.is_empty(), "should have no partner IDs initially");
+
+        let props = entry
+            .pub_properties
+            .as_ref()
+            .expect("should have pub_properties");
+        assert_eq!(props.origin_domain, "example.com");
+        assert_eq!(props.seen_domains.len(), 1);
+        let visit = props
+            .seen_domains
+            .get("example.com")
+            .expect("should have origin domain visit");
+        assert_eq!(visit.first, 1000);
+        assert_eq!(visit.last, 1000);
+        assert_eq!(visit.visits, 1);
     }
 
     #[test]
     fn new_entry_without_geo_uses_zz() {
         let consent = ConsentContext::default();
-        let entry = KvEntry::new(&consent, None, 1000);
+        let entry = KvEntry::new(&consent, None, 1000, "example.com");
         assert_eq!(
             entry.geo.country, "ZZ",
             "should use ZZ when geo is unavailable"
         );
         assert!(entry.geo.region.is_none());
+        assert!(entry.geo.asn.is_none());
+        assert!(entry.geo.dma.is_none());
     }
 
     #[test]
@@ -323,6 +476,10 @@ mod tests {
         assert_eq!(entry.v, SCHEMA_VERSION);
         assert!(entry.consent.ok, "should be a live entry");
         assert_eq!(entry.geo.country, "ZZ");
+        assert!(
+            entry.pub_properties.is_none(),
+            "minimal entry should have no pub_properties"
+        );
         assert_eq!(entry.ids.len(), 1);
         let partner = entry.ids.get("ssp_x").expect("should have ssp_x entry");
         assert_eq!(partner.uid, "abc123");
@@ -338,13 +495,17 @@ mod tests {
         assert!(entry.ids.is_empty(), "tombstone should have no partner IDs");
         assert_eq!(entry.geo.country, "ZZ");
         assert_eq!(entry.consent.updated, 1741910400);
+        assert!(
+            entry.pub_properties.is_none(),
+            "tombstone should have no pub_properties"
+        );
     }
 
     #[test]
     fn metadata_from_entry_mirrors_fields() {
         let consent = sample_consent_context();
         let geo = sample_geo_info();
-        let entry = KvEntry::new(&consent, Some(&geo), 1000);
+        let entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
         let meta = KvMetadata::from_entry(&entry);
 
         assert_eq!(meta.ok, entry.consent.ok);
@@ -381,6 +542,202 @@ mod tests {
         assert!(
             !json.contains("\"gpp\""),
             "None gpp should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn none_geo_fields_omitted_from_json() {
+        let entry = KvEntry::tombstone(1000);
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        assert!(
+            !json.contains("\"asn\""),
+            "None asn should be omitted from JSON"
+        );
+        assert!(
+            !json.contains("\"dma\""),
+            "None dma should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn geo_with_asn_and_dma_roundtrips() {
+        let geo = KvGeo {
+            country: "US".to_owned(),
+            region: Some("CA".to_owned()),
+            asn: Some(7922),
+            dma: Some(807),
+        };
+        let json = serde_json::to_string(&geo).expect("should serialize KvGeo");
+        let deserialized: KvGeo = serde_json::from_str(&json).expect("should deserialize KvGeo");
+
+        assert_eq!(deserialized.asn, Some(7922));
+        assert_eq!(deserialized.dma, Some(807));
+    }
+
+    #[test]
+    fn geo_without_asn_deserializes_from_v1_json() {
+        // Simulates a KvGeo stored before asn/dma fields were added.
+        let v1_json = r#"{"country":"US","region":"CA"}"#;
+        let geo: KvGeo = serde_json::from_str(v1_json).expect("should deserialize v1 KvGeo");
+
+        assert_eq!(geo.country, "US");
+        assert_eq!(geo.region.as_deref(), Some("CA"));
+        assert!(geo.asn.is_none(), "asn should default to None");
+        assert!(geo.dma.is_none(), "dma should default to None");
+    }
+
+    #[test]
+    fn pub_properties_roundtrip() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let entry = KvEntry::new(&consent, Some(&geo), 1000, "autoblog.com");
+
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        let deserialized: KvEntry = serde_json::from_str(&json).expect("should deserialize");
+
+        let props = deserialized
+            .pub_properties
+            .expect("should have pub_properties");
+        assert_eq!(props.origin_domain, "autoblog.com");
+        assert_eq!(props.seen_domains.len(), 1);
+        let visit = props
+            .seen_domains
+            .get("autoblog.com")
+            .expect("should have origin visit");
+        assert_eq!(visit.first, 1000);
+        assert_eq!(visit.last, 1000);
+        assert_eq!(visit.visits, 1);
+    }
+
+    #[test]
+    fn none_pub_properties_omitted_from_json() {
+        let entry = KvEntry::tombstone(1000);
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        assert!(
+            !json.contains("\"pub_properties\""),
+            "None pub_properties should be omitted from JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn entry_without_pub_properties_deserializes() {
+        // Simulates an entry stored before pub_properties was added.
+        let json = r#"{
+            "v": 1,
+            "created": 1000,
+            "last_seen": 1000,
+            "consent": { "ok": true, "updated": 1000 },
+            "geo": { "country": "US" }
+        }"#;
+        let entry: KvEntry =
+            serde_json::from_str(json).expect("should deserialize entry without pub_properties");
+
+        assert!(
+            entry.pub_properties.is_none(),
+            "missing pub_properties should deserialize as None"
+        );
+    }
+
+    #[test]
+    fn domain_visit_roundtrip() {
+        let visit = KvDomainVisit {
+            first: 1000,
+            last: 2000,
+            visits: 5,
+        };
+        let json = serde_json::to_string(&visit).expect("should serialize");
+        let deserialized: KvDomainVisit = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(deserialized.first, 1000);
+        assert_eq!(deserialized.last, 2000);
+        assert_eq!(deserialized.visits, 5);
+    }
+
+    #[test]
+    fn network_roundtrip() {
+        let network = KvNetwork {
+            cluster_size: Some(3),
+            cluster_checked: Some(1774921179),
+        };
+        let json = serde_json::to_string(&network).expect("should serialize KvNetwork");
+        let deserialized: KvNetwork =
+            serde_json::from_str(&json).expect("should deserialize KvNetwork");
+
+        assert_eq!(deserialized.cluster_size, Some(3));
+        assert_eq!(deserialized.cluster_checked, Some(1774921179));
+    }
+
+    #[test]
+    fn network_none_fields_omitted_from_json() {
+        let network = KvNetwork {
+            cluster_size: None,
+            cluster_checked: None,
+        };
+        let json = serde_json::to_string(&network).expect("should serialize");
+        assert!(
+            !json.contains("\"cluster_size\""),
+            "None cluster_size should be omitted, got: {json}"
+        );
+        assert!(
+            !json.contains("\"cluster_checked\""),
+            "None cluster_checked should be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn none_network_omitted_from_entry_json() {
+        let entry = KvEntry::tombstone(1000);
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        assert!(
+            !json.contains("\"network\""),
+            "None network should be omitted from JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn entry_without_network_deserializes() {
+        // Simulates an entry stored before network was added.
+        let json = r#"{
+            "v": 1,
+            "created": 1000,
+            "last_seen": 1000,
+            "consent": { "ok": true, "updated": 1000 },
+            "geo": { "country": "US" }
+        }"#;
+        let entry: KvEntry =
+            serde_json::from_str(json).expect("should deserialize entry without network");
+
+        assert!(
+            entry.network.is_none(),
+            "missing network should deserialize as None"
+        );
+    }
+
+    #[test]
+    fn metadata_from_entry_mirrors_cluster_size() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
+        entry.network = Some(KvNetwork {
+            cluster_size: Some(5),
+            cluster_checked: Some(1000),
+        });
+
+        let meta = KvMetadata::from_entry(&entry);
+        assert_eq!(
+            meta.cluster_size,
+            Some(5),
+            "metadata should mirror entry network cluster_size"
+        );
+    }
+
+    #[test]
+    fn metadata_from_entry_without_network_has_none_cluster_size() {
+        let entry = KvEntry::tombstone(1000);
+        let meta = KvMetadata::from_entry(&entry);
+        assert!(
+            meta.cluster_size.is_none(),
+            "metadata should have None cluster_size when entry has no network"
         );
     }
 }
