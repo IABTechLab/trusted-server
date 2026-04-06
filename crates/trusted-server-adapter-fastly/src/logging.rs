@@ -2,10 +2,9 @@ use chrono::{Local, SecondsFormat};
 use log_fastly::Logger;
 
 pub(crate) fn target_label(target: &str) -> &str {
-    target.split("::").last().unwrap_or(target)
+    target.rsplit_once("::").map_or(target, |(_, last)| last)
 }
 
-#[allow(dead_code)]
 pub(crate) fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
@@ -15,13 +14,13 @@ pub(crate) fn init_logger() {
         .expect("should build Logger");
 
     fern::Dispatch::new()
-        .format(|out, _message, record| {
+        .format(|out, message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
                 Local::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 record.level(),
                 target_label(record.target()),
-                record.args()
+                message
             ));
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
@@ -34,11 +33,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_label_uses_last_target_segment() {
+    fn target_label_extracts_correct_segment() {
         assert_eq!(
             target_label("trusted_server_adapter_fastly::proxy"),
             "proxy",
-            "should use the final target segment"
+            "should handle standard single-separator case"
         );
+        assert_eq!(
+            target_label("foo::bar::baz"),
+            "baz",
+            "should handle multiple separators"
+        );
+        assert_eq!(
+            target_label("no_separators_here"),
+            "no_separators_here",
+            "should handle inputs without ::"
+        );
+        assert_eq!(target_label(""), "", "should handle empty strings");
+        assert_eq!(target_label("trailing::"), "", "should handle trailing ::");
     }
 }
