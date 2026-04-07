@@ -186,7 +186,7 @@ fn json_response<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let body = serde_json::to_string(body).change_context(TrustedServerError::Configuration {
+    let body = serde_json::to_string(body).change_context(TrustedServerError::EdgeCookie {
         message: "Failed to serialize identify response".to_owned(),
     })?;
 

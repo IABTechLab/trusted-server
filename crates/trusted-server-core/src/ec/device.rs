@@ -175,15 +175,17 @@ const KNOWN_BROWSERS: &[(&str, &str, bool)] = &[
     ("t13d1717h2", "1:65536;2:0;4:131072;5:16384", true),
 ];
 
-/// Computes H2 fingerprint hashes for the known browser allowlist.
+/// Returns H2 fingerprint hashes for the known browser allowlist.
 ///
-/// Recomputed on each call — the list is tiny (3 entries) so the cost
-/// is negligible compared to any KV I/O.
-fn known_browser_h2_hashes() -> Vec<(&'static str, String, bool)> {
-    KNOWN_BROWSERS
-        .iter()
-        .map(|(ja4, h2_raw, known)| (*ja4, compute_h2_fp_hash(h2_raw), *known))
-        .collect()
+/// Computed once on first call and cached via `OnceLock`.
+fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
+    static CACHE: std::sync::OnceLock<Vec<(&str, String, bool)>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        KNOWN_BROWSERS
+            .iter()
+            .map(|(ja4, h2_raw, known)| (*ja4, compute_h2_fp_hash(h2_raw), *known))
+            .collect()
+    })
 }
 
 /// Evaluates whether a request comes from a known browser.
@@ -199,8 +201,7 @@ pub fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>)
     let ja4 = ja4_class?;
     let h2_hash = h2_fp_hash?;
 
-    let hashes = known_browser_h2_hashes();
-    for (known_ja4, known_h2_hash, is_browser) in &hashes {
+    for (known_ja4, known_h2_hash, is_browser) in known_browser_h2_hashes() {
         if ja4 == *known_ja4 && h2_hash == *known_h2_hash {
             return Some(*is_browser);
         }

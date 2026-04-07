@@ -18,9 +18,9 @@ use crate::settings::Settings;
 pub fn copy_custom_headers(from: &Request, to: &mut Request) {
     for header_name in from.get_header_names() {
         let name_str = header_name.as_str();
-        // Header names are lowercased by the HTTP library, so a single
-        // prefix check covers both `x-ts-` and `X-ts-` variants.
-        if (name_str.starts_with("x-") || name_str.starts_with("X-"))
+        // Header names are lowercased by the HTTP library (fastly crate),
+        // so only the lowercase prefix check is needed.
+        if name_str.starts_with("x-")
             && !name_str.starts_with("x-ts-")
             && !INTERNAL_HEADERS.contains(&name_str)
         {
@@ -81,6 +81,9 @@ pub fn is_navigation_request(req: &Request) -> bool {
 
     // Fallback for clients that don't send Fetch Metadata headers:
     // only match an explicit text/html (not */* which fonts also send).
+    // This path is weaker — `fetch()` can set Accept: text/html — so log
+    // it for monitoring how many clients lack Sec-Fetch-Dest.
+    log::debug!("is_navigation_request: Sec-Fetch-Dest absent, falling back to Accept header");
     req.get_header(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|accept| {
