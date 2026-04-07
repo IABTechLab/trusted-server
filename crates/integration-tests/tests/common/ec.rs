@@ -32,6 +32,10 @@ pub struct EcTestClient {
     client: Client,
     pub base_url: String,
     /// The active `ts-ec` cookie value, updated after each response.
+    ///
+    /// Uses `RefCell` for interior mutability because the test runner is
+    /// single-threaded. This would need to become `Arc<Mutex<..>>` if tests
+    /// are ever parallelized.
     ec_cookie: std::cell::RefCell<Option<String>>,
 }
 

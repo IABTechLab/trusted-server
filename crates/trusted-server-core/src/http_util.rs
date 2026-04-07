@@ -18,6 +18,8 @@ use crate::settings::Settings;
 pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>) {
     for (header_name, value) in from.headers() {
         let name_str = header_name.as_str();
+        // Header names are normalized by the HTTP library,
+        // so only the lowercase prefix check is needed.
         if name_str.starts_with("x-")
             && !name_str.starts_with("x-ts-")
             && !INTERNAL_HEADERS.contains(&name_str)
@@ -78,7 +80,11 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
 
     // Fallback for clients that don't send Fetch Metadata headers:
     // only match an explicit text/html (not */* which fonts also send).
-    req.headers().get(header::ACCEPT)
+    // This path is weaker — `fetch()` can set Accept: text/html — so log
+    // it for monitoring how many clients lack Sec-Fetch-Dest.
+    log::debug!("is_navigation_request: Sec-Fetch-Dest absent, falling back to Accept header");
+    req.headers()
+        .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|accept| {
             accept.split(',').any(|part| {

@@ -260,6 +260,12 @@ fn process_mappings(
     (accepted, errors)
 }
 
+/// Normalizes an EC ID for use as a KV key by lowercasing the hash prefix.
+///
+/// `hex::encode` (used in `generate_ec_id`) always produces lowercase hex,
+/// so internal EC IDs are already lowercase. This normalization is a
+/// defense-in-depth measure for EC IDs submitted by external partners
+/// (via batch sync) that may use uppercase hex.
 fn normalize_ec_id_for_kv(ec_id: &str) -> String {
     let mut parts = ec_id.splitn(2, '.');
     let hash = parts.next().unwrap_or_default();

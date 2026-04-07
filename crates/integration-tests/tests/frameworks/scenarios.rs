@@ -569,6 +569,12 @@ fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
     // 2. Second request with GPC=1 should revoke consent and expire the EC
     // cookie. This endpoint was selected because step #1 proved EC was
     // allowed for this client in the active runtime config.
+    //
+    // Implementation note: this works because GPC + no geo headers →
+    // `Jurisdiction::Unknown` → fail-closed → consent denied. If the
+    // consent engine ever becomes more permissive for Unknown jurisdictions,
+    // this test should be updated to use an explicit GDPR consent denial
+    // (e.g. a TCF string with denied purposes).
     let resp = client.get_with_headers("/", &[("sec-gpc", "1")])?;
 
     if !is_ec_cookie_expired(&resp) {

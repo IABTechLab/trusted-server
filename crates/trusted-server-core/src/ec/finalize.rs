@@ -10,7 +10,6 @@ use fastly::Response;
 use crate::consent::allows_ec_creation;
 use crate::consent::kv::delete_consent_from_kv;
 use crate::constants::HEADER_X_TS_EC;
-use crate::geo::GeoInfo;
 use crate::settings::Settings;
 
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
@@ -33,7 +32,6 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// and cookie writes for new EC generation.
 pub fn ec_finalize_response(
     settings: &Settings,
-    _geo_info: Option<&GeoInfo>, // reserved for future route-specific finalize behavior
     ec_context: &EcContext,
     kv: Option<&KvIdentityGraph>,
     response: &mut Response,
@@ -233,7 +231,7 @@ mod tests {
         response.set_header("x-ts-ec", "stale");
         response.set_header("x-ts-eids", "[]");
 
-        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+        ec_finalize_response(&settings, &ec_context, None, &mut response);
 
         assert!(
             response.get_header("x-ts-ec").is_none(),
@@ -268,7 +266,7 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+        ec_finalize_response(&settings, &ec_context, None, &mut response);
 
         let header = response
             .get_header("x-ts-ec")
@@ -301,7 +299,7 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+        ec_finalize_response(&settings, &ec_context, None, &mut response);
 
         let header = response
             .get_header("x-ts-ec")
@@ -334,7 +332,7 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+        ec_finalize_response(&settings, &ec_context, None, &mut response);
 
         let header = response
             .get_header("x-ts-ec")
@@ -355,7 +353,7 @@ mod tests {
         let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, None, &ec_context, None, &mut response);
+        ec_finalize_response(&settings, &ec_context, None, &mut response);
 
         assert!(
             response.get_header("x-ts-ec").is_none(),
