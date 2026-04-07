@@ -45,7 +45,7 @@ mod platform;
 mod route_tests;
 
 use crate::error::to_error_response;
-use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+use crate::platform::{build_runtime_services, UnavailableKvStore};
 
 fn main() -> Result<(), Error> {
     init_logger();
@@ -90,6 +90,13 @@ fn main() -> Result<(), Error> {
         }
     };
 
+    // Start with an unavailable KV slot. Consent-dependent routes lazily
+    // replace it with the configured store at dispatch time so unrelated
+    // routes stay available when consent persistence is misconfigured.
+    let kv_store = std::sync::Arc::new(UnavailableKvStore)
+        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
+    let runtime_services = build_runtime_services(&req, kv_store);
+
     let outcome = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
@@ -131,6 +138,7 @@ async fn route_request(
     sanitize_forwarded_headers(&mut req);
 
     // Extract geo info before auth check or routing consumes the request.
+    #[allow(deprecated)]
     let geo_info = GeoInfo::from_request(&req);
 
     // Derive device signals from TLS/H2/UA for bot detection.
@@ -228,9 +236,10 @@ async fn route_request(
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
-        (Method::GET, "/.well-known/trusted-server.json") => {
-            (handle_trusted_server_discovery(settings, req), false)
-        }
+        (Method::GET, "/.well-known/trusted-server.json") => (
+            handle_trusted_server_discovery(settings, runtime_services, req),
+            false,
+        ),
 
         // Signature verification endpoint
         (Method::POST, "/verify-signature") => (handle_verify_signature(settings, req), false),

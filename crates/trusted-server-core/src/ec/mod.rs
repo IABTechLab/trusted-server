@@ -167,6 +167,7 @@ impl EcContext {
         settings: &Settings,
         req: &Request,
     ) -> Result<Self, Report<TrustedServerError>> {
+        #[allow(deprecated)]
         let geo_info = GeoInfo::from_request(req);
         Self::read_from_request_with_geo(settings, req, geo_info.as_ref())
     }
@@ -211,6 +212,7 @@ impl EcContext {
             config: &settings.consent,
             geo: geo_info,
             ec_id: ec_value.as_deref(),
+            kv_store: None, // EC module manages its own KV identity graph
         });
 
         Ok(Self {
