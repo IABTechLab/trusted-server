@@ -196,13 +196,7 @@ async fn route_request(
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
             if is_real_browser {
-                ec_finalize_response(
-                    settings,
-                    geo_info.as_ref(),
-                    &ec_context,
-                    kv_graph.as_ref(),
-                    &mut response,
-                );
+                ec_finalize_response(settings, &ec_context, kv_graph.as_ref(), &mut response);
             }
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
@@ -345,13 +339,7 @@ async fn route_request(
 
     // Bot gate: skip EC cookie writes and pull sync for unrecognized clients.
     if is_real_browser {
-        ec_finalize_response(
-            settings,
-            geo_info.as_ref(),
-            &ec_context,
-            kv_graph.as_ref(),
-            &mut response,
-        );
+        ec_finalize_response(settings, &ec_context, kv_graph.as_ref(), &mut response);
     }
 
     finalize_response(settings, geo_info.as_ref(), &mut response);

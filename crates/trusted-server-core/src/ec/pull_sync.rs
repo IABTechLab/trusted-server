@@ -334,7 +334,9 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
         }
     };
 
-    const MAX_UID_LENGTH: usize = 256;
+    // Must match MAX_UID_LENGTH in sync_pixel.rs / batch_sync.rs so that
+    // partners see a consistent limit regardless of sync mechanism.
+    const MAX_UID_LENGTH: usize = 512;
 
     let uid = payload.uid.filter(|value| !value.is_empty());
     match uid {
@@ -526,12 +528,12 @@ mod tests {
 
     #[test]
     fn extract_pull_uid_rejects_oversized_uid() {
-        let long_uid = "x".repeat(257);
+        let long_uid = "x".repeat(513);
         let body = format!("{{\"uid\":\"{long_uid}\"}}");
         let response = fastly::Response::from_status(StatusCode::OK).with_body(body);
 
         let uid = extract_pull_uid(response, "ssp_x");
-        assert!(uid.is_none(), "should reject uid exceeding 256 bytes");
+        assert!(uid.is_none(), "should reject uid exceeding 512 bytes");
     }
 
     #[test]

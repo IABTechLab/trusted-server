@@ -532,6 +532,13 @@ impl PartnerStore {
     /// Reads the current index, adds or removes the partner ID, and writes
     /// it back. All errors are logged and swallowed — the primary record
     /// write has already succeeded.
+    ///
+    /// **Race condition:** This performs a read-modify-write without CAS.
+    /// Concurrent partner registrations can overwrite each other's index
+    /// updates (last write wins). The index is self-healing: any lost entry
+    /// will be re-added on the next `upsert()` for that partner, and
+    /// `pull_enabled_partners()` falls back to `list_registered()` when the
+    /// index is missing or stale.
     fn update_pull_enabled_index(
         &self,
         store: &KVStore,
