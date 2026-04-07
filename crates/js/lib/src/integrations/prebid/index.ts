@@ -243,6 +243,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         bidderParams[bid.bidder] = bid.params ?? {};
       }
 
+      // Keep only bids that should still execute in the browser. All other
+      // bidders are routed through the trustedServer adapter.
+      unit.bids = unit.bids.filter(
+        (bid) => bid?.bidder === ADAPTER_CODE || clientSideBidders.has(bid?.bidder ?? '')
+      );
+
       // WORKAROUND: Read the zone from mediaTypes.banner.name. This is NOT a
       // standard Prebid.js field — publishers must add it as a custom property
       // in their ad unit config. The server uses it to apply zone-specific
