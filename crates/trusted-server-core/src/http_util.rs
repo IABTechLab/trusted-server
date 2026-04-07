@@ -1,10 +1,11 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
-use fastly::http::{header, StatusCode};
-use fastly::{Request, Response};
+use edgezero_core::body::Body;
+use http::{header, StatusCode};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use crate::compat::{TlsCipher, TlsProtocol};
 use crate::constants::INTERNAL_HEADERS;
 use crate::settings::Settings;
 
@@ -14,15 +15,13 @@ use crate::settings::Settings;
 /// internal identity, geo-enrichment, and debugging data to downstream third-party
 /// services. Integrations that forward custom headers should use this utility
 /// instead of manually iterating over header names.
-pub fn copy_custom_headers(from: &Request, to: &mut Request) {
-    for header_name in from.get_header_names() {
+pub fn copy_custom_headers(from: &http::Request<Body>, to: &mut http::Request<Body>) {
+    for (header_name, value) in from.headers() {
         let name_str = header_name.as_str();
         if (name_str.starts_with("x-") || name_str.starts_with("X-"))
             && !INTERNAL_HEADERS.contains(&name_str)
         {
-            if let Some(value) = from.get_header(header_name) {
-                to.set_header(header_name, value);
-            }
+            to.headers_mut().insert(header_name.clone(), value.clone());
         }
     }
 }
@@ -32,7 +31,7 @@ pub fn copy_custom_headers(from: &Request, to: &mut Request) {
 /// On Fastly Compute the service is the edge — there is no upstream proxy that
 /// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
 /// to fall back to the trustworthy `Host` header and Fastly SDK TLS detection.
-const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
+pub(crate) const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
     "x-forwarded-proto",
@@ -44,11 +43,11 @@ const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
 /// Call this at the edge entry point (before routing) to prevent
 /// `X-Forwarded-Host: evil.com` from hijacking all URL rewriting.
 /// See <https://github.com/IABTechLab/trusted-server/issues/409>.
-pub fn sanitize_forwarded_headers(req: &mut Request) {
+pub fn sanitize_forwarded_headers(req: &mut http::Request<Body>) {
     for header in SPOOFABLE_FORWARDED_HEADERS {
-        if req.get_header(*header).is_some() {
+        if req.headers().contains_key(*header) {
             log::debug!("Stripped spoofable header: {}", header);
-            req.remove_header(*header);
+            req.headers_mut().remove(*header);
         }
     }
 }
@@ -70,7 +69,7 @@ pub struct RequestInfo {
 }
 
 impl RequestInfo {
-    /// Extract request info from a Fastly request.
+    /// Extract request info from an HTTP request.
     ///
     /// Host fallback order (first present wins):
     /// 1. `Forwarded` header (`host=...`)
@@ -78,7 +77,7 @@ impl RequestInfo {
     /// 3. `Host` header
     ///
     /// Scheme fallback order:
-    /// 1. Fastly SDK TLS detection
+    /// 1. Fastly SDK TLS detection (via [`TlsProtocol`] / [`TlsCipher`] extensions)
     /// 2. `Forwarded` header (`proto=...`)
     /// 3. `X-Forwarded-Proto`
     /// 4. `Fastly-SSL`
@@ -87,7 +86,7 @@ impl RequestInfo {
     /// In production the forwarded headers are stripped by
     /// [`sanitize_forwarded_headers`] at the edge, so `Host` and SDK TLS
     /// detection are the only sources that fire.
-    pub fn from_request(req: &Request) -> Self {
+    pub fn from_request(req: &http::Request<Body>) -> Self {
         let host = extract_request_host(req);
         let scheme = detect_request_scheme(req);
 
@@ -95,18 +94,18 @@ impl RequestInfo {
     }
 }
 
-fn extract_request_host(req: &Request) -> String {
-    req.get_header("forwarded")
-        .and_then(|h| h.to_str().ok())
+fn extract_request_host(req: &http::Request<Body>) -> String {
+    get_header_str(req, "forwarded")
         .and_then(|value| parse_forwarded_param(value, "host"))
-        .or_else(|| {
-            req.get_header("x-forwarded-host")
-                .and_then(|h| h.to_str().ok())
-                .and_then(parse_list_header_value)
-        })
-        .or_else(|| req.get_header(header::HOST).and_then(|h| h.to_str().ok()))
+        .or_else(|| get_header_str(req, "x-forwarded-host").and_then(parse_list_header_value))
+        .or_else(|| get_header_str(req, header::HOST.as_str()))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Get a header value as `&str`, returning `None` if absent or non-UTF-8.
+fn get_header_str<'a>(req: &'a http::Request<Body>, name: &str) -> Option<&'a str> {
+    req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 fn parse_forwarded_param<'a>(forwarded: &'a str, param: &str) -> Option<&'a str> {
@@ -156,55 +155,47 @@ fn normalize_scheme(value: &str) -> Option<String> {
     }
 }
 
-/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
+/// Detects the request scheme (HTTP or HTTPS).
 ///
-/// Tries multiple methods in order of reliability:
-/// 1. Fastly SDK TLS detection methods (most reliable)
-/// 2. Forwarded header (RFC 7239)
-/// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (least reliable, can be spoofed)
+/// Tries multiple sources in order of reliability:
+/// 1. Fastly SDK TLS info stored in [`TlsProtocol`] / [`TlsCipher`] request extensions
+/// 2. `Forwarded` header (RFC 7239)
+/// 3. `X-Forwarded-Proto` header
+/// 4. `Fastly-SSL` header (least reliable, can be spoofed)
 /// 5. Default to HTTP
-fn detect_request_scheme(req: &Request) -> String {
-    // 1. First try Fastly SDK's built-in TLS detection methods
-    if let Some(tls_protocol) = req.get_tls_protocol() {
-        log::debug!("TLS protocol detected: {}", tls_protocol);
+fn detect_request_scheme(req: &http::Request<Body>) -> String {
+    // 1. Check Fastly TLS extensions populated by `compat::from_fastly_request_ref`.
+    if let Some(TlsProtocol(Some(_))) = req.extensions().get::<TlsProtocol>() {
+        log::debug!("TLS protocol detected via extension");
         return "https".to_string();
     }
-
-    // Also check TLS cipher - if present, connection is HTTPS
-    if req.get_tls_cipher_openssl_name().is_some() {
-        log::debug!("TLS cipher detected, using HTTPS");
+    if let Some(TlsCipher(Some(_))) = req.extensions().get::<TlsCipher>() {
+        log::debug!("TLS cipher detected via extension, using HTTPS");
         return "https".to_string();
     }
 
     // 2. Try the Forwarded header (RFC 7239)
-    if let Some(forwarded) = req.get_header("forwarded") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(proto) = parse_forwarded_param(forwarded_str, "proto") {
-                if let Some(scheme) = normalize_scheme(proto) {
-                    return scheme;
-                }
+    if let Some(forwarded_str) = get_header_str(req, "forwarded") {
+        if let Some(proto) = parse_forwarded_param(forwarded_str, "proto") {
+            if let Some(scheme) = normalize_scheme(proto) {
+                return scheme;
             }
         }
     }
 
     // 3. Try X-Forwarded-Proto header
-    if let Some(proto) = req.get_header("x-forwarded-proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            if let Some(value) = parse_list_header_value(proto_str) {
-                if let Some(scheme) = normalize_scheme(value) {
-                    return scheme;
-                }
+    if let Some(proto_str) = get_header_str(req, "x-forwarded-proto") {
+        if let Some(value) = parse_list_header_value(proto_str) {
+            if let Some(scheme) = normalize_scheme(value) {
+                return scheme;
             }
         }
     }
 
     // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
-    if let Some(ssl) = req.get_header("fastly-ssl") {
-        if let Ok(ssl_str) = ssl.to_str() {
-            if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
-                return "https".to_string();
-            }
+    if let Some(ssl_str) = get_header_str(req, "fastly-ssl") {
+        if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
+            return "https".to_string();
         }
     }
 
@@ -214,38 +205,48 @@ fn detect_request_scheme(req: &Request) -> String {
 
 /// Build a static text response with strong `ETag` and standard caching headers.
 /// Handles If-None-Match to return 304 when appropriate.
-pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> Response {
+///
+/// # Panics
+///
+/// Panics if the `http::Response` builder fails (unreachable with valid status codes and headers).
+pub fn serve_static_with_etag(
+    body: &str,
+    req: &http::Request<Body>,
+    content_type: &str,
+) -> http::Response<Body> {
     // Compute ETag for conditional caching
     let hash = Sha256::digest(body.as_bytes());
     let etag = format!("\"sha256-{}\"", hex::encode(hash));
 
     // If-None-Match handling for 304 responses
-    if let Some(if_none_match) = req
-        .get_header(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-    {
+    if let Some(if_none_match) = get_header_str(req, header::IF_NONE_MATCH.as_str()) {
         if if_none_match == etag {
-            return Response::from_status(StatusCode::NOT_MODIFIED)
-                .with_header(header::ETAG, &etag)
-                .with_header(
+            return http::Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, &etag)
+                .header(
                     header::CACHE_CONTROL,
                     "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
                 )
-                .with_header("surrogate-control", "max-age=300")
-                .with_header(header::VARY, "Accept-Encoding");
+                .header("surrogate-control", "max-age=300")
+                .header(header::VARY, "Accept-Encoding")
+                .body(Body::empty())
+                .expect("should build 304 response");
         }
     }
 
-    Response::from_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, content_type)
-        .with_header(
+    http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
             header::CACHE_CONTROL,
             "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
         )
-        .with_header("surrogate-control", "max-age=300")
-        .with_header(header::ETAG, &etag)
-        .with_header(header::VARY, "Accept-Encoding")
-        .with_body(body)
+        .header("surrogate-control", "max-age=300")
+        .header(header::ETAG, &etag)
+        .header(header::VARY, "Accept-Encoding")
+        .body(Body::from(body.to_string()))
+        .expect("should build 200 response with body")
 }
 
 /// Encrypts a URL using XChaCha20-Poly1305 with a key derived from the publisher `proxy_secret`.
@@ -377,6 +378,20 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
 mod tests {
     use super::*;
 
+    fn make_request_with_header(
+        method: &str,
+        uri: &str,
+        name: &str,
+        value: &str,
+    ) -> http::Request<Body> {
+        http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(name, value)
+            .body(Body::empty())
+            .expect("should build test request with header")
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let settings = crate::test_support::tests::create_test_settings();
@@ -444,26 +459,34 @@ mod tests {
 
     #[test]
     fn test_request_info_from_host_header() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
-        req.set_header("host", "test.example.com");
+        let req = make_request_with_header(
+            "GET",
+            "https://test.example.com/page",
+            "host",
+            "test.example.com",
+        );
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
             info.host, "test.example.com",
             "Host should use Host header when forwarded headers are missing"
         );
-        // No TLS or forwarded headers, defaults to http.
+        // No TLS extensions, defaults to http.
         assert_eq!(
             info.scheme, "http",
-            "Scheme should default to http without TLS or forwarded headers"
+            "Scheme should default to http without TLS extensions or forwarded headers"
         );
     }
 
     #[test]
     fn test_request_info_x_forwarded_host_precedence() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
-        req.set_header("host", "internal-proxy.local");
-        req.set_header("x-forwarded-host", "public.example.com, proxy.local");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://test.example.com/page")
+            .header("host", "internal-proxy.local")
+            .header("x-forwarded-host", "public.example.com, proxy.local")
+            .body(Body::empty())
+            .expect("should build test request");
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
@@ -474,9 +497,13 @@ mod tests {
 
     #[test]
     fn test_request_info_scheme_from_x_forwarded_proto() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
-        req.set_header("host", "test.example.com");
-        req.set_header("x-forwarded-proto", "https, http");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://test.example.com/page")
+            .header("host", "test.example.com")
+            .header("x-forwarded-proto", "https, http")
+            .body(Body::empty())
+            .expect("should build test request");
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
@@ -484,14 +511,17 @@ mod tests {
             "Scheme should prefer the first X-Forwarded-Proto value"
         );
 
-        // Test HTTP
-        let mut req = Request::new(fastly::http::Method::GET, "http://test.example.com/page");
-        req.set_header("host", "test.example.com");
-        req.set_header("x-forwarded-proto", "http");
+        let req2 = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example.com/page")
+            .header("host", "test.example.com")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .expect("should build test request");
 
-        let info = RequestInfo::from_request(&req);
+        let info2 = RequestInfo::from_request(&req2);
         assert_eq!(
-            info.scheme, "http",
+            info2.scheme, "http",
             "Scheme should use the X-Forwarded-Proto value when present"
         );
     }
@@ -499,14 +529,18 @@ mod tests {
     #[test]
     fn request_info_forwarded_header_precedence() {
         // Forwarded header takes precedence over X-Forwarded-Proto
-        let mut req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
-        req.set_header(
-            "forwarded",
-            "for=192.0.2.60;proto=\"HTTPS\";host=\"public.example.com:443\"",
-        );
-        req.set_header("host", "internal-proxy.local");
-        req.set_header("x-forwarded-host", "proxy.local");
-        req.set_header("x-forwarded-proto", "http");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://test.example.com/page")
+            .header(
+                "forwarded",
+                "for=192.0.2.60;proto=\"HTTPS\";host=\"public.example.com:443\"",
+            )
+            .header("host", "internal-proxy.local")
+            .header("x-forwarded-host", "proxy.local")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .expect("should build test request");
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
@@ -521,8 +555,8 @@ mod tests {
 
     #[test]
     fn test_request_info_scheme_from_fastly_ssl() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://test.example.com/page");
-        req.set_header("fastly-ssl", "1");
+        let req =
+            make_request_with_header("GET", "https://test.example.com/page", "fastly-ssl", "1");
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
@@ -534,14 +568,14 @@ mod tests {
     #[test]
     fn test_request_info_chained_proxy_scenario() {
         // Simulate: Client (HTTPS) -> Proxy A -> Trusted Server (HTTP internally)
-        // Proxy A sets X-Forwarded-Host and X-Forwarded-Proto
-        let mut req = Request::new(
-            fastly::http::Method::GET,
-            "http://trusted-server.internal/page",
-        );
-        req.set_header("host", "trusted-server.internal");
-        req.set_header("x-forwarded-host", "public.example.com");
-        req.set_header("x-forwarded-proto", "https");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://trusted-server.internal/page")
+            .header("host", "trusted-server.internal")
+            .header("x-forwarded-host", "public.example.com")
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .expect("should build test request");
 
         let info = RequestInfo::from_request(&req);
         assert_eq!(
@@ -558,33 +592,38 @@ mod tests {
 
     #[test]
     fn sanitize_removes_all_spoofable_headers() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://example.com/page");
-        req.set_header("host", "legit.example.com");
-        req.set_header("forwarded", "host=evil.com;proto=https");
-        req.set_header("x-forwarded-host", "evil.com");
-        req.set_header("x-forwarded-proto", "https");
-        req.set_header("fastly-ssl", "1");
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/page")
+            .header("host", "legit.example.com")
+            .header("forwarded", "host=evil.com;proto=https")
+            .header("x-forwarded-host", "evil.com")
+            .header("x-forwarded-proto", "https")
+            .header("fastly-ssl", "1")
+            .body(Body::empty())
+            .expect("should build test request");
 
         sanitize_forwarded_headers(&mut req);
 
         assert!(
-            req.get_header("forwarded").is_none(),
+            req.headers().get("forwarded").is_none(),
             "should strip Forwarded header"
         );
         assert!(
-            req.get_header("x-forwarded-host").is_none(),
+            req.headers().get("x-forwarded-host").is_none(),
             "should strip X-Forwarded-Host header"
         );
         assert!(
-            req.get_header("x-forwarded-proto").is_none(),
+            req.headers().get("x-forwarded-proto").is_none(),
             "should strip X-Forwarded-Proto header"
         );
         assert!(
-            req.get_header("fastly-ssl").is_none(),
+            req.headers().get("fastly-ssl").is_none(),
             "should strip Fastly-SSL header"
         );
         assert_eq!(
-            req.get_header("host")
+            req.headers()
+                .get("host")
                 .expect("should have Host header")
                 .to_str()
                 .expect("should be valid UTF-8"),
@@ -595,10 +634,14 @@ mod tests {
 
     #[test]
     fn sanitize_then_request_info_falls_back_to_host() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://example.com/page");
-        req.set_header("host", "legit.example.com");
-        req.set_header("x-forwarded-host", "evil.com");
-        req.set_header("x-forwarded-proto", "http");
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/page")
+            .header("host", "legit.example.com")
+            .header("x-forwarded-host", "evil.com")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .expect("should build test request");
 
         sanitize_forwarded_headers(&mut req);
         let info = RequestInfo::from_request(&req);
@@ -633,32 +676,40 @@ mod tests {
 
     #[test]
     fn test_copy_custom_headers_filters_internal() {
-        let mut req = Request::new(fastly::http::Method::GET, "https://example.com");
-        req.set_header("x-custom-1", "value1");
-        // HeaderName is case-insensitive and always lowercase, but set_header accepts strings
-        req.set_header("X-Custom-2", "value2");
-        req.set_header("x-ts-ec", "should not copy");
-        req.set_header("x-geo-country", "US");
+        let from = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com")
+            .header("x-custom-1", "value1")
+            .header("x-custom-2", "value2")
+            .header("x-ts-ec", "should not copy")
+            .header("x-geo-country", "US")
+            .body(Body::empty())
+            .expect("should build from request");
 
-        let mut target = Request::new(fastly::http::Method::GET, "https://target.com");
-        copy_custom_headers(&req, &mut target);
+        let mut to = http::Request::builder()
+            .method("GET")
+            .uri("https://target.com")
+            .body(Body::empty())
+            .expect("should build to request");
+
+        copy_custom_headers(&from, &mut to);
 
         assert_eq!(
-            target.get_header("x-custom-1").unwrap().to_str().unwrap(),
+            to.headers().get("x-custom-1").unwrap().to_str().unwrap(),
             "value1",
             "Should copy arbitrary x-header"
         );
         assert_eq!(
-            target.get_header("x-custom-2").unwrap().to_str().unwrap(),
+            to.headers().get("x-custom-2").unwrap().to_str().unwrap(),
             "value2",
-            "Should copy arbitrary X-header (case insensitive)"
+            "Should copy arbitrary x-header (case preserved in lookup)"
         );
         assert!(
-            target.get_header("x-ts-ec").is_none(),
+            to.headers().get("x-ts-ec").is_none(),
             "Should filter x-ts-ec"
         );
         assert!(
-            target.get_header("x-geo-country").is_none(),
+            to.headers().get("x-geo-country").is_none(),
             "Should filter x-geo-country"
         );
     }

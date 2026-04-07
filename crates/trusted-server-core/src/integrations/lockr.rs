@@ -17,9 +17,8 @@ use serde::Deserialize;
 use validator::Validate;
 
 use crate::backend::BackendConfig;
-use crate::cookies::forward_cookie_header;
+use crate::compat;
 use crate::error::TrustedServerError;
-use crate::http_util::copy_custom_headers;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -235,7 +234,7 @@ impl LockrIntegration {
         }
 
         // Always strip consent cookies — consent travels through the OpenRTB body
-        forward_cookie_header(from, to, true);
+        compat::forward_cookie_header_fastly(from, to, true);
 
         // Use origin override if configured, otherwise forward original
         let origin = self
@@ -247,7 +246,7 @@ impl LockrIntegration {
             to.set_header(header::ORIGIN, origin);
         }
 
-        copy_custom_headers(from, to);
+        compat::copy_custom_headers_fastly(from, to);
     }
 }
 

@@ -6,9 +6,9 @@
 use std::borrow::Cow;
 
 use cookie::{Cookie, CookieJar};
+use edgezero_core::body::Body;
 use error_stack::{Report, ResultExt};
-use fastly::http::header;
-use fastly::Request;
+use http::header;
 
 use crate::constants::{
     COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EC, COOKIE_US_PRIVACY,
@@ -97,9 +97,9 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if the Cookie header contains invalid UTF-8
 pub fn handle_request_cookies(
-    req: &Request,
+    req: &http::Request<Body>,
 ) -> Result<Option<CookieJar>, Report<TrustedServerError>> {
-    match req.get_header(header::COOKIE) {
+    match req.headers().get(header::COOKIE) {
         Some(header_value) => {
             let header_value_str =
                 header_value
@@ -146,13 +146,18 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
 /// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
 /// are removed before forwarding. If stripping leaves no cookies, the header
 /// is omitted entirely. Non-UTF-8 cookie headers are forwarded unchanged.
-pub fn forward_cookie_header(from: &Request, to: &mut Request, strip_consent: bool) {
-    let Some(cookie_value) = from.get_header(header::COOKIE) else {
+pub fn forward_cookie_header(
+    from: &http::Request<Body>,
+    to: &mut http::Request<Body>,
+    strip_consent: bool,
+) {
+    let Some(cookie_value) = from.headers().get(header::COOKIE) else {
         return;
     };
 
     if !strip_consent {
-        to.set_header(header::COOKIE, cookie_value);
+        to.headers_mut()
+            .insert(header::COOKIE, cookie_value.clone());
         return;
     }
 
@@ -160,12 +165,15 @@ pub fn forward_cookie_header(from: &Request, to: &mut Request, strip_consent: bo
         Ok(s) => {
             let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
             if !stripped.is_empty() {
-                to.set_header(header::COOKIE, &stripped);
+                if let Ok(val) = http::HeaderValue::from_str(&stripped) {
+                    to.headers_mut().insert(header::COOKIE, val);
+                }
             }
         }
         Err(_) => {
             // Non-UTF-8 Cookie header — forward as-is
-            to.set_header(header::COOKIE, cookie_value);
+            to.headers_mut()
+                .insert(header::COOKIE, cookie_value.clone());
         }
     }
 }
@@ -246,7 +254,7 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// from injecting spurious cookie attributes via a controlled ID value.
 ///
 /// `cookie_domain` comes from operator configuration and is considered trusted.
-pub fn set_ec_cookie(settings: &Settings, response: &mut fastly::Response, ec_id: &str) {
+pub fn set_ec_cookie(settings: &Settings, response: &mut http::Response<Body>, ec_id: &str) {
     if !is_safe_cookie_value(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
@@ -254,16 +262,21 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut fastly::Response, ec_id
         );
         return;
     }
-    response.append_header(header::SET_COOKIE, create_ec_cookie(settings, ec_id));
+    let cookie_str = create_ec_cookie(settings, ec_id);
+    if let Ok(val) = http::HeaderValue::from_str(&cookie_str) {
+        response.headers_mut().append(header::SET_COOKIE, val);
+    }
 }
 
 /// Expires the EC cookie by setting `Max-Age=0`.
 ///
 /// Used when a user revokes consent — the browser will delete the cookie
 /// on receipt of this header.
-pub fn expire_ec_cookie(settings: &Settings, response: &mut fastly::Response) {
-    let cookie = format!("{}=; {}", COOKIE_TS_EC, ec_cookie_attributes(settings, 0),);
-    response.append_header(header::SET_COOKIE, cookie);
+pub fn expire_ec_cookie(settings: &Settings, response: &mut http::Response<Body>) {
+    let cookie = format!("{}=; {}", COOKIE_TS_EC, ec_cookie_attributes(settings, 0));
+    if let Ok(val) = http::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, val);
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +284,22 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
 
     use super::*;
+
+    fn make_request_with_cookie(cookie_value: &str) -> http::Request<Body> {
+        http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header(header::COOKIE, cookie_value)
+            .body(Body::empty())
+            .expect("should build test request with cookie")
+    }
+
+    fn make_empty_response() -> http::Response<Body> {
+        http::Response::builder()
+            .status(200)
+            .body(Body::empty())
+            .expect("should build empty response")
+    }
 
     #[test]
     fn test_parse_cookies_to_jar() {
@@ -309,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "c1=v1;c2=v2");
+        let req = make_request_with_cookie("c1=v1;c2=v2");
         let jar = handle_request_cookies(&req)
             .expect("should parse cookies")
             .expect("should have cookie jar");
@@ -321,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_with_empty_cookie() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "");
+        let req = make_request_with_cookie("");
         let jar = handle_request_cookies(&req)
             .expect("should parse cookies")
             .expect("should have cookie jar");
@@ -331,7 +360,11 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_no_cookie_header() {
-        let req: Request = Request::get("https://example.com");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com")
+            .body(Body::empty())
+            .expect("should build request without cookie");
         let jar = handle_request_cookies(&req).expect("should handle missing cookie header");
 
         assert!(jar.is_none());
@@ -339,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_invalid_cookie_header() {
-        let req = Request::get("http://example.com").with_header(header::COOKIE, "invalid");
+        let req = make_request_with_cookie("invalid");
         let jar = handle_request_cookies(&req)
             .expect("should parse cookies")
             .expect("should have cookie jar");
@@ -350,11 +383,12 @@ mod tests {
     #[test]
     fn test_set_ec_cookie() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = make_empty_response();
         set_ec_cookie(&settings, &mut response, "abc123.XyZ789");
 
         let cookie_str = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("Set-Cookie header should be present")
             .to_str()
             .expect("header should be valid UTF-8");
@@ -403,11 +437,11 @@ mod tests {
     #[test]
     fn test_set_ec_cookie_rejects_semicolon() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = make_empty_response();
         set_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "Set-Cookie should not be set when value contains a semicolon"
         );
     }
@@ -415,11 +449,11 @@ mod tests {
     #[test]
     fn test_set_ec_cookie_rejects_crlf() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = make_empty_response();
         set_ec_cookie(&settings, &mut response, "evil\r\nX-Injected: header");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "Set-Cookie should not be set when value contains CRLF"
         );
     }
@@ -427,11 +461,11 @@ mod tests {
     #[test]
     fn test_set_ec_cookie_rejects_space() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = make_empty_response();
         set_ec_cookie(&settings, &mut response, "bad value");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "Set-Cookie should not be set when value contains whitespace"
         );
     }
@@ -481,12 +515,13 @@ mod tests {
     #[test]
     fn test_expire_ec_cookie_matches_security_attributes() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = make_empty_response();
 
         expire_ec_cookie(&settings, &mut response);
 
         let cookie_header = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("Set-Cookie header should be present");
         let cookie_str = cookie_header
             .to_str()

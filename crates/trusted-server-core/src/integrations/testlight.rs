@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::edge_cookie::get_ec_id;
+use crate::compat;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -149,7 +149,7 @@ impl IntegrationProxy for TestlightIntegration {
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
         // Read EC ID from header (set by registry) or cookie
-        let ec_id = get_ec_id(&req)
+        let ec_id = compat::get_ec_id_fastly(&req)
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(

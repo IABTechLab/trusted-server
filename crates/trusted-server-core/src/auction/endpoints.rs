@@ -4,9 +4,8 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::compat;
 use crate::consent;
-use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
@@ -49,13 +48,14 @@ pub async fn handle_auction(
 
     // Generate EC ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
-    let ec_id =
-        get_or_generate_ec_id(settings, &req).change_context(TrustedServerError::Auction {
+    let ec_id = compat::get_or_generate_ec_id_fastly(settings, &req).change_context(
+        TrustedServerError::Auction {
             message: "Failed to generate EC ID".to_string(),
-        })?;
+        },
+    )?;
 
     // Extract consent from request cookies, headers, and geo.
-    let cookie_jar = handle_request_cookies(&req)?;
+    let cookie_jar = compat::handle_request_cookies_fastly(&req)?;
     #[allow(deprecated)]
     let geo = GeoInfo::from_request(&req);
     let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {

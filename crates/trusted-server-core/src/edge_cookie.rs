@@ -5,12 +5,13 @@
 
 use std::net::IpAddr;
 
+use edgezero_core::body::Body;
 use error_stack::{Report, ResultExt};
-use fastly::Request;
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
+use crate::compat::ClientIpExt;
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
 use crate::cookies::{ec_id_has_only_allowed_chars, handle_request_cookies};
 use crate::error::TrustedServerError;
@@ -62,17 +63,23 @@ fn generate_random_suffix(length: usize) -> String {
 /// the client IP address, then appends a random suffix for additional
 /// uniqueness. The resulting format is `{64hex}.{6alnum}`.
 ///
+/// The client IP is read from the [`ClientIpExt`] request extension, which is
+/// populated by [`crate::compat::from_fastly_request_ref`] from the Fastly SDK.
+/// Falls back to `"unknown"` when the extension is absent (e.g. in tests).
+///
 /// # Errors
 ///
 /// - [`TrustedServerError::Ec`] if HMAC generation fails
 pub fn generate_ec_id(
     settings: &Settings,
-    req: &Request,
+    req: &http::Request<Body>,
 ) -> Result<String, Report<TrustedServerError>> {
-    // Fallback to "unknown" when client IP is unavailable (e.g., local testing).
-    // All such requests share the same HMAC base; the random suffix provides uniqueness.
+    // Read client IP from the extension set by compat::from_fastly_request_ref.
+    // Falls back to "unknown" when absent (e.g. local testing or unit tests).
     let client_ip = req
-        .get_client_ip_addr()
+        .extensions()
+        .get::<ClientIpExt>()
+        .and_then(|ext| ext.0)
         .map(normalize_ip)
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -105,8 +112,12 @@ pub fn generate_ec_id(
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(ec_id) = req.get_header(HEADER_X_TS_EC).and_then(|h| h.to_str().ok()) {
+pub fn get_ec_id(req: &http::Request<Body>) -> Result<Option<String>, Report<TrustedServerError>> {
+    if let Some(ec_id) = req
+        .headers()
+        .get(HEADER_X_TS_EC)
+        .and_then(|h| h.to_str().ok())
+    {
         if ec_id_has_only_allowed_chars(ec_id) {
             log::trace!("Using existing EC ID from header: {}", ec_id);
             return Ok(Some(ec_id.to_string()));
@@ -146,7 +157,7 @@ pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerEr
 /// Returns an error if ID generation fails.
 pub fn get_or_generate_ec_id(
     settings: &Settings,
-    req: &Request,
+    req: &http::Request<Body>,
 ) -> Result<String, Report<TrustedServerError>> {
     if let Some(id) = get_ec_id(req)? {
         return Ok(id);
@@ -161,7 +172,7 @@ pub fn get_or_generate_ec_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastly::http::{HeaderName, HeaderValue};
+    use http::header;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::test_support::tests::create_test_settings;
@@ -196,16 +207,16 @@ mod tests {
         assert_eq!(normalize_ip(ipv6_a), "2001:db8:abcd:1::");
     }
 
-    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
-        let mut req = Request::new("GET", "http://example.com");
-        for (key, value) in headers {
-            req.set_header(
-                key,
-                HeaderValue::from_str(value).expect("should create valid header value"),
-            );
+    fn create_test_request(headers: Vec<(&str, &str)>) -> http::Request<Body> {
+        let mut builder = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
         }
-
-        req
+        builder
+            .body(Body::empty())
+            .expect("should build test request")
     }
 
     fn is_ec_id_format(value: &str) -> bool {
@@ -285,7 +296,7 @@ mod tests {
     #[test]
     fn test_get_ec_id_with_header() {
         let settings = create_test_settings();
-        let req = create_test_request(vec![(HEADER_X_TS_EC, "existing_ec_id")]);
+        let req = create_test_request(vec![(HEADER_X_TS_EC.as_str(), "existing_ec_id")]);
 
         let ec_id = get_ec_id(&req).expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_ec_id".to_string()));
@@ -298,7 +309,7 @@ mod tests {
     fn test_get_ec_id_with_cookie() {
         let settings = create_test_settings();
         let req = create_test_request(vec![(
-            fastly::http::header::COOKIE,
+            header::COOKIE.as_str(),
             &format!("{}=existing_cookie_id", COOKIE_TS_EC),
         )]);
 
@@ -328,9 +339,9 @@ mod tests {
     #[test]
     fn test_get_ec_id_rejects_invalid_header_and_falls_back_to_cookie() {
         let req = create_test_request(vec![
-            (HEADER_X_TS_EC, "evil;injected"),
+            (HEADER_X_TS_EC.as_str(), "evil;injected"),
             (
-                fastly::http::header::COOKIE,
+                header::COOKIE.as_str(),
                 &format!("{}=valid_cookie_id", COOKIE_TS_EC),
             ),
         ]);
@@ -346,7 +357,7 @@ mod tests {
     #[test]
     fn test_get_or_generate_ec_id_replaces_invalid_header() {
         let settings = create_test_settings();
-        let req = create_test_request(vec![(HEADER_X_TS_EC, "evil;injected")]);
+        let req = create_test_request(vec![(HEADER_X_TS_EC.as_str(), "evil;injected")]);
 
         let ec_id = get_or_generate_ec_id(&settings, &req)
             .expect("should generate fresh ID on invalid header");
@@ -363,7 +374,7 @@ mod tests {
     #[test]
     fn test_get_ec_id_rejects_invalid_cookie() {
         let req = create_test_request(vec![(
-            fastly::http::header::COOKIE,
+            header::COOKIE.as_str(),
             &format!("{}=bad<script>value", COOKIE_TS_EC),
         )]);
 

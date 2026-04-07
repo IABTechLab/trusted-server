@@ -5,12 +5,12 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::compat;
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
-use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -474,7 +474,7 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
 }
 
 fn append_ec_id(req: &Request, target_url_parsed: &mut url::Url) {
-    let ec_id_param = match get_ec_id(req) {
+    let ec_id_param = match compat::get_ec_id_fastly(req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract EC ID for forwarding: {:?}", e);
@@ -737,7 +737,7 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
-    let ec_id = match get_ec_id(&req) {
+    let ec_id = match compat::get_ec_id_fastly(&req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract EC ID for forwarding: {:?}", e);

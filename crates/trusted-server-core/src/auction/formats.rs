@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::compat;
 use crate::consent::ConsentContext;
 use crate::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
 use crate::creative;
-use crate::edge_cookie::generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
@@ -88,9 +88,11 @@ pub fn convert_tsjs_to_auction_request(
     ec_id: &str,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.to_owned();
-    let fresh_id = generate_ec_id(settings, req).change_context(TrustedServerError::Auction {
-        message: "Failed to generate fresh EC ID".to_string(),
-    })?;
+    let fresh_id = compat::generate_ec_id_fastly(settings, req).change_context(
+        TrustedServerError::Auction {
+            message: "Failed to generate fresh EC ID".to_string(),
+        },
+    )?;
 
     // Convert ad units to slots
     let mut slots = Vec::new();
