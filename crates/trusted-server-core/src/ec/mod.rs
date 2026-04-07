@@ -224,6 +224,7 @@ impl EcContext {
             config: &settings.consent,
             geo: geo_info,
             ec_id: ec_value.as_deref(),
+            // EC module manages its own KV identity graph.
             kv_store: None,
         });
 

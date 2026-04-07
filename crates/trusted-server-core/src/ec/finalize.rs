@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use fastly::Response;
 
 use crate::consent::allows_ec_creation;
-use crate::consent::kv::delete_consent_from_kv;
 use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
@@ -43,8 +42,18 @@ pub fn ec_finalize_response(
         clear_ec_on_response(settings, response);
 
         if let Some(store_name) = settings.consent.consent_store.as_deref() {
-            for ec_id in withdrawal_ec_ids(ec_context) {
-                delete_consent_from_kv(store_name, &ec_id);
+            if let Ok(store) = fastly::kv_store::KVStore::open(store_name) {
+                if let Some(store) = store {
+                    for ec_id in withdrawal_ec_ids(ec_context) {
+                        if let Err(err) = store.delete(&ec_id) {
+                            log::warn!("Failed to delete consent KV entry for '{ec_id}': {err:?}");
+                        } else {
+                            log::info!("Deleted consent KV entry for '{ec_id}' (consent revoked)");
+                        }
+                    }
+                }
+            } else {
+                log::warn!("Failed to open consent store '{store_name}' for withdrawal cleanup");
             }
         }
 

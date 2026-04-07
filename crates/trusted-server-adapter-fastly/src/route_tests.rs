@@ -121,7 +121,7 @@ fn create_test_settings() -> Settings {
     let settings = Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/admin"
+            path = "^(/admin|/_ts/admin)"
             username = "admin"
             password = "admin-pass"
 
@@ -196,7 +196,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     ))
     .expect("should route discovery request");
     assert_eq!(
-        discovery_resp.get_status(),
+        discovery_resp.response.get_status(),
         StatusCode::OK,
         "should keep discovery available when the consent store is unavailable"
     );
@@ -212,40 +212,13 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     ))
     .expect("should route admin request");
     assert_eq!(
-        admin_resp.get_status(),
+        admin_resp.response.get_status(),
         StatusCode::UNAUTHORIZED,
         "should keep admin auth behavior unchanged when the consent store is unavailable"
     );
 
-    let auction_req = Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#);
-    let auction_services = test_runtime_services(&auction_req);
-    let auction_resp = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &auction_services,
-        auction_req,
-    ))
-    .expect("should return an error response for auction requests");
-    assert_eq!(
-        auction_resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should fail auction requests when consent persistence is configured but unavailable"
-    );
-
-    let publisher_req = Request::get("https://test.com/articles/example");
-    let publisher_services = test_runtime_services(&publisher_req);
-    let publisher_resp = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &publisher_services,
-        publisher_req,
-    ))
-    .expect("should return an error response for publisher fallback");
-    assert_eq!(
-        publisher_resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should scope consent store failures to the consent-dependent routes"
-    );
+    // With the EC architecture, auction and publisher routes no longer
+    // pre-open the consent store at routing time. EC handles KV lazily,
+    // so a missing consent store does not block these routes from
+    // processing requests (consent degradation is graceful).
 }
