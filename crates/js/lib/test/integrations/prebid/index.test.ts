@@ -419,6 +419,8 @@ describe('prebid/installPrebidNpm', () => {
 
       const trustedServerBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer');
       expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: {} });
+      expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
+      expect(adUnits[1].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
 
       // Should call through to original requestBids
       expect(mockRequestBids).toHaveBeenCalled();
@@ -453,6 +455,7 @@ describe('prebid/installPrebidNpm', () => {
         appnexus: { placementId: 123 },
         rubicon: { accountId: 'abc' },
       });
+      expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
     });
 
     it('adds bids array to ad units that have none', () => {
@@ -655,6 +658,7 @@ describe('prebid/client-side bidders', () => {
     const rubiconBid = adUnits[0].bids.find((b: any) => b.bidder === 'rubicon') as any;
     expect(rubiconBid).toBeDefined();
     expect(rubiconBid.params).toEqual({ accountId: 'abc' });
+    expect(adUnits[0].bids.find((b: any) => b.bidder === 'appnexus')).toBeUndefined();
   });
 
   it('handles multiple client-side bidders', () => {
@@ -682,6 +686,7 @@ describe('prebid/client-side bidders', () => {
     // Both client-side bidders should remain
     expect(adUnits[0].bids.find((b: any) => b.bidder === 'rubicon')).toBeDefined();
     expect(adUnits[0].bids.find((b: any) => b.bidder === 'openx')).toBeDefined();
+    expect(adUnits[0].bids.find((b: any) => b.bidder === 'appnexus')).toBeUndefined();
   });
 
   it('behaves normally when no client-side bidders are configured', () => {
