@@ -42,8 +42,8 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 - Returning requests with consent and an existing `ts-ec` receive both:
   - `x-ts-ec` response header
   - refreshed `Set-Cookie: ts-ec=...`
-- `/identify` is read-only and returns identity enrichment (`uids` and `eids`)
-- `/sync` and `/_ts/api/v1/sync` write mappings into the EC identity graph
+- `/_ts/api/v1/identify` is read-only and returns identity enrichment (`uids` and `eids`)
+- `/_ts/api/v1/sync` and `/_ts/api/v1/batch-sync` write mappings into the EC identity graph
 
 ## Next Steps
 

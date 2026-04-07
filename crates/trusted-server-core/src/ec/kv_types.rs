@@ -125,7 +125,7 @@ pub struct KvPubProperties {
 
 /// Coarse, non-PII device signals derived from TLS handshake and UA.
 ///
-/// Used by the `/identify` endpoint for cross-suffix propagation decisions
+/// Used by the `/_ts/api/v1/identify` endpoint for cross-suffix propagation decisions
 /// and buyer-facing device quality scoring. Written once on
 /// [`KvEntry`] creation — never updated after.
 ///
@@ -163,7 +163,7 @@ pub struct KvDevice {
 /// count indicates a shared network (corporate VPN, campus); a low count
 /// indicates an individual or household.
 ///
-/// Written only by the `/identify` endpoint — the prefix-match list API
+/// Written only by the `/_ts/api/v1/identify` endpoint — the prefix-match list API
 /// call required to compute `cluster_size` is too expensive for the
 /// organic proxy hot path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

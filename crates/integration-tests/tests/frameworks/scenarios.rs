@@ -435,8 +435,9 @@ impl CustomScenario {
 /// EC identity lifecycle scenarios that test KV-backed stateful behavior.
 ///
 /// These run against the Viceroy runtime directly without a frontend
-/// framework container — they exercise EC-specific endpoints (`/sync`,
-/// `/identify`, `/_ts/api/v1/sync`, `/_ts/admin/partners/register`).
+/// framework container — they exercise EC-specific endpoints
+/// (`/_ts/api/v1/sync`, `/_ts/api/v1/identify`,
+/// `/_ts/api/v1/batch-sync`, `/_ts/admin/v1/partners/register`).
 #[derive(Debug, Clone)]
 pub enum EcScenario {
     /// Full flow: organic request generates EC → pixel sync writes partner
@@ -583,7 +584,7 @@ fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
     assert_status(&resp, 204).attach("identify should return 204 after cookie revocation")?;
 
     // 4. With GPC still asserted, identify should reflect consent denial.
-    let resp = client.get_with_headers("/identify", &[("sec-gpc", "1")])?;
+    let resp = client.get_with_headers("/_ts/api/v1/identify", &[("sec-gpc", "1")])?;
     assert_status(&resp, 403)
         .attach("identify with GPC should return 403 after consent withdrawal")?;
 
@@ -617,7 +618,7 @@ fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
     // fail-closed → consent denied. Per spec §11.4, consent is evaluated
     // *before* EC presence, so this must be 403 Forbidden regardless of
     // whether an EC cookie exists.
-    let resp = client.get_with_headers("/identify", &[("sec-gpc", "1")])?;
+    let resp = client.get_with_headers("/_ts/api/v1/identify", &[("sec-gpc", "1")])?;
 
     let status = resp.status().as_u16();
     if status != 403 {
