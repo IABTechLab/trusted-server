@@ -91,9 +91,9 @@ Next.js Pages Router embeds data in `__NEXT_DATA__` script:
 
 The Next.js integration is implemented across multiple files:
 
-- [crates/common/src/integrations/nextjs/mod.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/nextjs/mod.rs) - Main integration
-- [crates/common/src/integrations/nextjs/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/nextjs/rsc.rs) - RSC parsing
-- [crates/common/src/integrations/nextjs/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/nextjs/script_rewriter.rs) - Script rewriting
+- [crates/trusted-server-core/src/integrations/nextjs/mod.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/mod.rs) - Main integration
+- [crates/trusted-server-core/src/integrations/nextjs/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/rsc.rs) - RSC parsing
+- [crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs) - Script rewriting
 
 ### Key Components
 
@@ -120,7 +120,7 @@ Targets the Next.js data script for rewriting.
 Run your Next.js application behind Trusted Server for:
 
 - First-party asset loading
-- Synthetic ID injection
+- EC ID injection
 - Privacy-compliant tracking
 - Ad serving integration
 

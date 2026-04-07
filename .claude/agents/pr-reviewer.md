@@ -70,14 +70,16 @@ For each changed file, evaluate:
 #### WASM compatibility
 
 - Target is `wasm32-wasip1` — no std::net, std::thread, or OS-specific APIs
-- No Tokio or runtime-specific deps in `crates/common`
-- Fastly-specific APIs only in `crates/fastly`
+- No Tokio or runtime-specific deps in `crates/trusted-server-core`
+- Fastly-specific APIs only in `crates/trusted-server-adapter-fastly`
 
 #### Convention compliance (from CLAUDE.md)
 
 - `expect("should ...")` instead of `unwrap()` in production code
 - `error-stack` (`Report<E>`) with `derive_more::Display` for errors (not thiserror/anyhow)
 - `log` macros (not `println!`)
+- Config-derived regex/pattern compilation must not use panic-prone `expect()`/`unwrap()`; invalid enabled config should surface as startup/config errors
+- Invalid enabled integrations/providers must not be silently logged-and-disabled during startup or registration
 - `vi.hoisted()` for mock definitions in JS tests
 - Integration IDs match JS directory names
 - Colocated tests with `#[cfg(test)]`
@@ -105,6 +107,7 @@ For each changed file, evaluate:
 
 - Are new code paths tested?
 - Are edge cases covered (empty input, max values, error paths)?
+- If config-derived regex/pattern compilation changed: are invalid enabled-config startup failures and explicit `enabled = false` bypass cases both covered?
 - Rust tests: `cargo test --workspace`
 - JS tests: `npx vitest run` in `crates/js/lib/`
 
@@ -177,7 +180,7 @@ comment. Use the file's **current line number** (not diff position) with the
 
 ````json
 {
-  "path": "crates/common/src/publisher.rs",
+  "path": "crates/trusted-server-core/src/publisher.rs",
   "line": 166,
   "side": "RIGHT",
   "body": "🔧 **wrench** — Race condition: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
@@ -288,6 +291,6 @@ Output:
 - Do not include any byline, "Generated with" footer, `Co-Authored-By`
   trailer, or self-referential titles (e.g., "Staff Engineer Review") in
   review comments or the review body.
-- If the diff is very large (>50 files), prioritize `crates/common/` changes
+- If the diff is very large (>50 files), prioritize `crates/trusted-server-core/` changes
   and new files over mechanical changes (Cargo.lock, generated code).
 - Never submit a review without explicit user approval of the findings.

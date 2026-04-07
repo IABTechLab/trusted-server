@@ -57,7 +57,7 @@ Keys are stored in two separate Fastly stores:
 ### Basic Usage
 
 ```rust
-use trusted_server_common::request_signing::RequestSigner;
+use trusted_server_core::request_signing::RequestSigner;
 
 // Initialize signer (loads current key from config)
 let signer = RequestSigner::from_config()?;
@@ -96,7 +96,7 @@ request.set_header("X-Signature-Kid", signer.kid);
 ### Basic Verification
 
 ```rust
-use trusted_server_common::request_signing::verify_signature;
+use trusted_server_core::request_signing::verify_signature;
 
 // Extract signature and kid from request
 let signature = request.get_header("X-Signature")?;

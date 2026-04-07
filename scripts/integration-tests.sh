@@ -53,9 +53,9 @@ fi
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY="integration-test-secret-key" \
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY="integration-test-secret-key" \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
-    cargo build --bin trusted-server-fastly --release --target wasm32-wasip1
+    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
@@ -68,7 +68,7 @@ docker build \
     crates/integration-tests/fixtures/frameworks/nextjs/
 
 echo "==> Running integration tests (target: $TARGET, origin port: $ORIGIN_PORT)..."
-WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-fastly.wasm" \
+WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm" \
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
 RUST_LOG=info \
     cargo test \

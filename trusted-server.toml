@@ -14,17 +14,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "trusted-server"
-# Possible values
-#   - "client_ip"
-#   - "user_agent"
-#   - "accept_language"
-#   - "accept_encoding"
-#   - "random_uuid"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
@@ -148,10 +139,25 @@ rewrite_script = true
 
 
 # Proxy configuration
-# [proxy]
+[proxy]
 # Enable TLS certificate verification when proxying to HTTPS origins.
 # Defaults to true. Set to false only for local development with self-signed certificates.
 # certificate_check = true
+
+# Restrict redirect destinations for the first-party proxy to an explicit domain allowlist.
+# Supports exact match ("example.com") and subdomain wildcard prefix ("*.example.com").
+# Wildcard prefix also matches the apex domain ("*.example.com" matches "example.com").
+# Matching is case-insensitive. A dot-boundary check prevents "*.example.com" from
+# matching "evil-example.com".
+# When omitted or empty, redirect destinations are unrestricted — configure this in
+# production to prevent SSRF via signed URLs that redirect to internal services.
+# Note: this list governs only the first-party proxy redirect chain, not integration
+# endpoints defined under [integrations.*].
+# allowed_domains = [
+    # "ad.example.com",
+    # "*.doubleclick.net",
+    # "*.googlesyndication.com",
+# ]
 
 [auction]
 enabled = true

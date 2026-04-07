@@ -105,7 +105,7 @@ Intercepts scripts from `securepubads.g.doubleclick.net` and rewrites them to th
 
 Takes over `googletag.cmd` so every queued callback is wrapped before GPT executes it. This enables future hook points for:
 
-- Synthetic ID injection as page-level key-value targeting
+- EC ID injection as page-level key-value targeting
 - Consent gating of ad requests
 - Ad-unit path rewriting for A/B testing
 
@@ -147,7 +147,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ## Implementation
 
-- **Rust**: [crates/common/src/integrations/gpt.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/gpt.rs)
+- **Rust**: [crates/trusted-server-core/src/integrations/gpt.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/gpt.rs)
 - **TypeScript**: [crates/js/lib/src/integrations/gpt/](https://github.com/IABTechLab/trusted-server/blob/main/crates/js/lib/src/integrations/gpt/)
 
 ## Next Steps

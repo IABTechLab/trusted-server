@@ -132,7 +132,7 @@ Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
 
 Didomi consent status is checked before:
 
-- Generating synthetic IDs
+- Generating EC IDs
 - Syncing with identity partners (Lockr)
 - Activating tracking pixels
 - Sharing data with third parties
@@ -181,7 +181,7 @@ Didomi integration supports IAB's Transparency & Consent Framework 2.2:
 
 ## Implementation
 
-The Didomi integration is implemented in [crates/common/src/integrations/didomi.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/common/src/integrations/didomi.rs).
+The Didomi integration is implemented in [crates/trusted-server-core/src/integrations/didomi.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/didomi.rs).
 
 ### Key Components
 

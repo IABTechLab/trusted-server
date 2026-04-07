@@ -36,7 +36,7 @@ export default withMermaid(
   defineConfig({
     title: 'Trusted Server',
     description:
-      'Privacy-preserving edge computing for ad serving and synthetic ID generation',
+      'Privacy-preserving edge computing for ad serving and edge cookie (EC) generation',
     base: '/trusted-server',
 
     // Replace version placeholders like {{NODEJS_VERSION}} with values from .tool-versions
@@ -77,7 +77,7 @@ export default withMermaid(
         {
           text: 'Core Concepts',
           items: [
-            { text: 'Synthetic IDs', link: '/guide/synthetic-ids' },
+            { text: 'Edge Cookies', link: '/guide/edge-cookies' },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {

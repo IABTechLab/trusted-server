@@ -23,11 +23,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 ### Environment Variable Overrides
@@ -40,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
+export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
 ```
 
 ### Generate Secure Secrets
@@ -63,7 +60,8 @@ openssl rand -base64 32
 | Section             | Purpose                                      |
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
-| `[synthetic]`       | Synthetic ID generation                      |
+| `[edge_cookie]`     | Edge Cookie (EC) ID generation               |
+| `[proxy]`           | Proxy SSRF allowlist                         |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
 | `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
@@ -77,11 +75,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-hmac-secret-key"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 [request_signing]
 enabled = true
@@ -204,11 +199,11 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 #### `cookie_domain`
 
-**Purpose**: Domain scope for synthetic ID cookies.
+**Purpose**: Domain scope for EC cookies.
 
 **Usage**:
 
-- Set on `synthetic_id` cookie
+- Set on `ts-ec` cookie
 - Controls cookie sharing across subdomains
 
 **Format**: Domain with optional leading dot
@@ -244,7 +239,6 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 **Security**:
 
 - Keep confidential and secure
-- Cannot be the placeholder `"change-me-proxy-secret"` (case-insensitive) — startup will fail
 - Rotate periodically (90 days recommended)
 - Use cryptographically random values (32+ bytes)
 - Never commit to version control
@@ -267,100 +261,38 @@ openssl rand -base64 32
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
-## Synthetic ID Configuration
+## EC Configuration
 
-Settings for generating privacy-preserving synthetic identifiers.
+Settings for generating privacy-preserving Edge Cookie identifiers.
 
-### `[synthetic]`
+### `[edge_cookie]`
 
-| Field           | Type   | Required | Description                                    |
-| --------------- | ------ | -------- | ---------------------------------------------- |
-| `counter_store` | String | Yes      | Fastly KV store name for counters              |
-| `opid_store`    | String | Yes      | Fastly KV store name for publisher ID mappings |
-| `secret_key`    | String | Yes      | HMAC secret for ID generation                  |
-| `template`      | String | Yes      | Handlebars template for ID composition         |
+| Field        | Type   | Required | Description                   |
+| ------------ | ------ | -------- | ----------------------------- |
+| `secret_key` | String | Yes      | HMAC secret for ID generation |
 
 **Example**:
 
 ```toml
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-secure-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__SYNTHETIC__COUNTER_STORE=counter_store
-TRUSTED_SERVER__SYNTHETIC__OPID_STORE=opid_store
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
-TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
 ```
 
 ### Field Details
 
-#### `counter_store`
-
-**Purpose**: Fastly KV store for synthetic ID counters.
-
-**Usage**:
-
-- Stores incrementing counters per domain
-- Ensures ID uniqueness
-- Accessed via Fastly KV Store API
-
-**Setup**:
-
-```bash
-# Create KV store
-fastly kv-store create --name=counter_store
-```
-
-**Data Format**:
-
-```json
-{
-  "publisher.com": 12345,
-  "another.com": 67890
-}
-```
-
-#### `opid_store`
-
-**Purpose**: Fastly KV store for publisher-provided ID mappings.
-
-**Usage**:
-
-- Maps publisher IDs to synthetic IDs
-- Enables first-party ID integration
-- Optional (used if publisher provides IDs)
-
-**Setup**:
-
-```bash
-# Create KV store
-fastly kv-store create --name=opid_store
-```
-
-**Data Format**:
-
-```json
-{
-  "publisher-id-123": "synthetic-abc",
-  "publisher-id-456": "synthetic-def"
-}
-```
-
 #### `secret_key`
 
-**Purpose**: HMAC secret for synthetic ID base generation.
+**Purpose**: HMAC secret for EC ID base generation.
 
 **Security**:
 
 - Must be non-empty
-- Cannot be a known placeholder: `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - Rotate periodically for security
 - Store securely (environment variable recommended)
 
@@ -374,51 +306,6 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
-- Exactly `"secret-key"`, `"secret_key"`, or `"trusted-server"` (known placeholders, case-insensitive)
-
-#### `template`
-
-**Purpose**: Handlebars template defining ID composition.
-
-**Available Variables**:
-
-| Variable          | Description                                | Example                                |
-| ----------------- | ------------------------------------------ | -------------------------------------- |
-| `client_ip`       | Client IP address (IPv6 normalized to /64) | `192.168.1.1`                          |
-| `user_agent`      | User-Agent header                          | `Mozilla/5.0...`                       |
-| `accept_language` | Accept-Language header (first token)       | `en-US`                                |
-| `accept_encoding` | Accept-Encoding header                     | `gzip, deflate`                        |
-| `random_uuid`     | Random UUID v4 per generation              | `9b1d3b94-1e26-4a5f-bc39-1e6f2b6a3a0f` |
-
-**Template Examples**:
-
-**Simple (IP + UA)**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}"
-```
-
-**With Locale + Encoding**:
-
-```toml
-template = "{{ client_ip }}:{{ accept_language }}:{{ accept_encoding }}"
-```
-
-**With Randomized Suffix Input**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}:{{ random_uuid }}"
-```
-
-**Validation**: Must be non-empty string.
-
-::: tip Template Design
-Choose template variables based on your privacy and uniqueness requirements:
-
-- **More variables** = More unique IDs, less privacy
-- **Fewer variables** = More privacy, potential collisions
-- **Include `random_uuid`** only if you want a new ID for every generation
-  :::
 
 ## Response Headers
 
@@ -719,6 +606,79 @@ exclude_domains = ["*.publisher.com"]  # Skip unnecessary proxying
 
 See [Creative Processing](/guide/creative-processing#exclude-domains) for details.
 
+## Proxy Configuration
+
+Controls first-party proxy security settings.
+
+### `[proxy]`
+
+| Field             | Type          | Required           | Description                                            |
+| ----------------- | ------------- | ------------------ | ------------------------------------------------------ |
+| `allowed_domains` | Array[String] | No (default: `[]`) | Redirect destinations the proxy is permitted to follow |
+
+**Example**:
+
+```toml
+[proxy]
+allowed_domains = [
+  "tracker.com",         # Exact match
+  "*.adserver.com",      # Wildcard: adserver.com and all subdomains
+  "*.trusted-cdn.net",
+]
+```
+
+**Environment Override**:
+
+```bash
+# JSON array
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.com","*.adserver.com"]'
+
+# Indexed
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.adserver.com"
+
+# Comma-separated
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
+```
+
+### Field Details
+
+#### `allowed_domains`
+
+**Purpose**: Allowlist of redirect destinations the proxy is permitted to follow.
+
+**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
+
+**Default — open mode**: When `allowed_domains` is absent or empty, every redirect destination is allowed. This default is intentional for zero-config development but should not be used in production.
+
+**Pattern Matching**:
+
+| Pattern         | Matches                                             | Does not match     |
+| --------------- | --------------------------------------------------- | ------------------ |
+| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
+| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+
+- `"example.com"` — exact match only.
+- `"*.example.com"` — matches the base domain and any subdomain at any depth.
+- Matching is case-insensitive; entries are normalized to lowercase at startup.
+- Blank entries are ignored.
+- The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
+
+::: danger Production Recommendation
+Always configure `allowed_domains` in production. Without an explicit allowlist, a signed proxy URL can be used to follow redirects to arbitrary hosts, creating an SSRF risk.
+
+```toml
+[proxy]
+allowed_domains = [
+  "*.your-ad-network.com",
+  "tracker.your-partner.com",
+]
+```
+
+:::
+
+See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage details.
+
 ## Integration Configurations
 
 Settings for built-in integrations (Prebid, Next.js, Permutive, Testlight). For other
@@ -923,13 +883,11 @@ Configuration is validated at startup:
 
 - All fields non-empty
 - `origin_url` is valid URL
-- `proxy_secret` ≠ known placeholder (`"change-me-proxy-secret"` — case-insensitive)
 
-**Synthetic Validation**:
+**EC Validation**:
 
 - `secret_key` ≥ 1 character
 - `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
-- `template` non-empty
 
 **Handler Validation**:
 
@@ -986,7 +944,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_secret)
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1040,7 +998,7 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- `synthetic.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `edge_cookie.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
 - Change to a secure random value (see generation commands above)
@@ -1070,7 +1028,7 @@ trusted-server.dev.toml      # Development overrides
 **Print Loaded Config** (test only):
 
 ```rust
-use trusted_server_common::settings_data::get_settings;
+use trusted_server_core::settings_data::get_settings;
 
 let settings = get_settings()?;
 println!("{:#?}", settings);
@@ -1094,5 +1052,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-preserving identification
+- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
 - Review [Integrations](/guide/integrations-overview) for partner support

@@ -69,7 +69,7 @@ proxy_secret = "change-me-to-random-string"
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `synthetic.secret_key`
+- `edge_cookie.secret_key`
 
 ---
 
@@ -129,35 +129,29 @@ See [Configuration Reference](./configuration.md) for complete patterns.
 
 ## Runtime Errors
 
-### Synthetic ID generation failed
+### EC ID generation failed
 
 **Error Message:**
 
 ```
-Failed to generate synthetic ID: KV store not available
+Failed to generate EC ID: HMAC error
 ```
 
-**Cause:** KV store (counter_store or opid_store) not configured in Fastly
+**Cause:** HMAC secret key is missing or invalid in the Edge Cookie configuration.
 
 **Solution:**
 
-1. Create KV stores in Fastly dashboard
-2. Link them to your Compute service
-3. Update `trusted-server.toml`:
+1. Ensure `secret_key` is set in `trusted-server.toml`:
 
 ```toml
-[synthetic]
-counter_store = "counter_store"  # Must match Fastly KV store name
-opid_store = "opid_store"
+[edge_cookie]
+secret_key = "your-secure-hmac-secret"
 ```
 
-4. For local development, configure in `fastly.toml`:
+2. Or set via environment variable:
 
-```toml
-[local_server.kv_stores]
-    [[local_server.kv_stores.counter_store]]
-        key = "placeholder"
-        data = "placeholder"
+```bash
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secure-hmac-secret
 ```
 
 ---
@@ -512,7 +506,7 @@ secret_store_id = "your-secret-store-id"
 **Error Message:**
 
 ```
-error: could not compile `trusted-server-fastly`
+error: could not compile `trusted-server-adapter-fastly`
 ```
 
 **Cause:** Rust compilation error or missing dependencies
@@ -668,7 +662,7 @@ curl http://localhost:7676/first-party/ad?slot=test&w=300&h=250
 
 ```bash
 # Test configuration load
-cargo run --bin trusted-server-fastly -- --validate-config
+cargo run --bin trusted-server-adapter-fastly -- --validate-config
 
 # Or check startup logs
 fastly compute serve 2>&1 | grep -i "settings"
