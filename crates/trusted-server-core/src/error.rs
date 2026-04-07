@@ -167,7 +167,7 @@ mod tests {
             TrustedServerError::Proxy {
                 message: "upstream 10.0.0.1 refused".into(),
             },
-            TrustedServerError::Ec {
+            TrustedServerError::EdgeCookie {
                 message: "seed file missing".into(),
             },
             TrustedServerError::Auction {
