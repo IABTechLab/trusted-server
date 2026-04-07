@@ -1,4 +1,4 @@
-//! Pixel sync endpoint (`GET /sync`).
+//! Pixel sync endpoint (`GET /_ts/api/v1/sync`).
 
 use error_stack::{Report, ResultExt};
 use fastly::erl::{CounterDuration, RateCounter};
@@ -21,7 +21,7 @@ pub const RATE_COUNTER_NAME: &str = "counter_store";
 /// Maximum allowed length (in bytes) for a partner UID.
 const MAX_UID_LENGTH: usize = 512;
 
-/// Handles `GET /sync` pixel sync requests.
+/// Handles `GET /_ts/api/v1/sync` pixel sync requests.
 ///
 /// # Errors
 ///
@@ -247,7 +247,7 @@ fn decode_query_fallback_consent(
 
 /// Rate limiter abstraction for sync endpoints.
 ///
-/// Used by both pixel sync (`/sync`) and batch sync (`/_ts/api/v1/sync`)
+/// Used by both pixel sync (`/_ts/api/v1/sync`) and batch sync (`/_ts/api/v1/batch-sync`)
 /// for per-partner request rate enforcement.
 pub trait RateLimiter {
     /// Returns `true` when the rate limit has been exceeded for the given key.

@@ -37,7 +37,7 @@ pub struct EcTestClient {
 
 impl EcTestClient {
     /// Creates a new client. Redirects are disabled so tests can inspect
-    /// 302 responses from `/sync`.
+    /// 302 responses from `/_ts/api/v1/sync`.
     pub fn new(base_url: &str) -> Self {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -185,7 +185,7 @@ impl EcTestClient {
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASS: &str = "changeme";
 
-/// Registers a test partner via `POST /_ts/admin/partners/register`.
+/// Registers a test partner via `POST /_ts/admin/v1/partners/register`.
 pub fn register_test_partner(
     client: &EcTestClient,
     partner_id: &str,
@@ -202,7 +202,7 @@ pub fn register_test_partner(
     });
 
     let resp = client.post_json_with_basic_auth(
-        "/_ts/admin/partners/register",
+        "/_ts/admin/v1/partners/register",
         &body,
         ADMIN_USER,
         ADMIN_PASS,
@@ -222,7 +222,7 @@ pub fn register_test_partner(
 // Pixel sync
 // ---------------------------------------------------------------------------
 
-/// Calls `GET /sync` with the required query parameters.
+/// Calls `GET /_ts/api/v1/sync` with the required query parameters.
 ///
 /// Returns the raw response (typically a 302 redirect).
 pub fn pixel_sync(
@@ -232,7 +232,7 @@ pub fn pixel_sync(
     return_url: &str,
 ) -> TestResult<Response> {
     let path = format!(
-        "/sync?partner={partner}&uid={uid}&return={}",
+        "/_ts/api/v1/sync?partner={partner}&uid={uid}&return={}",
         urlencoding::encode(return_url)
     );
     client.get(&path)
@@ -242,32 +242,32 @@ pub fn pixel_sync(
 // Identify
 // ---------------------------------------------------------------------------
 
-/// Calls `GET /identify` and returns the raw response.
+/// Calls `GET /_ts/api/v1/identify` and returns the raw response.
 pub fn identify(client: &EcTestClient) -> TestResult<Response> {
-    client.get("/identify")
+    client.get("/_ts/api/v1/identify")
 }
 
 // ---------------------------------------------------------------------------
 // Batch sync
 // ---------------------------------------------------------------------------
 
-/// Calls `POST /_ts/api/v1/sync` with bearer auth and the given mappings.
+/// Calls `POST /_ts/api/v1/batch-sync` with bearer auth and the given mappings.
 pub fn batch_sync(
     client: &EcTestClient,
     api_key: &str,
     mappings: &[BatchMapping],
 ) -> TestResult<Response> {
     let body = serde_json::json!({ "mappings": mappings_to_json(mappings) });
-    client.post_json_with_bearer("/_ts/api/v1/sync", &body, api_key)
+    client.post_json_with_bearer("/_ts/api/v1/batch-sync", &body, api_key)
 }
 
-/// Calls `POST /_ts/api/v1/sync` without any auth header.
+/// Calls `POST /_ts/api/v1/batch-sync` without any auth header.
 pub fn batch_sync_no_auth(
     client: &EcTestClient,
     mappings: &[BatchMapping],
 ) -> TestResult<Response> {
     let body = serde_json::json!({ "mappings": mappings_to_json(mappings) });
-    client.post_json("/_ts/api/v1/sync", &body)
+    client.post_json("/_ts/api/v1/batch-sync", &body)
 }
 
 /// Single mapping in a batch sync request.

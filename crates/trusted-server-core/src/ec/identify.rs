@@ -1,4 +1,4 @@
-//! Identity lookup endpoint (`GET /identify`).
+//! Identity lookup endpoint (`GET /_ts/api/v1/identify`).
 
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ use super::EcContext;
 
 const MAX_EXPOSE_PARTNER_HEADERS: usize = 20;
 
-/// Handles `GET /identify`.
+/// Handles `GET /_ts/api/v1/identify`.
 ///
 /// # Errors
 ///
@@ -147,7 +147,7 @@ pub fn handle_identify(
     Ok(response)
 }
 
-/// Handles `OPTIONS /identify` CORS preflight.
+/// Handles `OPTIONS /_ts/api/v1/identify` CORS preflight.
 ///
 /// # Errors
 ///

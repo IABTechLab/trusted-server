@@ -149,7 +149,7 @@ async fn route_request(
 
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
-    if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/sync" {
+    if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/batch-sync" {
         let mut response = require_identity_graph(settings)
             .and_then(|kv| {
                 require_partner_store(settings).and_then(|partner_store| {
@@ -247,12 +247,12 @@ async fn route_request(
         (Method::POST, "/_ts/admin/keys/deactivate") => {
             (handle_deactivate_key(settings, req), false)
         }
-        (Method::POST, "/_ts/admin/partners/register") => (
+        (Method::POST, "/_ts/admin/v1/partners/register") => (
             require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
             false,
         ),
 
-        (Method::GET, "/sync") => (
+        (Method::GET, "/_ts/api/v1/sync") => (
             require_identity_graph(settings).and_then(|kv| {
                 require_partner_store(settings).and_then(|partner_store| {
                     handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
@@ -260,7 +260,7 @@ async fn route_request(
             }),
             false,
         ),
-        (Method::GET, "/identify") => (
+        (Method::GET, "/_ts/api/v1/identify") => (
             require_identity_graph(settings).and_then(|kv| {
                 require_partner_store(settings).and_then(|partner_store| {
                     handle_identify(settings, &kv, &partner_store, &req, &ec_context)
@@ -268,7 +268,9 @@ async fn route_request(
             }),
             false,
         ),
-        (Method::OPTIONS, "/identify") => (cors_preflight_identify(settings, &req), false),
+        (Method::OPTIONS, "/_ts/api/v1/identify") => {
+            (cors_preflight_identify(settings, &req), false)
+        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
