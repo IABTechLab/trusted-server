@@ -313,8 +313,11 @@ pub fn convert_to_openrtb_response(
 
     let mut response = Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
-        .with_header(HEADER_X_TS_EC, &auction_request.user.id)
         .with_body(body_bytes);
+
+    if !auction_request.user.id.is_empty() {
+        response.set_header(HEADER_X_TS_EC, &auction_request.user.id);
+    }
 
     // Signal consent status independently of whether EIDs were resolved.
     // A user may have granted consent but have no partner syncs yet;
@@ -343,7 +346,9 @@ mod tests {
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
-    use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
+    use crate::constants::{
+        HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
+    };
     use crate::openrtb::{Eid, Uid};
 
     fn make_minimal_auction_request() -> AuctionRequest {
@@ -462,6 +467,27 @@ mod tests {
         assert!(
             response.get_header(HEADER_X_TS_EIDS).is_none(),
             "should omit x-ts-eids when no EIDs available"
+        );
+        assert!(
+            response.get_header(HEADER_X_TS_EC).is_some(),
+            "should keep x-ts-ec when a valid EC is present"
+        );
+    }
+
+    #[test]
+    fn response_omits_ec_header_when_ec_id_is_empty() {
+        let mut request = make_minimal_auction_request();
+        request.user.id.clear();
+
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should build response");
+
+        assert!(
+            response.get_header(HEADER_X_TS_EC).is_none(),
+            "should omit x-ts-ec when no EC ID is available"
         );
     }
 }
