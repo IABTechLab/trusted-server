@@ -7,6 +7,7 @@
 //! (organic request paths) or propagate them (sync endpoints). See the
 //! per-operation error handling policy in the spec §7.5.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt};
@@ -16,7 +17,9 @@ use crate::error::TrustedServerError;
 
 use super::current_timestamp;
 use super::generation::ec_hash;
-use super::kv_types::{KvDomainVisit, KvEntry, KvMetadata, KvNetwork, MAX_SEEN_DOMAINS};
+use super::kv_types::{
+    KvDomainVisit, KvEntry, KvMetadata, KvNetwork, KvPubProperties, MAX_SEEN_DOMAINS,
+};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 3;
@@ -586,8 +589,10 @@ impl KvIdentityGraph {
         entry.last_seen = timestamp;
 
         // Update publisher domain visit history.
-        if let Some(ref mut props) = entry.pub_properties {
-            match props.seen_domains.get_mut(domain) {
+        // When `pub_properties` is `None` (entry created before this field
+        // was added), backfill it with the current domain as origin.
+        match entry.pub_properties {
+            Some(ref mut props) => match props.seen_domains.get_mut(domain) {
                 Some(visit) => {
                     visit.last = timestamp;
                     visit.visits = visit.visits.saturating_add(1);
@@ -609,6 +614,21 @@ impl KvIdentityGraph {
                         );
                     }
                 }
+            },
+            None => {
+                let mut seen_domains = HashMap::new();
+                seen_domains.insert(
+                    domain.to_owned(),
+                    KvDomainVisit {
+                        first: timestamp,
+                        last: timestamp,
+                        visits: 1,
+                    },
+                );
+                entry.pub_properties = Some(KvPubProperties {
+                    origin_domain: domain.to_owned(),
+                    seen_domains,
+                });
             }
         }
 
