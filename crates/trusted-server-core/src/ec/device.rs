@@ -62,6 +62,21 @@ impl DeviceSignals {
         }
     }
 
+    /// Returns `true` when the request looks like a real browser.
+    ///
+    /// Checks for the presence of recognizable signals rather than matching
+    /// against a hardcoded fingerprint allowlist. Real browsers always
+    /// produce a valid TLS fingerprint (`ja4_class`) and a recognizable UA
+    /// platform string (`platform_class`). Raw HTTP clients (curl, Python
+    /// requests, Go net/http, headless scrapers) typically lack one or both.
+    ///
+    /// `known_browser` is still computed and stored on [`KvDevice`] for
+    /// analytics but does not gate identity operations.
+    #[must_use]
+    pub fn looks_like_browser(&self) -> bool {
+        self.ja4_class.is_some() && self.platform_class.is_some()
+    }
+
     /// Converts these signals into a [`KvDevice`] for KV storage.
     #[must_use]
     pub fn to_kv_device(&self) -> KvDevice {
@@ -480,6 +495,63 @@ mod tests {
             parse_platform_class(ipad_ua).as_deref(),
             Some("ios"),
             "iPad should be ios"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_with_both_signals() {
+        let signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        );
+        assert!(
+            signals.looks_like_browser(),
+            "Chrome/Mac should look like a browser"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_unknown_fingerprint_still_passes() {
+        // Chrome/Windows with unknown JA4/H2 — still has ja4_class and platform_class
+        let signals = DeviceSignals::derive(
+            CHROME_WINDOWS_UA,
+            Some("t13d9999h2_unknown_unknown"),
+            Some("99:99;88:88"),
+        );
+        assert!(
+            signals.looks_like_browser(),
+            "unknown fingerprint with valid JA4 + platform should pass"
+        );
+        assert_eq!(signals.known_browser, None, "should not match allowlist");
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_bot() {
+        let signals = DeviceSignals::derive(BOT_UA, None, None);
+        assert!(
+            !signals.looks_like_browser(),
+            "bot with no JA4 and no platform should be rejected"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_missing_ja4() {
+        // Real UA but no TLS fingerprint (e.g. HTTP/1.1 or missing SDK support)
+        let signals = DeviceSignals::derive(CHROME_MAC_UA, None, Some("1:65536"));
+        assert!(
+            !signals.looks_like_browser(),
+            "missing JA4 should be rejected even with valid UA"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_missing_platform() {
+        // Has JA4 but unrecognizable UA
+        let signals = DeviceSignals::derive(BOT_UA, Some("t13d1516h2_abc_def"), None);
+        assert!(
+            !signals.looks_like_browser(),
+            "unrecognizable UA should be rejected even with JA4"
         );
     }
 }

@@ -137,7 +137,8 @@ Expected shape:
       "source": "formally-vital-lion.edgecompute.app",
       "uids": [{ "id": "mock-user-123", "atype": 3 }]
     }
-  ]
+  ],
+  "cluster_size": 12
 }
 ```
 
