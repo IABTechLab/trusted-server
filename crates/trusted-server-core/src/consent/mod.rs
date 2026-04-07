@@ -23,17 +23,18 @@
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
 //!     ec_id: Some("ec_abc123"),
+//!     kv_store: Some(runtime_services.kv_store()),
 //! });
 //! ```
 
 mod extraction;
 pub mod gpp;
 pub mod jurisdiction;
-pub mod kv;
 pub mod tcf;
 pub mod types;
 pub mod us_privacy;
 
+pub use crate::storage::kv_store as kv;
 pub use extraction::extract_consent_signals;
 pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
@@ -68,10 +69,15 @@ pub struct ConsentPipelineInput<'a> {
     pub geo: Option<&'a GeoInfo>,
     /// EC ID for KV Store consent persistence.
     ///
-    /// When set along with `config.consent_store`, enables:
+    /// When set along with `kv_store`, enables:
     /// - **Read fallback**: loads consent from KV when cookies are absent.
     /// - **Write-on-change**: persists cookie-sourced consent to KV.
     pub ec_id: Option<&'a str>,
+    /// KV store for consent persistence.
+    ///
+    /// `None` when consent persistence is not configured for this request, or
+    /// when the caller intentionally skips consent KV access.
+    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -516,14 +522,13 @@ fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
 /// Attempts to load consent from the KV Store when cookie signals are empty.
 ///
 /// Returns `Some(ConsentContext)` if a valid entry was found and decoded,
-/// `None` otherwise. Requires both `consent_store` and `ec_id` to
-/// be configured.
+/// `None` otherwise. Requires both `kv_store` and `ec_id` to be present.
 fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
-    let store_name = input.config.consent_store.as_deref()?;
+    let kv_store = input.kv_store?;
     let ec_id = input.ec_id?;
 
     log::debug!("No cookie consent signals, trying KV fallback for '{ec_id}'");
-    let mut ctx = kv::load_consent_from_kv(store_name, ec_id)?;
+    let mut ctx = kv::load_consent_from_kv(kv_store, ec_id)?;
 
     // Re-detect jurisdiction from current geo (may differ from stored value).
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
@@ -539,14 +544,14 @@ fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
 /// Only writes when consent signals are non-empty and have changed since
 /// the last write (fingerprint comparison).
 fn try_kv_write(input: &ConsentPipelineInput<'_>, ctx: &ConsentContext) {
-    let Some(store_name) = input.config.consent_store.as_deref() else {
+    let Some(kv_store) = input.kv_store else {
         return;
     };
     let Some(ec_id) = input.ec_id else {
         return;
     };
 
-    kv::save_consent_to_kv(store_name, ec_id, ctx, input.config.max_consent_age_days);
+    kv::save_consent_to_kv(kv_store, ec_id, ctx, input.config.max_consent_age_days);
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +751,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: None,
+            kv_store: None,
         });
 
         assert!(
@@ -775,6 +781,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: None,
+            kv_store: None,
         });
 
         assert!(
