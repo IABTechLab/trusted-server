@@ -6,15 +6,15 @@ This guide covers:
 
 1. Fastly store setup
 2. Partner registration
-3. Browser pixel sync (`/sync`)
-4. Server-to-server batch sync (`/_ts/api/v1/sync`)
-5. Identity verification (`/identify`)
+3. Browser pixel sync (`/_ts/api/v1/sync`)
+4. Server-to-server batch sync (`/_ts/api/v1/batch-sync`)
+5. Identity verification (`/_ts/api/v1/identify`)
 6. Auction bidstream verification (`/auction`)
 
 ## Prerequisites
 
 - Trusted Server deployed and reachable (example: `https://getpurpose.ai`)
-- Admin credentials for `/_ts/admin/partners/register`
+- Admin credentials for `/_ts/admin/v1/partners/register`
 - Fastly CLI authenticated (for store verification)
 - A valid TCF consent string (`euconsent-v2`) for consent-required requests
 
@@ -56,10 +56,10 @@ PARTNER_UID="mock-user-$(date +%s)"
 
 ## 3) Register Partner
 
-Endpoint: `POST /_ts/admin/partners/register`
+Endpoint: `POST /_ts/admin/v1/partners/register`
 
 ```bash
-curl -X POST "${TS_BASE_URL}/_ts/admin/partners/register" \
+curl -X POST "${TS_BASE_URL}/_ts/admin/v1/partners/register" \
   -u "${ADMIN_USER}:${ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d "{
@@ -94,10 +94,10 @@ Look for:
 
 ## 5) Pixel Sync (Browser-style)
 
-Endpoint: `GET /sync`
+Endpoint: `GET /_ts/api/v1/sync`
 
 ```bash
-curl -si "${TS_BASE_URL}/sync?partner=${PARTNER_ID}&uid=${PARTNER_UID}&return=${MOCK_SSP_URL}/done" \
+curl -si "${TS_BASE_URL}/_ts/api/v1/sync?partner=${PARTNER_ID}&uid=${PARTNER_UID}&return=${MOCK_SSP_URL}/done" \
   -H "Cookie: ts-ec=${EC_ID}; euconsent-v2=${TCF_CONSENT}"
 ```
 
@@ -115,10 +115,10 @@ Common `ts_reason` values:
 
 ## 6) Verify Identity
 
-Endpoint: `GET /identify`
+Endpoint: `GET /_ts/api/v1/identify`
 
 ```bash
-curl -s "${TS_BASE_URL}/identify" \
+curl -s "${TS_BASE_URL}/_ts/api/v1/identify" \
   -H "Cookie: ts-ec=${EC_ID}; euconsent-v2=${TCF_CONSENT}" | python3 -m json.tool
 ```
 
@@ -144,7 +144,7 @@ Expected shape:
 
 ## 7) Batch Sync (S2S)
 
-Endpoint: `POST /_ts/api/v1/sync`
+Endpoint: `POST /_ts/api/v1/batch-sync`
 
 Important: request field is `ec_id` (full `{64hex}.{6alnum}` value).
 
@@ -152,7 +152,7 @@ Important: request field is `ec_id` (full `{64hex}.{6alnum}` value).
 BATCH_UID="${PARTNER_UID}-batch"
 NOW_TS="$(date +%s)"
 
-curl -X POST "${TS_BASE_URL}/_ts/api/v1/sync" \
+curl -X POST "${TS_BASE_URL}/_ts/api/v1/batch-sync" \
   -H "Authorization: Bearer ${PARTNER_API_KEY}" \
   -H "Content-Type: application/json" \
   -d "{
@@ -235,13 +235,13 @@ If pixel sync returns `write_failed`, check whether KV entry has:
 
 ## 10) Troubleshooting Quick Map
 
-| Symptom                                    | Likely Cause                           | Check                                     |
-| ------------------------------------------ | -------------------------------------- | ----------------------------------------- |
-| `invalid_token` on batch sync              | Wrong partner API key                  | Re-register partner with known API key    |
-| `missing field ec_id`                      | Wrong request schema                   | Use `ec_id` field                         |
-| `ts_reason=no_consent`                     | Missing/invalid consent cookie         | Include valid `euconsent-v2`              |
-| `ts_reason=write_failed`                   | KV write blocked (often consent state) | Inspect identity KV entry and store links |
-| `/identify` returns `{"consent":"denied"}` | No consent for current request         | Send consent cookie                       |
-| No `uids` in `/identify`                   | No successful sync yet                 | Run `/sync` or batch sync first           |
+| Symptom                                               | Likely Cause                           | Check                                      |
+| ----------------------------------------------------- | -------------------------------------- | ------------------------------------------ |
+| `invalid_token` on batch sync                         | Wrong partner API key                  | Re-register partner with known API key     |
+| `missing field ec_id`                                 | Wrong request schema                   | Use `ec_id` field                          |
+| `ts_reason=no_consent`                                | Missing/invalid consent cookie         | Include valid `euconsent-v2`               |
+| `ts_reason=write_failed`                              | KV write blocked (often consent state) | Inspect identity KV entry and store links  |
+| `/_ts/api/v1/identify` returns `{"consent":"denied"}` | No consent for current request         | Send consent cookie                        |
+| No `uids` in `/_ts/api/v1/identify`                   | No successful sync yet                 | Run `/_ts/api/v1/sync` or batch sync first |
 
 See also: [Edge Cookies](/guide/edge-cookies), [Configuration](/guide/configuration), [API Reference](/guide/api-reference)
