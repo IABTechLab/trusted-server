@@ -1,6 +1,6 @@
 //! Shared EID resolution and formatting helpers.
 //!
-//! Used by both `/identify` and `/auction` to resolve partner IDs from KV
+//! Used by both `/_ts/api/v1/identify` and `/auction` to resolve partner IDs from KV
 //! entries, convert them to `OpenRTB` EID structures, and build base64-encoded
 //! response headers.
 
