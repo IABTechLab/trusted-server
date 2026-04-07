@@ -75,7 +75,7 @@ Phase 0 — bot gate (pure in-memory, no KV I/O):
     │  - req.get_client_h2_fingerprint() → h2_fp_hash  │
     │  - (ja4_class, h2_fp_hash) → known_browser       │
     │                                                   │
-    │  known_browser != Some(true)?                     │
+    │  !looks_like_browser()?                             │
     │    → suppress KV graph (None), skip ec_finalize,  │
     │      skip pull sync. Request still proxied to     │
     │      origin — bot receives valid HTML but leaves   │
@@ -327,7 +327,7 @@ impl EcContext {
     pub fn device_signals(&self) -> Option<&DeviceSignals>;
 
     /// Returns the stable 64-char hex prefix, or `None` if no EC.
-    /// 
+    ///
     /// Note: This extracts only the prefix for display/logging purposes. All KV
     /// operations use the full EC ID (via `ec_value()`), not just this hash.
     pub fn ec_hash(&self) -> Option<&str>;
@@ -411,9 +411,9 @@ derive_device_signals(req)
     h2_fp_hash = sha256(h2_fp)[..6].hex()   // 12 hex chars
     known_browser = evaluate_known_browser(ja4_class, h2_fp_hash) // allowlist match
 
-  is_known_browser = (known_browser == Some(true))
+  is_real_browser = looks_like_browser()   // ja4_class.is_some() && platform_class.is_some()
 
-  if !is_known_browser:
+  if !is_real_browser:
     log::debug("Bot gate: blocking EC operations")
     kv_graph = None                          // suppress all KV operations
     // ec_finalize_response() will be skipped
@@ -458,10 +458,10 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
             // no-ops if a live entry (ok=true) already exists
 ```
 
-**`ec_finalize_response(settings, geo, ec_context, &kv, response)` — runs only when `is_known_browser == true`:**
+**`ec_finalize_response(settings, geo, ec_context, &kv, response)` — runs only when `is_real_browser == true`:**
 
 ```
-  // Bot gate: when known_browser != Some(true), this entire block is skipped.
+  // Bot gate: when !looks_like_browser(), this entire block is skipped.
   // The response is proxied to origin without any cookie writes or KV operations.
 
   ├── !allows_ec_creation(&consent) && cookie_was_present?
@@ -996,31 +996,43 @@ is small (3 entries) so the cost is negligible.
 
 ### 7A.4 Bot gate behavior
 
-Device signals gate all downstream KV and cookie operations:
+The bot gate checks for **signal presence** rather than matching against a
+hardcoded fingerprint allowlist. Real browsers always produce a valid TLS
+fingerprint (`ja4_class`) and a recognizable UA platform string
+(`platform_class`). Raw HTTP clients (curl, Python requests, Go net/http,
+headless scrapers) typically lack one or both.
 
-| `known_browser`  | KV entry created | Cookie set | Partner IDs written | Pull sync |
-| ---------------- | ---------------- | ---------- | ------------------- | --------- |
-| `true`           | Yes              | Yes        | Yes                 | Yes       |
-| `false`          | **No**           | **No**     | **No**              | **No**    |
-| `None` (unknown) | **No**           | **No**     | **No**              | **No**    |
+The gate uses `DeviceSignals::looks_like_browser()`:
 
-`None` (unrecognized client) is treated the same as `false`. An advertiser
-cannot bid on a session we cannot verify as human — allowing `None` entries
-into the identity graph would degrade buyer trust with no offsetting benefit.
+```rust
+pub fn looks_like_browser(&self) -> bool {
+    self.ja4_class.is_some() && self.platform_class.is_some()
+}
+```
+
+| Condition                                        | EC operations | Example                          |
+| ------------------------------------------------ | ------------- | -------------------------------- |
+| `ja4_class` present AND `platform_class` present | **Allowed**   | Any real browser on any OS       |
+| `ja4_class` missing OR `platform_class` missing  | **Blocked**   | curl, Python requests, Googlebot |
+
+`known_browser` (the fingerprint allowlist match) is still computed and stored
+on `KvDevice` for analytics and future buyer-facing quality scoring, but it
+does **not** gate identity operations. This avoids blocking legitimate browsers
+whose JA4/H2 fingerprints are not yet in the allowlist.
 
 **Implementation in the Fastly adapter:**
 
 1. After `GeoInfo::from_request()`, call `derive_device_signals(req)` which
    reads `User-Agent`, `req.get_tls_ja4()`, and
    `req.get_client_h2_fingerprint()`.
-2. If `known_browser != Some(true)`:
+2. If `!looks_like_browser()`:
    - `kv_graph` is set to `None` (suppresses all KV reads and writes)
    - `ec_finalize_response()` is skipped (no cookie set/deleted)
    - Pull sync is skipped
    - The request proceeds through normal routing — organic requests are
      proxied to publisher origin, API endpoints respond normally (but
      without EC identity data)
-3. If `known_browser == Some(true)`: proceed normally. Device signals are set
+3. If `looks_like_browser()`: proceed normally. Device signals are set
    on `EcContext` via `set_device_signals()` so they flow through to
    `KvEntry` creation.
 
@@ -1044,6 +1056,10 @@ pub struct DeviceSignals {
 impl DeviceSignals {
     /// Derives all device signals from raw request data.
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self;
+
+    /// Returns true when ja4_class and platform_class are both present.
+    /// Used by the bot gate — see §7A.4.
+    pub fn looks_like_browser(&self) -> bool;
 
     /// Converts to KvDevice for KV storage.
     pub fn to_kv_device(&self) -> KvDevice;
@@ -1588,7 +1604,7 @@ Set on `200` responses only:
 
 | Header              | Value                                                                                                                                                                                                                                                                                                                           |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `X-ts-ec`           | `{64-hex}.{6-alnum}` — full EC ID                                                                                                                                                                                                                                                                                              |
+| `X-ts-ec`           | `{64-hex}.{6-alnum}` — full EC ID                                                                                                                                                                                                                                                                                               |
 | `X-ts-eids`         | Standard base64 (RFC 4648, with `=` padding) of the JSON array of OpenRTB 2.6 `user.eids` objects. Capped at **4 KB** after encoding. If the encoded value exceeds 4 KB, the array is truncated (fewest partners first — highest `synced` timestamp retained) until it fits, and a `x-ts-eids-truncated: true` header is added. |
 | `X-ts-<partner_id>` | Resolved UID per partner (e.g., `X-ts-uid2`). One header per partner with a resolved UID. **Capped at 20 partners** — partners sorted by most-recently synced; excess partners are omitted silently.                                                                                                                            |
 | `X-ts-ec-consent`   | `ok` (always — denied consent returns `403`, not `200`)                                                                                                                                                                                                                                                                         |
@@ -2082,10 +2098,10 @@ async fn route_request(...) -> Result<(), Error> {
 
     // Phase 0 — bot gate (pure in-memory, no KV I/O). See §7A.
     let device_signals = derive_device_signals(&req);
-    let is_known_browser = device_signals.known_browser == Some(true);
-    if !is_known_browser {
-        log::debug!("Bot gate: blocking EC operations (known_browser={:?})",
-            device_signals.known_browser);
+    let is_real_browser = device_signals.looks_like_browser();
+    if !is_real_browser {
+        log::debug!("Bot gate: blocking EC operations (ja4={:?}, platform={:?})",
+            device_signals.ja4_class, device_signals.platform_class);
     }
 
     // Pre-routing — read only, no generation (matches GeoInfo pattern).
@@ -2106,7 +2122,7 @@ async fn route_request(...) -> Result<(), Error> {
     ec_context.set_device_signals(device_signals);
 
     // Bot gate: suppress all KV operations for unrecognized clients.
-    let kv = if is_known_browser {
+    let kv = if is_real_browser {
         Some(KvIdentityGraph::new(&settings.ec.ec_store))
     } else {
         None
@@ -2116,7 +2132,7 @@ async fn route_request(...) -> Result<(), Error> {
 
     if let Some(mut response) = enforce_basic_auth(settings, &req) {
         // Bot gate: skip EC cookie writes for unrecognized clients.
-        if is_known_browser {
+        if is_real_browser {
             ec_finalize_response(settings, geo_info.as_ref(), &ec_context, kv.as_ref(), &mut response);
         }
         response.send_to_client();
@@ -2152,14 +2168,15 @@ async fn route_request(...) -> Result<(), Error> {
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
     // Bot gate: skip EC cookie writes and finalize for unrecognized clients.
-    if is_known_browser {
+    // Bot gate: skip EC cookie writes and finalize for unrecognized clients.
+    if is_real_browser {
         ec_finalize_response(settings, geo_info.as_ref(), &ec_context, kv.as_ref(), &mut response);
     }
 
     response.send_to_client();
 
-    // Background pull sync — organic routes only, known browsers only (§7A.4, §10.2).
-    if is_known_browser && is_organic {
+    // Background pull sync — organic routes only, real browsers only (§7A.4, §10.2).
+    if is_real_browser && is_organic {
         if let (Some(ip), Ok(pull_partners)) = (ec_context.client_ip, partner_store.pull_enabled_partners()) {
             pull_sync_dispatcher.dispatch_background(&ec_context, ip, &pull_partners, kv.as_ref());
         }

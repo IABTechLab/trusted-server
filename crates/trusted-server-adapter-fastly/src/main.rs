@@ -136,14 +136,14 @@ async fn route_request(
     // Derive device signals from TLS/H2/UA for bot detection.
     // This is pure in-memory computation — no KV I/O.
     let device_signals = derive_device_signals(&req);
-    let is_known_browser = device_signals.known_browser == Some(true);
+    let is_real_browser = device_signals.looks_like_browser();
 
-    if !is_known_browser {
+    if !is_real_browser {
         log::debug!(
-            "Bot gate: blocking EC operations (known_browser={:?}, ja4={:?}, platform={:?})",
-            device_signals.known_browser,
+            "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
             device_signals.ja4_class,
             device_signals.platform_class,
+            device_signals.is_mobile,
         );
     }
 
@@ -184,7 +184,7 @@ async fn route_request(
     // Bot gate: suppress all KV operations for unrecognized clients.
     // The request is still proxied normally — the bot receives valid
     // HTML but leaves no trace in the identity graph.
-    let kv_graph = if is_known_browser {
+    let kv_graph = if is_real_browser {
         maybe_identity_graph(settings)
     } else {
         None
@@ -195,7 +195,7 @@ async fn route_request(
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
-            if is_known_browser {
+            if is_real_browser {
                 ec_finalize_response(
                     settings,
                     geo_info.as_ref(),
@@ -342,7 +342,7 @@ async fn route_request(
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
     // Bot gate: skip EC cookie writes and pull sync for unrecognized clients.
-    if is_known_browser {
+    if is_real_browser {
         ec_finalize_response(
             settings,
             geo_info.as_ref(),
@@ -354,7 +354,7 @@ async fn route_request(
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
-    let pull_sync_context = if is_known_browser && organic_route && route_succeeded {
+    let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
         build_pull_sync_context(&ec_context)
     } else {
         None
