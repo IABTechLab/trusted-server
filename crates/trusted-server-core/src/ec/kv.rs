@@ -58,6 +58,15 @@ pub enum UpsertResult {
     Stale,
 }
 
+/// Truncates an EC ID for safe inclusion in log messages.
+///
+/// Returns the first 8 characters followed by `…` to aid debugging without
+/// writing the full user identifier to logs (satisfies the `CodeQL`
+/// "cleartext logging of sensitive information" rule).
+fn log_id(ec_id: &str) -> &str {
+    ec_id.get(..8).unwrap_or(ec_id)
+}
+
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
 /// Each EC ID (`{64hex}.{6alnum}`) maps to a JSON-encoded [`KvEntry`]
@@ -280,12 +289,18 @@ impl KvIdentityGraph {
 
         // Live entry — nothing to do.
         if existing.consent.ok {
-            log::debug!("create_or_revive: live entry exists for '{ec_id}', no-op");
+            log::debug!(
+                "create_or_revive: live entry exists for '{}…', no-op",
+                log_id(ec_id)
+            );
             return Ok(());
         }
 
         // Tombstone — CAS overwrite to revive.
-        log::info!("create_or_revive: reviving tombstone for '{ec_id}'");
+        log::info!(
+            "create_or_revive: reviving tombstone for '{}…'",
+            log_id(ec_id)
+        );
 
         let mut current_gen = generation;
         for attempt in 0..MAX_CAS_RETRIES {
@@ -367,7 +382,10 @@ impl KvIdentityGraph {
                 Some(pair) => pair,
                 None => {
                     // Root entry missing — create a minimal entry.
-                    log::info!("upsert_partner_id: no entry for '{ec_id}', creating minimal entry");
+                    log::info!(
+                        "upsert_partner_id: no entry for '{}…', creating minimal entry",
+                        log_id(ec_id)
+                    );
                     let minimal = KvEntry::minimal(partner_id, uid, synced);
                     let (min_body, min_meta) = Self::serialize_entry(&minimal, &self.store_name)?;
                     if Self::try_insert_add(&store, ec_id, &min_body, &min_meta, &self.store_name)?
@@ -556,7 +574,10 @@ impl KvIdentityGraph {
         let (mut entry, generation) = match self.get(ec_id)? {
             Some(pair) => pair,
             None => {
-                log::debug!("update_last_seen: no entry for '{ec_id}', skipping");
+                log::debug!(
+                    "update_last_seen: no entry for '{}…', skipping",
+                    log_id(ec_id)
+                );
                 return Ok(());
             }
         };
@@ -564,7 +585,10 @@ impl KvIdentityGraph {
         // Skip tombstones — a stale cookie should not extend a 24h tombstone
         // back to 1-year TTL.
         if !entry.consent.ok {
-            log::debug!("update_last_seen: entry for '{ec_id}' is a tombstone, skipping");
+            log::debug!(
+                "update_last_seen: entry for '{}…' is a tombstone, skipping",
+                log_id(ec_id)
+            );
             return Ok(());
         }
 
@@ -610,7 +634,8 @@ impl KvIdentityGraph {
                     } else {
                         log::debug!(
                             "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
-                             for '{ec_id}', dropping domain '{domain}'"
+                             for '{}…', dropping domain '{domain}'",
+                            log_id(ec_id),
                         );
                     }
                 }
@@ -746,8 +771,9 @@ impl KvIdentityGraph {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
                     log::trace!(
-                        "evaluate_cluster: cached cluster_size for '{ec_id}' \
+                        "evaluate_cluster: cached cluster_size for '{}…' \
                          (age={}s, ttl={recheck_secs}s)",
+                        log_id(ec_id),
                         now.saturating_sub(checked),
                     );
                     return Ok(network.cluster_size);
@@ -759,7 +785,10 @@ impl KvIdentityGraph {
         let hash_prefix = ec_hash(ec_id);
         let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
 
-        log::debug!("evaluate_cluster: computed cluster_size={cluster_size} for '{ec_id}'");
+        log::debug!(
+            "evaluate_cluster: computed cluster_size={cluster_size} for '{}…'",
+            log_id(ec_id)
+        );
 
         // Best-effort CAS write-back — update the network field.
         let mut updated_entry = entry.clone();
@@ -787,7 +816,10 @@ impl KvIdentityGraph {
             }
             Err(err) => {
                 // Log but don't fail — the computed value is still valid.
-                log::warn!("evaluate_cluster: failed to write cluster_size for '{ec_id}': {err}");
+                log::warn!(
+                    "evaluate_cluster: failed to write cluster_size for '{}…': {err}",
+                    log_id(ec_id)
+                );
             }
         }
 
