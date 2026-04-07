@@ -61,7 +61,7 @@ fn partner_id_regex() -> Result<&'static Regex, String> {
 
 /// A registered partner configuration stored in the partner KV store.
 ///
-/// Created via `POST /_ts/admin/partners/register`. Used by pixel sync, batch
+/// Created via `POST /_ts/admin/v1/partners/register`. Used by pixel sync, batch
 /// sync, pull sync, and auction bidstream decoration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartnerRecord {

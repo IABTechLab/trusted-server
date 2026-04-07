@@ -248,7 +248,7 @@ pub struct Ec {
     pub cluster_trust_threshold: u32,
 
     /// Seconds before re-evaluating an entry's `cluster_size`.
-    /// Re-check occurs only in the `/identify` endpoint.
+    /// Re-check occurs only in the `/_ts/api/v1/identify` endpoint.
     #[serde(default = "Ec::default_cluster_recheck_secs")]
     pub cluster_recheck_secs: u64,
 }
@@ -634,7 +634,7 @@ impl Settings {
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
-        "/_ts/admin/partners/register",
+        "/_ts/admin/v1/partners/register",
     ];
 
     /// Returns admin endpoint paths that no configured handler covers.
@@ -2054,7 +2054,7 @@ mod tests {
             vec![
                 "/_ts/admin/keys/rotate",
                 "/_ts/admin/keys/deactivate",
-                "/_ts/admin/partners/register",
+                "/_ts/admin/v1/partners/register",
             ],
             "should report all admin endpoints as uncovered"
         );
@@ -2089,7 +2089,10 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate", "/_ts/admin/partners/register"],
+            vec![
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/v1/partners/register"
+            ],
             "should detect endpoints not covered by the rotate-only handler"
         );
     }

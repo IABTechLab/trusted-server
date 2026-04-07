@@ -1,6 +1,6 @@
 //! Admin endpoints for partner management.
 //!
-//! Provides `POST /_ts/admin/partners/register` for registering and updating
+//! Provides `POST /_ts/admin/v1/partners/register` for registering and updating
 //! partner configurations. Authentication is handled by the `[[handlers]]`
 //! basic-auth layer before this code runs.
 
@@ -16,7 +16,7 @@ use super::partner::{
     hash_api_key, validate_partner_id, validate_pull_sync_config, PartnerRecord, PartnerStore,
 };
 
-/// Request body for `POST /_ts/admin/partners/register`.
+/// Request body for `POST /_ts/admin/v1/partners/register`.
 ///
 /// Accepts `api_key` as plaintext — it is hashed before storage and
 /// never persisted in cleartext.
@@ -124,7 +124,7 @@ fn normalize_hostname_list(
     Ok(normalized_values)
 }
 
-/// Response body for `POST /_ts/admin/partners/register`.
+/// Response body for `POST /_ts/admin/v1/partners/register`.
 ///
 /// Echoes key fields without exposing sensitive data (`api_key_hash`,
 /// `ts_pull_token`).
@@ -137,7 +137,7 @@ pub struct RegisterPartnerResponse {
     pub created: bool,
 }
 
-/// Handles `POST /_ts/admin/partners/register`.
+/// Handles `POST /_ts/admin/v1/partners/register`.
 ///
 /// Registers a new partner or updates an existing one. Authentication is
 /// handled upstream by the `[[handlers]]` basic-auth layer.

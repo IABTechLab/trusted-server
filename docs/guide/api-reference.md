@@ -50,7 +50,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 ## Edge Cookie Endpoints
 
-### POST /\_ts/admin/partners/register
+### POST /\_ts/admin/v1/partners/register
 
 Registers or updates a partner used for EC sync and bidstream enrichment.
 
@@ -76,7 +76,7 @@ Registers or updates a partner used for EC sync and bidstream enrichment.
 
 ---
 
-### GET /sync
+### GET /\_ts/api/v1/sync
 
 Browser pixel sync endpoint. Associates an EC ID with a partner UID.
 
@@ -102,7 +102,7 @@ Common `ts_reason` values: `no_ec`, `no_consent`, `write_failed`, `rate_limited`
 
 ---
 
-### GET /identify
+### GET /\_ts/api/v1/identify
 
 Returns EC identity plus resolved partner IDs and EIDs for the current user.
 
@@ -131,7 +131,7 @@ Returns EC identity plus resolved partner IDs and EIDs for the current user.
 
 ---
 
-### POST /\_ts/api/v1/sync
+### POST /\_ts/api/v1/batch-sync
 
 Server-to-server batch sync endpoint for writing EC ID to partner UID mappings.
 

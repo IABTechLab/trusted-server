@@ -9,7 +9,7 @@
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
 //!    when none exists and consent allows it. This is called only in organic
 //!    handlers (publisher proxy, integration proxy) — never in read-only
-//!    endpoints like `/identify`.
+//!    endpoints like `/_ts/api/v1/identify`.
 //!
 //! # Module structure
 //!
@@ -21,10 +21,10 @@
 //! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
 //! - [`partner`] — Partner registry (`PartnerRecord`, `PartnerStore`)
 //! - [`admin`] — Admin endpoints for partner management
-//! - [`sync_pixel`] — Pixel sync write endpoint (`GET /sync`)
-//! - [`identify`] — Browser identity read endpoint (`GET /identify`)
+//! - [`sync_pixel`] — Pixel sync write endpoint (`GET /_ts/api/v1/sync`)
+//! - [`identify`] — Browser identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
-//! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/sync`)
+//! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
 pub mod admin;
@@ -337,7 +337,7 @@ impl EcContext {
 
     /// Returns a mutable reference to the consent context.
     ///
-    /// Used by `/sync` to apply query-param fallback consent for the current
+    /// Used by `/_ts/api/v1/sync` to apply query-param fallback consent for the current
     /// request only when pre-routing consent extraction produced an empty
     /// context.
     pub fn consent_mut(&mut self) -> &mut ConsentContext {
