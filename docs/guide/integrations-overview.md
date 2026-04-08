@@ -232,6 +232,10 @@ Do you use Permutive for audience data?
 ├─ Yes → Enable Permutive integration
 └─ No → Skip Permutive
 
+Do you use Sourcepoint for consent management?
+├─ Yes → Enable Sourcepoint integration
+└─ No → Skip Sourcepoint
+
 Are you developing/testing integrations?
 ├─ Yes → Enable Testlight integration
 └─ No → Skip Testlight
@@ -239,12 +243,13 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration   | Performance Impact | Caching Strategy            | Notes                                        |
-| ------------- | ------------------ | --------------------------- | -------------------------------------------- |
-| **Prebid**    | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
-| **Next.js**   | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
-| **Permutive** | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
-| **Testlight** | Low                | No caching                  | Development use only                         |
+| Integration     | Performance Impact | Caching Strategy            | Notes                                        |
+| --------------- | ------------------ | --------------------------- | -------------------------------------------- |
+| **Prebid**      | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
+| **Next.js**     | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
+| **Permutive**   | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
+| **Sourcepoint** | Low                | CDN cached (1 hour default) | JS rewriting adds minor overhead             |
+| **Testlight**   | Low                | No caching                  | Development use only                         |
 
 ## Environment Variables
 
@@ -263,6 +268,10 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
 # Permutive
 TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__ORGANIZATION_ID="neworg"
 TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__WORKSPACE_ID="workspace-123"
+
+# Sourcepoint
+TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__ENABLED=true
+TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__CDN_ORIGIN="https://cdn.privacy-mgmt.com"
 
 # Testlight
 TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__ENDPOINT="https://test.example.com"

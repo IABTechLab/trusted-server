@@ -1,3 +1,25 @@
+//! Sourcepoint integration for first-party CMP (Consent Management Platform) delivery.
+//!
+//! Proxies Sourcepoint's CDN (`cdn.privacy-mgmt.com`) and geo
+//! (`geo.privacymanager.io`) endpoints through Trusted Server so the browser
+//! loads consent management assets from first-party paths.
+//!
+//! ## Rewriting layers
+//!
+//! | Layer | Mechanism | What it catches |
+//! |-------|-----------|-----------------|
+//! | HTML attributes | `IntegrationAttributeRewriter` | Static `<script src>` / `<link href>` tags |
+//! | JS response bodies | `rewrite_script_content` | Webpack chunk paths + hardcoded CDN URLs |
+//! | Runtime config | `IntegrationHeadInjector` | `window._sp_` assignments from Next.js chunks |
+//! | Dynamic DOM | TS script guard (`script_guard.ts`) | Script/link elements inserted after page load |
+//!
+//! ## Endpoints
+//!
+//! | Method | Path | Upstream |
+//! |--------|------|----------|
+//! | `GET/POST` | `/integrations/sourcepoint/cdn/*` | `cdn.privacy-mgmt.com` |
+//! | `GET` | `/integrations/sourcepoint/geo{,/*}` | `geo.privacymanager.io` |
+
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -38,6 +60,11 @@ const SOURCEPOINT_GEO_PREFIX: &str = "/integrations/sourcepoint/geo";
 /// - `"https://cdn.privacy-mgmt.com/consent/tcfv2"`
 /// - `"//cdn.privacy-mgmt.com/mms/v2"`
 /// - `"cdn.privacy-mgmt.com"` (bare domain)
+///
+/// **Note:** The `regex` crate does not support backreferences, so the opening
+/// and closing quote groups (`['"]`) are independent character classes rather
+/// than a matched pair.  In practice Sourcepoint's minified JS always uses
+/// matching quotes, so this is not a concern for real-world content.
 static SP_CDN_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(['"])(https?:)?(//)?cdn\.privacy-mgmt\.com(/[^'"]*)?(['"])"#)
         .expect("Sourcepoint CDN URL regex should compile")
@@ -114,7 +141,7 @@ enum SourcepointBackend {
     Geo,
 }
 
-pub struct SourcepointIntegration {
+struct SourcepointIntegration {
     config: Arc<SourcepointConfig>,
 }
 
@@ -195,10 +222,13 @@ impl SourcepointIntegration {
             proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
         }
 
+        // Accept-Encoding is deliberately omitted here and handled per-backend
+        // in the caller: CDN routes that need script rewriting request
+        // `identity` encoding so the body can be safely read as UTF-8, while
+        // other routes forward the client's original encoding.
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
-            header::ACCEPT_ENCODING,
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
@@ -257,6 +287,17 @@ impl SourcepointIntegration {
                 &format!(r#".origin+"{SOURCEPOINT_CDN_PREFIX}/unified/"#),
             )
             .into_owned()
+    }
+
+    /// Returns `true` for CDN paths that are likely JavaScript bundles.
+    ///
+    /// Used to decide whether to request uncompressed content from upstream so
+    /// the body can be read and rewritten.  Paths that don't match still get
+    /// the `is_javascript_response` check after the response arrives, so this
+    /// is a conservative preflight — false negatives just mean we skip the
+    /// `Accept-Encoding: identity` optimisation for that request.
+    fn is_likely_javascript_path(path: &str) -> bool {
+        path.ends_with(".js") || path.starts_with("/unified/") || path.starts_with("/wrapper/")
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
@@ -350,6 +391,7 @@ impl IntegrationProxy for SourcepointIntegration {
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
+        let method = req.get_method().clone();
         let (backend, target_path) = Self::backend_for_route(&path).ok_or_else(|| {
             Report::new(Self::error(format!("Unknown Sourcepoint route: {path}")))
         })?;
@@ -357,6 +399,8 @@ impl IntegrationProxy for SourcepointIntegration {
         let target_url = self
             .build_target_url(backend, target_path, req.get_query_str())
             .change_context(Self::error("Failed to build Sourcepoint target URL"))?;
+
+        log::info!("[sourcepoint] Proxying {method} {path} → {target_url} (backend: {backend:?})");
         let base_origin = match backend {
             SourcepointBackend::Cdn => self.config.cdn_origin.as_str(),
             SourcepointBackend::Geo => self.config.geo_origin.as_str(),
@@ -367,11 +411,18 @@ impl IntegrationProxy for SourcepointIntegration {
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
         self.copy_headers(&req, &mut proxy_req);
 
-        // Request uncompressed content for CDN routes so we can safely read
-        // and rewrite the JavaScript body.  Geo routes don't need rewriting,
-        // so they keep the client's original Accept-Encoding for efficiency.
-        if backend == SourcepointBackend::Cdn && self.config.rewrite_sdk {
+        // Request uncompressed content only for CDN paths that are likely
+        // JavaScript (the files we need to regex-rewrite).  All other CDN
+        // responses (images, JSON API responses, CSS) and geo routes keep the
+        // client's original Accept-Encoding for efficiency.
+        let needs_script_rewrite = backend == SourcepointBackend::Cdn
+            && self.config.rewrite_sdk
+            && Self::is_likely_javascript_path(target_path);
+
+        if needs_script_rewrite {
             proxy_req.set_header(header::ACCEPT_ENCODING, "identity");
+        } else if let Some(ae) = req.get_header(header::ACCEPT_ENCODING) {
+            proxy_req.set_header(header::ACCEPT_ENCODING, ae);
         }
 
         if matches!(
@@ -388,6 +439,11 @@ impl IntegrationProxy for SourcepointIntegration {
             .send(&backend_name)
             .change_context(Self::error("Sourcepoint upstream request failed"))?;
 
+        log::info!(
+            "[sourcepoint] Upstream responded with status {}",
+            response.get_status()
+        );
+
         // Rewrite CDN URLs inside JavaScript responses so that dynamically
         // loaded chunks and API calls route through the first-party proxy.
         if backend == SourcepointBackend::Cdn
@@ -395,6 +451,8 @@ impl IntegrationProxy for SourcepointIntegration {
             && self.config.rewrite_sdk
             && Self::is_javascript_response(&response)
         {
+            log::info!("[sourcepoint] Rewriting JavaScript response body for {path}");
+
             let body = response.take_body_str();
             let rewritten = Self::rewrite_script_content(&body);
 
@@ -480,8 +538,8 @@ impl IntegrationHeadInjector for SourcepointIntegration {
                 "var Q=\"{geo_prefix}\";",
                 "function r(s){{",
                 "if(typeof s!==\"string\")return s;",
-                "return s.replace(\"https://\"+C,P).replace(\"http://\"+C,P)",
-                ".replace(\"https://\"+G,Q).replace(\"http://\"+G,Q)",
+                "return s.replace(\"https://\"+C,P).replace(\"http://\"+C,P).replace(\"//\"+C,P)",
+                ".replace(\"https://\"+G,Q).replace(\"http://\"+G,Q).replace(\"//\"+G,Q)",
                 "}}",
                 "function p(o){{",
                 "if(!o||typeof o!==\"object\")return o;",
@@ -694,6 +752,44 @@ mod tests {
             registry.has_route(&Method::GET, "/integrations/sourcepoint/geo"),
             "should register geo proxy route"
         );
+    }
+
+    #[test]
+    fn attribute_rewriter_skips_when_rewrite_disabled() {
+        let mut cfg = config(true);
+        cfg.rewrite_sdk = false;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let ctx = IntegrationAttributeContext {
+            attribute_name: "src",
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+        };
+
+        assert_eq!(
+            integration.rewrite("src", "https://cdn.privacy-mgmt.com/wrapper.js", &ctx,),
+            AttributeRewriteAction::keep(),
+            "should not rewrite when rewrite_sdk is false"
+        );
+    }
+
+    #[test]
+    fn identifies_likely_javascript_paths() {
+        assert!(SourcepointIntegration::is_likely_javascript_path(
+            "/unified/4.40.1/gdpr-tcf.bundle.js"
+        ));
+        assert!(SourcepointIntegration::is_likely_javascript_path(
+            "/wrapper/v2/messages"
+        ));
+        assert!(SourcepointIntegration::is_likely_javascript_path(
+            "/wrapperMessagingWithoutDetection.js"
+        ));
+        assert!(!SourcepointIntegration::is_likely_javascript_path(
+            "/mms/v2/get_site_data"
+        ));
+        assert!(!SourcepointIntegration::is_likely_javascript_path(
+            "/consent/tcfv2"
+        ));
     }
 
     #[test]
