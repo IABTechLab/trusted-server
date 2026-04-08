@@ -5,11 +5,12 @@
 
 use std::net::IpAddr;
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::header;
-use fastly::Request;
 use handlebars::Handlebars;
 use hmac::{Hmac, Mac};
+use http::header;
+use http::Request;
 use rand::Rng;
 use serde_json::json;
 use sha2::Sha256;
@@ -97,18 +98,21 @@ fn generate_random_suffix(length: usize) -> String {
 pub fn generate_synthetic_id(
     settings: &Settings,
     services: &RuntimeServices,
-    req: &Request,
+    req: &Request<EdgeBody>,
 ) -> Result<String, Report<TrustedServerError>> {
     let client_ip = services.client_info.client_ip.map(normalize_ip);
     let user_agent = req
-        .get_header(header::USER_AGENT)
+        .headers()
+        .get(header::USER_AGENT)
         .map(|h| h.to_str().unwrap_or("unknown"));
     let accept_language = req
-        .get_header(header::ACCEPT_LANGUAGE)
+        .headers()
+        .get(header::ACCEPT_LANGUAGE)
         .and_then(|h| h.to_str().ok())
         .map(|lang| lang.split(',').next().unwrap_or("unknown"));
     let accept_encoding = req
-        .get_header(header::ACCEPT_ENCODING)
+        .headers()
+        .get(header::ACCEPT_ENCODING)
         .and_then(|h| h.to_str().ok());
     let random_uuid = Uuid::new_v4().to_string();
 
@@ -167,9 +171,12 @@ pub fn generate_synthetic_id(
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if the Cookie header contains invalid UTF-8
-pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
+pub fn get_synthetic_id(
+    req: &Request<EdgeBody>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(raw) = req
-        .get_header(HEADER_X_SYNTHETIC_ID)
+        .headers()
+        .get(HEADER_X_SYNTHETIC_ID)
         .and_then(|h| h.to_str().ok())
     {
         if is_valid_synthetic_id(raw) {
@@ -218,7 +225,7 @@ pub fn get_synthetic_id(req: &Request) -> Result<Option<String>, Report<TrustedS
 pub fn get_or_generate_synthetic_id(
     settings: &Settings,
     services: &RuntimeServices,
-    req: &Request,
+    req: &Request<EdgeBody>,
 ) -> Result<String, Report<TrustedServerError>> {
     if let Some(id) = get_synthetic_id(req)? {
         return Ok(id);
@@ -233,7 +240,7 @@ pub fn get_or_generate_synthetic_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastly::http::{HeaderName, HeaderValue};
+    use http::{HeaderName, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
@@ -269,10 +276,14 @@ mod tests {
         assert_eq!(normalize_ip(ipv6_a), "2001:db8:abcd:1::");
     }
 
-    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
-        let mut req = Request::new("GET", "http://example.com");
+    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request<EdgeBody> {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
         for (key, value) in headers {
-            req.set_header(
+            req.headers_mut().insert(
                 key,
                 HeaderValue::from_str(value).expect("should create valid header value"),
             );

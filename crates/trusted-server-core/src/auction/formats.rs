@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::compat;
 use crate::consent::ConsentContext;
 use crate::creative;
 use crate::error::TrustedServerError;
@@ -89,7 +90,8 @@ pub fn convert_tsjs_to_auction_request(
     geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let synthetic_id = synthetic_id.to_owned();
-    let fresh_id = generate_synthetic_id(settings, services, req).change_context(
+    let http_req = compat::from_fastly_request_ref(req);
+    let fresh_id = generate_synthetic_id(settings, services, &http_req).change_context(
         TrustedServerError::Auction {
             message: "Failed to generate fresh ID".to_string(),
         },

@@ -5,13 +5,13 @@ use fastly::{Error, Request, Response};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::compat;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -106,7 +106,7 @@ async fn route_request(
     // Strip client-spoofable forwarded headers at the edge.
     // On Fastly this service IS the first proxy — these headers from
     // clients are untrusted and can hijack URL rewriting (see #409).
-    sanitize_forwarded_headers(&mut req);
+    compat::sanitize_fastly_forwarded_headers(&mut req);
 
     // Look up geo info via the platform abstraction using the client IP
     // already captured in RuntimeServices at the entry point.
@@ -121,8 +121,10 @@ async fn route_request(
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    match enforce_basic_auth(settings, &req) {
-        Ok(Some(mut response)) => {
+    let auth_req = compat::from_fastly_request_ref(&req);
+    match enforce_basic_auth(settings, &auth_req) {
+        Ok(Some(response)) => {
+            let mut response = compat::to_fastly_response(response);
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(response);
         }

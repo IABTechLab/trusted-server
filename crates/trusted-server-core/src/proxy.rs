@@ -1,3 +1,4 @@
+use crate::compat;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
@@ -485,7 +486,8 @@ pub async fn proxy_request(
 }
 
 fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
-    let synthetic_id_param = match get_synthetic_id(req) {
+    let http_req = compat::from_fastly_request_ref(req);
+    let synthetic_id_param = match get_synthetic_id(&http_req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
@@ -800,7 +802,8 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
-    let synthetic_id = match get_synthetic_id(&req) {
+    let http_req = compat::from_fastly_request_ref(&req);
+    let synthetic_id = match get_synthetic_id(&http_req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);

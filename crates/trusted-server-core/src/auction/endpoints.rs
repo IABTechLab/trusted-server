@@ -4,6 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
+use crate::compat;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
@@ -46,16 +47,18 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    let http_req = compat::from_fastly_request_ref(&req);
+
     // Generate synthetic ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
-    let synthetic_id = get_or_generate_synthetic_id(settings, services, &req).change_context(
+    let synthetic_id = get_or_generate_synthetic_id(settings, services, &http_req).change_context(
         TrustedServerError::Auction {
             message: "Failed to generate synthetic ID".to_string(),
         },
     )?;
 
     // Extract consent from request cookies, headers, and geo.
-    let cookie_jar = handle_request_cookies(&req)?;
+    let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
         .lookup(services.client_info.client_ip)
@@ -65,7 +68,7 @@ pub async fn handle_auction(
         });
     let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
-        req: &req,
+        req: &http_req,
         config: &settings.consent,
         geo: geo.as_ref(),
         synthetic_id: Some(synthetic_id.as_str()),

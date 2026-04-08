@@ -8,8 +8,8 @@ use fastly::http::Method;
 use fastly::{Request, Response};
 use matchit::Router;
 
+use crate::compat;
 use crate::constants::HEADER_X_SYNTHETIC_ID;
-use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -659,7 +659,8 @@ impl IntegrationRegistry {
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Generate synthetic ID before consuming request
-            let synthetic_id_result = get_or_generate_synthetic_id(settings, services, &req);
+            let http_req = compat::from_fastly_request_ref(&req);
+            let synthetic_id_result = get_or_generate_synthetic_id(settings, services, &http_req);
 
             // Set synthetic ID header on the request so integrations can read it.
             // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
@@ -681,7 +682,11 @@ impl IntegrationRegistry {
                         // Cookie is intentionally not set when synthetic_id contains RFC 6265-illegal
                         // characters (e.g. a crafted x-synthetic-id header value). The response header
                         // is still emitted; only cookie persistence is skipped.
-                        set_synthetic_cookie(settings, response, synthetic_id.as_str());
+                        compat::set_fastly_synthetic_cookie(
+                            settings,
+                            response,
+                            synthetic_id.as_str(),
+                        );
                     }
                     Err(ref err) => {
                         log::warn!(

@@ -3,9 +3,10 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
+use crate::compat;
 use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthetic_cookie};
+use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -115,12 +116,15 @@ pub fn handle_tsjs_dynamic(
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
+    let http_req = compat::from_fastly_request_ref(req);
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid)
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        let http_resp =
+            serve_static_with_etag(&body, &http_req, "application/javascript; charset=utf-8");
+        let mut resp = compat::to_fastly_response(http_resp);
         resp.set_header(HEADER_X_COMPRESS_HINT, "on");
         return Ok(resp);
     }
@@ -132,8 +136,9 @@ pub fn handle_tsjs_dynamic(
             return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
         }
         if let Some(content) = trusted_server_js::module_bundle(module_id) {
-            let mut resp =
-                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            let http_resp =
+                serve_static_with_etag(content, &http_req, "application/javascript; charset=utf-8");
+            let mut resp = compat::to_fastly_response(http_resp);
             resp.set_header(HEADER_X_COMPRESS_HINT, "on");
             return Ok(resp);
         }
@@ -299,8 +304,10 @@ pub fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
+    let http_req = compat::from_fastly_request_ref(&req);
+
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req, &services.client_info);
+    let request_info = RequestInfo::from_request(&http_req, &services.client_info);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
@@ -314,7 +321,7 @@ pub fn handle_publisher_request(
     );
 
     // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
-    let cookie_jar = handle_request_cookies(&req)?;
+    let cookie_jar = handle_request_cookies(&http_req)?;
 
     // Capture the current SSC cookie value for revocation handling.
     // This must come from the cookie itself (not the x-synthetic-id header)
@@ -327,7 +334,7 @@ pub fn handle_publisher_request(
     // Generate synthetic identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let synthetic_id = get_or_generate_synthetic_id(settings, services, &req)?;
+    let synthetic_id = get_or_generate_synthetic_id(settings, services, &http_req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
@@ -343,7 +350,7 @@ pub fn handle_publisher_request(
         });
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
-        req: &req,
+        req: &http_req,
         config: &settings.consent,
         geo: geo.as_ref(),
         synthetic_id: Some(synthetic_id.as_str()),
@@ -461,11 +468,11 @@ pub fn handle_publisher_request(
         response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
         // Cookie persistence is skipped if the synthetic ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+        compat::set_fastly_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
     } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
         // Always expire the cookie — consent is withdrawn regardless of whether the
         // stored value is well-formed.
-        expire_synthetic_cookie(settings, &mut response);
+        compat::expire_fastly_synthetic_cookie(settings, &mut response);
         if is_valid_synthetic_id(cookie_synthetic_id) {
             log::info!(
                 "SSC revoked: consent withdrawn (jurisdiction={})",
@@ -693,14 +700,16 @@ mod tests {
             format!("synthetic_id={cookie_synthetic_id}; other=value"),
         );
 
-        let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
+        let http_req = compat::from_fastly_request_ref(&req);
+        let cookie_jar = handle_request_cookies(&http_req).expect("should parse cookies");
         let existing_ssc_cookie = cookie_jar
             .as_ref()
             .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
             .map(|cookie| cookie.value().to_owned());
 
-        let resolved_synthetic_id = get_or_generate_synthetic_id(&settings, &noop_services(), &req)
-            .expect("should resolve synthetic id");
+        let resolved_synthetic_id =
+            get_or_generate_synthetic_id(&settings, &noop_services(), &http_req)
+                .expect("should resolve synthetic id");
 
         assert_eq!(
             existing_ssc_cookie.as_deref(),

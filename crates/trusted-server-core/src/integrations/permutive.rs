@@ -13,8 +13,8 @@ use serde::Deserialize;
 use validator::Validate;
 
 use crate::backend::BackendConfig;
+use crate::compat;
 use crate::error::TrustedServerError;
-use crate::http_util::copy_custom_headers;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -495,7 +495,7 @@ impl PermutiveIntegration {
         }
 
         // Copy any X-* custom headers, skipping TS-internal headers
-        copy_custom_headers(from, to);
+        compat::copy_fastly_custom_headers(from, to);
     }
 }
 

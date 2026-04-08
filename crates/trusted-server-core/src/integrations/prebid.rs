@@ -15,8 +15,8 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::backend::BackendConfig;
+use crate::compat;
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::forward_cookie_header;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -443,7 +443,7 @@ fn copy_request_headers(
         }
     }
 
-    forward_cookie_header(from, to, consent_forwarding.strips_consent_cookies());
+    compat::forward_fastly_cookie_header(from, to, consent_forwarding.strips_consent_cookies());
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -710,7 +710,8 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let request_info = RequestInfo::from_request(context.request, context.client_info);
+        let http_req = compat::from_fastly_request_ref(context.request);
+        let request_info = RequestInfo::from_request(&http_req, context.client_info);
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (
@@ -1008,7 +1009,8 @@ impl AuctionProvider for PrebidAuctionProvider {
             &context.settings.request_signing
         {
             if request_signing_config.enabled {
-                let request_info = RequestInfo::from_request(context.request, context.client_info);
+                let http_req = compat::from_fastly_request_ref(context.request);
+                let request_info = RequestInfo::from_request(&http_req, context.client_info);
                 let signer = RequestSigner::from_services(context.services)?;
                 let params =
                     SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);

@@ -2824,6 +2824,7 @@ dependencies = [
  "log",
  "lol_html",
  "matchit",
+ "mime",
  "pin-project-lite",
  "rand",
  "regex",

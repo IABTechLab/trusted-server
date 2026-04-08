@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
+use crate::compat;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -151,7 +152,8 @@ impl IntegrationProxy for TestlightIntegration {
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
         // Read synthetic ID from header (set by registry) or cookie
-        let synthetic_id = get_synthetic_id(&req)
+        let http_req = compat::from_fastly_request_ref(&req);
+        let synthetic_id = get_synthetic_id(&http_req)
             .change_context(Self::error("Failed to read synthetic ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
