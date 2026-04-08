@@ -1,14 +1,18 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose, Engine as _};
+use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt};
+use rand::rngs::OsRng;
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
+use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
 pub(crate) struct NoopConfigStore;
 
@@ -40,6 +44,74 @@ impl PlatformSecretStore for NoopSecretStore {
         _key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn create(
+        &self,
+        _store_id: &StoreId,
+        _name: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+pub(crate) struct HashMapConfigStore {
+    data: HashMap<String, String>,
+}
+
+impl HashMapConfigStore {
+    pub(crate) fn new(data: HashMap<String, String>) -> Self {
+        Self { data }
+    }
+}
+
+impl PlatformConfigStore for HashMapConfigStore {
+    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        self.data
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Report::new(PlatformError::ConfigStore))
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+pub(crate) struct HashMapSecretStore {
+    data: HashMap<String, Vec<u8>>,
+}
+
+impl HashMapSecretStore {
+    pub(crate) fn new(data: HashMap<String, Vec<u8>>) -> Self {
+        Self { data }
+    }
+}
+
+impl PlatformSecretStore for HashMapSecretStore {
+    fn get_bytes(
+        &self,
+        _store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        self.data
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Report::new(PlatformError::SecretStore))
     }
 
     fn create(
@@ -280,6 +352,28 @@ pub(crate) fn build_services_with_config_and_secret(
         .build()
 }
 
+pub(crate) fn build_request_signing_services() -> RuntimeServices {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
+    let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+    let jwk_json = format!(
+        r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
+        x_b64
+    );
+
+    let mut config_data = HashMap::new();
+    config_data.insert("current-kid".to_string(), "test-kid".to_string());
+    config_data.insert("test-kid".to_string(), jwk_json);
+
+    let mut secret_data = HashMap::new();
+    secret_data.insert("test-kid".to_string(), key_b64.into_bytes());
+
+    build_services_with_config_and_secret(
+        HashMapConfigStore::new(config_data),
+        HashMapSecretStore::new(secret_data),
+    )
+}
+
 pub(crate) fn build_services_with_config(
     config_store: impl PlatformConfigStore + 'static,
 ) -> RuntimeServices {
@@ -500,6 +594,55 @@ mod tests {
         assert!(
             secret_result.is_err(),
             "should delegate to injected secret store"
+        );
+    }
+
+    #[test]
+    fn hash_map_stores_return_preset_values() {
+        let mut config = HashMap::new();
+        config.insert("current-kid".to_string(), "test-kid".to_string());
+
+        let mut secrets = HashMap::new();
+        secrets.insert("test-kid".to_string(), b"secret-material".to_vec());
+
+        let services = build_services_with_config_and_secret(
+            HashMapConfigStore::new(config),
+            HashMapSecretStore::new(secrets),
+        );
+
+        assert_eq!(
+            services
+                .config_store()
+                .get(&JWKS_STORE_NAME, "current-kid")
+                .expect("should read current-kid from config test store"),
+            "test-kid"
+        );
+        assert_eq!(
+            services
+                .secret_store()
+                .get_bytes(&SIGNING_STORE_NAME, "test-kid")
+                .expect("should read signing key bytes from secret test store"),
+            b"secret-material".to_vec()
+        );
+    }
+
+    #[test]
+    fn build_request_signing_services_provides_current_kid_and_signing_key() {
+        let services = build_request_signing_services();
+
+        let kid = services
+            .config_store()
+            .get(&JWKS_STORE_NAME, "current-kid")
+            .expect("should expose current-kid in config store");
+        let key_bytes = services
+            .secret_store()
+            .get_bytes(&SIGNING_STORE_NAME, &kid)
+            .expect("should expose signing key bytes in secret store");
+
+        assert_eq!(kid, "test-kid", "should use the standard signing test kid");
+        assert!(
+            !key_bytes.is_empty(),
+            "should provide key material for the current signing key"
         );
     }
 }

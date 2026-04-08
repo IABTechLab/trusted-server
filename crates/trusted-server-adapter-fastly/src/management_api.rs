@@ -18,6 +18,7 @@
 
 use std::io::Read;
 
+use base64::{engine::general_purpose, Engine as _};
 use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
@@ -27,15 +28,84 @@ use crate::platform::FastlyPlatformSecretStore;
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
 const API_KEYS_STORE: &str = "api-keys";
 const API_KEY_ENTRY: &str = "api_key";
+const SECRET_UPSERT_METHOD: &str = "PUT";
+const ERROR_BODY_LIMIT: usize = 200;
+
+fn encode_path_segment(value: &str) -> String {
+    urlencoding::encode(value).into_owned()
+}
 
 pub(crate) fn build_config_item_payload(value: &str) -> String {
     format!("item_value={}", urlencoding::encode(value))
 }
 
+pub(crate) fn build_config_item_path(store_id: &str, key: &str) -> String {
+    format!(
+        "/resources/stores/config/{}/item/{}",
+        encode_path_segment(store_id),
+        encode_path_segment(key)
+    )
+}
+
+fn build_secret_collection_path(store_id: &str) -> String {
+    format!(
+        "/resources/stores/secret/{}/secrets",
+        encode_path_segment(store_id)
+    )
+}
+
+fn build_secret_path(store_id: &str, secret_name: &str) -> String {
+    format!(
+        "/resources/stores/secret/{}/secrets/{}",
+        encode_path_segment(store_id),
+        encode_path_segment(secret_name)
+    )
+}
+
+fn build_secret_payload(secret_name: &str, secret_value: &str) -> String {
+    serde_json::json!({
+        "name": secret_name,
+        "secret": general_purpose::STANDARD.encode(secret_value.as_bytes()),
+    })
+    .to_string()
+}
+
+fn truncate_error_body(body: &str) -> String {
+    body.trim().chars().take(ERROR_BODY_LIMIT).collect()
+}
+
+fn check_response(
+    response: &mut Response,
+    error_kind: fn() -> PlatformError,
+    operation: &str,
+    entity_description: &str,
+    store_id: &str,
+) -> Result<(), Report<PlatformError>> {
+    let mut body = String::new();
+    response
+        .get_body_mut()
+        .read_to_string(&mut body)
+        .change_context(error_kind())?;
+
+    if response.get_status().is_success() {
+        return Ok(());
+    }
+
+    Err(Report::new(error_kind()).attach(format!(
+        "{} failed with HTTP {} - {} for {} in store '{}'",
+        operation,
+        response.get_status(),
+        truncate_error_body(&body),
+        entity_description,
+        store_id
+    )))
+}
+
 /// HTTP client for Fastly management API write operations.
 ///
-/// Backs the `put`/`delete` methods of [`FastlyPlatformConfigStore`] and
-/// the `create`/`delete` methods of [`FastlyPlatformSecretStore`].
+/// Backs the `put`/`delete` methods of
+/// [`super::platform::FastlyPlatformConfigStore`] and the `create`/`delete`
+/// methods of [`super::platform::FastlyPlatformSecretStore`].
 pub(crate) struct FastlyManagementApiClient {
     api_key: String,
     base_url: &'static str,
@@ -118,7 +188,7 @@ impl FastlyManagementApiClient {
         key: &str,
         value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
+        let path = build_config_item_path(store_id, key);
         let payload = build_config_item_payload(value);
 
         let mut response = self.make_request(
@@ -128,28 +198,21 @@ impl FastlyManagementApiClient {
             "application/x-www-form-urlencoded",
         )?;
 
-        let mut buf = String::new();
-        response
-            .get_body_mut()
-            .read_to_string(&mut buf)
-            .change_context(PlatformError::ConfigStore)?;
+        let entity_description = format!("key '{}'", key);
+        check_response(
+            &mut response,
+            || PlatformError::ConfigStore,
+            "config item update",
+            &entity_description,
+            store_id,
+        )?;
 
-        if response.get_status().is_success() {
-            log::debug!(
-                "FastlyManagementApiClient: updated config key '{}' in store '{}'",
-                key,
-                store_id
-            );
-            Ok(())
-        } else {
-            Err(Report::new(PlatformError::ConfigStore).attach(format!(
-                "config item update failed with HTTP {} - {} for key '{}' in store '{}'",
-                response.get_status(),
-                buf.trim(),
-                key,
-                store_id
-            )))
-        }
+        log::debug!(
+            "FastlyManagementApiClient: updated config key '{}' in store '{}'",
+            key,
+            store_id
+        );
+        Ok(())
     }
 
     /// Delete a config store item.
@@ -162,32 +225,25 @@ impl FastlyManagementApiClient {
         store_id: &str,
         key: &str,
     ) -> Result<(), Report<PlatformError>> {
-        let path = format!("/resources/stores/config/{}/item/{}", store_id, key);
+        let path = build_config_item_path(store_id, key);
 
         let mut response = self.make_request("DELETE", &path, None, "application/json")?;
 
-        let mut buf = String::new();
-        response
-            .get_body_mut()
-            .read_to_string(&mut buf)
-            .change_context(PlatformError::ConfigStore)?;
+        let entity_description = format!("key '{}'", key);
+        check_response(
+            &mut response,
+            || PlatformError::ConfigStore,
+            "config item delete",
+            &entity_description,
+            store_id,
+        )?;
 
-        if response.get_status().is_success() {
-            log::debug!(
-                "FastlyManagementApiClient: deleted config key '{}' from store '{}'",
-                key,
-                store_id
-            );
-            Ok(())
-        } else {
-            Err(Report::new(PlatformError::ConfigStore).attach(format!(
-                "config item delete failed with HTTP {} - {} for key '{}' in store '{}'",
-                response.get_status(),
-                buf.trim(),
-                key,
-                store_id
-            )))
-        }
+        log::debug!(
+            "FastlyManagementApiClient: deleted config key '{}' from store '{}'",
+            key,
+            store_id
+        );
+        Ok(())
     }
 
     /// Create or overwrite a secret store entry.
@@ -201,37 +257,31 @@ impl FastlyManagementApiClient {
         secret_name: &str,
         secret_value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        let path = format!("/resources/stores/secret/{}/secrets", store_id);
-        let payload = serde_json::json!({
-            "name": secret_name,
-            "secret": secret_value
-        });
+        let path = build_secret_collection_path(store_id);
+        let payload = build_secret_payload(secret_name, secret_value);
 
-        let mut response =
-            self.make_request("POST", &path, Some(payload.to_string()), "application/json")?;
+        let mut response = self.make_request(
+            SECRET_UPSERT_METHOD,
+            &path,
+            Some(payload),
+            "application/json",
+        )?;
 
-        let mut buf = String::new();
-        response
-            .get_body_mut()
-            .read_to_string(&mut buf)
-            .change_context(PlatformError::SecretStore)?;
+        let entity_description = format!("name '{}'", secret_name);
+        check_response(
+            &mut response,
+            || PlatformError::SecretStore,
+            "secret upsert",
+            &entity_description,
+            store_id,
+        )?;
 
-        if response.get_status().is_success() {
-            log::debug!(
-                "FastlyManagementApiClient: created secret '{}' in store '{}'",
-                secret_name,
-                store_id
-            );
-            Ok(())
-        } else {
-            Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret create failed with HTTP {} - {} for name '{}' in store '{}'",
-                response.get_status(),
-                buf.trim(),
-                secret_name,
-                store_id
-            )))
-        }
+        log::debug!(
+            "FastlyManagementApiClient: upserted secret '{}' in store '{}'",
+            secret_name,
+            store_id
+        );
+        Ok(())
     }
 
     /// Delete a secret store entry.
@@ -244,35 +294,25 @@ impl FastlyManagementApiClient {
         store_id: &str,
         secret_name: &str,
     ) -> Result<(), Report<PlatformError>> {
-        let path = format!(
-            "/resources/stores/secret/{}/secrets/{}",
-            store_id, secret_name
-        );
+        let path = build_secret_path(store_id, secret_name);
 
         let mut response = self.make_request("DELETE", &path, None, "application/json")?;
 
-        let mut buf = String::new();
-        response
-            .get_body_mut()
-            .read_to_string(&mut buf)
-            .change_context(PlatformError::SecretStore)?;
+        let entity_description = format!("name '{}'", secret_name);
+        check_response(
+            &mut response,
+            || PlatformError::SecretStore,
+            "secret delete",
+            &entity_description,
+            store_id,
+        )?;
 
-        if response.get_status().is_success() {
-            log::debug!(
-                "FastlyManagementApiClient: deleted secret '{}' from store '{}'",
-                secret_name,
-                store_id
-            );
-            Ok(())
-        } else {
-            Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret delete failed with HTTP {} - {} for name '{}' in store '{}'",
-                response.get_status(),
-                buf.trim(),
-                secret_name,
-                store_id
-            )))
-        }
+        log::debug!(
+            "FastlyManagementApiClient: deleted secret '{}' from store '{}'",
+            secret_name,
+            store_id
+        );
+        Ok(())
     }
 }
 
@@ -289,5 +329,47 @@ mod tests {
             "item_value=value%20with%20spaces%20%2B%20symbols%20%26%3D%20%7B%22kid%22%3A%22a%2Bb%22%7D",
             "should URL-encode config item values in form payloads"
         );
+    }
+
+    #[test]
+    fn build_config_item_path_url_encodes_store_id_and_key() {
+        let path = build_config_item_path("store/id", "current?kid+#1");
+
+        assert_eq!(
+            path, "/resources/stores/config/store%2Fid/item/current%3Fkid%2B%231",
+            "should percent-encode reserved path characters"
+        );
+    }
+
+    #[test]
+    fn secret_upsert_method_uses_put() {
+        assert_eq!(
+            SECRET_UPSERT_METHOD, "PUT",
+            "should use PUT so secret writes can overwrite existing entries"
+        );
+    }
+
+    #[test]
+    fn build_secret_payload_base64_encodes_raw_secret_value() {
+        let payload = build_secret_payload("signing-key", "raw-secret-value");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("should serialize secret payload as JSON");
+
+        assert_eq!(json["name"], "signing-key");
+        assert_eq!(
+            json["secret"],
+            base64::engine::general_purpose::STANDARD.encode("raw-secret-value"),
+            "should base64-encode the secret payload for the Fastly API"
+        );
+    }
+
+    #[test]
+    fn truncate_error_body_limits_length_after_trimming() {
+        let body = format!("  {}  ", "a".repeat(250));
+
+        let truncated = truncate_error_body(&body);
+
+        assert_eq!(truncated.len(), 200, "should cap error bodies at 200 chars");
+        assert_eq!(truncated, "a".repeat(200), "should trim before truncating");
     }
 }

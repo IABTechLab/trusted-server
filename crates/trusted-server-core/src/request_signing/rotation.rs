@@ -14,17 +14,22 @@ use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreId};
 use crate::request_signing::JWKS_STORE_NAME;
 
+/// Result of a key rotation operation.
 #[derive(Debug, Clone)]
 pub struct KeyRotationResult {
+    /// Newly generated or supplied key identifier.
     pub new_kid: String,
+    /// Previously active key identifier, if one existed.
     pub previous_kid: Option<String>,
+    /// Active key identifiers after rotation completes.
     pub active_kids: Vec<String>,
+    /// Public JWK associated with the newly active key.
     pub jwk: Jwk,
 }
 
 /// Manages signing key lifecycle using platform store primitives.
 ///
-/// Reads use the edge-visible store name ([`JWKS_CONFIG_STORE_NAME`]).
+/// Reads use the edge-visible store name ([`super::JWKS_CONFIG_STORE_NAME`]).
 /// Writes use the management API store identifiers supplied at construction.
 pub struct KeyRotationManager {
     /// Management API store ID for config store writes.
@@ -38,7 +43,7 @@ impl KeyRotationManager {
     ///
     /// The `config_store_id` and `secret_store_id` are platform management API
     /// identifiers used for write operations. Edge reads use the store names
-    /// defined in [`JWKS_CONFIG_STORE_NAME`] and
+    /// defined in [`super::JWKS_CONFIG_STORE_NAME`] and
     /// [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
     #[must_use]
     pub fn new(config_store_id: impl Into<String>, secret_store_id: impl Into<String>) -> Self {
@@ -92,6 +97,9 @@ impl KeyRotationManager {
         kid: &str,
         signing_key: &SigningKey,
     ) -> Result<(), Report<TrustedServerError>> {
+        // The platform secret-store write interface is string-based, so signing
+        // keys are persisted as base64 text. The Fastly adapter applies its own
+        // transport-level base64 encoding when calling the management API.
         let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
 
         services

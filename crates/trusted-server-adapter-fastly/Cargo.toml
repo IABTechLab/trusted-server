@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
 edgezero-core = { workspace = true }

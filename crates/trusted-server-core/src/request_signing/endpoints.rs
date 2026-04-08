@@ -52,18 +52,27 @@ pub fn handle_trusted_server_discovery(
         .with_body(json))
 }
 
+/// JSON request body for the signature verification endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VerifySignatureRequest {
+    /// Canonical payload that was signed.
     pub payload: String,
+    /// Base64-encoded Ed25519 signature to verify.
     pub signature: String,
+    /// Key identifier used to look up the public JWK.
     pub kid: String,
 }
 
+/// JSON response body for the signature verification endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VerifySignatureResponse {
+    /// Whether signature verification succeeded.
     pub verified: bool,
+    /// Key identifier that was used during verification.
     pub kid: String,
+    /// Human-readable verification result summary.
     pub message: String,
+    /// Error detail when verification fails unexpectedly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -124,22 +133,50 @@ pub fn handle_verify_signature(
         .with_body(response_json))
 }
 
+/// JSON request body for the key-rotation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RotateKeyRequest {
+    /// Optional explicit key identifier for the new signing key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
 }
 
+/// JSON response body for the key-rotation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RotateKeyResponse {
+    /// Whether the rotation operation succeeded.
     pub success: bool,
+    /// Human-readable summary of the rotation result.
     pub message: String,
+    /// Newly generated or supplied key identifier.
     pub new_kid: String,
+    /// Previously active key identifier, if one existed.
     pub previous_kid: Option<String>,
+    /// Active key identifiers after the rotation completes.
     pub active_kids: Vec<String>,
+    /// Public JWK associated with the newly active key.
     pub jwk: serde_json::Value,
+    /// Error detail when rotation fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+fn signing_store_ids(settings: &Settings) -> Result<(&str, &str), Report<TrustedServerError>> {
+    settings
+        .request_signing
+        .as_ref()
+        .map(|setting| {
+            (
+                setting.config_store_id.as_str(),
+                setting.secret_store_id.as_str(),
+            )
+        })
+        .ok_or_else(|| {
+            TrustedServerError::Configuration {
+                message: "missing signing storage configuration".to_string(),
+            }
+            .into()
+        })
 }
 
 /// Rotates the current active kid by generating and saving a new one
@@ -152,15 +189,7 @@ pub fn handle_rotate_key(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
-        None => {
-            return Err(TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
-            }
-            .into());
-        }
-    };
+    let (config_store_id, secret_store_id) = signing_store_ids(settings)?;
 
     let body = req.take_body_str();
     let rotate_req: RotateKeyRequest = if body.is_empty() {
@@ -225,20 +254,30 @@ pub fn handle_rotate_key(
     }
 }
 
+/// JSON request body for the key-deactivation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeactivateKeyRequest {
+    /// Key identifier to deactivate or delete.
     pub kid: String,
+    /// Whether the key should be deleted from storage after deactivation.
     #[serde(default)]
     pub delete: bool,
 }
 
+/// JSON response body for the key-deactivation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeactivateKeyResponse {
+    /// Whether the deactivation or deletion succeeded.
     pub success: bool,
+    /// Human-readable summary of the operation result.
     pub message: String,
+    /// Key identifier that was deactivated or deleted.
     pub deactivated_kid: String,
+    /// Whether the key was deleted from storage.
     pub deleted: bool,
+    /// Active key identifiers remaining after the operation.
     pub remaining_active_kids: Vec<String>,
+    /// Error detail when the operation fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -253,15 +292,7 @@ pub fn handle_deactivate_key(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
-        None => {
-            return Err(TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
-            }
-            .into());
-        }
-    };
+    let (config_store_id, secret_store_id) = signing_store_ids(settings)?;
 
     let body = req.take_body_str();
     let deactivate_req: DeactivateKeyRequest =
@@ -336,80 +367,13 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use error_stack::Report;
-
     use crate::platform::{
-        test_support::{
-            build_services_with_config, build_services_with_config_and_secret, noop_services,
-        },
-        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+        test_support::{build_request_signing_services, build_services_with_config, noop_services},
+        PlatformConfigStore, PlatformError, StoreId, StoreName,
     };
 
     use super::*;
     use fastly::http::{Method, StatusCode};
-
-    /// Build `RuntimeServices` pre-loaded with a real Ed25519 keypair for
-    /// testing signature creation and verification in endpoint handlers.
-    fn build_signing_services_for_test() -> crate::platform::RuntimeServices {
-        use base64::{engine::general_purpose, Engine};
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        struct MapConfigStore(HashMap<String, String>);
-        impl PlatformConfigStore for MapConfigStore {
-            fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-                self.0
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| Report::new(PlatformError::ConfigStore))
-            }
-            fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-        }
-
-        struct MapSecretStore(HashMap<String, Vec<u8>>);
-        impl PlatformSecretStore for MapSecretStore {
-            fn get_bytes(
-                &self,
-                _: &StoreName,
-                key: &str,
-            ) -> Result<Vec<u8>, Report<PlatformError>> {
-                self.0
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| Report::new(PlatformError::SecretStore))
-            }
-            fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-        }
-
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
-        let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
-        let jwk_json = format!(
-            r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
-            x_b64
-        );
-
-        let mut cfg = HashMap::new();
-        cfg.insert("current-kid".to_string(), "test-kid".to_string());
-        cfg.insert("test-kid".to_string(), jwk_json);
-
-        let mut sec = HashMap::new();
-        sec.insert("test-kid".to_string(), key_b64.into_bytes());
-
-        build_services_with_config_and_secret(MapConfigStore(cfg), MapSecretStore(sec))
-    }
 
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
@@ -438,7 +402,7 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_valid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let services = build_signing_services_for_test();
+        let services = build_request_signing_services();
 
         let payload = "test message";
         let signer = crate::request_signing::RequestSigner::from_services(&services)
@@ -478,7 +442,7 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_invalid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let services = build_signing_services_for_test();
+        let services = build_request_signing_services();
 
         let signer = crate::request_signing::RequestSigner::from_services(&services)
             .expect("should create signer from services");
