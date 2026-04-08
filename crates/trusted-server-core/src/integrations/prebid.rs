@@ -111,7 +111,7 @@ pub struct PrebidIntegrationConfig {
     /// fixed_bottom = {placementId = "_s2sBottomId"}
     /// ```
     #[serde(default)]
-    pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
+    pub bid_param_zone_overrides: ZoneBidOverride,
     /// Static per-bidder parameter overrides merged into every outgoing
     /// `OpenRTB` imp `ext.prebid.bidder.{bidder}` object before zone-specific
     /// overrides are applied.
@@ -131,7 +131,7 @@ pub struct PrebidIntegrationConfig {
     /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"bidder-name":{"param1":12345,"param2":"value"}}'
     /// ```
     #[serde(default)]
-    pub bid_param_overrides: HashMap<String, Json>,
+    pub bid_param_overrides: StaticBidOverride,
     /// How consent signals are forwarded to Prebid Server.
     ///
     /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
@@ -549,8 +549,12 @@ pub struct ZoneBidOverride(pub HashMap<String, HashMap<String, Json>>);
 impl BidOverride for ZoneBidOverride {
     fn apply(&self, bidder: &str, context: &BidOverrideContext<'_>, params: &mut Json) {
         let Some(zone) = context.zone else { return };
-        let Some(zone_map) = self.0.get(bidder) else { return };
-        let Some(Json::Object(ovr)) = zone_map.get(zone) else { return };
+        let Some(zone_map) = self.0.get(bidder) else {
+            return;
+        };
+        let Some(Json::Object(ovr)) = zone_map.get(zone) else {
+            return;
+        };
         log::debug!(
             "prebid: zone override for '{}' zone '{}': keys {:?}",
             bidder,
@@ -697,39 +701,13 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                // Apply static bidder param overrides before the more specific
-                // zone-based overrides below.
+                // Apply overrides in order: static first, then zone-specific.
+                let ctx = BidOverrideContext { zone };
                 for (name, params) in &mut bidder {
-                    if let Some(Json::Object(ovr)) =
-                        self.config.bid_param_overrides.get(name.as_str())
-                    {
-                        log::debug!(
-                            "prebid: bidder override for '{}': keys {:?}",
-                            name,
-                            ovr.keys().collect::<Vec<_>>()
-                        );
-                        merge_bidder_param_object(params, ovr);
-                    }
-                }
-
-                // Apply zone-specific bid param overrides when configured.
-                for (name, params) in &mut bidder {
-                    let zone_override = zone.and_then(|z| {
-                        self.config
-                            .bid_param_zone_overrides
-                            .get(name.as_str())
-                            .and_then(|zones| zones.get(z))
-                    });
-
-                    if let Some(Json::Object(ovr)) = zone_override {
-                        log::debug!(
-                            "prebid: zone override for '{}' zone '{}': keys {:?}",
-                            name,
-                            zone.unwrap_or(""),
-                            ovr.keys().collect::<Vec<_>>()
-                        );
-                        merge_bidder_param_object(params, ovr);
-                    }
+                    self.config.bid_param_overrides.apply(name, &ctx, params);
+                    self.config
+                        .bid_param_zone_overrides
+                        .apply(name, &ctx, params);
                 }
 
                 Some(Imp {
@@ -1414,8 +1392,8 @@ mod tests {
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             client_side_bidders: Vec::new(),
-            bid_param_zone_overrides: HashMap::new(),
-            bid_param_overrides: HashMap::new(),
+            bid_param_zone_overrides: ZoneBidOverride::default(),
+            bid_param_overrides: StaticBidOverride::default(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
     }
@@ -3139,17 +3117,25 @@ fixed_bottom = {placementId = "_s2sBottom"}
             let ctx = BidOverrideContext::default();
             let mut params = params_with("networkId", json!(1));
             overrides.apply("kargo", &ctx, &mut params);
-            assert_eq!(params["networkId"], 1, "should not touch params for absent bidder");
+            assert_eq!(
+                params["networkId"], 1,
+                "should not touch params for absent bidder"
+            );
         }
 
         #[test]
         fn static_ignores_zone_in_context() {
             let mut overrides = StaticBidOverride::default();
             overrides.insert("criteo".to_string(), json!({ "networkId": 42 }));
-            let ctx = BidOverrideContext { zone: Some("header") };
+            let ctx = BidOverrideContext {
+                zone: Some("header"),
+            };
             let mut params = empty_params();
             overrides.apply("criteo", &ctx, &mut params);
-            assert_eq!(params["networkId"], 42, "static override should apply regardless of zone");
+            assert_eq!(
+                params["networkId"], 42,
+                "static override should apply regardless of zone"
+            );
         }
 
         #[test]
@@ -3172,7 +3158,9 @@ fixed_bottom = {placementId = "_s2sBottom"}
                 "kargo".to_string(),
                 HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
             );
-            let ctx = BidOverrideContext { zone: Some("header") };
+            let ctx = BidOverrideContext {
+                zone: Some("header"),
+            };
             let mut params = params_with("placementId", json!("client"));
             overrides.apply("kargo", &ctx, &mut params);
             assert_eq!(params["placementId"], "s2s_h", "should apply zone override");
@@ -3188,7 +3176,10 @@ fixed_bottom = {placementId = "_s2sBottom"}
             let ctx = BidOverrideContext { zone: None };
             let mut params = params_with("placementId", json!("client"));
             overrides.apply("kargo", &ctx, &mut params);
-            assert_eq!(params["placementId"], "client", "missing zone should be a no-op");
+            assert_eq!(
+                params["placementId"], "client",
+                "missing zone should be a no-op"
+            );
         }
 
         #[test]
@@ -3198,10 +3189,15 @@ fixed_bottom = {placementId = "_s2sBottom"}
                 "kargo".to_string(),
                 HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
             );
-            let ctx = BidOverrideContext { zone: Some("sidebar") };
+            let ctx = BidOverrideContext {
+                zone: Some("sidebar"),
+            };
             let mut params = params_with("placementId", json!("client"));
             overrides.apply("kargo", &ctx, &mut params);
-            assert_eq!(params["placementId"], "client", "unknown zone should be a no-op");
+            assert_eq!(
+                params["placementId"], "client",
+                "unknown zone should be a no-op"
+            );
         }
 
         #[test]
@@ -3211,10 +3207,15 @@ fixed_bottom = {placementId = "_s2sBottom"}
                 "kargo".to_string(),
                 HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
             );
-            let ctx = BidOverrideContext { zone: Some("header") };
+            let ctx = BidOverrideContext {
+                zone: Some("header"),
+            };
             let mut params = params_with("placementId", json!("client"));
             overrides.apply("rubicon", &ctx, &mut params);
-            assert_eq!(params["placementId"], "client", "absent bidder should be a no-op");
+            assert_eq!(
+                params["placementId"], "client",
+                "absent bidder should be a no-op"
+            );
         }
 
         #[test]
@@ -3224,11 +3225,19 @@ fixed_bottom = {placementId = "_s2sBottom"}
                 "kargo".to_string(),
                 HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
             );
-            let ctx = BidOverrideContext { zone: Some("header") };
+            let ctx = BidOverrideContext {
+                zone: Some("header"),
+            };
             let mut params = json!({ "placementId": "client", "extra": "keep" });
             overrides.apply("kargo", &ctx, &mut params);
-            assert_eq!(params["placementId"], "s2s_h", "should replace overridden key");
-            assert_eq!(params["extra"], "keep", "should preserve non-overridden key");
+            assert_eq!(
+                params["placementId"], "s2s_h",
+                "should replace overridden key"
+            );
+            assert_eq!(
+                params["extra"], "keep",
+                "should preserve non-overridden key"
+            );
         }
     }
 
