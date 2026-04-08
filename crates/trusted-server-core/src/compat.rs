@@ -29,6 +29,12 @@ use std::net::IpAddr;
 use edgezero_core::body::Body;
 use http::{HeaderName, HeaderValue, StatusCode};
 
+use crate::auth;
+use crate::cookies;
+use crate::edge_cookie;
+use crate::http_util;
+use crate::http_util::{RequestInfo, SPOOFABLE_FORWARDED_HEADERS};
+
 // ── Request extension types ────────────────────────────────────────────────
 
 /// TLS protocol string detected by the Fastly SDK.
@@ -266,7 +272,6 @@ pub fn append_header_to_response(
 ///
 /// # TODO(PR15): Remove once the handler layer migrates to `http` types.
 pub fn sanitize_forwarded_headers_fastly(req: &mut fastly::Request) {
-    use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
     for header in SPOOFABLE_FORWARDED_HEADERS {
         if req.get_header(*header).is_some() {
             log::debug!("Stripped spoofable header: {}", header);
@@ -289,7 +294,6 @@ pub fn enforce_basic_auth_fastly(
     settings: &crate::settings::Settings,
     req: &fastly::Request,
 ) -> Result<Option<fastly::Response>, error_stack::Report<crate::error::TrustedServerError>> {
-    use crate::auth;
     let http_req = from_fastly_request_ref(req);
     auth::enforce_basic_auth(settings, &http_req).map(|opt| opt.map(to_fastly_response))
 }
@@ -303,7 +307,6 @@ pub fn serve_static_with_etag_fastly(
     req: &fastly::Request,
     content_type: &str,
 ) -> fastly::Response {
-    use crate::http_util;
     let http_req = from_fastly_request_ref(req);
     let http_resp = http_util::serve_static_with_etag(body, &http_req, content_type);
     to_fastly_response(http_resp)
@@ -324,7 +327,6 @@ pub fn set_ec_cookie_fastly(
     response: &mut fastly::Response,
     ec_id: &str,
 ) {
-    use crate::cookies;
     let mut temp = http::Response::builder()
         .status(200u16)
         .body(Body::empty())
@@ -346,7 +348,6 @@ pub fn expire_ec_cookie_fastly(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
-    use crate::cookies;
     let mut temp = http::Response::builder()
         .status(200u16)
         .body(Body::empty())
@@ -372,7 +373,6 @@ pub fn forward_cookie_header_fastly(
     to: &mut fastly::Request,
     strip_consent: bool,
 ) {
-    use crate::cookies;
     let http_from = from_fastly_request_ref(from);
     let mut http_to = http::Request::builder()
         .method("GET")
@@ -399,7 +399,6 @@ pub fn forward_cookie_header_fastly(
 ///
 /// # TODO(PR15): Remove once integration layer migrates to `http` types.
 pub fn copy_custom_headers_fastly(from: &fastly::Request, to: &mut fastly::Request) {
-    use crate::http_util;
     let http_from = from_fastly_request_ref(from);
     let mut http_to = http::Request::builder()
         .method("GET")
@@ -415,8 +414,7 @@ pub fn copy_custom_headers_fastly(from: &fastly::Request, to: &mut fastly::Reque
 /// Apply `http_util::RequestInfo::from_request` with a `fastly::Request`.
 ///
 /// # TODO(PR15): Remove once the handler layer migrates to `http` types.
-pub fn request_info_from_fastly(req: &fastly::Request) -> crate::http_util::RequestInfo {
-    use crate::http_util::RequestInfo;
+pub fn request_info_from_fastly(req: &fastly::Request) -> RequestInfo {
     let http_req = from_fastly_request_ref(req);
     RequestInfo::from_request(&http_req)
 }
@@ -431,7 +429,6 @@ pub fn request_info_from_fastly(req: &fastly::Request) -> crate::http_util::Requ
 pub fn get_ec_id_fastly(
     req: &fastly::Request,
 ) -> Result<Option<String>, error_stack::Report<crate::error::TrustedServerError>> {
-    use crate::edge_cookie;
     let http_req = from_fastly_request_ref(req);
     edge_cookie::get_ec_id(&http_req)
 }
@@ -447,7 +444,6 @@ pub fn get_or_generate_ec_id_fastly(
     settings: &crate::settings::Settings,
     req: &fastly::Request,
 ) -> Result<String, error_stack::Report<crate::error::TrustedServerError>> {
-    use crate::edge_cookie;
     let http_req = from_fastly_request_ref(req);
     edge_cookie::get_or_generate_ec_id(settings, &http_req)
 }
@@ -463,7 +459,6 @@ pub fn generate_ec_id_fastly(
     settings: &crate::settings::Settings,
     req: &fastly::Request,
 ) -> Result<String, error_stack::Report<crate::error::TrustedServerError>> {
-    use crate::edge_cookie;
     let http_req = from_fastly_request_ref(req);
     edge_cookie::generate_ec_id(settings, &http_req)
 }
@@ -478,7 +473,6 @@ pub fn generate_ec_id_fastly(
 pub fn handle_request_cookies_fastly(
     req: &fastly::Request,
 ) -> Result<Option<cookie::CookieJar>, error_stack::Report<crate::error::TrustedServerError>> {
-    use crate::cookies;
     let http_req = from_fastly_request_ref(req);
     cookies::handle_request_cookies(&http_req)
 }
