@@ -12,15 +12,16 @@
 
 ## Files Modified
 
-| File | Changes |
-|------|---------|
+| File                                                    | Changes                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/trusted-server-core/src/integrations/prebid.rs` | Replace `BidOverride` / `StaticBidOverride` / `ContextKey` / `KeyedBidOverride` runtime with canonical rule structs and one internal engine; add canonical rule parsing, validation, normalization, and runtime application; update config docs and tests |
-| `crates/trusted-server-core/src/settings.rs` | Add env parsing coverage for `bid_param_override_rules` |
-| `trusted-server.toml` | Document the new canonical rule syntax while keeping compatibility examples |
+| `crates/trusted-server-core/src/settings.rs`            | Add env parsing coverage for `bid_param_override_rules`                                                                                                                                                                                                   |
+| `trusted-server.toml`                                   | Document the new canonical rule syntax while keeping compatibility examples                                                                                                                                                                               |
 
 ## Task 1: Add failing tests for canonical rules and compatibility normalization
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 
 - [ ] **Step 1.1: Add a canonical rule parsing test near the existing Prebid config parsing tests**
@@ -158,6 +159,7 @@ fn compile_rule_rejects_non_object_set() {
 - [ ] **Step 1.5: Run the focused tests and confirm they fail for the expected missing pieces**
 
 Run:
+
 ```bash
 cargo test -p trusted-server-core explicit_bid_param_override_rule
 cargo test -p trusted-server-core compile_rule_rejects
@@ -168,11 +170,13 @@ Expected: failures because `bid_param_override_rules` and compiled-rule validati
 ## Task 2: Replace the split override runtime with one compiled rule engine
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 
 - [ ] **Step 2.1: Add the canonical config structs to `PrebidIntegrationConfig`**
 
 Add:
+
 ```rust
 /// Canonical ordered bidder-param override rules.
 #[serde(default)]
@@ -180,6 +184,7 @@ pub bid_param_override_rules: Vec<BidParamOverrideRule>,
 ```
 
 With new supporting structs:
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,6 +206,7 @@ pub struct BidParamOverrideWhen {
 - [ ] **Step 2.2: Delete the current runtime override abstraction block**
 
 Delete:
+
 - `BidOverrideContext`
 - `BidOverride`
 - `StaticBidOverride`
@@ -210,6 +216,7 @@ Delete:
 - `ZoneBidOverride`
 
 Replace them with:
+
 ```rust
 #[derive(Debug, Default)]
 struct BidParamOverrideEngine {
@@ -233,6 +240,7 @@ struct CompiledBidParamOverrideRule {
 - [ ] **Step 2.3: Implement compiled-rule validation and engine normalization**
 
 Add:
+
 - `impl TryFrom<BidParamOverrideRule> for CompiledBidParamOverrideRule`
 - helper `fn validate_matcher_string(...)`
 - helper `fn json_object_for_override(...)`
@@ -243,6 +251,7 @@ Add:
   - explicit `bid_param_override_rules`
 
 Validation rules:
+
 - reject empty `when`
 - reject empty strings for `bidder` or `zone`
 - reject non-object or empty-object `set`
@@ -250,12 +259,14 @@ Validation rules:
 - [ ] **Step 2.4: Store the compiled engine in `PrebidIntegration` and `PrebidAuctionProvider`**
 
 Change the structs from:
+
 ```rust
 pub struct PrebidIntegration { config: PrebidIntegrationConfig }
 pub struct PrebidAuctionProvider { config: PrebidIntegrationConfig }
 ```
 
 To:
+
 ```rust
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
@@ -273,6 +284,7 @@ Compile the engine in `PrebidIntegration::new` and `PrebidAuctionProvider::new`.
 - [ ] **Step 2.5: Replace the runtime application path in `to_openrtb`**
 
 Replace:
+
 ```rust
 let ctx = BidOverrideContext { zone };
 for (name, params) in &mut bidder {
@@ -282,6 +294,7 @@ for (name, params) in &mut bidder {
 ```
 
 With:
+
 ```rust
 for (name, params) in &mut bidder {
     self.bid_param_override_engine.apply(
@@ -297,6 +310,7 @@ for (name, params) in &mut bidder {
 - [ ] **Step 2.6: Run the targeted tests and make them pass**
 
 Run:
+
 ```bash
 cargo test -p trusted-server-core explicit_bid_param_override_rule
 cargo test -p trusted-server-core compile_rule_rejects
@@ -307,12 +321,14 @@ Expected: PASS
 ## Task 3: Update existing tests to the new engine model and extend env coverage
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 - Modify: `crates/trusted-server-core/src/settings.rs`
 
 - [ ] **Step 3.1: Rewrite the old override unit tests to target the engine directly**
 
 Replace the current `mod bid_override` tests with engine-centric tests:
+
 - compatibility static rule normalization
 - compatibility zone rule normalization
 - `apply` with bidder-only facts
@@ -323,6 +339,7 @@ Replace the current `mod bid_override` tests with engine-centric tests:
 - [ ] **Step 3.2: Remove tests that only exist for deleted types**
 
 Delete tests specific to:
+
 - `StaticBidOverride`
 - `ZoneBidOverride`
 - `KeyedBidOverride`
@@ -331,6 +348,7 @@ Delete tests specific to:
 - [ ] **Step 3.3: Add env parsing coverage for canonical rules in `settings.rs`**
 
 Add a test similar to the existing `bid_param_overrides` env test:
+
 ```rust
 #[test]
 fn test_prebid_bid_param_override_rules_override_with_json_env() {
@@ -339,6 +357,7 @@ fn test_prebid_bid_param_override_rules_override_with_json_env() {
 ```
 
 Assert that:
+
 - the array parses
 - `when.bidder` and `when.zone` survive round-trip
 - `set` preserves the JSON object
@@ -346,6 +365,7 @@ Assert that:
 - [ ] **Step 3.4: Run the focused Rust tests for Prebid and settings**
 
 Run:
+
 ```bash
 cargo test -p trusted-server-core bid_param_override
 cargo test -p trusted-server-core test_prebid_bid_param_override
@@ -356,6 +376,7 @@ Expected: PASS
 ## Task 4: Update operator-facing documentation and sample config
 
 **Files:**
+
 - Modify: `trusted-server.toml`
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 
@@ -371,12 +392,14 @@ Keep the existing compatibility examples, then add the canonical rule format:
 ```
 
 Document:
+
 - compatibility fields are still supported
 - canonical rules are preferred for future overrides
 
 - [ ] **Step 4.2: Update `PrebidIntegrationConfig` field docs**
 
 Adjust the field comments so they describe:
+
 - `bid_param_overrides` as compatibility sugar
 - `bid_param_zone_overrides` as compatibility sugar
 - `bid_param_override_rules` as the canonical ordered rule list
@@ -384,6 +407,7 @@ Adjust the field comments so they describe:
 - [ ] **Step 4.3: Run rustdoc-sensitive checks for the touched crate**
 
 Run:
+
 ```bash
 cargo test -p trusted-server-core parse_prebid_toml
 ```
@@ -393,11 +417,13 @@ Expected: PASS
 ## Task 5: Verify, commit, and leave the branch clean
 
 **Files:**
+
 - Modify: `docs/superpowers/plans/2026-04-08-prebid-generic-bid-param-override-rules.md` (check off completed steps if desired)
 
 - [ ] **Step 5.1: Run formatting**
 
 Run:
+
 ```bash
 cargo fmt --all -- --check
 ```
@@ -407,6 +433,7 @@ Expected: PASS
 - [ ] **Step 5.2: Run crate-level verification**
 
 Run:
+
 ```bash
 cargo test -p trusted-server-core
 cargo clippy -p trusted-server-core --all-targets --all-features -- -D warnings
@@ -417,6 +444,7 @@ Expected: PASS
 - [ ] **Step 5.3: Run workspace verification**
 
 Run:
+
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -427,6 +455,7 @@ Expected: PASS
 - [ ] **Step 5.4: Review `git diff` and commit all changes**
 
 Run:
+
 ```bash
 git status --short
 git diff -- crates/trusted-server-core/src/integrations/prebid.rs crates/trusted-server-core/src/settings.rs trusted-server.toml docs/superpowers/plans/2026-04-08-prebid-generic-bid-param-override-rules.md
