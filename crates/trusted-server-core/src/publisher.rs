@@ -181,7 +181,7 @@ struct ProcessResponseParams<'a> {
 /// # Errors
 ///
 /// Returns an error if processor creation or chunk processing fails.
-fn process_response_streaming<W: std::io::Write>(
+fn process_response_streaming<W: Write>(
     body: Body,
     output: &mut W,
     params: &ProcessResponseParams,
@@ -323,6 +323,7 @@ pub fn stream_publisher_body<W: Write>(
 /// streamed or must be sent buffered. The streaming path is chosen when:
 /// - The backend returns a 2xx status
 /// - The response has a processable content type
+/// - The response uses a supported `Content-Encoding` (gzip, deflate, br)
 /// - No HTML post-processors are registered (the streaming gate)
 ///
 /// # Errors
@@ -379,11 +380,7 @@ pub fn handle_publisher_request(
         synthetic_id: Some(synthetic_id.as_str()),
     });
     let ssc_allowed = allows_ssc_creation(&consent_context);
-    log::debug!(
-        "Proxy synthetic IDs - trusted: {}, ssc_allowed: {}",
-        synthetic_id,
-        ssc_allowed,
-    );
+    log::debug!("Proxy ssc_allowed: {}", ssc_allowed);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -429,12 +426,14 @@ pub fn handle_publisher_request(
         .to_string();
 
     let should_process = is_processable_content_type(&content_type);
+    let is_success = response.get_status().is_success();
 
-    if !should_process || request_host.is_empty() {
+    if !should_process || request_host.is_empty() || !is_success {
         log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}'",
+            "Skipping response processing - should_process: {}, request_host: '{}', status: {}",
             should_process,
-            request_host
+            request_host,
+            response.get_status(),
         );
         return Ok(PublisherResponse::Buffered(response));
     }
@@ -446,11 +445,14 @@ pub fn handle_publisher_request(
         .to_lowercase();
 
     // Streaming gate: can we stream this response?
+    // - 2xx status (non-success already returned Buffered above)
+    // - Supported Content-Encoding (unsupported would fail mid-stream)
     // - No HTML post-processors registered (they need the full document)
     // - Non-HTML content always streams (post-processors only apply to HTML)
     let is_html = content_type.contains("text/html");
     let has_post_processors = integration_registry.has_html_post_processors();
-    let can_stream = !is_html || !has_post_processors;
+    let encoding_supported = is_supported_content_encoding(&content_encoding);
+    let can_stream = encoding_supported && (!is_html || !has_post_processors);
 
     if can_stream {
         log::debug!(
@@ -509,6 +511,15 @@ fn is_processable_content_type(content_type: &str) -> bool {
     content_type.contains("text/")
         || content_type.contains("application/javascript")
         || content_type.contains("application/json")
+}
+
+/// Whether the `Content-Encoding` is one the streaming pipeline can handle.
+///
+/// Unsupported encodings (e.g. `zstd` from a misbehaving origin) must fall
+/// back to buffered mode so a processing failure produces a proper error
+/// response instead of a truncated stream.
+fn is_supported_content_encoding(encoding: &str) -> bool {
+    matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
 /// Apply synthetic ID and cookie headers to the response.
@@ -589,6 +600,34 @@ mod tests {
                 "Content-Type '{content_type}' should_process: expected {expected}",
             );
         }
+    }
+
+    #[test]
+    fn supported_content_encoding_accepts_known_values() {
+        assert!(is_supported_content_encoding(""), "should accept empty");
+        assert!(
+            is_supported_content_encoding("identity"),
+            "should accept identity"
+        );
+        assert!(is_supported_content_encoding("gzip"), "should accept gzip");
+        assert!(
+            is_supported_content_encoding("deflate"),
+            "should accept deflate"
+        );
+        assert!(is_supported_content_encoding("br"), "should accept br");
+    }
+
+    #[test]
+    fn supported_content_encoding_rejects_unknown_values() {
+        assert!(!is_supported_content_encoding("zstd"), "should reject zstd");
+        assert!(
+            !is_supported_content_encoding("compress"),
+            "should reject compress"
+        );
+        assert!(
+            !is_supported_content_encoding("snappy"),
+            "should reject snappy"
+        );
     }
 
     #[test]

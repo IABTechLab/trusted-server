@@ -192,7 +192,7 @@ async fn route_request(
                         settings,
                         integration_registry,
                     ) {
-                        // Headers already sent (200 OK). Log and abort — client
+                        // Headers already committed. Log and abort — client
                         // sees a truncated response. Standard proxy behavior.
                         log::error!("Streaming processing failed: {e:?}");
                         drop(streaming_body);
