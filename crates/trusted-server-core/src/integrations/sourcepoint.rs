@@ -13,7 +13,8 @@ use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -322,7 +323,8 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(SOURCEPOINT_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_attribute_rewriter(integration.clone())
+            .with_head_injector(integration)
             .build(),
     ))
 }
@@ -450,10 +452,69 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
     }
 }
 
+impl IntegrationHeadInjector for SourcepointIntegration {
+    fn integration_id(&self) -> &'static str {
+        SOURCEPOINT_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        if !self.config.rewrite_sdk {
+            return vec![];
+        }
+
+        // Install a property trap on `window._sp_` so that when the
+        // publisher's code (typically a Next.js hydration chunk) sets the
+        // Sourcepoint config object, we intercept it and rewrite any
+        // `cdn.privacy-mgmt.com` URLs to the first-party proxy prefix.
+        //
+        // The trap is transparent: the getter returns the (patched) value and
+        // the setter accepts any shape the SDK expects.  We also handle the
+        // case where `window._sp_` is already set before our script runs.
+        vec![format!(
+            concat!(
+                "<script>",
+                "(function(){{",
+                "var C=\"{cdn_host}\";",
+                "var P=\"{cdn_prefix}\";",
+                "var G=\"{geo_host}\";",
+                "var Q=\"{geo_prefix}\";",
+                "function r(s){{",
+                "if(typeof s!==\"string\")return s;",
+                "return s.replace(\"https://\"+C,P).replace(\"http://\"+C,P)",
+                ".replace(\"https://\"+G,Q).replace(\"http://\"+G,Q)",
+                "}}",
+                "function p(o){{",
+                "if(!o||typeof o!==\"object\")return o;",
+                "if(o.config){{",
+                "if(typeof o.config.baseEndpoint===\"string\")o.config.baseEndpoint=r(o.config.baseEndpoint);",
+                "if(typeof o.config.mmsDomain===\"string\")o.config.mmsDomain=r(o.config.mmsDomain);",
+                "if(typeof o.config.wrapperAPIOrigin===\"string\")o.config.wrapperAPIOrigin=r(o.config.wrapperAPIOrigin);",
+                "if(typeof o.config.cmpOrigin===\"string\")o.config.cmpOrigin=r(o.config.cmpOrigin);",
+                "}}",
+                "if(typeof o.metricUrl===\"string\")o.metricUrl=r(o.metricUrl);",
+                "return o",
+                "}}",
+                "var v=window._sp_?p(window._sp_):undefined;",
+                "Object.defineProperty(window,\"_sp_\",{{",
+                "configurable:true,",
+                "get:function(){{return v}},",
+                "set:function(n){{v=p(n)}}",
+                "}});",
+                "}})();",
+                "</script>",
+            ),
+            cdn_host = SOURCEPOINT_CDN_HOST,
+            cdn_prefix = SOURCEPOINT_CDN_PREFIX,
+            geo_host = SOURCEPOINT_GEO_HOST,
+            geo_prefix = SOURCEPOINT_GEO_PREFIX,
+        )]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationRegistry;
+    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
     use serde_json::json;
@@ -632,6 +693,75 @@ mod tests {
         assert!(
             registry.has_route(&Method::GET, "/integrations/sourcepoint/geo"),
             "should register geo proxy route"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_sp_property_trap() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.autoblog.com",
+            request_scheme: "https",
+            origin_host: "origin.autoblog.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(inserts.len(), 1, "should produce exactly one head insert");
+
+        let script = &inserts[0];
+        assert!(
+            script.starts_with("<script>") && script.ends_with("</script>"),
+            "should be wrapped in script tags: {script}",
+        );
+        assert!(
+            script.contains("cdn.privacy-mgmt.com"),
+            "should reference the CDN host to rewrite: {script}",
+        );
+        assert!(
+            script.contains("/integrations/sourcepoint/cdn"),
+            "should contain the first-party CDN prefix: {script}",
+        );
+        assert!(
+            script.contains("geo.privacymanager.io"),
+            "should reference the geo host to rewrite: {script}",
+        );
+        assert!(
+            script.contains("/integrations/sourcepoint/geo"),
+            "should contain the first-party geo prefix: {script}",
+        );
+        assert!(
+            script.contains("Object.defineProperty"),
+            "should install a property trap on window._sp_: {script}",
+        );
+        assert!(
+            script.contains("baseEndpoint"),
+            "should patch baseEndpoint in the config: {script}",
+        );
+        assert!(
+            script.contains("metricUrl"),
+            "should patch metricUrl: {script}",
+        );
+    }
+
+    #[test]
+    fn head_injector_returns_empty_when_rewrite_disabled() {
+        let mut cfg = config(true);
+        cfg.rewrite_sdk = false;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.autoblog.com",
+            request_scheme: "https",
+            origin_host: "origin.autoblog.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert!(
+            inserts.is_empty(),
+            "should not inject anything when rewrite_sdk is false"
         );
     }
 }
