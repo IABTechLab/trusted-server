@@ -169,7 +169,14 @@ impl AuctionOrchestrator {
                     .change_context(TrustedServerError::Auction {
                         message: format!("Mediator {} request failed", mediator.provider_name()),
                     })?;
-            let backend_response = platform_response_to_fastly(platform_resp);
+            let backend_response = platform_response_to_fastly(platform_resp).change_context(
+                TrustedServerError::Auction {
+                    message: format!(
+                        "Mediator {} returned an unsupported response body",
+                        mediator.provider_name()
+                    ),
+                },
+            )?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
@@ -241,8 +248,9 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses `fastly::http::request::select()` to process responses as they
-    /// become ready, rather than waiting for each response sequentially.
+    /// Uses [`RuntimeServices::http_client`] and
+    /// [`crate::platform::PlatformHttpClient::select`] to process responses as
+    /// they become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
@@ -388,27 +396,41 @@ impl AuctionOrchestrator {
                 Ok(platform_response) => {
                     // Identify the provider from the backend name
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
-                    let response = platform_response_to_fastly(platform_response);
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms) {
-                            Ok(auction_response) => {
-                                log::info!(
-                                    "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
-                                    auction_response.provider,
-                                    auction_response.bids.len(),
-                                    auction_response.status,
-                                    auction_response.response_time_ms
-                                );
-                                responses.push(auction_response);
+                        match platform_response_to_fastly(platform_response) {
+                            Ok(response) => {
+                                match provider.parse_response(response, response_time_ms) {
+                                    Ok(auction_response) => {
+                                        log::info!(
+                                        "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
+                                        auction_response.provider,
+                                        auction_response.bids.len(),
+                                        auction_response.status,
+                                        auction_response.response_time_ms
+                                    );
+                                        responses.push(auction_response);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Provider '{}' failed to parse response: {:?}",
+                                            provider_name,
+                                            e
+                                        );
+                                        responses.push(AuctionResponse::error(
+                                            provider_name,
+                                            response_time_ms,
+                                        ));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "Provider '{}' failed to parse response: {:?}",
+                                    "Provider '{}' returned an unsupported response body: {:?}",
                                     provider_name,
                                     e
                                 );
