@@ -112,7 +112,7 @@ pub struct PrebidIntegrationConfig {
     /// fixed_bottom = {placementId = "_s2sBottomId"}
     /// ```
     #[serde(default)]
-    pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
+    pub bid_param_zone_overrides: HashMap<String, HashMap<String, serde_json::Map<String, Json>>>,
     /// Compatibility sugar for static per-bidder parameter overrides.
     ///
     /// These rules are normalized into the canonical
@@ -132,7 +132,7 @@ pub struct PrebidIntegrationConfig {
     /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"bidder-name":{"param1":12345,"param2":"value"}}'
     /// ```
     #[serde(default)]
-    pub bid_param_overrides: HashMap<String, Json>,
+    pub bid_param_overrides: HashMap<String, serde_json::Map<String, Json>>,
     /// Canonical ordered bidder-param override rules.
     ///
     /// Each rule has structured `when` matchers and a non-empty `set` object
@@ -181,7 +181,7 @@ pub struct BidParamOverrideRule {
     /// Structured exact-match conditions for this rule.
     pub when: BidParamOverrideWhen,
     /// Parameters shallow-merged into bidder params when the rule matches.
-    pub set: Json,
+    pub set: serde_json::Map<String, Json>,
 }
 
 /// Structured exact-match conditions for a [`BidParamOverrideRule`].
@@ -496,6 +496,11 @@ fn expand_trusted_server_bidders(
         .collect()
 }
 
+/// Shallow-merges `override_obj` into `params`.
+///
+/// When `params` is a JSON object, each key in `override_obj` is inserted
+/// or replaced in `params`. When `params` is not an object, it is replaced
+/// entirely with the override object.
 fn merge_bidder_param_object(params: &mut Json, override_obj: &serde_json::Map<String, Json>) {
     match params {
         Json::Object(base) => {
@@ -575,7 +580,10 @@ impl BidParamOverrideEngine {
 }
 
 impl CompiledBidParamOverrideRule {
-    fn from_bidder_override(bidder: &str, set: &Json) -> Result<Self, Report<TrustedServerError>> {
+    fn from_bidder_override(
+        bidder: &str,
+        set: &serde_json::Map<String, Json>,
+    ) -> Result<Self, Report<TrustedServerError>> {
         Self::new(
             Some(bidder.to_string()),
             None,
@@ -587,7 +595,7 @@ impl CompiledBidParamOverrideRule {
     fn from_zone_override(
         bidder: &str,
         zone: &str,
-        set: &Json,
+        set: &serde_json::Map<String, Json>,
     ) -> Result<Self, Report<TrustedServerError>> {
         Self::new(
             Some(bidder.to_string()),
@@ -600,7 +608,7 @@ impl CompiledBidParamOverrideRule {
     fn new(
         bidder: Option<String>,
         zone: Option<String>,
-        set: &Json,
+        set: &serde_json::Map<String, Json>,
         source: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
         let bidder = bidder
@@ -619,7 +627,7 @@ impl CompiledBidParamOverrideRule {
         Ok(Self {
             bidder,
             zone,
-            set: json_object_for_override(set, source)?,
+            set: non_empty_override_object(set, source)?,
         })
     }
 
@@ -667,23 +675,17 @@ fn validate_override_matcher_string(
     Ok(value)
 }
 
-fn json_object_for_override(
-    value: &Json,
+fn non_empty_override_object(
+    value: &serde_json::Map<String, Json>,
     source: &str,
 ) -> Result<serde_json::Map<String, Json>, Report<TrustedServerError>> {
-    let Json::Object(map) = value else {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{source}.set must be a JSON object"),
-        }));
-    };
-
-    if map.is_empty() {
+    if value.is_empty() {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!("{source}.set must not be empty"),
         }));
     }
 
-    Ok(map.clone())
+    Ok(value.clone())
 }
 
 /// Copies browser headers to the outgoing Prebid Server request.
@@ -1601,6 +1603,24 @@ secret_key = "test-secret-key"
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("should get config")
             .expect("should be enabled")
+    }
+
+    fn parse_prebid_toml_result(
+        prebid_section: &str,
+    ) -> Result<PrebidIntegrationConfig, Report<TrustedServerError>> {
+        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let settings = Settings::from_toml(&toml_str)?;
+        settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")?
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "prebid integration should be enabled".to_string(),
+                })
+            })
+    }
+
+    fn json_object(value: Json) -> serde_json::Map<String, Json> {
+        serde_json::from_value(value).expect("should build JSON object")
     }
 
     #[test]
@@ -3034,7 +3054,7 @@ pubid = "server-pub"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "s2s_header_id" }),
+                json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
 
@@ -3061,7 +3081,7 @@ pubid = "server-pub"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "zone_header_id" }),
+                json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
 
@@ -3089,7 +3109,7 @@ pubid = "server-pub"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "zone_header_id" }),
+                json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
 
@@ -3117,7 +3137,7 @@ pubid = "server-pub"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "s2s_header_id" }),
+                json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
 
@@ -3149,7 +3169,10 @@ pubid = "server-pub"
         config.bidders = vec!["kargo".to_string()];
         config.bid_param_zone_overrides.insert(
             "kargo".to_string(),
-            HashMap::from([("header".to_string(), json!({ "placementId": "s2s_header" }))]),
+            HashMap::from([(
+                "header".to_string(),
+                json_object(json!({ "placementId": "s2s_header" })),
+            )]),
         );
 
         // Client sends extra field alongside placementId
@@ -3237,6 +3260,58 @@ set = { placementId = "_s2sHeader", extra = "x" }
         assert_eq!(
             config.bid_param_override_rules[0].set["placementId"], "_s2sHeader",
             "should parse canonical set object"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_config_rejects_non_object_bidder_value() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_overrides]
+criteo = "not-an-object"
+"#,
+        );
+
+        assert!(result.is_err(), "should reject non-object bidder overrides");
+    }
+
+    #[test]
+    fn zone_overrides_config_rejects_non_object_zone_value() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = "not-an-object"
+"#,
+        );
+
+        assert!(result.is_err(), "should reject non-object zone overrides");
+    }
+
+    #[test]
+    fn bid_param_override_rules_config_rejects_non_object_set() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+set = "not-an-object"
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject canonical override rules with non-object sets"
         );
     }
 
@@ -3340,9 +3415,10 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_normalizes_static_compatibility_rule() {
             let mut config = base_config();
-            config
-                .bid_param_overrides
-                .insert("criteo".to_string(), json!({ "networkId": 99 }));
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 99 })),
+            );
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
                 .expect("should compile static compatibility overrides");
@@ -3371,7 +3447,7 @@ set = { placementId = "explicit_header" }
                 "kargo".to_string(),
                 HashMap::from([(
                     "header".to_string(),
-                    json!({ "placementId": "zone-header" }),
+                    json_object(json!({ "placementId": "zone-header" })),
                 )]),
             );
 
@@ -3399,9 +3475,10 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_applies_bidder_only_rule() {
             let mut config = base_config();
-            config
-                .bid_param_overrides
-                .insert("criteo".to_string(), json!({ "networkId": 42 }));
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 42 })),
+            );
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
                 .expect("should compile bidder-only override");
@@ -3426,7 +3503,10 @@ set = { placementId = "explicit_header" }
             let mut config = base_config();
             config.bid_param_zone_overrides.insert(
                 "kargo".to_string(),
-                HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
+                HashMap::from([(
+                    "header".to_string(),
+                    json_object(json!({ "placementId": "s2s_h" })),
+                )]),
             );
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
@@ -3450,7 +3530,10 @@ set = { placementId = "explicit_header" }
             let mut config = base_config();
             config.bid_param_zone_overrides.insert(
                 "kargo".to_string(),
-                HashMap::from([("header".to_string(), json!({ "placementId": "s2s_h" }))]),
+                HashMap::from([(
+                    "header".to_string(),
+                    json_object(json!({ "placementId": "s2s_h" })),
+                )]),
             );
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
@@ -3474,15 +3557,16 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_applies_later_rule_last_write_wins() {
             let mut config = base_config();
-            config
-                .bid_param_overrides
-                .insert("kargo".to_string(), json!({ "placementId": "compat" }));
+            config.bid_param_overrides.insert(
+                "kargo".to_string(),
+                json_object(json!({ "placementId": "compat" })),
+            );
             config.bid_param_override_rules.push(BidParamOverrideRule {
                 when: BidParamOverrideWhen {
                     bidder: Some("kargo".to_string()),
                     zone: Some("header".to_string()),
                 },
-                set: json!({ "placementId": "explicit", "extra": "x" }),
+                set: json_object(json!({ "placementId": "explicit", "extra": "x" })),
             });
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
@@ -3512,25 +3596,11 @@ set = { placementId = "explicit_header" }
         fn compile_rule_rejects_empty_when() {
             let rule = BidParamOverrideRule {
                 when: BidParamOverrideWhen::default(),
-                set: json!({ "placementId": "x" }),
+                set: json_object(json!({ "placementId": "x" })),
             };
 
             let result = CompiledBidParamOverrideRule::try_from(rule);
             assert!(result.is_err(), "should reject empty when");
-        }
-
-        #[test]
-        fn compile_rule_rejects_non_object_set() {
-            let rule = BidParamOverrideRule {
-                when: BidParamOverrideWhen {
-                    bidder: Some("kargo".to_string()),
-                    zone: None,
-                },
-                set: json!("not-an-object"),
-            };
-
-            let result = CompiledBidParamOverrideRule::try_from(rule);
-            assert!(result.is_err(), "should reject non-object set");
         }
 
         #[test]
@@ -3540,7 +3610,7 @@ set = { placementId = "explicit_header" }
                     bidder: Some("kargo".to_string()),
                     zone: None,
                 },
-                set: json!({}),
+                set: serde_json::Map::new(),
             };
 
             let result = CompiledBidParamOverrideRule::try_from(rule);
