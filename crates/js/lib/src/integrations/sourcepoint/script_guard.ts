@@ -1,7 +1,6 @@
 import { createScriptGuard } from '../../shared/script_guard';
 
 const SOURCEPOINT_CDN_HOST = 'cdn.privacy-mgmt.com';
-const SOURCEPOINT_GEO_HOST = 'geo.privacymanager.io';
 
 function normalizeSourcepointUrl(url: string): string | null {
   if (!url) return null;
@@ -17,7 +16,7 @@ function normalizeSourcepointUrl(url: string): string | null {
     return trimmed;
   }
 
-  if (trimmed.startsWith(SOURCEPOINT_CDN_HOST) || trimmed.startsWith(SOURCEPOINT_GEO_HOST)) {
+  if (trimmed.startsWith(SOURCEPOINT_CDN_HOST)) {
     return `https://${trimmed}`;
   }
 
@@ -37,20 +36,16 @@ function parseSourcepointUrl(url: string): URL | null {
 
 export function isSourcepointUrl(url: string): boolean {
   const parsed = parseSourcepointUrl(url);
-  return parsed?.host === SOURCEPOINT_CDN_HOST || parsed?.host === SOURCEPOINT_GEO_HOST;
+  return parsed?.host === SOURCEPOINT_CDN_HOST;
 }
 
 export function rewriteSourcepointUrl(originalUrl: string): string {
   const parsed = parseSourcepointUrl(originalUrl);
   if (!parsed) return originalUrl;
 
-  const prefix =
-    parsed.host === SOURCEPOINT_CDN_HOST
-      ? '/integrations/sourcepoint/cdn'
-      : '/integrations/sourcepoint/geo';
   const query = parsed.search || '';
 
-  return `${window.location.origin}${prefix}${parsed.pathname}${query}`;
+  return `${window.location.origin}/integrations/sourcepoint/cdn${parsed.pathname}${query}`;
 }
 
 const guard = createScriptGuard({

@@ -1,8 +1,7 @@
 //! Sourcepoint integration for first-party CMP (Consent Management Platform) delivery.
 //!
-//! Proxies Sourcepoint's CDN (`cdn.privacy-mgmt.com`) and geo
-//! (`geo.privacymanager.io`) endpoints through Trusted Server so the browser
-//! loads consent management assets from first-party paths.
+//! Proxies Sourcepoint's CDN (`cdn.privacy-mgmt.com`) through Trusted Server so
+//! the browser loads consent management assets from first-party paths.
 //!
 //! ## Rewriting layers
 //!
@@ -18,7 +17,6 @@
 //! | Method | Path | Upstream |
 //! |--------|------|----------|
 //! | `GET/POST` | `/integrations/sourcepoint/cdn/*` | `cdn.privacy-mgmt.com` |
-//! | `GET` | `/integrations/sourcepoint/geo{,/*}` | `geo.privacymanager.io` |
 
 use std::sync::{Arc, LazyLock};
 
@@ -42,9 +40,7 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
 const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
-const SOURCEPOINT_GEO_HOST: &str = "geo.privacymanager.io";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
-const SOURCEPOINT_GEO_PREFIX: &str = "/integrations/sourcepoint/geo";
 
 /// Matches quoted references to `cdn.privacy-mgmt.com` URLs in script content.
 ///
@@ -99,10 +95,6 @@ pub struct SourcepointConfig {
     #[serde(default = "default_cdn_origin")]
     #[validate(url)]
     pub cdn_origin: String,
-    /// Base URL for Sourcepoint geo requests.
-    #[serde(default = "default_geo_origin")]
-    #[validate(url)]
-    pub geo_origin: String,
     /// Cache TTL for Sourcepoint static responses in seconds.
     #[serde(default = "default_cache_ttl")]
     #[validate(range(min = 60, max = 86400))]
@@ -127,18 +119,8 @@ fn default_cdn_origin() -> String {
     format!("https://{SOURCEPOINT_CDN_HOST}")
 }
 
-fn default_geo_origin() -> String {
-    format!("https://{SOURCEPOINT_GEO_HOST}")
-}
-
 fn default_cache_ttl() -> u32 {
     3600
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum SourcepointBackend {
-    Cdn,
-    Geo,
 }
 
 struct SourcepointIntegration {
@@ -157,28 +139,24 @@ impl SourcepointIntegration {
         }
     }
 
-    fn backend_for_route(path: &str) -> Option<(SourcepointBackend, &str)> {
-        if let Some(target_path) = path.strip_prefix(SOURCEPOINT_CDN_PREFIX) {
-            return Some((SourcepointBackend::Cdn, normalize_target_path(target_path)));
-        }
-
-        path.strip_prefix(SOURCEPOINT_GEO_PREFIX)
-            .map(|target_path| (SourcepointBackend::Geo, normalize_target_path(target_path)))
+    fn strip_cdn_prefix(path: &str) -> Option<&str> {
+        path.strip_prefix(SOURCEPOINT_CDN_PREFIX)
+            .map(|target_path| {
+                if target_path.is_empty() {
+                    "/"
+                } else {
+                    target_path
+                }
+            })
     }
 
     fn build_target_url(
         &self,
-        backend: SourcepointBackend,
         target_path: &str,
         query: Option<&str>,
     ) -> Result<String, Report<TrustedServerError>> {
-        let base = match backend {
-            SourcepointBackend::Cdn => self.config.cdn_origin.as_str(),
-            SourcepointBackend::Geo => self.config.geo_origin.as_str(),
-        };
-
-        let mut target =
-            Url::parse(base).change_context(Self::error("Invalid Sourcepoint origin URL"))?;
+        let mut target = Url::parse(&self.config.cdn_origin)
+            .change_context(Self::error("Invalid Sourcepoint CDN origin URL"))?;
         target.set_path(target_path);
         target.set_query(query);
         Ok(target.to_string())
@@ -186,25 +164,14 @@ impl SourcepointIntegration {
 
     fn build_first_party_url(
         &self,
-        backend: SourcepointBackend,
         source_url: &str,
         ctx: &IntegrationAttributeContext<'_>,
     ) -> Option<String> {
         let parsed = parse_sourcepoint_url(source_url)?;
-        let target_backend = match parsed.host_str()? {
-            SOURCEPOINT_CDN_HOST => SourcepointBackend::Cdn,
-            SOURCEPOINT_GEO_HOST => SourcepointBackend::Geo,
-            _ => return None,
-        };
-
-        if target_backend != backend {
+        if parsed.host_str()? != SOURCEPOINT_CDN_HOST {
             return None;
         }
 
-        let prefix = match target_backend {
-            SourcepointBackend::Cdn => SOURCEPOINT_CDN_PREFIX,
-            SourcepointBackend::Geo => SOURCEPOINT_GEO_PREFIX,
-        };
         let path = parsed.path();
         let query = parsed
             .query()
@@ -213,7 +180,7 @@ impl SourcepointIntegration {
 
         Some(format!(
             "{}://{}{}{}{}",
-            ctx.request_scheme, ctx.request_host, prefix, path, query
+            ctx.request_scheme, ctx.request_host, SOURCEPOINT_CDN_PREFIX, path, query
         ))
     }
 
@@ -222,10 +189,10 @@ impl SourcepointIntegration {
             proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
         }
 
-        // Accept-Encoding is deliberately omitted here and handled per-backend
-        // in the caller: CDN routes that need script rewriting request
-        // `identity` encoding so the body can be safely read as UTF-8, while
-        // other routes forward the client's original encoding.
+        // Accept-Encoding is deliberately omitted here and handled in the
+        // caller: paths that need script rewriting request `identity` encoding
+        // so the body can be safely read as UTF-8, while other paths forward
+        // the client's original encoding.
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
@@ -240,9 +207,8 @@ impl SourcepointIntegration {
         }
     }
 
-    fn apply_cache_headers(&self, backend: SourcepointBackend, response: &mut Response) {
-        if backend == SourcepointBackend::Cdn
-            && response.get_header(header::CACHE_CONTROL).is_none()
+    fn apply_cache_headers(&self, response: &mut Response) {
+        if response.get_header(header::CACHE_CONTROL).is_none()
             && response.get_status().is_success()
         {
             response.set_header(
@@ -308,14 +274,6 @@ impl SourcepointIntegration {
     }
 }
 
-fn normalize_target_path(target_path: &str) -> &str {
-    if target_path.is_empty() {
-        "/"
-    } else {
-        target_path
-    }
-}
-
 fn parse_sourcepoint_url(url: &str) -> Option<Url> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -326,8 +284,7 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
         format!("https:{trimmed}")
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
-    } else if trimmed.starts_with(SOURCEPOINT_CDN_HOST) || trimmed.starts_with(SOURCEPOINT_GEO_HOST)
-    {
+    } else if trimmed.starts_with(SOURCEPOINT_CDN_HOST) {
         format!("https://{trimmed}")
     } else {
         return None;
@@ -377,12 +334,7 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            self.get("/cdn/*"),
-            self.post("/cdn/*"),
-            self.get("/geo"),
-            self.get("/geo/*"),
-        ]
+        vec![self.get("/cdn/*"), self.post("/cdn/*")]
     }
 
     async fn handle(
@@ -392,34 +344,27 @@ impl IntegrationProxy for SourcepointIntegration {
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
         let method = req.get_method().clone();
-        let (backend, target_path) = Self::backend_for_route(&path).ok_or_else(|| {
+        let target_path = Self::strip_cdn_prefix(&path).ok_or_else(|| {
             Report::new(Self::error(format!("Unknown Sourcepoint route: {path}")))
         })?;
 
         let target_url = self
-            .build_target_url(backend, target_path, req.get_query_str())
+            .build_target_url(target_path, req.get_query_str())
             .change_context(Self::error("Failed to build Sourcepoint target URL"))?;
 
-        log::info!("[sourcepoint] Proxying {method} {path} → {target_url} (backend: {backend:?})");
-        let base_origin = match backend {
-            SourcepointBackend::Cdn => self.config.cdn_origin.as_str(),
-            SourcepointBackend::Geo => self.config.geo_origin.as_str(),
-        };
-        let backend_name = BackendConfig::from_url(base_origin, true)
+        log::info!("[sourcepoint] Proxying {method} {path} → {target_url}");
+
+        let backend_name = BackendConfig::from_url(&self.config.cdn_origin, true)
             .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
         self.copy_headers(&req, &mut proxy_req);
 
-        // Request uncompressed content only for CDN paths that are likely
+        // Request uncompressed content only for paths that are likely
         // JavaScript (the files we need to regex-rewrite).  All other CDN
-        // responses (images, JSON API responses, CSS) and geo routes keep the
-        // client's original Accept-Encoding for efficiency.
-        let needs_script_rewrite = backend == SourcepointBackend::Cdn
-            && self.config.rewrite_sdk
-            && Self::is_likely_javascript_path(target_path);
-
-        if needs_script_rewrite {
+        // responses (images, JSON API responses, CSS) keep the client's
+        // original Accept-Encoding for efficiency.
+        if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
             proxy_req.set_header(header::ACCEPT_ENCODING, "identity");
         } else if let Some(ae) = req.get_header(header::ACCEPT_ENCODING) {
             proxy_req.set_header(header::ACCEPT_ENCODING, ae);
@@ -446,8 +391,7 @@ impl IntegrationProxy for SourcepointIntegration {
 
         // Rewrite CDN URLs inside JavaScript responses so that dynamically
         // loaded chunks and API calls route through the first-party proxy.
-        if backend == SourcepointBackend::Cdn
-            && response.get_status() == StatusCode::OK
+        if response.get_status() == StatusCode::OK
             && self.config.rewrite_sdk
             && Self::is_javascript_response(&response)
         {
@@ -470,7 +414,7 @@ impl IntegrationProxy for SourcepointIntegration {
             return Ok(new_response);
         }
 
-        self.apply_cache_headers(backend, &mut response);
+        self.apply_cache_headers(&mut response);
         Ok(response)
     }
 }
@@ -494,15 +438,7 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
             return AttributeRewriteAction::keep();
         }
 
-        if let Some(rewritten) =
-            self.build_first_party_url(SourcepointBackend::Cdn, attr_value, ctx)
-        {
-            return AttributeRewriteAction::replace(rewritten);
-        }
-
-        if let Some(rewritten) =
-            self.build_first_party_url(SourcepointBackend::Geo, attr_value, ctx)
-        {
+        if let Some(rewritten) = self.build_first_party_url(attr_value, ctx) {
             return AttributeRewriteAction::replace(rewritten);
         }
 
@@ -534,12 +470,9 @@ impl IntegrationHeadInjector for SourcepointIntegration {
                 "(function(){{",
                 "var C=\"{cdn_host}\";",
                 "var P=\"{cdn_prefix}\";",
-                "var G=\"{geo_host}\";",
-                "var Q=\"{geo_prefix}\";",
                 "function r(s){{",
                 "if(typeof s!==\"string\")return s;",
                 "return s.replace(\"https://\"+C,P).replace(\"http://\"+C,P).replace(\"//\"+C,P)",
-                ".replace(\"https://\"+G,Q).replace(\"http://\"+G,Q).replace(\"//\"+G,Q)",
                 "}}",
                 "function p(o){{",
                 "if(!o||typeof o!==\"object\")return o;",
@@ -563,8 +496,6 @@ impl IntegrationHeadInjector for SourcepointIntegration {
             ),
             cdn_host = SOURCEPOINT_CDN_HOST,
             cdn_prefix = SOURCEPOINT_CDN_PREFIX,
-            geo_host = SOURCEPOINT_GEO_HOST,
-            geo_prefix = SOURCEPOINT_GEO_PREFIX,
         )]
     }
 }
@@ -582,22 +513,25 @@ mod tests {
             enabled,
             rewrite_sdk: true,
             cdn_origin: default_cdn_origin(),
-            geo_origin: default_geo_origin(),
             cache_ttl_seconds: default_cache_ttl(),
         }
     }
 
     #[test]
-    fn selects_backend_for_cdn_and_geo_routes() {
+    fn strips_cdn_prefix_from_routes() {
         assert_eq!(
-            SourcepointIntegration::backend_for_route(
+            SourcepointIntegration::strip_cdn_prefix(
                 "/integrations/sourcepoint/cdn/wrapper/v2/messages"
             ),
-            Some((SourcepointBackend::Cdn, "/wrapper/v2/messages"))
+            Some("/wrapper/v2/messages")
         );
         assert_eq!(
-            SourcepointIntegration::backend_for_route("/integrations/sourcepoint/geo/"),
-            Some((SourcepointBackend::Geo, "/"))
+            SourcepointIntegration::strip_cdn_prefix("/integrations/sourcepoint/cdn"),
+            Some("/")
+        );
+        assert_eq!(
+            SourcepointIntegration::strip_cdn_prefix("/some/other/path"),
+            None
         );
     }
 
@@ -621,26 +555,6 @@ mod tests {
             rewritten,
             AttributeRewriteAction::replace(
                 "https://edge.example.com/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=821",
-            )
-        );
-    }
-
-    #[test]
-    fn rewrites_geo_urls_to_first_party_paths() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "href",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
-        let rewritten = integration.rewrite("href", "https://geo.privacymanager.io/", &ctx);
-
-        assert_eq!(
-            rewritten,
-            AttributeRewriteAction::replace(
-                "https://edge.example.com/integrations/sourcepoint/geo/"
             )
         );
     }
@@ -748,10 +662,6 @@ mod tests {
             ),
             "should register CDN proxy route"
         );
-        assert!(
-            registry.has_route(&Method::GET, "/integrations/sourcepoint/geo"),
-            "should register geo proxy route"
-        );
     }
 
     #[test]
@@ -818,14 +728,6 @@ mod tests {
         assert!(
             script.contains("/integrations/sourcepoint/cdn"),
             "should contain the first-party CDN prefix: {script}",
-        );
-        assert!(
-            script.contains("geo.privacymanager.io"),
-            "should reference the geo host to rewrite: {script}",
-        );
-        assert!(
-            script.contains("/integrations/sourcepoint/geo"),
-            "should contain the first-party geo prefix: {script}",
         );
         assert!(
             script.contains("Object.defineProperty"),

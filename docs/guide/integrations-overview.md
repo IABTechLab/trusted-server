@@ -122,13 +122,14 @@ rewrite_sdk = true
 
 ### Sourcepoint
 
-**What it does:** Proxies Sourcepoint CMP CDN and geo endpoints through Trusted Server and rewrites publisher references to those URLs.
+**What it does:** Proxies Sourcepoint CMP CDN endpoints through Trusted Server and rewrites publisher references to first-party paths.
 
 **Key Features:**
 
-- CDN proxy for `privacy-mgmt.com`
-- Geo lookup proxy for `privacymanager.io`
+- CDN proxy for `cdn.privacy-mgmt.com`
 - HTML attribute rewriting for Sourcepoint assets
+- JavaScript body rewriting for webpack chunks and API URLs
+- Head-injected `window._sp_` property trap for runtime config
 - Client-side script guard for dynamic script insertion
 
 **Configuration:**
@@ -138,14 +139,12 @@ rewrite_sdk = true
 enabled = true
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
-geo_origin = "https://geo.privacymanager.io"
 cache_ttl_seconds = 3600
 ```
 
 **Endpoints:**
 
 - `GET/POST /integrations/sourcepoint/cdn/*` - Sourcepoint CDN proxy
-- `GET /integrations/sourcepoint/geo/*` - Sourcepoint geo proxy
 
 **When to use:** You load Sourcepoint CMP assets and want them to flow through first-party paths without introducing an open-ended proxy.
 

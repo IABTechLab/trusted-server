@@ -73,7 +73,6 @@ api_origin = "https://api.privacy-center.org"
 enabled = false
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
-geo_origin = "https://geo.privacymanager.io"
 cache_ttl_seconds = 3600
 
 [integrations.permutive]

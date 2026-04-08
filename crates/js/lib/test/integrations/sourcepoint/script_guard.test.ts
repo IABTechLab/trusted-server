@@ -22,22 +22,18 @@ describe('Sourcepoint SDK Script Interception Guard', () => {
     resetGuardState();
   });
 
-  it('detects Sourcepoint CDN and geo URLs', () => {
+  it('detects Sourcepoint CDN URLs', () => {
     expect(isSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages')).toBe(true);
-    expect(isSourcepointUrl('https://geo.privacymanager.io/')).toBe(true);
     expect(isSourcepointUrl('//cdn.privacy-mgmt.com/mms/v2/get_site_data')).toBe(true);
     expect(isSourcepointUrl('https://example.com/script.js')).toBe(false);
+    expect(isSourcepointUrl('https://geo.privacymanager.io/')).toBe(false);
   });
 
   it('rewrites CDN URLs to the first-party proxy path', () => {
-    expect(rewriteSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages?env=prod')).toBe(
+    expect(
+      rewriteSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages?env=prod')
+    ).toBe(
       `${window.location.origin}/integrations/sourcepoint/cdn/wrapper/v2/messages?env=prod`
-    );
-  });
-
-  it('rewrites geo URLs to the first-party proxy path', () => {
-    expect(rewriteSourcepointUrl('https://geo.privacymanager.io/')).toBe(
-      `${window.location.origin}/integrations/sourcepoint/geo/`
     );
   });
 
