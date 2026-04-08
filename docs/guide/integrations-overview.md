@@ -4,12 +4,13 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 ## Quick Comparison
 
-| Integration   | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
-| ------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
-| **Prebid**    | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
-| **Next.js**   | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
-| **Permutive** | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
-| **Testlight** | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
+| Integration     | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
+| --------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
+| **Prebid**      | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
+| **Next.js**     | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
+| **Permutive**   | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
+| **Sourcepoint** | Proxy + Rewriter | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
+| **Testlight**   | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
 
@@ -116,6 +117,39 @@ rewrite_sdk = true
 **When to use:** You use Permutive for audience segmentation and want to maintain first-party data collection in a privacy-compliant way.
 
 **Learn more:** [Integration Guide](./integration-guide.md)
+
+---
+
+### Sourcepoint
+
+**What it does:** Proxies Sourcepoint CMP CDN and geo endpoints through Trusted Server and rewrites publisher references to those URLs.
+
+**Key Features:**
+
+- CDN proxy for `privacy-mgmt.com`
+- Geo lookup proxy for `privacymanager.io`
+- HTML attribute rewriting for Sourcepoint assets
+- Client-side script guard for dynamic script insertion
+
+**Configuration:**
+
+```toml
+[integrations.sourcepoint]
+enabled = true
+rewrite_sdk = true
+cdn_origin = "https://cdn.privacy-mgmt.com"
+geo_origin = "https://geo.privacymanager.io"
+cache_ttl_seconds = 3600
+```
+
+**Endpoints:**
+
+- `GET/POST /integrations/sourcepoint/cdn/*` - Sourcepoint CDN proxy
+- `GET /integrations/sourcepoint/geo/*` - Sourcepoint geo proxy
+
+**When to use:** You load Sourcepoint CMP assets and want them to flow through first-party paths without introducing an open-ended proxy.
+
+**Learn more:** [Sourcepoint Integration](./integrations/sourcepoint.md)
 
 ---
 

@@ -16,6 +16,7 @@ pub mod nextjs;
 pub mod permutive;
 pub mod prebid;
 mod registry;
+pub mod sourcepoint;
 pub mod testlight;
 
 pub use registry::{
@@ -37,6 +38,7 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         permutive::register,
         lockr::register,
         didomi::register,
+        sourcepoint::register,
         google_tag_manager::register,
         datadome::register,
         gpt::register,

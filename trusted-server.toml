@@ -69,6 +69,13 @@ enabled = false
 sdk_origin = "https://sdk.privacy-center.org"
 api_origin = "https://api.privacy-center.org"
 
+[integrations.sourcepoint]
+enabled = false
+rewrite_sdk = true
+cdn_origin = "https://cdn.privacy-mgmt.com"
+geo_origin = "https://geo.privacymanager.io"
+cache_ttl_seconds = 3600
+
 [integrations.permutive]
 enabled = false
 organization_id = ""
@@ -189,5 +196,4 @@ timeout_ms = 1000
 # query parameter name. Arrays are joined with commas.
 [integrations.adserver_mock.context_query_params]
 permutive_segments = "permutive"
-
 
