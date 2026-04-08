@@ -190,7 +190,7 @@ impl PlatformBackend for FastlyPlatformBackend {
 // FastlyPlatformHttpClient — helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a platform-neutral [`EdgeRequest`] to a [`fastly::Request`].
+/// Convert a platform-neutral [`edgezero_core::http::Request`] to a [`fastly::Request`].
 ///
 /// Only `Body::Once` bodies are forwarded; `Body::Stream` bodies are not
 /// used on this path (proxy.rs builds bodies from byte slices).
@@ -198,7 +198,7 @@ fn edge_request_to_fastly(request: edgezero_core::http::Request) -> fastly::Requ
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
-        fastly_req.set_header(name.as_str(), value.as_bytes());
+        fastly_req.append_header(name.as_str(), value.as_bytes());
     }
     // Only Body::Once is supported. Body::Stream is intentionally not forwarded
     // because all outbound proxy bodies are built from Vec<u8> via EdgeBody::from()
@@ -288,55 +288,24 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
-        let mut saved_names: Vec<String> = Vec::with_capacity(pending_requests.len());
 
         for platform_req in pending_requests {
-            let name = platform_req.backend_name().unwrap_or("").to_string();
             let inner = platform_req.downcast::<PendingRequest>().map_err(|_| {
                 Report::new(PlatformError::HttpClient)
                     .attach("PlatformPendingRequest inner type is not fastly::PendingRequest")
             })?;
             fastly_pending.push(inner);
-            saved_names.push(name);
         }
 
         let (result, remaining_fastly) = select(fastly_pending);
 
-        // Re-attach saved backend names to the remaining pending requests.
-        // Identify which request completed by matching the response backend name
-        // to the saved names, then skip that index when rebuilding remaining.
-        let completed_name = match &result {
-            Ok(resp) => resp.get_backend_name().map(str::to_string),
-            Err(_) => None,
-        };
-        let completed_idx = completed_name
-            .as_deref()
-            .and_then(|name| saved_names.iter().position(|n| n == name));
-        if completed_name.is_some() && completed_idx.is_none() {
-            log::warn!(
-                "select: completed backend name not found in saved names; \
-                 remaining requests will lose backend correlation"
-            );
-        }
-
-        let remaining: Vec<PlatformPendingRequest> = if let Some(idx) = completed_idx {
-            remaining_fastly
-                .into_iter()
-                .zip(
-                    saved_names
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != idx)
-                        .map(|(_, name)| name),
-                )
-                .map(|(req, name)| PlatformPendingRequest::new(req).with_backend_name(name))
-                .collect()
-        } else {
-            remaining_fastly
-                .into_iter()
-                .map(PlatformPendingRequest::new)
-                .collect()
-        };
+        // Fastly's select() does not preserve input order for remaining requests,
+        // so positional backend-name re-association is unreliable. Backend names
+        // are re-derived from get_backend_name() when each remaining request completes.
+        let remaining: Vec<PlatformPendingRequest> = remaining_fastly
+            .into_iter()
+            .map(PlatformPendingRequest::new)
+            .collect();
 
         let ready = match result {
             Ok(fastly_resp) => {

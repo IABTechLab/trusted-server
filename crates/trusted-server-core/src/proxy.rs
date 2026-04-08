@@ -57,7 +57,7 @@ pub(crate) fn platform_response_to_fastly(platform_resp: PlatformResponse) -> Re
     };
     let mut resp = Response::from_status(parts.status.as_u16());
     for (name, value) in parts.headers.iter() {
-        resp.set_header(name.as_str(), value.as_bytes());
+        resp.append_header(name.as_str(), value.as_bytes());
     }
     resp.set_body(body_bytes);
     resp
@@ -91,19 +91,10 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
-    /// Domain allowlist enforced on the initial target and every redirect hop.
-    ///
-    /// An empty slice disables allowlist enforcement (open mode).
-    /// Integration proxies should pass `&[]`; first-party proxy passes
-    /// `&settings.proxy.allowed_domains`.
-    pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the EC ID.
-    ///
-    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
-    /// first-party proxy by setting `allowed_domains` directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
@@ -114,7 +105,6 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
-            allowed_domains: &[],
         }
     }
 
@@ -425,6 +415,7 @@ fn finalize_response(
     }
 }
 
+/// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
 struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
     copy_request_headers: bool,
@@ -455,7 +446,6 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
-        allowed_domains: _,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -773,7 +763,6 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
-            allowed_domains: &settings.proxy.allowed_domains,
         },
         services,
     )
@@ -1946,7 +1935,6 @@ mod tests {
                 headers: Vec::new(),
                 copy_request_headers: false,
                 stream_passthrough: false,
-                allowed_domains: &[],
             },
             &services,
         )
