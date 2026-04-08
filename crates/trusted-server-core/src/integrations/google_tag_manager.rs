@@ -22,6 +22,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use crate::compat;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -429,9 +430,16 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             }
         };
 
-        let mut response = proxy_request(settings, req, proxy_config, services)
+        let mut response = compat::to_fastly_response(
+            proxy_request(
+                settings,
+                compat::from_fastly_request(req),
+                proxy_config,
+                services,
+            )
             .await
-            .change_context(Self::error("Failed to proxy GTM request"))?;
+            .change_context(Self::error("Failed to proxy GTM request"))?,
+        );
 
         // If we are serving gtm.js or gtag.js, rewrite internal URLs to route beacons through us.
         if self.is_rewritable_script(&path) {

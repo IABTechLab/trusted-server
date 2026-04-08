@@ -176,9 +176,16 @@ impl IntegrationProxy for TestlightIntegration {
             HeaderValue::from_static("application/json"),
         ));
 
-        let mut response = proxy_request(settings, req, proxy_config, services)
+        let mut response = compat::to_fastly_response(
+            proxy_request(
+                settings,
+                compat::from_fastly_request(req),
+                proxy_config,
+                services,
+            )
             .await
-            .change_context(Self::error("Failed to contact upstream integration"))?;
+            .change_context(Self::error("Failed to contact upstream integration"))?,
+        );
 
         // Attempt to parse response into structured form for logging/future transforms.
         let response_body = response.take_body_bytes();

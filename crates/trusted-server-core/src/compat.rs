@@ -79,6 +79,20 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
     fastly_req
 }
 
+/// Convert a borrowed `http::Request<EdgeBody>` into a `fastly::Request`.
+///
+/// Headers, method, and URI are copied; the body is empty.
+///
+/// # PR 15 removal target
+pub fn to_fastly_request_ref(req: &http::Request<EdgeBody>) -> fastly::Request {
+    let mut fastly_req = fastly::Request::new(req.method().clone(), req.uri().to_string());
+    for (name, value) in req.headers() {
+        fastly_req.set_header(name.as_str(), value.as_bytes());
+    }
+
+    fastly_req
+}
+
 /// Convert a `fastly::Response` into an `http::Response<EdgeBody>`.
 ///
 /// # PR 15 removal target
@@ -366,6 +380,40 @@ mod tests {
         assert!(
             fastly_resp.get_header("content-type").is_some(),
             "should copy content-type header"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_ref_copies_method_uri_and_headers_without_body() {
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/path?q=1")
+            .header("x-custom", "value")
+            .body(EdgeBody::from(b"payload".as_ref()))
+            .expect("should build request");
+
+        let mut fastly_req = to_fastly_request_ref(&http_req);
+
+        assert_eq!(
+            fastly_req.get_method(),
+            &fastly::http::Method::POST,
+            "should copy method"
+        );
+        assert_eq!(
+            fastly_req.get_url_str(),
+            "https://example.com/path?q=1",
+            "should copy URI"
+        );
+        assert_eq!(
+            fastly_req
+                .get_header("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("value"),
+            "should copy headers"
+        );
+        assert!(
+            fastly_req.take_body_bytes().is_empty(),
+            "borrowed conversion should not copy body bytes"
         );
     }
 

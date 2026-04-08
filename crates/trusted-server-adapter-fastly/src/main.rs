@@ -1,6 +1,10 @@
+use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::http::{
+    header, HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
+};
 use error_stack::Report;
-use fastly::http::Method;
-use fastly::{Error, Request, Response};
+use fastly::http::Method as FastlyMethod;
+use fastly::{Error, Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -10,7 +14,7 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::RuntimeServices;
@@ -35,13 +39,13 @@ use crate::error::to_error_response;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
 #[fastly::main]
-fn main(req: Request) -> Result<Response, Error> {
+fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
     logging::init_logger();
 
     // Keep the health probe independent from settings loading and routing so
     // readiness checks still get a cheap liveness response during startup.
-    if req.get_method() == Method::GET && req.get_path() == "/health" {
-        return Ok(Response::from_status(200).with_body_text_plain("ok"));
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
+        return Ok(FastlyResponse::from_status(200).with_body_text_plain("ok"));
     }
 
     let settings = match get_settings() {
@@ -85,31 +89,11 @@ fn main(req: Request) -> Result<Response, Error> {
                 as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>
         }
     };
-    let runtime_services = build_runtime_services(&req, kv_store);
-
-    futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &runtime_services,
-        req,
-    ))
-}
-
-async fn route_request(
-    settings: &Settings,
-    orchestrator: &AuctionOrchestrator,
-    integration_registry: &IntegrationRegistry,
-    runtime_services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Error> {
-    // Strip client-spoofable forwarded headers at the edge.
-    // On Fastly this service IS the first proxy — these headers from
-    // clients are untrusted and can hijack URL rewriting (see #409).
+    // Strip client-spoofable forwarded headers at the edge before building
+    // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    // Look up geo info via the platform abstraction using the client IP
-    // already captured in RuntimeServices at the entry point.
+    let runtime_services = build_runtime_services(&req, kv_store);
     let geo_info = runtime_services
         .geo()
         .lookup(runtime_services.client_info().client_ip)
@@ -117,32 +101,44 @@ async fn route_request(
             log::warn!("geo lookup failed: {e}");
             None
         });
+    let http_req = compat::from_fastly_request(req);
 
+    let mut response = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        http_req,
+    ))
+    .unwrap_or_else(|e| http_error_response(&e));
+
+    finalize_response(&settings, geo_info.as_ref(), &mut response);
+
+    Ok(compat::to_fastly_response(response))
+}
+
+async fn route_request(
+    settings: &Settings,
+    orchestrator: &AuctionOrchestrator,
+    integration_registry: &IntegrationRegistry,
+    runtime_services: &RuntimeServices,
+    req: HttpRequest,
+) -> Result<HttpResponse, Report<TrustedServerError>> {
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    let auth_req = compat::from_fastly_request_ref(&req);
-    match enforce_basic_auth(settings, &auth_req) {
-        Ok(Some(response)) => {
-            let mut response = compat::to_fastly_response(response);
-            finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Ok(response);
-        }
+    match enforce_basic_auth(settings, &req) {
+        Ok(Some(response)) => return Ok(response),
         Ok(None) => {}
-        Err(e) => {
-            log::error!("Failed to evaluate basic auth: {:?}", e);
-            let mut response = to_error_response(&e);
-            finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Ok(response);
-        }
+        Err(e) => return Err(e),
     }
 
     // Get path and method for routing
-    let path = req.get_path().to_string();
-    let method = req.get_method().clone();
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
 
     // Match known routes and handle them
-    let result = match (method, path.as_str()) {
+    match (method.clone(), path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&req, integration_registry)
@@ -184,13 +180,20 @@ async fn route_request(
             handle_first_party_proxy_rebuild(settings, runtime_services, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, runtime_services, req)
+            .handle_proxy(
+                &m,
+                path,
+                settings,
+                runtime_services,
+                compat::to_fastly_request(req),
+            )
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            }),
+            })
+            .map(compat::from_fastly_response),
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
@@ -199,22 +202,9 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(settings, integration_registry, runtime_services, req) {
-                Ok(response) => Ok(response),
-                Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    Err(e)
-                }
-            }
+            handle_publisher_request(settings, integration_registry, runtime_services, req).await
         }
-    };
-
-    // Convert any errors to HTTP error responses
-    let mut response = result.unwrap_or_else(|e| to_error_response(&e));
-
-    finalize_response(settings, geo_info.as_ref(), &mut response);
-
-    Ok(response)
+    }
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
@@ -225,21 +215,53 @@ async fn route_request(
 /// Header precedence (last write wins): geo headers are set first, then
 /// version/staging, then operator-configured `settings.response_headers`.
 /// This means operators can intentionally override any managed header.
-fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut Response) {
+fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
     if let Some(geo) = geo_info {
         geo.set_response_headers(response);
     } else {
-        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
+        response.headers_mut().insert(
+            HEADER_X_GEO_INFO_AVAILABLE,
+            HeaderValue::from_static("false"),
+        );
     }
 
     if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        response.set_header(HEADER_X_TS_VERSION, v);
+        if let Ok(value) = HeaderValue::from_str(&v) {
+            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
+        } else {
+            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+        }
     }
     if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response.set_header(HEADER_X_TS_ENV, "staging");
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
     }
 
     for (key, value) in &settings.response_headers {
-        response.set_header(key, value);
+        let header_name = HeaderName::from_bytes(key.as_bytes());
+        let header_value = HeaderValue::from_str(value);
+        if let (Ok(header_name), Ok(header_value)) = (header_name, header_value) {
+            response.headers_mut().insert(header_name, header_value);
+        } else {
+            log::warn!(
+                "Skipping invalid configured response header value for {}",
+                key
+            );
+        }
     }
+}
+
+fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
+    let root_error = report.current_context();
+    log::error!("Error occurred: {:?}", report);
+
+    let mut response =
+        HttpResponse::new(EdgeBody::from(format!("{}\n", root_error.user_message())));
+    *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }

@@ -1,7 +1,8 @@
 //! HTTP endpoint handlers for auction requests.
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::{Request, Response};
+use http::{Request, Response};
 
 use crate::auction::formats::AdRequest;
 use crate::compat;
@@ -33,21 +34,22 @@ pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let (parts, body) = req.into_parts();
+
     // Parse request body
-    let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Auction {
+    let body: AdRequest =
+        serde_json::from_slice(&body.into_bytes()).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
-        },
-    )?;
+        })?;
 
     log::info!(
         "Auction request received for {} ad units",
         body.ad_units.len()
     );
 
-    let http_req = compat::from_fastly_request_ref(&req);
+    let http_req = Request::from_parts(parts, EdgeBody::empty());
 
     // Generate synthetic ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
@@ -79,16 +81,18 @@ pub async fn handle_auction(
         &body,
         settings,
         services,
-        &req,
+        &http_req,
         consent_context,
         &synthetic_id,
         geo,
     )?;
 
+    let fastly_req = compat::to_fastly_request_ref(&http_req);
+
     // Create auction context
     let context = AuctionContext {
         settings,
-        request: &req,
+        request: &fastly_req,
         client_info: &services.client_info,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,

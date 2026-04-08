@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::Validate;
 
+use crate::compat;
 use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -245,9 +246,11 @@ impl GptIntegration {
         context: &str,
     ) -> Result<Response, Report<TrustedServerError>> {
         let config = Self::build_proxy_config(target_url, &req);
-        let response = proxy_request(settings, req, config, services)
-            .await
-            .change_context(Self::error(context))?;
+        let response = compat::to_fastly_response(
+            proxy_request(settings, compat::from_fastly_request(req), config, services)
+                .await
+                .change_context(Self::error(context))?,
+        );
 
         Self::ensure_successful_gpt_asset_response(&response, context)?;
         Ok(self.finalize_gpt_asset_response(response))

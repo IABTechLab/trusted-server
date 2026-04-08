@@ -10,12 +10,21 @@ fn strip_line_comments(source: &str) -> String {
 }
 
 #[test]
-fn migrated_utility_modules_do_not_depend_on_fastly_request_response_types() {
+fn migrated_utility_and_handler_modules_do_not_depend_on_fastly_request_response_types() {
     let sources = [
         ("auth.rs", include_str!("auth.rs")),
         ("cookies.rs", include_str!("cookies.rs")),
         ("synthetic.rs", include_str!("synthetic.rs")),
         ("http_util.rs", include_str!("http_util.rs")),
+        ("geo.rs", include_str!("geo.rs")),
+        ("publisher.rs", include_str!("publisher.rs")),
+        ("proxy.rs", include_str!("proxy.rs")),
+        ("auction/formats.rs", include_str!("auction/formats.rs")),
+        ("auction/endpoints.rs", include_str!("auction/endpoints.rs")),
+        (
+            "request_signing/endpoints.rs",
+            include_str!("request_signing/endpoints.rs"),
+        ),
         (
             "consent/extraction.rs",
             include_str!("consent/extraction.rs"),

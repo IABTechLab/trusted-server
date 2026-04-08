@@ -7,11 +7,33 @@ use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformPendingRequest, RuntimeServices};
-use crate::proxy::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
+
+fn platform_response_to_fastly(
+    platform_resp: crate::platform::PlatformResponse,
+) -> fastly::Response {
+    let (parts, body) = platform_resp.response.into_parts();
+    debug_assert!(
+        matches!(&body, edgezero_core::body::Body::Once(_)),
+        "unexpected Body::Stream in platform response conversion: body will be empty"
+    );
+    let body_bytes = match body {
+        edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
+        edgezero_core::body::Body::Stream(_) => {
+            log::warn!("streaming platform response body; body will be empty");
+            vec![]
+        }
+    };
+    let mut resp = fastly::Response::from_status(parts.status.as_u16());
+    for (name, value) in parts.headers.iter() {
+        resp.set_header(name.as_str(), value.as_bytes());
+    }
+    resp.set_body(body_bytes);
+    resp
+}
 
 /// Compute the remaining time budget from a deadline.
 ///

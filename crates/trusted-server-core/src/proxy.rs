@@ -1,11 +1,10 @@
-use crate::compat;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, HeaderValue, Method, StatusCode};
-use fastly::{Request, Response};
+use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
@@ -14,9 +13,7 @@ use crate::constants::{
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::error::TrustedServerError;
-use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices,
-};
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::synthetic::get_synthetic_id;
@@ -32,37 +29,6 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_REFERER,
     HEADER_X_FORWARDED_FOR,
 ];
-
-/// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
-///
-/// Shared with `auction/orchestrator.rs`. Both files will migrate off `fastly::Response`
-/// entirely in Phase 2, at which point this conversion helper will be removed.
-///
-/// # Panics (debug builds only)
-///
-/// Panics when `platform_resp` carries a `Body::Stream` body, which indicates a
-/// programming error — all outbound proxy bodies are built from byte slices and
-/// are therefore always `Body::Once`.
-pub(crate) fn platform_response_to_fastly(platform_resp: PlatformResponse) -> Response {
-    let (parts, body) = platform_resp.response.into_parts();
-    debug_assert!(
-        matches!(&body, EdgeBody::Once(_)),
-        "unexpected Body::Stream in platform response conversion: body will be empty"
-    );
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
-            log::warn!("streaming platform response body; body will be empty");
-            vec![]
-        }
-    };
-    let mut resp = Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.set_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    resp
-}
 
 #[derive(Deserialize)]
 struct ProxySignReq {
@@ -156,17 +122,19 @@ const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
 /// If `preserve_encoding` is true, the Content-Encoding header is kept (for compressed responses).
 /// If false, Content-Encoding is stripped (for decompressed responses).
 fn rebuild_response_with_body(
-    beresp: &Response,
+    beresp: &Response<EdgeBody>,
     content_type: &'static str,
     body: Vec<u8>,
     preserve_encoding: bool,
-) -> Response {
-    let status = beresp.get_status();
+) -> Response<EdgeBody> {
+    let status = beresp.status();
     let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
-        .get_headers()
+        .headers()
+        .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    let mut resp = Response::from_status(status);
+    let mut resp = Response::new(EdgeBody::from(body));
+    *resp.status_mut() = status;
     for (name, value) in headers {
         // Always skip Content-Length (size changed) and Content-Type (we set it)
         if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
@@ -176,10 +144,10 @@ fn rebuild_response_with_body(
         if name == header::CONTENT_ENCODING && !preserve_encoding {
             continue;
         }
-        resp.set_header(name, value);
+        resp.headers_mut().append(name, value);
     }
-    resp.set_header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    resp.set_body(body);
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     resp
 }
 
@@ -188,23 +156,23 @@ fn rebuild_response_with_body(
 /// Handles decompression, content processing, and re-compression while preserving
 /// the response status and headers.
 fn process_response_with_pipeline<P: StreamProcessor>(
-    mut beresp: Response,
+    mut beresp: Response<EdgeBody>,
     processor: P,
     compression: Compression,
     content_type: &'static str,
     error_context: &'static str,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let config = PipelineConfig {
         input_compression: compression,
         output_compression: compression,
         chunk_size: STREAMING_CHUNK_SIZE,
     };
 
-    let body = beresp.take_body();
+    let body = std::mem::replace(beresp.body_mut(), EdgeBody::empty());
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body, &mut output)
+        .process(Cursor::new(body.into_bytes()), &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;
@@ -219,28 +187,32 @@ fn process_response_with_pipeline<P: StreamProcessor>(
 
 fn finalize_proxied_response(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url: &str,
-    mut beresp: Response,
-) -> Result<Response, Report<TrustedServerError>> {
+    mut beresp: Response<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Determine content-type and content-encoding from response headers
-    let status_code = beresp.get_status().as_u16();
+    let status_code = beresp.status().as_u16();
     let ct_raw = beresp
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let content_encoding = beresp
-        .get_header(header::CONTENT_ENCODING)
+        .headers()
+        .get(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let cl_raw = beresp
-        .get_header(header::CONTENT_LENGTH)
+        .headers()
+        .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     let accept_raw = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
@@ -287,20 +259,24 @@ fn finalize_proxied_response(
 
     // Image handling: set generic content-type if missing and log pixel heuristics
     let req_accept_images = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_ascii_lowercase().contains("image/"))
         .unwrap_or(false);
 
     if ct.starts_with("image/") || req_accept_images {
-        if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+            beresp
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
         }
 
         // Heuristics to log likely tracking pixels without altering response
         let mut is_pixel = false;
         if let Some(cl) = beresp
-            .get_header(header::CONTENT_LENGTH)
+            .headers()
+            .get(header::CONTENT_LENGTH)
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -334,22 +310,25 @@ fn finalize_proxied_response(
 }
 
 fn finalize_proxied_response_streaming(
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url: &str,
-    mut beresp: Response,
-) -> Response {
-    let status_code = beresp.get_status().as_u16();
+    mut beresp: Response<EdgeBody>,
+) -> Response<EdgeBody> {
+    let status_code = beresp.status().as_u16();
     let ct_raw = beresp
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let cl_raw = beresp
-        .get_header(header::CONTENT_LENGTH)
+        .headers()
+        .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     let accept_raw = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
@@ -366,19 +345,23 @@ fn finalize_proxied_response_streaming(
     let ct = ct_raw.to_ascii_lowercase();
 
     let req_accept_images = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_ascii_lowercase().contains("image/"))
         .unwrap_or(false);
 
     if ct.starts_with("image/") || req_accept_images {
-        if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+            beresp
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
         }
 
         let mut is_pixel = false;
         if let Some(cl) = beresp
-            .get_header(header::CONTENT_LENGTH)
+            .headers()
+            .get(header::CONTENT_LENGTH)
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -414,11 +397,11 @@ fn finalize_proxied_response_streaming(
 /// content processing based on the `stream_passthrough` flag.
 fn finalize_response(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     url: &str,
-    beresp: Response,
+    beresp: Response<EdgeBody>,
     stream_passthrough: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     if stream_passthrough {
         Ok(finalize_proxied_response_streaming(req, url, beresp))
     } else {
@@ -444,10 +427,10 @@ struct ProxyRequestHeaders<'a> {
 ///   scheme, lacks a host, or the upstream fetch fails
 pub async fn proxy_request(
     settings: &Settings,
-    req: Request,
+    req: Request<EdgeBody>,
     config: ProxyRequestConfig<'_>,
     services: &RuntimeServices,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let ProxyRequestConfig {
         target_url,
         follow_redirects,
@@ -485,9 +468,8 @@ pub async fn proxy_request(
     .await
 }
 
-fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
-    let http_req = compat::from_fastly_request_ref(req);
-    let synthetic_id_param = match get_synthetic_id(&http_req) {
+fn append_synthetic_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
+    let synthetic_id_param = match get_synthetic_id(req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
@@ -557,17 +539,17 @@ fn is_host_allowed(host: &str, pattern: &str) -> bool {
 
 async fn proxy_with_redirects(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url_parsed: url::Url,
     follow_redirects: bool,
     body: Option<&[u8]>,
     request_headers: ProxyRequestHeaders<'_>,
     stream_passthrough: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const MAX_REDIRECTS: usize = 4;
 
     let mut current_url = target_url_parsed.to_string();
-    let mut current_method: Method = req.get_method().clone();
+    let mut current_method: Method = req.method().clone();
 
     for redirect_attempt in 0..=MAX_REDIRECTS {
         let parsed_url = url::Url::parse(&current_url).map_err(|_| {
@@ -624,7 +606,7 @@ async fn proxy_with_redirects(
 
         if request_headers.copy_request_headers {
             for header_name in PROXY_FORWARD_HEADERS {
-                if let Some(v) = req.get_header(&header_name) {
+                if let Some(v) = req.headers().get(&header_name) {
                     builder = builder.header(header_name.as_str(), v.as_bytes());
                 }
             }
@@ -653,13 +635,13 @@ async fn proxy_with_redirects(
                 message: "Failed to proxy".to_string(),
             })?;
 
-        let beresp = platform_response_to_fastly(platform_resp);
+        let beresp = platform_resp.response;
 
         if !follow_redirects {
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
-        let status = beresp.get_status();
+        let status = beresp.status();
         let is_redirect = matches!(
             status,
             StatusCode::MOVED_PERMANENTLY
@@ -674,7 +656,8 @@ async fn proxy_with_redirects(
         }
 
         let Some(location) = beresp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
@@ -757,11 +740,11 @@ async fn proxy_with_redirects(
 pub async fn handle_first_party_proxy(
     settings: &Settings,
     services: &RuntimeServices,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Parse, reconstruct, and validate the signed target URL
     let SignedTarget { target_url, .. } =
-        reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
+        reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
     proxy_request(
         settings,
@@ -794,16 +777,15 @@ pub async fn handle_first_party_proxy(
 pub async fn handle_first_party_click(
     settings: &Settings,
     _services: &RuntimeServices,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let SignedTarget {
         target_url: full_for_token,
         tsurl,
         had_params,
-    } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
+    } = reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
-    let http_req = compat::from_fastly_request_ref(&req);
-    let synthetic_id = match get_synthetic_id(&http_req) {
+    let synthetic_id = match get_synthetic_id(&req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
@@ -847,11 +829,13 @@ pub async fn handle_first_party_click(
 
     // Log click metadata for observability
     let ua = req
-        .get_header(HEADER_USER_AGENT)
+        .headers()
+        .get(HEADER_USER_AGENT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     let referer = req
-        .get_header(HEADER_REFERER)
+        .headers()
+        .get(HEADER_REFERER)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
@@ -865,9 +849,19 @@ pub async fn handle_first_party_click(
     );
 
     // 302 redirect to target URL
-    Ok(Response::from_status(fastly::http::StatusCode::FOUND)
-        .with_header(header::LOCATION, &redirect_target)
-        .with_header(header::CACHE_CONTROL, "no-store, private"))
+    let location = HeaderValue::from_str(&redirect_target).map_err(|_| {
+        Report::new(TrustedServerError::InvalidHeaderValue {
+            message: "invalid redirect target".to_string(),
+        })
+    })?;
+    let mut response = Response::new(EdgeBody::empty());
+    *response.status_mut() = StatusCode::FOUND;
+    response.headers_mut().insert(header::LOCATION, location);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    Ok(response)
 }
 
 /// Sign an arbitrary asset URL so creatives can request first-party proxying at runtime.
@@ -882,20 +876,24 @@ pub async fn handle_first_party_click(
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let method = req.get_method().clone();
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let method = req.method().clone();
+    let req_url = req.uri().to_string();
 
-    let payload = if method == fastly::http::Method::POST {
-        let body = req.take_body_str();
+    let payload = if method == Method::POST {
+        let body = String::from_utf8(req.into_body().into_bytes().to_vec()).change_context(
+            TrustedServerError::InvalidUtf8 {
+                message: "first-party sign request body should be valid UTF-8".to_string(),
+            },
+        )?;
         serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
             message: "invalid JSON".to_string(),
         })?
     } else {
-        let parsed =
-            url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
-            })?;
+        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })?;
         let url = parsed
             .query_pairs()
             .find(|(k, _)| k == "url")
@@ -910,7 +908,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let trimmed = payload.url.trim();
     let abs = if trimmed.starts_with("//") {
-        let default_scheme = url::Url::parse(req.get_url_str())
+        let default_scheme = url::Url::parse(&req_url)
             .ok()
             .map(|u| u.scheme().to_ascii_lowercase())
             .filter(|scheme| !scheme.is_empty())
@@ -953,12 +951,15 @@ pub async fn handle_first_party_proxy_sign(
         base: base.to_string(),
     };
 
-    let mut response = Response::from_status(fastly::http::StatusCode::OK);
-    response.set_header(header::CONTENT_TYPE, "application/json; charset=utf-8");
-    response.set_body(
+    let mut response = Response::new(EdgeBody::from(
         serde_json::to_string(&resp).change_context(TrustedServerError::Proxy {
             message: "failed to serialize".to_string(),
         })?,
+    ));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
     );
     Ok(response)
 }
@@ -990,11 +991,16 @@ struct ProxyRebuildResp {
 pub async fn handle_first_party_proxy_rebuild(
     settings: &Settings,
     _services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let method = req.get_method().clone();
-    let payload = if method == fastly::http::Method::POST {
-        let body = req.take_body_str();
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let method = req.method().clone();
+    let req_url = req.uri().to_string();
+    let payload = if method == Method::POST {
+        let body = String::from_utf8(req.into_body().into_bytes().to_vec()).change_context(
+            TrustedServerError::InvalidUtf8 {
+                message: "first-party rebuild request body should be valid UTF-8".to_string(),
+            },
+        )?;
         serde_json::from_str::<ProxyRebuildReq>(&body).change_context(
             TrustedServerError::Proxy {
                 message: "invalid JSON".to_string(),
@@ -1002,10 +1008,9 @@ pub async fn handle_first_party_proxy_rebuild(
         )?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
-        let parsed =
-            url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
-            })?;
+        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })?;
         let mut tsclick: Option<String> = None;
         let mut add: Option<std::collections::HashMap<String, String>> = None;
         let mut del: Option<Vec<String>> = None;
@@ -1122,11 +1127,21 @@ pub async fn handle_first_party_proxy_rebuild(
         }
     }
 
-    if method == fastly::http::Method::GET {
+    if method == Method::GET {
         // Redirect for GET usage to streamline navigation
-        Ok(Response::from_status(fastly::http::StatusCode::FOUND)
-            .with_header(header::LOCATION, href)
-            .with_header(header::CACHE_CONTROL, "no-store, private"))
+        let location = HeaderValue::from_str(&href).map_err(|_| {
+            Report::new(TrustedServerError::InvalidHeaderValue {
+                message: "invalid rebuild redirect target".to_string(),
+            })
+        })?;
+        let mut response = Response::new(EdgeBody::empty());
+        *response.status_mut() = StatusCode::FOUND;
+        response.headers_mut().insert(header::LOCATION, location);
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+        Ok(response)
     } else {
         let json = serde_json::to_string(&ProxyRebuildResp {
             href,
@@ -1135,10 +1150,17 @@ pub async fn handle_first_party_proxy_rebuild(
             removed,
         })
         .unwrap_or_else(|_| "{}".to_string());
-        Ok(Response::from_status(fastly::http::StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-            .with_header(header::CACHE_CONTROL, "no-store, private")
-            .with_body(json))
+        let mut response = Response::new(EdgeBody::from(json));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+        Ok(response)
     }
 }
 
@@ -1262,34 +1284,84 @@ mod tests {
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
-    use fastly::http::{header, HeaderValue, Method, StatusCode};
-    use fastly::{Request, Response};
+    use http::{
+        header, HeaderValue, Method as HttpMethod, Request as HttpRequest,
+        Response as HttpResponse, StatusCode as HttpStatusCode,
+    };
+
+    fn build_http_request(method: HttpMethod, uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri.as_ref())
+            .body(EdgeBody::empty())
+            .expect("should build http request")
+    }
+
+    fn build_http_post_json_request(
+        uri: impl AsRef<str>,
+        body: &serde_json::Value,
+    ) -> HttpRequest<EdgeBody> {
+        HttpRequest::builder()
+            .method(HttpMethod::POST)
+            .uri(uri.as_ref())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build http post request")
+    }
+
+    fn response_body_string(response: http::Response<EdgeBody>) -> String {
+        String::from_utf8(response.into_body().into_bytes().to_vec())
+            .expect("response body should be valid UTF-8")
+    }
+
+    fn build_http_response(status: HttpStatusCode, body: EdgeBody) -> HttpResponse<EdgeBody> {
+        let mut response = HttpResponse::new(body);
+        *response.status_mut() = status;
+        response
+    }
+
+    fn response_header(
+        response: &HttpResponse<EdgeBody>,
+        name: header::HeaderName,
+    ) -> Option<&str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
 
     #[tokio::test]
     async fn proxy_missing_param_returns_400() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/first-party/proxy");
+        let req = build_http_request(HttpMethod::GET, "https://example.com/first-party/proxy");
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
     async fn proxy_missing_or_invalid_token_returns_400() {
         let settings = create_test_settings();
         // missing tstoken should 400
-        let req = Request::new(
-            Method::GET,
+        let req = build_http_request(
+            HttpMethod::GET,
             "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
         );
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1298,13 +1370,12 @@ mod tests {
         let body = serde_json::json!({
             "url": "https://cdn.example/asset.js?c=3&b=2",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("sign ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), HttpStatusCode::OK);
+        let json = response_body_string(resp);
         assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
         assert!(json.contains("tsexp"), "{}", json);
         assert!(
@@ -1320,13 +1391,15 @@ mod tests {
         let body = serde_json::json!({
             "url": "data:image/png;base64,AAAA",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
         let err: Report<TrustedServerError> =
             handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1335,17 +1408,12 @@ mod tests {
         let body = serde_json::json!({
             "url": "https://cdn.example.com:9443/img/300x250.svg",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("should sign URL with non-standard port");
-        assert_eq!(
-            resp.get_status(),
-            StatusCode::OK,
-            "should return 200 for valid sign request"
-        );
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), HttpStatusCode::OK);
+        let json = response_body_string(resp);
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
             json.contains("%3A9443"),
@@ -1417,7 +1485,10 @@ mod tests {
         let err: Report<TrustedServerError> =
             reconstruct_and_validate_signed_target(&settings, &url)
                 .expect_err("expected expiration failure");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1438,7 +1509,7 @@ mod tests {
                 .expect_err("should reject tampered token");
         assert_eq!(
             err.current_context().status_code(),
-            StatusCode::FORBIDDEN,
+            HttpStatusCode::FORBIDDEN,
             "should return 403 for invalid tstoken"
         );
     }
@@ -1446,12 +1517,15 @@ mod tests {
     #[tokio::test]
     async fn click_missing_params_returns_400() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://edge.example/first-party/click");
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/click");
         let err: Report<TrustedServerError> =
             handle_first_party_click(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1461,8 +1535,8 @@ mod tests {
         let params = "foo=1&bar=2";
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let req = Request::new(
-            Method::GET,
+        let req = build_http_request(
+            HttpMethod::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
                 url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
@@ -1473,9 +1547,10 @@ mod tests {
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.get_status(), StatusCode::FOUND);
+        assert_eq!(resp.status(), HttpStatusCode::FOUND);
         let loc = resp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(http::header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         assert_eq!(loc, full);
@@ -1488,8 +1563,8 @@ mod tests {
         let params = "foo=1";
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let mut req = Request::new(
-            Method::GET,
+        let mut req = build_http_request(
+            HttpMethod::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
                 url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
@@ -1498,14 +1573,18 @@ mod tests {
             ),
         );
         let valid_synthetic_id = crate::test_support::tests::VALID_SYNTHETIC_ID;
-        req.set_header(crate::constants::HEADER_X_SYNTHETIC_ID, valid_synthetic_id);
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_SYNTHETIC_ID,
+            HeaderValue::from_static(valid_synthetic_id),
+        );
 
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
 
         let loc = resp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .expect("Location header should be present and valid");
         let parsed = url::Url::parse(loc).expect("Location should be a valid URL");
@@ -1531,16 +1610,18 @@ mod tests {
             "add": {"y": "2"},
             "del": ["x"],
         });
-        let mut req = Request::new(
-            Method::POST,
-            "https://edge.example/first-party/proxy-rebuild",
-        );
-        req.set_body(serde_json::to_string(&body).expect("test JSON should serialize"));
-        let mut resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+        let req = HttpRequest::builder()
+            .method(HttpMethod::POST)
+            .uri("https://edge.example/first-party/proxy-rebuild")
+            .body(EdgeBody::from(
+                serde_json::to_string(&body).expect("test JSON should serialize"),
+            ))
+            .expect("should build proxy rebuild request");
+        let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
             .await
             .expect("rebuild ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), HttpStatusCode::OK);
+        let json = response_body_string(resp);
         assert!(json.contains("/first-party/click?tsurl="));
         assert!(json.contains("tstoken"));
         // Diagnostics
@@ -1613,12 +1694,18 @@ mod tests {
         let clear = "ftp://cdn.example/file.gif";
         // Build a first-party proxy URL with a token for the unsupported scheme
         let first_party = creative::build_proxy_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = build_http_request(
+            HttpMethod::GET,
+            format!("https://edge.example{}", first_party),
+        );
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1634,12 +1721,15 @@ mod tests {
             url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
             sig
         );
-        let req = Request::new(Method::GET, &url);
+        let req = build_http_request(HttpMethod::GET, &url);
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.current_context().status_code(),
+            HttpStatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]
@@ -1647,15 +1737,15 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/landing.html?x=1";
         let first_party = creative::build_click_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = build_http_request(
+            HttpMethod::GET,
+            format!("https://edge.example{}", first_party),
+        );
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.get_status(), StatusCode::FOUND);
-        let cc = resp
-            .get_header(header::CACHE_CONTROL)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        assert_eq!(resp.status(), HttpStatusCode::FOUND);
+        let cc = response_header(&resp, header::CACHE_CONTROL).unwrap_or("");
         assert!(cc.contains("no-store"));
         assert!(cc.contains("private"));
     }
@@ -1670,38 +1760,40 @@ mod tests {
         let settings = create_test_settings();
         // HTML with an external image that should be proxied in rewrite
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_header(header::CACHE_CONTROL, "public, max-age=60")
-            .with_header(header::SET_COOKIE, "a=1; Path=/; Secure")
-            .with_body(html);
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        beresp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        beresp.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; Secure"),
+        );
         // Sanity: header present and creative rewrite works directly
-        let ct_pre = beresp
-            .get_header(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
+        let ct_pre = response_header(&beresp, header::CONTENT_TYPE)
             .unwrap_or("")
             .to_string();
         assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
         let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
-        let cc = out
-            .get_header(header::CACHE_CONTROL)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let cc = response_header(&out, header::CACHE_CONTROL)
+            .unwrap_or("")
+            .to_string();
         assert_eq!(cc, "public, max-age=60");
-        let cookie = out
-            .get_header(header::SET_COOKIE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let cookie = response_header(&out, header::SET_COOKIE)
+            .unwrap_or("")
+            .to_string();
         assert!(cookie.contains("a=1"));
     }
 
@@ -1709,19 +1801,18 @@ mod tests {
     fn css_response_is_rewritten_and_content_type_set() {
         let settings = create_test_settings();
         let css = "body{background:url(https://cdn.example/bg.png)}";
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/css")
-            .with_body(css);
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(css));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should succeed");
-        let body = out.take_body_str();
-        assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
+        let body = response_body_string(out);
+        assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
     }
 
@@ -1741,12 +1832,14 @@ mod tests {
   </body>
 </html>"#;
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(html);
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(
             &settings,
             &req,
             "https://cdn.example.com:9443/creatives/300x250.html",
@@ -1754,7 +1847,7 @@ mod tests {
         )
         .expect("should finalize HTML response with non-standard port URL");
 
-        let body = out.take_body_str();
+        let body = response_body_string(out);
 
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
@@ -1767,38 +1860,37 @@ mod tests {
     #[test]
     fn image_accept_sets_generic_content_type_when_missing() {
         let settings = create_test_settings();
-        let beresp = Response::from_status(StatusCode::OK).with_body("PNG");
-        let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        req.set_header(HEADER_ACCEPT, "image/*");
+        let beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from("PNG"));
+        let mut req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        req.headers_mut()
+            .insert(HEADER_ACCEPT, HeaderValue::from_static("image/*"));
         let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
             .expect("finalize should succeed");
         // Since CT was missing and Accept indicates image, it should set generic image/*
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
-            .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+        let ct = response_header(&out, header::CONTENT_TYPE)
+            .expect("Content-Type header should be present");
         assert_eq!(ct, "image/*");
     }
 
     #[test]
     fn non_image_non_html_passthrough() {
         let settings = create_test_settings();
-        let beresp = Response::from_status(StatusCode::ACCEPTED)
-            .with_header(header::CONTENT_TYPE, "application/json")
-            .with_body("{\"ok\":true}");
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp)
+        let mut beresp =
+            build_http_response(HttpStatusCode::ACCEPTED, EdgeBody::from("{\"ok\":true}"));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://api.example/ok", beresp)
             .expect("finalize should succeed");
         // Should not rewrite, preserve status and content-type
-        assert_eq!(out.get_status(), StatusCode::ACCEPTED);
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        assert_eq!(out.status(), HttpStatusCode::ACCEPTED);
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "application/json");
-        let body = out.take_body_str();
+        let body = response_body_string(out);
         assert_eq!(body, "{\"ok\":true}");
     }
 
@@ -1819,28 +1911,28 @@ mod tests {
             .expect("gzip write should succeed");
         let compressed = encoder.finish().expect("gzip finish should succeed");
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_header(header::CONTENT_ENCODING, "gzip")
-            .with_body(compressed);
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(compressed));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should process and succeed");
 
         // Content-Encoding should be preserved (gzip in -> gzip out)
-        let ce = out
-            .get_header(header::CONTENT_ENCODING)
+        let ce = response_header(&out, header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
-            .to_str()
-            .expect("Content-Encoding should be valid UTF-8");
+            .to_string();
         assert_eq!(ce, "gzip");
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -1876,28 +1968,27 @@ mod tests {
                 .expect("brotli write should succeed");
         }
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/css")
-            .with_header(header::CONTENT_ENCODING, "br")
-            .with_body(compressed);
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(compressed));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should process brotli and succeed");
 
         // Content-Encoding should be preserved (br in -> br out)
-        let ce = out
-            .get_header(header::CONTENT_ENCODING)
+        let ce = response_header(&out, header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
-            .to_str()
-            .expect("Content-Encoding should be valid UTF-8");
+            .to_string();
         assert_eq!(ce, "br");
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -1920,28 +2011,28 @@ mod tests {
         let settings = create_test_settings();
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(html);
+        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
 
         // No Content-Encoding since input was uncompressed
         assert!(
-            out.get_header(header::CONTENT_ENCODING).is_none(),
+            response_header(&out, header::CONTENT_ENCODING).is_none(),
             "Content-Encoding should not be set for uncompressed input"
         );
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
 
-        let body = out.take_body_str();
+        let body = response_body_string(out);
         assert!(
             body.contains("/first-party/proxy?tsurl="),
             "HTML should be rewritten: {}",
@@ -1962,7 +2053,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/");
+        let req = build_http_request(HttpMethod::GET, "https://example.com/");
 
         let result = proxy_request(
             &settings,
@@ -2226,14 +2317,14 @@ mod tests {
             urlencoding::encode(target),
             token,
         );
-        let req = Request::new(Method::GET, url);
+        let req = build_http_request(HttpMethod::GET, url);
         let services = crate::platform::test_support::noop_services();
         let err = handle_first_party_proxy(&settings, &services, req)
             .await
             .expect_err("should block initial target not in allowlist");
         assert_eq!(
             err.current_context().status_code(),
-            StatusCode::FORBIDDEN,
+            HttpStatusCode::FORBIDDEN,
             "should return 403 for allowlist violation"
         );
         assert!(

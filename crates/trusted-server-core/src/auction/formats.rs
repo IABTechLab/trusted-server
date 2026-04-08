@@ -4,16 +4,15 @@
 //! - Parsing incoming tsjs/Prebid.js format requests
 //! - Converting internal auction results to `OpenRTB` 2.x responses
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{ensure, Report, ResultExt};
-use fastly::http::{header, StatusCode};
-use fastly::{Request, Response};
+use http::{header, HeaderValue, Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
-use crate::compat;
 use crate::consent::ConsentContext;
 use crate::creative;
 use crate::error::TrustedServerError;
@@ -84,14 +83,13 @@ pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
     services: &RuntimeServices,
-    req: &Request,
+    req: &Request<EdgeBody>,
     consent: ConsentContext,
     synthetic_id: &str,
     geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let synthetic_id = synthetic_id.to_owned();
-    let http_req = compat::from_fastly_request_ref(req);
-    let fresh_id = generate_synthetic_id(settings, services, &http_req).change_context(
+    let fresh_id = generate_synthetic_id(settings, services, req).change_context(
         TrustedServerError::Auction {
             message: "Failed to generate fresh ID".to_string(),
         },
@@ -140,8 +138,10 @@ pub fn convert_tsjs_to_auction_request(
     // Build device info with user-agent (always) and geo (if available)
     let device = Some(DeviceInfo {
         user_agent: req
-            .get_header_str("user-agent")
-            .map(std::string::ToString::to_string),
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
         ip: services.client_info.client_ip.map(|ip| ip.to_string()),
         geo,
     });
@@ -214,7 +214,7 @@ pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,
     auction_request: &AuctionRequest,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
 
@@ -314,10 +314,175 @@ pub fn convert_to_openrtb_response(
             message: "Failed to serialize auction response".to_string(),
         })?;
 
-    Ok(Response::from_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, "application/json")
-        .with_header("X-Synthetic-ID", &auction_request.user.id)
-        .with_header("X-Synthetic-Fresh", &auction_request.user.fresh_id)
-        .with_header("X-Synthetic-Trusted-Server", &auction_request.user.id)
-        .with_body(body_bytes))
+    let mut response = Response::new(EdgeBody::from(body_bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    insert_response_header(
+        response.headers_mut(),
+        "X-Synthetic-ID",
+        auction_request.user.id.as_str(),
+    )?;
+    insert_response_header(
+        response.headers_mut(),
+        "X-Synthetic-Fresh",
+        auction_request.user.fresh_id.as_str(),
+    )?;
+    insert_response_header(
+        response.headers_mut(),
+        "X-Synthetic-Trusted-Server",
+        auction_request.user.id.as_str(),
+    )?;
+
+    Ok(response)
+}
+
+fn insert_response_header(
+    headers: &mut http::HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    let header_value =
+        HeaderValue::from_str(value).change_context(TrustedServerError::InvalidHeaderValue {
+            message: format!("Invalid response header value for {name}"),
+        })?;
+    headers.insert(name, header_value);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auction::{AuctionResponse, Bid};
+    use crate::consent::ConsentContext;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{header, Method, Request as HttpRequest, StatusCode};
+
+    fn sample_ad_request() -> AdRequest {
+        AdRequest {
+            ad_units: vec![AdUnit {
+                code: "slot-1".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250]],
+                    }),
+                }),
+                bids: Some(vec![BidConfig {
+                    bidder: "prebid".to_string(),
+                    params: serde_json::json!({"placementId": "abc"}),
+                }]),
+            }],
+            config: None,
+        }
+    }
+
+    fn sample_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "auction-123".to_string(),
+            slots: vec![AdSlot {
+                id: "slot-1".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "publisher.example".to_string(),
+                page_url: Some("https://publisher.example/page".to_string()),
+            },
+            user: UserInfo {
+                id: VALID_SYNTHETIC_ID.to_string(),
+                fresh_id: "fresh-123".to_string(),
+                consent: Some(ConsentContext::default()),
+            },
+            device: None,
+            site: Some(SiteInfo {
+                domain: "publisher.example".to_string(),
+                page: "https://publisher.example/page".to_string(),
+            }),
+            context: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_accepts_http_request() {
+        let settings = create_test_settings();
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example/auction")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let auction_request = convert_tsjs_to_auction_request(
+            &sample_ad_request(),
+            &settings,
+            &noop_services(),
+            &req,
+            ConsentContext::default(),
+            VALID_SYNTHETIC_ID,
+            None,
+        )
+        .expect("should convert auction request");
+
+        assert_eq!(auction_request.slots.len(), 1, "should create one slot");
+        assert_eq!(
+            auction_request.slots[0].id, "slot-1",
+            "should preserve slot code"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_returns_http_response_with_synthetic_headers() {
+        let settings = create_test_settings();
+        let bid = Bid {
+            slot_id: "slot-1".to_string(),
+            price: Some(1.25),
+            currency: "USD".to_string(),
+            creative: Some("<div>creative</div>".to_string()),
+            adomain: Some(vec!["advertiser.example".to_string()]),
+            bidder: "prebid".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            metadata: HashMap::new(),
+        };
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success("prebid", vec![bid.clone()], 12)],
+            mediator_response: None,
+            winning_bids: HashMap::from([(String::from("slot-1"), bid)]),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &sample_auction_request())
+            .expect("should convert to openrtb response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return 200 OK");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "should return json content type"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Synthetic-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some(VALID_SYNTHETIC_ID),
+            "should include synthetic id header"
+        );
+    }
 }
