@@ -262,9 +262,7 @@ impl SourcepointIntegration {
     fn is_javascript_response(response: &Response) -> bool {
         response
             .get_header_str(header::CONTENT_TYPE)
-            .is_some_and(|ct| {
-                ct.contains("javascript") || ct.contains("ecmascript")
-            })
+            .is_some_and(|ct| ct.contains("javascript") || ct.contains("ecmascript"))
     }
 }
 
@@ -366,6 +364,13 @@ impl IntegrationProxy for SourcepointIntegration {
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
         self.copy_headers(&req, &mut proxy_req);
+
+        // Request uncompressed content for CDN routes so we can safely read
+        // and rewrite the JavaScript body.  Geo routes don't need rewriting,
+        // so they keep the client's original Accept-Encoding for efficiency.
+        if backend == SourcepointBackend::Cdn && self.config.rewrite_sdk {
+            proxy_req.set_header(header::ACCEPT_ENCODING, "identity");
+        }
 
         if matches!(
             req.get_method(),
