@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method};
+use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
+use regex::Regex;
 use serde::Deserialize;
 use url::Url;
 use validator::Validate;
@@ -21,6 +22,41 @@ const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
 const SOURCEPOINT_GEO_HOST: &str = "geo.privacymanager.io";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
 const SOURCEPOINT_GEO_PREFIX: &str = "/integrations/sourcepoint/geo";
+
+/// Matches quoted references to `cdn.privacy-mgmt.com` URLs in script content.
+///
+/// Pattern breakdown:
+/// - `(['"])` — opening quote
+/// - `(https?:)?` — optional protocol
+/// - `(//)?` — optional protocol-relative slashes
+/// - `cdn\.privacy-mgmt\.com` — literal CDN hostname
+/// - `(/[^'"]*)?` — optional path (everything until closing quote)
+/// - `(['"])` — closing quote
+///
+/// Handles all common URL styles:
+/// - `"https://cdn.privacy-mgmt.com/consent/tcfv2"`
+/// - `"//cdn.privacy-mgmt.com/mms/v2"`
+/// - `"cdn.privacy-mgmt.com"` (bare domain)
+static SP_CDN_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(['"])(https?:)?(//)?cdn\.privacy-mgmt\.com(/[^'"]*)?(['"])"#)
+        .expect("Sourcepoint CDN URL regex should compile")
+});
+
+/// Matches the webpack chunk loading pattern where the script resolves its
+/// own origin from `document.currentScript` and appends `/unified/…`.
+///
+/// The Sourcepoint wrapper builds its public path as:
+/// ```js
+/// t.origin + "/unified/4.40.1/"
+/// ```
+/// We rewrite this so chunks load through the first-party prefix:
+/// ```js
+/// t.origin + "/integrations/sourcepoint/cdn/unified/4.40.1/"
+/// ```
+static SP_ORIGIN_UNIFIED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\.origin\s*\+\s*"/unified/"#)
+        .expect("Sourcepoint origin+unified regex should compile")
+});
 
 /// Configuration for the Sourcepoint first-party proxy.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -184,6 +220,52 @@ impl SourcepointIntegration {
             );
         }
     }
+
+    /// Rewrite Sourcepoint CDN URLs inside JavaScript response bodies so that
+    /// dynamically loaded chunks and API calls route through the first-party
+    /// proxy instead of hitting `cdn.privacy-mgmt.com` directly.
+    ///
+    /// Two patterns are rewritten:
+    ///
+    /// 1. **Quoted CDN URL references** — e.g. `"https://cdn.privacy-mgmt.com"`
+    ///    becomes `"/integrations/sourcepoint/cdn"`, turning absolute third-party
+    ///    URLs into root-relative first-party paths.
+    ///
+    /// 2. **Webpack `origin + "/unified/"` chunk loader** — the Sourcepoint
+    ///    wrapper resolves `document.currentScript.src` and appends
+    ///    `"/unified/…"`. We insert the CDN prefix so chunks load from
+    ///    `/integrations/sourcepoint/cdn/unified/…`.
+    fn rewrite_script_content(content: &str) -> String {
+        // Step 1: rewrite quoted cdn.privacy-mgmt.com URLs to root-relative paths.
+        let after_cdn = SP_CDN_URL_PATTERN
+            .replace_all(content, |caps: &regex::Captures| {
+                let open_quote = &caps[1];
+                let path = caps.get(4).map_or("", |m| m.as_str());
+                let close_quote = &caps[5];
+                format!(
+                    "{}{}{}{close_quote}",
+                    open_quote, SOURCEPOINT_CDN_PREFIX, path
+                )
+            })
+            .into_owned();
+
+        // Step 2: rewrite origin+"/unified/" to origin+"/integrations/sourcepoint/cdn/unified/".
+        SP_ORIGIN_UNIFIED_PATTERN
+            .replace_all(
+                &after_cdn,
+                &format!(r#".origin+"{SOURCEPOINT_CDN_PREFIX}/unified/"#),
+            )
+            .into_owned()
+    }
+
+    /// Returns `true` when the response `Content-Type` looks like JavaScript.
+    fn is_javascript_response(response: &Response) -> bool {
+        response
+            .get_header_str(header::CONTENT_TYPE)
+            .is_some_and(|ct| {
+                ct.contains("javascript") || ct.contains("ecmascript")
+            })
+    }
 }
 
 fn normalize_target_path(target_path: &str) -> &str {
@@ -298,6 +380,31 @@ impl IntegrationProxy for SourcepointIntegration {
         let mut response = proxy_req
             .send(&backend_name)
             .change_context(Self::error("Sourcepoint upstream request failed"))?;
+
+        // Rewrite CDN URLs inside JavaScript responses so that dynamically
+        // loaded chunks and API calls route through the first-party proxy.
+        if backend == SourcepointBackend::Cdn
+            && response.get_status() == StatusCode::OK
+            && self.config.rewrite_sdk
+            && Self::is_javascript_response(&response)
+        {
+            let body = response.take_body_str();
+            let rewritten = Self::rewrite_script_content(&body);
+
+            let mut new_response = Response::new();
+            new_response.set_status(StatusCode::OK);
+            new_response.set_header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            );
+            new_response.set_header(
+                header::CACHE_CONTROL,
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
+            );
+            new_response.set_body(rewritten);
+            return Ok(new_response);
+        }
+
         self.apply_cache_headers(backend, &mut response);
         Ok(response)
     }
@@ -431,6 +538,77 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_quoted_cdn_urls_to_root_relative_paths() {
+        let input = r#"var fallback="https://cdn.privacy-mgmt.com";var api="https://cdn.privacy-mgmt.com/consent/tcfv2";"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            r#"var fallback="/integrations/sourcepoint/cdn";var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#
+        );
+    }
+
+    #[test]
+    fn rewrites_protocol_relative_cdn_urls() {
+        let input = r#"url="//cdn.privacy-mgmt.com/mms/v2/get_site_data""#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert!(
+            output.contains("\"/integrations/sourcepoint/cdn/mms/v2/get_site_data\""),
+            "Should rewrite protocol-relative CDN URL. Got: {output}",
+        );
+    }
+
+    #[test]
+    fn rewrites_origin_plus_unified_chunk_pattern() {
+        let input = r#"return t.origin+"/unified/4.40.1/"}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            r#"return t.origin+"/integrations/sourcepoint/cdn/unified/4.40.1/"}"#
+        );
+    }
+
+    #[test]
+    fn rewrites_both_patterns_in_realistic_snippet() {
+        // Mirrors the real Sourcepoint webpack public path resolution:
+        //   try { ... return t.origin+"/unified/4.40.1/" }
+        //   catch(e) {} return e+"/unified/4.40.1/"
+        // where e defaults to "https://cdn.privacy-mgmt.com"
+        let input = concat!(
+            r#"var e="https://cdn.privacy-mgmt.com";"#,
+            r#"try{var t=document.createElement("a");"#,
+            r#"t.href=document.currentScript.src;"#,
+            r#"return t.origin+"/unified/4.40.1/"}"#,
+            r#"catch(n){}return e+"/unified/4.40.1/""#,
+        );
+
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert!(
+            output.contains(r#"var e="/integrations/sourcepoint/cdn";"#),
+            "Fallback CDN default should be rewritten. Got: {output}",
+        );
+        assert!(
+            output.contains(r#"t.origin+"/integrations/sourcepoint/cdn/unified/4.40.1/"}"#),
+            "Origin chunk path should be prefixed. Got: {output}",
+        );
+        assert!(
+            output.contains(r#"e+"/unified/4.40.1/""#),
+            "Fallback concatenation should keep /unified/ since e is already rewritten. Got: {output}",
+        );
+    }
+
+    #[test]
+    fn preserves_non_sourcepoint_urls() {
+        let input = r#"var cdn="https://example.com/script.js";var x=t.origin+"/assets/app.js""#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(output, input, "Non-Sourcepoint URLs should be untouched");
+    }
+
+    #[test]
     fn registers_sourcepoint_routes() {
         let mut settings = create_test_settings();
         settings
@@ -447,7 +625,7 @@ mod tests {
             "should register CDN proxy route"
         );
         assert!(
-            registry.has_route(&Method::GET, "/integrations/sourcepoint/geo/"),
+            registry.has_route(&Method::GET, "/integrations/sourcepoint/geo"),
             "should register geo proxy route"
         );
     }
