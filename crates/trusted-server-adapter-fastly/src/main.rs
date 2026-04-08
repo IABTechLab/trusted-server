@@ -14,6 +14,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -29,7 +30,12 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod error;
+mod platform;
+#[cfg(test)]
+mod route_tests;
+
 use crate::error::to_error_response;
+use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
 /// Entry point for the Fastly Compute program.
 ///
@@ -81,12 +87,20 @@ fn main() {
         }
     };
 
+    // Start with an unavailable KV slot. Consent-dependent routes lazily
+    // replace it with the configured store at dispatch time so unrelated
+    // routes stay available when consent persistence is misconfigured.
+    let kv_store = std::sync::Arc::new(UnavailableKvStore)
+        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
+    let runtime_services = build_runtime_services(&req, kv_store);
+
     // route_request may send the response directly (streaming path) or
     // return it for us to send (buffered path).
     if let Some(response) = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
+        &runtime_services,
         req,
     )) {
         response.send_to_client();
@@ -97,6 +111,7 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
+    runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Option<Response> {
     // Strip client-spoofable forwarded headers at the edge.
@@ -104,8 +119,15 @@ async fn route_request(
     // clients are untrusted and can hijack URL rewriting (see #409).
     sanitize_forwarded_headers(&mut req);
 
-    // Extract geo info before auth check or routing consumes the request
-    let geo_info = GeoInfo::from_request(&req);
+    // Look up geo info via the platform abstraction using the client IP
+    // already captured in RuntimeServices at the entry point.
+    let geo_info = runtime_services
+        .geo()
+        .lookup(runtime_services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
@@ -137,7 +159,7 @@ async fn route_request(
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
-            handle_trusted_server_discovery(settings, req)
+            handle_trusted_server_discovery(settings, runtime_services, req)
         }
 
         // Signature verification endpoint
@@ -149,7 +171,14 @@ async fn route_request(
         (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
 
         // Unified auction endpoint (returns creative HTML inline)
-        (Method::POST, "/auction") => handle_auction(settings, orchestrator, req).await,
+        (Method::POST, "/auction") => {
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(auction_services) => {
+                    handle_auction(settings, orchestrator, &auction_services, req).await
+                }
+                Err(e) => Err(e),
+            }
+        }
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
@@ -176,37 +205,47 @@ async fn route_request(
                 path
             );
 
-            match handle_publisher_request(settings, integration_registry, req) {
-                Ok(PublisherResponse::Stream {
-                    mut response,
-                    body,
-                    params,
-                }) => {
-                    // Streaming path: finalize headers, then stream body to client.
-                    finalize_response(settings, geo_info.as_ref(), &mut response);
-                    let mut streaming_body = response.stream_to_client();
-                    if let Err(e) = stream_publisher_body(
-                        body,
-                        &mut streaming_body,
-                        &params,
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(publisher_services) => {
+                    match handle_publisher_request(
                         settings,
                         integration_registry,
+                        &publisher_services,
+                        req,
                     ) {
-                        // Headers already committed. Log and abort — client
-                        // sees a truncated response. Standard proxy behavior.
-                        log::error!("Streaming processing failed: {e:?}");
-                        drop(streaming_body);
-                    } else if let Err(e) = streaming_body.finish() {
-                        log::error!("Failed to finish streaming body: {e}");
+                        Ok(PublisherResponse::Stream {
+                            mut response,
+                            body,
+                            params,
+                        }) => {
+                            // Streaming path: finalize headers, then stream body to client.
+                            finalize_response(settings, geo_info.as_ref(), &mut response);
+                            let mut streaming_body = response.stream_to_client();
+                            if let Err(e) = stream_publisher_body(
+                                body,
+                                &mut streaming_body,
+                                &params,
+                                settings,
+                                integration_registry,
+                            ) {
+                                // Headers already committed. Log and abort — client
+                                // sees a truncated response. Standard proxy behavior.
+                                log::error!("Streaming processing failed: {e:?}");
+                                drop(streaming_body);
+                            } else if let Err(e) = streaming_body.finish() {
+                                log::error!("Failed to finish streaming body: {e}");
+                            }
+                            // Response already sent via stream_to_client()
+                            return None;
+                        }
+                        Ok(PublisherResponse::Buffered(response)) => Ok(response),
+                        Err(e) => {
+                            log::error!("Failed to proxy to publisher origin: {:?}", e);
+                            Err(e)
+                        }
                     }
-                    // Response already sent via stream_to_client()
-                    return None;
                 }
-                Ok(PublisherResponse::Buffered(response)) => Ok(response),
-                Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    Err(e)
-                }
+                Err(e) => Err(e),
             }
         }
     };
@@ -217,6 +256,24 @@ async fn route_request(
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
     Some(response)
+}
+
+fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

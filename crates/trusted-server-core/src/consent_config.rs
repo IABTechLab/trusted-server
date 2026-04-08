@@ -75,7 +75,7 @@ pub struct ConsentConfig {
 
     /// Name of the KV Store used for consent persistence.
     ///
-    /// When set, consent data is persisted per Synthetic ID so that
+    /// When set, consent data is persisted per Edge Cookie (EC) ID so that
     /// returning users without consent cookies can still have their
     /// consent preferences applied. Set to `None` to disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

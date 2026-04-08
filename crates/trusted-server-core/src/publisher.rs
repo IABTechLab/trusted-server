@@ -5,18 +5,18 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
-use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipelineInput};
-use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthetic_cookie};
+use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
+use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
+use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
+use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
+use crate::platform::RuntimeServices;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
-use crate::synthetic::{get_or_generate_synthetic_id, is_valid_synthetic_id};
-
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
 fn restrict_accept_encoding(req: &mut Request) {
@@ -266,7 +266,7 @@ pub enum PublisherResponse {
     /// 3. Call `stream_publisher_body()` with the body and streaming writer
     /// 4. Call `StreamingBody::finish()`
     Stream {
-        /// Response with all headers set (synthetic ID, cookies, etc.)
+        /// Response with all headers set (EC ID, cookies, etc.)
         /// but body not yet written. `Content-Length` already removed.
         response: Response,
         /// Origin body to be piped through the streaming pipeline.
@@ -333,6 +333,7 @@ pub fn stream_publisher_body<W: Write>(
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -350,37 +351,43 @@ pub fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
-    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
+    // Parse cookies once for reuse by both consent extraction and EC ID logic.
     let cookie_jar = handle_request_cookies(&req)?;
 
-    // Capture the current SSC cookie value for revocation handling.
-    // This must come from the cookie itself (not the x-synthetic-id header)
+    // Capture the current EC cookie value for revocation handling.
+    // This must come from the cookie itself (not the x-ts-ec header)
     // to ensure KV deletion targets the same identifier being revoked.
-    let existing_ssc_cookie = cookie_jar
+    let existing_ec_cookie = cookie_jar
         .as_ref()
-        .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
+        .and_then(|jar| jar.get(COOKIE_TS_EC))
         .map(|cookie| cookie.value().to_owned());
 
-    // Generate synthetic identifiers before the request body is consumed.
+    // Generate EC identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let synthetic_id = get_or_generate_synthetic_id(settings, &req)?;
+    let ec_id = get_or_generate_ec_id(settings, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
     // (for OpenRTB forwarding) and decoded data (for enforcement).
     // When a consent_store is configured, this also persists consent to KV
     // and falls back to stored consent when cookies are absent.
+    #[allow(deprecated)]
     let geo = crate::geo::GeoInfo::from_request(&req);
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
         req: &req,
         config: &settings.consent,
         geo: geo.as_ref(),
-        synthetic_id: Some(synthetic_id.as_str()),
+        ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
     });
-    let ssc_allowed = allows_ssc_creation(&consent_context);
-    log::debug!("Proxy ssc_allowed: {}", ssc_allowed);
+    let ec_allowed = allows_ec_creation(&consent_context);
+    log::debug!("Proxy ec_allowed: {}", ec_allowed);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -408,14 +415,15 @@ pub fn handle_publisher_request(
         log::debug!("  {}: {:?}", name, value);
     }
 
-    // Set synthetic ID / cookie headers BEFORE body processing.
+    // Set EC ID / cookie headers BEFORE body processing.
     // These are body-independent (computed from request cookies + consent).
-    apply_synthetic_id_headers(
+    apply_ec_headers(
         settings,
+        services,
         &mut response,
-        &synthetic_id,
-        ssc_allowed,
-        existing_ssc_cookie.as_deref(),
+        &ec_id,
+        ec_allowed,
+        existing_ec_cookie.as_deref(),
         &consent_context,
     );
 
@@ -522,47 +530,44 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
-/// Apply synthetic ID and cookie headers to the response.
+/// Apply EC ID and cookie headers to the response.
 ///
 /// Extracted so headers can be set before streaming begins (headers must
 /// be finalized before `stream_to_client()` commits them).
-fn apply_synthetic_id_headers(
+///
+/// Consent-gated EC creation:
+/// - Consent given → set EC ID header + cookie.
+/// - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
+/// - Consent absent + no cookie → do nothing.
+fn apply_ec_headers(
     settings: &Settings,
+    services: &RuntimeServices,
     response: &mut Response,
-    synthetic_id: &str,
-    ssc_allowed: bool,
-    existing_ssc_cookie: Option<&str>,
+    ec_id: &str,
+    ec_allowed: bool,
+    existing_ec_cookie: Option<&str>,
     consent_context: &crate::consent::ConsentContext,
 ) {
-    if ssc_allowed {
-        // Fastly's HeaderValue API rejects \r, \n, and \0, so the synthetic ID
+    if ec_allowed {
+        // Fastly's HeaderValue API rejects \r, \n, and \0, so the EC ID
         // cannot inject additional response headers.
-        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id);
-        // Cookie persistence is skipped if the synthetic ID contains RFC 6265-illegal
+        response.set_header(HEADER_X_TS_EC, ec_id);
+        // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        set_synthetic_cookie(settings, response, synthetic_id);
-    } else if let Some(cookie_synthetic_id) = existing_ssc_cookie {
-        // Always expire the cookie — consent is withdrawn regardless of whether the
-        // stored value is well-formed.
-        expire_synthetic_cookie(settings, response);
-        if is_valid_synthetic_id(cookie_synthetic_id) {
-            log::info!(
-                "SSC revoked: consent withdrawn (jurisdiction={})",
-                consent_context.jurisdiction,
-            );
-            if let Some(store_name) = &settings.consent.consent_store {
-                crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
-            }
-        } else {
-            log::warn!(
-                "SSC cookie has invalid format, skipping KV deletion (len={}, jurisdiction={})",
-                cookie_synthetic_id.len(),
-                consent_context.jurisdiction,
-            );
+        set_ec_cookie(settings, response, ec_id);
+    } else if let Some(cookie_ec_id) = existing_ec_cookie {
+        log::info!(
+            "EC revoked for '{}': consent withdrawn (jurisdiction={})",
+            cookie_ec_id,
+            consent_context.jurisdiction,
+        );
+        expire_ec_cookie(settings, response);
+        if settings.consent.consent_store.is_some() {
+            crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
     } else {
         log::debug!(
-            "SSC skipped: no consent and no existing cookie (jurisdiction={})",
+            "EC skipped: no consent and no existing cookie (jurisdiction={})",
             consent_context.jurisdiction,
         );
     }
@@ -572,7 +577,7 @@ fn apply_synthetic_id_headers(
 mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
-    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
+    use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
 
     #[test]
@@ -780,34 +785,28 @@ mod tests {
     }
 
     #[test]
-    fn revocation_targets_cookie_synthetic_id_not_header() {
+    fn revocation_targets_cookie_ec_id_not_header() {
         let settings = create_test_settings();
-        let cookie_synthetic_id =
-            "b2a1c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0b1a2.Zx98y7";
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header(HEADER_X_SYNTHETIC_ID, VALID_SYNTHETIC_ID);
-        req.set_header(
-            header::COOKIE,
-            format!("synthetic_id={cookie_synthetic_id}; other=value"),
-        );
+        req.set_header("x-ts-ec", "header_id");
+        req.set_header("cookie", "ts-ec=cookie_id; other=value");
 
         let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
-        let existing_ssc_cookie = cookie_jar
+        let existing_ec_cookie = cookie_jar
             .as_ref()
-            .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
+            .and_then(|jar| jar.get(COOKIE_TS_EC))
             .map(|cookie| cookie.value().to_owned());
 
-        let resolved_synthetic_id =
-            get_or_generate_synthetic_id(&settings, &req).expect("should resolve synthetic id");
+        let resolved_ec_id = get_or_generate_ec_id(&settings, &req).expect("should resolve EC ID");
 
         assert_eq!(
-            existing_ssc_cookie.as_deref(),
-            Some(cookie_synthetic_id),
+            existing_ec_cookie.as_deref(),
+            Some("cookie_id"),
             "should read revocation target from cookie value"
         );
         assert_eq!(
-            resolved_synthetic_id, VALID_SYNTHETIC_ID,
-            "should still resolve request synthetic ID from header precedence"
+            resolved_ec_id, "header_id",
+            "should still resolve request EC ID from header precedence"
         );
     }
 

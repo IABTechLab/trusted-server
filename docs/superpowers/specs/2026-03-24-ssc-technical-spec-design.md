@@ -39,11 +39,11 @@ EC is the full replacement for SyntheticID. The PRD explicitly states backward c
 
 **Prerequisites (must be merged before this epic begins):**
 
-- **SyntheticID removal** — [PR #479](https://github.com/IABTechLab/trusted-server/pull/479) removes SyntheticID from all active code paths: `get_or_generate_synthetic_id()`, `COOKIE_SYNTHETIC_ID`, `X-Synthetic-*` headers, `synthetic.rs` module, `settings.synthetic` config, and all SyntheticID generation/cookie code from `publisher.rs`, `endpoints.rs`, and `registry.rs`. It also renames `ConsentPipelineInput.synthetic_id` to `identity_key`, updates consent KV helper parameters/docs, and handles consent-store key migration (old SyntheticID keys orphaned, TTL expiry cleans them up). **This PR must be merged before implementation of this spec begins.** The spec assumes a codebase where SyntheticID no longer exists. Verify before starting:
+- **SyntheticID → Edge Cookie rename** — [PR #479](https://github.com/IABTechLab/trusted-server/pull/479) renames SyntheticID to Edge Cookie (EC) across all code paths: `synthetic.rs` → `edge_cookie.rs`, `COOKIE_SYNTHETIC_ID` → `COOKIE_EC_ID`, `X-Synthetic-*` → `X-ts-ec`/`X-ts-ec-fresh` headers, `settings.synthetic` → `settings.edge_cookie`, and simplifies EC generation to IP-only HMAC-SHA256 (removing Handlebars templating). It also renames `ConsentPipelineInput.synthetic_id` to `ec_id`, updates consent KV helper parameters/docs, and handles consent-store key migration (old SyntheticID keys orphaned, TTL expiry cleans them up). **This PR must be merged before implementation of this spec begins.** The spec assumes a codebase where SyntheticID no longer exists. Verify before starting:
   - `grep -r 'synthetic_id' crates/` returns no hits outside test fixtures
   - `grep -r 'X-Synthetic' crates/` returns no hits
   - `trusted-server.toml` has no `[synthetic]` section
-  - `ConsentPipelineInput` uses `identity_key`, not `synthetic_id`
+  - `ConsentPipelineInput` uses `ec_id`, not `synthetic_id`
 - **Consent implementation** — The consent pipeline (`build_consent_context()`, `ConsentContext`, `allows_ec_creation()`, TCF/GPP/US-Privacy decoding) is implemented and available as a stable interface before this epic. PR `#380` merged to `main`. EC calls `allows_ec_creation()` directly — no new gating functions are introduced. Note: EC changes the _phase order_ relative to the old SyntheticID flow — consent is evaluated before EC generation, so first-visit consent KV persistence is deferred to the second request (see §6.1.1 for full analysis).
 
 **Deferred from this spec (not in scope):**
@@ -257,7 +257,7 @@ impl EcContext {
     /// `GeoInfo::from_request()` in the current `main.rs`.
     ///
     /// Calls `build_consent_context()` with the EC hash (when present) passed
-    /// via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id`
+    /// via `ConsentPipelineInput.ec_id` (renamed from `synthetic_id`
     /// in PR #479).
     ///
     /// When an EC hash is available (returning user), this enables the consent
@@ -452,7 +452,7 @@ the consent module; EC only consumes that existing decision.
 
 **Consent pipeline integration:**
 
-`EcContext::read_from_request()` calls `build_consent_context()` with the EC hash as the identity key, passed via `ConsentPipelineInput.identity_key` (renamed from `synthetic_id` in PR #479). The consent pipeline's KV persistence and fallback behavior works with EC hashes:
+`EcContext::read_from_request()` calls `build_consent_context()` with the EC hash as the identity key, passed via `ConsentPipelineInput.ec_id` (renamed from `synthetic_id` in PR #479). The consent pipeline's KV persistence and fallback behavior works with EC hashes:
 
 - **Returning user** (EC cookie present → `ec_hash` is `Some`): consent KV fallback read is available when consent cookies are absent; consent KV write persists cookie-sourced consent for future requests. Note: `build_consent_context()` calls `try_kv_write()` internally, so phase 1 writes to the **consent** KV store (not the EC identity store).
 - **First visit** (no EC cookie → `ec_hash` is `None`): no consent KV interaction. Consent is evaluated purely from request cookies/headers. The gap: consent is not persisted to consent KV on the first request. This is accepted — in regulated jurisdictions (GDPR, US state), consent cookies/headers must be present for `allows_ec_creation()` to return `true`, so there is always a signal to persist on the next request. In non-regulated jurisdictions, `allows_ec_creation()` returns `true` without consent signals, so there is nothing to persist anyway. Consent KV persistence begins on the second request when the EC cookie is present.
