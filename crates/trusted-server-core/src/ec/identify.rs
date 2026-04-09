@@ -7,7 +7,7 @@ use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use url::Url;
 
-use crate::consent::allows_ec_creation;
+use super::consent::ec_consent_granted;
 use crate::constants::{
     HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
 };
@@ -17,6 +17,7 @@ use crate::settings::Settings;
 
 use super::eids::{build_eids_header, resolve_partner_ids, to_eids};
 use super::kv::KvIdentityGraph;
+use super::log_id;
 use super::partner::PartnerStore;
 use super::EcContext;
 
@@ -39,7 +40,7 @@ pub fn handle_identify(
         return Ok(Response::from_status(StatusCode::FORBIDDEN));
     }
 
-    if !allows_ec_creation(ec_context.consent()) {
+    if !ec_consent_granted(ec_context.consent()) {
         let mut response = json_response(
             StatusCode::FORBIDDEN,
             &serde_json::json!({ "consent": "denied" }),
@@ -81,14 +82,20 @@ pub fn handle_identify(
                     cluster_size = size;
                 }
                 Err(err) => {
-                    log::warn!("Cluster evaluation failed for '{ec_id}': {err:?}");
+                    log::warn!(
+                        "Cluster evaluation failed for '{}…': {err:?}",
+                        log_id(ec_id)
+                    );
                     // Non-fatal — cluster_size stays None, response is still useful.
                 }
             }
         }
         Ok(None) => {}
         Err(err) => {
-            log::warn!("Identify KV read failed for EC ID '{ec_id}': {err:?}");
+            log::warn!(
+                "Identify KV read failed for EC ID '{}…': {err:?}",
+                log_id(ec_id)
+            );
             degraded = true;
         }
     }

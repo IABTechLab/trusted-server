@@ -90,20 +90,28 @@ impl DeviceSignals {
     }
 }
 
+/// Device is a desktop (confirmed via UA platform token).
+pub const MOBILE_DESKTOP: u8 = 0;
+/// Device is a mobile (confirmed via UA mobile token).
+pub const MOBILE_MOBILE: u8 = 1;
+/// Device type is genuinely unknown (typically bots or hardened clients).
+pub const MOBILE_UNKNOWN: u8 = 2;
+
 /// Derives mobile signal from the User-Agent string.
 ///
-/// Returns `0` for confirmed desktop, `1` for confirmed mobile,
-/// `2` for genuinely unknown (typically bots or hardened clients).
+/// Returns [`MOBILE_DESKTOP`] for confirmed desktop,
+/// [`MOBILE_MOBILE`] for confirmed mobile,
+/// [`MOBILE_UNKNOWN`] for genuinely unknown (typically bots or hardened clients).
 #[must_use]
 pub fn parse_is_mobile(ua: &str) -> u8 {
     // Mobile patterns checked first — more specific.
     if ua.contains("iPhone") || ua.contains("iPad") || ua.contains("Android") {
-        return 1;
+        return MOBILE_MOBILE;
     }
     if ua.contains("Macintosh") || ua.contains("Windows") || ua.contains("Linux") {
-        return 0;
+        return MOBILE_DESKTOP;
     }
-    2
+    MOBILE_UNKNOWN
 }
 
 /// Parses coarse OS family from the User-Agent string.

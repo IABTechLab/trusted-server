@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cookies_to_jar_emtpy() {
+    fn test_parse_cookies_to_jar_empty() {
         let cookie_str = "";
         let jar = parse_cookies_to_jar(cookie_str);
 

@@ -58,14 +58,7 @@ pub enum UpsertResult {
     Stale,
 }
 
-/// Truncates an EC ID for safe inclusion in log messages.
-///
-/// Returns the first 8 characters followed by `…` to aid debugging without
-/// writing the full user identifier to logs (satisfies the `CodeQL`
-/// "cleartext logging of sensitive information" rule).
-fn log_id(ec_id: &str) -> &str {
-    ec_id.get(..8).unwrap_or(ec_id)
-}
+use super::log_id;
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
@@ -74,6 +67,7 @@ fn log_id(ec_id: &str) -> &str {
 ///
 /// Methods use optimistic concurrency (generation markers) for safe
 /// read-modify-write operations on concurrent requests.
+#[derive(Debug)]
 pub struct KvIdentityGraph {
     store_name: String,
 }
@@ -314,8 +308,9 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
+                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
                         attempt + 1,
+                        log_id(ec_id),
                     );
                     // Re-read to get fresh generation.
                     match self.get(ec_id)? {
@@ -394,7 +389,8 @@ impl KvIdentityGraph {
                     }
                     // Key appeared between get() and create — re-read on next iteration.
                     log::debug!(
-                        "upsert_partner_id: minimal create raced for '{ec_id}', retrying (attempt {}/{})",
+                        "upsert_partner_id: minimal create raced for '{}…', retrying (attempt {}/{})",
+                        log_id(ec_id),
                         attempt + 1,
                         MAX_CAS_RETRIES,
                     );
@@ -406,7 +402,8 @@ impl KvIdentityGraph {
             // repopulate partner IDs after consent withdrawal.
             if !entry.consent.ok {
                 log::info!(
-                    "upsert_partner_id: entry for '{ec_id}' is a tombstone, rejecting upsert"
+                    "upsert_partner_id: entry for '{}…' is a tombstone, rejecting upsert",
+                    log_id(ec_id),
                 );
                 return Err(Report::new(TrustedServerError::KvStore {
                     store_name: self.store_name.clone(),
@@ -437,8 +434,9 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
+                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
                         attempt + 1,
+                        log_id(ec_id),
                     );
                     // Loop will re-read on next iteration.
                 }
@@ -522,8 +520,9 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(UpsertResult::Written),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{ec_id}'",
+                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
                         attempt + 1,
+                        log_id(ec_id),
                     );
                 }
                 Err(err) => {
@@ -595,7 +594,8 @@ impl KvIdentityGraph {
         // Guard against stale/out-of-order timestamps.
         if timestamp <= entry.last_seen {
             log::trace!(
-                "update_last_seen: stale timestamp for '{ec_id}' (stored={}, incoming={timestamp})",
+                "update_last_seen: stale timestamp for '{}…' (stored={}, incoming={timestamp})",
+                log_id(ec_id),
                 entry.last_seen,
             );
             return Ok(());
@@ -604,7 +604,8 @@ impl KvIdentityGraph {
         // Debounce: skip if the stored value is recent enough.
         if timestamp - entry.last_seen < LAST_SEEN_DEBOUNCE_SECS {
             log::trace!(
-                "update_last_seen: debounced for '{ec_id}' (delta={}s)",
+                "update_last_seen: debounced for '{}…' (delta={}s)",
+                log_id(ec_id),
                 timestamp - entry.last_seen,
             );
             return Ok(());
@@ -660,16 +661,30 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
         let (body, meta_str) = Self::serialize_entry(&entry, &self.store_name)?;
 
-        store
+        match store
             .build_insert()
             .if_generation_match(generation)
             .metadata(&meta_str)
             .time_to_live(ENTRY_TTL)
             .execute(ec_id, body)
-            .change_context(TrustedServerError::KvStore {
-                store_name: self.store_name.clone(),
-                message: format!("Failed to update last_seen for key '{ec_id}'"),
-            })
+        {
+            Ok(()) => Ok(()),
+            // CAS conflict means another request updated more recently —
+            // the debounce condition is satisfied by their write.
+            Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
+                log::debug!(
+                    "update_last_seen: CAS conflict for '{}…', another write won",
+                    log_id(ec_id),
+                );
+                Ok(())
+            }
+            Err(err) => Err(
+                Report::new(err).change_context(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!("Failed to update last_seen for key '{}…'", log_id(ec_id)),
+                }),
+            ),
+        }
     }
 
     /// Writes a withdrawal tombstone for consent enforcement.
@@ -810,8 +825,9 @@ impl KvIdentityGraph {
             Ok(()) => {}
             Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                 log::debug!(
-                    "evaluate_cluster: CAS conflict writing cluster_size for '{ec_id}', \
-                     returning computed value anyway"
+                    "evaluate_cluster: CAS conflict writing cluster_size for '{}…', \
+                     returning computed value anyway",
+                    log_id(ec_id),
                 );
             }
             Err(err) => {

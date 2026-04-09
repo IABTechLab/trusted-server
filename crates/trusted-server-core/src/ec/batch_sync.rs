@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
 
-use super::generation::is_valid_ec_id;
+use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
 use super::kv::{KvIdentityGraph, UpsertResult};
+use super::log_id;
 use super::partner::{hash_api_key, PartnerRecord, PartnerStore};
 use super::sync_pixel::RateLimiter;
 
@@ -27,8 +28,7 @@ const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
 
-/// Maximum allowed length (in bytes) for a partner UID.
-const MAX_UID_LENGTH: usize = 512;
+use super::kv_types::MAX_UID_LENGTH;
 
 trait BatchSyncWriter {
     fn upsert_partner_id_if_exists(
@@ -159,8 +159,16 @@ fn handle_batch_sync_with_writer(
         ));
     }
 
-    // 3. Parse body
-    let body: BatchSyncRequest = serde_json::from_slice(&req.take_body_bytes()).map_err(|e| {
+    // 3. Parse body (with size limit to prevent OOM before validation)
+    const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+    let body_bytes = req.take_body_bytes();
+    if body_bytes.len() > MAX_BODY_SIZE {
+        return Ok(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+        ));
+    }
+    let body: BatchSyncRequest = serde_json::from_slice(&body_bytes).map_err(|e| {
         Report::new(TrustedServerError::BadRequest {
             message: format!("Invalid request body: {e}"),
         })
@@ -238,8 +246,8 @@ fn process_mappings(
             }
             Err(err) => {
                 log::warn!(
-                    "Batch sync KV write failed for index {idx} (ec_id '{}'): {err:?}",
-                    mapping.ec_id
+                    "Batch sync KV write failed for index {idx} (ec_id '{}…'): {err:?}",
+                    log_id(&mapping.ec_id),
                 );
                 errors.push(MappingError {
                     index: idx,
@@ -258,19 +266,6 @@ fn process_mappings(
     }
 
     (accepted, errors)
-}
-
-/// Normalizes an EC ID for use as a KV key by lowercasing the hash prefix.
-///
-/// `hex::encode` (used in `generate_ec_id`) always produces lowercase hex,
-/// so internal EC IDs are already lowercase. This normalization is a
-/// defense-in-depth measure for EC IDs submitted by external partners
-/// (via batch sync) that may use uppercase hex.
-fn normalize_ec_id_for_kv(ec_id: &str) -> String {
-    let mut parts = ec_id.splitn(2, '.');
-    let hash = parts.next().unwrap_or_default();
-    let suffix = parts.next().unwrap_or_default();
-    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
 }
 
 fn json_response<T: serde::Serialize>(

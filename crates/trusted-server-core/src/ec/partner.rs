@@ -154,7 +154,13 @@ pub fn validate_pull_sync_config(record: &PartnerRecord) -> Result<(), String> {
         );
     }
 
-    if record.ts_pull_token.as_deref().unwrap_or("").is_empty() {
+    if record
+        .ts_pull_token
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         return Err(
             "pull_sync_url and ts_pull_token are required when pull_sync_enabled is true"
                 .to_owned(),
@@ -440,6 +446,22 @@ impl PartnerStore {
         let index_key = format!("{APIKEY_INDEX_PREFIX}{}", record.api_key_hash);
         let previous_index_partner_id = self.read_index_partner_id(&store, &index_key)?;
 
+        // Guard against API key hash collision: reject if the index already
+        // points to a *different* partner. This prevents silently reassigning
+        // another partner's auth mapping.
+        if let Some(ref existing_id) = previous_index_partner_id {
+            if existing_id != &record.id {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!(
+                        "API key hash already assigned to partner '{existing_id}', \
+                         cannot assign to '{}'",
+                        record.id
+                    ),
+                }));
+            }
+        }
+
         // 1. Write new API key index.
         store
             .build_insert()
@@ -549,7 +571,10 @@ impl PartnerStore {
         let mut ids: Vec<String> = match store.lookup(PULL_ENABLED_INDEX_KEY) {
             Ok(mut resp) => {
                 let bytes = resp.take_body_bytes();
-                serde_json::from_slice(&bytes).unwrap_or_default()
+                serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                    log::warn!("Failed to deserialize pull-enabled index, starting fresh: {err}");
+                    Vec::new()
+                })
             }
             Err(_) => Vec::new(),
         };

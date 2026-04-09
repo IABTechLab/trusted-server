@@ -61,13 +61,13 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
         return None;
     }
 
-    let ec_id = ec_context.ec_value()?;
-    if !is_valid_ec_id(ec_id) {
+    let ec_id_ref = ec_context.ec_value()?;
+    if !is_valid_ec_id(ec_id_ref) {
         log::debug!("Pull sync: skipping dispatch because active EC ID is invalid format");
         return None;
     }
 
-    let ec_id = ec_context.ec_value()?.to_owned();
+    let ec_id = ec_id_ref.to_owned();
     let client_ip = ec_context.client_ip()?.to_owned();
     Some(PullSyncContext { ec_id, client_ip })
 }
@@ -334,9 +334,7 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
         }
     };
 
-    // Must match MAX_UID_LENGTH in sync_pixel.rs / batch_sync.rs so that
-    // partners see a consistent limit regardless of sync mechanism.
-    const MAX_UID_LENGTH: usize = 512;
+    use super::kv_types::MAX_UID_LENGTH;
 
     let uid = payload.uid.filter(|value| !value.is_empty());
     match uid {
