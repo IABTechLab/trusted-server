@@ -220,7 +220,6 @@ impl DerefMut for IntegrationSettings {
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
-#[allow(unused)]
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
@@ -284,14 +283,21 @@ impl Ec {
             .any(|p| p.eq_ignore_ascii_case(passphrase))
     }
 
-    /// Validates that the passphrase is not empty.
+    /// Minimum passphrase length for HMAC key strength.
+    const MIN_PASSPHRASE_LENGTH: usize = 8;
+
+    /// Validates that the passphrase is not empty and meets minimum length.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the passphrase is empty.
+    /// Returns a validation error if the passphrase is empty or shorter
+    /// than [`Self::MIN_PASSPHRASE_LENGTH`] characters.
     pub fn validate_passphrase(passphrase: &Redacted<String>) -> Result<(), ValidationError> {
         if passphrase.expose().is_empty() {
             return Err(ValidationError::new("empty_passphrase"));
+        }
+        if passphrase.expose().len() < Self::MIN_PASSPHRASE_LENGTH {
+            return Err(ValidationError::new("short_passphrase"));
         }
         Ok(())
     }
@@ -485,7 +491,6 @@ pub struct Settings {
     pub proxy: Proxy,
 }
 
-#[allow(unused)]
 impl Settings {
     /// Creates a new [`Settings`] instance from a pre-built TOML string.
     ///

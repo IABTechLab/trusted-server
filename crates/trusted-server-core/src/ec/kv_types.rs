@@ -20,6 +20,11 @@ pub const SCHEMA_VERSION: u8 = 1;
 /// When the cap is reached, new domains are silently dropped.
 pub const MAX_SEEN_DOMAINS: usize = 50;
 
+/// Maximum allowed length (in bytes) for a partner UID across all sync
+/// mechanisms (pixel, batch, pull). Defined centrally to ensure consistent
+/// validation.
+pub const MAX_UID_LENGTH: usize = 512;
+
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).

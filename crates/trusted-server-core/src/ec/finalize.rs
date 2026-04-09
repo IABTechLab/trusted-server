@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use fastly::Response;
 
-use crate::consent::allows_ec_creation;
+use super::consent::ec_consent_granted;
 use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
@@ -15,6 +15,7 @@ use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::current_timestamp;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
+use super::log_id;
 use super::EcContext;
 
 /// TS-managed response headers tied to EC identity output.
@@ -35,20 +36,29 @@ pub fn ec_finalize_response(
     kv: Option<&KvIdentityGraph>,
     response: &mut Response,
 ) {
-    let consent_allows_ec = allows_ec_creation(ec_context.consent());
+    let consent_allows_ec = ec_consent_granted(ec_context.consent());
 
     // Withdrawal path: no consent + cookie was present.
     if !consent_allows_ec && ec_context.cookie_was_present() {
         clear_ec_on_response(settings, response);
 
+        // Compute once — used for both consent store cleanup and tombstoning.
+        let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+
         if let Some(store_name) = settings.consent.consent_store.as_deref() {
             if let Ok(store) = fastly::kv_store::KVStore::open(store_name) {
                 if let Some(store) = store {
-                    for ec_id in withdrawal_ec_ids(ec_context) {
-                        if let Err(err) = store.delete(&ec_id) {
-                            log::warn!("Failed to delete consent KV entry for '{ec_id}': {err:?}");
+                    for ec_id in &ids_to_withdraw {
+                        if let Err(err) = store.delete(ec_id) {
+                            log::warn!(
+                                "Failed to delete consent KV entry for '{}…': {err:?}",
+                                log_id(ec_id)
+                            );
                         } else {
-                            log::info!("Deleted consent KV entry for '{ec_id}' (consent revoked)");
+                            log::info!(
+                                "Deleted consent KV entry for '{}…' (consent revoked)",
+                                log_id(ec_id)
+                            );
                         }
                     }
                 }
@@ -58,11 +68,11 @@ pub fn ec_finalize_response(
         }
 
         if let Some(graph) = kv {
-            for ec_id in withdrawal_ec_ids(ec_context) {
-                if let Err(err) = graph.write_withdrawal_tombstone(&ec_id) {
+            for ec_id in &ids_to_withdraw {
+                if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
                     log::error!(
-                        "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
-                        ec_id,
+                        "Failed to write withdrawal tombstone for EC ID '{}…': {err:?}",
+                        log_id(ec_id),
                     );
                 }
             }
@@ -77,7 +87,10 @@ pub fn ec_finalize_response(
             if let Err(err) =
                 graph.update_last_seen(ec_id, current_timestamp(), &settings.publisher.domain)
             {
-                log::error!("Failed to update last_seen for EC ID '{}': {err:?}", ec_id,);
+                log::error!(
+                    "Failed to update last_seen for EC ID '{}…': {err:?}",
+                    log_id(ec_id)
+                );
             }
         }
 
@@ -228,7 +241,7 @@ mod tests {
     #[test]
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
-        let ec_id = sample_ec_id("ABC123");
+        let ec_id = sample_ec_id("aBc123");
         let ec_context = make_context(
             Some(&ec_id),
             Some(&ec_id),
@@ -264,8 +277,8 @@ mod tests {
     #[test]
     fn finalize_returning_user_with_cookie_mismatch_rewrites_cookie_and_header() {
         let settings = create_test_settings();
-        let active_ec = sample_ec_id("ACTIVE1");
-        let cookie_ec = sample_ec_id("COOKIE1");
+        let active_ec = sample_ec_id("activ1");
+        let cookie_ec = sample_ec_id("cook1e");
         let ec_context = make_context(
             Some(&active_ec),
             Some(&cookie_ec),
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn finalize_returning_user_refreshes_cookie_and_header_when_matching() {
         let settings = create_test_settings();
-        let ec_id = sample_ec_id("MATCH01");
+        let ec_id = sample_ec_id("mtch01");
         let ec_context = make_context(
             Some(&ec_id),
             Some(&ec_id),
@@ -331,7 +344,7 @@ mod tests {
     #[test]
     fn finalize_generated_ec_sets_cookie_and_header() {
         let settings = create_test_settings();
-        let generated_ec = sample_ec_id("GEN123");
+        let generated_ec = sample_ec_id("gen123");
         let ec_context = make_context(
             Some(&generated_ec),
             None,
