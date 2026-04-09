@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_placeholder_secret_key() {
+    fn rejects_placeholder_passphrase() {
         let toml = toml_with_secrets("secret-key", "real-proxy-secret");
         let settings = Settings::from_toml(&toml).expect("should parse TOML");
         let err = settings

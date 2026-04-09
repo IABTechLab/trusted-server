@@ -42,6 +42,16 @@ pub mod partner;
 pub mod pull_sync;
 pub mod sync_pixel;
 
+/// Truncates an EC ID for safe inclusion in log messages.
+///
+/// Returns the first 8 characters followed by `…` to aid debugging without
+/// writing the full user identifier to logs (satisfies the `CodeQL`
+/// "cleartext logging of sensitive information" rule).
+#[must_use]
+pub fn log_id(ec_id: &str) -> &str {
+    ec_id.get(..8).unwrap_or(ec_id)
+}
+
 use cookie::CookieJar;
 use error_stack::Report;
 use fastly::Request;
@@ -277,7 +287,7 @@ impl EcContext {
         })?;
 
         let ec_id = generation::generate_ec_id(settings, client_ip)?;
-        log::trace!("Generated new EC ID: {ec_id}");
+        log::trace!("Generated new EC ID: {}…", log_id(&ec_id));
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
 

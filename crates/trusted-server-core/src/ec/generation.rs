@@ -69,6 +69,10 @@ fn generate_random_suffix(length: usize) -> String {
 /// the client IP address, then appends a random suffix for additional
 /// uniqueness. The resulting format is `{64hex}.{6alnum}`.
 ///
+/// **Important:** `client_ip` must be pre-normalized via [`extract_client_ip`].
+/// Raw IPv6 addresses produce different hashes than their normalized /64
+/// form, which would create duplicate identity graph entries.
+///
 /// # Errors
 ///
 /// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
@@ -76,8 +80,6 @@ pub fn generate_ec_id(
     settings: &Settings,
     client_ip: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    log::trace!("Input for fresh EC ID: client_ip={client_ip}");
-
     let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
         .change_context(TrustedServerError::EdgeCookie {
             message: "Failed to create HMAC instance".to_string(),
@@ -89,7 +91,7 @@ pub fn generate_ec_id(
     let random_suffix = generate_random_suffix(6);
     let ec_id = format!("{hmac_hash}.{random_suffix}");
 
-    log::trace!("Generated fresh EC ID: {ec_id}");
+    log::trace!("Generated fresh EC ID: {}…", super::log_id(&ec_id));
 
     Ok(ec_id)
 }
@@ -125,6 +127,20 @@ pub fn ec_hash(ec_id: &str) -> &str {
     }
 }
 
+/// Normalizes an EC ID for use as a KV key by lowercasing the hash prefix.
+///
+/// `hex::encode` (used in [`generate_ec_id`]) always produces lowercase hex,
+/// so internal EC IDs are already lowercase. This normalization is a
+/// defense-in-depth measure for EC IDs submitted by external partners
+/// (via batch sync) that may use uppercase hex.
+#[must_use]
+pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
+    let mut parts = ec_id.splitn(2, '.');
+    let hash = parts.next().unwrap_or_default();
+    let suffix = parts.next().unwrap_or_default();
+    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
+}
+
 /// Checks whether a string is a valid 64-character hex EC hash prefix.
 ///
 /// Used by batch sync, finalize, and other modules that handle the
@@ -139,8 +155,9 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// Checks whether a string matches the expected EC ID format.
 ///
 /// The format is `{64hex}.{6alnum}` where the first part is a 64-character
-/// lowercase hex string and the second part is a 6-character alphanumeric
-/// string.
+/// **lowercase** hex string and the second part is a 6-character alphanumeric
+/// string. Only lowercase hex is accepted; callers must normalize before
+/// validation to prevent duplicate KV keys from case-variant EC IDs.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
     let mut parts = value.split('.');
@@ -158,7 +175,9 @@ pub fn is_valid_ec_id(value: &str) -> bool {
 
     hmac_part.len() == 64
         && suffix_part.len() == 6
-        && hmac_part.bytes().all(|b| b.is_ascii_hexdigit())
+        && hmac_part
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && suffix_part.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
