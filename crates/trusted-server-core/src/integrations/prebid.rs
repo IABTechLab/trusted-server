@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode, Url};
-use fastly::{Request, Response};
+use http::header::HeaderValue as HttpHeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use validator::Validate;
@@ -15,8 +16,8 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::backend::BackendConfig;
-use crate::compat;
 use crate::consent_config::ConsentForwardingMode;
+use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -29,7 +30,9 @@ use crate::openrtb::{
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{
+    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
+};
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -229,16 +232,22 @@ impl PrebidIntegration {
         false
     }
 
-    fn handle_script_handler(&self) -> Result<Response, Report<TrustedServerError>> {
+    fn handle_script_handler(
+        &self,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
 
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
-            .with_header(header::CACHE_CONTROL, "public, max-age=31536000")
-            .with_body(body))
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .body(EdgeBody::from(body))
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to build Prebid script handler response".to_string(),
+            })
     }
 }
 
@@ -316,15 +325,20 @@ impl IntegrationProxy for PrebidIntegration {
         &self,
         _settings: &Settings,
         _services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path().to_string();
-        let method = req.get_method().clone();
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
 
         match method {
             // Serve empty JS for matching script patterns
             Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
-            _ => Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found")),
+            _ => http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(EdgeBody::from("Not Found"))
+                .change_context(TrustedServerError::Prebid {
+                    message: "Failed to build Prebid not found response".to_string(),
+                }),
         }
     }
 }
@@ -426,8 +440,8 @@ fn expand_trusted_server_bidders(
 /// stripped from the `Cookie` header since consent travels exclusively
 /// through the `OpenRTB` body.
 fn copy_request_headers(
-    from: &Request,
-    to: &mut Request,
+    from: &http::Request<EdgeBody>,
+    to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
 ) {
     let headers_to_copy = [
@@ -438,12 +452,37 @@ fn copy_request_headers(
     ];
 
     for header_name in &headers_to_copy {
-        if let Some(value) = from.get_header(header_name) {
-            to.set_header(header_name, value);
+        if let Some(value) = from.headers().get(header_name) {
+            to.headers_mut().insert(header_name, value.clone());
         }
     }
 
-    compat::forward_fastly_cookie_header(from, to, consent_forwarding.strips_consent_cookies());
+    let Some(cookie_value) = from.headers().get(header::COOKIE) else {
+        return;
+    };
+
+    if !consent_forwarding.strips_consent_cookies() {
+        to.headers_mut()
+            .insert(header::COOKIE, cookie_value.clone());
+        return;
+    }
+
+    match cookie_value.to_str() {
+        Ok(value) => {
+            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
+            if stripped.is_empty() {
+                return;
+            }
+
+            if let Ok(cookie_header) = HttpHeaderValue::from_str(&stripped) {
+                to.headers_mut().insert(header::COOKIE, cookie_header);
+            }
+        }
+        Err(_) => {
+            to.headers_mut()
+                .insert(header::COOKIE, cookie_value.clone());
+        }
+    }
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -627,17 +666,24 @@ impl PrebidAuctionProvider {
         });
 
         // Extract DNT header and Accept-Language from the original request
-        let dnt = context.request.get_header_str("DNT").and_then(|v| {
-            if v.trim() == "1" {
-                Some(true)
-            } else {
-                None
-            }
-        });
+        let dnt = context
+            .request
+            .headers()
+            .get("DNT")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                if value.trim() == "1" {
+                    Some(true)
+                } else {
+                    None
+                }
+            });
 
         let language = context
             .request
-            .get_header_str(header::ACCEPT_LANGUAGE)
+            .headers()
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok())
             .and_then(|v| {
                 // Extract the primary ISO-639 language tag (e.g., "en" from
                 // "en-US,en;q=0.9"). Strip the region subtag so bidders get a
@@ -710,8 +756,7 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let http_req = compat::from_fastly_request_ref(context.request);
-        let request_info = RequestInfo::from_request(&http_req, context.client_info);
+        let request_info = RequestInfo::from_request(context.request, context.client_info);
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (
@@ -744,7 +789,9 @@ impl PrebidAuctionProvider {
         // Extract Referer header for site.ref
         let referer = context
             .request
-            .get_header_str(header::REFERER)
+            .headers()
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
             .map(std::string::ToString::to_string);
 
         let tmax = to_openrtb_i32(self.config.timeout_ms, "tmax", "request");
@@ -992,16 +1039,17 @@ impl PrebidAuctionProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl AuctionProvider for PrebidAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "prebid"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // Create signer and compute signature if request signing is enabled
@@ -1009,8 +1057,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             &context.settings.request_signing
         {
             if request_signing_config.enabled {
-                let http_req = compat::from_fastly_request_ref(context.request);
-                let request_info = RequestInfo::from_request(&http_req, context.client_info);
+                let request_info = RequestInfo::from_request(context.request, context.client_info);
                 let signer = RequestSigner::from_services(context.services)?;
                 let params =
                     SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
@@ -1057,21 +1104,27 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         // Create HTTP request
-        let mut pbs_req = Request::new(
-            Method::POST,
-            format!("{}/openrtb2/auction", self.config.server_url),
-        );
+        let mut pbs_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("{}/openrtb2/auction", self.config.server_url))
+            .body(EdgeBody::empty())
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to build Prebid request".to_string(),
+            })?;
         copy_request_headers(
             context.request,
             &mut pbs_req,
             self.config.consent_forwarding,
         );
 
-        pbs_req
-            .set_body_json(&openrtb)
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to set request body".to_string(),
-            })?;
+        let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
+            message: "Failed to serialize Prebid request body".to_string(),
+        })?;
+        pbs_req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HttpHeaderValue::from_static("application/json"),
+        );
+        *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
         // Send request asynchronously with auction-scoped timeout
         let backend_name = BackendConfig::from_url_with_first_byte_timeout(
@@ -1079,29 +1132,31 @@ impl AuctionProvider for PrebidAuctionProvider {
             true,
             Duration::from_millis(u64::from(context.timeout_ms)),
         )?;
-        let pending =
-            pbs_req
-                .send_async(backend_name)
-                .change_context(TrustedServerError::Prebid {
-                    message: "Failed to send async request to Prebid Server".to_string(),
-                })?;
+        let pending = context
+            .services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(pbs_req, backend_name))
+            .await
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to send async request to Prebid Server".to_string(),
+            })?;
 
         Ok(pending)
     }
 
     fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // Parse response
-        let body_bytes = response.take_body_bytes();
+        let response = response.response;
+        let status = response.status();
 
-        if !response.get_status().is_success() {
-            log::warn!(
-                "Prebid returned non-success status: {}",
-                response.get_status(),
-            );
+        // Parse response
+        let body_bytes = response.into_body().into_bytes();
+
+        if !status.is_success() {
+            log::warn!("Prebid returned non-success status: {}", status,);
             if log::log_enabled!(log::Level::Trace) {
                 let body_preview = String::from_utf8_lossy(&body_bytes);
                 log::trace!(
@@ -1213,6 +1268,8 @@ pub fn register_auction_provider(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -1223,11 +1280,11 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
-    use fastly::http::Method;
-    use fastly::Request;
+    use http::Method;
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -1282,9 +1339,56 @@ mod tests {
         }
     }
 
+    fn build_test_request() -> http::Request<EdgeBody> {
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://pub.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[test]
+    fn prebid_provider_uses_platform_http_client_for_bid_request() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = make_settings();
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &http_req,
+            client_info: services.client_info(),
+            timeout_ms: 500,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let pending =
+            futures::executor::block_on(provider.request_bids(&auction_request, &context))
+                .expect("should start request");
+
+        assert!(
+            pending.backend_name().is_some(),
+            "should preserve backend correlation"
+        );
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "should launch one upstream request through PlatformHttpClient"
+        );
+    }
+
     fn create_test_auction_context<'a>(
         settings: &'a Settings,
-        request: &'a Request,
+        request: &'a http::Request<EdgeBody>,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
         use crate::platform::test_support::noop_services;
@@ -1535,19 +1639,24 @@ server_url = "https://prebid.example"
             .handle_script_handler()
             .expect("should return response");
 
-        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let content_type = response
-            .get_header_str(header::CONTENT_TYPE)
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
             .expect("should have content-type");
         assert_eq!(content_type, "application/javascript; charset=utf-8");
 
         let cache_control = response
-            .get_header_str(header::CACHE_CONTROL)
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
             .expect("should have cache-control");
         assert!(cache_control.contains("max-age=31536000"));
 
-        let body = response.into_body_str();
+        let body = String::from_utf8(response.into_body().into_bytes().to_vec())
+            .expect("should parse script body as utf-8");
         assert!(body.contains("// Script overridden by Trusted Server"));
     }
 
@@ -1709,7 +1818,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1764,7 +1873,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1801,7 +1910,7 @@ server_url = "https://prebid.example"
             geo: None,
         });
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1836,7 +1945,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1894,7 +2003,7 @@ server_url = "https://prebid.example"
         auction_request.slots[0].floor_price = Some(1.5);
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1922,7 +2031,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request(); // floor_price is None
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1949,7 +2058,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -1996,7 +2105,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2049,7 +2158,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2090,7 +2199,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2121,7 +2230,7 @@ server_url = "https://prebid.example"
         // No device/geo
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2147,7 +2256,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request(); // consent=None, no geo
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2176,7 +2285,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2399,8 +2508,10 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("DNT", "1");
+        let mut request = build_test_request();
+        request
+            .headers_mut()
+            .insert("DNT", http::header::HeaderValue::from_static("1"));
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2428,8 +2539,11 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Accept-Language", "en-US,en;q=0.9,fr;q=0.8");
+        let mut request = build_test_request();
+        request.headers_mut().insert(
+            "Accept-Language",
+            http::header::HeaderValue::from_static("en-US,en;q=0.9,fr;q=0.8"),
+        );
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2461,8 +2575,11 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Accept-Language", "");
+        let mut request = build_test_request();
+        request.headers_mut().insert(
+            "Accept-Language",
+            http::header::HeaderValue::from_static(""),
+        );
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2501,7 +2618,7 @@ server_url = "https://prebid.example"
         }];
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2539,7 +2656,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2575,7 +2692,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2608,7 +2725,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2638,7 +2755,7 @@ server_url = "https://prebid.example"
         });
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2671,8 +2788,11 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
-        let mut request = Request::get("https://pub.example/auction");
-        request.set_header("Referer", "https://google.com/search?q=test");
+        let mut request = build_test_request();
+        request.headers_mut().insert(
+            "Referer",
+            http::header::HeaderValue::from_static("https://google.com/search?q=test"),
+        );
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2699,7 +2819,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
-        let request = Request::get("https://pub.example/auction");
+        let request = build_test_request();
         let context = create_test_auction_context(
             &settings,
             &request,
@@ -2860,7 +2980,11 @@ server_url = "https://prebid.example"
         use crate::platform::test_support::noop_services;
         let provider = PrebidAuctionProvider::new(config);
         let settings = make_settings();
-        let fastly_req = Request::new(Method::POST, "https://example.com/auction");
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/auction")
+            .body(EdgeBody::empty())
+            .expect("should build request");
         let client_info = crate::platform::ClientInfo {
             client_ip: None,
             tls_protocol: None,
@@ -2869,7 +2993,7 @@ server_url = "https://prebid.example"
         let services = noop_services();
         let context = AuctionContext {
             settings: &settings,
-            request: &fastly_req,
+            request: &http_req,
             client_info: &client_info,
             timeout_ms: 1000,
             provider_responses: None,

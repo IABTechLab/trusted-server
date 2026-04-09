@@ -4,9 +4,10 @@
 //! This integration acts as a mediator in the auction flow, selecting winning bids
 //! based on price (highest price wins).
 
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::Method;
-use fastly::Request;
+use http::{header, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
@@ -21,6 +22,7 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
 // ============================================================================
@@ -269,16 +271,17 @@ impl AdServerMockProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl AuctionProvider for AdServerMockProvider {
     fn provider_name(&self) -> &'static str {
         "adserver_mock"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         // Get bidder responses from context (passed by orchestrator for mediation)
         let bidder_responses = context.provider_responses.unwrap_or(&[]);
 
@@ -301,7 +304,18 @@ impl AuctionProvider for AdServerMockProvider {
         let endpoint_url = self.build_endpoint_url(request);
 
         // Create HTTP POST request
-        let mut req = Request::new(Method::POST, &endpoint_url);
+        let mediation_body =
+            serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize mediation request".to_string(),
+            })?;
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(&endpoint_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(mediation_body))
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to build mediation request".to_string(),
+            })?;
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
         if let Ok(url) = url::Url::parse(&self.config.endpoint) {
@@ -311,14 +325,13 @@ impl AuctionProvider for AdServerMockProvider {
                 } else {
                     host.to_string()
                 };
-                req.set_header("Host", &host_with_port);
+                req.headers_mut().insert(
+                    header::HOST,
+                    header::HeaderValue::from_str(&host_with_port)
+                        .expect("should build host header"),
+                );
             }
         }
-
-        req.set_body_json(&mediation_req)
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to set mediation request body".to_string(),
-            })?;
 
         // Send async with auction-scoped timeout
         let backend_name = BackendConfig::from_url_with_first_byte_timeout(
@@ -333,8 +346,11 @@ impl AuctionProvider for AdServerMockProvider {
             ),
         })?;
 
-        let pending = req
-            .send_async(backend_name)
+        let pending = context
+            .services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(req, backend_name))
+            .await
             .change_context(TrustedServerError::Auction {
                 message: "Failed to send mediation request".to_string(),
             })?;
@@ -344,18 +360,17 @@ impl AuctionProvider for AdServerMockProvider {
 
     fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        if !response.get_status().is_success() {
-            log::warn!(
-                "AdServer Mock returned non-success: {}",
-                response.get_status()
-            );
+        let response = response.response;
+
+        if !response.status().is_success() {
+            log::warn!("AdServer Mock returned non-success: {}", response.status());
             return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
         }
 
-        let body_bytes = response.take_body_bytes();
+        let body_bytes = response.into_body().into_bytes();
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse mediation response".to_string(),

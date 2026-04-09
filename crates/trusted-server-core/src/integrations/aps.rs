@@ -2,9 +2,10 @@
 //!
 //! This module provides the APS auction provider for server-side bidding.
 
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::Method;
-use fastly::Request;
+use http::{header, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::IntegrationConfig;
 
 // ============================================================================
@@ -468,16 +470,17 @@ impl ApsAuctionProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl AuctionProvider for ApsAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "aps"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         log::info!(
             "APS: requesting bids for {} slots (pub_id: {})",
             request.slots.len(),
@@ -496,12 +499,17 @@ impl AuctionProvider for ApsAuctionProvider {
         log::trace!("APS: sending bid request: {:?}", aps_json);
 
         // Create HTTP POST request
-        let mut aps_req = Request::new(Method::POST, &self.config.endpoint);
-
-        aps_req
-            .set_body_json(&aps_json)
+        let aps_body =
+            serde_json::to_vec(&aps_json).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize APS request body".to_string(),
+            })?;
+        let aps_req = http::Request::builder()
+            .method(Method::POST)
+            .uri(&self.config.endpoint)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(aps_body))
             .change_context(TrustedServerError::Auction {
-                message: "Failed to set APS request body".to_string(),
+                message: "Failed to build APS request".to_string(),
             })?;
 
         // Send request asynchronously with auction-scoped timeout
@@ -517,29 +525,33 @@ impl AuctionProvider for ApsAuctionProvider {
             ),
         })?;
 
-        let pending =
-            aps_req
-                .send_async(backend_name)
-                .change_context(TrustedServerError::Auction {
-                    message: "Failed to send async request to APS".to_string(),
-                })?;
+        let pending = context
+            .services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(aps_req, backend_name))
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to send async request to APS".to_string(),
+            })?;
 
         Ok(pending)
     }
 
     fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let response = response.response;
+
         // Check status code
-        if !response.get_status().is_success() {
-            log::warn!("APS returned non-success status: {}", response.get_status());
+        if !response.status().is_success() {
+            log::warn!("APS returned non-success status: {}", response.status());
             return Ok(AuctionResponse::error("aps", response_time_ms));
         }
 
         // Parse response body
-        let body_bytes = response.take_body_bytes();
+        let body_bytes = response.into_body().into_bytes();
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse APS response JSON".to_string(),

@@ -12,29 +12,6 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
-fn platform_response_to_fastly(
-    platform_resp: crate::platform::PlatformResponse,
-) -> fastly::Response {
-    let (parts, body) = platform_resp.response.into_parts();
-    debug_assert!(
-        matches!(&body, edgezero_core::body::Body::Once(_)),
-        "unexpected Body::Stream in platform response conversion: body will be empty"
-    );
-    let body_bytes = match body {
-        edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-        edgezero_core::body::Body::Stream(_) => {
-            log::warn!("streaming platform response body; body will be empty");
-            vec![]
-        }
-    };
-    let mut resp = fastly::Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.set_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    resp
-}
-
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,
@@ -176,13 +153,14 @@ impl AuctionOrchestrator {
             let start_time = Instant::now();
             let pending = mediator
                 .request_bids(request, &mediator_context)
+                .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
             let select_result = services
                 .http_client()
-                .select(vec![PlatformPendingRequest::new(pending)])
+                .select(vec![pending])
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} request failed", mediator.provider_name()),
@@ -193,11 +171,10 @@ impl AuctionOrchestrator {
                     .change_context(TrustedServerError::Auction {
                         message: format!("Mediator {} request failed", mediator.provider_name()),
                     })?;
-            let backend_response = platform_response_to_fastly(platform_resp);
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
-                .parse_response(backend_response, response_time_ms)
+                .parse_response(platform_resp, response_time_ms)
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} parse failed", mediator.provider_name()),
                 })?;
@@ -265,7 +242,7 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses `fastly::http::request::select()` to process responses as they
+    /// Uses `services.http_client().select(...)` to process responses as they
     /// become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
@@ -359,14 +336,17 @@ impl AuctionOrchestrator {
             );
 
             let start_time = Instant::now();
-            match provider.request_bids(request, &provider_context) {
+            match provider.request_bids(request, &provider_context).await {
                 Ok(pending) => {
+                    let request_backend_name = pending
+                        .backend_name()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| backend_name.clone());
                     backend_to_provider.insert(
-                        backend_name.clone(),
+                        request_backend_name.clone(),
                         (provider.provider_name(), start_time, provider.as_ref()),
                     );
-                    pending_requests
-                        .push(PlatformPendingRequest::new(pending).with_backend_name(backend_name));
+                    pending_requests.push(pending);
                     log::debug!(
                         "Request to '{}' launched successfully",
                         provider.provider_name()
@@ -414,14 +394,13 @@ impl AuctionOrchestrator {
                 Ok(platform_response) => {
                     // Identify the provider from the backend name
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
-                    let response = platform_response_to_fastly(platform_response);
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms) {
+                        match provider.parse_response(platform_response, response_time_ms) {
                             Ok(auction_response) => {
                                 log::info!(
                                     "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
@@ -644,7 +623,6 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
-    use fastly::Request;
     use std::collections::{HashMap, HashSet};
 
     use super::AuctionOrchestrator;
@@ -698,7 +676,7 @@ mod tests {
 
     fn create_test_context<'a>(
         settings: &'a crate::settings::Settings,
-        req: &'a Request,
+        req: &'a http::Request<edgezero_core::body::Body>,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
         let services: &'static crate::platform::RuntimeServices =
@@ -770,8 +748,9 @@ mod tests {
     }
 
     // TODO: Re-enable provider integration tests after implementing mock support
-    // for send_async(). Mock providers can't create PendingRequest without real
-    // Fastly backends.
+    // for `PlatformHttpClient::send_async()`. Mock providers currently cannot
+    // create realistic pending requests for the select loop without real
+    // platform-backed transport handles.
     //
     // Untested timeout enforcement paths (require real backends):
     // - Deadline check in select() loop (drops remaining requests)
@@ -779,9 +758,9 @@ mod tests {
     // - Provider skip when effective_timeout == 0 (budget exhausted before launch)
     // - Provider context receives reduced timeout_ms per remaining budget
     //
-    // Follow-up: introduce a thin abstraction over `select()` (e.g. a trait)
+    // Follow-up: introduce a thin abstraction over `PlatformHttpClient::select()`
     // so the deadline/drop logic can be unit-tested with mock futures instead
-    // of requiring real Fastly backends.  An `#[ignore]` integration test
+    // of requiring real platform backends. An `#[ignore]` integration test
     // exercising the full path via Viceroy would also catch regressions.
 
     #[tokio::test]
@@ -799,7 +778,11 @@ mod tests {
 
         let request = create_test_auction_request();
         let settings = create_test_settings();
-        let req = Request::get("https://test.com/test");
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://test.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
         let context = create_test_context(
             &settings,
             &req,

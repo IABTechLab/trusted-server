@@ -58,20 +58,21 @@
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method, StatusCode};
-use fastly::{Request, Response};
+use http::header;
+use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
+use url::Url;
 use validator::Validate;
 
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
@@ -249,87 +250,122 @@ impl DataDomeIntegration {
     }
 
     /// Handle the /tags.js endpoint - fetch and rewrite the `DataDome` SDK.
-    async fn handle_tags_js(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
-        let target_url = self.build_sdk_url("/tags.js", req.get_query_str());
+    async fn handle_tags_js(
+        &self,
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let target_url = self.build_sdk_url("/tags.js", req.uri().query());
 
         log::info!("[datadome] Fetching tags.js from {}", target_url);
 
-        let backend = BackendConfig::from_url(&target_url, true)
+        let backend = Self::backend_name_for_url(services, &target_url)
             .change_context(Self::error("Invalid SDK URL"))?;
 
         let sdk_host = Self::extract_host(&self.config.sdk_origin);
 
-        let mut backend_req = Request::new(Method::GET, &target_url);
-        backend_req.set_header(header::HOST, sdk_host);
-        backend_req.set_header(header::ACCEPT, "application/javascript, */*");
+        let mut backend_req = http::Request::builder()
+            .method(Method::GET)
+            .uri(&target_url)
+            .header(header::HOST, sdk_host)
+            .header(header::ACCEPT, "application/javascript, */*")
+            .body(EdgeBody::empty())
+            .change_context(Self::error("Failed to build DataDome SDK request"))?;
 
         // Copy relevant headers from original request
-        if let Some(ua) = req.get_header(header::USER_AGENT) {
-            backend_req.set_header(header::USER_AGENT, ua);
+        if let Some(ua) = req.headers().get(header::USER_AGENT) {
+            backend_req
+                .headers_mut()
+                .insert(header::USER_AGENT, ua.clone());
         }
 
-        let mut backend_resp = backend_req
-            .send(&backend)
+        let backend_resp = services
+            .http_client()
+            .send(PlatformHttpRequest::new(backend_req, backend))
+            .await
             .change_context(Self::error("Failed to fetch tags.js from DataDome"))?;
 
-        if backend_resp.get_status() != StatusCode::OK {
+        if backend_resp.response.status() != StatusCode::OK {
             log::warn!(
                 "[datadome] tags.js fetch returned status {}",
-                backend_resp.get_status()
+                backend_resp.response.status()
             );
-            return Ok(backend_resp);
+            return Ok(backend_resp.response);
         }
 
         // Read and rewrite the script content
-        let body = backend_resp.take_body_str();
-        let rewritten = self.rewrite_script_content(&body);
+        let cors_header = backend_resp
+            .response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .cloned();
+        let body = backend_resp.response.into_body().into_bytes();
+        let rewritten = self.rewrite_script_content(&String::from_utf8_lossy(&body));
 
         // Build response with caching headers
-        let mut response = Response::new();
-        response.set_status(StatusCode::OK);
-        response.set_header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        );
-        response.set_header(
-            header::CACHE_CONTROL,
-            format!("public, max-age={}", self.config.cache_ttl_seconds),
-        );
+        let mut response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .header(
+                header::CACHE_CONTROL,
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
+            )
+            .body(EdgeBody::from(rewritten.into_bytes()))
+            .change_context(Self::error("Failed to build DataDome SDK response"))?;
 
         // Copy CORS headers if present
-        if let Some(cors) = backend_resp.get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
-            response.set_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, cors);
+        if let Some(cors) = cors_header {
+            response
+                .headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, cors);
         }
 
-        response.set_body(rewritten);
         Ok(response)
     }
 
     /// Handle the /js/* signal collection endpoint - proxy pass-through to api-js.datadome.co.
-    async fn handle_js_api(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
+    async fn handle_js_api(
+        &self,
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let (parts, body) = req.into_parts();
+        let original_path = parts.uri.path().to_string();
 
         // Strip our prefix to get the DataDome path
         let datadome_path = original_path
             .strip_prefix("/integrations/datadome")
-            .unwrap_or(original_path);
+            .unwrap_or(&original_path);
 
         // Use api_origin (api-js.datadome.co) for signal collection requests
-        let target_url = self.build_api_url(datadome_path, req.get_query_str());
+        let target_url = self.build_api_url(datadome_path, parts.uri.query());
         let api_host = Self::extract_host(&self.config.api_origin);
 
         log::info!(
             "[datadome] Proxying signal request to {} (method: {}, host: {})",
             target_url,
-            req.get_method(),
+            parts.method,
             api_host
         );
 
-        let backend = BackendConfig::from_url(&target_url, true)
+        let backend = Self::backend_name_for_url(services, &target_url)
             .change_context(Self::error("Invalid API URL"))?;
 
-        let mut backend_req = Request::new(req.get_method().clone(), &target_url);
-        backend_req.set_header(header::HOST, api_host);
+        let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
+            body
+        } else {
+            EdgeBody::empty()
+        };
+
+        let mut backend_req = http::Request::builder()
+            .method(parts.method.clone())
+            .uri(&target_url)
+            .header(header::HOST, api_host)
+            .body(request_body)
+            .change_context(Self::error("Failed to build DataDome API request"))?;
 
         // Copy relevant headers
         let headers_to_copy = [
@@ -344,27 +380,23 @@ impl DataDomeIntegration {
         ];
 
         for h in &headers_to_copy {
-            if let Some(value) = req.get_header(h) {
-                backend_req.set_header(h, value);
+            if let Some(value) = parts.headers.get(h) {
+                backend_req.headers_mut().insert(h, value.clone());
             }
         }
 
-        // Copy body for POST/PUT requests
-        if req.get_method() == Method::POST || req.get_method() == Method::PUT {
-            let body = req.into_body();
-            backend_req.set_body(body);
-        }
-
-        let backend_resp = backend_req
-            .send(&backend)
+        let backend_resp = services
+            .http_client()
+            .send(PlatformHttpRequest::new(backend_req, backend))
+            .await
             .change_context(Self::error("Failed to proxy signal request to DataDome"))?;
 
         log::info!(
             "[datadome] Signal request returned status {}",
-            backend_resp.get_status()
+            backend_resp.response.status()
         );
 
-        Ok(backend_resp)
+        Ok(backend_resp.response)
     }
 
     /// Extract the path portion after the `DataDome` domain from a URL.
@@ -380,6 +412,28 @@ impl DataDomeIntegration {
                 }
             })
             .unwrap_or("/tags.js")
+    }
+
+    fn backend_name_for_url(
+        services: &RuntimeServices,
+        target_url: &str,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let parsed =
+            Url::parse(target_url).change_context(Self::error("Invalid DataDome upstream URL"))?;
+
+        services
+            .backend()
+            .ensure(&PlatformBackendSpec {
+                scheme: parsed.scheme().to_string(),
+                host: parsed
+                    .host_str()
+                    .ok_or_else(|| Report::new(Self::error("DataDome upstream URL missing host")))?
+                    .to_string(),
+                port: parsed.port(),
+                certificate_check: true,
+                first_byte_timeout: std::time::Duration::from_secs(15),
+            })
+            .change_context(Self::error("Failed to register DataDome backend"))
     }
 }
 
@@ -405,15 +459,15 @@ impl IntegrationProxy for DataDomeIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
-        _services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
 
         if path == "/integrations/datadome/tags.js" {
-            self.handle_tags_js(req).await
+            self.handle_tags_js(services, req).await
         } else if path.starts_with("/integrations/datadome/js/") {
-            self.handle_js_api(req).await
+            self.handle_js_api(services, req).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown DataDome route: {}",
@@ -503,7 +557,11 @@ pub fn register(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> DataDomeConfig {
         DataDomeConfig {
@@ -819,5 +877,35 @@ mod tests {
             }
             _ => panic!("Expected Replace action for bare domain"),
         }
+    }
+
+    #[test]
+    fn datadome_proxy_uses_platform_http_client() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = DataDomeIntegration::new(test_config());
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/integrations/datadome/js/check")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed response"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should route outbound request through PlatformHttpClient"
+        );
     }
 }

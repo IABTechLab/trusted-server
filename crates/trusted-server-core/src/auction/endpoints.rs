@@ -5,7 +5,6 @@ use error_stack::{Report, ResultExt};
 use http::{Request, Response};
 
 use crate::auction::formats::AdRequest;
-use crate::compat;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
@@ -87,13 +86,11 @@ pub async fn handle_auction(
         geo,
     )?;
 
-    let fastly_req = compat::to_fastly_request_ref(&http_req);
-
     // Create auction context
     let context = AuctionContext {
         settings,
-        request: &fastly_req,
-        client_info: &services.client_info,
+        request: &http_req,
+        client_info: services.client_info(),
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,

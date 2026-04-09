@@ -6,20 +6,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method, StatusCode};
-use fastly::{Request, Response};
+use http::header::{self, HeaderMap, HeaderValue};
+use http::{Method, StatusCode};
 use serde::Deserialize;
+use url::Url;
 use validator::Validate;
 
-use crate::backend::BackendConfig;
-use crate::compat;
+use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
@@ -106,8 +107,8 @@ impl PermutiveIntegration {
     async fn handle_sdk_serving(
         &self,
         _settings: &Settings,
-        _req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         log::info!("Handling Permutive SDK request");
 
         let sdk_url = self.sdk_url();
@@ -116,33 +117,39 @@ impl PermutiveIntegration {
         // TODO: Check KV store cache first (future enhancement)
 
         // Fetch SDK from Permutive CDN
-        let mut permutive_req = Request::new(Method::GET, &sdk_url);
-        permutive_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
-        permutive_req.set_header(header::ACCEPT, "application/javascript, */*");
+        let permutive_req = http::Request::builder()
+            .method(Method::GET)
+            .uri(&sdk_url)
+            .header(header::USER_AGENT, "TrustedServer/1.0")
+            .header(header::ACCEPT, "application/javascript, */*")
+            .body(EdgeBody::empty())
+            .change_context(Self::error("Failed to build Permutive SDK request"))?;
 
-        let backend_name = BackendConfig::from_url(&sdk_url, true)
+        let backend_name = Self::backend_name_for_url(services, &sdk_url)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
-        let mut permutive_response =
-            permutive_req
-                .send(backend_name)
-                .change_context(Self::error(format!(
-                    "Failed to fetch Permutive SDK from {}",
-                    sdk_url
-                )))?;
+        let permutive_response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(permutive_req, backend_name))
+            .await
+            .change_context(Self::error(format!(
+                "Failed to fetch Permutive SDK from {}",
+                sdk_url
+            )))?
+            .response;
 
-        if !permutive_response.get_status().is_success() {
+        if !permutive_response.status().is_success() {
             log::error!(
                 "Permutive SDK fetch failed with status: {}",
-                permutive_response.get_status()
+                permutive_response.status()
             );
             return Err(Report::new(Self::error(format!(
                 "Permutive SDK returned error status: {}",
-                permutive_response.get_status()
+                permutive_response.status()
             ))));
         }
 
-        let sdk_body = permutive_response.take_body_bytes();
+        let sdk_body = permutive_response.into_body().into_bytes();
         log::info!(
             "Successfully fetched Permutive SDK: {} bytes",
             sdk_body.len()
@@ -150,335 +157,96 @@ impl PermutiveIntegration {
 
         // TODO: Cache in KV store (future enhancement)
 
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
-            .with_header(
+            .header(
                 header::CACHE_CONTROL,
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
-            .with_header("X-Permutive-SDK-Proxy", "true")
-            .with_header("X-SDK-Source", &sdk_url)
-            .with_body(sdk_body))
+            .header("X-Permutive-SDK-Proxy", "true")
+            .header("X-SDK-Source", &sdk_url)
+            .body(EdgeBody::from(sdk_body.to_vec()))
+            .change_context(Self::error("Failed to build Permutive SDK response"))
     }
 
-    /// Handle API proxy - forward requests to api.permutive.com.
-    async fn handle_api_proxy(
+    async fn forward_proxy_request(
         &self,
-        _settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+        route_prefix: &str,
+        upstream_base: &str,
+        route_name: &str,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let (parts, body) = req.into_parts();
+        let original_path = parts.uri.path().to_string();
+        let method = parts.method.clone();
 
         log::info!(
-            "Proxying Permutive API request: {} {}",
+            "Proxying {} request: {} {}",
+            route_name,
             method,
             original_path
         );
 
-        // Extract path after /integrations/permutive/api
-        let api_path = original_path
-            .strip_prefix("/integrations/permutive/api")
-            .ok_or_else(|| Self::error(format!("Invalid Permutive API path: {}", original_path)))?;
+        let upstream_path = original_path.strip_prefix(route_prefix).ok_or_else(|| {
+            Self::error(format!("Invalid {} path: {}", route_name, original_path))
+        })?;
 
-        // Build full target URL with query parameters
-        let query = req
-            .get_url()
+        let query = parts
+            .uri
             .query()
             .map(|q| format!("?{}", q))
             .unwrap_or_default();
-        let target_url = format!("{}{}{}", self.config.api_endpoint, api_path, query);
+        let target_url = format!("{}{}{}", upstream_base, upstream_path, query);
 
-        log::info!("Forwarding to Permutive API: {}", target_url);
+        log::info!("Forwarding {} to {}", route_name, target_url);
 
-        // Create new request
-        let mut target_req = Request::new(method.clone(), &target_url);
+        let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+            body
+        } else {
+            EdgeBody::empty()
+        };
 
-        // Copy headers
-        self.copy_request_headers(&req, &mut target_req);
-
-        // Copy body for POST/PUT/PATCH
-        if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-            let body = req.take_body();
-            target_req.set_body(body);
-        }
-
-        // Get backend and forward
-        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
-            .change_context(Self::error("Failed to determine backend for API proxy"))?;
-
-        let response = target_req
-            .send(backend_name)
+        let mut target_req = http::Request::builder()
+            .method(method)
+            .uri(&target_url)
+            .body(request_body)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to build {} proxy request",
+                route_name
             )))?;
+        self.copy_request_headers(&parts.headers, target_req.headers_mut());
 
-        log::info!(
-            "Permutive API responded with status: {}",
-            response.get_status()
-        );
-
-        Ok(response)
-    }
-
-    /// Handle Secure Signals proxy - forward requests to secure-signals.permutive.app.
-    async fn handle_secure_signals_proxy(
-        &self,
-        _settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
-
-        log::info!(
-            "Proxying Permutive Secure Signals request: {} {}",
-            method,
-            original_path
-        );
-
-        // Extract path after /integrations/permutive/secure-signal
-        let signal_path = original_path
-            .strip_prefix("/integrations/permutive/secure-signal")
-            .ok_or_else(|| {
-                Self::error(format!(
-                    "Invalid Permutive Secure Signals path: {}",
-                    original_path
-                ))
-            })?;
-
-        // Build full target URL with query parameters
-        let query = req
-            .get_url()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-        let target_url = format!(
-            "{}{}{}",
-            self.config.secure_signals_endpoint, signal_path, query
-        );
-
-        log::info!("Forwarding to Permutive Secure Signals: {}", target_url);
-
-        // Create new request
-        let mut target_req = Request::new(method.clone(), &target_url);
-
-        // Copy headers
-        self.copy_request_headers(&req, &mut target_req);
-
-        // Copy body for POST/PUT/PATCH
-        if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-            let body = req.take_body();
-            target_req.set_body(body);
-        }
-
-        // Get backend and forward
-        let backend_name = BackendConfig::from_url(&self.config.secure_signals_endpoint, true)
-            .change_context(Self::error(
-                "Failed to determine backend for Secure Signals proxy",
+        let backend_name =
+            Self::backend_name_for_url(services, upstream_base).change_context(Self::error(
+                format!("Failed to determine backend for {} proxy", route_name),
             ))?;
 
-        let response = target_req
-            .send(backend_name)
+        let response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(target_req, backend_name))
+            .await
             .change_context(Self::error(format!(
                 "Failed to forward request to {}",
                 target_url
-            )))?;
+            )))?
+            .response;
 
         log::info!(
-            "Permutive Secure Signals responded with status: {}",
-            response.get_status()
-        );
-
-        Ok(response)
-    }
-
-    /// Handle Events proxy - forward requests to events.permutive.app.
-    async fn handle_events_proxy(
-        &self,
-        _settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
-
-        log::info!(
-            "Proxying Permutive Events request: {} {}",
-            method,
-            original_path
-        );
-
-        // Extract path after /integrations/permutive/events
-        let events_path = original_path
-            .strip_prefix("/integrations/permutive/events")
-            .ok_or_else(|| {
-                Self::error(format!("Invalid Permutive Events path: {}", original_path))
-            })?;
-
-        // Build full target URL with query parameters
-        let query = req
-            .get_url()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-        let target_url = format!("https://events.permutive.app{}{}", events_path, query);
-
-        log::info!("Forwarding to Permutive Events: {}", target_url);
-
-        // Create new request
-        let mut target_req = Request::new(method.clone(), &target_url);
-
-        // Copy headers
-        self.copy_request_headers(&req, &mut target_req);
-
-        // Copy body for POST/PUT/PATCH
-        if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-            let body = req.take_body();
-            target_req.set_body(body);
-        }
-
-        // Get backend and forward
-        let backend_name = BackendConfig::from_url("https://events.permutive.app", true)
-            .change_context(Self::error("Failed to determine backend for Events proxy"))?;
-
-        let response = target_req
-            .send(backend_name)
-            .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
-            )))?;
-
-        log::info!(
-            "Permutive Events responded with status: {}",
-            response.get_status()
-        );
-
-        Ok(response)
-    }
-
-    /// Handle Sync proxy - forward requests to sync.permutive.com.
-    async fn handle_sync_proxy(
-        &self,
-        _settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
-
-        log::info!(
-            "Proxying Permutive Sync request: {} {}",
-            method,
-            original_path
-        );
-
-        // Extract path after /integrations/permutive/sync
-        let sync_path = original_path
-            .strip_prefix("/integrations/permutive/sync")
-            .ok_or_else(|| {
-                Self::error(format!("Invalid Permutive Sync path: {}", original_path))
-            })?;
-
-        // Build full target URL with query parameters
-        let query = req
-            .get_url()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-        let target_url = format!("https://sync.permutive.com{}{}", sync_path, query);
-
-        log::info!("Forwarding to Permutive Sync: {}", target_url);
-
-        // Create new request
-        let mut target_req = Request::new(method.clone(), &target_url);
-
-        // Copy headers
-        self.copy_request_headers(&req, &mut target_req);
-
-        // Copy body for POST/PUT/PATCH
-        if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-            let body = req.take_body();
-            target_req.set_body(body);
-        }
-
-        // Get backend and forward
-        let backend_name = BackendConfig::from_url("https://sync.permutive.com", true)
-            .change_context(Self::error("Failed to determine backend for Sync proxy"))?;
-
-        let response = target_req
-            .send(backend_name)
-            .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
-            )))?;
-
-        log::info!(
-            "Permutive Sync responded with status: {}",
-            response.get_status()
-        );
-
-        Ok(response)
-    }
-
-    /// Handle CDN proxy - forward requests to cdn.permutive.com.
-    async fn handle_cdn_proxy(
-        &self,
-        _settings: &Settings,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
-
-        log::info!(
-            "Proxying Permutive CDN request: {} {}",
-            method,
-            original_path
-        );
-
-        // Extract path after /integrations/permutive/cdn
-        let cdn_path = original_path
-            .strip_prefix("/integrations/permutive/cdn")
-            .ok_or_else(|| Self::error(format!("Invalid Permutive CDN path: {}", original_path)))?;
-
-        // Build full target URL with query parameters
-        let query = req
-            .get_url()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-        let target_url = format!("https://cdn.permutive.com{}{}", cdn_path, query);
-
-        log::info!("Forwarding to Permutive CDN: {}", target_url);
-
-        // Create new request
-        let mut target_req = Request::new(method.clone(), &target_url);
-
-        // Copy headers
-        self.copy_request_headers(&req, &mut target_req);
-
-        // Get backend and forward
-        let backend_name = BackendConfig::from_url("https://cdn.permutive.com", true)
-            .change_context(Self::error("Failed to determine backend for CDN proxy"))?;
-
-        let response = target_req
-            .send(backend_name)
-            .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
-            )))?;
-
-        log::info!(
-            "Permutive CDN responded with status: {}",
-            response.get_status()
+            "{} responded with status: {}",
+            route_name,
+            response.status()
         );
 
         Ok(response)
     }
 
     /// Copy relevant request headers for proxying.
-    fn copy_request_headers(&self, from: &Request, to: &mut Request) {
+    fn copy_request_headers(&self, from: &HeaderMap<HeaderValue>, to: &mut HeaderMap<HeaderValue>) {
         let headers_to_copy = [
             header::CONTENT_TYPE,
             header::ACCEPT,
@@ -489,13 +257,42 @@ impl PermutiveIntegration {
         ];
 
         for header_name in &headers_to_copy {
-            if let Some(value) = from.get_header(header_name) {
-                to.set_header(header_name, value);
+            if let Some(value) = from.get(header_name) {
+                to.insert(header_name, value.clone());
             }
         }
 
         // Copy any X-* custom headers, skipping TS-internal headers
-        compat::copy_fastly_custom_headers(from, to);
+        for (name, value) in from {
+            let name_str = name.as_str();
+            if (name_str.starts_with("x-") || name_str.starts_with("X-"))
+                && !INTERNAL_HEADERS.contains(&name_str)
+            {
+                to.append(name.clone(), value.clone());
+            }
+        }
+    }
+
+    fn backend_name_for_url(
+        services: &RuntimeServices,
+        target_url: &str,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let parsed =
+            Url::parse(target_url).change_context(Self::error("Invalid Permutive upstream URL"))?;
+
+        services
+            .backend()
+            .ensure(&PlatformBackendSpec {
+                scheme: parsed.scheme().to_string(),
+                host: parsed
+                    .host_str()
+                    .ok_or_else(|| Report::new(Self::error("Permutive upstream URL missing host")))?
+                    .to_string(),
+                port: parsed.port(),
+                certificate_check: true,
+                first_byte_timeout: std::time::Duration::from_secs(15),
+            })
+            .change_context(Self::error("Failed to register Permutive backend"))
     }
 }
 
@@ -561,23 +358,58 @@ impl IntegrationProxy for PermutiveIntegration {
     async fn handle(
         &self,
         settings: &Settings,
-        _services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
 
         if path.starts_with("/integrations/permutive/api/") {
-            self.handle_api_proxy(settings, req).await
+            self.forward_proxy_request(
+                services,
+                req,
+                "/integrations/permutive/api",
+                &self.config.api_endpoint,
+                "Permutive API",
+            )
+            .await
         } else if path.starts_with("/integrations/permutive/secure-signal/") {
-            self.handle_secure_signals_proxy(settings, req).await
+            self.forward_proxy_request(
+                services,
+                req,
+                "/integrations/permutive/secure-signal",
+                &self.config.secure_signals_endpoint,
+                "Permutive Secure Signals",
+            )
+            .await
         } else if path.starts_with("/integrations/permutive/events/") {
-            self.handle_events_proxy(settings, req).await
+            self.forward_proxy_request(
+                services,
+                req,
+                "/integrations/permutive/events",
+                "https://events.permutive.app",
+                "Permutive Events",
+            )
+            .await
         } else if path.starts_with("/integrations/permutive/sync/") {
-            self.handle_sync_proxy(settings, req).await
+            self.forward_proxy_request(
+                services,
+                req,
+                "/integrations/permutive/sync",
+                "https://sync.permutive.com",
+                "Permutive Sync",
+            )
+            .await
         } else if path.starts_with("/integrations/permutive/cdn/") {
-            self.handle_cdn_proxy(settings, req).await
+            self.forward_proxy_request(
+                services,
+                req,
+                "/integrations/permutive/cdn",
+                "https://cdn.permutive.com",
+                "Permutive CDN",
+            )
+            .await
         } else if path == "/integrations/permutive/sdk" {
-            self.handle_sdk_serving(settings, req).await
+            self.handle_sdk_serving(settings, services).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown Permutive route: {}",
@@ -641,7 +473,10 @@ fn default_rewrite_sdk() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -789,6 +624,45 @@ mod tests {
                 .iter()
                 .any(|r| r.path == "/integrations/permutive/sdk" && r.method == Method::GET),
             "Should register SDK endpoint"
+        );
+    }
+
+    #[test]
+    fn permutive_proxy_uses_platform_http_client() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = PermutiveIntegration::new(PermutiveConfig {
+            enabled: true,
+            organization_id: "myorg".to_string(),
+            workspace_id: "workspace-123".to_string(),
+            project_id: String::new(),
+            api_endpoint: default_api_endpoint(),
+            secure_signals_endpoint: default_secure_signals_endpoint(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+        });
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/integrations/permutive/api/v2.0/events")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed response"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should route outbound request through PlatformHttpClient"
         );
     }
 }

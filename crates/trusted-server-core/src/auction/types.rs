@@ -1,6 +1,7 @@
 //! Core types for auction requests and responses.
 
-use fastly::Request;
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -102,7 +103,7 @@ pub struct SiteInfo {
 /// Context passed to auction providers.
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
-    pub request: &'a Request,
+    pub request: &'a Request<EdgeBody>,
     pub client_info: &'a ClientInfo,
     pub timeout_ms: u32,
     /// Provider responses from the bidding phase, used by mediators.

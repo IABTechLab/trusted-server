@@ -3,13 +3,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use fastly::http::Method;
-use fastly::{Request, Response};
+use http::{HeaderValue, Method, Request, Response};
 use matchit::Router;
 
-use crate::compat;
 use crate::constants::HEADER_X_SYNTHETIC_ID;
+use crate::cookies::set_synthetic_cookie;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -260,8 +260,8 @@ pub trait IntegrationProxy: Send + Sync {
         &self,
         settings: &Settings,
         services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>>;
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>>;
 
     /// Helper to create a namespaced GET endpoint.
     /// Automatically prefixes the path with `/integrations/{integration_name()}`.
@@ -655,38 +655,45 @@ impl IntegrationRegistry {
         path: &str,
         settings: &Settings,
         services: &RuntimeServices,
-        mut req: Request,
-    ) -> Option<Result<Response, Report<TrustedServerError>>> {
+        mut req: Request<EdgeBody>,
+    ) -> Option<Result<Response<EdgeBody>, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Generate synthetic ID before consuming request
-            let http_req = compat::from_fastly_request_ref(&req);
-            let synthetic_id_result = get_or_generate_synthetic_id(settings, services, &http_req);
+            let synthetic_id_result = get_or_generate_synthetic_id(settings, services, &req);
 
-            // Set synthetic ID header on the request so integrations can read it.
-            // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
-            // so a crafted synthetic_id cannot inject additional request headers.
             if let Ok(ref synthetic_id) = synthetic_id_result {
-                req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+                match HeaderValue::from_str(synthetic_id) {
+                    Ok(header_value) => {
+                        req.headers_mut()
+                            .insert(HEADER_X_SYNTHETIC_ID.clone(), header_value);
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to build x-synthetic-id request header value: {}",
+                            error
+                        );
+                    }
+                }
             }
 
             let mut result = proxy.handle(settings, services, req).await;
 
-            // Set synthetic ID header on successful responses
             if let Ok(ref mut response) = result {
                 match synthetic_id_result {
                     Ok(ref synthetic_id) => {
-                        // Response-header injection: Fastly's HeaderValue API rejects values
-                        // containing \r, \n, or \0, so a crafted synthetic_id cannot inject
-                        // additional response headers.
-                        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-                        // Cookie is intentionally not set when synthetic_id contains RFC 6265-illegal
-                        // characters (e.g. a crafted x-synthetic-id header value). The response header
-                        // is still emitted; only cookie persistence is skipped.
-                        compat::set_fastly_synthetic_cookie(
-                            settings,
-                            response,
-                            synthetic_id.as_str(),
-                        );
+                        match HeaderValue::from_str(synthetic_id) {
+                            Ok(header_value) => {
+                                response
+                                    .headers_mut()
+                                    .insert(HEADER_X_SYNTHETIC_ID.clone(), header_value);
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Failed to build x-synthetic-id response header value: {}",
+                                    error
+                                );
+                            }
+                        }
+                        set_synthetic_cookie(settings, response, synthetic_id);
                     }
                     Err(ref err) => {
                         log::warn!(
@@ -952,6 +959,7 @@ impl IntegrationRegistry {
 mod tests {
     use super::*;
     use crate::platform::test_support::noop_services;
+    use http::{header, StatusCode};
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -970,9 +978,9 @@ mod tests {
             &self,
             _settings: &Settings,
             _services: &RuntimeServices,
-            _req: Request,
-        ) -> Result<Response, Report<TrustedServerError>> {
-            Ok(Response::new())
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
         }
     }
 
@@ -985,6 +993,33 @@ mod tests {
 
         fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
             false
+        }
+    }
+
+    struct EchoProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EchoProxy {
+        fn integration_name(&self) -> &'static str {
+            "echo"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            req: http::Request<EdgeBody>,
+        ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("x-echo-path", req.uri().path())
+                .body(EdgeBody::empty())
+                .expect("should build echo response");
+            Ok(response)
         }
     }
 
@@ -1002,6 +1037,42 @@ mod tests {
         assert!(
             !processor.should_process("<html></html>", &ctx),
             "Default `should_process` should be false to avoid running post-processing unexpectedly"
+        );
+    }
+
+    #[test]
+    fn handle_proxy_passes_http_request_without_fastly_round_trip() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            http::Method::GET,
+            "/integrations/test/echo",
+            (Arc::new(EchoProxy) as Arc<dyn IntegrationProxy>, "echo"),
+        )]);
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://test.example.com/integrations/test/echo?x=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(registry.handle_proxy(
+            &http::Method::GET,
+            "/integrations/test/echo",
+            &settings,
+            &noop_services(),
+            req,
+        ))
+        .expect("should match route")
+        .expect("proxy should succeed");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should preserve HTTP status"
+        );
+        assert_eq!(
+            response.headers()["x-echo-path"],
+            "/integrations/test/echo",
+            "should expose the HTTP request path to the proxy"
         );
     }
 
@@ -1226,7 +1297,6 @@ mod tests {
     // Tests for synthetic ID header on proxy responses
     use crate::constants::COOKIE_SYNTHETIC_ID;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::header;
 
     /// Mock proxy that returns a simple 200 OK response
     struct SyntheticIdTestProxy;
@@ -1254,11 +1324,12 @@ mod tests {
             &self,
             _settings: &Settings,
             _services: &RuntimeServices,
-            _req: Request,
-        ) -> Result<Response, Report<TrustedServerError>> {
-            // Return a simple response without the synthetic ID header.
-            // The registry's handle_proxy should add it.
-            Ok(Response::from_status(fastly::http::StatusCode::OK).with_body("test response"))
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from("test response"))
+                .expect("should build test response"))
         }
     }
 
@@ -1276,7 +1347,11 @@ mod tests {
         let registry = IntegrationRegistry::from_routes(routes);
 
         // Create a request without a synthetic ID cookie
-        let req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/synthetic")
+            .body(EdgeBody::empty())
+            .expect("should build request");
 
         // Call handle_proxy (uses futures executor in test environment)
         let result = futures::executor::block_on(registry.handle_proxy(
@@ -1294,14 +1369,12 @@ mod tests {
 
         let response = response.unwrap();
 
-        // Verify x-synthetic-id header is present
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            response.headers().get(&HEADER_X_SYNTHETIC_ID).is_some(),
             "Response should have x-synthetic-id header"
         );
 
-        // Verify Set-Cookie header is present (since no cookie was in request)
-        let set_cookie = response.get_header(header::SET_COOKIE);
+        let set_cookie = response.headers().get(header::SET_COOKIE);
         assert!(
             set_cookie.is_some(),
             "Response should have Set-Cookie header for synthetic_id"
@@ -1328,8 +1401,15 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
-        req.set_header(HEADER_X_SYNTHETIC_ID, "evil;injected");
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/synthetic")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
+            HEADER_X_SYNTHETIC_ID.clone(),
+            HeaderValue::from_static("evil;injected"),
+        );
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
@@ -1342,13 +1422,15 @@ mod tests {
 
         let response = result.expect("handler should succeed");
         let response_header = response
-            .get_header(HEADER_X_SYNTHETIC_ID)
+            .headers()
+            .get(&HEADER_X_SYNTHETIC_ID)
             .expect("response should have x-synthetic-id header")
             .to_str()
             .expect("header should be valid UTF-8")
             .to_string();
         let cookie_header = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("response should have Set-Cookie header")
             .to_str()
             .expect("header should be valid UTF-8");
@@ -1381,15 +1463,19 @@ mod tests {
 
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test.example.com/integrations/test/synthetic");
-        // Pre-existing cookie with a valid-format synthetic ID
-        req.set_header(
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test.example.com/integrations/test/synthetic")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
             header::COOKIE,
-            format!(
+            HeaderValue::from_str(&format!(
                 "{}={}",
                 crate::constants::COOKIE_SYNTHETIC_ID,
                 crate::test_support::tests::VALID_SYNTHETIC_ID
-            ),
+            ))
+            .expect("should build Cookie header"),
         );
 
         let result = futures::executor::block_on(registry.handle_proxy(
@@ -1403,14 +1489,12 @@ mod tests {
 
         let response = result.expect("proxy handle should succeed");
 
-        // Should still have x-synthetic-id header
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            response.headers().get(&HEADER_X_SYNTHETIC_ID).is_some(),
             "Response should still have x-synthetic-id header"
         );
 
-        // Should ALWAYS set the cookie again (per new requirements)
-        let set_cookie = response.get_header(header::SET_COOKIE);
+        let set_cookie = response.headers().get(header::SET_COOKIE);
 
         assert!(
             set_cookie.is_some(),
@@ -1440,8 +1524,11 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let req = Request::post("https://test-publisher.com/integrations/test/synthetic")
-            .with_body("test body");
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/synthetic")
+            .body(EdgeBody::from("test body"))
+            .expect("should build POST request");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::POST,
@@ -1457,7 +1544,7 @@ mod tests {
 
         let response = response.unwrap();
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
+            response.headers().get(&HEADER_X_SYNTHETIC_ID).is_some(),
             "POST response should have x-synthetic-id header"
         );
     }

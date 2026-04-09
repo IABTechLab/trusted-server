@@ -180,20 +180,13 @@ async fn route_request(
             handle_first_party_proxy_rebuild(settings, runtime_services, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(
-                &m,
-                path,
-                settings,
-                runtime_services,
-                compat::to_fastly_request(req),
-            )
+            .handle_proxy(&m, path, settings, runtime_services, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            })
-            .map(compat::from_fastly_response),
+            }),
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {

@@ -24,7 +24,8 @@ The auction orchestration system allows you to:
                           ▼
 ┌─────────────────────────────────────────────────────────┐
 │              AuctionProvider Trait                       │
-│  - request_bids()                                        │
+│  - request_bids() async                                  │
+│  - parse_response()                                      │
 │  - provider_name()                                       │
 │  - timeout_ms()                                          │
 │  - is_enabled()                                          │
@@ -54,7 +55,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs:84)                    │
 │     - Pattern: (Method::POST, "/auction")                            │
-│     - Handler: handle_auction(settings, &orchestrator, &storage, req)│
+│     - Handler: handle_auction(settings, &orchestrator, runtime_services, req)│
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -496,6 +497,7 @@ timeout_ms = 500
 use async_trait::async_trait;
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
+use crate::platform::{PlatformPendingRequest, PlatformResponse};
 
 pub struct YourAuctionProvider {
     config: YourConfig,
@@ -511,11 +513,19 @@ impl AuctionProvider for YourAuctionProvider {
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         // 1. Transform AuctionRequest to your provider's format
-        // 2. Make HTTP request to your provider
-        // 3. Parse response
-        // 4. Return AuctionResponse with bids
+        // 2. Launch HTTP request through services.http_client().send_async(...)
+        // 3. Return PlatformPendingRequest for the orchestrator to await
+        todo!()
+    }
+
+    fn parse_response(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // 4. Parse PlatformResponse into AuctionResponse
         todo!()
     }
 
@@ -551,7 +561,7 @@ let orchestrator = AuctionOrchestrator::new(config);
 orchestrator.register_provider(Arc::new(PrebidAuctionProvider::new(prebid_config)));
 orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
 
-let result = orchestrator.run_auction(&request, &context).await?;
+let result = orchestrator.run_auction(&request, &context, &services).await?;
 
 // Check results
 assert_eq!(result.winning_bids.len(), 2);
