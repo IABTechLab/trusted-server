@@ -20,7 +20,7 @@ use super::partner::{
 ///
 /// Accepts `api_key` as plaintext — it is hashed before storage and
 /// never persisted in cleartext.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct RegisterPartnerRequest {
     pub id: String,
     pub name: String,
@@ -48,6 +48,23 @@ pub struct RegisterPartnerRequest {
     pub pull_sync_rate_limit: u32,
     #[serde(default)]
     pub ts_pull_token: Option<String>,
+}
+
+impl std::fmt::Debug for RegisterPartnerRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterPartnerRequest")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("api_key", &"[REDACTED]")
+            .field("bidstream_enabled", &self.bidstream_enabled)
+            .field("source_domain", &self.source_domain)
+            .field("pull_sync_enabled", &self.pull_sync_enabled)
+            .field(
+                "ts_pull_token",
+                &self.ts_pull_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 fn default_openrtb_atype() -> u8 {

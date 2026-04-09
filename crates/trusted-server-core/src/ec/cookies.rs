@@ -8,7 +8,11 @@
 //! - `Secure` restricts to HTTPS
 //! - `SameSite=Lax` provides CSRF protection while allowing top-level navigations
 //! - `Max-Age` of 1 year (or 0 to expire)
-//! - No `HttpOnly` — the cookie needs to be readable by client-side scripts
+//! - No `HttpOnly` — intentionally omitted so the cookie is available to
+//!   client-side JS if needed in the future (e.g. direct reads from
+//!   `document.cookie` for the identify endpoint). This does expose the EC
+//!   ID to XSS; if client-side access is never needed, consider restoring
+//!   `HttpOnly` for defense-in-depth.
 
 use fastly::http::header;
 
@@ -44,7 +48,16 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 }
 
 /// Sets the EC ID cookie on the given response.
+///
+/// # Panics (debug only)
+///
+/// Debug-asserts that `ec_id` passes [`super::generation::is_valid_ec_id`]
+/// as a defense-in-depth check against cookie injection.
 pub fn set_ec_cookie(settings: &Settings, response: &mut fastly::Response, ec_id: &str) {
+    debug_assert!(
+        super::generation::is_valid_ec_id(ec_id),
+        "EC ID must be validated before cookie creation: got '{ec_id}'"
+    );
     response.append_header(header::SET_COOKIE, create_ec_cookie(settings, ec_id));
 }
 
@@ -65,16 +78,20 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use fastly::http::header;
 
+    /// A valid EC ID for use in cookie tests.
+    const TEST_EC_ID: &str =
+        "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff0000000011111111.abcXYZ";
+
     #[test]
     fn create_ec_cookie_uses_computed_domain() {
         let settings = create_test_settings();
-        let result = create_ec_cookie(&settings, "12345");
+        let result = create_ec_cookie(&settings, TEST_EC_ID);
 
         assert_eq!(
             result,
             format!(
-                "{}=12345; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}",
-                COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
+                "{}={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                COOKIE_TS_EC, TEST_EC_ID, settings.publisher.domain, COOKIE_MAX_AGE,
             ),
             "should use computed cookie domain (.{{domain}})"
         );
@@ -84,7 +101,7 @@ mod tests {
     fn set_ec_cookie_appends_header() {
         let settings = create_test_settings();
         let mut response = fastly::Response::new();
-        set_ec_cookie(&settings, &mut response, "test-id-123");
+        set_ec_cookie(&settings, &mut response, TEST_EC_ID);
 
         let cookie_header = response
             .get_header(header::SET_COOKIE)
@@ -93,7 +110,7 @@ mod tests {
 
         assert_eq!(
             cookie_str,
-            create_ec_cookie(&settings, "test-id-123"),
+            create_ec_cookie(&settings, TEST_EC_ID),
             "should match create_ec_cookie output"
         );
     }
