@@ -69,6 +69,11 @@ pub async fn handle_auction(
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
     });
 
     // Convert tsjs request format to auction request

@@ -118,7 +118,7 @@ impl PlatformBackend for StubBackend {
 // StubHttpClient
 // ---------------------------------------------------------------------------
 
-/// Canned response carried by a [`StubPendingResponse`] through `send_async`
+/// Canned response carried by a [`PlatformPendingRequest`] through `send_async`
 /// and resolved by [`StubHttpClient::select`].
 struct StubPendingResponse {
     backend_name: String,
@@ -318,8 +318,7 @@ pub(crate) fn build_services_with_http_client(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 
@@ -453,7 +452,7 @@ mod tests {
             host: "example.com".to_string(),
             port: None,
             certificate_check: true,
-            first_byte_timeout: Duration::from_secs(15),
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");

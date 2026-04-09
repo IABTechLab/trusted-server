@@ -134,10 +134,11 @@ pub struct RuntimeServices {
     pub(crate) config_store: Arc<dyn PlatformConfigStore>,
     /// Access to encrypted secret stores.
     pub(crate) secret_store: Arc<dyn PlatformSecretStore>,
-    /// KV store for the primary (opid) store.
+    /// KV store service selected for the current request path.
     ///
-    /// Additional stores (`counter_store`, `creative_store`) are opened on
-    /// demand in individual handlers until multi-store support lands here.
+    /// Adapters may replace this with a different concrete store on a
+    /// per-request basis by cloning [`RuntimeServices`] with
+    /// [`RuntimeServices::with_kv_store`].
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
     /// Dynamic backend registration and name prediction.
     pub(crate) backend: Arc<dyn PlatformBackend>,
@@ -186,6 +187,12 @@ impl RuntimeServices {
         &*self.secret_store
     }
 
+    /// Returns the KV store service.
+    #[must_use]
+    pub fn kv_store(&self) -> &dyn PlatformKvStore {
+        &*self.kv_store
+    }
+
     /// Returns the dynamic backend service.
     #[must_use]
     pub fn backend(&self) -> &dyn PlatformBackend {
@@ -215,6 +222,19 @@ impl RuntimeServices {
     #[must_use]
     pub fn kv_handle(&self) -> super::KvHandle {
         super::KvHandle::new(self.kv_store.clone())
+    }
+
+    /// Returns a clone of this instance with the KV store replaced by `store`.
+    ///
+    /// Adapters use this to lazily inject the request-specific KV store for
+    /// handlers that require one without rebuilding the rest of the runtime
+    /// services graph.
+    #[must_use]
+    pub fn with_kv_store(self, store: Arc<dyn PlatformKvStore>) -> Self {
+        Self {
+            kv_store: store,
+            ..self
+        }
     }
 }
 

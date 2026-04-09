@@ -346,6 +346,11 @@ pub fn handle_publisher_request(
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
     });
     let ec_allowed = allows_ec_creation(&consent_context);
     log::trace!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed);
@@ -464,8 +469,8 @@ pub fn handle_publisher_request(
             consent_context.jurisdiction,
         );
         expire_ec_cookie(settings, &mut response);
-        if let Some(store_name) = &settings.consent.consent_store {
-            crate::consent::kv::delete_consent_from_kv(store_name, cookie_ec_id);
+        if settings.consent.consent_store.is_some() {
+            crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
     } else {
         log::debug!(

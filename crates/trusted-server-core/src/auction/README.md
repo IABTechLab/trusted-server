@@ -52,9 +52,10 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs:84)                    │
+│  2. Route Matching (crates/trusted-server-adapter-fastly/src/main.rs)│
 │     - Pattern: (Method::POST, "/auction")                            │
-│     - Handler: handle_auction(settings, &orchestrator, &storage, req)│
+│     - Handler: handle_auction(settings, &orchestrator,               │
+│       &runtime_services, req)                                        │
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -286,7 +287,12 @@ let result = match (method, path.as_str()) {
     (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
     (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
     (Method::POST, "/auction") => {
-        handle_auction(settings, orchestrator, runtime_services, req).await
+        match runtime_services_for_consent_route(settings, runtime_services) {
+            Ok(auction_services) => {
+                handle_auction(settings, orchestrator, &auction_services, req).await
+            }
+            Err(e) => Err(e),
+        }
     }
     (Method::GET, "/first-party/proxy") => {
         handle_first_party_proxy(settings, runtime_services, req).await
@@ -308,7 +314,12 @@ let result = match (method, path.as_str()) {
                 message: format!("Unknown integration route: {path}"),
             }))
         }),
-    _ => handle_publisher_request(settings, integration_registry, runtime_services, req),
+    _ => match runtime_services_for_consent_route(settings, runtime_services) {
+        Ok(publisher_services) => {
+            handle_publisher_request(settings, integration_registry, &publisher_services, req)
+        }
+        Err(e) => Err(e),
+    },
 };
 ```
 
