@@ -337,15 +337,19 @@ pub fn assert_json_response(resp: Response, expected_status: u16) -> TestResult<
 /// Returns `None` if no `ts-ec` cookie was set.
 pub fn extract_ec_cookie_from_response(resp: &Response) -> Option<String> {
     for value in resp.headers().get_all("set-cookie") {
-        let cookie_str = value.to_str().ok()?;
+        let Ok(cookie_str) = value.to_str() else {
+            continue;
+        };
         if cookie_str.starts_with("ts-ec=") {
-            let value = cookie_str
+            let extracted = cookie_str
                 .split(';')
-                .next()?
-                .strip_prefix("ts-ec=")?
-                .to_owned();
-            if !value.is_empty() {
-                return Some(value);
+                .next()
+                .and_then(|s| s.strip_prefix("ts-ec="))
+                .map(str::to_owned);
+            if let Some(ref v) = extracted {
+                if !v.is_empty() {
+                    return extracted;
+                }
             }
         }
     }
@@ -417,12 +421,7 @@ impl MinimalOrigin {
 
                         let body = "<html><body><h1>Test Origin</h1></body></html>";
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: text/html\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = stream.write_all(response.as_bytes());

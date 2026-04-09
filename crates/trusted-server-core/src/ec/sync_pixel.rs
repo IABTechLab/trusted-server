@@ -6,7 +6,9 @@ use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use url::Url;
 
-use crate::consent::{allows_ec_creation, gpp, tcf, ConsentContext};
+use crate::consent::{gpp, tcf, ConsentContext};
+
+use super::consent::ec_consent_granted;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
@@ -19,7 +21,7 @@ use super::EcContext;
 pub const RATE_COUNTER_NAME: &str = "counter_store";
 
 /// Maximum allowed length (in bytes) for a partner UID.
-const MAX_UID_LENGTH: usize = 512;
+use super::kv_types::MAX_UID_LENGTH;
 
 /// Handles `GET /_ts/api/v1/sync` pixel sync requests.
 ///
@@ -68,7 +70,7 @@ pub fn handle_sync(
         }
     }
 
-    if !allows_ec_creation(ec_context.consent()) {
+    if !ec_consent_granted(ec_context.consent()) {
         return Ok(redirect_with_status(&return_url, "0", Some("no_consent")));
     }
 
@@ -155,6 +157,15 @@ fn validate_return_url(
     let parsed = Url::parse(return_url).change_context(TrustedServerError::BadRequest {
         message: "return URL must be a valid absolute URL".to_owned(),
     })?;
+
+    if parsed.scheme() != "https" {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!(
+                "return URL must use HTTPS, got scheme '{}'",
+                parsed.scheme()
+            ),
+        }));
+    }
 
     let host = parsed
         .host_str()

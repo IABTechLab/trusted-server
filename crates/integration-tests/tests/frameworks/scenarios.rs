@@ -526,6 +526,15 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
         .attach(format!("pixel sync should redirect; body: {body}")));
     }
 
+    // Verify the redirect points to the registered return domain.
+    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    if !location.is_some_and(|l| l.starts_with("https://sync.example.com/")) {
+        return Err(Report::new(TestError::UnexpectedContent).attach(format!(
+            "pixel sync redirect should point to return domain, got: {:?}",
+            location
+        )));
+    }
+
     // 4. Identify should return the synced UID
     let json = assert_json_response(identify(&client)?, 200)
         .attach("EC full lifecycle: identify after pixel sync")?;
@@ -578,10 +587,8 @@ fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
     let resp = client.get_with_headers("/", &[("sec-gpc", "1")])?;
 
     if !is_ec_cookie_expired(&resp) {
-        return Err(Report::new(TestError::JsonFieldMismatch {
-            field: "set-cookie(ts-ec expired)".to_owned(),
-        })
-        .attach("consent withdrawal should expire ts-ec cookie"));
+        return Err(Report::new(TestError::UnexpectedContent)
+            .attach("consent withdrawal should expire ts-ec cookie (expected Max-Age=0)"));
     }
 
     // 3. With cookie revoked and no GPC header on identify, server should

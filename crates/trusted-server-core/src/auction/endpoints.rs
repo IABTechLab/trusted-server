@@ -7,6 +7,7 @@ use crate::auction::formats::AdRequest;
 use crate::consent::gate_eids_by_consent;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::log_id;
 use crate::ec::partner::PartnerStore;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
@@ -129,7 +130,10 @@ fn resolve_auction_eids(
         Ok(Some((entry, _generation))) => entry,
         Ok(None) => return Some(Vec::new()),
         Err(err) => {
-            log::warn!("Auction KV read failed for EC ID '{ec_id}': {err:?}");
+            log::warn!(
+                "Auction KV read failed for EC ID '{}…': {err:?}",
+                log_id(ec_id)
+            );
             return Some(Vec::new());
         }
     };
