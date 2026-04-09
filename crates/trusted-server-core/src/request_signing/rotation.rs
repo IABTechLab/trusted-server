@@ -9,7 +9,7 @@ use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
 
-use super::Keypair;
+use super::{read_active_kids, Keypair};
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreId};
 use crate::request_signing::JWKS_STORE_NAME;
@@ -75,10 +75,15 @@ impl KeyRotationManager {
         self.store_private_key(services, &new_kid, &keypair.signing_key)?;
         self.store_public_jwk(services, &new_kid, &jwk)?;
 
-        let active_kids = match &previous_kid {
-            Some(prev) if prev != &new_kid => vec![prev.clone(), new_kid.clone()],
-            _ => vec![new_kid.clone()],
-        };
+        let mut active_kids = read_active_kids(services).unwrap_or_default();
+        if let Some(prev) = &previous_kid {
+            if prev != &new_kid && !active_kids.iter().any(|kid| kid == prev) {
+                active_kids.push(prev.clone());
+            }
+        }
+        if !active_kids.iter().any(|kid| kid == &new_kid) {
+            active_kids.push(new_kid.clone());
+        }
 
         self.update_current_kid(services, &new_kid)?;
         self.update_active_kids(services, &active_kids)?;
@@ -167,18 +172,7 @@ impl KeyRotationManager {
         &self,
         services: &RuntimeServices,
     ) -> Result<Vec<String>, Report<TrustedServerError>> {
-        let active_kids_str = services
-            .config_store()
-            .get(&JWKS_STORE_NAME, "active-kids")
-            .change_context(TrustedServerError::Configuration {
-                message: "failed to read active-kids from config store".into(),
-            })?;
-
-        Ok(active_kids_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect())
+        read_active_kids(services)
     }
 
     /// Deactivates a key by removing it from the active keys list.
@@ -399,6 +393,45 @@ mod tests {
         assert!(
             rotation.active_kids.contains(&"new-kid".to_string()),
             "should include new kid in active kids"
+        );
+    }
+
+    #[test]
+    fn rotate_key_preserves_existing_active_kids() {
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), "kid-b".to_string());
+        data.insert("active-kids".to_string(), "kid-a, kid-b".to_string());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services = build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let rotation = manager
+            .rotate_key(&services, Some("kid-c".to_string()))
+            .expect("should rotate key successfully");
+
+        assert_eq!(
+            rotation.active_kids,
+            vec![
+                "kid-a".to_string(),
+                "kid-b".to_string(),
+                "kid-c".to_string()
+            ],
+            "should preserve previously active keys and append the new kid"
+        );
+
+        let active_kids = manager
+            .list_active_keys(&services)
+            .expect("should read back updated active kids");
+        assert_eq!(
+            active_kids,
+            vec![
+                "kid-a".to_string(),
+                "kid-b".to_string(),
+                "kid-c".to_string()
+            ],
+            "should store the full active kid list after rotation"
         );
     }
 

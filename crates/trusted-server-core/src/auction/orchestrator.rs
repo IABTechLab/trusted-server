@@ -617,8 +617,9 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
@@ -672,25 +673,6 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
-    }
-
-    static TEST_SERVICES: std::sync::LazyLock<crate::platform::RuntimeServices> =
-        std::sync::LazyLock::new(noop_services);
-
-    fn create_test_context<'a>(
-        settings: &'a crate::settings::Settings,
-        req: &'a Request,
-        client_info: &'a crate::platform::ClientInfo,
-    ) -> AuctionContext<'a> {
-        let services: &'static crate::platform::RuntimeServices = &TEST_SERVICES;
-        AuctionContext {
-            settings,
-            request: req,
-            client_info,
-            timeout_ms: 2000,
-            provider_responses: None,
-            services,
-        }
     }
 
     #[test]
@@ -780,7 +762,7 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(
+        let context = create_test_auction_context(
             &settings,
             &req,
             &crate::platform::ClientInfo {
@@ -788,6 +770,7 @@ mod tests {
                 tls_protocol: None,
                 tls_cipher: None,
             },
+            2000,
         );
 
         let result = orchestrator

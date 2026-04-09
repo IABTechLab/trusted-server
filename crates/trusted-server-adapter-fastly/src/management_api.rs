@@ -147,6 +147,7 @@ impl FastlyManagementApiClient {
         path: &str,
         body: Option<String>,
         content_type: &str,
+        error_kind: fn() -> PlatformError,
     ) -> Result<Response, Report<PlatformError>> {
         let url = format!("{}{}", self.base_url, path);
 
@@ -156,7 +157,7 @@ impl FastlyManagementApiClient {
             "PUT" => Request::put(&url),
             "DELETE" => Request::delete(&url),
             _ => {
-                return Err(Report::new(PlatformError::ConfigStore)
+                return Err(Report::new(error_kind())
                     .attach(format!("unsupported HTTP method: {}", method)))
             }
         };
@@ -172,8 +173,7 @@ impl FastlyManagementApiClient {
         }
 
         request.send(&self.backend_name).map_err(|e| {
-            Report::new(PlatformError::ConfigStore)
-                .attach(format!("management API request failed: {}", e))
+            Report::new(error_kind()).attach(format!("management API request failed: {}", e))
         })
     }
 
@@ -196,6 +196,7 @@ impl FastlyManagementApiClient {
             &path,
             Some(payload),
             "application/x-www-form-urlencoded",
+            || PlatformError::ConfigStore,
         )?;
 
         let entity_description = format!("key '{}'", key);
@@ -227,7 +228,9 @@ impl FastlyManagementApiClient {
     ) -> Result<(), Report<PlatformError>> {
         let path = build_config_item_path(store_id, key);
 
-        let mut response = self.make_request("DELETE", &path, None, "application/json")?;
+        let mut response = self.make_request("DELETE", &path, None, "application/json", || {
+            PlatformError::ConfigStore
+        })?;
 
         let entity_description = format!("key '{}'", key);
         check_response(
@@ -265,6 +268,7 @@ impl FastlyManagementApiClient {
             &path,
             Some(payload),
             "application/json",
+            || PlatformError::SecretStore,
         )?;
 
         let entity_description = format!("name '{}'", secret_name);
@@ -296,7 +300,9 @@ impl FastlyManagementApiClient {
     ) -> Result<(), Report<PlatformError>> {
         let path = build_secret_path(store_id, secret_name);
 
-        let mut response = self.make_request("DELETE", &path, None, "application/json")?;
+        let mut response = self.make_request("DELETE", &path, None, "application/json", || {
+            PlatformError::SecretStore
+        })?;
 
         let entity_description = format!("name '{}'", secret_name);
         check_response(
@@ -371,5 +377,23 @@ mod tests {
 
         assert_eq!(truncated.len(), 200, "should cap error bodies at 200 chars");
         assert_eq!(truncated, "a".repeat(200), "should trim before truncating");
+    }
+
+    #[test]
+    fn create_secret_uses_secret_store_error_for_transport_failures() {
+        let client = FastlyManagementApiClient {
+            api_key: "test-api-key".to_string(),
+            base_url: FASTLY_API_HOST,
+            backend_name: "missing-management-backend".to_string(),
+        };
+
+        let err = client
+            .create_secret("store-id", "secret-name", "secret-value")
+            .expect_err("should fail when the management API backend is unavailable");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::SecretStore),
+            "should classify secret transport failures as secret-store errors"
+        );
     }
 }

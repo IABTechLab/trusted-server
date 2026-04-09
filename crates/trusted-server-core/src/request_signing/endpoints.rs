@@ -82,7 +82,8 @@ pub struct VerifySignatureResponse {
 ///
 /// # Errors
 ///
-/// Returns an error if the request body cannot be parsed as JSON or if verification fails.
+/// Returns an error if the request body cannot be parsed as JSON or if the
+/// response body cannot be serialized.
 pub fn handle_verify_signature(
     _settings: &Settings,
     services: &RuntimeServices,
@@ -114,12 +115,15 @@ pub fn handle_verify_signature(
             message: "Signature verification failed".into(),
             error: Some("Invalid signature".into()),
         },
-        Err(e) => VerifySignatureResponse {
-            verified: false,
-            kid: verify_req.kid,
-            message: "Verification error".into(),
-            error: Some(format!("{}", e)),
-        },
+        Err(e) => {
+            log::warn!("signature verification failed: {e}");
+            VerifySignatureResponse {
+                verified: false,
+                kid: verify_req.kid,
+                message: "Verification error".into(),
+                error: Some("internal verification error".into()),
+            }
+        }
     };
 
     let response_json = serde_json::to_string(&response).map_err(|e| {
@@ -480,6 +484,47 @@ mod tests {
         );
         assert_eq!(verify_resp.kid, signer.kid);
         assert!(verify_resp.error.is_some());
+    }
+
+    #[test]
+    fn test_handle_verify_signature_hides_internal_error_details() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let verify_req = VerifySignatureRequest {
+            payload: "test message".to_string(),
+            signature: "any-signature".to_string(),
+            kid: "missing-kid".to_string(),
+        };
+
+        let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
+        let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
+        req.set_body(body);
+
+        let services = noop_services();
+        let mut resp = handle_verify_signature(&settings, &services, req)
+            .expect("should return a verification response for internal errors");
+
+        assert_eq!(resp.get_status(), StatusCode::OK, "should return 200 OK");
+
+        let resp_body = resp.take_body_str();
+        let verify_resp: VerifySignatureResponse =
+            serde_json::from_str(&resp_body).expect("should deserialize verify response");
+
+        assert!(
+            !verify_resp.verified,
+            "should mark internal verification errors as unverified"
+        );
+        assert_eq!(verify_resp.kid, "missing-kid");
+        assert_eq!(verify_resp.message, "Verification error");
+        assert_eq!(
+            verify_resp.error.as_deref(),
+            Some("internal verification error"),
+            "should return a generic error to unauthenticated callers"
+        );
+        assert!(
+            !resp_body.contains("failed"),
+            "should not leak internal error details in the response body"
+        );
     }
 
     #[test]

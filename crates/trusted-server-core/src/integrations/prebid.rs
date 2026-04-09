@@ -1212,6 +1212,7 @@ pub fn register_auction_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
@@ -1280,23 +1281,12 @@ mod tests {
         }
     }
 
-    static TEST_SERVICES: std::sync::LazyLock<crate::platform::RuntimeServices> =
-        std::sync::LazyLock::new(crate::platform::test_support::noop_services);
-
     fn create_test_auction_context<'a>(
         settings: &'a Settings,
         request: &'a Request,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
-        let services: &'static crate::platform::RuntimeServices = &TEST_SERVICES;
-        AuctionContext {
-            settings,
-            request,
-            client_info,
-            timeout_ms: 1000,
-            provider_responses: None,
-            services,
-        }
+        shared_test_auction_context(settings, request, client_info, 1000)
     }
 
     fn config_from_settings(
