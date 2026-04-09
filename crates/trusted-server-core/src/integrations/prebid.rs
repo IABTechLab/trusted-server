@@ -540,15 +540,25 @@ impl BidParamOverrideEngine {
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut rules = Vec::new();
 
-        for (bidder, set) in &config.bid_param_overrides {
+        let mut bidder_overrides = config.bid_param_overrides.iter().collect::<Vec<_>>();
+        bidder_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        for (bidder, set) in bidder_overrides {
             rules.push(CompiledBidParamOverrideRule::from_bidder_override(
                 bidder.as_str(),
                 set,
             )?);
         }
 
-        for (bidder, zone_overrides) in &config.bid_param_zone_overrides {
-            for (zone, set) in zone_overrides {
+        let mut zone_overrides = config.bid_param_zone_overrides.iter().collect::<Vec<_>>();
+        zone_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        for (bidder, zone_override_sets) in zone_overrides {
+            let mut sorted_zone_overrides = zone_override_sets.iter().collect::<Vec<_>>();
+            sorted_zone_overrides
+                .sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+            for (zone, set) in sorted_zone_overrides {
                 rules.push(CompiledBidParamOverrideRule::from_zone_override(
                     bidder.as_str(),
                     zone.as_str(),
@@ -585,7 +595,7 @@ impl CompiledBidParamOverrideRule {
         set: &serde_json::Map<String, Json>,
     ) -> Result<Self, Report<TrustedServerError>> {
         Self::new(
-            Some(bidder.to_string()),
+            Some(bidder),
             None,
             set,
             &format!("integrations.prebid.bid_param_overrides.{bidder}"),
@@ -598,16 +608,16 @@ impl CompiledBidParamOverrideRule {
         set: &serde_json::Map<String, Json>,
     ) -> Result<Self, Report<TrustedServerError>> {
         Self::new(
-            Some(bidder.to_string()),
-            Some(zone.to_string()),
+            Some(bidder),
+            Some(zone),
             set,
             &format!("integrations.prebid.bid_param_zone_overrides.{bidder}.{zone}"),
         )
     }
 
     fn new(
-        bidder: Option<String>,
-        zone: Option<String>,
+        bidder: Option<&str>,
+        zone: Option<&str>,
         set: &serde_json::Map<String, Json>,
         source: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
@@ -653,8 +663,8 @@ impl TryFrom<BidParamOverrideRule> for CompiledBidParamOverrideRule {
 
     fn try_from(rule: BidParamOverrideRule) -> Result<Self, Self::Error> {
         Self::new(
-            rule.when.bidder,
-            rule.when.zone,
+            rule.when.bidder.as_deref(),
+            rule.when.zone.as_deref(),
             &rule.set,
             "integrations.prebid.bid_param_override_rules[*]",
         )
@@ -662,17 +672,19 @@ impl TryFrom<BidParamOverrideRule> for CompiledBidParamOverrideRule {
 }
 
 fn validate_override_matcher_string(
-    value: String,
+    value: &str,
     field: &str,
     source: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    if value.trim().is_empty() {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!("{source}.{field} must not be empty"),
         }));
     }
 
-    Ok(value)
+    Ok(trimmed.to_string())
 }
 
 fn non_empty_override_object(
@@ -3412,6 +3424,14 @@ set = { placementId = "explicit_header" }
             Json::Object(map)
         }
 
+        fn rule_signature(rule: &CompiledBidParamOverrideRule) -> String {
+            format!(
+                "{}:{}",
+                rule.bidder.as_deref().unwrap_or("*"),
+                rule.zone.as_deref().unwrap_or("*")
+            )
+        }
+
         #[test]
         fn engine_normalizes_static_compatibility_rule() {
             let mut config = base_config();
@@ -3590,6 +3610,91 @@ set = { placementId = "explicit_header" }
                 "should merge additional explicit keys"
             );
             assert_eq!(params["keep"], "yes", "should preserve unrelated params");
+        }
+
+        #[test]
+        fn compile_rule_trims_matcher_whitespace() {
+            let rule = BidParamOverrideRule {
+                when: BidParamOverrideWhen {
+                    bidder: Some(" kargo ".to_string()),
+                    zone: Some(" header ".to_string()),
+                },
+                set: json_object(json!({ "placementId": "trimmed" })),
+            };
+
+            let compiled = CompiledBidParamOverrideRule::try_from(rule)
+                .expect("should compile rule with surrounding whitespace");
+
+            assert_eq!(
+                compiled.bidder.as_deref(),
+                Some("kargo"),
+                "should store trimmed bidder matcher"
+            );
+            assert_eq!(
+                compiled.zone.as_deref(),
+                Some("header"),
+                "should store trimmed zone matcher"
+            );
+            assert!(
+                compiled.matches(BidParamOverrideFacts {
+                    bidder: "kargo",
+                    zone: Some("header"),
+                }),
+                "trimmed matchers should match normalized request facts"
+            );
+        }
+
+        #[test]
+        fn engine_compiles_compatibility_rules_in_sorted_matcher_order() {
+            let expected = [
+                "alpha:*",
+                "beta:*",
+                "gamma:*",
+                "kargo:footer",
+                "kargo:header",
+                "openx:sidebar",
+            ];
+
+            for iteration in 0..16 {
+                let mut config = base_config();
+                config.bid_param_overrides = HashMap::from([
+                    ("gamma".to_string(), json_object(json!({ "networkId": 3 }))),
+                    ("alpha".to_string(), json_object(json!({ "networkId": 1 }))),
+                    ("beta".to_string(), json_object(json!({ "networkId": 2 }))),
+                ]);
+                config.bid_param_zone_overrides = HashMap::from([
+                    (
+                        "openx".to_string(),
+                        HashMap::from([(
+                            "sidebar".to_string(),
+                            json_object(json!({ "placementId": "openx-sidebar" })),
+                        )]),
+                    ),
+                    (
+                        "kargo".to_string(),
+                        HashMap::from([
+                            (
+                                "header".to_string(),
+                                json_object(json!({ "placementId": "kargo-header" })),
+                            ),
+                            (
+                                "footer".to_string(),
+                                json_object(json!({ "placementId": "kargo-footer" })),
+                            ),
+                        ]),
+                    ),
+                ]);
+
+                let engine = BidParamOverrideEngine::try_from_config(&config)
+                    .expect("should compile compatibility overrides");
+                let actual = engine.rules.iter().map(rule_signature).collect::<Vec<_>>();
+
+                assert_eq!(
+                    actual,
+                    expected,
+                    "compatibility rules should compile in sorted matcher order on iteration {iteration}"
+                );
+            }
         }
 
         #[test]
