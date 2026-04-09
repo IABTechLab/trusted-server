@@ -238,10 +238,7 @@ async fn route_request(
                             // Response already sent via stream_to_client()
                             return None;
                         }
-                        Ok(PublisherResponse::PassThrough {
-                            mut response,
-                            body,
-                        }) => {
+                        Ok(PublisherResponse::PassThrough { mut response, body }) => {
                             // Binary pass-through: reattach body and send via send_to_client().
                             // This preserves Content-Length and avoids chunked encoding overhead.
                             // Fastly streams the body from its internal buffer — no WASM

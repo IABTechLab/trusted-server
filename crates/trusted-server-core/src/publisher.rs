@@ -275,8 +275,8 @@ pub enum PublisherResponse {
         params: OwnedProcessResponseParams,
     },
     /// Non-processable 2xx response (images, fonts, video). The caller must:
-    /// 1. Call `finalize_response()` on the response
-    /// 2. Reattach the body via `response.set_body(body)`
+    /// 1. Reattach the body via `response.set_body(body)`
+    /// 2. Call `finalize_response()` on the response
     /// 3. Call `response.send_to_client()`
     ///
     /// `Content-Length` is preserved — the body is unmodified. Using
@@ -819,10 +819,9 @@ mod tests {
         // pass-through doesn't process, so the host is irrelevant.
         let should_process = false;
         let is_success = true;
-        let request_host_empty = true;
-        // In production: enters the `!should_process || request_host.is_empty()` block,
-        // then the PassThrough guard checks `is_success && !should_process` — host irrelevant.
-        let _enters_early_return = !should_process || request_host_empty;
+        // In production, empty host enters the early-return block via
+        // `!should_process || request_host.is_empty()`. The PassThrough guard
+        // checks `is_success && !should_process` — host is irrelevant.
         let should_pass_through = is_success && !should_process;
         assert!(
             should_pass_through,
