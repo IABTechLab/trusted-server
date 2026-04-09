@@ -17,10 +17,7 @@ fern = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 log-fastly = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-trusted-server-core = { path = "../trusted-server-core" }
-trusted-server-js = { path = "../js" }
+trusted-server-core = {workspace = true}
 
 [dev-dependencies]
 edgezero-core = { workspace = true, features = ["test-utils"] }
