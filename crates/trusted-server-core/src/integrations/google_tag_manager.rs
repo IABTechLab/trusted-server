@@ -135,8 +135,10 @@ pub struct GoogleTagManagerIntegration {
     /// Accumulates text fragments when `lol_html` splits a text node across
     /// chunk boundaries. Drained on `is_last_in_text_node`.
     ///
-    /// `lol_html` delivers text chunks sequentially per element — the buffer
-    /// is always empty when a new element's text begins.
+    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
+    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
+    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
+    /// per element — the buffer is always empty when a new element's text begins.
     accumulated_text: Mutex<String>,
 }
 
@@ -1771,6 +1773,73 @@ container_id = "GTM-DEFAULT"
                 );
             }
             other => panic!("expected Replace with passthrough, got {other:?}"),
+        }
+    }
+
+    /// Verify the accumulation buffer drains correctly between two consecutive
+    /// `<script>` elements. The first is a fragmented GTM script, the second
+    /// is a fragmented non-GTM script. Both must produce correct output.
+    #[test]
+    fn accumulation_buffer_drains_between_consecutive_script_elements() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-MULTI1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+
+        // --- First <script>: fragmented GTM snippet ---
+        let gtm_frag1 = r#"j.src='https://www.google"#;
+        let gtm_frag2 = r#"tagmanager.com/gtm.js?id=GTM-MULTI1';"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action =
+            IntegrationScriptRewriter::rewrite(&*integration, gtm_frag1, &ctx_intermediate);
+        assert_eq!(action, ScriptRewriteAction::RemoveNode);
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, gtm_frag2, &ctx_last);
+        assert!(
+            matches!(action, ScriptRewriteAction::Replace(ref s) if s.contains("/integrations/google_tag_manager/gtm.js")),
+            "first element: should rewrite GTM URL. Got: {action:?}"
+        );
+
+        // --- Second <script>: fragmented non-GTM script ---
+        // Buffer must be empty here — no leftover from the first element.
+        let other_frag1 = "console.log('hel";
+        let other_frag2 = "lo');";
+
+        let action =
+            IntegrationScriptRewriter::rewrite(&*integration, other_frag1, &ctx_intermediate);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::RemoveNode,
+            "second element intermediate should suppress"
+        );
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, other_frag2, &ctx_last);
+        match action {
+            ScriptRewriteAction::Replace(content) => {
+                assert_eq!(
+                    content, "console.log('hello');",
+                    "second element should contain only its own content, no GTM leftover"
+                );
+            }
+            other => panic!("expected Replace for second element, got {other:?}"),
         }
     }
 

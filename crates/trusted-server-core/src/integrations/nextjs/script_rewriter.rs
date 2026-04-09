@@ -17,8 +17,10 @@ pub(super) struct NextJsNextDataRewriter {
     /// Accumulates text fragments when `lol_html` splits a text node across
     /// chunk boundaries. Drained on `is_last_in_text_node`.
     ///
-    /// `lol_html` delivers text chunks sequentially per element — the buffer
-    /// is always empty when a new element's text begins.
+    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
+    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
+    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
+    /// per element — the buffer is always empty when a new element's text begins.
     accumulated_text: Mutex<String>,
 }
 
