@@ -10,8 +10,10 @@ use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::integrations::{IntegrationEndpoint, IntegrationProxy, IntegrationRegistration};
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::integrations::{
+    ensure_integration_backend, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+};
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
@@ -169,21 +171,7 @@ impl DidomiIntegration {
         services: &RuntimeServices,
         origin: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed = Url::parse(origin).change_context(Self::error("Invalid Didomi origin URL"))?;
-
-        services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: parsed.scheme().to_string(),
-                host: parsed
-                    .host_str()
-                    .ok_or_else(|| Report::new(Self::error("Didomi origin missing host")))?
-                    .to_string(),
-                port: parsed.port(),
-                certificate_check: true,
-                first_byte_timeout: std::time::Duration::from_secs(15),
-            })
-            .change_context(Self::error("Failed to register Didomi backend"))
+        ensure_integration_backend(services, origin, DIDOMI_INTEGRATION_ID)
     }
 }
 
