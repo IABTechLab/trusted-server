@@ -156,19 +156,13 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
-            let select_result = services
+            let platform_resp = services
                 .http_client()
-                .select(vec![PlatformPendingRequest::new(pending)])
+                .wait(PlatformPendingRequest::new(pending))
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} request failed", mediator.provider_name()),
                 })?;
-            let platform_resp =
-                select_result
-                    .ready
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} request failed", mediator.provider_name()),
-                    })?;
             let backend_response = platform_response_to_fastly(platform_resp).change_context(
                 TrustedServerError::Auction {
                     message: format!(

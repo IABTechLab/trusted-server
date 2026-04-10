@@ -91,6 +91,12 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// Domains allowed for the initial request and any redirects.
+    ///
+    /// When empty every host is permitted (open mode). Integration proxies
+    /// should leave this empty; first-party handlers should pass
+    /// `&settings.proxy.allowed_domains` to enforce the publisher allowlist.
+    pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
@@ -105,6 +111,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &[],
         }
     }
 
@@ -420,6 +427,11 @@ struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
     copy_request_headers: bool,
     services: &'a RuntimeServices,
+    /// Domains permitted for the initial request and any redirects.
+    ///
+    /// Empty slice means open mode (all hosts allowed). Populated by first-party
+    /// handlers; integration proxies leave it empty.
+    allowed_domains: &'a [String],
 }
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
@@ -446,6 +458,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        allowed_domains,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -468,6 +481,7 @@ pub async fn proxy_request(
             additional_headers: &headers,
             copy_request_headers,
             services,
+            allowed_domains,
         },
         stream_passthrough,
     )
@@ -579,7 +593,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -699,7 +713,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -763,6 +777,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            allowed_domains: &settings.proxy.allowed_domains,
         },
         services,
     )
@@ -1225,6 +1240,7 @@ mod tests {
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
+        SUPPORTED_ENCODINGS,
     };
     use crate::constants::HEADER_ACCEPT;
     use crate::creative;
@@ -1976,6 +1992,7 @@ mod tests {
                 headers: Vec::new(),
                 copy_request_headers: false,
                 stream_passthrough: false,
+                allowed_domains: &[],
             },
             &services,
         )
@@ -1987,6 +2004,69 @@ mod tests {
         assert_eq!(
             calls[0], "stub-backend",
             "should use backend name from StubBackend"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
+        use crate::platform::test_support::StubHttpClient;
+
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let mut req = Request::new(Method::GET, "https://example.com/");
+        req.set_header(header::USER_AGENT, "test-agent/1.0");
+        req.set_header(header::ACCEPT, "text/html");
+        req.set_header(header::ACCEPT_LANGUAGE, "en-US");
+
+        let result = proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig {
+                target_url: "https://example.com/resource",
+                follow_redirects: false,
+                forward_ec_id: false,
+                body: None,
+                headers: Vec::new(),
+                copy_request_headers: true,
+                stream_passthrough: false,
+                allowed_domains: &[],
+            },
+            &services,
+        )
+        .await;
+
+        assert!(result.is_ok(), "should proxy successfully");
+        let all_headers = stub.recorded_request_headers();
+        assert_eq!(all_headers.len(), 1, "should have captured one request");
+        let sent = &all_headers[0];
+
+        let header_value = |name: &str| -> Option<String> {
+            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            header_value("user-agent").as_deref(),
+            Some("test-agent/1.0"),
+            "should forward User-Agent"
+        );
+        assert_eq!(
+            header_value("accept").as_deref(),
+            Some("text/html"),
+            "should forward Accept"
+        );
+        assert_eq!(
+            header_value("accept-language").as_deref(),
+            Some("en-US"),
+            "should forward Accept-Language"
+        );
+        assert_eq!(
+            header_value("accept-encoding").as_deref(),
+            Some(SUPPORTED_ENCODINGS),
+            "should override Accept-Encoding with supported encodings"
         );
     }
 
@@ -2009,6 +2089,7 @@ mod tests {
                 headers: Vec::new(),
                 copy_request_headers: false,
                 stream_passthrough: false,
+                allowed_domains: &[],
             },
             &services,
         )
