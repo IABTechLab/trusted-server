@@ -38,6 +38,12 @@ pub fn handle_sync(
 ) -> Result<Response, Report<TrustedServerError>> {
     let query = SyncQuery::parse(req)?;
 
+    if query.uid.trim().is_empty() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "uid must not be empty or whitespace-only".to_owned(),
+        }));
+    }
+
     if query.uid.len() > MAX_UID_LENGTH {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: format!("uid exceeds maximum length of {MAX_UID_LENGTH} bytes"),
@@ -88,7 +94,7 @@ pub fn handle_sync(
         log::warn!(
             "Pixel sync write failed for partner '{}' and ec_id '{}': {err:?}",
             partner.id,
-            cookie_ec_id,
+            super::log_id(&cookie_ec_id),
         );
         return Ok(redirect_with_status(&return_url, "0", Some("write_failed")));
     }

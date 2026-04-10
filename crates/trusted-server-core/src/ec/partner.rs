@@ -148,10 +148,7 @@ pub fn validate_pull_sync_config(record: &PartnerRecord) -> Result<(), String> {
 
     let url_str = record.pull_sync_url.as_deref().unwrap_or("");
     if url_str.is_empty() {
-        return Err(
-            "pull_sync_url and ts_pull_token are required when pull_sync_enabled is true"
-                .to_owned(),
-        );
+        return Err("pull_sync_url is required when pull_sync_enabled is true".to_owned());
     }
 
     if record
@@ -161,10 +158,7 @@ pub fn validate_pull_sync_config(record: &PartnerRecord) -> Result<(), String> {
         .trim()
         .is_empty()
     {
-        return Err(
-            "pull_sync_url and ts_pull_token are required when pull_sync_enabled is true"
-                .to_owned(),
-        );
+        return Err("ts_pull_token is required when pull_sync_enabled is true".to_owned());
     }
 
     // Validate that the pull sync URL uses HTTPS (bearer tokens must not

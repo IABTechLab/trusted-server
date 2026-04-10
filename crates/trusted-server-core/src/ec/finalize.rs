@@ -51,12 +51,12 @@ pub fn ec_finalize_response(
                     for ec_id in &ids_to_withdraw {
                         if let Err(err) = store.delete(ec_id) {
                             log::warn!(
-                                "Failed to delete consent KV entry for '{}…': {err:?}",
+                                "Failed to delete consent KV entry for '{}': {err:?}",
                                 log_id(ec_id)
                             );
                         } else {
                             log::info!(
-                                "Deleted consent KV entry for '{}…' (consent revoked)",
+                                "Deleted consent KV entry for '{}' (consent revoked)",
                                 log_id(ec_id)
                             );
                         }
@@ -71,7 +71,7 @@ pub fn ec_finalize_response(
             for ec_id in &ids_to_withdraw {
                 if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
                     log::error!(
-                        "Failed to write withdrawal tombstone for EC ID '{}…': {err:?}",
+                        "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
                         log_id(ec_id),
                     );
                 }
@@ -88,7 +88,7 @@ pub fn ec_finalize_response(
                 graph.update_last_seen(ec_id, current_timestamp(), &settings.publisher.domain)
             {
                 log::error!(
-                    "Failed to update last_seen for EC ID '{}…': {err:?}",
+                    "Failed to update last_seen for EC ID '{}': {err:?}",
                     log_id(ec_id)
                 );
             }
