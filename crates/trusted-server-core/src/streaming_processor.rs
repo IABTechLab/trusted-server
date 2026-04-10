@@ -8,13 +8,13 @@
 //!
 //! # Platform notes
 //!
-//! This module is **platform-agnostic** (verified in PR 8). It has zero
+//! This module is **platform-agnostic** (verified in the content rewriting verification). It has zero
 //! `fastly` imports. [`StreamingPipeline::process`] is generic over
 //! `R: Read + W: Write` — any reader or writer works, including
 //! `fastly::Body` (which implements `std::io::Read`) or standard
 //! `std::io::Cursor<&[u8]>`.
 //!
-//! Future adapters (PR 16/17) do not need to implement any compression or
+//! Future adapters (subsequent adapter migrations) do not need to implement any compression or
 //! streaming interface. See `crate::platform` module doc for the
 //! authoritative note.
 
