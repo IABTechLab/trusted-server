@@ -137,8 +137,7 @@ fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
     let host = url.host_str().unwrap_or_default();
     if !host.ends_with(".privacy-mgmt.com") {
         let mut err = ValidationError::new("disallowed_host");
-        err.message =
-            Some("cdn_origin host must end with .privacy-mgmt.com".into());
+        err.message = Some("cdn_origin host must end with .privacy-mgmt.com".into());
         return Err(err);
     }
 
@@ -333,6 +332,12 @@ fn build(
 ///
 /// Returns an error when the Sourcepoint integration is enabled with invalid
 /// configuration.
+///
+/// # Examples
+///
+/// ```ignore
+/// let registration = sourcepoint::register(&settings)?;
+/// ```
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -426,9 +431,7 @@ impl IntegrationProxy for SourcepointIntegration {
                         &format!("http://{SOURCEPOINT_CDN_HOST}"),
                         SOURCEPOINT_CDN_PREFIX,
                     );
-                log::info!(
-                    "Sourcepoint: rewrote redirect Location to {rewritten_location}"
-                );
+                log::info!("Sourcepoint: rewrote redirect Location to {rewritten_location}");
                 response.set_header(header::LOCATION, &rewritten_location);
             }
             self.apply_cache_headers(&mut response);
@@ -511,10 +514,8 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
-        if !self.config.rewrite_sdk {
-            return AttributeRewriteAction::keep();
-        }
-
+        // `handles_attribute()` already gates on `rewrite_sdk`, so this
+        // method is only called when rewriting is enabled.
         if let Some(rewritten) = self.build_first_party_url(attr_value, ctx) {
             return AttributeRewriteAction::replace(rewritten);
         }
@@ -746,17 +747,14 @@ mod tests {
         let mut cfg = config(true);
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
 
-        assert_eq!(
-            integration.rewrite("src", "https://cdn.privacy-mgmt.com/wrapper.js", &ctx,),
-            AttributeRewriteAction::keep(),
-            "should not rewrite when rewrite_sdk is false"
+        assert!(
+            !integration.handles_attribute("src"),
+            "should not handle src when rewrite_sdk is false"
+        );
+        assert!(
+            !integration.handles_attribute("href"),
+            "should not handle href when rewrite_sdk is false"
         );
     }
 
@@ -837,6 +835,45 @@ mod tests {
         assert!(
             inserts.is_empty(),
             "should not inject anything when rewrite_sdk is false"
+        );
+    }
+
+    #[test]
+    fn rejects_cdn_origin_outside_privacy_mgmt_domain() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "http://169.254.169.254".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "should reject cdn_origin not on *.privacy-mgmt.com"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_cdn_origin() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "should accept cdn_origin on *.privacy-mgmt.com"
+        );
+    }
+
+    #[test]
+    fn rewrites_single_quoted_origin_plus_unified_pattern() {
+        let input = r#"return t.origin+'/unified/4.40.1/'}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output, r#"return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}"#,
+            "should rewrite single-quoted unified path"
         );
     }
 }
