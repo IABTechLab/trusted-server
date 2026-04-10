@@ -24,6 +24,7 @@ It also runs as a monitoring tool — `--diff` mode compares a new sweep against
 /audit-js-assets https://www.publisher.com                # init — generate js-assets.toml
 /audit-js-assets https://www.publisher.com --diff         # diff — compare against existing file
 /audit-js-assets https://www.publisher.com --settle 15000 # longer settle for ad-tech-heavy pages
+/audit-js-assets https://www.publisher.com --no-filter    # bypass heuristic filtering
 ```
 
 ---
@@ -54,6 +55,8 @@ A network request is **first-party** if the request URL's host, after stripping 
 
 Publisher-owned CDN subdomains (e.g., `cdn.publisher.com`, `static.publisher.com`) are treated as third-party by default. If the publisher wants to exclude them, they can be added to a `first_party_hosts` list in the command invocation (e.g., `--first-party cdn.publisher.com`).
 
+**Auto-detection:** The target URL's hostname is automatically included as first-party, in addition to `publisher.domain` from `trusted-server.toml`. This ensures that auditing `https://golf.com` when `publisher.domain = "test-publisher.com"` correctly excludes `golf.com` scripts without requiring `--first-party golf.com`.
+
 ### URL normalization
 
 Applied to every captured script URL before slug generation and before persisting `origin_url`:
@@ -72,14 +75,25 @@ The following origin categories are excluded silently. The terminal summary repo
 
 **Matching:** Filter entries match if the request URL's host ends with the filter entry, with a dot-boundary check. For example, `googletagmanager.com` in the filter matches `www.googletagmanager.com` but not `evil-googletagmanager.com`.
 
-| Category       | Excluded origins                                                               |
-| -------------- | ------------------------------------------------------------------------------ |
-| Framework CDNs | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com` |
-| Error tracking | `sentry.io`, `bugsnag.com`, `rollbar.com`                                      |
-| Font services  | `fonts.googleapis.com`, `fonts.gstatic.com`                                    |
-| Social embeds  | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`               |
+| Category            | Excluded origins                                                                              |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| Framework CDNs      | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com`                |
+| Error tracking      | `sentry.io`, `bugsnag.com`, `rollbar.com`                                                     |
+| Font services       | `fonts.googleapis.com`, `fonts.gstatic.com`                                                   |
+| Social embeds       | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`                              |
+| Google ad rendering | `pagead2.googlesyndication.com`, `tpc.googlesyndication.com`, `s0.2mdn.net`,                  |
+|                     | `googleads.g.doubleclick.net`, `www.googleadservices.com`                                     |
+| Ad fraud detection  | `adtrafficquality.google`                                                                     |
+| Ad verification     | `adsafeprotected.com`, `moatads.com`, `doubleverify.com`                                      |
+| reCAPTCHA           | `recaptcha.net`, `www.google.com/recaptcha/*`, `www.gstatic.com/recaptcha/*`                   |
+
+**Path-prefix matching:** Some hosts (e.g., `www.google.com`) serve both filterable and non-filterable resources. Entries with a path suffix (e.g., `www.google.com/recaptcha/*`) match only when the URL's path begins with the specified prefix. Plain host entries use dot-boundary suffix matching as before.
 
 **`googletagmanager.com` is not filtered** — GTM is ad tech and should be proxied.
+
+**`securepubads.g.doubleclick.net` is not filtered** — this is the GPT ad server SDK. Publishers deliberately place this tag. Its sub-resources (e.g., `pubads_impl.js`) are also intentional. The filter targets ad-rendering infrastructure (iframes, creatives, verification), not ad-serving SDKs.
+
+**`--no-filter`** bypasses heuristic filtering entirely, surfacing all non-first-party scripts. First-party filtering always applies.
 
 Everything else surfaces for operator review.
 
@@ -116,7 +130,7 @@ The pipe (`|`) separator is required — it cannot appear in domain names or at 
 
 Path segments matching any of these patterns are replaced with `*`:
 
-- Semver: `\d+\.\d+[\.\d-]*` (e.g., `1.19.8-hcskhn`)
+- Semver: `\d+\.\d+[\.\d\w-]*` (e.g., `1.19.8-hcskhn`)
 - Hex hash: `[a-f0-9]{8,}` between path separators (lowercase hex, minimum 8 characters)
 - Mixed alphanumeric hash: `[A-Za-z0-9]{8,}` between path separators, **must contain at least one digit and at least one letter** — this excludes pure-alpha dictionary words like `analytics` or `bootstrap`
 
@@ -209,9 +223,12 @@ Missing:    1 asset no longer seen on page ⚠
 
 ## Implementation
 
-The Auditor is a Claude Code skill file. No compiled code.
+The Auditor has two components:
 
-**Skill location:** `.claude/commands/audit-js-assets.md`
+1. **Skill file** (`.claude/commands/audit-js-assets.md`) — Drives the browser via Chrome DevTools MCP, collects raw script URLs, and calls the processing script. ~100 lines.
+2. **Processing script** (`scripts/audit-js-assets.mjs`) — Pure Node.js script (no external dependencies) that performs URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting. Takes raw data on stdin (JSON with `networkUrls` and `headUrls`), writes TOML to a file, and prints a JSON summary to stdout.
+
+This split ensures deterministic, testable processing (the script) while keeping browser automation in the LLM's domain (the skill).
 
 **MCP tools used:**
 
@@ -221,12 +238,15 @@ The Auditor is a Claude Code skill file. No compiled code.
 - `mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script` — settle window + detect head-loaded scripts via DOM query
 - `mcp__plugin_chrome-devtools-mcp_chrome-devtools__close_page` — clean up tab
 
-**Permission grants required:** `navigate_page`, `list_network_requests`, and `close_page` are not currently approved in `.claude/settings.json`. Add them to `permissions.allow` before running the skill, or expect interactive permission prompts on first run.
+**Standalone utilities:**
+
+- `scripts/js-asset-slug.mjs` — Standalone slug generator for individual URLs
+- `scripts/audit-js-assets.mjs` — Full audit processing pipeline
 
 **File tools used:**
 
-- `Read` — read `trusted-server.toml` (publisher domain) and existing `js-assets.toml` (diff mode)
-- `Write` — write generated/updated `js-assets.toml`
+- `Read` — read `trusted-server.toml` (publisher domain)
+- `Write` — write input JSON for processing script
 
 ---
 
