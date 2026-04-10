@@ -46,11 +46,11 @@ pub const JWKS_CONFIG_STORE_NAME: &str = "jwks_store";
 pub const SIGNING_SECRET_STORE_NAME: &str = "signing_keys";
 
 /// Lazily constructed [`StoreName`] for JWKS config-store reads.
-pub static JWKS_STORE_NAME: LazyLock<StoreName> =
+pub(crate) static JWKS_STORE_NAME: LazyLock<StoreName> =
     LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
 
 /// Lazily constructed [`StoreName`] for signing-key secret-store reads.
-pub static SIGNING_STORE_NAME: LazyLock<StoreName> =
+pub(crate) static SIGNING_STORE_NAME: LazyLock<StoreName> =
     LazyLock::new(|| StoreName::from(SIGNING_SECRET_STORE_NAME));
 
 fn parse_active_kids(active_kids: &str) -> Vec<String> {
@@ -77,3 +77,53 @@ pub use endpoints::*;
 pub use jwks::*;
 pub use rotation::*;
 pub use signing::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_active_kids_splits_comma_separated_kids() {
+        let result = parse_active_kids("kid-a,kid-b,kid-c");
+        assert_eq!(result, vec!["kid-a", "kid-b", "kid-c"]);
+    }
+
+    #[test]
+    fn parse_active_kids_trims_whitespace_around_each_kid() {
+        let result = parse_active_kids(" kid-a , kid-b ");
+        assert_eq!(result, vec!["kid-a", "kid-b"]);
+    }
+
+    #[test]
+    fn parse_active_kids_skips_empty_segments() {
+        let result = parse_active_kids("kid-a,,kid-b");
+        assert_eq!(result, vec!["kid-a", "kid-b"]);
+    }
+
+    #[test]
+    fn parse_active_kids_skips_whitespace_only_segments() {
+        let result = parse_active_kids(" kid-a , , kid-b ");
+        assert_eq!(result, vec!["kid-a", "kid-b"]);
+    }
+
+    #[test]
+    fn parse_active_kids_returns_empty_for_empty_string() {
+        let result = parse_active_kids("");
+        assert!(result.is_empty(), "should return no kids for empty input");
+    }
+
+    #[test]
+    fn parse_active_kids_returns_empty_for_only_commas() {
+        let result = parse_active_kids(",,,");
+        assert!(
+            result.is_empty(),
+            "should return no kids when input is only commas"
+        );
+    }
+
+    #[test]
+    fn parse_active_kids_handles_single_kid() {
+        let result = parse_active_kids("only-kid");
+        assert_eq!(result, vec!["only-kid"]);
+    }
+}
