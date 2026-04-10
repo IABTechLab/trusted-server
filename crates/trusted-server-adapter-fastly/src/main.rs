@@ -138,7 +138,7 @@ async fn route_request(
     let method = req.method().clone();
 
     // Match known routes and handle them
-    match (method.clone(), path.as_str()) {
+    match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&req, integration_registry)
