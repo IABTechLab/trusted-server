@@ -24,7 +24,6 @@ use super::EcContext;
 #[derive(Debug, Clone)]
 pub struct PullSyncContext {
     ec_id: String,
-    client_ip: String,
 }
 
 impl PullSyncContext {
@@ -32,12 +31,6 @@ impl PullSyncContext {
     #[must_use]
     pub fn ec_id(&self) -> &str {
         &self.ec_id
-    }
-
-    /// Returns the normalized client IP for pull endpoint query parameters.
-    #[must_use]
-    pub fn client_ip(&self) -> &str {
-        &self.client_ip
     }
 }
 
@@ -53,8 +46,7 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC, there is no active EC ID, or no
-/// client IP is available.
+/// Returns `None` when consent denies EC or there is no active EC ID.
 #[must_use]
 pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
     if !ec_context.ec_allowed() {
@@ -68,8 +60,7 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
     }
 
     let ec_id = ec_id_ref.to_owned();
-    let client_ip = ec_context.client_ip()?.to_owned();
-    Some(PullSyncContext { ec_id, client_ip })
+    Some(PullSyncContext { ec_id })
 }
 
 /// Dispatches partner pull-sync requests in the background.
@@ -88,7 +79,7 @@ pub fn dispatch_pull_sync(
         Err(err) => {
             log::warn!(
                 "Pull sync: failed to read identity graph for '{}': {err:?}",
-                context.ec_id()
+                super::log_id(context.ec_id())
             );
             return;
         }
@@ -142,7 +133,7 @@ pub fn dispatch_pull_sync(
                 log::debug!(
                     "Pull sync: rate-limited partner '{}' for ec_id '{}'",
                     partner.id,
-                    context.ec_id()
+                    super::log_id(context.ec_id())
                 );
                 continue;
             }
@@ -164,7 +155,7 @@ pub fn dispatch_pull_sync(
             continue;
         };
 
-        let request_url = build_pull_request_url(url, context.ec_id(), context.client_ip());
+        let request_url = build_pull_request_url(url, context.ec_id());
         let mut request = Request::new(Method::GET, request_url.as_str());
         request.set_header("authorization", format!("Bearer {token}"));
 
@@ -266,11 +257,8 @@ fn validated_pull_sync_url(partner: &PartnerRecord) -> Option<Url> {
     Some(parsed)
 }
 
-fn build_pull_request_url(mut base_url: Url, ec_id: &str, client_ip: &str) -> Url {
-    base_url
-        .query_pairs_mut()
-        .append_pair("ec_id", ec_id)
-        .append_pair("ip", client_ip);
+fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
+    base_url.query_pairs_mut().append_pair("ec_id", ec_id);
     base_url
 }
 
@@ -296,11 +284,17 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
             log::warn!(
                 "Pull sync: failed to upsert partner '{}' for ec_id '{}': {err:?}",
                 partner_id,
-                ec_id
+                super::log_id(ec_id)
             );
         }
     }
 }
+
+/// Maximum response body size accepted from pull sync partners (64 KiB).
+///
+/// The expected response is `{"uid":"<string>"}`, so 64 KiB is generous.
+/// This prevents a misbehaving partner from exhausting WASM memory.
+const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024;
 
 fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<String> {
     let status = response.get_status();
@@ -323,6 +317,14 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
     }
 
     let body = response.take_body_bytes();
+    if body.len() > MAX_PULL_RESPONSE_BYTES {
+        log::warn!(
+            "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",
+            partner_id,
+            body.len()
+        );
+        return None;
+    }
     let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
         Ok(payload) => payload,
         Err(err) => {
@@ -336,7 +338,7 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
 
     use super::kv_types::MAX_UID_LENGTH;
 
-    let uid = payload.uid.filter(|value| !value.is_empty());
+    let uid = payload.uid.filter(|value| !value.trim().is_empty());
     match uid {
         None => {
             log::debug!(
@@ -385,38 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn build_pull_sync_context_requires_ec_and_ip() {
-        let consent = ConsentContext {
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-            ..ConsentContext::default()
-        };
-        let ec_context =
-            EcContext::new_for_test(Some(format!("{}.ABC123", "a".repeat(64))), consent);
-
-        let context = build_pull_sync_context(&ec_context);
-        assert!(
-            context.is_none(),
-            "should require client_ip for pull sync dispatch context"
-        );
-    }
-
-    #[test]
     fn build_pull_sync_context_returns_context_when_valid() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context =
-            EcContext::new_for_test_with_ip(Some(ec_id), consent, Some("1.2.3.4".to_owned()));
+        let ec_context = EcContext::new_for_test(Some(ec_id), consent);
 
         let context = build_pull_sync_context(&ec_context)
-            .expect("should build pull sync context for valid EC with IP");
+            .expect("should build pull sync context for valid EC");
         assert_eq!(
             context.ec_id(),
-            ec_context.ec_value().expect("ec should be present")
+            ec_context.ec_value().expect("ec should be present"),
+            "should capture the EC ID from context"
         );
-        assert_eq!(context.client_ip(), "1.2.3.4");
     }
 
     #[test]
@@ -425,11 +410,7 @@ mod tests {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
-        let ec_context = EcContext::new_for_test_with_ip(
-            Some("invalid-ec".to_owned()),
-            consent,
-            Some("1.2.3.4".to_owned()),
-        );
+        let ec_context = EcContext::new_for_test(Some("invalid-ec".to_owned()), consent);
 
         let context = build_pull_sync_context(&ec_context);
         assert!(
@@ -498,14 +479,17 @@ mod tests {
     }
 
     #[test]
-    fn build_pull_request_url_appends_query_pairs() {
+    fn build_pull_request_url_appends_ec_id() {
         let url = Url::parse("https://sync.partner.test/pull?x=1").expect("should parse URL");
-        let result = build_pull_request_url(url, "ecid123", "1.2.3.4");
+        let result = build_pull_request_url(url, "ecid123");
 
         let query = result.query().expect("should have query string");
         assert!(query.contains("x=1"), "should preserve existing query");
         assert!(query.contains("ec_id=ecid123"), "should append ec_id");
-        assert!(query.contains("ip=1.2.3.4"), "should append ip");
+        assert!(
+            !query.contains("ip="),
+            "should not forward client IP to partners"
+        );
     }
 
     #[test]

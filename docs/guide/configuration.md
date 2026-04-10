@@ -37,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
+export TRUSTED_SERVER__EC__PASSPHRASE=your-passphrase
 ```
 
 ### Generate Secure Secrets
@@ -953,7 +953,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=$(cat /run/secrets/ec_secret)
+TRUSTED_SERVER__EC__PASSPHRASE=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
