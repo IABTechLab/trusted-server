@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
