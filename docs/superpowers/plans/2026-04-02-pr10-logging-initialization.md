@@ -78,7 +78,9 @@ use chrono::{Local, SecondsFormat};
 use log_fastly::Logger;
 
 pub(crate) fn target_label(target: &str) -> &str {
-    target.split("::").last().unwrap_or(target)
+    target
+        .rsplit_once("::")
+        .map_or(target, |(_, last)| if last.is_empty() { target } else { last })
 }
 
 pub(crate) fn init_logger() {

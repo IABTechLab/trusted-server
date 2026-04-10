@@ -1,10 +1,27 @@
 use chrono::{Local, SecondsFormat};
 use log_fastly::Logger;
 
+/// Extracts the final `::` segment from a Rust module path for use as a log label.
+///
+/// Falls back to the full target string when the input contains no separator or
+/// when the separator appears at the trailing position (e.g. `"foo::"`), which
+/// would otherwise produce an empty label in log output.
 pub(crate) fn target_label(target: &str) -> &str {
-    target.rsplit_once("::").map_or(target, |(_, last)| last)
+    target.rsplit_once("::").map_or(
+        target,
+        |(_, last)| if last.is_empty() { target } else { last },
+    )
 }
 
+/// Initialises the Fastly-backed `fern` logger and installs it as the global logger.
+///
+/// Log records are forwarded to the `tslog` Fastly endpoint and echoed to stdout.
+/// Each line is prefixed with an RFC 3339 timestamp, level, and the final segment
+/// of the record's target module path.
+///
+/// # Panics
+///
+/// Panics if the logger cannot be built or if a global logger has already been set.
 pub(crate) fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")
@@ -50,6 +67,10 @@ mod tests {
             "should handle inputs without ::"
         );
         assert_eq!(target_label(""), "", "should handle empty strings");
-        assert_eq!(target_label("trailing::"), "", "should handle trailing ::");
+        assert_eq!(
+            target_label("trailing::"),
+            "trailing::",
+            "should fall back to full target when segment after :: is empty"
+        );
     }
 }
