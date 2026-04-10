@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use futures::StreamExt as _;
 use http::header::{self, HeaderValue};
 use http::Response;
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    collect_body, AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::platform::RuntimeServices;
@@ -94,24 +93,6 @@ impl TestlightIntegration {
         TrustedServerError::Integration {
             integration: TESTLIGHT_INTEGRATION_ID.to_string(),
             message: message.into(),
-        }
-    }
-
-    async fn collect_body_bytes(body: EdgeBody) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        match body {
-            EdgeBody::Once(bytes) => Ok(bytes.to_vec()),
-            EdgeBody::Stream(mut stream) => {
-                let mut body_bytes = Vec::new();
-                while let Some(chunk_result) = stream.next().await {
-                    let chunk = chunk_result.map_err(|error| {
-                        Report::new(Self::error(format!(
-                            "Failed to read Testlight request body: {error}"
-                        )))
-                    })?;
-                    body_bytes.extend_from_slice(&chunk);
-                }
-                Ok(body_bytes)
-            }
         }
     }
 
@@ -197,7 +178,7 @@ impl IntegrationProxy for TestlightIntegration {
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
-        let payload_bytes = Self::collect_body_bytes(body).await?;
+        let payload_bytes = collect_body(body, TESTLIGHT_INTEGRATION_ID).await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
         // Read synthetic ID from header (set by registry) or cookie
@@ -227,7 +208,7 @@ impl IntegrationProxy for TestlightIntegration {
         let (parts, body) = response.into_parts();
 
         // Attempt to parse response into structured form for logging/future transforms.
-        let response_body = Self::collect_body_bytes(body).await?;
+        let response_body = collect_body(body, TESTLIGHT_INTEGRATION_ID).await?;
         match serde_json::from_slice::<TestlightResponseBody>(&response_body) {
             Ok(body) => {
                 let response_body = serde_json::to_vec(&body)

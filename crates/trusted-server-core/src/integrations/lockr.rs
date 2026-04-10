@@ -15,17 +15,16 @@ use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use serde::Deserialize;
-use url::Url;
 use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
@@ -271,8 +270,7 @@ impl LockrIntegration {
 
         for (name, value) in from {
             let name_str = name.as_str();
-            if (name_str.starts_with("x-") || name_str.starts_with("X-"))
-                && !INTERNAL_HEADERS.contains(&name_str)
+            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str)
             {
                 to.append(name.clone(), value.clone());
             }
@@ -313,22 +311,7 @@ impl LockrIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed =
-            Url::parse(target_url).change_context(Self::error("Invalid Lockr upstream URL"))?;
-
-        services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: parsed.scheme().to_string(),
-                host: parsed
-                    .host_str()
-                    .ok_or_else(|| Report::new(Self::error("Lockr upstream URL missing host")))?
-                    .to_string(),
-                port: parsed.port(),
-                certificate_check: true,
-                first_byte_timeout: std::time::Duration::from_secs(15),
-            })
-            .change_context(Self::error("Failed to register Lockr backend"))
+        ensure_integration_backend(services, target_url, LOCKR_INTEGRATION_ID)
     }
 }
 

@@ -64,15 +64,14 @@ use http::header;
 use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
-use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
@@ -418,22 +417,7 @@ impl DataDomeIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed =
-            Url::parse(target_url).change_context(Self::error("Invalid DataDome upstream URL"))?;
-
-        services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: parsed.scheme().to_string(),
-                host: parsed
-                    .host_str()
-                    .ok_or_else(|| Report::new(Self::error("DataDome upstream URL missing host")))?
-                    .to_string(),
-                port: parsed.port(),
-                certificate_check: true,
-                first_byte_timeout: std::time::Duration::from_secs(15),
-            })
-            .change_context(Self::error("Failed to register DataDome backend"))
+        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID)
     }
 }
 

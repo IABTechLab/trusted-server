@@ -11,16 +11,15 @@ use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use serde::Deserialize;
-use url::Url;
 use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
@@ -265,8 +264,7 @@ impl PermutiveIntegration {
         // Copy any X-* custom headers, skipping TS-internal headers
         for (name, value) in from {
             let name_str = name.as_str();
-            if (name_str.starts_with("x-") || name_str.starts_with("X-"))
-                && !INTERNAL_HEADERS.contains(&name_str)
+            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str)
             {
                 to.append(name.clone(), value.clone());
             }
@@ -277,22 +275,7 @@ impl PermutiveIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        let parsed =
-            Url::parse(target_url).change_context(Self::error("Invalid Permutive upstream URL"))?;
-
-        services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: parsed.scheme().to_string(),
-                host: parsed
-                    .host_str()
-                    .ok_or_else(|| Report::new(Self::error("Permutive upstream URL missing host")))?
-                    .to_string(),
-                port: parsed.port(),
-                certificate_check: true,
-                first_byte_timeout: std::time::Duration::from_secs(15),
-            })
-            .change_context(Self::error("Failed to register Permutive backend"))
+        ensure_integration_backend(services, target_url, PERMUTIVE_INTEGRATION_ID)
     }
 }
 

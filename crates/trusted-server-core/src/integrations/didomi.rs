@@ -117,6 +117,7 @@ impl DidomiIntegration {
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
+            header::CONTENT_TYPE,
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,

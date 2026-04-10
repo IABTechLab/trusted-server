@@ -5,8 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method, StatusCode, Url};
-use http::header::HeaderValue as HttpHeaderValue;
+use http::{header, Method, StatusCode};
+use http::header::HeaderValue;
+use url::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use validator::Validate;
@@ -474,7 +475,7 @@ fn copy_request_headers(
                 return;
             }
 
-            if let Ok(cookie_header) = HttpHeaderValue::from_str(&stripped) {
+            if let Ok(cookie_header) = HeaderValue::from_str(&stripped) {
                 to.headers_mut().insert(header::COOKIE, cookie_header);
             }
         }
@@ -1122,7 +1123,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         })?;
         pbs_req.headers_mut().insert(
             header::CONTENT_TYPE,
-            HttpHeaderValue::from_static("application/json"),
+            HeaderValue::from_static("application/json"),
         );
         *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
