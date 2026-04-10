@@ -143,7 +143,7 @@ fn resolve_auction_eids(
         Ok(None) => return Some(Vec::new()),
         Err(err) => {
             log::warn!(
-                "Auction KV read failed for EC ID '{}…': {err:?}",
+                "Auction KV read failed for EC ID '{}': {err:?}",
                 log_id(ec_id)
             );
             return Some(Vec::new());

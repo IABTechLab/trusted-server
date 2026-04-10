@@ -151,7 +151,7 @@ passphrase = "your-secure-hmac-secret"
 2. Or set via environment variable:
 
 ```bash
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secure-hmac-secret
+TRUSTED_SERVER__EC__PASSPHRASE=your-secure-hmac-passphrase
 ```
 
 ---

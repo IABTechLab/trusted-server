@@ -284,7 +284,7 @@ impl KvIdentityGraph {
         // Live entry — nothing to do.
         if existing.consent.ok {
             log::debug!(
-                "create_or_revive: live entry exists for '{}…', no-op",
+                "create_or_revive: live entry exists for '{}', no-op",
                 log_id(ec_id)
             );
             return Ok(());
@@ -292,7 +292,7 @@ impl KvIdentityGraph {
 
         // Tombstone — CAS overwrite to revive.
         log::info!(
-            "create_or_revive: reviving tombstone for '{}…'",
+            "create_or_revive: reviving tombstone for '{}'",
             log_id(ec_id)
         );
 
@@ -308,7 +308,7 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
+                        "create_or_revive: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
                         attempt + 1,
                         log_id(ec_id),
                     );
@@ -378,7 +378,7 @@ impl KvIdentityGraph {
                 None => {
                     // Root entry missing — create a minimal entry.
                     log::info!(
-                        "upsert_partner_id: no entry for '{}…', creating minimal entry",
+                        "upsert_partner_id: no entry for '{}', creating minimal entry",
                         log_id(ec_id)
                     );
                     let minimal = KvEntry::minimal(partner_id, uid, synced);
@@ -389,7 +389,7 @@ impl KvIdentityGraph {
                     }
                     // Key appeared between get() and create — re-read on next iteration.
                     log::debug!(
-                        "upsert_partner_id: minimal create raced for '{}…', retrying (attempt {}/{})",
+                        "upsert_partner_id: minimal create raced for '{}', retrying (attempt {}/{})",
                         log_id(ec_id),
                         attempt + 1,
                         MAX_CAS_RETRIES,
@@ -402,7 +402,7 @@ impl KvIdentityGraph {
             // repopulate partner IDs after consent withdrawal.
             if !entry.consent.ok {
                 log::info!(
-                    "upsert_partner_id: entry for '{}…' is a tombstone, rejecting upsert",
+                    "upsert_partner_id: entry for '{}' is a tombstone, rejecting upsert",
                     log_id(ec_id),
                 );
                 return Err(Report::new(TrustedServerError::KvStore {
@@ -434,7 +434,7 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(()),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
+                        "upsert_partner_id: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
                         attempt + 1,
                         log_id(ec_id),
                     );
@@ -520,7 +520,7 @@ impl KvIdentityGraph {
                 Ok(()) => return Ok(UpsertResult::Written),
                 Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                     log::debug!(
-                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}…'",
+                        "upsert_partner_id_if_exists: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
                         attempt + 1,
                         log_id(ec_id),
                     );
@@ -574,7 +574,7 @@ impl KvIdentityGraph {
             Some(pair) => pair,
             None => {
                 log::debug!(
-                    "update_last_seen: no entry for '{}…', skipping",
+                    "update_last_seen: no entry for '{}', skipping",
                     log_id(ec_id)
                 );
                 return Ok(());
@@ -585,7 +585,7 @@ impl KvIdentityGraph {
         // back to 1-year TTL.
         if !entry.consent.ok {
             log::debug!(
-                "update_last_seen: entry for '{}…' is a tombstone, skipping",
+                "update_last_seen: entry for '{}' is a tombstone, skipping",
                 log_id(ec_id)
             );
             return Ok(());
@@ -594,7 +594,7 @@ impl KvIdentityGraph {
         // Guard against stale/out-of-order timestamps.
         if timestamp <= entry.last_seen {
             log::trace!(
-                "update_last_seen: stale timestamp for '{}…' (stored={}, incoming={timestamp})",
+                "update_last_seen: stale timestamp for '{}' (stored={}, incoming={timestamp})",
                 log_id(ec_id),
                 entry.last_seen,
             );
@@ -602,11 +602,12 @@ impl KvIdentityGraph {
         }
 
         // Debounce: skip if the stored value is recent enough.
-        if timestamp - entry.last_seen < LAST_SEEN_DEBOUNCE_SECS {
+        let elapsed = timestamp.saturating_sub(entry.last_seen);
+        if elapsed < LAST_SEEN_DEBOUNCE_SECS {
             log::trace!(
-                "update_last_seen: debounced for '{}…' (delta={}s)",
+                "update_last_seen: debounced for '{}' (delta={}s)",
                 log_id(ec_id),
-                timestamp - entry.last_seen,
+                elapsed,
             );
             return Ok(());
         }
@@ -635,7 +636,7 @@ impl KvIdentityGraph {
                     } else {
                         log::debug!(
                             "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
-                             for '{}…', dropping domain '{domain}'",
+                             for '{}', dropping domain '{domain}'",
                             log_id(ec_id),
                         );
                     }
@@ -673,7 +674,7 @@ impl KvIdentityGraph {
             // the debounce condition is satisfied by their write.
             Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                 log::debug!(
-                    "update_last_seen: CAS conflict for '{}…', another write won",
+                    "update_last_seen: CAS conflict for '{}', another write won",
                     log_id(ec_id),
                 );
                 Ok(())
@@ -681,7 +682,7 @@ impl KvIdentityGraph {
             Err(err) => Err(
                 Report::new(err).change_context(TrustedServerError::KvStore {
                     store_name: self.store_name.clone(),
-                    message: format!("Failed to update last_seen for key '{}…'", log_id(ec_id)),
+                    message: format!("Failed to update last_seen for key '{}'", log_id(ec_id)),
                 }),
             ),
         }
@@ -786,7 +787,7 @@ impl KvIdentityGraph {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
                     log::trace!(
-                        "evaluate_cluster: cached cluster_size for '{}…' \
+                        "evaluate_cluster: cached cluster_size for '{}' \
                          (age={}s, ttl={recheck_secs}s)",
                         log_id(ec_id),
                         now.saturating_sub(checked),
@@ -801,7 +802,7 @@ impl KvIdentityGraph {
         let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
 
         log::debug!(
-            "evaluate_cluster: computed cluster_size={cluster_size} for '{}…'",
+            "evaluate_cluster: computed cluster_size={cluster_size} for '{}'",
             log_id(ec_id)
         );
 
@@ -825,7 +826,7 @@ impl KvIdentityGraph {
             Ok(()) => {}
             Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
                 log::debug!(
-                    "evaluate_cluster: CAS conflict writing cluster_size for '{}…', \
+                    "evaluate_cluster: CAS conflict writing cluster_size for '{}', \
                      returning computed value anyway",
                     log_id(ec_id),
                 );
@@ -833,7 +834,7 @@ impl KvIdentityGraph {
             Err(err) => {
                 // Log but don't fail — the computed value is still valid.
                 log::warn!(
-                    "evaluate_cluster: failed to write cluster_size for '{}…': {err}",
+                    "evaluate_cluster: failed to write cluster_size for '{}': {err}",
                     log_id(ec_id)
                 );
             }

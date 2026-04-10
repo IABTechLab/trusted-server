@@ -48,8 +48,9 @@ pub mod sync_pixel;
 /// writing the full user identifier to logs (satisfies the `CodeQL`
 /// "cleartext logging of sensitive information" rule).
 #[must_use]
-pub fn log_id(ec_id: &str) -> &str {
-    ec_id.get(..8).unwrap_or(ec_id)
+pub fn log_id(ec_id: &str) -> String {
+    let prefix = ec_id.get(..8).unwrap_or(ec_id);
+    format!("{prefix}…")
 }
 
 use cookie::CookieJar;
@@ -138,7 +139,7 @@ pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<Trusted
         .filter(|v| is_valid_ec_id(v))
         .or_else(|| parsed.cookie_ec.filter(|v| is_valid_ec_id(v)));
     if let Some(ref id) = ec_id {
-        log::trace!("Existing EC ID found: {id}");
+        log::trace!("Existing EC ID found: {}", log_id(id));
     }
     Ok(ec_id)
 }
@@ -219,7 +220,7 @@ impl EcContext {
         let ec_was_present = ec_value.is_some();
 
         if let Some(ref id) = ec_value {
-            log::trace!("Existing EC ID found: {id}");
+            log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
         // Capture the client IP now — the request body may be consumed later.
@@ -287,7 +288,7 @@ impl EcContext {
         })?;
 
         let ec_id = generation::generate_ec_id(settings, client_ip)?;
-        log::trace!("Generated new EC ID: {}…", log_id(&ec_id));
+        log::trace!("Generated new EC ID: {}", log_id(&ec_id));
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
 
@@ -307,7 +308,7 @@ impl EcContext {
             if let Err(err) = graph.create_or_revive(ec_value, &entry) {
                 log::error!(
                     "Failed to create or revive EC entry for id '{}' after generation: {err:?}",
-                    ec_value,
+                    log_id(ec_value),
                 );
             }
         }
