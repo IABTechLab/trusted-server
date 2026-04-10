@@ -91,7 +91,7 @@ pub fn generate_ec_id(
     let random_suffix = generate_random_suffix(6);
     let ec_id = format!("{hmac_hash}.{random_suffix}");
 
-    log::trace!("Generated fresh EC ID: {}…", super::log_id(&ec_id));
+    log::trace!("Generated fresh EC ID: {}", super::log_id(&ec_id));
 
     Ok(ec_id)
 }

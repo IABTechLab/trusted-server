@@ -8,11 +8,10 @@
 //! - `Secure` restricts to HTTPS
 //! - `SameSite=Lax` provides CSRF protection while allowing top-level navigations
 //! - `Max-Age` of 1 year (or 0 to expire)
-//! - No `HttpOnly` — intentionally omitted so the cookie is available to
-//!   client-side JS if needed in the future (e.g. direct reads from
-//!   `document.cookie` for the identify endpoint). This does expose the EC
-//!   ID to XSS; if client-side access is never needed, consider restoring
-//!   `HttpOnly` for defense-in-depth.
+//! - `HttpOnly` prevents client-side JS from reading the cookie via
+//!   `document.cookie`, providing XSS defense-in-depth. The identify
+//!   endpoint (`/_ts/api/v1/identify`) exposes the EC ID in its response
+//!   body and `x-ts-ec` header for legitimate JS use cases.
 
 use fastly::http::header;
 
@@ -28,7 +27,7 @@ const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 /// attributes (e.g. adding `Partitioned`) only need updating in one place.
 fn format_set_cookie(domain: &str, value: &str, max_age: i32) -> String {
     format!(
-        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
         COOKIE_TS_EC, value, domain, max_age,
     )
 }
@@ -90,7 +89,7 @@ mod tests {
         assert_eq!(
             result,
             format!(
-                "{}={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+                "{}={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
                 COOKIE_TS_EC, TEST_EC_ID, settings.publisher.domain, COOKIE_MAX_AGE,
             ),
             "should use computed cookie domain (.{{domain}})"

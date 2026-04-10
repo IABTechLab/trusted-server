@@ -82,10 +82,7 @@ pub fn handle_identify(
                     cluster_size = size;
                 }
                 Err(err) => {
-                    log::warn!(
-                        "Cluster evaluation failed for '{}…': {err:?}",
-                        log_id(ec_id)
-                    );
+                    log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
                     // Non-fatal — cluster_size stays None, response is still useful.
                 }
             }
@@ -93,7 +90,7 @@ pub fn handle_identify(
         Ok(None) => {}
         Err(err) => {
             log::warn!(
-                "Identify KV read failed for EC ID '{}…': {err:?}",
+                "Identify KV read failed for EC ID '{}': {err:?}",
                 log_id(ec_id)
             );
             degraded = true;

@@ -206,7 +206,8 @@ fn process_mappings(
     let mut errors = Vec::new();
 
     for (idx, mapping) in mappings.iter().enumerate() {
-        if !is_valid_ec_id(&mapping.ec_id) {
+        let ec_id = normalize_ec_id_for_kv(&mapping.ec_id);
+        if !is_valid_ec_id(&ec_id) {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_EC_ID,
@@ -214,15 +215,13 @@ fn process_mappings(
             continue;
         }
 
-        if mapping.partner_uid.is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
+        if mapping.partner_uid.trim().is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
             errors.push(MappingError {
                 index: idx,
                 reason: REASON_INVALID_PARTNER_UID,
             });
             continue;
         }
-
-        let ec_id = normalize_ec_id_for_kv(&mapping.ec_id);
         match writer.upsert_partner_id_if_exists(
             &ec_id,
             partner_id,
@@ -246,7 +245,7 @@ fn process_mappings(
             }
             Err(err) => {
                 log::warn!(
-                    "Batch sync KV write failed for index {idx} (ec_id '{}…'): {err:?}",
+                    "Batch sync KV write failed for index {idx} (ec_id '{}'): {err:?}",
                     log_id(&mapping.ec_id),
                 );
                 errors.push(MappingError {
