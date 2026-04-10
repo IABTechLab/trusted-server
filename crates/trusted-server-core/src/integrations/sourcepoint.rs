@@ -42,6 +42,11 @@ const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
 const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
 
+/// Maximum response body size (5 MB) that will be read into memory for
+/// JavaScript rewriting. Responses larger than this are passed through
+/// unmodified to avoid unbounded memory consumption.
+const MAX_REWRITE_BODY_SIZE: u64 = 5 * 1024 * 1024;
+
 /// Matches quoted references to `cdn.privacy-mgmt.com` URLs in script content.
 ///
 /// Pattern breakdown:
@@ -445,6 +450,24 @@ impl IntegrationProxy for SourcepointIntegration {
             && Self::is_javascript_response(&response)
         {
             log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
+
+            // Guard against unexpectedly large responses to avoid unbounded
+            // memory consumption during rewriting.
+            if let Some(content_length) = response
+                .get_header(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                if content_length > MAX_REWRITE_BODY_SIZE {
+                    log::warn!(
+                        "Sourcepoint: response body for {path} exceeds {} bytes \
+                         (Content-Length: {content_length}), skipping rewrite",
+                        MAX_REWRITE_BODY_SIZE
+                    );
+                    self.apply_cache_headers(&mut response);
+                    return Ok(response);
+                }
+            }
 
             let body_bytes = response.take_body_bytes();
             let body = match String::from_utf8(body_bytes) {

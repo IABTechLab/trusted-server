@@ -8,19 +8,12 @@ function normalizeSourcepointUrl(url: string): string | null {
   const trimmed = url.trim();
   if (!trimmed) return null;
 
-  if (trimmed.startsWith('//')) {
-    return `https:${trimmed}`;
-  }
+  if (trimmed.startsWith('//')) return `https:${trimmed}`;
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
 
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
-  }
-
-  if (trimmed.startsWith(SOURCEPOINT_CDN_HOST)) {
-    return `https://${trimmed}`;
-  }
-
-  return null;
+  // Bare domain or path — attempt to parse as https URL.
+  // The host === check in isSourcepointUrl rejects non-matching domains.
+  return `https://${trimmed}`;
 }
 
 function parseSourcepointUrl(url: string): URL | null {
