@@ -27,7 +27,7 @@ use fastly::{Request, Response};
 use regex::Regex;
 use serde::Deserialize;
 use url::Url;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
@@ -93,7 +93,7 @@ pub struct SourcepointConfig {
     pub rewrite_sdk: bool,
     /// Base URL for Sourcepoint CDN assets and API calls.
     #[serde(default = "default_cdn_origin")]
-    #[validate(url)]
+    #[validate(custom(function = "validate_cdn_origin"))]
     pub cdn_origin: String,
     /// Cache TTL for Sourcepoint static responses in seconds.
     #[serde(default = "default_cache_ttl")]
@@ -121,6 +121,26 @@ fn default_cdn_origin() -> String {
 
 fn default_cache_ttl() -> u32 {
     3600
+}
+
+/// Validates that `cdn_origin` is a syntactically valid URL whose host ends
+/// with `.privacy-mgmt.com`, preventing SSRF via arbitrary origins.
+fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
+    let url = Url::parse(value).map_err(|_| {
+        let mut err = ValidationError::new("invalid_url");
+        err.message = Some("cdn_origin must be a valid URL".into());
+        err
+    })?;
+
+    let host = url.host_str().unwrap_or_default();
+    if !host.ends_with(".privacy-mgmt.com") {
+        let mut err = ValidationError::new("disallowed_host");
+        err.message =
+            Some("cdn_origin host must end with .privacy-mgmt.com".into());
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 struct SourcepointIntegration {
@@ -370,10 +390,7 @@ impl IntegrationProxy for SourcepointIntegration {
             proxy_req.set_header(header::ACCEPT_ENCODING, ae);
         }
 
-        if matches!(
-            req.get_method(),
-            &Method::POST | &Method::PUT | &Method::PATCH
-        ) {
+        if matches!(req.get_method(), &Method::POST) {
             if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
                 proxy_req.set_header(header::CONTENT_TYPE, content_type);
             }

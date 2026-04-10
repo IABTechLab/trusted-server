@@ -30,9 +30,7 @@ describe('Sourcepoint SDK Script Interception Guard', () => {
   });
 
   it('rewrites CDN URLs to the first-party proxy path', () => {
-    expect(
-      rewriteSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages?env=prod')
-    ).toBe(
+    expect(rewriteSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages?env=prod')).toBe(
       `${window.location.origin}/integrations/sourcepoint/cdn/wrapper/v2/messages?env=prod`
     );
   });
