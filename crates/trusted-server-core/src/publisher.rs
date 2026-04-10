@@ -21,6 +21,10 @@ use crate::synthetic::{get_or_generate_synthetic_id, is_valid_synthetic_id};
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
+    std::io::Cursor::new(body.into_bytes())
+}
+
 fn not_found_response() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Not Found"));
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -225,7 +229,7 @@ fn process_response_streaming(
         };
 
         let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(Cursor::new(body.into_bytes()), &mut output)?;
+        pipeline.process(body_as_reader(body), &mut output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -243,7 +247,7 @@ fn process_response_streaming(
         };
 
         let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(Cursor::new(body.into_bytes()), &mut output)?;
+        pipeline.process(body_as_reader(body), &mut output)?;
     } else {
         // Use simple text replacer for non-HTML content
         let replacer = create_url_replacer(
@@ -260,7 +264,7 @@ fn process_response_streaming(
         };
 
         let mut pipeline = StreamingPipeline::new(config, replacer);
-        pipeline.process(Cursor::new(body.into_bytes()), &mut output)?;
+        pipeline.process(body_as_reader(body), &mut output)?;
     }
 
     log::debug!(
@@ -296,6 +300,11 @@ fn create_html_stream_processor(
 /// This function forwards incoming requests to the configured origin URL,
 /// preserving headers and request body. It's used as a fallback for routes
 /// not explicitly handled by the trusted server.
+///
+/// This is `async` because it uses `services.http_client().send(...).await` rather
+/// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
+/// route handler in `block_on`, so behavior is equivalent — the change reflects the
+/// migration to the platform-agnostic HTTP client.
 ///
 /// # Errors
 ///

@@ -12,6 +12,10 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
+// # PR 15 removal target
+//
+// Mirrors compat::to_fastly_response — both should stay in sync until PR 15
+// removes the compat layer entirely.
 fn platform_response_to_fastly(
     platform_resp: crate::platform::PlatformResponse,
 ) -> fastly::Response {
@@ -29,7 +33,7 @@ fn platform_response_to_fastly(
     };
     let mut resp = fastly::Response::from_status(parts.status.as_u16());
     for (name, value) in parts.headers.iter() {
-        resp.set_header(name.as_str(), value.as_bytes());
+        resp.append_header(name.as_str(), value.as_bytes());
     }
     resp.set_body(body_bytes);
     resp

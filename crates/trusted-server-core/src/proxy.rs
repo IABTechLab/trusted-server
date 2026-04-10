@@ -21,6 +21,10 @@ use crate::synthetic::get_synthetic_id;
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
 
+fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
+    Cursor::new(body.into_bytes())
+}
+
 /// Headers copied from the original client request to the upstream proxy request.
 const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_USER_AGENT,
@@ -172,7 +176,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(Cursor::new(body.into_bytes()), &mut output)
+        .process(body_as_reader(body), &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;
@@ -1286,12 +1290,9 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
-    use http::{
-        header, HeaderValue, Method as HttpMethod, Request as HttpRequest,
-        Response as HttpResponse, StatusCode as HttpStatusCode,
-    };
+    use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 
-    fn build_http_request(method: HttpMethod, uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+    fn build_http_request(method: Method, uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
         HttpRequest::builder()
             .method(method)
             .uri(uri.as_ref())
@@ -1304,7 +1305,7 @@ mod tests {
         body: &serde_json::Value,
     ) -> HttpRequest<EdgeBody> {
         HttpRequest::builder()
-            .method(HttpMethod::POST)
+            .method(Method::POST)
             .uri(uri.as_ref())
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
@@ -1316,16 +1317,13 @@ mod tests {
             .expect("response body should be valid UTF-8")
     }
 
-    fn build_http_response(status: HttpStatusCode, body: EdgeBody) -> HttpResponse<EdgeBody> {
-        let mut response = HttpResponse::new(body);
+    fn build_http_response(status: StatusCode, body: EdgeBody) -> Response<EdgeBody> {
+        let mut response = Response::new(body);
         *response.status_mut() = status;
         response
     }
 
-    fn response_header(
-        response: &HttpResponse<EdgeBody>,
-        name: header::HeaderName,
-    ) -> Option<&str> {
+    fn response_header(response: &Response<EdgeBody>, name: header::HeaderName) -> Option<&str> {
         response
             .headers()
             .get(name)
@@ -1335,15 +1333,12 @@ mod tests {
     #[tokio::test]
     async fn proxy_missing_param_returns_400() {
         let settings = create_test_settings();
-        let req = build_http_request(HttpMethod::GET, "https://example.com/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://example.com/first-party/proxy");
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1351,17 +1346,14 @@ mod tests {
         let settings = create_test_settings();
         // missing tstoken should 400
         let req = build_http_request(
-            HttpMethod::GET,
+            Method::GET,
             "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
         );
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1374,7 +1366,7 @@ mod tests {
         let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("sign ok");
-        assert_eq!(resp.status(), HttpStatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         let json = response_body_string(resp);
         assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
         assert!(json.contains("tsexp"), "{}", json);
@@ -1396,10 +1388,7 @@ mod tests {
             handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1412,7 +1401,7 @@ mod tests {
         let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("should sign URL with non-standard port");
-        assert_eq!(resp.status(), HttpStatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         let json = response_body_string(resp);
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
@@ -1485,10 +1474,7 @@ mod tests {
         let err: Report<TrustedServerError> =
             reconstruct_and_validate_signed_target(&settings, &url)
                 .expect_err("expected expiration failure");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1509,7 +1495,7 @@ mod tests {
                 .expect_err("should reject tampered token");
         assert_eq!(
             err.current_context().status_code(),
-            HttpStatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
             "should return 403 for invalid tstoken"
         );
     }
@@ -1517,15 +1503,12 @@ mod tests {
     #[tokio::test]
     async fn click_missing_params_returns_400() {
         let settings = create_test_settings();
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/click");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/click");
         let err: Report<TrustedServerError> =
             handle_first_party_click(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1536,7 +1519,7 @@ mod tests {
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
         let req = build_http_request(
-            HttpMethod::GET,
+            Method::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
                 url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
@@ -1547,7 +1530,7 @@ mod tests {
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.status(), HttpStatusCode::FOUND);
+        assert_eq!(resp.status(), StatusCode::FOUND);
         let loc = resp
             .headers()
             .get(http::header::LOCATION)
@@ -1564,7 +1547,7 @@ mod tests {
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
         let mut req = build_http_request(
-            HttpMethod::GET,
+            Method::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
                 url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
@@ -1611,7 +1594,7 @@ mod tests {
             "del": ["x"],
         });
         let req = HttpRequest::builder()
-            .method(HttpMethod::POST)
+            .method(Method::POST)
             .uri("https://edge.example/first-party/proxy-rebuild")
             .body(EdgeBody::from(
                 serde_json::to_string(&body).expect("test JSON should serialize"),
@@ -1620,7 +1603,7 @@ mod tests {
         let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
             .await
             .expect("rebuild ok");
-        assert_eq!(resp.status(), HttpStatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         let json = response_body_string(resp);
         assert!(json.contains("/first-party/click?tsurl="));
         assert!(json.contains("tstoken"));
@@ -1694,18 +1677,12 @@ mod tests {
         let clear = "ftp://cdn.example/file.gif";
         // Build a first-party proxy URL with a token for the unsupported scheme
         let first_party = creative::build_proxy_url(&settings, clear);
-        let req = build_http_request(
-            HttpMethod::GET,
-            format!("https://edge.example{}", first_party),
-        );
+        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1721,15 +1698,12 @@ mod tests {
             url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
             sig
         );
-        let req = build_http_request(HttpMethod::GET, &url);
+        let req = build_http_request(Method::GET, &url);
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
                 .expect_err("expected error");
-        assert_eq!(
-            err.current_context().status_code(),
-            HttpStatusCode::BAD_GATEWAY
-        );
+        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1737,14 +1711,11 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/landing.html?x=1";
         let first_party = creative::build_click_url(&settings, clear);
-        let req = build_http_request(
-            HttpMethod::GET,
-            format!("https://edge.example{}", first_party),
-        );
+        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.status(), HttpStatusCode::FOUND);
+        assert_eq!(resp.status(), StatusCode::FOUND);
         let cc = response_header(&resp, header::CACHE_CONTROL).unwrap_or("");
         assert!(cc.contains("no-store"));
         assert!(cc.contains("private"));
@@ -1760,7 +1731,7 @@ mod tests {
         let settings = create_test_settings();
         // HTML with an external image that should be proxied in rewrite
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
         beresp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
@@ -1780,7 +1751,7 @@ mod tests {
         assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
         let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
         let ct = response_header(&out, header::CONTENT_TYPE)
@@ -1801,11 +1772,11 @@ mod tests {
     fn css_response_is_rewritten_and_content_type_set() {
         let settings = create_test_settings();
         let css = "body{background:url(https://cdn.example/bg.png)}";
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(css));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(css));
         beresp
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should succeed");
         let ct = response_header(&out, header::CONTENT_TYPE)
@@ -1832,13 +1803,13 @@ mod tests {
   </body>
 </html>"#;
 
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
         beresp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
         );
 
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(
             &settings,
             &req,
@@ -1860,8 +1831,8 @@ mod tests {
     #[test]
     fn image_accept_sets_generic_content_type_when_missing() {
         let settings = create_test_settings();
-        let beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from("PNG"));
-        let mut req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let beresp = build_http_response(StatusCode::OK, EdgeBody::from("PNG"));
+        let mut req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         req.headers_mut()
             .insert(HEADER_ACCEPT, HeaderValue::from_static("image/*"));
         let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
@@ -1875,17 +1846,16 @@ mod tests {
     #[test]
     fn non_image_non_html_passthrough() {
         let settings = create_test_settings();
-        let mut beresp =
-            build_http_response(HttpStatusCode::ACCEPTED, EdgeBody::from("{\"ok\":true}"));
+        let mut beresp = build_http_response(StatusCode::ACCEPTED, EdgeBody::from("{\"ok\":true}"));
         beresp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://api.example/ok", beresp)
             .expect("finalize should succeed");
         // Should not rewrite, preserve status and content-type
-        assert_eq!(out.status(), HttpStatusCode::ACCEPTED);
+        assert_eq!(out.status(), StatusCode::ACCEPTED);
         let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
             .to_string();
@@ -1911,7 +1881,7 @@ mod tests {
             .expect("gzip write should succeed");
         let compressed = encoder.finish().expect("gzip finish should succeed");
 
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(compressed));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(compressed));
         beresp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
@@ -1920,7 +1890,7 @@ mod tests {
             .headers_mut()
             .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should process and succeed");
 
@@ -1968,7 +1938,7 @@ mod tests {
                 .expect("brotli write should succeed");
         }
 
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(compressed));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(compressed));
         beresp
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
@@ -1976,7 +1946,7 @@ mod tests {
             .headers_mut()
             .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
 
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should process brotli and succeed");
 
@@ -2011,13 +1981,13 @@ mod tests {
         let settings = create_test_settings();
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
 
-        let mut beresp = build_http_response(HttpStatusCode::OK, EdgeBody::from(html));
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
         beresp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
         );
 
-        let req = build_http_request(HttpMethod::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
 
@@ -2053,7 +2023,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = build_http_request(HttpMethod::GET, "https://example.com/");
+        let req = build_http_request(Method::GET, "https://example.com/");
 
         let result = proxy_request(
             &settings,
@@ -2317,14 +2287,14 @@ mod tests {
             urlencoding::encode(target),
             token,
         );
-        let req = build_http_request(HttpMethod::GET, url);
+        let req = build_http_request(Method::GET, url);
         let services = crate::platform::test_support::noop_services();
         let err = handle_first_party_proxy(&settings, &services, req)
             .await
             .expect_err("should block initial target not in allowlist");
         assert_eq!(
             err.current_context().status_code(),
-            HttpStatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
             "should return 403 for allowlist violation"
         );
         assert!(
