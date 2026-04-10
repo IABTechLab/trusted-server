@@ -72,13 +72,15 @@ static SP_CDN_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// The Sourcepoint wrapper builds its public path as:
 /// ```js
 /// t.origin + "/unified/4.40.1/"
+/// // or single-quoted:
+/// t.origin + '/unified/4.40.1/'
 /// ```
 /// We rewrite this so chunks load through the first-party prefix:
 /// ```js
 /// t.origin + "/integrations/sourcepoint/cdn/unified/4.40.1/"
 /// ```
 static SP_ORIGIN_UNIFIED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\.origin\s*\+\s*"/unified/"#)
+    Regex::new(r#"\.origin\s*\+\s*(['"])/unified/"#)
         .expect("Sourcepoint origin+unified regex should compile")
 });
 
@@ -268,10 +270,10 @@ impl SourcepointIntegration {
 
         // Step 2: rewrite origin+"/unified/" to origin+"/integrations/sourcepoint/cdn/unified/".
         SP_ORIGIN_UNIFIED_PATTERN
-            .replace_all(
-                &after_cdn,
-                &format!(r#".origin+"{SOURCEPOINT_CDN_PREFIX}/unified/"#),
-            )
+            .replace_all(&after_cdn, |caps: &regex::Captures| {
+                let quote = &caps[1];
+                format!(".origin+{quote}{SOURCEPOINT_CDN_PREFIX}/unified/")
+            })
             .into_owned()
     }
 
@@ -372,7 +374,7 @@ impl IntegrationProxy for SourcepointIntegration {
             .build_target_url(target_path, req.get_query_str())
             .change_context(Self::error("Failed to build Sourcepoint target URL"))?;
 
-        log::info!("[sourcepoint] Proxying {method} {path} → {target_url}");
+        log::info!("Sourcepoint: proxying {method} {path} → {target_url}");
 
         let backend_name = BackendConfig::from_url(&self.config.cdn_origin, true)
             .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
@@ -402,9 +404,36 @@ impl IntegrationProxy for SourcepointIntegration {
             .change_context(Self::error("Sourcepoint upstream request failed"))?;
 
         log::info!(
-            "[sourcepoint] Upstream responded with status {}",
+            "Sourcepoint: upstream responded with status {}",
             response.get_status()
         );
+
+        // Rewrite Location headers on redirect responses so the browser
+        // follows the redirect through the first-party proxy instead of
+        // leaking the CDN origin to the client.
+        if response.get_status().is_redirection() {
+            if let Some(location) = response
+                .get_header(header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .filter(|loc| loc.contains(SOURCEPOINT_CDN_HOST))
+            {
+                let rewritten_location = location
+                    .replace(
+                        &format!("https://{SOURCEPOINT_CDN_HOST}"),
+                        SOURCEPOINT_CDN_PREFIX,
+                    )
+                    .replace(
+                        &format!("http://{SOURCEPOINT_CDN_HOST}"),
+                        SOURCEPOINT_CDN_PREFIX,
+                    );
+                log::info!(
+                    "Sourcepoint: rewrote redirect Location to {rewritten_location}"
+                );
+                response.set_header(header::LOCATION, &rewritten_location);
+            }
+            self.apply_cache_headers(&mut response);
+            return Ok(response);
+        }
 
         // Rewrite CDN URLs inside JavaScript responses so that dynamically
         // loaded chunks and API calls route through the first-party proxy.
@@ -412,9 +441,26 @@ impl IntegrationProxy for SourcepointIntegration {
             && self.config.rewrite_sdk
             && Self::is_javascript_response(&response)
         {
-            log::info!("[sourcepoint] Rewriting JavaScript response body for {path}");
+            log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
 
-            let body = response.take_body_str();
+            let body_bytes = response.take_body_bytes();
+            let body = match String::from_utf8(body_bytes) {
+                Ok(text) => text,
+                Err(err) => {
+                    log::warn!(
+                        "Sourcepoint: upstream body for {path} is not valid UTF-8, \
+                         passing through unmodified"
+                    );
+                    let mut passthrough = Response::new();
+                    passthrough.set_status(response.get_status());
+                    if let Some(ct) = response.get_header(header::CONTENT_TYPE) {
+                        passthrough.set_header(header::CONTENT_TYPE, ct);
+                    }
+                    passthrough.set_body(err.into_bytes());
+                    self.apply_cache_headers(&mut passthrough);
+                    return Ok(passthrough);
+                }
+            };
             let rewritten = Self::rewrite_script_content(&body);
 
             let mut new_response = Response::new();
@@ -427,6 +473,20 @@ impl IntegrationProxy for SourcepointIntegration {
                 header::CACHE_CONTROL,
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             );
+
+            // Preserve CORS headers from upstream so cross-origin consumers
+            // continue to work through the first-party proxy.
+            for header_name in [
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            ] {
+                if let Some(value) = response.get_header(&header_name) {
+                    new_response.set_header(&header_name, value);
+                }
+            }
+
             new_response.set_body(rewritten);
             return Ok(new_response);
         }
