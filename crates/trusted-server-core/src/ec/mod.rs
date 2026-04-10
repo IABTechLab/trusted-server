@@ -26,6 +26,7 @@
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
+//! - [`fp_signals`] — First-party signal extraction from browser cookies
 
 pub mod admin;
 pub mod batch_sync;
@@ -34,6 +35,7 @@ pub mod cookies;
 pub mod device;
 pub mod eids;
 pub mod finalize;
+pub mod fp_signals;
 pub mod generation;
 pub mod identify;
 pub mod kv;
@@ -158,6 +160,9 @@ pub struct EcContext {
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
+    /// The parsed cookie jar from the incoming request.
+    /// Retained for first-party signal extraction in the post-EC phase.
+    cookie_jar: Option<CookieJar>,
 }
 
 impl EcContext {
@@ -234,6 +239,7 @@ impl EcContext {
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
+            cookie_jar: parsed.jar,
         })
     }
 
@@ -378,6 +384,15 @@ impl EcContext {
         consent::ec_consent_granted(&self.consent)
     }
 
+    /// Returns a reference to the parsed cookie jar from the incoming request.
+    ///
+    /// Used by first-party signal extraction to read partner cookies without
+    /// re-parsing the `Cookie` header.
+    #[must_use]
+    pub fn cookie_jar(&self) -> Option<&CookieJar> {
+        self.cookie_jar.as_ref()
+    }
+
     /// Returns the existing EC cookie value for revocation handling.
     ///
     /// When consent is withdrawn, this value is needed to identify the
@@ -417,6 +432,7 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            cookie_jar: None,
         }
     }
 
@@ -437,6 +453,7 @@ impl EcContext {
             client_ip,
             geo_info: None,
             device_signals: None,
+            cookie_jar: None,
         }
     }
 
@@ -460,6 +477,7 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            cookie_jar: None,
         }
     }
 }
@@ -471,6 +489,21 @@ pub(crate) fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or_else(|err| {
+            log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");
+            0
+        })
+}
+
+/// Returns the current Unix timestamp in milliseconds.
+///
+/// Uses `std::time::SystemTime` which is supported on `wasm32-wasip1`.
+/// The `as u64` narrowing from `u128` is safe for ~584 million years.
+#[must_use]
+pub fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or_else(|err| {
             log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");
             0

@@ -381,6 +381,9 @@ mod tests {
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
             ts_pull_token: Some("token".to_owned()),
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         }
     }
 

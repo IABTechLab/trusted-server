@@ -1,13 +1,17 @@
 //! Partner registry — `PartnerRecord` schema and `PartnerStore` operations.
 //!
 //! Each partner (SSP, DSP, identity vendor) is stored as a JSON record in
-//! the Fastly KV Store keyed by `partner_id`. Two secondary indexes exist:
+//! the Fastly KV Store keyed by `partner_id`. Three secondary indexes exist:
 //!
 //! - `apikey:{sha256_hex}` — maps API key hashes to partner IDs for O(1)
 //!   auth lookups during batch sync.
 //! - `_pull_enabled` — JSON array of partner IDs with `pull_sync_enabled:
 //!   true`, enabling O(1+N) reads on the pull sync hot path instead of a
 //!   full partner scan.
+//! - `_fp_signal_enabled` — JSON array of partner configs for partners
+//!   with at least one `fp_signal_cookie_names` entry, enabling O(1+N)
+//!   reads for first-party signal collection config without a full
+//!   partner scan.
 
 use std::{collections::HashSet, sync::OnceLock};
 
@@ -45,6 +49,14 @@ const APIKEY_INDEX_PREFIX: &str = "apikey:";
 /// Updated on every `upsert()` so that `pull_enabled_partners()` can read
 /// a single index key instead of listing/scanning all partners.
 const PULL_ENABLED_INDEX_KEY: &str = "_pull_enabled";
+
+/// Key for the FP-signal-enabled partner secondary index.
+///
+/// Stores a JSON array of [`super::fp_signals::FpSignalPartnerConfig`] for
+/// partners with at least one `fp_signal_cookie_names` entry. Updated on
+/// every `upsert()` so that `fp_signal_configs()` can read a single key
+/// instead of scanning all partners.
+const FP_SIGNAL_INDEX_KEY: &str = "_fp_signal_enabled";
 
 /// Cached compiled regex for partner ID validation.
 static PARTNER_ID_REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
@@ -112,6 +124,24 @@ pub struct PartnerRecord {
     /// send to us, so it only needs hash verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_pull_token: Option<String>,
+    /// First-party cookie names that may carry this partner's UID.
+    /// Checked in order; first match wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fp_signal_cookie_names: Vec<String>,
+    /// Dot-notation JSON path to extract the UID from a JSON cookie
+    /// value. When `None`, the raw cookie value is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp_signal_json_path: Option<String>,
+    /// Minimum seconds between re-collection writes for this partner.
+    /// Defaults to 86400 (24 hours).
+    #[serde(default = "PartnerRecord::default_fp_signal_ttl_sec")]
+    pub fp_signal_ttl_sec: u64,
+}
+
+impl PartnerRecord {
+    fn default_fp_signal_ttl_sec() -> u64 {
+        86400
+    }
 }
 
 /// Validates a partner ID format and checks against reserved names.
@@ -198,6 +228,92 @@ pub fn validate_pull_sync_config(record: &PartnerRecord) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates first-party signal configuration fields on a [`PartnerRecord`].
+///
+/// If `fp_signal_cookie_names` is empty, all FP signal fields are ignored
+/// and validation always succeeds. When cookie names are present the
+/// following rules apply:
+///
+/// - At most 5 cookie names.
+/// - Each cookie name must be non-empty, contain only ASCII characters, and
+///   must not contain `;` or `=` (reserved in the Cookie header spec).
+/// - If `fp_signal_json_path` is `Some`, it must be non-empty, contain only
+///   alphanumeric characters, `.`, or `_`, and have at most 4 dot-separated
+///   segments.
+/// - `fp_signal_ttl_sec` must be between 60 and 604800 (7 days) inclusive.
+///
+/// # Errors
+///
+/// Returns a descriptive error string on validation failure.
+pub fn validate_fp_signal_config(record: &PartnerRecord) -> Result<(), String> {
+    if record.fp_signal_cookie_names.is_empty() {
+        return Ok(());
+    }
+
+    const MAX_COOKIE_NAMES: usize = 5;
+    if record.fp_signal_cookie_names.len() > MAX_COOKIE_NAMES {
+        return Err(format!(
+            "fp_signal_cookie_names must have at most {MAX_COOKIE_NAMES} entries, got {}",
+            record.fp_signal_cookie_names.len()
+        ));
+    }
+
+    const MAX_COOKIE_NAME_LENGTH: usize = 128;
+    for name in &record.fp_signal_cookie_names {
+        if name.is_empty() {
+            return Err("fp_signal_cookie_names entries must not be empty".to_owned());
+        }
+        if name.len() > MAX_COOKIE_NAME_LENGTH {
+            return Err(format!(
+                "fp_signal_cookie_names entry must be at most {MAX_COOKIE_NAME_LENGTH} characters, got {}",
+                name.len()
+            ));
+        }
+        if !name.is_ascii() {
+            return Err(format!(
+                "fp_signal_cookie_names entry '{name}' must contain only ASCII characters"
+            ));
+        }
+        if name.contains(';') || name.contains('=') {
+            return Err(format!(
+                "fp_signal_cookie_names entry '{name}' must not contain ';' or '='"
+            ));
+        }
+    }
+
+    if let Some(path) = &record.fp_signal_json_path {
+        if path.is_empty() {
+            return Err("fp_signal_json_path must not be empty when present".to_owned());
+        }
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        {
+            return Err(format!(
+                "fp_signal_json_path '{path}' must contain only alphanumeric characters, '.', or '_'"
+            ));
+        }
+        let segment_count = path.split('.').count();
+        const MAX_SEGMENTS: usize = 4;
+        if segment_count > MAX_SEGMENTS {
+            return Err(format!(
+                "fp_signal_json_path '{path}' must have at most {MAX_SEGMENTS} dot-separated segments, got {segment_count}"
+            ));
+        }
+    }
+
+    const MIN_TTL: u64 = 60;
+    const MAX_TTL: u64 = 604_800;
+    if record.fp_signal_ttl_sec < MIN_TTL || record.fp_signal_ttl_sec > MAX_TTL {
+        return Err(format!(
+            "fp_signal_ttl_sec must be between {MIN_TTL} and {MAX_TTL}, got {}",
+            record.fp_signal_ttl_sec
+        ));
+    }
+
+    Ok(())
+}
+
 /// Computes the SHA-256 hex digest of an API key.
 #[must_use]
 pub fn hash_api_key(api_key: &str) -> String {
@@ -208,13 +324,16 @@ pub fn hash_api_key(api_key: &str) -> String {
 
 /// Wraps a Fastly KV Store for partner registry operations.
 ///
-/// Partner records are keyed by `partner_id`. Two secondary indexes
+/// Partner records are keyed by `partner_id`. Three secondary indexes
 /// optimize hot-path operations:
 ///
 /// - `apikey:{sha256_hex}` maps API key hashes to partner IDs for
 ///   O(1) auth lookups during batch sync.
 /// - `_pull_enabled` stores a JSON array of partner IDs with
 ///   `pull_sync_enabled: true` for O(1+N) reads during pull sync dispatch.
+/// - `_fp_signal_enabled` stores a JSON array of partner configs for
+///   partners with at least one `fp_signal_cookie_names` entry for
+///   O(1+N) reads during first-party signal collection.
 pub struct PartnerStore {
     store_name: String,
 }
@@ -311,7 +430,10 @@ impl PartnerStore {
             })?;
 
             for key in page.keys() {
-                if key.starts_with(APIKEY_INDEX_PREFIX) || key == PULL_ENABLED_INDEX_KEY {
+                if key.starts_with(APIKEY_INDEX_PREFIX)
+                    || key == PULL_ENABLED_INDEX_KEY
+                    || key == FP_SIGNAL_INDEX_KEY
+                {
                     continue;
                 }
 
@@ -514,6 +636,9 @@ impl PartnerStore {
         //    `list_registered()` if the index is missing or stale.
         self.update_pull_enabled_index(&store, &record.id, record.pull_sync_enabled);
 
+        // 5. Update _fp_signal_enabled secondary index (best-effort).
+        self.update_fp_signal_index(&store, record);
+
         Ok(is_create)
     }
 
@@ -607,6 +732,90 @@ impl PartnerStore {
                 partner_id
             );
         }
+    }
+
+    /// Best-effort update of the `_fp_signal_enabled` secondary index.
+    ///
+    /// Reads the current index, replaces the entry for `record.id`, and
+    /// writes it back. If `fp_signal_cookie_names` is empty the partner is
+    /// removed from the index. All errors are logged and swallowed — the
+    /// primary record write has already succeeded.
+    fn update_fp_signal_index(&self, store: &KVStore, record: &PartnerRecord) {
+        // Read existing index (or start with empty list).
+        let mut configs: Vec<super::fp_signals::FpSignalPartnerConfig> =
+            match store.lookup(FP_SIGNAL_INDEX_KEY) {
+                Ok(mut resp) => {
+                    let bytes = resp.take_body_bytes();
+                    serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                        log::warn!("Failed to deserialize fp-signal index, starting fresh: {err}");
+                        Vec::new()
+                    })
+                }
+                Err(_) => Vec::new(),
+            };
+
+        // Remove any existing entry for this partner.
+        configs.retain(|c| c.partner_id != record.id);
+
+        // Re-add if partner has cookie names configured.
+        if !record.fp_signal_cookie_names.is_empty() {
+            configs.push(super::fp_signals::FpSignalPartnerConfig {
+                partner_id: record.id.clone(),
+                cookie_names: record.fp_signal_cookie_names.clone(),
+                json_path: record.fp_signal_json_path.clone(),
+                ttl_sec: record.fp_signal_ttl_sec,
+            });
+        }
+
+        let body = match serde_json::to_string(&configs) {
+            Ok(b) => b,
+            Err(err) => {
+                log::warn!(
+                    "Failed to serialize fp-signal index after updating partner '{}': {err}",
+                    record.id
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = store.build_insert().execute(FP_SIGNAL_INDEX_KEY, body) {
+            log::warn!(
+                "Failed to write fp-signal index after updating partner '{}': {err:?}",
+                record.id
+            );
+        }
+    }
+
+    /// Returns FP-signal-enabled partner configs via the `_fp_signal_enabled`
+    /// secondary index.
+    ///
+    /// Returns an empty [`Vec`] when the index is missing or corrupt rather
+    /// than propagating an error, matching the best-effort semantics of the
+    /// index itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] if the store cannot be opened.
+    pub fn fp_signal_configs(
+        &self,
+    ) -> Result<Vec<super::fp_signals::FpSignalPartnerConfig>, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+
+        let index_body = match store.lookup(FP_SIGNAL_INDEX_KEY) {
+            Ok(mut resp) => resp.take_body_bytes(),
+            Err(fastly::kv_store::KVStoreError::ItemNotFound) => return Ok(Vec::new()),
+            Err(err) => {
+                log::warn!("Failed to read fp-signal index: {err:?}");
+                return Ok(Vec::new());
+            }
+        };
+
+        let configs = serde_json::from_slice(&index_body).unwrap_or_else(|err| {
+            log::warn!("Failed to deserialize fp-signal index, returning empty: {err}");
+            Vec::new()
+        });
+
+        Ok(configs)
     }
 
     fn restore_previous_index_mapping(
@@ -726,6 +935,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: None,
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
 
         let json = serde_json::to_string(&record).expect("should serialize");
@@ -827,6 +1039,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: None,
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         assert!(validate_pull_sync_config(&record).is_ok());
     }
@@ -849,6 +1064,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: Some("token".to_owned()),
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         let err = validate_pull_sync_config(&record).unwrap_err();
         assert!(err.contains("pull_sync_url"), "got: {err}");
@@ -872,6 +1090,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: None,
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         let err = validate_pull_sync_config(&record).unwrap_err();
         assert!(err.contains("ts_pull_token"), "got: {err}");
@@ -895,6 +1116,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: Some("token".to_owned()),
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         let err = validate_pull_sync_config(&record).unwrap_err();
         assert!(
@@ -921,6 +1145,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: Some("token".to_owned()),
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         let err = validate_pull_sync_config(&record).unwrap_err();
         assert!(err.contains("pull_sync_allowed_domains"), "got: {err}");
@@ -944,6 +1171,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: Some("token".to_owned()),
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         assert!(validate_pull_sync_config(&record).is_ok());
     }
@@ -966,6 +1196,9 @@ mod tests {
             pull_sync_ttl_sec: 86400,
             pull_sync_rate_limit: 10,
             ts_pull_token: None,
+            fp_signal_cookie_names: vec![],
+            fp_signal_json_path: None,
+            fp_signal_ttl_sec: 86400,
         };
         let json = serde_json::to_string(&record).expect("should serialize");
         assert!(
@@ -979,6 +1212,126 @@ mod tests {
         assert!(
             !json.contains("pull_sync_allowed_domains"),
             "empty pull_sync_allowed_domains should be omitted"
+        );
+        assert!(
+            !json.contains("fp_signal_cookie_names"),
+            "empty fp_signal_cookie_names should be omitted"
+        );
+        assert!(
+            !json.contains("fp_signal_json_path"),
+            "None fp_signal_json_path should be omitted"
+        );
+    }
+
+    fn base_fp_signal_record() -> PartnerRecord {
+        PartnerRecord {
+            id: "test".to_owned(),
+            name: "Test".to_owned(),
+            allowed_return_domains: vec![],
+            api_key_hash: String::new(),
+            bidstream_enabled: false,
+            source_domain: "test.com".to_owned(),
+            openrtb_atype: 3,
+            sync_rate_limit: 100,
+            batch_rate_limit: 60,
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: 86400,
+            pull_sync_rate_limit: 10,
+            ts_pull_token: None,
+            fp_signal_cookie_names: vec!["uid2_token".to_owned()],
+            fp_signal_json_path: Some("advertising_token".to_owned()),
+            fp_signal_ttl_sec: 86400,
+        }
+    }
+
+    #[test]
+    fn validate_fp_signal_config_accepts_valid() {
+        let record = base_fp_signal_record();
+        assert!(
+            validate_fp_signal_config(&record).is_ok(),
+            "should accept valid FP signal config"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_config_ok_when_empty() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_cookie_names = vec![];
+        assert!(
+            validate_fp_signal_config(&record).is_ok(),
+            "should accept empty cookie names without validating other fields"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_empty_cookie_name() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_cookie_names = vec!["valid_cookie".to_owned(), String::new()];
+        let err = validate_fp_signal_config(&record).expect_err("should reject empty cookie name");
+        assert!(
+            err.contains("must not be empty"),
+            "should mention empty entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_too_many_cookie_names() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_cookie_names = (0..6).map(|i| format!("cookie_{i}")).collect();
+        let err = validate_fp_signal_config(&record).expect_err("should reject 6 cookie names");
+        assert!(
+            err.contains("at most 5"),
+            "should mention 5-entry limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_cookie_name_with_semicolon() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_cookie_names = vec!["bad;name".to_owned()];
+        let err = validate_fp_signal_config(&record)
+            .expect_err("should reject cookie name with semicolon");
+        assert!(
+            err.contains("';'"),
+            "should mention forbidden character, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_ttl_too_low() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_ttl_sec = 10;
+        let err = validate_fp_signal_config(&record).expect_err("should reject TTL of 10");
+        assert!(
+            err.contains("fp_signal_ttl_sec"),
+            "should mention ttl field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_invalid_json_path() {
+        let mut record = base_fp_signal_record();
+        // "a.b.c.d.e" has 5 segments — exceeds max of 4.
+        record.fp_signal_json_path = Some("a.b.c.d.e".to_owned());
+        let err = validate_fp_signal_config(&record)
+            .expect_err("should reject json path with 5 segments");
+        assert!(
+            err.contains("at most 4"),
+            "should mention 4-segment limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fp_signal_rejects_cookie_name_too_long() {
+        let mut record = base_fp_signal_record();
+        record.fp_signal_cookie_names = vec!["x".repeat(129)];
+        let err = validate_fp_signal_config(&record)
+            .expect_err("should reject cookie name exceeding 128 chars");
+        assert!(
+            err.contains("at most 128"),
+            "should mention 128-char limit, got: {err}"
         );
     }
 }

@@ -12,8 +12,12 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::current_timestamp_ms;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::fp_signals::{
+    extract_fp_signals, write_fp_signals, FpSignal, FpSignalPartnerConfig,
+};
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::partner::PartnerStore;
@@ -108,9 +112,21 @@ fn main() -> Result<(), Error> {
     let RouteOutcome {
         response,
         pull_sync_context,
+        ec_id,
+        fp_signals,
+        fp_signal_configs,
     } = outcome;
 
     response.send_to_client();
+
+    // Write first-party signals to KV (post-send, off critical path).
+    // Uses ec_id directly — not gated on PullSyncContext — so signals are
+    // still written when client_ip is unavailable.
+    if !fp_signals.is_empty() {
+        if let Some(ref ec_id) = ec_id {
+            run_fp_signal_collection_after_send(&settings, ec_id, &fp_signals, &fp_signal_configs);
+        }
+    }
 
     if let Some(context) = pull_sync_context {
         run_pull_sync_after_send(&settings, &context);
@@ -123,6 +139,12 @@ fn main() -> Result<(), Error> {
 struct RouteOutcome {
     response: Response,
     pull_sync_context: Option<PullSyncContext>,
+    /// The active EC ID, carried independently from [`PullSyncContext`] so
+    /// that FP signal writes succeed even when `client_ip` is unavailable
+    /// (which makes `PullSyncContext` `None`).
+    ec_id: Option<String>,
+    fp_signals: Vec<FpSignal>,
+    fp_signal_configs: Vec<FpSignalPartnerConfig>,
 }
 
 async fn route_request(
@@ -170,6 +192,9 @@ async fn route_request(
         return Ok(RouteOutcome {
             response,
             pull_sync_context: None,
+            ec_id: None,
+            fp_signals: vec![],
+            fp_signal_configs: vec![],
         });
     }
 
@@ -182,6 +207,9 @@ async fn route_request(
                 return Ok(RouteOutcome {
                     response,
                     pull_sync_context: None,
+                    ec_id: None,
+                    fp_signals: vec![],
+                    fp_signal_configs: vec![],
                 });
             }
         };
@@ -210,6 +238,9 @@ async fn route_request(
             return Ok(RouteOutcome {
                 response,
                 pull_sync_context: None,
+                ec_id: None,
+                fp_signals: vec![],
+                fp_signal_configs: vec![],
             });
         }
         Ok(None) => {}
@@ -220,6 +251,9 @@ async fn route_request(
             return Ok(RouteOutcome {
                 response,
                 pull_sync_context: None,
+                ec_id: None,
+                fp_signals: vec![],
+                fp_signal_configs: vec![],
             });
         }
     }
@@ -353,15 +387,46 @@ async fn route_request(
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
+    // Extract first-party signals from cookies for post-send KV write.
+    let (fp_signals, fp_signal_configs) =
+        if is_real_browser && organic_route && route_succeeded && ec_context.ec_allowed() {
+            if ec_context.ec_value().is_some() {
+                let partner_store = require_partner_store(settings).ok();
+                let configs = partner_store
+                    .as_ref()
+                    .and_then(|s| s.fp_signal_configs().ok())
+                    .unwrap_or_default();
+                if configs.is_empty() {
+                    (vec![], vec![])
+                } else {
+                    let now_ms = current_timestamp_ms();
+                    let signals = ec_context
+                        .cookie_jar()
+                        .map(|j| extract_fp_signals(j, &configs, now_ms))
+                        .unwrap_or_default();
+                    (signals, configs)
+                }
+            } else {
+                (vec![], vec![])
+            }
+        } else {
+            (vec![], vec![])
+        };
+
     let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
         build_pull_sync_context(&ec_context)
     } else {
         None
     };
 
+    let ec_id = ec_context.ec_value().map(str::to_owned);
+
     Ok(RouteOutcome {
         response,
         pull_sync_context,
+        ec_id,
+        fp_signals,
+        fp_signal_configs,
     })
 }
 
@@ -388,6 +453,24 @@ fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
 
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     dispatch_pull_sync(settings, &kv, &partner_store, &limiter, context);
+}
+
+fn run_fp_signal_collection_after_send(
+    settings: &Settings,
+    ec_id: &str,
+    signals: &[FpSignal],
+    configs: &[FpSignalPartnerConfig],
+) {
+    let kv = match require_identity_graph(settings) {
+        Ok(kv) => kv,
+        Err(err) => {
+            log::debug!("FP signal collection: identity graph unavailable: {err:?}");
+            return;
+        }
+    };
+    if let Err(err) = write_fp_signals(&kv, ec_id, signals, configs) {
+        log::warn!("FP signal collection failed: {err:?}");
+    }
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

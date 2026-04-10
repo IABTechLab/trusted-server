@@ -60,6 +60,15 @@ pub enum UpsertResult {
 
 use super::log_id;
 
+/// Outcome of a [`KvIdentityGraph::cas_write`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasWriteOutcome {
+    /// Write succeeded.
+    Ok,
+    /// Generation mismatch — caller should re-read and retry.
+    Conflict,
+}
+
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
 /// Each EC ID (`{64hex}.{6alnum}`) maps to a JSON-encoded [`KvEntry`]
@@ -840,6 +849,45 @@ impl KvIdentityGraph {
         }
 
         Ok(Some(cluster_size))
+    }
+
+    /// CAS-writes a full entry using the given generation marker.
+    ///
+    /// Returns [`CasWriteOutcome::Ok`] on success, or
+    /// [`CasWriteOutcome::Conflict`] when the generation does not match —
+    /// the caller should re-read and retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on serialization or store failure
+    /// (not on generation mismatch — that is [`CasWriteOutcome::Conflict`]).
+    pub fn cas_write(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        generation: u64,
+    ) -> Result<CasWriteOutcome, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+        let (body, meta_str) = Self::serialize_entry(entry, &self.store_name)?;
+
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .metadata(&meta_str)
+            .time_to_live(ENTRY_TTL)
+            .execute(ec_id, body.as_str())
+        {
+            Ok(()) => Ok(CasWriteOutcome::Ok),
+            Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
+                Ok(CasWriteOutcome::Conflict)
+            }
+            Err(err) => Err(
+                Report::new(err).change_context(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!("CAS write failed for key '{ec_id}'"),
+                }),
+            ),
+        }
     }
 
     /// Hard-deletes the entry.

@@ -13,7 +13,8 @@ use url::Host;
 use crate::error::TrustedServerError;
 
 use super::partner::{
-    hash_api_key, validate_partner_id, validate_pull_sync_config, PartnerRecord, PartnerStore,
+    hash_api_key, validate_fp_signal_config, validate_partner_id, validate_pull_sync_config,
+    PartnerRecord, PartnerStore,
 };
 
 /// Request body for `POST /_ts/admin/v1/partners/register`.
@@ -48,6 +49,12 @@ pub struct RegisterPartnerRequest {
     pub pull_sync_rate_limit: u32,
     #[serde(default)]
     pub ts_pull_token: Option<String>,
+    #[serde(default)]
+    pub fp_signal_cookie_names: Vec<String>,
+    #[serde(default)]
+    pub fp_signal_json_path: Option<String>,
+    #[serde(default = "default_fp_signal_ttl_sec")]
+    pub fp_signal_ttl_sec: u64,
 }
 
 impl std::fmt::Debug for RegisterPartnerRequest {
@@ -81,6 +88,9 @@ fn default_pull_sync_ttl_sec() -> u64 {
 }
 fn default_pull_sync_rate_limit() -> u32 {
     10
+}
+fn default_fp_signal_ttl_sec() -> u64 {
+    86400
 }
 
 fn bad_request(message: impl Into<String>) -> Report<TrustedServerError> {
@@ -199,6 +209,9 @@ pub fn handle_register_partner(
         pull_sync_ttl_sec,
         pull_sync_rate_limit,
         ts_pull_token,
+        fp_signal_cookie_names,
+        fp_signal_json_path,
+        fp_signal_ttl_sec,
     } = request;
 
     // Validate partner ID.
@@ -238,10 +251,16 @@ pub fn handle_register_partner(
         pull_sync_ttl_sec,
         pull_sync_rate_limit,
         ts_pull_token,
+        fp_signal_cookie_names,
+        fp_signal_json_path,
+        fp_signal_ttl_sec,
     };
 
     // Validate pull sync configuration.
     validate_pull_sync_config(&record).map_err(bad_request)?;
+
+    // Validate FP signal configuration.
+    validate_fp_signal_config(&record).map_err(bad_request)?;
 
     // Persist to KV store.
     let created = partner_store.upsert(&record)?;
@@ -299,6 +318,12 @@ mod tests {
         assert!(!req.pull_sync_enabled, "should default to false");
         assert!(req.pull_sync_url.is_none());
         assert!(req.ts_pull_token.is_none());
+        assert!(
+            req.fp_signal_cookie_names.is_empty(),
+            "should default to empty"
+        );
+        assert!(req.fp_signal_json_path.is_none(), "should default to None");
+        assert_eq!(req.fp_signal_ttl_sec, 86400, "should default to 86400");
     }
 
     #[test]
@@ -340,7 +365,10 @@ mod tests {
             "pull_sync_allowed_domains": ["sync.example-ssp.com"],
             "pull_sync_ttl_sec": 43200,
             "pull_sync_rate_limit": 5,
-            "ts_pull_token": "bearer-token-123"
+            "ts_pull_token": "bearer-token-123",
+            "fp_signal_cookie_names": ["uid2_token", "__euid_uid2"],
+            "fp_signal_json_path": "advertising_token",
+            "fp_signal_ttl_sec": 43200
         }"#;
 
         let req: RegisterPartnerRequest =
@@ -353,6 +381,15 @@ mod tests {
             req.pull_sync_url.as_deref(),
             Some("https://sync.example-ssp.com/pull")
         );
+        assert_eq!(
+            req.fp_signal_cookie_names,
+            vec!["uid2_token".to_owned(), "__euid_uid2".to_owned()]
+        );
+        assert_eq!(
+            req.fp_signal_json_path.as_deref(),
+            Some("advertising_token")
+        );
+        assert_eq!(req.fp_signal_ttl_sec, 43200);
     }
 
     #[test]
