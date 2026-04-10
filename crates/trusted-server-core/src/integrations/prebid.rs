@@ -136,7 +136,7 @@ pub struct PrebidIntegrationConfig {
     /// Canonical ordered bidder-param override rules.
     ///
     /// Each rule has structured `when` matchers and a non-empty `set` object
-    /// that is shallow-merged into the bidder params when every matcher
+    /// that is deep-merged into the bidder params when every matcher
     /// matches. Compatibility fields such as [`bid_param_overrides`](Self::bid_param_overrides)
     /// and [`bid_param_zone_overrides`](Self::bid_param_zone_overrides) are
     /// normalized into the same runtime rule engine before request handling.
@@ -173,14 +173,14 @@ impl IntegrationConfig for PrebidIntegrationConfig {
 /// Canonical bidder-param override rule.
 ///
 /// A rule matches against the request-time facts in [`BidParamOverrideWhen`]
-/// and shallow-merges [`set`](Self::set) into the bidder params when all
+/// and deep-merges [`set`](Self::set) into the bidder params when all
 /// populated matchers are equal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BidParamOverrideRule {
     /// Structured exact-match conditions for this rule.
     pub when: BidParamOverrideWhen,
-    /// Parameters shallow-merged into bidder params when the rule matches.
+    /// Parameters deep-merged into bidder params when the rule matches.
     pub set: serde_json::Map<String, Json>,
 }
 
@@ -230,6 +230,9 @@ pub struct PrebidIntegration {
 
 impl PrebidIntegration {
     fn try_new(config: PrebidIntegrationConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        // Validate override rules eagerly so that `register()` fails fast before the
+        // integration is added to the registry. `PrebidAuctionProvider::try_new` repeats
+        // this build when the auction provider is registered from the same config.
         let _ = BidParamOverrideEngine::try_from_config(&config)?;
         Ok(Arc::new(Self { config }))
     }
@@ -496,15 +499,27 @@ fn expand_trusted_server_bidders(
         .collect()
 }
 
-/// Shallow-merges `override_obj` into `params`.
+/// Deep-merges `override_obj` into `params`.
 ///
-/// When `params` is a JSON object, each key in `override_obj` is inserted
-/// or replaced in `params`. When `params` is not an object, it is replaced
-/// entirely with the override object.
+/// When `params` is a JSON object, each key in `override_obj` is inserted or
+/// replaced in `params`. When both the existing value and the override value
+/// are JSON objects, the merge recurses so nested objects are merged rather
+/// than replaced. When `params` is not an object, it is replaced entirely
+/// with the override object.
 fn merge_bidder_param_object(params: &mut Json, override_obj: &serde_json::Map<String, Json>) {
     match params {
         Json::Object(base) => {
-            base.extend(override_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+            for (k, v) in override_obj {
+                let existing = base.entry(k.clone()).or_insert(Json::Null);
+                if existing.is_object() && v.is_object() {
+                    merge_bidder_param_object(
+                        existing,
+                        v.as_object().expect("should be a JSON object"),
+                    );
+                } else {
+                    *existing = v.clone();
+                }
+            }
         }
         _ => {
             *params = Json::Object(override_obj.clone());
@@ -1626,7 +1641,7 @@ secret_key = "test-secret-key"
             .integration_config::<PrebidIntegrationConfig>("prebid")?
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
-                    message: "prebid integration should be enabled".to_string(),
+                    message: "prebid integration config should be present and enabled".to_string(),
                 })
             })
     }
@@ -3038,6 +3053,53 @@ pubid = "server-pub"
         assert_eq!(
             params["criteo"]["keep"], "present",
             "override should preserve unrelated bidder params"
+        );
+    }
+
+    #[test]
+    fn bidder_param_override_deep_merges_nested_objects() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["appnexus"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = { bidder = "appnexus" }
+set = { keywords = { genre = "news" } }
+"#,
+        );
+
+        // Client sends a nested `keywords` object with an existing key alongside
+        // one that the override does not touch.
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "appnexus": {
+                    "placementId": 12345,
+                    "keywords": { "sport": "football", "genre": "sports" }
+                }
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        let keywords = &params["appnexus"]["keywords"];
+
+        assert_eq!(
+            keywords["genre"], "news",
+            "override should replace the matching nested key"
+        );
+        assert_eq!(
+            keywords["sport"], "football",
+            "deep merge should preserve unrelated nested keys"
+        );
+        assert_eq!(
+            params["appnexus"]["placementId"], 12345,
+            "deep merge should preserve top-level keys not in the override"
         );
     }
 
