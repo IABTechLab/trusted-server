@@ -1,0 +1,9 @@
+{
+  "plugins": [
+    {
+      "name": "js-asset-auditor",
+      "description": "Audit publisher pages for third-party JS assets and generate js-assets.toml entries using Playwright",
+      "path": "packages/js-asset-auditor"
+    }
+  ]
+}
