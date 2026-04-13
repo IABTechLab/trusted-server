@@ -14,39 +14,40 @@ The Auditor eliminates this friction. It sweeps a publisher's page using Playwri
 
 It also runs as a monitoring tool — `--diff` mode compares a new sweep against the existing config and surfaces new or removed assets, giving publishers ongoing visibility into their third-party JS footprint.
 
-**Implementation:** Standalone Playwright CLI (`tools/js-asset-auditor/audit.mjs`) backed by a shared processing library (`scripts/audit-js-assets.mjs`). No Rust, no compiled code. The Claude Code skill (`/audit-js-assets`) is a thin wrapper that invokes the CLI.
+**Implementation:** Claude Code plugin at `packages/js-asset-auditor/` containing a standalone Playwright CLI, a processing library, and a skill definition. No Rust, no compiled code. Can also be run directly without Claude Code.
 
 ---
 
 ## Command Interface
 
 ```bash
-# Via Claude Code skill
-/audit-js-assets https://www.publisher.com                # init — generate js-assets.toml
-/audit-js-assets https://www.publisher.com --diff         # diff — compare against existing file
-/audit-js-assets https://www.publisher.com --settle 15000 # longer settle for ad-tech-heavy pages
-/audit-js-assets https://www.publisher.com --no-filter    # bypass heuristic filtering
-/audit-js-assets https://www.publisher.com --headed       # visible browser for debugging
+# Via Claude Code plugin skill
+/js-asset-auditor:audit-js-assets https://www.publisher.com                # init — generate js-assets.toml
+/js-asset-auditor:audit-js-assets https://www.publisher.com --diff         # diff — compare against existing file
+/js-asset-auditor:audit-js-assets https://www.publisher.com --settle 15000 # longer settle for ad-tech-heavy pages
+/js-asset-auditor:audit-js-assets https://www.publisher.com --no-filter    # bypass heuristic filtering
+/js-asset-auditor:audit-js-assets https://www.publisher.com --headed       # visible browser for debugging
 
 # Direct CLI invocation (no Claude Code required)
-node tools/js-asset-auditor/audit.mjs https://www.publisher.com
-node tools/js-asset-auditor/audit.mjs https://www.publisher.com --diff --output js-assets.toml
+node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com
+node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com --domain publisher.com
+node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com --diff --output js-assets.toml
 ```
 
 ---
 
 ## Sweep Protocol
 
-The CLI (`tools/js-asset-auditor/audit.mjs`) performs the full sweep:
+The CLI (`packages/js-asset-auditor/lib/audit.mjs`) performs the full sweep:
 
-1. Read `trusted-server.toml` → extract `publisher.domain` (defines first-party boundary)
+1. Resolve publisher domain: `--domain` flag → `trusted-server.toml` → infer from target URL
 2. Launch headless Chromium via Playwright (visible with `--headed`)
 3. Register a response listener for `resourceType() === 'script'` to capture all script network requests
 4. Navigate to target URL (`page.goto`, 30s timeout, follows redirects transparently)
 5. Wait for page load settle: `page.waitForTimeout(SETTLE_MS)` where `SETTLE_MS` defaults to 6000 (configurable via `--settle <ms>`)
 6. Evaluate `document.head.querySelectorAll('script[src]')` to collect head-loaded script URLs
 7. Close browser
-8. Pass collected URLs to `processAssets()` from `scripts/audit-js-assets.mjs` — applies URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation
+8. Pass collected URLs to `processAssets()` from `lib/process.mjs` — applies URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation
 9. Write `js-assets.toml` output (init or diff mode)
 10. Print JSON summary to stdout (progress lines go to stderr)
 
@@ -58,11 +59,13 @@ The CLI (`tools/js-asset-auditor/audit.mjs`) performs the full sweep:
 
 ### First-party boundary
 
-A network request is **first-party** if the request URL's host, after stripping a leading `www.`, matches `publisher.domain` (from `trusted-server.toml`) after the same stripping. Matching is exact on the resulting strings.
+A network request is **first-party** if the request URL's host, after stripping a leading `www.`, matches the publisher domain after the same stripping. Matching is exact on the resulting strings.
 
-Publisher-owned CDN subdomains (e.g., `cdn.publisher.com`, `static.publisher.com`) are treated as third-party by default. If the publisher wants to exclude them, they can be added to a `first_party_hosts` list in the command invocation (e.g., `--first-party cdn.publisher.com`).
+**Domain resolution order:** `--domain <host>` flag → `publisher.domain` from `trusted-server.toml` → inferred from the target URL's hostname. This makes the tool usable in any project — `trusted-server.toml` is not required.
 
-**Auto-detection:** The target URL's hostname is automatically included as first-party, in addition to `publisher.domain` from `trusted-server.toml`. This ensures that auditing `https://golf.com` when `publisher.domain = "test-publisher.com"` correctly excludes `golf.com` scripts without requiring `--first-party golf.com`.
+**Auto-detection:** The target URL's hostname is automatically included as first-party, in addition to the resolved publisher domain. This ensures that auditing `https://golf.com` when `publisher.domain = "test-publisher.com"` correctly excludes `golf.com` scripts without requiring `--first-party golf.com`.
+
+Publisher-owned CDN subdomains (e.g., `cdn.publisher.com`, `static.publisher.com`) are treated as third-party by default. If the publisher wants to exclude them, they can be added via `--first-party cdn.publisher.com`.
 
 ### URL normalization
 
@@ -131,7 +134,7 @@ The pipe (`|`) separator is required — it cannot appear in domain names or at 
 
 **Rationale:** Fully opaque and hash-derived — no human naming required, no ambiguity for cryptic vendor filenames. The KV metadata (`origin_url`, `content_type`, `asset_slug`) serves as the lookup table. Operators can query `js-asset:{slug}` in the KV store to retrieve full provenance. The terminal summary also prints slug → origin_url at generation time.
 
-**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. The reference implementation lives in `scripts/js-asset-slug.mjs` (standalone CLI) and is duplicated in `scripts/audit-js-assets.mjs` (processing library). Any changes must be synchronized across both files and the Rust proxy.
+**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. The reference implementation lives in `packages/js-asset-auditor/lib/slug.mjs` (standalone CLI) and `packages/js-asset-auditor/lib/process.mjs` (processing library), with a copy in `scripts/js-asset-slug.mjs`. Any changes must be synchronized across all files and the Rust proxy.
 
 ### Wildcard detection
 
@@ -230,28 +233,45 @@ Missing:    1 asset no longer seen on page ⚠
 
 ## Implementation
 
-The Auditor has three components:
+The Auditor is packaged as a Claude Code plugin at `packages/js-asset-auditor/` with three components:
 
-1. **Playwright CLI** (`tools/js-asset-auditor/audit.mjs`) — Standalone Node.js script that launches headless Chromium via Playwright, navigates to the target URL, collects script network requests and head script DOM state, then calls the processing library. Outputs TOML file + JSON summary. Can be run directly without Claude Code.
-2. **Processing library** (`scripts/audit-js-assets.mjs`) — Pure Node.js module (no external dependencies) that exports `processAssets()` and individual utility functions. Handles URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting. Also usable as a standalone stdin-based CLI for integration with other tools.
-3. **Claude Code skill** (`.claude/commands/audit-js-assets.md`) — Thin wrapper (~60 lines) that invokes the Playwright CLI via Bash and formats the JSON summary as a terminal report. No browser automation logic.
+```
+packages/js-asset-auditor/
+├── .claude-plugin/plugin.json       # Plugin manifest
+├── skills/audit-js-assets/SKILL.md  # Skill definition
+├── bin/audit-js-assets              # Executable (added to PATH by Claude Code)
+├── lib/
+│   ├── audit.mjs                    # Playwright CLI — browser automation + orchestration
+│   ├── process.mjs                  # Processing library — normalization, filtering, slugs, TOML
+│   └── slug.mjs                     # Standalone slug generator
+├── package.json                     # playwright dependency
+└── settings.json                    # Auto-grants Bash(audit-js-assets:*) permission
+```
 
-This architecture ensures fully deterministic, testable execution (the CLI) with an optional LLM-powered interface (the skill).
+1. **Playwright CLI** (`lib/audit.mjs`) — Launches headless Chromium, navigates to the target URL, collects script network requests and head script DOM state, then calls `processAssets()`. Outputs TOML file + JSON summary. Can be run directly without Claude Code.
+2. **Processing library** (`lib/process.mjs`) — Pure Node.js module (no external dependencies) that exports `processAssets()` and individual utility functions. Handles URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting.
+3. **Claude Code skill** (`skills/audit-js-assets/SKILL.md`) — Thin wrapper that invokes the CLI via the `bin/audit-js-assets` executable and formats the JSON summary.
 
-**Dependencies:**
+**Plugin installation:**
 
-- `playwright` — installed in `tools/js-asset-auditor/` (`npm install`). Chromium binaries are cached in `~/Library/Caches/ms-playwright/` and shared with `crates/integration-tests/browser/`.
+```bash
+# Local testing (loads for one session)
+claude --plugin-dir packages/js-asset-auditor
+
+# Via marketplace (permanent installation)
+/plugin marketplace add <org>/<repo>
+/plugin install js-asset-auditor
+```
+
+**Setup (one-time after install):**
+
+```bash
+cd packages/js-asset-auditor && npm install && npx playwright install chromium
+```
 
 **Standalone utilities:**
 
-- `scripts/js-asset-slug.mjs` — Standalone slug generator for individual URLs (stdlib-only, no external dependencies)
-- `scripts/audit-js-assets.mjs` — Processing library + stdin-based CLI (stdlib-only, no external dependencies)
-
-**Setup (one-time):**
-
-```bash
-cd tools/js-asset-auditor && npm install && npx playwright install chromium
-```
+- `scripts/js-asset-slug.mjs` — Standalone slug generator for individual URLs (kept outside the plugin for backward compatibility)
 
 ---
 
@@ -265,7 +285,7 @@ See [delivery order in the Proxy spec](2026-04-01-js-asset-proxy-design.md) _(on
 
 ## Verification
 
-- Run `node tools/js-asset-auditor/audit.mjs https://www.publisher.com` against a known test publisher page
+- Run `node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com` against a known test publisher page
 - Verify generated entries match actual third-party JS observed on the page (cross-check in browser DevTools)
 - Verify `inject_in_head = true` only for scripts that appear in `<head>` (not `<body>`)
 - Verify wildcard detection fires for versioned path segments (e.g., `1.19.13-0fnlww`) and not for stable paths
@@ -276,4 +296,5 @@ See [delivery order in the Proxy spec](2026-04-01-js-asset-proxy-design.md) _(on
 - Run `--diff` against an unchanged page → all entries confirmed, no new/missing
 - Run `--diff` after adding a new vendor script to the page → appears as `NEW` in summary
 - Run `--diff` after removing a script → appears as `MISSING ⚠` in summary, file unchanged
-- Run `/audit-js-assets <url>` via Claude Code skill → identical results to direct CLI invocation
+- Run `/js-asset-auditor:audit-js-assets <url>` via Claude Code plugin → identical results to direct CLI invocation
+- Run CLI without `trusted-server.toml` (using `--domain` or domain inference) → works in any project
