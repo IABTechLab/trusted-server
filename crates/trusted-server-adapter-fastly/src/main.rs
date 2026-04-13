@@ -38,9 +38,9 @@ mod middleware;
 mod platform;
 
 use crate::app::TrustedServerApp;
-use edgezero_core::app::Hooks as _;
 use crate::error::to_error_response;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
 ///
@@ -52,7 +52,7 @@ fn parse_edgezero_flag(value: &str) -> bool {
 }
 
 /// Reads the `edgezero_enabled` key from the `"trusted_server_config"` Fastly
-/// ConfigStore.
+/// [`ConfigStore`].
 ///
 /// Returns `Err` on any store open or key-read failure, so callers should use
 /// `.unwrap_or(false)` to ensure the legacy path is the safe default.
@@ -82,7 +82,10 @@ fn main(req: FastlyRequest) -> Result<FastlyResponse, Error> {
     // Safe default: if the flag cannot be read (store unavailable, key missing),
     // fall back to the legacy path to avoid accidentally routing through an
     // untested EdgeZero path.
-    if is_edgezero_enabled().unwrap_or(false) {
+    if is_edgezero_enabled().unwrap_or_else(|e| {
+        log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
+        false
+    }) {
         let app = TrustedServerApp::build_app();
         edgezero_adapter_fastly::dispatch(&app, req)
     } else {
@@ -323,15 +326,24 @@ mod tests {
         assert!(parse_edgezero_flag("true"), "should parse 'true'");
         assert!(parse_edgezero_flag("1"), "should parse '1'");
         assert!(parse_edgezero_flag("  true  "), "should trim whitespace");
-        assert!(parse_edgezero_flag("  1  "), "should trim whitespace around '1'");
+        assert!(
+            parse_edgezero_flag("  1  "),
+            "should trim whitespace around '1'"
+        );
     }
 
     #[test]
     fn rejects_non_true_flag_values() {
         assert!(!parse_edgezero_flag("false"), "should not parse 'false'");
         assert!(!parse_edgezero_flag(""), "should not parse empty string");
-        assert!(!parse_edgezero_flag("  "), "should not parse whitespace-only");
+        assert!(
+            !parse_edgezero_flag("  "),
+            "should not parse whitespace-only"
+        );
         assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
-        assert!(!parse_edgezero_flag("TRUE"), "should not parse uppercase 'TRUE'");
+        assert!(
+            !parse_edgezero_flag("TRUE"),
+            "should not parse uppercase 'TRUE'"
+        );
     }
 }
