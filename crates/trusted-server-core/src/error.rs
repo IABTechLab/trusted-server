@@ -16,6 +16,10 @@ use http::StatusCode;
 #[derive(Debug, Display)]
 pub enum TrustedServerError {
     /// Client-side input/validation error resulting in a 400 Bad Request.
+    ///
+    /// **Note:** The `message` field is included in client-facing HTTP responses
+    /// via [`IntoHttpResponse::user_message()`]. Keep it free of internal
+    /// implementation details.
     #[display("Bad request: {message}")]
     BadRequest { message: String },
     /// Configuration errors that prevent the server from starting.
@@ -30,6 +34,10 @@ pub enum TrustedServerError {
     #[display("GAM error: {message}")]
     Gam { message: String },
     /// GDPR consent handling error.
+    ///
+    /// **Note:** Unlike [`BadRequest`](Self::BadRequest), the detail `message`
+    /// is intentionally suppressed in client-facing responses because consent
+    /// strings may contain user data. Only the category name is returned.
     #[display("GDPR consent error: {message}")]
     GdprConsent { message: String },
 
@@ -72,13 +80,9 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
-    /// Synthetic ID generation or validation failed.
-    #[display("Synthetic ID error: {message}")]
-    SyntheticId { message: String },
-
-    /// Template rendering error.
-    #[display("Template error: {message}")]
-    Template { message: String },
+    /// EC ID generation or validation failed.
+    #[display("EC error: {message}")]
+    Ec { message: String },
 }
 
 impl Error for TrustedServerError {}
@@ -89,7 +93,10 @@ pub trait IntoHttpResponse {
     /// Convert the error into an HTTP status code.
     fn status_code(&self) -> StatusCode;
 
-    /// Get the error message to show to users (uses the Display implementation).
+    /// Get a safe, user-facing error message.
+    ///
+    /// Client errors (4xx) return a brief description; server/integration errors
+    /// return a generic message. Full error details are preserved in server logs.
     fn user_message(&self) -> String;
 }
 
@@ -102,20 +109,95 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidUtf8 { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
-            Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Template { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     fn user_message(&self) -> String {
-        // Use the Display implementation which already has the specific error message
-        self.to_string()
+        match self {
+            // Client errors (4xx) — safe to surface a brief description
+            Self::BadRequest { message } => format!("Bad request: {message}"),
+            // Consent strings may contain user data; return category only.
+            Self::GdprConsent { .. } => "GDPR consent error".to_string(),
+            Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            // Server/integration errors (5xx/502/503) — generic message only.
+            // Full details are already logged via log::error! in to_error_response.
+            _ => "An internal error occurred".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_errors_return_generic_message() {
+        let cases = [
+            TrustedServerError::Configuration {
+                message: "secret db path".into(),
+            },
+            TrustedServerError::KvStore {
+                store_name: "users".into(),
+                message: "timeout".into(),
+            },
+            TrustedServerError::Proxy {
+                message: "upstream 10.0.0.1 refused".into(),
+            },
+            TrustedServerError::Ec {
+                message: "seed file missing".into(),
+            },
+            TrustedServerError::Auction {
+                message: "bid timeout".into(),
+            },
+            TrustedServerError::Gam {
+                message: "api key invalid".into(),
+            },
+            TrustedServerError::Prebid {
+                message: "adapter error".into(),
+            },
+            TrustedServerError::Integration {
+                integration: "foo".into(),
+                message: "connection refused".into(),
+            },
+            TrustedServerError::Settings {
+                message: "parse failed".into(),
+            },
+            TrustedServerError::InvalidUtf8 {
+                message: "byte 0xff".into(),
+            },
+        ];
+        for error in &cases {
+            assert_eq!(
+                error.user_message(),
+                "An internal error occurred",
+                "should not leak details for {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn client_errors_return_safe_descriptions() {
+        let error = TrustedServerError::BadRequest {
+            message: "missing field".into(),
+        };
+        assert_eq!(error.user_message(), "Bad request: missing field");
+
+        let error = TrustedServerError::GdprConsent {
+            message: "no consent string".into(),
+        };
+        assert_eq!(error.user_message(), "GDPR consent error");
+
+        let error = TrustedServerError::InvalidHeaderValue {
+            message: "non-ascii".into(),
+        };
+        assert_eq!(error.user_message(), "Invalid header value");
     }
 }
