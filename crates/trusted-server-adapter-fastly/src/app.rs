@@ -132,6 +132,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 
 /// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
 /// mirroring [`crate::http_error_response`] exactly.
+///
+/// The near-identical function in `main.rs` is intentional: the legacy path
+/// uses fastly HTTP types while this path uses `edgezero_core` types. The
+/// duplication will be removed when `legacy_main` is deleted in PR 15.
 fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
@@ -160,6 +164,13 @@ impl Hooks for TrustedServerApp {
 
     fn routes() -> RouterService {
         let state = build_state();
+
+        // Each handler below follows the same pattern: clone state, build
+        // per-request services, consume the context into the request, call the
+        // core handler, and convert errors with http_error. The pattern is kept
+        // explicit rather than abstracted into a macro so each route can be
+        // audited in isolation and handlers with differing signatures (sync vs
+        // async, extra orchestrator argument) remain readable without special-casing.
 
         // /.well-known/trusted-server.json
         let s = Arc::clone(&state);
@@ -295,9 +306,9 @@ impl Hooks for TrustedServerApp {
             let s = Arc::clone(&s);
             async move {
                 let services = build_per_request_services(&s, &ctx);
-                let path = ctx.request().uri().path().to_string();
-                let method = ctx.request().method().clone();
                 let req = ctx.into_request();
+                let path = req.uri().path().to_string();
+                let method = req.method().clone();
 
                 let result = if path.starts_with("/static/tsjs=") {
                     handle_tsjs_dynamic(&req, &s.registry)
