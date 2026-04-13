@@ -86,9 +86,15 @@ fn main(req: FastlyRequest) -> Result<FastlyResponse, Error> {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
     }) {
+        log::info!("routing request through EdgeZero path");
         let app = TrustedServerApp::build_app();
-        edgezero_adapter_fastly::dispatch(&app, req)
+        // `run_app_with_config` and `run_app_with_logging` call `init_logger`
+        // internally — a second `set_logger` call panics because our custom
+        // fern logger is already initialised above.  `dispatch_with_config`
+        // skips logger initialisation and injects the config store directly.
+        edgezero_adapter_fastly::dispatch_with_config(&app, req, "trusted_server_config")
     } else {
+        log::info!("routing request through legacy path");
         legacy_main(req)
     }
 }
