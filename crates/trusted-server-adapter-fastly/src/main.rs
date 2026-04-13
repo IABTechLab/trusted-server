@@ -105,6 +105,7 @@ fn main(req: FastlyRequest) -> Result<FastlyResponse, Error> {
 /// # Errors
 ///
 /// Propagates [`fastly::Error`] from the Fastly SDK.
+// TODO: delete after Phase 5 EdgeZero cutover — see issue #495
 fn legacy_main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
     let settings = match get_settings() {
         Ok(s) => s,
