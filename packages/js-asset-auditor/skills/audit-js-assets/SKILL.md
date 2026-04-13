@@ -7,7 +7,7 @@ Audit a publisher page for third-party JS assets and generate `js-assets.toml` e
 
 Usage: /js-asset-auditor:audit-js-assets $ARGUMENTS
 
-`$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headed]`
+`$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headed] [--config [path]] [--force]`
 
 ---
 
@@ -62,3 +62,18 @@ Missing:    {missing.length} asset(s) no longer seen on page ⚠
   NEW      {prefix}  {shortUrl}  → review in js-assets.toml
   MISSING  {slug}    {originUrl} → may have been removed or renamed
 ```
+
+### Integration detection (when --config is used)
+
+If the JSON summary includes an `integrations` array, append:
+
+```
+Detected Integrations:
+  {id}  ✓ fully configured
+  {id}  ✓ {field}={value} (auto-detected)
+  {id}  ⚠ {field} needs manual input
+
+→ {config path} generated with {count} integrations
+```
+
+Use ✓ for `full` category and integrations with no TODOs. Use ⚠ for integrations with TODO fields.

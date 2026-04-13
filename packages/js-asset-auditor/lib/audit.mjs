@@ -68,6 +68,8 @@ function parseArgs(argv) {
     noFilter: false,
     headed: false,
     output: "js-assets.toml",
+    config: null,
+    force: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -86,6 +88,16 @@ function parseArgs(argv) {
       args.headed = true;
     } else if (arg === "--output") {
       args.output = argv[++i];
+    } else if (arg === "--config") {
+      // --config with optional path: default to "trusted-server.toml"
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) {
+        args.config = argv[++i];
+      } else {
+        args.config = "trusted-server.toml";
+      }
+    } else if (arg === "--force") {
+      args.force = true;
     } else if (!arg.startsWith("--") && !args.url) {
       args.url = arg.startsWith("http") ? arg : `https://${arg}`;
     } else {
@@ -96,7 +108,7 @@ function parseArgs(argv) {
 
   if (!args.url) {
     console.error(
-      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headed] [--output <path>]",
+      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headed] [--output <path>] [--config [path]] [--force]",
     );
     process.exit(1);
   }
@@ -207,6 +219,47 @@ export async function main() {
         ? result.summary.surfaced
         : result.summary.new.length;
     console.error(`Wrote ${args.output} (${count} entries)`);
+
+    // Integration detection & config generation
+    if (args.config) {
+      const { detectIntegrations, generateConfig } = await import(
+        "./detect.mjs"
+      );
+      const detection = detectIntegrations(scriptUrls);
+
+      if (detection.integrations.length > 0) {
+        // Check if config file already exists
+        let fileExists = false;
+        try {
+          readFileSync(args.config);
+          fileExists = true;
+        } catch {
+          // File doesn't exist — safe to write
+        }
+
+        if (fileExists && !args.force) {
+          console.error(
+            `${args.config} already exists. Use --force to overwrite.`,
+          );
+        } else {
+          const configToml = generateConfig(domain, args.url, detection);
+          writeFileSync(args.config, configToml);
+          console.error(
+            `Wrote ${args.config} (${detection.integrations.length} integrations detected)`,
+          );
+        }
+      } else {
+        console.error("No integrations detected — skipping config generation");
+      }
+
+      result.summary.integrations = detection.integrations.map((i) => ({
+        id: i.id,
+        label: i.label,
+        category: i.category,
+        extracted: i.extracted,
+        todos: i.todos,
+      }));
+    }
 
     console.log(JSON.stringify(result.summary));
   } finally {
