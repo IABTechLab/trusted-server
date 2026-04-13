@@ -10,40 +10,47 @@
 
 The JS Asset Proxy requires a `js-assets.toml` file declaring which third-party JS assets to proxy. Without tooling, populating this file requires manually inspecting network requests in browser DevTools, extracting URLs, generating opaque slugs, and writing TOML — a tedious error-prone process that is a barrier to publisher onboarding.
 
-The Auditor eliminates this friction. It sweeps a publisher's page using the Chrome DevTools MCP, detects third-party JS assets, auto-generates `js-assets.toml` entries, and auto-detects `inject_in_head` from the page DOM. The operator's only remaining decision is reviewing the output before committing.
+The Auditor eliminates this friction. It sweeps a publisher's page using Playwright (headless Chromium), detects third-party JS assets, auto-generates `js-assets.toml` entries, and auto-detects `inject_in_head` from the page DOM. The operator's only remaining decision is reviewing the output before committing.
 
 It also runs as a monitoring tool — `--diff` mode compares a new sweep against the existing config and surfaces new or removed assets, giving publishers ongoing visibility into their third-party JS footprint.
 
-**Implementation:** Pure Claude Code skill — no Rust, no compiled code, no additional dependencies. Uses the Chrome DevTools MCP already configured in `.claude/settings.json`.
+**Implementation:** Standalone Playwright CLI (`tools/js-asset-auditor/audit.mjs`) backed by a shared processing library (`scripts/audit-js-assets.mjs`). No Rust, no compiled code. The Claude Code skill (`/audit-js-assets`) is a thin wrapper that invokes the CLI.
 
 ---
 
 ## Command Interface
 
 ```bash
+# Via Claude Code skill
 /audit-js-assets https://www.publisher.com                # init — generate js-assets.toml
 /audit-js-assets https://www.publisher.com --diff         # diff — compare against existing file
 /audit-js-assets https://www.publisher.com --settle 15000 # longer settle for ad-tech-heavy pages
 /audit-js-assets https://www.publisher.com --no-filter    # bypass heuristic filtering
+/audit-js-assets https://www.publisher.com --headed       # visible browser for debugging
+
+# Direct CLI invocation (no Claude Code required)
+node tools/js-asset-auditor/audit.mjs https://www.publisher.com
+node tools/js-asset-auditor/audit.mjs https://www.publisher.com --diff --output js-assets.toml
 ```
 
 ---
 
 ## Sweep Protocol
 
-1. Read `trusted-server.toml` → extract `publisher.domain` (defines first-party boundary)
-2. Open Chrome via `mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page`, navigate to target URL via `mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page`
-3. Wait for page load settle: `mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script` with `await new Promise(r => setTimeout(r, SETTLE_MS))` where `SETTLE_MS` defaults to 6000 (configurable via `--settle <ms>`)
-4. In parallel:
-   - `mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_network_requests` with `resourceTypes: ["script"]` → post-filter to exclude first-party hosts (see URL Processing below)
-   - `mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script` → `Array.from(document.head.querySelectorAll('script[src]')).map(s => s.src)` → collect head-loaded script URLs
-5. Apply URL normalization (see below), then heuristic filter (see below)
-6. For each surviving asset, generate a `[[js_assets]]` entry (see below)
-7. Write output (init or diff mode)
-8. Print terminal summary
-9. Close page via `mcp__plugin_chrome-devtools-mcp_chrome-devtools__close_page`
+The CLI (`tools/js-asset-auditor/audit.mjs`) performs the full sweep:
 
-**`inject_in_head` semantics:** The DOM snapshot in step 4 captures the final state of `<head>` after the settle window. Scripts that were briefly inserted and then removed by a loader will not appear. This is intentional — `inject_in_head = true` means "the script is present in `<head>` at page-stable state." If a loader removes it before the snapshot, the proxy should not re-inject it.
+1. Read `trusted-server.toml` → extract `publisher.domain` (defines first-party boundary)
+2. Launch headless Chromium via Playwright (visible with `--headed`)
+3. Register a response listener for `resourceType() === 'script'` to capture all script network requests
+4. Navigate to target URL (`page.goto`, 30s timeout, follows redirects transparently)
+5. Wait for page load settle: `page.waitForTimeout(SETTLE_MS)` where `SETTLE_MS` defaults to 6000 (configurable via `--settle <ms>`)
+6. Evaluate `document.head.querySelectorAll('script[src]')` to collect head-loaded script URLs
+7. Close browser
+8. Pass collected URLs to `processAssets()` from `scripts/audit-js-assets.mjs` — applies URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation
+9. Write `js-assets.toml` output (init or diff mode)
+10. Print JSON summary to stdout (progress lines go to stderr)
+
+**`inject_in_head` semantics:** The DOM snapshot in step 6 captures the final state of `<head>` after the settle window. Scripts that were briefly inserted and then removed by a loader will not appear. This is intentional — `inject_in_head = true` means "the script is present in `<head>` at page-stable state." If a loader removes it before the snapshot, the proxy should not re-inject it.
 
 ---
 
@@ -124,7 +131,7 @@ The pipe (`|`) separator is required — it cannot appear in domain names or at 
 
 **Rationale:** Fully opaque and hash-derived — no human naming required, no ambiguity for cryptic vendor filenames. The KV metadata (`origin_url`, `content_type`, `asset_slug`) serves as the lookup table. Operators can query `js-asset:{slug}` in the KV store to retrieve full provenance. The terminal summary also prints slug → origin_url at generation time.
 
-**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. Engineering should implement this as a shared utility (e.g., a small JS/TS helper in the skill, or a standalone `scripts/` utility) rather than duplicating the logic.
+**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. The reference implementation lives in `scripts/js-asset-slug.mjs` (standalone CLI) and is duplicated in `scripts/audit-js-assets.mjs` (processing library). Any changes must be synchronized across both files and the Rust proxy.
 
 ### Wildcard detection
 
@@ -223,30 +230,28 @@ Missing:    1 asset no longer seen on page ⚠
 
 ## Implementation
 
-The Auditor has two components:
+The Auditor has three components:
 
-1. **Skill file** (`.claude/commands/audit-js-assets.md`) — Drives the browser via Chrome DevTools MCP, collects raw script URLs, and calls the processing script. ~100 lines.
-2. **Processing script** (`scripts/audit-js-assets.mjs`) — Pure Node.js script (no external dependencies) that performs URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting. Takes raw data on stdin (JSON with `networkUrls` and `headUrls`), writes TOML to a file, and prints a JSON summary to stdout.
+1. **Playwright CLI** (`tools/js-asset-auditor/audit.mjs`) — Standalone Node.js script that launches headless Chromium via Playwright, navigates to the target URL, collects script network requests and head script DOM state, then calls the processing library. Outputs TOML file + JSON summary. Can be run directly without Claude Code.
+2. **Processing library** (`scripts/audit-js-assets.mjs`) — Pure Node.js module (no external dependencies) that exports `processAssets()` and individual utility functions. Handles URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting. Also usable as a standalone stdin-based CLI for integration with other tools.
+3. **Claude Code skill** (`.claude/commands/audit-js-assets.md`) — Thin wrapper (~60 lines) that invokes the Playwright CLI via Bash and formats the JSON summary as a terminal report. No browser automation logic.
 
-This split ensures deterministic, testable processing (the script) while keeping browser automation in the LLM's domain (the skill).
+This architecture ensures fully deterministic, testable execution (the CLI) with an optional LLM-powered interface (the skill).
 
-**MCP tools used:**
+**Dependencies:**
 
-- `mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page` — open browser tab
-- `mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page` — load publisher URL
-- `mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_network_requests` — capture JS requests
-- `mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script` — settle window + detect head-loaded scripts via DOM query
-- `mcp__plugin_chrome-devtools-mcp_chrome-devtools__close_page` — clean up tab
+- `playwright` — installed in `tools/js-asset-auditor/` (`npm install`). Chromium binaries are cached in `~/Library/Caches/ms-playwright/` and shared with `crates/integration-tests/browser/`.
 
 **Standalone utilities:**
 
-- `scripts/js-asset-slug.mjs` — Standalone slug generator for individual URLs
-- `scripts/audit-js-assets.mjs` — Full audit processing pipeline
+- `scripts/js-asset-slug.mjs` — Standalone slug generator for individual URLs (stdlib-only, no external dependencies)
+- `scripts/audit-js-assets.mjs` — Processing library + stdin-based CLI (stdlib-only, no external dependencies)
 
-**File tools used:**
+**Setup (one-time):**
 
-- `Read` — read `trusted-server.toml` (publisher domain)
-- `Write` — write input JSON for processing script
+```bash
+cd tools/js-asset-auditor && npm install && npx playwright install chromium
+```
 
 ---
 
@@ -260,12 +265,15 @@ See [delivery order in the Proxy spec](2026-04-01-js-asset-proxy-design.md) _(on
 
 ## Verification
 
-- Run `/audit-js-assets https://www.publisher.com` against a known test publisher page with identified third-party JS
+- Run `node tools/js-asset-auditor/audit.mjs https://www.publisher.com` against a known test publisher page
 - Verify generated entries match actual third-party JS observed on the page (cross-check in browser DevTools)
 - Verify `inject_in_head = true` only for scripts that appear in `<head>` (not `<body>`)
-- Verify wildcard detection fires for versioned path segments and not for stable paths
+- Verify wildcard detection fires for versioned path segments (e.g., `1.19.13-0fnlww`) and not for stable paths
 - Verify GTM (`googletagmanager.com`) is captured and not filtered
-- Verify framework CDNs (`cdnjs.cloudflare.com` etc.) are filtered with reason in summary
+- Verify Google ad rendering infra (`pagead2.googlesyndication.com`, `s0.2mdn.net` etc.) is filtered with reason in summary
+- Verify `securepubads.g.doubleclick.net` (GPT) is **not** filtered
+- Verify first-party auto-detection: auditing `golf.com` with `publisher.domain = "test-publisher.com"` excludes `golf.com` scripts
 - Run `--diff` against an unchanged page → all entries confirmed, no new/missing
 - Run `--diff` after adding a new vendor script to the page → appears as `NEW` in summary
 - Run `--diff` after removing a script → appears as `MISSING ⚠` in summary, file unchanged
+- Run `/audit-js-assets <url>` via Claude Code skill → identical results to direct CLI invocation
