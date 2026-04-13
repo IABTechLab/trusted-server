@@ -26,7 +26,6 @@ use std::sync::Arc;
 use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
-use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderValue, Response};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -60,10 +59,10 @@ use crate::platform::{
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
-    pub settings: Arc<Settings>,
-    pub orchestrator: Arc<AuctionOrchestrator>,
-    pub registry: Arc<IntegrationRegistry>,
-    pub kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) settings: Arc<Settings>,
+    pub(crate) orchestrator: Arc<AuctionOrchestrator>,
+    pub(crate) registry: Arc<IntegrationRegistry>,
+    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
 }
 
 /// Build the application state, loading settings and constructing all
@@ -137,8 +136,7 @@ fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
 
-    let body =
-        edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()).into_bytes());
+    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
     response.headers_mut().insert(
@@ -295,7 +293,7 @@ impl Hooks for TrustedServerApp {
         let s = Arc::clone(&state);
         let get_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
-            Box::pin(async move {
+            async move {
                 let services = build_per_request_services(&s, &ctx);
                 let path = ctx.request().uri().path().to_string();
                 let method = ctx.request().method().clone();
@@ -317,7 +315,7 @@ impl Hooks for TrustedServerApp {
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
-            })
+            }
         };
 
         // POST /{*rest} — integration proxy or publisher origin fallback
@@ -343,7 +341,7 @@ impl Hooks for TrustedServerApp {
                     handle_publisher_request(&s.settings, &s.registry, &services, req).await
                 };
 
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+                Ok(result.unwrap_or_else(|e| http_error(&e)))
             }
         };
 
