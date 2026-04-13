@@ -3,11 +3,11 @@
 // JS Asset Auditor CLI
 //
 // Standalone Playwright-based tool that sweeps a publisher page for third-party
-// JS assets and generates js-assets.toml entries. Fully deterministic — no LLM
-// involvement.
+// JS assets and generates js-assets.toml entries.
 //
 // Usage:
-//   node tools/js-asset-auditor/audit.mjs https://www.publisher.com [options]
+//   node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com [options]
+//   audit-js-assets https://www.publisher.com [options]  (when plugin bin/ is in PATH)
 //
 // Options:
 //   --diff              Compare against existing js-assets.toml
@@ -18,11 +18,11 @@
 //   --output <path>     Output file path (default: js-assets.toml)
 //
 // Prerequisites:
-//   cd tools/js-asset-auditor && npm install && npx playwright install chromium
+//   cd packages/js-asset-auditor && npm install && npx playwright install chromium
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { processAssets } from "../../scripts/audit-js-assets.mjs";
+import { processAssets } from "./process.mjs";
 
 // ---------------------------------------------------------------------------
 // Config reading
@@ -84,7 +84,6 @@ function parseArgs(argv) {
     } else if (arg === "--output") {
       args.output = argv[++i];
     } else if (!arg.startsWith("--") && !args.url) {
-      // Positional argument: the URL
       args.url = arg.startsWith("http") ? arg : `https://${arg}`;
     } else {
       console.error(`Unknown argument: ${arg}`);
@@ -94,7 +93,7 @@ function parseArgs(argv) {
 
   if (!args.url) {
     console.error(
-      "Usage: node tools/js-asset-auditor/audit.mjs <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headed] [--output <path>]",
+      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headed] [--output <path>]",
     );
     process.exit(1);
   }
@@ -106,11 +105,10 @@ function parseArgs(argv) {
 // Main
 // ---------------------------------------------------------------------------
 
-async function main() {
+export async function main() {
   const args = parseArgs(process.argv);
   const repoRoot = process.cwd();
 
-  // Read publisher domain from config
   let domain;
   try {
     domain = readPublisherDomain(repoRoot);
@@ -119,18 +117,16 @@ async function main() {
     process.exit(1);
   }
 
-  // Import Playwright
   let chromium;
   try {
     ({ chromium } = await import("playwright"));
   } catch {
     console.error(
-      "Playwright not installed. Run:\n  cd tools/js-asset-auditor && npm install",
+      "Playwright not installed. Run:\n  cd packages/js-asset-auditor && npm install",
     );
     process.exit(1);
   }
 
-  // Launch browser
   console.error(`Launching browser...`);
   let browser;
   try {
@@ -138,7 +134,7 @@ async function main() {
   } catch (err) {
     if (err.message.includes("Executable doesn't exist")) {
       console.error(
-        "Chromium not installed. Run:\n  cd tools/js-asset-auditor && npx playwright install chromium",
+        "Chromium not installed. Run:\n  cd packages/js-asset-auditor && npx playwright install chromium",
       );
       process.exit(1);
     }
@@ -149,7 +145,6 @@ async function main() {
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    // Collect script network requests
     const scriptUrls = [];
     page.on("response", (response) => {
       const req = response.request();
@@ -158,15 +153,12 @@ async function main() {
       }
     });
 
-    // Navigate
     console.error(`Navigating to ${args.url}...`);
     await page.goto(args.url, { waitUntil: "load", timeout: 30000 });
 
-    // Settle
     console.error(`Waiting ${args.settle}ms for page to settle...`);
     await page.waitForTimeout(args.settle);
 
-    // Collect head scripts from DOM
     const headScriptUrls = await page.evaluate(() =>
       Array.from(
         document.head.querySelectorAll("script[src]"),
@@ -179,7 +171,6 @@ async function main() {
 
     await browser.close();
 
-    // Process
     console.error("Processing assets...");
     const result = processAssets(
       { networkUrls: scriptUrls, headUrls: headScriptUrls },
@@ -198,7 +189,6 @@ async function main() {
       process.exit(1);
     }
 
-    // Write output
     writeFileSync(args.output, result.toml);
     const count =
       result.summary.mode === "init"
@@ -206,7 +196,6 @@ async function main() {
         : result.summary.new.length;
     console.error(`Wrote ${args.output} (${count} entries)`);
 
-    // Print JSON summary to stdout
     console.log(JSON.stringify(result.summary));
   } finally {
     if (browser.isConnected()) {
@@ -215,4 +204,11 @@ async function main() {
   }
 }
 
-main();
+// Run when invoked directly
+const isDirectExecution =
+  process.argv[1] &&
+  new URL(process.argv[1], "file://").href === import.meta.url;
+
+if (isDirectExecution) {
+  main();
+}

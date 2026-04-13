@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+
+// Plugin bin/ wrapper — resolves lib/audit.mjs relative to plugin root,
+// not the user's working directory.
+
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const { main } = await import(resolve(pluginRoot, "lib/audit.mjs"));
+main();

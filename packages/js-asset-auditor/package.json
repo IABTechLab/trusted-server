@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "audit-js-assets": "./bin/audit-js-assets"
+  },
   "dependencies": {
     "playwright": "^1.58.0"
   }

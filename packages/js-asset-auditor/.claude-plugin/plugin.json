@@ -1,0 +1,10 @@
+{
+  "name": "js-asset-auditor",
+  "version": "1.0.0",
+  "description": "Audit publisher pages for third-party JS assets and generate js-assets.toml entries using Playwright",
+  "author": {
+    "name": "StackPop"
+  },
+  "license": "MIT",
+  "keywords": ["js-assets", "audit", "playwright", "ad-tech", "proxy"]
+}

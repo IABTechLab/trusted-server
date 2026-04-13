@@ -1,6 +1,11 @@
+---
+name: audit-js-assets
+description: Audit a publisher page for third-party JavaScript assets. Use when analyzing external scripts, generating js-assets.toml entries, or monitoring changes to a publisher's JS footprint.
+---
+
 Audit a publisher page for third-party JS assets and generate `js-assets.toml` entries.
 
-Usage: /audit-js-assets $ARGUMENTS
+Usage: /js-asset-auditor:audit-js-assets $ARGUMENTS
 
 `$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headed]`
 
@@ -13,7 +18,7 @@ Follow these steps exactly. Stop and report if any step fails.
 Run the Playwright CLI via Bash, forwarding all arguments from `$ARGUMENTS`:
 
 ```bash
-node tools/js-asset-auditor/audit.mjs $ARGUMENTS
+audit-js-assets $ARGUMENTS
 ```
 
 The CLI reads `trusted-server.toml` for the publisher domain, opens a headless browser, collects script URLs, processes them, and writes `js-assets.toml`. Progress lines appear on stderr; a JSON summary prints to stdout.
@@ -21,7 +26,7 @@ The CLI reads `trusted-server.toml` for the publisher domain, opens a headless b
 If the command fails with "Playwright not installed" or "Chromium not installed", tell the user to run:
 
 ```bash
-cd tools/js-asset-auditor && npm install && npx playwright install chromium
+cd packages/js-asset-auditor && npm install && npx playwright install chromium
 ```
 
 ## 2. Show results
@@ -42,7 +47,7 @@ Surfaced:  {surfaced} assets → js-assets.toml
   ...
 
 Review inject_in_head values and commit js-assets.toml when ready.
-Diff mode: /audit-js-assets <url> --diff
+Diff mode: /js-asset-auditor:audit-js-assets <url> --diff
 ```
 
 ### Diff mode
