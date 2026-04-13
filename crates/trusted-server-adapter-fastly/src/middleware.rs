@@ -114,9 +114,9 @@ impl Middleware for AuthMiddleware {
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Err(EdgeError::internal(std::io::Error::other(format!(
+                return Err(EdgeError::internal(anyhow::anyhow!(
                     "auth check failed: {report}"
-                ))));
+                )));
             }
         }
 
@@ -139,7 +139,7 @@ impl Middleware for AuthMiddleware {
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. `settings.response_headers` — operator-configured overrides applied last
 // Called from FinalizeResponseMiddleware::handle and from tests.
-// The struct is gated behind #[allow(dead_code)] until Task 4 wires app.rs.
+// This function is gated behind #[allow(dead_code)] until Task 4 wires app.rs.
 #[allow(dead_code)]
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
@@ -155,7 +155,7 @@ pub(crate) fn apply_finalize_headers(
         );
     }
 
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+    if let Ok(v) = std::env::var(ENV_FASTLY_SERVICE_VERSION) {
         if let Ok(value) = HeaderValue::from_str(&v) {
             response.headers_mut().insert(HEADER_X_TS_VERSION, value);
         } else {
@@ -163,7 +163,7 @@ pub(crate) fn apply_finalize_headers(
         }
     }
 
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+    if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
         response
             .headers_mut()
             .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
