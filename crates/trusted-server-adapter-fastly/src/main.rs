@@ -30,24 +30,79 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
+mod app;
 mod error;
 mod logging;
 mod management_api;
+mod middleware;
 mod platform;
 
+use crate::app::TrustedServerApp;
+use edgezero_core::app::Hooks as _;
 use crate::error::to_error_response;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
-#[fastly::main]
-fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
-    logging::init_logger();
+/// Returns `true` if the raw config-store value represents an enabled flag.
+///
+/// Accepted values (after whitespace trimming): `"true"` and `"1"`.
+/// All other values, including the empty string, are treated as disabled.
+fn parse_edgezero_flag(value: &str) -> bool {
+    let v = value.trim();
+    v == "true" || v == "1"
+}
 
-    // Keep the health probe independent from settings loading and routing so
-    // readiness checks still get a cheap liveness response during startup.
+/// Reads the `edgezero_enabled` key from the `"trusted_server_config"` Fastly
+/// ConfigStore.
+///
+/// Returns `Err` on any store open or key-read failure, so callers should use
+/// `.unwrap_or(false)` to ensure the legacy path is the safe default.
+///
+/// # Errors
+///
+/// - [`fastly::Error`] if the config store cannot be opened or the key cannot be read.
+fn is_edgezero_enabled() -> Result<bool, fastly::Error> {
+    let store = fastly::ConfigStore::try_open("trusted_server_config")
+        .map_err(|e| fastly::Error::msg(format!("failed to open config store: {e}")))?;
+    let value = store
+        .try_get("edgezero_enabled")
+        .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?
+        .unwrap_or_default();
+    Ok(parse_edgezero_flag(&value))
+}
+
+#[fastly::main]
+fn main(req: FastlyRequest) -> Result<FastlyResponse, Error> {
+    // Health probe bypasses routing, settings, and app construction — cheap liveness signal.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
         return Ok(FastlyResponse::from_status(200).with_body_text_plain("ok"));
     }
 
+    logging::init_logger();
+
+    // Safe default: if the flag cannot be read (store unavailable, key missing),
+    // fall back to the legacy path to avoid accidentally routing through an
+    // untested EdgeZero path.
+    if is_edgezero_enabled().unwrap_or(false) {
+        let app = TrustedServerApp::build_app();
+        edgezero_adapter_fastly::dispatch(&app, req)
+    } else {
+        legacy_main(req)
+    }
+}
+
+/// Handles a request using the original Fastly-native entry point.
+///
+/// Preserves identical semantics to the pre-PR14 `main()`. Called when
+/// the `edgezero_enabled` config flag is absent or `false`.
+///
+/// The thin fastly↔http conversion layer (via `compat::from_fastly_request` /
+/// `compat::to_fastly_response`) lives here in the adapter crate. `compat.rs`
+/// will be deleted in PR 15 once this legacy path is retired.
+///
+/// # Errors
+///
+/// Propagates [`fastly::Error`] from the Fastly SDK.
+fn legacy_main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
@@ -257,4 +312,26 @@ fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_edgezero_flag;
+
+    #[test]
+    fn parses_true_flag_values() {
+        assert!(parse_edgezero_flag("true"), "should parse 'true'");
+        assert!(parse_edgezero_flag("1"), "should parse '1'");
+        assert!(parse_edgezero_flag("  true  "), "should trim whitespace");
+        assert!(parse_edgezero_flag("  1  "), "should trim whitespace around '1'");
+    }
+
+    #[test]
+    fn rejects_non_true_flag_values() {
+        assert!(!parse_edgezero_flag("false"), "should not parse 'false'");
+        assert!(!parse_edgezero_flag(""), "should not parse empty string");
+        assert!(!parse_edgezero_flag("  "), "should not parse whitespace-only");
+        assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
+        assert!(!parse_edgezero_flag("TRUE"), "should not parse uppercase 'TRUE'");
+    }
 }
