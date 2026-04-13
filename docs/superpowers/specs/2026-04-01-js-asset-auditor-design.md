@@ -87,17 +87,17 @@ The following origin categories are excluded silently. The terminal summary repo
 
 **Matching:** Filter entries match if the request URL's host ends with the filter entry, with a dot-boundary check. For example, `googletagmanager.com` in the filter matches `www.googletagmanager.com` but not `evil-googletagmanager.com`.
 
-| Category            | Excluded origins                                                                              |
-| ------------------- | --------------------------------------------------------------------------------------------- |
-| Framework CDNs      | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com`                |
-| Error tracking      | `sentry.io`, `bugsnag.com`, `rollbar.com`                                                     |
-| Font services       | `fonts.googleapis.com`, `fonts.gstatic.com`                                                   |
-| Social embeds       | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`                              |
-| Google ad rendering | `pagead2.googlesyndication.com`, `tpc.googlesyndication.com`, `s0.2mdn.net`,                  |
-|                     | `googleads.g.doubleclick.net`, `www.googleadservices.com`                                     |
-| Ad fraud detection  | `adtrafficquality.google`                                                                     |
-| Ad verification     | `adsafeprotected.com`, `moatads.com`, `doubleverify.com`                                      |
-| reCAPTCHA           | `recaptcha.net`, `www.google.com/recaptcha/*`, `www.gstatic.com/recaptcha/*`                   |
+| Category            | Excluded origins                                                               |
+| ------------------- | ------------------------------------------------------------------------------ |
+| Framework CDNs      | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com` |
+| Error tracking      | `sentry.io`, `bugsnag.com`, `rollbar.com`                                      |
+| Font services       | `fonts.googleapis.com`, `fonts.gstatic.com`                                    |
+| Social embeds       | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`               |
+| Google ad rendering | `pagead2.googlesyndication.com`, `tpc.googlesyndication.com`, `s0.2mdn.net`,   |
+|                     | `googleads.g.doubleclick.net`, `www.googleadservices.com`                      |
+| Ad fraud detection  | `adtrafficquality.google`                                                      |
+| Ad verification     | `adsafeprotected.com`, `moatads.com`, `doubleverify.com`                       |
+| reCAPTCHA           | `recaptcha.net`, `www.google.com/recaptcha/*`, `www.gstatic.com/recaptcha/*`   |
 
 **Path-prefix matching:** Some hosts (e.g., `www.google.com`) serve both filterable and non-filterable resources. Entries with a path suffix (e.g., `www.google.com/recaptcha/*`) match only when the URL's path begins with the specified prefix. Plain host entries use dot-boundary suffix matching as before.
 
@@ -241,16 +241,16 @@ When invoked with `--config [path]`, the CLI also detects known integrations fro
 
 Integration detection runs on raw URLs (before normalization) to preserve query parameters needed for field extraction.
 
-| URL Pattern                                        | Integration            | Extracted Fields                          |
-| -------------------------------------------------- | ---------------------- | ----------------------------------------- |
-| `securepubads.g.doubleclick.net/tag/js/gpt*`       | `gpt`                  | `script_url`                              |
-| `www.googletagmanager.com/gtm.js?id=GTM-XXX`       | `google_tag_manager`   | `container_id` from `?id=`               |
-| `sdk.privacy-center.org`                           | `didomi`               | (defaults)                                |
-| `js.datadome.co`                                   | `datadome`             | (defaults)                                |
-| `aim.loc.kr/*identity-lockr*.js`                   | `lockr`                | `sdk_url`                                 |
-| `*.edge.permutive.app/*-web.js`                    | `permutive`            | `organization_id`, `workspace_id` from URL |
-| `*/prebid.js`, `*/prebidjs.js` (+ .min variants)  | `prebid`               | (detect only)                             |
-| `c.amazon-adsystem.com/aax2/apstag*`               | `aps`                  | (detect only)                             |
+| URL Pattern                                      | Integration          | Extracted Fields                           |
+| ------------------------------------------------ | -------------------- | ------------------------------------------ |
+| `securepubads.g.doubleclick.net/tag/js/gpt*`     | `gpt`                | `script_url`                               |
+| `www.googletagmanager.com/gtm.js?id=GTM-XXX`     | `google_tag_manager` | `container_id` from `?id=`                 |
+| `sdk.privacy-center.org`                         | `didomi`             | (defaults)                                 |
+| `js.datadome.co`                                 | `datadome`           | (defaults)                                 |
+| `aim.loc.kr/*identity-lockr*.js`                 | `lockr`              | `sdk_url`                                  |
+| `*.edge.permutive.app/*-web.js`                  | `permutive`          | `organization_id`, `workspace_id` from URL |
+| `*/prebid.js`, `*/prebidjs.js` (+ .min variants) | `prebid`             | (detect only)                              |
+| `c.amazon-adsystem.com/aax2/apstag*`             | `aps`                | (detect only)                              |
 
 ### Field categories
 
@@ -364,4 +364,3 @@ See [delivery order in the Proxy spec](2026-04-01-js-asset-proxy-design.md) _(on
 - Verify integrations with TODO fields are marked with `# TODO:` comments
 - Verify `--config` without `--force` errors when target file exists
 - Verify JSON summary includes `integrations` array when `--config` is used
-
