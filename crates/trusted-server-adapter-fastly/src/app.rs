@@ -18,14 +18,13 @@
 //! | GET | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
-//! | GET | `/static/{*rest}` | [`handle_tsjs_dynamic`] (tsjs prefix) |
-//! | GET | `/{*rest}` | integration proxy or publisher fallback |
+//! | GET | `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST | `/{*rest}` | integration proxy or publisher fallback |
 
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderValue, Response};
@@ -162,7 +161,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = Arc::new(build_state());
+        let state = build_state();
 
         // /.well-known/trusted-server.json
         let s = Arc::clone(&state);
@@ -171,8 +170,8 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_trusted_server_discovery(&s.settings, &services, req)
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                Ok(handle_trusted_server_discovery(&s.settings, &services, req)
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -183,8 +182,8 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_verify_signature(&s.settings, &services, req)
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                Ok(handle_verify_signature(&s.settings, &services, req)
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -195,8 +194,8 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_rotate_key(&s.settings, &services, req)
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                Ok(handle_rotate_key(&s.settings, &services, req)
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -207,8 +206,8 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_deactivate_key(&s.settings, &services, req)
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                Ok(handle_deactivate_key(&s.settings, &services, req)
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -219,9 +218,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_auction(&s.settings, &s.orchestrator, &services, req)
+                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
                     .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -232,9 +231,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_first_party_proxy(&s.settings, &services, req)
+                Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -245,9 +244,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_first_party_click(&s.settings, &services, req)
+                Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -258,9 +257,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_first_party_proxy_sign(&s.settings, &services, req)
+                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -271,9 +270,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_first_party_proxy_sign(&s.settings, &services, req)
+                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -284,34 +283,27 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                handle_first_party_proxy_rebuild(&s.settings, &services, req)
-                    .await
-                    .map_err(|e| EdgeError::internal(std::io::Error::other(format!("{e}"))))
+                Ok(
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
 
-        // GET /static/{*rest} — tsjs dynamic bundles
-        let s = Arc::clone(&state);
-        let tsjs_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let response = handle_tsjs_dynamic(ctx.request(), &s.registry)
-                    .unwrap_or_else(|e| http_error(&e));
-                Ok::<Response, EdgeError>(response)
-            }
-        };
-
-        // GET /{*rest} — integration proxy or publisher origin fallback
+        // GET /{*rest} — tsjs (if /static/tsjs= prefix), integration proxy, or publisher fallback
         let s = Arc::clone(&state);
         let get_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
-            async move {
+            Box::pin(async move {
                 let services = build_per_request_services(&s, &ctx);
+                let path = ctx.request().uri().path().to_string();
+                let method = ctx.request().method().clone();
                 let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
 
-                let result = if s.registry.has_route(&method, &path) {
+                let result = if path.starts_with("/static/tsjs=") {
+                    handle_tsjs_dynamic(&req, &s.registry)
+                } else if s.registry.has_route(&method, &path) {
                     s.registry
                         .handle_proxy(&method, &path, &s.settings, &services, req)
                         .await
@@ -321,15 +313,11 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    log::info!(
-                        "No known route matched for path: {}, proxying to publisher origin",
-                        path
-                    );
                     handle_publisher_request(&s.settings, &s.registry, &services, req).await
                 };
 
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
-            }
+                Ok(result.unwrap_or_else(|e| http_error(&e)))
+            })
         };
 
         // POST /{*rest} — integration proxy or publisher origin fallback
@@ -352,10 +340,6 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    log::info!(
-                        "No known route matched for path: {}, proxying to publisher origin",
-                        path
-                    );
                     handle_publisher_request(&s.settings, &s.registry, &services, req).await
                 };
 
@@ -376,13 +360,8 @@ impl Hooks for TrustedServerApp {
             .get("/first-party/sign", fp_sign_get_handler)
             .post("/first-party/sign", fp_sign_post_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_handler)
-            .get("/static/{*rest}", tsjs_handler)
             .get("/{*rest}", get_fallback)
             .post("/{*rest}", post_fallback)
             .build()
-    }
-
-    fn configure(app: &mut App) {
-        app.set_name("TrustedServer");
     }
 }
