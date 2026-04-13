@@ -48,6 +48,11 @@ build = """
             env = "FASTLY_KEY"
 
     [local_server.config_stores]
+        [local_server.config_stores.trusted_server_config]
+            format = "inline-toml"
+        [local_server.config_stores.trusted_server_config.contents]
+            edgezero_enabled = "true"
+
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]
