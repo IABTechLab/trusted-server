@@ -358,6 +358,10 @@ impl Hooks for TrustedServerApp {
             .get("/first-party/sign", fp_sign_get_handler)
             .post("/first-party/sign", fp_sign_post_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_handler)
+            // matchit's `/{*rest}` does not match the bare root `/` — register
+            // explicit root routes so `/` reaches the publisher fallback too.
+            .get("/", get_fallback.clone())
+            .post("/", post_fallback.clone())
             .get("/{*rest}", get_fallback)
             .post("/{*rest}", post_fallback)
             .build()
