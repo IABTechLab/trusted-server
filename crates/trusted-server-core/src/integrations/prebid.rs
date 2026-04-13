@@ -5,11 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Method, StatusCode};
 use http::header::HeaderValue;
-use url::Url;
+use http::{header, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use url::Url;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;

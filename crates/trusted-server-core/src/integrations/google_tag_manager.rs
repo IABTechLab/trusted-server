@@ -16,8 +16,8 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
-use futures::StreamExt as _;
 use error_stack::{Report, ResultExt};
+use futures::StreamExt as _;
 use http::{header, Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,9 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
-    IntegrationScriptRewriter, ScriptRewriteAction,
+    collect_body, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -333,7 +333,6 @@ impl GoogleTagManagerIntegration {
             }
         }
     }
-
 }
 
 fn build(

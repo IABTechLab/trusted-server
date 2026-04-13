@@ -264,8 +264,7 @@ impl PermutiveIntegration {
         // Copy any X-* custom headers, skipping TS-internal headers
         for (name, value) in from {
             let name_str = name.as_str();
-            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str)
-            {
+            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
                 to.append(name.clone(), value.clone());
             }
         }

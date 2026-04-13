@@ -12,7 +12,6 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
-
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,

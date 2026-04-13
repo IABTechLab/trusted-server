@@ -25,7 +25,7 @@
       "Bash(git status:*)",
       "mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page",
       "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_stop_trace",
-      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script"
     ]
   },
   "enabledPlugins": {

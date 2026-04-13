@@ -11,8 +11,8 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
