@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
-// JS Asset Auditor — Processing Script
+// JS Asset Auditor — Processing Library & CLI
 //
-// Takes raw browser data (network script URLs + head script URLs) on stdin,
-// applies normalization, filtering, wildcard detection, and slug generation,
-// then writes a js-assets.toml file and prints a JSON summary to stdout.
+// Provides URL processing functions (normalization, filtering, wildcard
+// detection, slug generation, TOML formatting) used by both the standalone
+// Playwright CLI (tools/js-asset-auditor/audit.mjs) and the stdin-based
+// pipeline invoked by the Claude Code skill.
 //
-// Usage:
+// CLI usage (stdin mode):
 //   cat input.json | node scripts/audit-js-assets.mjs \
 //     --domain <publisher_domain> --target <target_url> \
 //     [--output js-assets.toml] [--diff] [--first-party <hosts>] [--no-filter]
@@ -30,7 +31,7 @@ const BASE62_CHARSET =
 
 // Heuristic filter: host-only entries use dot-boundary suffix matching.
 // Entries with a `pathPrefix` also require the URL path to start with it.
-const HEURISTIC_FILTERS = {
+export const HEURISTIC_FILTERS = {
   "Framework CDNs": ["cdnjs.cloudflare.com", "ajax.googleapis.com", "cdn.jsdelivr.net", "unpkg.com"],
   "Error tracking": ["sentry.io", "bugsnag.com", "rollbar.com"],
   "Font services": ["fonts.googleapis.com", "fonts.gstatic.com"],
@@ -73,7 +74,7 @@ function bufferToBase62(buffer) {
   return chars.reverse().join("");
 }
 
-function extractAssetStem(originUrl) {
+export function extractAssetStem(originUrl) {
   let pathname;
   try {
     pathname = new URL(originUrl).pathname;
@@ -92,7 +93,7 @@ function extractAssetStem(originUrl) {
   return dot > 0 ? basename.slice(0, dot) : basename;
 }
 
-function generateSlug(publisherDomain, originUrl) {
+export function generateSlug(publisherDomain, originUrl) {
   const input = `${publisherDomain}|${originUrl}`;
   const digest = createHash("sha256").update(input).digest();
   const base62 = bufferToBase62(digest);
@@ -105,17 +106,13 @@ function generateSlug(publisherDomain, originUrl) {
 // URL processing
 // ---------------------------------------------------------------------------
 
-function normalizeUrl(raw) {
+export function normalizeUrl(raw) {
   let url = raw;
-  // Fix protocol-relative URLs
   if (url.startsWith("//")) url = "https:" + url;
-  // Strip fragment
   const hashIdx = url.indexOf("#");
   if (hashIdx !== -1) url = url.slice(0, hashIdx);
-  // Strip query params
   const qIdx = url.indexOf("?");
   if (qIdx !== -1) url = url.slice(0, qIdx);
-  // Strip trailing slash
   if (url.endsWith("/")) url = url.slice(0, -1);
   return url;
 }
@@ -124,7 +121,7 @@ function stripWww(host) {
   return host.startsWith("www.") ? host.slice(4) : host;
 }
 
-function isFirstParty(hostname, publisherDomain, targetHost, extraHosts) {
+export function isFirstParty(hostname, publisherDomain, targetHost, extraHosts) {
   const stripped = stripWww(hostname);
   if (stripped === stripWww(publisherDomain)) return true;
   if (stripped === stripWww(targetHost)) return true;
@@ -138,7 +135,7 @@ function dotBoundaryMatch(hostname, filterEntry) {
   return hostname === filterEntry || hostname.endsWith("." + filterEntry);
 }
 
-function matchesHeuristicFilter(hostname, pathname) {
+export function matchesHeuristicFilter(hostname, pathname) {
   for (const [category, entries] of Object.entries(HEURISTIC_FILTERS)) {
     for (const entry of entries) {
       if (typeof entry === "string") {
@@ -146,7 +143,6 @@ function matchesHeuristicFilter(hostname, pathname) {
           return { category, entry };
         }
       } else {
-        // Path-prefix filter: {host, pathPrefix}
         if (
           dotBoundaryMatch(hostname, entry.host) &&
           pathname.startsWith(entry.pathPrefix)
@@ -163,7 +159,7 @@ function matchesHeuristicFilter(hostname, pathname) {
 // Wildcard detection
 // ---------------------------------------------------------------------------
 
-function applyWildcards(url) {
+export function applyWildcards(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -200,7 +196,7 @@ function applyWildcards(url) {
 // TOML formatting
 // ---------------------------------------------------------------------------
 
-function formatTomlEntry(asset, commented = false) {
+export function formatTomlEntry(asset, commented = false) {
   const pfx = commented ? "# " : "";
   let block = "";
   if (asset.hasWildcard && asset.originalUrl) {
@@ -213,7 +209,7 @@ function formatTomlEntry(asset, commented = false) {
   return block;
 }
 
-function shortenUrl(url) {
+export function shortenUrl(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -229,10 +225,9 @@ function shortenUrl(url) {
 // Diff mode: parse existing TOML
 // ---------------------------------------------------------------------------
 
-function parseExistingToml(content) {
+export function parseExistingToml(content) {
   const entries = [];
   const blocks = content.split("[[js_assets]]");
-  // Skip the first element (preamble before the first [[js_assets]])
   for (let i = 1; i < blocks.length; i++) {
     const block = blocks[i];
     const originMatch = block.match(/^origin_url\s*=\s*"([^"]+)"/m);
@@ -248,7 +243,195 @@ function parseExistingToml(content) {
 }
 
 // ---------------------------------------------------------------------------
-// CLI argument parsing
+// Core processing pipeline
+// ---------------------------------------------------------------------------
+
+export function processAssets(input, args) {
+  const { networkUrls: rawNetworkUrls, headUrls: rawHeadUrls } = input;
+
+  let targetHost = "";
+  try {
+    targetHost = new URL(args.target).hostname;
+  } catch {
+    targetHost = args.target;
+  }
+
+  // Normalize and deduplicate
+  const normalizedNetwork = [...new Set(rawNetworkUrls.map(normalizeUrl))];
+  const normalizedHead = new Set(rawHeadUrls.map(normalizeUrl));
+
+  // First-party filter
+  const firstPartyFiltered = [];
+  const thirdPartyUrls = [];
+
+  for (const url of normalizedNetwork) {
+    let hostname;
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      continue;
+    }
+    if (isFirstParty(hostname, args.domain, targetHost, args.firstParty || [])) {
+      firstPartyFiltered.push({ url, host: hostname });
+    } else {
+      thirdPartyUrls.push(url);
+    }
+  }
+
+  // Heuristic filter
+  const heuristicFiltered = [];
+  const survivingUrls = [];
+
+  for (const url of thirdPartyUrls) {
+    let hostname, pathname;
+    try {
+      const parsed = new URL(url);
+      hostname = parsed.hostname;
+      pathname = parsed.pathname;
+    } catch {
+      survivingUrls.push(url);
+      continue;
+    }
+
+    if (args.noFilter) {
+      survivingUrls.push(url);
+      continue;
+    }
+
+    const match = matchesHeuristicFilter(hostname, pathname);
+    if (match) {
+      heuristicFiltered.push({ url, host: hostname, ...match });
+    } else {
+      survivingUrls.push(url);
+    }
+  }
+
+  const filterCounts = {};
+  for (const f of heuristicFiltered) {
+    filterCounts[f.host] = (filterCounts[f.host] || 0) + 1;
+  }
+
+  // Process surviving URLs
+  const assets = [];
+  const seenOrigins = new Set();
+
+  for (const url of survivingUrls) {
+    const { wildcarded, original, hasWildcard } = applyWildcards(url);
+
+    if (seenOrigins.has(wildcarded)) continue;
+    seenOrigins.add(wildcarded);
+
+    const slug = generateSlug(args.domain, wildcarded);
+    const prefix = slug.split(":")[0];
+    const injectInHead = normalizedHead.has(url);
+
+    let path;
+    if (hasWildcard) {
+      path = `/js-assets/${prefix}/*`;
+    } else {
+      const stem = extractAssetStem(wildcarded);
+      path = `/js-assets/${prefix}/${stem}.js`;
+    }
+
+    let hostname;
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      hostname = "unknown";
+    }
+
+    assets.push({
+      slug,
+      prefix,
+      path,
+      originUrl: wildcarded,
+      originalUrl: original,
+      injectInHead,
+      hasWildcard,
+      host: hostname,
+      shortUrl: shortenUrl(wildcarded),
+    });
+  }
+
+  // Generate TOML and summary
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (args.diff) {
+    let existingContent;
+    try {
+      existingContent = readFileSync(args.output, "utf-8");
+    } catch {
+      return { error: `Cannot read ${args.output} for diff mode` };
+    }
+
+    const existingEntries = parseExistingToml(existingContent);
+    const existingOrigins = new Set(existingEntries.map((e) => e.originUrl));
+    const sweepOrigins = new Set(assets.map((a) => a.originUrl));
+
+    const confirmed = existingEntries.filter((e) => sweepOrigins.has(e.originUrl));
+    const missing = existingEntries.filter((e) => !sweepOrigins.has(e.originUrl));
+    const newAssets = assets.filter((a) => !existingOrigins.has(a.originUrl));
+
+    let appendBlock = "";
+    if (newAssets.length > 0) {
+      appendBlock = `\n# --- NEW (detected by /audit-js-assets --diff on ${today}, uncomment to activate) ---\n`;
+      for (const a of newAssets) {
+        appendBlock += `\n# [[js_assets]]\n`;
+        appendBlock += formatTomlEntry(a, true);
+      }
+    }
+
+    return {
+      toml: existingContent + appendBlock,
+      summary: {
+        mode: "diff",
+        publisherDomain: args.domain,
+        targetUrl: args.target,
+        confirmed: confirmed.map((e) => ({ slug: e.slug, originUrl: e.originUrl })),
+        new: newAssets.map((a) => ({ slug: a.slug, prefix: a.prefix, shortUrl: a.shortUrl, originUrl: a.originUrl })),
+        missing: missing.map((e) => ({ slug: e.slug, originUrl: e.originUrl })),
+        outputFile: args.output,
+      },
+    };
+  }
+
+  // Init mode
+  let toml = `# Generated by /audit-js-assets on ${today}\n`;
+  toml += `# Publisher: ${args.domain}\n`;
+  toml += `# Source URL: ${args.target}\n`;
+
+  for (const a of assets) {
+    toml += `\n[[js_assets]]\n`;
+    toml += formatTomlEntry(a);
+  }
+
+  const filterSummary = Object.entries(filterCounts).map(([host, count]) => ({ host, count }));
+
+  return {
+    toml,
+    summary: {
+      mode: "init",
+      publisherDomain: args.domain,
+      targetUrl: args.target,
+      totalDetected: thirdPartyUrls.length,
+      firstPartyFiltered: firstPartyFiltered.length,
+      firstPartyHost: targetHost,
+      heuristicFiltered: filterSummary,
+      heuristicFilteredTotal: heuristicFiltered.length,
+      surfaced: assets.length,
+      assets: assets.map((a) => ({
+        prefix: a.prefix,
+        injectInHead: a.injectInHead,
+        shortUrl: a.shortUrl,
+        wildcard: a.hasWildcard,
+      })),
+      outputFile: args.output,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing (for stdin mode)
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
@@ -298,227 +481,32 @@ function parseArgs(argv) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// CLI entry point (stdin mode) — only runs when invoked directly
 // ---------------------------------------------------------------------------
 
 async function main() {
   const args = parseArgs(process.argv);
 
-  // Read stdin
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const input = JSON.parse(Buffer.concat(chunks).toString());
-  const { networkUrls: rawNetworkUrls, headUrls: rawHeadUrls } = input;
 
-  // Determine target host for auto first-party detection
-  let targetHost = "";
-  try {
-    targetHost = new URL(args.target).hostname;
-  } catch {
-    // If the target isn't a full URL, use it as-is
-    targetHost = args.target;
+  const result = processAssets(input, args);
+
+  if (result.error) {
+    console.error(result.error);
+    process.exit(1);
   }
 
-  // Step 1: Normalize and deduplicate
-  const normalizedNetwork = [
-    ...new Set(rawNetworkUrls.map(normalizeUrl)),
-  ];
-  const normalizedHead = new Set(rawHeadUrls.map(normalizeUrl));
-
-  // Step 2: First-party filter
-  const firstPartyFiltered = [];
-  const thirdPartyUrls = [];
-
-  for (const url of normalizedNetwork) {
-    let hostname;
-    try {
-      hostname = new URL(url).hostname;
-    } catch {
-      continue;
-    }
-    if (isFirstParty(hostname, args.domain, targetHost, args.firstParty)) {
-      firstPartyFiltered.push({ url, host: hostname });
-    } else {
-      thirdPartyUrls.push(url);
-    }
-  }
-
-  // Step 3: Heuristic filter
-  const heuristicFiltered = [];
-  const survivingUrls = [];
-
-  for (const url of thirdPartyUrls) {
-    let hostname, pathname;
-    try {
-      const parsed = new URL(url);
-      hostname = parsed.hostname;
-      pathname = parsed.pathname;
-    } catch {
-      survivingUrls.push(url);
-      continue;
-    }
-
-    if (args.noFilter) {
-      survivingUrls.push(url);
-      continue;
-    }
-
-    const match = matchesHeuristicFilter(hostname, pathname);
-    if (match) {
-      heuristicFiltered.push({ url, host: hostname, ...match });
-    } else {
-      survivingUrls.push(url);
-    }
-  }
-
-  // Aggregate filter counts by host
-  const filterCounts = {};
-  for (const f of heuristicFiltered) {
-    filterCounts[f.host] = (filterCounts[f.host] || 0) + 1;
-  }
-
-  // Step 4: Process surviving URLs
-  const assets = [];
-  const seenOrigins = new Set();
-
-  for (const url of survivingUrls) {
-    const { wildcarded, original, hasWildcard } = applyWildcards(url);
-
-    // Deduplicate by wildcarded origin URL
-    if (seenOrigins.has(wildcarded)) continue;
-    seenOrigins.add(wildcarded);
-
-    const slug = generateSlug(args.domain, wildcarded);
-    const prefix = slug.split(":")[0];
-    const injectInHead = normalizedHead.has(url);
-
-    let path;
-    if (hasWildcard) {
-      path = `/js-assets/${prefix}/*`;
-    } else {
-      const stem = extractAssetStem(wildcarded);
-      path = `/js-assets/${prefix}/${stem}.js`;
-    }
-
-    let hostname;
-    try {
-      hostname = new URL(url).hostname;
-    } catch {
-      hostname = "unknown";
-    }
-
-    assets.push({
-      slug,
-      prefix,
-      path,
-      originUrl: wildcarded,
-      originalUrl: original,
-      injectInHead,
-      hasWildcard,
-      host: hostname,
-      shortUrl: shortenUrl(wildcarded),
-    });
-  }
-
-  // Step 5: Generate output
-  const today = new Date().toISOString().slice(0, 10);
-
-  if (args.diff) {
-    // Diff mode
-    let existingContent;
-    try {
-      existingContent = readFileSync(args.output, "utf-8");
-    } catch {
-      console.error(`Error: cannot read ${args.output} for diff mode`);
-      process.exit(1);
-    }
-
-    const existingEntries = parseExistingToml(existingContent);
-    const existingOrigins = new Set(
-      existingEntries.map((e) => e.originUrl),
-    );
-    const sweepOrigins = new Set(assets.map((a) => a.originUrl));
-
-    const confirmed = existingEntries.filter((e) =>
-      sweepOrigins.has(e.originUrl),
-    );
-    const missing = existingEntries.filter(
-      (e) => !sweepOrigins.has(e.originUrl),
-    );
-    const newAssets = assets.filter(
-      (a) => !existingOrigins.has(a.originUrl),
-    );
-
-    // Append new entries as comments
-    if (newAssets.length > 0) {
-      let appendBlock = `\n# --- NEW (detected by /audit-js-assets --diff on ${today}, uncomment to activate) ---\n`;
-      for (const a of newAssets) {
-        appendBlock += `\n# [[js_assets]]\n`;
-        appendBlock += formatTomlEntry(a, true);
-      }
-      writeFileSync(args.output, existingContent + appendBlock);
-    }
-
-    // Print diff summary
-    const summary = {
-      mode: "diff",
-      publisherDomain: args.domain,
-      targetUrl: args.target,
-      confirmed: confirmed.map((e) => ({
-        slug: e.slug,
-        originUrl: e.originUrl,
-      })),
-      new: newAssets.map((a) => ({
-        slug: a.slug,
-        prefix: a.prefix,
-        shortUrl: a.shortUrl,
-        originUrl: a.originUrl,
-      })),
-      missing: missing.map((e) => ({
-        slug: e.slug,
-        originUrl: e.originUrl,
-      })),
-      outputFile: args.output,
-    };
-    console.log(JSON.stringify(summary));
-  } else {
-    // Init mode
-    let toml = `# Generated by /audit-js-assets on ${today}\n`;
-    toml += `# Publisher: ${args.domain}\n`;
-    toml += `# Source URL: ${args.target}\n`;
-
-    for (const a of assets) {
-      toml += `\n[[js_assets]]\n`;
-      toml += formatTomlEntry(a);
-    }
-
-    writeFileSync(args.output, toml);
-
-    // Build filter summary entries
-    const filterSummary = Object.entries(filterCounts).map(
-      ([host, count]) => ({ host, count }),
-    );
-
-    const summary = {
-      mode: "init",
-      publisherDomain: args.domain,
-      targetUrl: args.target,
-      totalDetected: thirdPartyUrls.length,
-      firstPartyFiltered: firstPartyFiltered.length,
-      firstPartyHost: targetHost,
-      heuristicFiltered: filterSummary,
-      heuristicFilteredTotal: heuristicFiltered.length,
-      surfaced: assets.length,
-      assets: assets.map((a) => ({
-        prefix: a.prefix,
-        injectInHead: a.injectInHead,
-        shortUrl: a.shortUrl,
-        wildcard: a.hasWildcard,
-      })),
-      outputFile: args.output,
-    };
-    console.log(JSON.stringify(summary));
-  }
+  writeFileSync(args.output, result.toml);
+  console.log(JSON.stringify(result.summary));
 }
 
-main();
+// Only run main() when this file is executed directly, not when imported
+const isDirectExecution =
+  process.argv[1] &&
+  new URL(process.argv[1], "file://").href === import.meta.url;
+
+if (isDirectExecution) {
+  main();
+}

@@ -31,6 +31,9 @@ src/*.html
 /guest-profiles
 /benchmark-results/**
 
+# JS Asset Auditor tool
+/tools/js-asset-auditor/node_modules/
+
 # Playwright browser tests
 /crates/integration-tests/browser/node_modules/
 /crates/integration-tests/browser/test-results/
