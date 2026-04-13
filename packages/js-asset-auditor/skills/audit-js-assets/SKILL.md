@@ -7,7 +7,7 @@ Audit a publisher page for third-party JS assets and generate `js-assets.toml` e
 
 Usage: /js-asset-auditor:audit-js-assets $ARGUMENTS
 
-`$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headed] [--config [path]] [--force]`
+`$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headless] [--config [path]] [--force]`
 
 ---
 

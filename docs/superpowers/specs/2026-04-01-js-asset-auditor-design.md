@@ -26,7 +26,7 @@ It also runs as a monitoring tool — `--diff` mode compares a new sweep against
 /js-asset-auditor:audit-js-assets https://www.publisher.com --diff         # diff — compare against existing file
 /js-asset-auditor:audit-js-assets https://www.publisher.com --settle 15000 # longer settle for ad-tech-heavy pages
 /js-asset-auditor:audit-js-assets https://www.publisher.com --no-filter    # bypass heuristic filtering
-/js-asset-auditor:audit-js-assets https://www.publisher.com --headed       # visible browser for debugging
+/js-asset-auditor:audit-js-assets https://www.publisher.com --headless       # headless mode for CI/automation
 /js-asset-auditor:audit-js-assets https://www.publisher.com --config       # also generate trusted-server.toml
 
 # Direct CLI invocation (no Claude Code required)
@@ -43,7 +43,7 @@ node packages/js-asset-auditor/lib/audit.mjs https://www.publisher.com --config 
 The CLI (`packages/js-asset-auditor/lib/audit.mjs`) performs the full sweep:
 
 1. Resolve publisher domain: `--domain` flag → `trusted-server.toml` → infer from target URL
-2. Launch headless Chromium via Playwright (visible with `--headed`)
+2. Launch Chromium via Playwright (headed by default to avoid bot detection; `--headless` for CI)
 3. Register a response listener for `resourceType() === 'script'` to capture all script network requests
 4. Navigate to target URL (`page.goto`, 30s timeout, follows redirects transparently)
 5. Wait for page load settle: `page.waitForTimeout(SETTLE_MS)` where `SETTLE_MS` defaults to 6000 (configurable via `--settle <ms>`)
@@ -309,7 +309,7 @@ packages/js-asset-auditor/
 └── settings.json                    # Auto-grants Bash(audit-js-assets:*) permission
 ```
 
-1. **Playwright CLI** (`lib/audit.mjs`) — Launches headless Chromium, navigates to the target URL, collects script network requests and head script DOM state, then calls `processAssets()`. Outputs TOML file + JSON summary. Can be run directly without Claude Code.
+1. **Playwright CLI** (`lib/audit.mjs`) — Launches Chromium (headed by default), navigates to the target URL, collects script network requests and head script DOM state, then calls `processAssets()`. Outputs TOML file + JSON summary. Can be run directly without Claude Code.
 2. **Processing library** (`lib/process.mjs`) — Pure Node.js module (no external dependencies) that exports `processAssets()` and individual utility functions. Handles URL normalization, first-party filtering, heuristic filtering, wildcard detection, slug generation, and TOML formatting.
 3. **Claude Code skill** (`skills/audit-js-assets/SKILL.md`) — Thin wrapper that invokes the CLI via the `bin/audit-js-assets` executable and formats the JSON summary.
 

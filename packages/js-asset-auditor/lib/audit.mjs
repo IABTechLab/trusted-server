@@ -66,7 +66,7 @@ function parseArgs(argv) {
     settle: 6000,
     firstParty: [],
     noFilter: false,
-    headed: false,
+    headless: false,
     output: "js-assets.toml",
     config: null,
     force: false,
@@ -84,8 +84,8 @@ function parseArgs(argv) {
       args.firstParty = argv[++i].split(",").filter(Boolean);
     } else if (arg === "--no-filter") {
       args.noFilter = true;
-    } else if (arg === "--headed") {
-      args.headed = true;
+    } else if (arg === "--headless") {
+      args.headless = true;
     } else if (arg === "--output") {
       args.output = argv[++i];
     } else if (arg === "--config") {
@@ -108,7 +108,7 @@ function parseArgs(argv) {
 
   if (!args.url) {
     console.error(
-      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headed] [--output <path>] [--config [path]] [--force]",
+      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headless] [--output <path>] [--config [path]] [--force]",
     );
     process.exit(1);
   }
@@ -154,7 +154,7 @@ export async function main() {
   console.error(`Launching browser...`);
   let browser;
   try {
-    browser = await chromium.launch({ headless: !args.headed });
+    browser = await chromium.launch({ headless: args.headless });
   } catch (err) {
     if (err.message.includes("Executable doesn't exist")) {
       console.error(
