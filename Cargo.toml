@@ -56,10 +56,10 @@ config = "0.15.19"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
 error-stack = "0.6"
 fastly = "0.11.12"
 fern = "0.7.1"
@@ -86,7 +86,7 @@ subtle = "2.6"
 temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-test = "0.4"
-toml = "1.0"
+toml = "1.1"
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
