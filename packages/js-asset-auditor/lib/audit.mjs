@@ -61,6 +61,7 @@ function readPublisherDomain(repoRoot) {
 function parseArgs(argv) {
   const args = {
     url: null,
+    domain: null,
     diff: false,
     settle: 6000,
     firstParty: [],
@@ -71,7 +72,9 @@ function parseArgs(argv) {
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--diff") {
+    if (arg === "--domain") {
+      args.domain = argv[++i];
+    } else if (arg === "--diff") {
       args.diff = true;
     } else if (arg === "--settle") {
       args.settle = parseInt(argv[++i], 10);
@@ -109,12 +112,21 @@ export async function main() {
   const args = parseArgs(process.argv);
   const repoRoot = process.cwd();
 
-  let domain;
-  try {
-    domain = readPublisherDomain(repoRoot);
-  } catch (err) {
-    console.error(err.message);
-    process.exit(1);
+  // Resolve publisher domain: --domain flag > trusted-server.toml > infer from URL
+  let domain = args.domain;
+  if (!domain) {
+    try {
+      domain = readPublisherDomain(repoRoot);
+    } catch {
+      // No config file — infer from target URL
+      try {
+        const host = new URL(args.url).hostname;
+        domain = host.startsWith("www.") ? host.slice(4) : host;
+      } catch {
+        domain = args.url;
+      }
+      console.error(`No trusted-server.toml found, using domain: ${domain}`);
+    }
   }
 
   let chromium;
