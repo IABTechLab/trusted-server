@@ -58,7 +58,7 @@ Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
 - KV store mappings
-- Synthetic ID templates
+- EC configuration
 - GDPR settings
 
 See [Configuration](/guide/configuration) for details.
@@ -71,6 +71,6 @@ fastly compute publish
 
 ## Next Steps
 
-- Learn about [Synthetic IDs](/guide/synthetic-ids)
+- Learn about [Edge Cookies](/guide/edge-cookies)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

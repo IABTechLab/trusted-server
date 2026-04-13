@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
+use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
@@ -15,7 +16,6 @@ use crate::integrations::{
 };
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::get_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -148,23 +148,23 @@ impl IntegrationProxy for TestlightIntegration {
             .validate()
             .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
 
-        // Read synthetic ID from header (set by registry) or cookie
-        let synthetic_id = get_synthetic_id(&req)
-            .change_context(Self::error("Failed to read synthetic ID"))?
+        // Read EC ID from header (set by registry) or cookie
+        let ec_id = get_ec_id(&req)
+            .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "Synthetic ID not found in request header or cookie — \
+                    "EC ID not found in request header or cookie — \
                      check that the integration registry propagated it",
                 ))
             })?;
 
-        payload.user.id = Some(synthetic_id);
+        payload.user.id = Some(ec_id);
 
         let payload_bytes = serde_json::to_vec(&payload)
             .change_context(Self::error("Failed to serialize request body"))?;
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint);
-        proxy_config.forward_synthetic_id = false;
+        proxy_config.forward_ec_id = false;
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;
         proxy_config.headers.push((
