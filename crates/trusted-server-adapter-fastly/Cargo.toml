@@ -7,7 +7,6 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-anyhow = "1.0"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }

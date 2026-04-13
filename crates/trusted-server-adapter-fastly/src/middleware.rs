@@ -114,9 +114,12 @@ impl Middleware for AuthMiddleware {
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Err(EdgeError::internal(anyhow::anyhow!(
+                // `EdgeError::internal` requires `E: Into<anyhow::Error>`.
+                // `std::io::Error` satisfies this bound without pulling in anyhow
+                // as a direct dependency (which the project convention forbids).
+                return Err(EdgeError::internal(std::io::Error::other(format!(
                     "auth check failed: {report}"
-                )));
+                ))));
             }
         }
 
