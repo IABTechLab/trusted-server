@@ -11,11 +11,10 @@ use std::sync::Arc;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
-use fastly::geo::geo_lookup;
+use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
-use trusted_server_core::geo::geo_from_fastly;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -349,10 +348,23 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 // FastlyPlatformGeo
 // ---------------------------------------------------------------------------
 
-/// Fastly geo-lookup implementation of [`PlatformGeo`].
+/// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
 ///
-/// Uses [`geo_from_fastly`] from `trusted_server_core::geo` to avoid
-/// duplicating the field-mapping logic present in `GeoInfo::from_request`.
+/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
+/// that field mapping is never duplicated.
+fn geo_from_fastly(geo: &Geo) -> GeoInfo {
+    GeoInfo {
+        city: geo.city().to_string(),
+        country: geo.country_code().to_string(),
+        continent: format!("{:?}", geo.continent()),
+        latitude: geo.latitude(),
+        longitude: geo.longitude(),
+        metro_code: geo.metro_code(),
+        region: geo.region().map(str::to_string),
+    }
+}
+
+/// Fastly geo-lookup implementation of [`PlatformGeo`].
 pub struct FastlyPlatformGeo;
 
 impl PlatformGeo for FastlyPlatformGeo {
