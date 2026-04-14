@@ -20,7 +20,7 @@
     "eslint": "^10",
     "mermaid": "^11.12.3",
     "prettier": "^3.4.2",
-    "typescript-eslint": "8.57",
+    "typescript-eslint": "8.58",
     "vitepress": "^1.5.0",
     "vitepress-plugin-mermaid": "^2.0.17"
   }
