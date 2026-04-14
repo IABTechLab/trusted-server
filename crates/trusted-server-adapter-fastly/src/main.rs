@@ -7,20 +7,19 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
+    COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_core::ec::admin::handle_register_partner;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::partner::PartnerStore;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
-use trusted_server_core::ec::sync_pixel::{handle_sync, FastlyRateLimiter, RATE_COUNTER_NAME};
+use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -90,6 +89,15 @@ fn main() -> Result<(), Error> {
         }
     };
 
+    let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Failed to build partner registry: {:?}", e);
+            to_error_response(&e).send_to_client();
+            return Ok(());
+        }
+    };
+
     // Start with an unavailable KV slot. Consent-dependent routes lazily
     // replace it with the configured store at dispatch time so unrelated
     // routes stay available when consent persistence is misconfigured.
@@ -101,6 +109,7 @@ fn main() -> Result<(), Error> {
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &runtime_services,
         req,
     ))?;
@@ -113,7 +122,7 @@ fn main() -> Result<(), Error> {
     response.send_to_client();
 
     if let Some(context) = pull_sync_context {
-        run_pull_sync_after_send(&settings, &context);
+        run_pull_sync_after_send(&settings, &partner_registry, &context);
     }
 
     Ok(())
@@ -129,6 +138,7 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
+    partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Result<RouteOutcome, Error> {
@@ -140,6 +150,9 @@ async fn route_request(
     // Extract geo info before auth check or routing consumes the request.
     #[allow(deprecated)]
     let geo_info = GeoInfo::from_request(&req);
+
+    // Extract the Prebid EIDs cookie before routing consumes the request.
+    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
 
     // Derive device signals from TLS/H2/UA for bot detection.
     // This is pure in-memory computation — no KV I/O.
@@ -159,12 +172,11 @@ async fn route_request(
     // context creation and the EC finalize middleware entirely.
     if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/batch-sync" {
         let mut response = require_identity_graph(settings)
-            .and_then(|kv| {
-                require_partner_store(settings).and_then(|partner_store| {
-                    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-                    handle_batch_sync(&kv, &partner_store, &limiter, req)
-                })
+            .map(|kv| {
+                let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                handle_batch_sync(&kv, partner_registry, &limiter, req)
             })
+            .and_then(|r| r)
             .unwrap_or_else(|e| to_error_response(&e));
         finalize_response(settings, geo_info.as_ref(), &mut response);
         return Ok(RouteOutcome {
@@ -204,7 +216,14 @@ async fn route_request(
     match enforce_basic_auth(settings, &req) {
         Ok(Some(mut response)) => {
             if is_real_browser {
-                ec_finalize_response(settings, &ec_context, kv_graph.as_ref(), &mut response);
+                ec_finalize_response(
+                    settings,
+                    &ec_context,
+                    kv_graph.as_ref(),
+                    partner_registry,
+                    eids_cookie.as_deref(),
+                    &mut response,
+                );
             }
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
@@ -250,25 +269,9 @@ async fn route_request(
         (Method::POST, "/_ts/admin/keys/deactivate") => {
             (handle_deactivate_key(settings, req), false)
         }
-        (Method::POST, "/_ts/admin/v1/partners/register") => (
-            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
-            false,
-        ),
-
-        (Method::GET, "/_ts/api/v1/sync") => (
-            require_identity_graph(settings).and_then(|kv| {
-                require_partner_store(settings).and_then(|partner_store| {
-                    handle_sync(settings, &kv, &partner_store, &req, &mut ec_context)
-                })
-            }),
-            false,
-        ),
         (Method::GET, "/_ts/api/v1/identify") => (
-            require_identity_graph(settings).and_then(|kv| {
-                require_partner_store(settings).and_then(|partner_store| {
-                    handle_identify(settings, &kv, &partner_store, &req, &ec_context)
-                })
-            }),
+            require_identity_graph(settings)
+                .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context)),
             false,
         ),
         (Method::OPTIONS, "/_ts/api/v1/identify") => {
@@ -277,13 +280,17 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            let partner_store = require_partner_store(settings).ok();
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(partner_registry)
+            };
             (
                 handle_auction(
                     settings,
                     orchestrator,
                     kv_graph.as_ref(),
-                    partner_store.as_ref(),
+                    registry_ref,
                     &ec_context,
                     req,
                 )
@@ -348,7 +355,14 @@ async fn route_request(
 
     // Bot gate: skip EC cookie writes and pull sync for unrecognized clients.
     if is_real_browser {
-        ec_finalize_response(settings, &ec_context, kv_graph.as_ref(), &mut response);
+        ec_finalize_response(
+            settings,
+            &ec_context,
+            kv_graph.as_ref(),
+            partner_registry,
+            eids_cookie.as_deref(),
+            &mut response,
+        );
     }
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
@@ -369,7 +383,11 @@ fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
     settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
 }
 
-fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
+fn run_pull_sync_after_send(
+    settings: &Settings,
+    partner_registry: &PartnerRegistry,
+    context: &PullSyncContext,
+) {
     let kv = match require_identity_graph(settings) {
         Ok(kv) => kv,
         Err(err) => {
@@ -378,16 +396,8 @@ fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
         }
     };
 
-    let partner_store = match require_partner_store(settings) {
-        Ok(store) => store,
-        Err(err) => {
-            log::debug!("Pull sync: partner store unavailable, skipping: {err:?}");
-            return;
-        }
-    };
-
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(settings, &kv, &partner_store, &limiter, context);
+    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context);
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
@@ -444,18 +454,6 @@ fn init_logger() {
         .expect("should initialize logger");
 }
 
-/// Constructs a `PartnerStore` from settings, or returns 503 if the
-/// `partner_store` config is not set.
-fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
-    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
-            store_name: "ec.partner_store".to_owned(),
-            message: "ec.partner_store is not configured".to_owned(),
-        })
-    })?;
-    Ok(PartnerStore::new(store_name))
-}
-
 /// Constructs a `KvIdentityGraph` from settings, or returns 503 if the
 /// `ec_store` config is not set.
 fn require_identity_graph(
@@ -468,6 +466,20 @@ fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(store_name))
+}
+
+/// Extracts a named cookie value from the request's `Cookie` header.
+fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
+    let cookie_header = req.get_header_str("cookie")?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some((key, value)) = pair.split_once('=') {
+            if key.trim() == name {
+                return Some(value.trim().to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Derives device signals from TLS, H2, and UA request data.
