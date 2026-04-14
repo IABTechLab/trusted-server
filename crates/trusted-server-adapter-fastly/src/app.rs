@@ -126,6 +126,16 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .build()
 }
 
+/// Open the consent KV store named in `config`, returning `None` when not configured or unavailable.
+fn open_consent_kv(
+    config: &trusted_server_core::consent_config::ConsentConfig,
+) -> Option<FastlyConsentKvStore> {
+    config
+        .consent_store
+        .as_deref()
+        .and_then(FastlyConsentKvStore::open)
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -322,17 +332,14 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    let consent_kv = s
-                        .settings
-                        .consent
-                        .consent_store
-                        .as_deref()
-                        .and_then(FastlyConsentKvStore::open);
+                    let consent_kv = open_consent_kv(&s.settings.consent);
                     handle_publisher_request(
                         &s.settings,
                         &s.registry,
                         &services,
-                        consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                        consent_kv
+                            .as_ref()
+                            .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
                         req,
                     )
                     .await
@@ -362,17 +369,14 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    let consent_kv = s
-                        .settings
-                        .consent
-                        .consent_store
-                        .as_deref()
-                        .and_then(FastlyConsentKvStore::open);
+                    let consent_kv = open_consent_kv(&s.settings.consent);
                     handle_publisher_request(
                         &s.settings,
                         &s.registry,
                         &services,
-                        consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                        consent_kv
+                            .as_ref()
+                            .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
                         req,
                     )
                     .await

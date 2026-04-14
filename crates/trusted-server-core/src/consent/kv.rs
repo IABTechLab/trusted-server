@@ -91,12 +91,6 @@ pub trait ConsentKvOps: Send + Sync {
     /// Errors are logged internally and never propagated.
     fn save_entry_with_ttl(&self, key: &str, entry: &KvConsentEntry, ttl: std::time::Duration);
 
-    /// Check whether the stored fingerprint matches `fp`.
-    ///
-    /// Returns `false` on a miss or when no fingerprint is stored, triggering
-    /// an unconditional write (self-healing for older entries without `fp`).
-    fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool;
-
     /// Delete a consent entry.
     ///
     /// Called when consent is revoked (SSC cookie expiry). Errors are logged
@@ -268,16 +262,17 @@ pub fn save_consent(kv: &dyn ConsentKvOps, key: &str, ctx: &ConsentContext, max_
         log::debug!("Skipping consent KV write: consent is empty");
         return;
     }
-
-    let fp = consent_fingerprint(ctx);
-    if kv.fingerprint_unchanged(key, &fp) {
-        log::debug!("Consent unchanged for '{key}' (fp={fp}), skipping write");
+    let new_fp = consent_fingerprint(ctx);
+    // Load existing entry once; check fp to skip write when unchanged.
+    let existing_fp = kv.load_entry(key).and_then(|e| e.fp);
+    if existing_fp.as_deref() == Some(new_fp.as_str()) {
+        log::debug!("Consent unchanged for '{key}' (fp={new_fp}), skipping write");
         return;
     }
-
     let entry = entry_from_context(ctx, super::now_deciseconds());
     let ttl = std::time::Duration::from_secs(u64::from(max_age_days) * 86_400);
     kv.save_entry_with_ttl(key, &entry, ttl);
+    log::info!("Saved consent to KV store for '{key}' (fp={new_fp}, ttl={max_age_days}d)");
 }
 
 // ---------------------------------------------------------------------------
@@ -484,15 +479,6 @@ mod tests {
                 .insert(key.to_owned(), entry.clone());
         }
 
-        fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool {
-            self.stored
-                .lock()
-                .expect("should lock stub KV store")
-                .get(key)
-                .and_then(|e| e.fp.as_deref())
-                == Some(fp)
-        }
-
         fn delete_entry(&self, key: &str) {
             self.stored
                 .lock()
@@ -515,8 +501,7 @@ mod tests {
         save_consent(&kv, "user-1", &ctx, 30);
         let loaded = load_consent(&kv, "user-1").expect("should load saved consent");
         assert_eq!(
-            loaded.raw_tc_string,
-            ctx.raw_tc_string,
+            loaded.raw_tc_string, ctx.raw_tc_string,
             "should restore raw TC string"
         );
     }
@@ -541,7 +526,7 @@ mod tests {
             .expect("should lock")
             .get("user-1")
             .map(|e| e.stored_at_ds)
-            .unwrap();
+            .expect("should find entry after first write");
 
         // Second write with same context — fingerprint unchanged.
         save_consent(&kv, "user-1", &ctx, 30);
@@ -551,7 +536,7 @@ mod tests {
             .expect("should lock")
             .get("user-1")
             .map(|e| e.stored_at_ds)
-            .unwrap();
+            .expect("should find entry after second write");
 
         assert_eq!(
             stored_ts, ts_after,

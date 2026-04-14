@@ -410,10 +410,7 @@ impl FastlyConsentKvStore {
 }
 
 impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
-    fn load_entry(
-        &self,
-        key: &str,
-    ) -> Option<trusted_server_core::consent::kv::KvConsentEntry> {
+    fn load_entry(&self, key: &str) -> Option<trusted_server_core::consent::kv::KvConsentEntry> {
         let mut response = match self.store.lookup(key) {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return None,
@@ -442,17 +439,15 @@ impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
             log::warn!("Failed to serialize consent entry for '{key}'");
             return;
         };
-        match self.store.build_insert().time_to_live(ttl).execute(key, body) {
+        match self
+            .store
+            .build_insert()
+            .time_to_live(ttl)
+            .execute(key, body)
+        {
             Ok(()) => log::info!("Saved consent to KV store for '{key}'"),
             Err(e) => log::warn!("Failed to write consent to KV store for '{key}': {e}"),
         }
-    }
-
-    fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool {
-        self.load_entry(key)
-            .and_then(|e| e.fp)
-            .as_deref()
-            == Some(fp)
     }
 
     fn delete_entry(&self, key: &str) {
