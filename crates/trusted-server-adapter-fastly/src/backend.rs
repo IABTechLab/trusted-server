@@ -286,7 +286,6 @@ impl<'a> BackendConfig<'a> {
             .first_byte_timeout(first_byte_timeout)
             .ensure()
     }
-
 }
 
 #[cfg(test)]

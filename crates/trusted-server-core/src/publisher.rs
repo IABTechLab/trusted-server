@@ -4,7 +4,9 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 
-use crate::consent::{allows_ssc_creation, build_consent_context, kv::ConsentKvOps, ConsentPipelineInput};
+use crate::consent::{
+    allows_ssc_creation, build_consent_context, kv::ConsentKvOps, ConsentPipelineInput,
+};
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;

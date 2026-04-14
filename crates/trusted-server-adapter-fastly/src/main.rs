@@ -270,7 +270,9 @@ async fn route_request(
                 settings,
                 integration_registry,
                 runtime_services,
-                consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                consent_kv
+                    .as_ref()
+                    .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
                 req,
             )
             .await
