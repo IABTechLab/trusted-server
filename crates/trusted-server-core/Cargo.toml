@@ -22,7 +22,6 @@ config = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
-fastly = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 handlebars = { workspace = true }
