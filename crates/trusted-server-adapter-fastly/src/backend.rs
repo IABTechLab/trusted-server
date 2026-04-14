@@ -217,10 +217,9 @@ impl<'a> BackendConfig<'a> {
 
     /// Parse an origin URL into its (scheme, host, port) components.
     ///
-    /// Centralises URL parsing so that [`from_url`](Self::from_url),
-    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout),
-    /// and [`backend_name_for_url`](Self::backend_name_for_url) share one
-    /// code-path.
+    /// Centralises URL parsing so that [`from_url`](Self::from_url) and
+    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
+    /// share one code-path.
     fn parse_origin(
         origin_url: &str,
     ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
@@ -288,36 +287,6 @@ impl<'a> BackendConfig<'a> {
             .ensure()
     }
 
-    /// Compute the backend name that
-    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
-    /// would produce for the given URL and timeout, **without** registering a
-    /// backend.
-    ///
-    /// This is useful when callers need the name for mapping purposes (e.g. the
-    /// auction orchestrator correlating responses to providers) but want the
-    /// actual registration to happen later with specific settings.
-    ///
-    /// The `first_byte_timeout` must match the value that will be used at
-    /// registration time so that the predicted name is correct.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the URL cannot be parsed or lacks a host.
-    pub fn backend_name_for_url(
-        origin_url: &str,
-        certificate_check: bool,
-        first_byte_timeout: Duration,
-    ) -> Result<String, Report<TrustedServerError>> {
-        let (scheme, host, port) = Self::parse_origin(origin_url)?;
-
-        let (name, _) = BackendConfig::new(&scheme, &host)
-            .port(port)
-            .certificate_check(certificate_check)
-            .first_byte_timeout(first_byte_timeout)
-            .compute_name()?;
-
-        Ok(name)
-    }
 }
 
 #[cfg(test)]
