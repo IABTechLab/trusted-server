@@ -9,9 +9,11 @@ describe('Beacon Guard', () => {
   let config: BeaconGuardConfig;
 
   beforeEach(() => {
+    // Save originals
     originalSendBeacon = navigator.sendBeacon;
     originalFetch = window.fetch;
 
+    // Create spies that simulate real sendBeacon/fetch behaviour
     sendBeaconSpy = vi.fn<typeof navigator.sendBeacon>(() => true);
     navigator.sendBeacon = sendBeaconSpy;
 

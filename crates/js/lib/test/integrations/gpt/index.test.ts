@@ -14,7 +14,7 @@ type GptWindow = Window & {
   };
 };
 
-describe('GPT shim - patchCommandQueue', () => {
+describe('GPT shim: patchCommandQueue', () => {
   let win: GptWindow;
   let installGptShim: () => boolean;
 
@@ -162,7 +162,7 @@ describe('GPT shim - patchCommandQueue', () => {
   });
 });
 
-describe('GPT shim - runtime gating', () => {
+describe('GPT shim: runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;
     __tsjs_installGptShim?: () => void;

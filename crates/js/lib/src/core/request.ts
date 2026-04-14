@@ -1,6 +1,6 @@
+// Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { buildAdRequest, sendAuction } from './auction';
 import { collectContext } from './context';
-// Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
