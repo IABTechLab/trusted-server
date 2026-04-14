@@ -21,12 +21,24 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: crates/js/lib/package-lock.json
 
       - name: Get Viceroy cache key
         id: viceroy-rev
