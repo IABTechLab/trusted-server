@@ -216,6 +216,74 @@ impl DerefMut for IntegrationSettings {
     }
 }
 
+/// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
+///
+/// Partners are defined statically in `trusted-server.toml` rather than
+/// registered via API. At startup, each partner's `api_token` is hashed
+/// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EcPartner {
+    /// Unique partner identifier. Must match `^[a-z0-9_-]{1,32}$` and
+    /// not collide with reserved IDs (`ec`, `ts`, `eids`, etc.).
+    pub id: String,
+    /// Human-readable partner name.
+    pub name: String,
+    /// `OpenRTB` `source.domain` for EID entries (e.g. `"liveramp.com"`).
+    pub source_domain: String,
+    /// `OpenRTB` `atype` value (typically 3).
+    #[serde(default = "EcPartner::default_openrtb_atype")]
+    pub openrtb_atype: u8,
+    /// Whether this partner's UIDs appear in auction `user.eids`.
+    #[serde(default)]
+    pub bidstream_enabled: bool,
+    /// Plaintext API token. Hashed at startup for auth lookups.
+    /// Used by batch sync (inbound) and identify (inbound).
+    pub api_token: Redacted<String>,
+    /// Max batch sync API requests per partner per minute.
+    #[serde(default = "EcPartner::default_batch_rate_limit")]
+    pub batch_rate_limit: u32,
+    /// Whether server-to-server pull sync is enabled for this partner.
+    #[serde(default)]
+    pub pull_sync_enabled: bool,
+    /// URL to call for pull sync. Required when `pull_sync_enabled`.
+    #[serde(default)]
+    pub pull_sync_url: Option<String>,
+    /// Allowlist of domains TS may call for this partner's pull sync.
+    #[serde(default)]
+    pub pull_sync_allowed_domains: Vec<String>,
+    /// Seconds between pull sync refreshes.
+    #[serde(default = "EcPartner::default_pull_sync_ttl_sec")]
+    pub pull_sync_ttl_sec: u64,
+    /// Max pull sync calls per EC hash per partner per hour.
+    #[serde(default = "EcPartner::default_pull_sync_rate_limit")]
+    pub pull_sync_rate_limit: u32,
+    /// Outbound bearer token for pull sync requests.
+    #[serde(default)]
+    pub ts_pull_token: Option<Redacted<String>>,
+}
+
+impl EcPartner {
+    #[must_use]
+    pub const fn default_openrtb_atype() -> u8 {
+        3
+    }
+
+    #[must_use]
+    pub const fn default_batch_rate_limit() -> u32 {
+        60
+    }
+
+    #[must_use]
+    pub const fn default_pull_sync_ttl_sec() -> u64 {
+        86400
+    }
+
+    #[must_use]
+    pub const fn default_pull_sync_rate_limit() -> u32 {
+        10
+    }
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -227,14 +295,8 @@ pub struct Ec {
     pub passphrase: Redacted<String>,
 
     /// Fastly KV store name for the EC identity graph.
-    /// Required for Stories 3+ (KV identity graph).
     #[serde(default)]
     pub ec_store: Option<String>,
-
-    /// Fastly KV store name for the partner registry.
-    /// Required for Story 4+ (partner registry).
-    #[serde(default)]
-    pub partner_store: Option<String>,
 
     /// Maximum number of concurrent pull-sync requests.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
@@ -250,6 +312,10 @@ pub struct Ec {
     /// Re-check occurs only in the `/_ts/api/v1/identify` endpoint.
     #[serde(default = "Ec::default_cluster_recheck_secs")]
     pub cluster_recheck_secs: u64,
+
+    /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
+    #[serde(default)]
+    pub partners: Vec<EcPartner>,
 }
 
 impl Ec {
@@ -622,11 +688,8 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
-        "/_ts/admin/keys/rotate",
-        "/_ts/admin/keys/deactivate",
-        "/_ts/admin/v1/partners/register",
-    ];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
+        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -1935,11 +1998,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec![
-                "/_ts/admin/keys/rotate",
-                "/_ts/admin/keys/deactivate",
-                "/_ts/admin/v1/partners/register",
-            ],
+            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate",],
             "should report all admin endpoints as uncovered"
         );
     }
@@ -1973,10 +2032,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec![
-                "/_ts/admin/keys/deactivate",
-                "/_ts/admin/v1/partners/register"
-            ],
+            vec!["/_ts/admin/keys/deactivate"],
             "should detect endpoints not covered by the rotate-only handler"
         );
     }
