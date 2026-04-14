@@ -20,8 +20,8 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::{ensure_integration_backend_with_timeout, predict_backend_name_for_url};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -334,9 +334,10 @@ impl AuctionProvider for AdServerMockProvider {
         }
 
         // Send async with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend_with_timeout(
+            context.services,
             &self.config.endpoint,
-            true,
+            "adserver_mock",
             Duration::from_millis(u64::from(context.timeout_ms)),
         )
         .change_context(TrustedServerError::Auction {
@@ -402,18 +403,18 @@ impl AuctionProvider for AdServerMockProvider {
     }
 
     fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        BackendConfig::backend_name_for_url(
+        let name = predict_backend_name_for_url(
             &self.config.endpoint,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|e| {
+        );
+        if name.is_none() {
             log::error!(
-                "Failed to create backend for AdServer Mock endpoint '{}': {e:?}",
+                "Failed to predict backend name for AdServer Mock endpoint '{}'",
                 self.config.endpoint
             );
-        })
-        .ok()
+        }
+        name
     }
 }
 

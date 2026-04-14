@@ -14,8 +14,8 @@ use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::{ensure_integration_backend_with_timeout, predict_backend_name_for_url};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::IntegrationConfig;
 
@@ -513,9 +513,10 @@ impl AuctionProvider for ApsAuctionProvider {
             })?;
 
         // Send request asynchronously with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend_with_timeout(
+            context.services,
             &self.config.endpoint,
-            true,
+            "aps",
             Duration::from_millis(u64::from(context.timeout_ms)),
         )
         .change_context(TrustedServerError::Auction {
@@ -585,18 +586,18 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        BackendConfig::backend_name_for_url(
+        let name = predict_backend_name_for_url(
             &self.config.endpoint,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|e| {
+        );
+        if name.is_none() {
             log::error!(
-                "Failed to create backend for APS endpoint '{}': {e:?}",
+                "Failed to predict backend name for APS endpoint '{}'",
                 self.config.endpoint
             );
-        })
-        .ok()
+        }
+        name
     }
 }
 

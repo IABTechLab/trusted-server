@@ -14,7 +14,7 @@ use error_stack::{Report, ResultExt};
 use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
-use trusted_server_core::backend::BackendConfig;
+use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,

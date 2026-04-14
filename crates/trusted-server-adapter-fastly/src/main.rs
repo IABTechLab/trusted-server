@@ -30,6 +30,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod app;
+mod backend;
 mod compat;
 mod error;
 mod logging;

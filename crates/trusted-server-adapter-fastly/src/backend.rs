@@ -4,7 +4,7 @@ use error_stack::{Report, ResultExt};
 use fastly::backend::Backend;
 use url::Url;
 
-use crate::error::TrustedServerError;
+use trusted_server_core::error::TrustedServerError;
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]

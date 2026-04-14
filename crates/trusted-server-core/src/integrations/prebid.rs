@@ -16,15 +16,14 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
-use crate::backend::BackendConfig;
 use crate::consent_config::ConsentForwardingMode;
 use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    ensure_integration_backend_with_timeout, predict_backend_name_for_url, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
 };
 use crate::openrtb::{
     to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
@@ -1128,9 +1127,10 @@ impl AuctionProvider for PrebidAuctionProvider {
         *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
         // Send request asynchronously with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend_with_timeout(
+            context.services,
             &self.config.server_url,
-            true,
+            "prebid",
             Duration::from_millis(u64::from(context.timeout_ms)),
         )?;
         let pending = context
@@ -1209,18 +1209,18 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        BackendConfig::backend_name_for_url(
+        let name = predict_backend_name_for_url(
             &self.config.server_url,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|e| {
+        );
+        if name.is_none() {
             log::error!(
-                "Failed to create backend for Prebid server URL '{}': {e:?}",
+                "Failed to predict backend name for Prebid server URL '{}'",
                 self.config.server_url
             );
-        })
-        .ok()
+        }
+        name
     }
 }
 
