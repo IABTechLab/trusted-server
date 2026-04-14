@@ -23,6 +23,7 @@
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
 //!     synthetic_id: Some("sid_abc123"),
+//!     kv_ops: None,
 //! });
 //! ```
 
@@ -69,10 +70,14 @@ pub struct ConsentPipelineInput<'a> {
     pub geo: Option<&'a GeoInfo>,
     /// Synthetic ID for KV Store consent persistence.
     ///
-    /// When set along with `config.consent_store`, enables:
+    /// When set along with `kv_ops`, enables:
     /// - **Read fallback**: loads consent from KV when cookies are absent.
     /// - **Write-on-change**: persists cookie-sourced consent to KV.
     pub synthetic_id: Option<&'a str>,
+    /// Platform KV store for consent persistence (read/write).
+    ///
+    /// When `None`, KV fallback and KV writes are skipped silently.
+    pub kv_ops: Option<&'a dyn kv::ConsentKvOps>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -520,11 +525,11 @@ fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
 /// `None` otherwise. Requires both `consent_store` and `synthetic_id` to
 /// be configured.
 fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
-    let store_name = input.config.consent_store.as_deref()?;
+    let kv = input.kv_ops?;
     let synthetic_id = input.synthetic_id?;
 
     log::debug!("No cookie consent signals, trying KV fallback for '{synthetic_id}'");
-    let mut ctx = kv::load_consent_from_kv(store_name, synthetic_id)?;
+    let mut ctx = kv::load_consent(kv, synthetic_id)?;
 
     // Re-detect jurisdiction from current geo (may differ from stored value).
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
@@ -540,19 +545,14 @@ fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
 /// Only writes when consent signals are non-empty and have changed since
 /// the last write (fingerprint comparison).
 fn try_kv_write(input: &ConsentPipelineInput<'_>, ctx: &ConsentContext) {
-    let Some(store_name) = input.config.consent_store.as_deref() else {
+    let Some(kv) = input.kv_ops else {
         return;
     };
     let Some(synthetic_id) = input.synthetic_id else {
         return;
     };
 
-    kv::save_consent_to_kv(
-        store_name,
-        synthetic_id,
-        ctx,
-        input.config.max_consent_age_days,
-    );
+    kv::save_consent(kv, synthetic_id, ctx, input.config.max_consent_age_days);
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +761,7 @@ mod tests {
             config: &config,
             geo: None,
             synthetic_id: None,
+            kv_ops: None,
         });
 
         assert!(
@@ -790,6 +791,7 @@ mod tests {
             config: &config,
             geo: None,
             synthetic_id: None,
+            kv_ops: None,
         });
 
         assert!(

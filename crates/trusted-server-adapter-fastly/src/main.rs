@@ -261,7 +261,19 @@ async fn route_request(
                 path
             );
 
-            handle_publisher_request(settings, integration_registry, runtime_services, req).await
+            let consent_kv = settings
+                .consent
+                .consent_store
+                .as_deref()
+                .and_then(crate::platform::FastlyConsentKvStore::open);
+            handle_publisher_request(
+                settings,
+                integration_registry,
+                runtime_services,
+                consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                req,
+            )
+            .await
         }
     }
 }

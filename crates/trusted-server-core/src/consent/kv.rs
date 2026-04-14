@@ -1,21 +1,19 @@
 //! KV Store consent persistence.
 //!
-//! Stores and retrieves consent data from a Fastly KV Store, keyed by
-//! Synthetic ID. This provides consent continuity for returning users
+//! Stores and retrieves consent data from a platform-neutral KV Store, keyed
+//! by Synthetic ID. This provides consent continuity for returning users
 //! whose browsers may not have consent cookies on every request.
 //!
 //! # Storage layout
 //!
-//! Each entry uses:
-//! - **Body** ([`KvConsentEntry`]) — JSON with raw consent strings and context.
-//! - **Metadata** ([`ConsentKvMetadata`]) — compact JSON summary for fast
-//!   consent status checks and change detection (max 2000 bytes).
+//! Each entry is a single JSON body ([`KvConsentEntry`]) containing raw consent
+//! strings, context flags, and a compact fingerprint for change detection.
 //!
 //! # Change detection
 //!
 //! Writes only occur when consent signals have actually changed.
 //! [`consent_fingerprint`] hashes the raw strings into a compact fingerprint
-//! stored in metadata. On the next request, the existing fingerprint is
+//! stored inside the body. On the next request, the existing fingerprint is
 //! compared before writing.
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +28,8 @@ use super::types::{ConsentContext, ConsentSource};
 
 /// Consent data stored in the KV Store body.
 ///
-/// Contains the raw consent strings needed to reconstruct a [`ConsentContext`].
+/// Contains the raw consent strings needed to reconstruct a [`ConsentContext`],
+/// plus a compact fingerprint used for write-on-change detection.
 /// Decoded data (TCF, GPP, US Privacy) is not stored — it is re-decoded on
 /// read to avoid stale decoded state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,31 +59,50 @@ pub struct KvConsentEntry {
 
     /// When this entry was stored (deciseconds since Unix epoch).
     pub stored_at_ds: u64,
+
+    /// SHA-256 fingerprint (first 16 hex chars) of all raw consent signals.
+    ///
+    /// Used for write-on-change detection. If the fingerprint of the stored
+    /// entry equals the fingerprint of the current request's consent signals,
+    /// no write is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// KV metadata (compact JSON, max 2000 bytes)
+// Platform-neutral KV operations trait
 // ---------------------------------------------------------------------------
 
-/// Compact consent summary stored in KV Store metadata.
+/// Synchronous KV operations required for consent persistence.
 ///
-/// Used for fast consent status checks without reading the full body,
-/// and for change detection via the `fingerprint` field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsentKvMetadata {
-    /// SHA-256 fingerprint (first 16 hex chars) of all raw consent strings.
+/// Implemented by the platform adapter (e.g., Fastly KV store). Synchronous
+/// to remain compatible with the non-async [`super::build_consent_context`]
+/// pipeline.
+pub trait ConsentKvOps: Send + Sync {
+    /// Load a consent entry from the KV store.
     ///
-    /// Used for write-on-change detection. If the fingerprint matches the
-    /// current request's consent signals, no write is needed.
-    pub fp: String,
-    /// Whether GDPR applies.
-    pub gdpr: bool,
-    /// Whether GPC is set.
-    pub gpc: bool,
-    /// Whether a US Privacy string is present.
-    pub usp: bool,
-    /// Whether a TCF string is present.
-    pub tcf: bool,
+    /// Returns `None` on a cache miss or deserialization failure. Errors are
+    /// logged internally and never propagated — KV failures must not break
+    /// the request pipeline.
+    fn load_entry(&self, key: &str) -> Option<KvConsentEntry>;
+
+    /// Save a consent entry with a time-to-live.
+    ///
+    /// Errors are logged internally and never propagated.
+    fn save_entry_with_ttl(&self, key: &str, entry: &KvConsentEntry, ttl: std::time::Duration);
+
+    /// Check whether the stored fingerprint matches `fp`.
+    ///
+    /// Returns `false` on a miss or when no fingerprint is stored, triggering
+    /// an unconditional write (self-healing for older entries without `fp`).
+    fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool;
+
+    /// Delete a consent entry.
+    ///
+    /// Called when consent is revoked (SSC cookie expiry). Errors are logged
+    /// internally and never propagated — KV failures must not break the
+    /// request pipeline.
+    fn delete_entry(&self, key: &str);
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +112,8 @@ pub struct ConsentKvMetadata {
 /// Builds a [`KvConsentEntry`] from a [`ConsentContext`].
 ///
 /// Captures only the raw strings and contextual flags. Decoded data is
-/// intentionally omitted — it will be re-decoded on read.
+/// intentionally omitted — it will be re-decoded on read. The entry includes
+/// a fingerprint for write-on-change detection on subsequent requests.
 #[must_use]
 pub fn entry_from_context(ctx: &ConsentContext, now_ds: u64) -> KvConsentEntry {
     KvConsentEntry {
@@ -107,18 +126,7 @@ pub fn entry_from_context(ctx: &ConsentContext, now_ds: u64) -> KvConsentEntry {
         gpc: ctx.gpc,
         jurisdiction: ctx.jurisdiction.to_string(),
         stored_at_ds: now_ds,
-    }
-}
-
-/// Builds a [`ConsentKvMetadata`] from a [`ConsentContext`].
-#[must_use]
-pub fn metadata_from_context(ctx: &ConsentContext) -> ConsentKvMetadata {
-    ConsentKvMetadata {
-        fp: consent_fingerprint(ctx),
-        gdpr: ctx.gdpr_applies,
-        gpc: ctx.gpc,
-        usp: ctx.raw_us_privacy.is_some(),
-        tcf: ctx.raw_tc_string.is_some(),
+        fp: Some(consent_fingerprint(ctx)),
     }
 }
 
@@ -220,50 +228,10 @@ fn parse_jurisdiction(s: &str) -> Jurisdiction {
 }
 
 // ---------------------------------------------------------------------------
-// KV Store operations
+// KV Store operations (platform-neutral)
 // ---------------------------------------------------------------------------
 
-/// Opens a Fastly KV Store by name, logging a warning on failure.
-///
-/// Returns [`None`] if the store does not exist or cannot be opened.
-fn open_store(store_name: &str) -> Option<fastly::kv_store::KVStore> {
-    match fastly::kv_store::KVStore::open(store_name) {
-        Ok(Some(store)) => Some(store),
-        Ok(None) => {
-            log::warn!("Consent KV store '{store_name}' not found");
-            None
-        }
-        Err(e) => {
-            log::warn!("Failed to open consent KV store '{store_name}': {e}");
-            None
-        }
-    }
-}
-
-/// Checks whether the stored consent fingerprint matches the current one.
-///
-/// Returns `true` when the stored metadata fingerprint equals `new_fp`,
-/// meaning no write is needed.
-///
-/// Entries written by older code versions may lack metadata, in which case
-/// this returns `false` and the entry will be unconditionally re-written
-/// with the current fingerprint (self-healing migration).
-fn fingerprint_unchanged(
-    store: &fastly::kv_store::KVStore,
-    synthetic_id: &str,
-    new_fp: &str,
-) -> bool {
-    let stored_fp = store
-        .lookup(synthetic_id)
-        .ok()
-        .and_then(|resp| resp.metadata())
-        .and_then(|bytes| serde_json::from_slice::<ConsentKvMetadata>(&bytes).ok())
-        .map(|meta| meta.fp);
-
-    stored_fp.as_deref() == Some(new_fp)
-}
-
-/// Loads consent data from the KV Store for a given Synthetic ID.
+/// Loads consent data from the KV Store for a given key.
 ///
 /// Returns `Some(ConsentContext)` if a valid entry is found, [`None`] if the
 /// key does not exist or deserialization fails. Errors are logged but never
@@ -271,124 +239,45 @@ fn fingerprint_unchanged(
 ///
 /// # Arguments
 ///
-/// * `store_name` — The KV Store name (from `consent.consent_store` config).
-/// * `synthetic_id` — The Synthetic ID used as the KV Store key.
+/// * `kv` — Platform KV implementation for consent operations.
+/// * `key` — The Synthetic ID used as the KV Store key.
 #[must_use]
-pub fn load_consent_from_kv(store_name: &str, synthetic_id: &str) -> Option<ConsentContext> {
-    let store = open_store(store_name)?;
-
-    let mut response = match store.lookup(synthetic_id) {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::debug!("Consent KV lookup miss for '{synthetic_id}': {e}");
-            return None;
-        }
-    };
-
-    let body_bytes = response.take_body_bytes();
-    match serde_json::from_slice::<KvConsentEntry>(&body_bytes) {
-        Ok(entry) => {
-            log::info!(
-                "Loaded consent from KV store for '{synthetic_id}' (stored_at_ds={})",
-                entry.stored_at_ds
-            );
-            Some(context_from_entry(&entry))
-        }
-        Err(e) => {
-            log::warn!("Failed to deserialize consent KV entry for '{synthetic_id}': {e}");
-            None
-        }
-    }
+pub fn load_consent(kv: &dyn ConsentKvOps, key: &str) -> Option<ConsentContext> {
+    let entry = kv.load_entry(key)?;
+    log::info!(
+        "Loaded consent from KV store for '{key}' (stored_at_ds={})",
+        entry.stored_at_ds
+    );
+    Some(context_from_entry(&entry))
 }
 
 /// Saves consent data to the KV Store, writing only when signals have changed.
 ///
-/// Compares the fingerprint of the current consent signals against the
-/// stored metadata. If they match, the write is skipped. Otherwise, the
-/// entry is written with the configured TTL.
+/// Compares the fingerprint of the current consent signals against the stored
+/// body. If they match, the write is skipped. Otherwise, the entry is written
+/// with the configured TTL.
 ///
 /// # Arguments
 ///
-/// * `store_name` — The KV Store name (from `consent.consent_store` config).
-/// * `synthetic_id` — The Synthetic ID used as the KV Store key.
+/// * `kv` — Platform KV implementation for consent operations.
+/// * `key` — The Synthetic ID used as the KV Store key.
 /// * `ctx` — The current request's consent context.
 /// * `max_age_days` — TTL for the entry, matching `max_consent_age_days`.
-pub fn save_consent_to_kv(
-    store_name: &str,
-    synthetic_id: &str,
-    ctx: &ConsentContext,
-    max_age_days: u32,
-) {
+pub fn save_consent(kv: &dyn ConsentKvOps, key: &str, ctx: &ConsentContext, max_age_days: u32) {
     if ctx.is_empty() {
         log::debug!("Skipping consent KV write: consent is empty");
         return;
     }
 
-    let Some(store) = open_store(store_name) else {
-        return;
-    };
-
-    let metadata = metadata_from_context(ctx);
-
-    if fingerprint_unchanged(&store, synthetic_id, &metadata.fp) {
-        log::debug!(
-            "Consent unchanged for '{synthetic_id}' (fp={}), skipping write",
-            metadata.fp
-        );
+    let fp = consent_fingerprint(ctx);
+    if kv.fingerprint_unchanged(key, &fp) {
+        log::debug!("Consent unchanged for '{key}' (fp={fp}), skipping write");
         return;
     }
 
     let entry = entry_from_context(ctx, super::now_deciseconds());
-
-    let Ok(body) = serde_json::to_string(&entry) else {
-        log::warn!("Failed to serialize consent entry for '{synthetic_id}'");
-        return;
-    };
-    let Ok(meta_str) = serde_json::to_string(&metadata) else {
-        log::warn!("Failed to serialize consent metadata for '{synthetic_id}'");
-        return;
-    };
-
     let ttl = std::time::Duration::from_secs(u64::from(max_age_days) * 86_400);
-
-    match store
-        .build_insert()
-        .metadata(&meta_str)
-        .time_to_live(ttl)
-        .execute(synthetic_id, body)
-    {
-        Ok(()) => {
-            log::info!(
-                "Saved consent to KV store for '{synthetic_id}' (fp={}, ttl={max_age_days}d)",
-                metadata.fp
-            );
-        }
-        Err(e) => {
-            log::warn!("Failed to write consent to KV store for '{synthetic_id}': {e}");
-        }
-    }
-}
-
-/// Deletes a consent entry from the KV Store for a given Synthetic ID.
-///
-/// Used when a user revokes consent — the existing SSC cookie is being
-/// expired, so the persisted consent data must also be removed.
-///
-/// Errors are logged but never propagated — KV Store failures must not
-/// break the request pipeline.
-pub fn delete_consent_from_kv(store_name: &str, synthetic_id: &str) {
-    let Some(store) = open_store(store_name) else {
-        return;
-    };
-
-    match store.delete(synthetic_id) {
-        Ok(()) => {
-            log::info!("Deleted consent KV entry for '{synthetic_id}' (consent revoked)");
-        }
-        Err(e) => {
-            log::warn!("Failed to delete consent KV entry for '{synthetic_id}': {e}");
-        }
-    }
+    kv.save_entry_with_ttl(key, &entry, ttl);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,32 +323,6 @@ mod tests {
         assert_eq!(restored.gpc, ctx.gpc);
         assert_eq!(restored.jurisdiction, "GDPR");
         assert_eq!(restored.stored_at_ds, 1_000_000);
-    }
-
-    #[test]
-    fn metadata_roundtrip() {
-        let ctx = make_test_context();
-        let meta = metadata_from_context(&ctx);
-        let json = serde_json::to_string(&meta).expect("should serialize");
-        let restored: ConsentKvMetadata = serde_json::from_str(&json).expect("should deserialize");
-
-        assert_eq!(restored.fp, meta.fp);
-        assert!(restored.gdpr);
-        assert!(!restored.gpc);
-        assert!(restored.usp);
-        assert!(restored.tcf);
-    }
-
-    #[test]
-    fn metadata_fits_in_2000_bytes() {
-        let ctx = make_test_context();
-        let meta = metadata_from_context(&ctx);
-        let json = serde_json::to_string(&meta).expect("should serialize");
-        assert!(
-            json.len() <= 2000,
-            "metadata JSON must fit in 2000 bytes, was {} bytes",
-            json.len()
-        );
     }
 
     #[test]
@@ -583,6 +446,145 @@ mod tests {
             restored.raw_ac_string,
             Some("2~1234.5678~dv.".to_owned()),
             "AC string should survive roundtrip"
+        );
+    }
+
+    // --- ConsentKvOps integration tests using a stub ---
+
+    struct StubKvOps {
+        stored: std::sync::Mutex<std::collections::HashMap<String, KvConsentEntry>>,
+    }
+
+    impl StubKvOps {
+        fn new() -> Self {
+            Self {
+                stored: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl ConsentKvOps for StubKvOps {
+        fn load_entry(&self, key: &str) -> Option<KvConsentEntry> {
+            self.stored
+                .lock()
+                .expect("should lock stub KV store")
+                .get(key)
+                .cloned()
+        }
+
+        fn save_entry_with_ttl(
+            &self,
+            key: &str,
+            entry: &KvConsentEntry,
+            _ttl: std::time::Duration,
+        ) {
+            self.stored
+                .lock()
+                .expect("should lock stub KV store")
+                .insert(key.to_owned(), entry.clone());
+        }
+
+        fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool {
+            self.stored
+                .lock()
+                .expect("should lock stub KV store")
+                .get(key)
+                .and_then(|e| e.fp.as_deref())
+                == Some(fp)
+        }
+
+        fn delete_entry(&self, key: &str) {
+            self.stored
+                .lock()
+                .expect("should lock stub KV store")
+                .remove(key);
+        }
+    }
+
+    #[test]
+    fn load_consent_returns_none_on_miss() {
+        let kv = StubKvOps::new();
+        let result = load_consent(&kv, "missing-key");
+        assert!(result.is_none(), "should return None on cache miss");
+    }
+
+    #[test]
+    fn save_and_load_consent_roundtrip() {
+        let kv = StubKvOps::new();
+        let ctx = make_test_context();
+        save_consent(&kv, "user-1", &ctx, 30);
+        let loaded = load_consent(&kv, "user-1").expect("should load saved consent");
+        assert_eq!(
+            loaded.raw_tc_string,
+            ctx.raw_tc_string,
+            "should restore raw TC string"
+        );
+    }
+
+    #[test]
+    fn save_consent_skips_write_when_fingerprint_unchanged() {
+        let kv = StubKvOps::new();
+        let ctx = make_test_context();
+
+        // First write.
+        save_consent(&kv, "user-1", &ctx, 30);
+        assert_eq!(
+            kv.stored.lock().expect("should lock").len(),
+            1,
+            "should have one entry"
+        );
+
+        // Track the stored timestamp to verify no new write happens.
+        let stored_ts = kv
+            .stored
+            .lock()
+            .expect("should lock")
+            .get("user-1")
+            .map(|e| e.stored_at_ds)
+            .unwrap();
+
+        // Second write with same context — fingerprint unchanged.
+        save_consent(&kv, "user-1", &ctx, 30);
+        let ts_after = kv
+            .stored
+            .lock()
+            .expect("should lock")
+            .get("user-1")
+            .map(|e| e.stored_at_ds)
+            .unwrap();
+
+        assert_eq!(
+            stored_ts, ts_after,
+            "should not overwrite when fingerprint is unchanged"
+        );
+    }
+
+    #[test]
+    fn save_consent_writes_when_fingerprint_changes() {
+        let kv = StubKvOps::new();
+        let ctx1 = make_test_context();
+        save_consent(&kv, "user-1", &ctx1, 30);
+
+        let mut ctx2 = make_test_context();
+        ctx2.raw_tc_string = Some("DIFFERENT".to_owned());
+        save_consent(&kv, "user-1", &ctx2, 30);
+
+        let loaded = load_consent(&kv, "user-1").expect("should load updated entry");
+        assert_eq!(
+            loaded.raw_tc_string,
+            Some("DIFFERENT".to_owned()),
+            "should reflect updated TC string"
+        );
+    }
+
+    #[test]
+    fn save_consent_skips_empty_consent() {
+        let kv = StubKvOps::new();
+        let ctx = ConsentContext::default();
+        save_consent(&kv, "user-1", &ctx, 30);
+        assert!(
+            kv.stored.lock().expect("should lock").is_empty(),
+            "should not write empty consent"
         );
     }
 }

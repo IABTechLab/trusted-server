@@ -376,6 +376,94 @@ impl PlatformGeo for FastlyPlatformGeo {
 }
 
 // ---------------------------------------------------------------------------
+// FastlyConsentKvStore
+// ---------------------------------------------------------------------------
+
+/// Fastly KV Store–backed implementation of [`trusted_server_core::consent::kv::ConsentKvOps`].
+///
+/// Uses the synchronous Fastly KV Store API so it is compatible with the
+/// non-async consent pipeline ([`trusted_server_core::consent::build_consent_context`]).
+pub struct FastlyConsentKvStore {
+    store: fastly::kv_store::KVStore,
+}
+
+impl FastlyConsentKvStore {
+    /// Open a Fastly KV Store by name for consent persistence.
+    ///
+    /// Returns `None` when the store does not exist or cannot be opened;
+    /// a warning is logged in that case. Callers should treat `None` as "KV
+    /// disabled" and pass `kv_ops: None` to the consent pipeline.
+    #[must_use]
+    pub fn open(store_name: &str) -> Option<Self> {
+        match fastly::kv_store::KVStore::open(store_name) {
+            Ok(Some(store)) => Some(Self { store }),
+            Ok(None) => {
+                log::warn!("Consent KV store '{store_name}' not found");
+                None
+            }
+            Err(e) => {
+                log::warn!("Failed to open consent KV store '{store_name}': {e}");
+                None
+            }
+        }
+    }
+}
+
+impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
+    fn load_entry(
+        &self,
+        key: &str,
+    ) -> Option<trusted_server_core::consent::kv::KvConsentEntry> {
+        let mut response = match self.store.lookup(key) {
+            Ok(resp) => resp,
+            Err(fastly::kv_store::KVStoreError::ItemNotFound) => return None,
+            Err(e) => {
+                log::debug!("Consent KV lookup miss for '{key}': {e}");
+                return None;
+            }
+        };
+        let bytes = response.take_body_bytes();
+        match serde_json::from_slice(&bytes) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                log::warn!("Failed to deserialize consent KV entry for '{key}': {e}");
+                None
+            }
+        }
+    }
+
+    fn save_entry_with_ttl(
+        &self,
+        key: &str,
+        entry: &trusted_server_core::consent::kv::KvConsentEntry,
+        ttl: std::time::Duration,
+    ) {
+        let Ok(body) = serde_json::to_string(entry) else {
+            log::warn!("Failed to serialize consent entry for '{key}'");
+            return;
+        };
+        match self.store.build_insert().time_to_live(ttl).execute(key, body) {
+            Ok(()) => log::info!("Saved consent to KV store for '{key}'"),
+            Err(e) => log::warn!("Failed to write consent to KV store for '{key}': {e}"),
+        }
+    }
+
+    fn fingerprint_unchanged(&self, key: &str, fp: &str) -> bool {
+        self.load_entry(key)
+            .and_then(|e| e.fp)
+            .as_deref()
+            == Some(fp)
+    }
+
+    fn delete_entry(&self, key: &str) {
+        match self.store.delete(key) {
+            Ok(()) => log::info!("Deleted consent KV entry for '{key}' (consent revoked)"),
+            Err(e) => log::warn!("Failed to delete consent KV entry for '{key}': {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry-point helper
 // ---------------------------------------------------------------------------
 

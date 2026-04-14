@@ -49,8 +49,8 @@ use trusted_server_core::settings_data::get_settings;
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::open_kv_store;
 use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyConsentKvStore, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
+    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -322,7 +322,20 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req).await
+                    let consent_kv = s
+                        .settings
+                        .consent
+                        .consent_store
+                        .as_deref()
+                        .and_then(FastlyConsentKvStore::open);
+                    handle_publisher_request(
+                        &s.settings,
+                        &s.registry,
+                        &services,
+                        consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                        req,
+                    )
+                    .await
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -349,7 +362,20 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req).await
+                    let consent_kv = s
+                        .settings
+                        .consent
+                        .consent_store
+                        .as_deref()
+                        .and_then(FastlyConsentKvStore::open);
+                    handle_publisher_request(
+                        &s.settings,
+                        &s.registry,
+                        &services,
+                        consent_kv.as_ref().map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                        req,
+                    )
+                    .await
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))

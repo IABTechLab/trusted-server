@@ -4,7 +4,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 
-use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipelineInput};
+use crate::consent::{allows_ssc_creation, build_consent_context, kv::ConsentKvOps, ConsentPipelineInput};
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
@@ -314,6 +314,7 @@ pub async fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
+    kv_ops: Option<&dyn ConsentKvOps>,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -369,6 +370,7 @@ pub async fn handle_publisher_request(
         config: &settings.consent,
         geo: geo.as_ref(),
         synthetic_id: Some(synthetic_id.as_str()),
+        kv_ops,
     });
     let ssc_allowed = allows_ssc_creation(&consent_context);
     log::debug!(
@@ -543,8 +545,8 @@ pub async fn handle_publisher_request(
                 "SSC revoked: consent withdrawn (jurisdiction={})",
                 consent_context.jurisdiction,
             );
-            if let Some(store_name) = &settings.consent.consent_store {
-                crate::consent::kv::delete_consent_from_kv(store_name, cookie_synthetic_id);
+            if let Some(kv) = kv_ops {
+                kv.delete_entry(cookie_synthetic_id);
             }
         } else {
             log::warn!(
@@ -984,7 +986,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = handle_publisher_request(&settings, &registry, &services, req)
+        let response = handle_publisher_request(&settings, &registry, &services, None, req)
             .await
             .expect("should proxy publisher request");
 

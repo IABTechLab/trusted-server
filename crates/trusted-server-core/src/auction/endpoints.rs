@@ -73,6 +73,7 @@ pub async fn handle_auction(
         config: &settings.consent,
         geo: geo.as_ref(),
         synthetic_id: Some(synthetic_id.as_str()),
+        kv_ops: None,
     });
 
     // Convert tsjs request format to auction request

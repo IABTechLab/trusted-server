@@ -2798,6 +2798,7 @@ dependencies = [
  "serde_json",
  "trusted-server-core",
  "trusted-server-js",
+ "url",
  "urlencoding",
 ]
 
