@@ -1208,13 +1208,13 @@ pub fn ingest_prebid_eids(
 
 ### 8.2 Cookie format
 
-| Attribute  | Value                                                                    |
-| ---------- | ------------------------------------------------------------------------ |
-| Name       | `ts-eids`                                                                |
-| Format     | Base64-encoded (standard RFC 4648) JSON array of `{source, id, atype}`   |
-| Max size   | 3 KB                                                                     |
-| Written by | TSJS Prebid integration (client-side JS)                                 |
-| Read by    | `ec_finalize_response()` (server-side, via `ingest_prebid_eids()`)       |
+| Attribute  | Value                                                                  |
+| ---------- | ---------------------------------------------------------------------- |
+| Name       | `ts-eids`                                                              |
+| Format     | Base64-encoded (standard RFC 4648) JSON array of `{source, id, atype}` |
+| Max size   | 3 KB                                                                   |
+| Written by | TSJS Prebid integration (client-side JS)                               |
+| Read by    | `ec_finalize_response()` (server-side, via `ingest_prebid_eids()`)     |
 
 **Example decoded value:**
 
@@ -1488,7 +1488,7 @@ The authenticated partner determines which UID is returned — each partner sees
 
 | Header                                                    | Required                               |
 | --------------------------------------------------------- | -------------------------------------- |
-| `Authorization: Bearer <api_token>`                        | Yes                                    |
+| `Authorization: Bearer <api_token>`                       | Yes                                    |
 | `Cookie: ts-ec=<value>` or `X-ts-ec: <value>`             | Yes                                    |
 | `Cookie: euconsent-v2=<value>` or `Cookie: __gpp=<value>` | Yes for EU/UK/US users                 |
 | `X-consent-advertising: <value>`                          | Optional — takes precedence if present |
@@ -1585,9 +1585,9 @@ Consent is evaluated **after** auth but **before** EC presence. If `!allows_ec_c
 
 Set on `200` responses only:
 
-| Header            | Value                                                          |
-| ----------------- | -------------------------------------------------------------- |
-| `X-ts-ec`         | `{64-hex}.{6-alnum}` — full EC ID                              |
+| Header    | Value                             |
+| --------- | --------------------------------- |
+| `X-ts-ec` | `{64-hex}.{6-alnum}` — full EC ID |
 
 The JSON body is the primary contract. The `X-ts-ec` header is supplementary for proxy-layer consumers.
 
@@ -2190,18 +2190,18 @@ Follow the project's **Arrange-Act-Assert** pattern. Test both happy paths and e
 
 Each module in `ec/` has a `#[cfg(test)]` module covering:
 
-| Module           | Key test cases                                                                                                  |
-| ---------------- | --------------------------------------------------------------------------------------------------------------- |
-| `generation.rs`  | IPv4/IPv6 normalization, /64 truncation, HMAC determinism, output format                                        |
+| Module           | Key test cases                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `generation.rs`  | IPv4/IPv6 normalization, /64 truncation, HMAC determinism, output format                                                 |
 | `finalize.rs`    | `ec_finalize_response()`: cookie write on generation, deletion on withdrawal, `update_last_seen` debounce, EID ingestion |
-| `cookies.rs`     | Cookie string format, Max-Age=0 for deletion, domain derivation                                                 |
-| `kv.rs`          | Serialization/deserialization roundtrip, CAS merge logic, metadata extraction                                   |
-| `partner.rs`     | Partner ID validation, API key hashing                                                                          |
-| `registry.rs`    | `from_config()` validation, duplicate detection, O(1) lookups by ID/hash/domain                                 |
-| `prebid_eids.rs` | Base64 decode, JSON parse, source domain matching, debounce                                                     |
-| `batch_sync.rs`  | Status code selection (200/207/401/400/429), per-mapping rejection reasons, API-key rate limit                   |
-| `pull_sync.rs`   | Trigger conditions, null/404 no-op, dispatch limit                                                              |
-| `identify.rs`    | Bearer auth (200/401/403/204), scoped partner response, degraded flag, CORS                                     |
+| `cookies.rs`     | Cookie string format, Max-Age=0 for deletion, domain derivation                                                          |
+| `kv.rs`          | Serialization/deserialization roundtrip, CAS merge logic, metadata extraction                                            |
+| `partner.rs`     | Partner ID validation, API key hashing                                                                                   |
+| `registry.rs`    | `from_config()` validation, duplicate detection, O(1) lookups by ID/hash/domain                                          |
+| `prebid_eids.rs` | Base64 decode, JSON parse, source domain matching, debounce                                                              |
+| `batch_sync.rs`  | Status code selection (200/207/401/400/429), per-mapping rejection reasons, API-key rate limit                           |
+| `pull_sync.rs`   | Trigger conditions, null/404 no-op, dispatch limit                                                                       |
+| `identify.rs`    | Bearer auth (200/401/403/204), scoped partner response, degraded flag, CORS                                              |
 
 ### 18.2 Integration tests
 
