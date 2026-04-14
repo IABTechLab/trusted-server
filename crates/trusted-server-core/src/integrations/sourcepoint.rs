@@ -130,8 +130,14 @@ fn default_cache_ttl() -> u32 {
     3600
 }
 
-/// Validates that `cdn_origin` is a syntactically valid URL whose host ends
-/// with `.privacy-mgmt.com`, preventing SSRF via arbitrary origins.
+/// Validates that `cdn_origin` is a syntactically valid HTTP(S) URL pointing
+/// to exactly `cdn.privacy-mgmt.com`, preventing SSRF via arbitrary origins.
+///
+/// The host is pinned to `cdn.privacy-mgmt.com` (not `*.privacy-mgmt.com`)
+/// because all four rewriting layers (HTML attributes, JS body regex, runtime
+/// config trap, client-side DOM guard) hardcode this host.  Allowing a
+/// different subdomain would create a config/rewriter mismatch where the
+/// proxy works but rewriting silently does nothing.
 fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
     let url = Url::parse(value).map_err(|_| {
         let mut err = ValidationError::new("invalid_url");
@@ -139,10 +145,16 @@ fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
         err
     })?;
 
+    if !matches!(url.scheme(), "http" | "https") {
+        let mut err = ValidationError::new("invalid_scheme");
+        err.message = Some("cdn_origin scheme must be http or https".into());
+        return Err(err);
+    }
+
     let host = url.host_str().unwrap_or_default();
-    if !host.ends_with(".privacy-mgmt.com") {
+    if host != SOURCEPOINT_CDN_HOST {
         let mut err = ValidationError::new("disallowed_host");
-        err.message = Some("cdn_origin host must end with .privacy-mgmt.com".into());
+        err.message = Some(format!("cdn_origin host must be {SOURCEPOINT_CDN_HOST}").into());
         return Err(err);
     }
 
@@ -219,13 +231,15 @@ impl SourcepointIntegration {
         // caller: paths that need script rewriting request `identity` encoding
         // so the body can be safely read as UTF-8, while other paths forward
         // the client's original encoding.
+        // Authorization is intentionally omitted — forwarding the
+        // publisher's bearer token to a third-party CDN would be a
+        // credential-leak risk.
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
-            header::AUTHORIZATION,
         ] {
             if let Some(value) = original_req.get_header(&header_name) {
                 proxy_req.set_header(&header_name, value);
@@ -242,6 +256,34 @@ impl SourcepointIntegration {
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             );
         }
+    }
+
+    /// Rewrites a redirect `Location` header that points to the Sourcepoint CDN
+    /// so the browser follows the redirect through the first-party proxy.
+    ///
+    /// Handles absolute (`https://cdn.privacy-mgmt.com/…`), protocol-relative
+    /// (`//cdn.privacy-mgmt.com/…`), and relative locations. Returns `None`
+    /// when the location does not reference the CDN host.
+    fn rewrite_redirect_location(location: &str, target_url: &str) -> Option<String> {
+        // Resolve against the target URL to handle both absolute and
+        // protocol-relative Location values.
+        let base = Url::parse(target_url).ok()?;
+        let resolved = base.join(location).ok()?;
+
+        if resolved.host_str() != Some(SOURCEPOINT_CDN_HOST) {
+            return None;
+        }
+
+        let query = resolved
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        Some(format!(
+            "{}{}{}",
+            SOURCEPOINT_CDN_PREFIX,
+            resolved.path(),
+            query
+        ))
     }
 
     /// Rewrite Sourcepoint CDN URLs inside JavaScript response bodies so that
@@ -425,19 +467,11 @@ impl IntegrationProxy for SourcepointIntegration {
             if let Some(location) = response
                 .get_header(header::LOCATION)
                 .and_then(|h| h.to_str().ok())
-                .filter(|loc| loc.contains(SOURCEPOINT_CDN_HOST))
             {
-                let rewritten_location = location
-                    .replace(
-                        &format!("https://{SOURCEPOINT_CDN_HOST}"),
-                        SOURCEPOINT_CDN_PREFIX,
-                    )
-                    .replace(
-                        &format!("http://{SOURCEPOINT_CDN_HOST}"),
-                        SOURCEPOINT_CDN_PREFIX,
-                    );
-                log::info!("Sourcepoint: rewrote redirect Location to {rewritten_location}");
-                response.set_header(header::LOCATION, &rewritten_location);
+                if let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url) {
+                    log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
+                    response.set_header(header::LOCATION, &rewritten);
+                }
             }
             self.apply_cache_headers(&mut response);
             return Ok(response);
@@ -452,21 +486,34 @@ impl IntegrationProxy for SourcepointIntegration {
             log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
 
             // Guard against unexpectedly large responses to avoid unbounded
-            // memory consumption during rewriting.
-            if let Some(content_length) = response
+            // memory consumption during rewriting.  When Content-Length is
+            // absent (e.g. chunked transfer encoding), we also skip the
+            // rewrite — reading an unknown-length body into memory has no
+            // upper bound.
+            let content_length = response
                 .get_header(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                if content_length > MAX_REWRITE_BODY_SIZE {
+                .and_then(|s| s.parse::<u64>().ok());
+
+            match content_length {
+                Some(len) if len > MAX_REWRITE_BODY_SIZE => {
                     log::warn!(
                         "Sourcepoint: response body for {path} exceeds {} bytes \
-                         (Content-Length: {content_length}), skipping rewrite",
+                         (Content-Length: {len}), skipping rewrite",
                         MAX_REWRITE_BODY_SIZE
                     );
                     self.apply_cache_headers(&mut response);
                     return Ok(response);
                 }
+                None => {
+                    log::warn!(
+                        "Sourcepoint: no Content-Length for {path}, \
+                         skipping rewrite to avoid unbounded memory read"
+                    );
+                    self.apply_cache_headers(&mut response);
+                    return Ok(response);
+                }
+                Some(_) => {}
             }
 
             let body_bytes = response.take_body_bytes();
@@ -477,14 +524,9 @@ impl IntegrationProxy for SourcepointIntegration {
                         "Sourcepoint: upstream body for {path} is not valid UTF-8, \
                          passing through unmodified"
                     );
-                    let mut passthrough = Response::new();
-                    passthrough.set_status(response.get_status());
-                    if let Some(ct) = response.get_header(header::CONTENT_TYPE) {
-                        passthrough.set_header(header::CONTENT_TYPE, ct);
-                    }
-                    passthrough.set_body(err.into_bytes());
-                    self.apply_cache_headers(&mut passthrough);
-                    return Ok(passthrough);
+                    response.set_body(err.into_bytes());
+                    self.apply_cache_headers(&mut response);
+                    return Ok(response);
                 }
             };
             let rewritten = Self::rewrite_script_content(&body);
@@ -495,6 +537,11 @@ impl IntegrationProxy for SourcepointIntegration {
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             );
+            // Rewritten JS bundles are static, versioned assets (paths like
+            // `/unified/4.40.1/…`), so we apply a fixed public cache policy
+            // regardless of what upstream sent.  This intentionally diverges
+            // from the passthrough path's `apply_cache_headers` (which only
+            // sets a default when upstream omitted Cache-Control).
             new_response.set_header(
                 header::CACHE_CONTROL,
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
@@ -565,6 +612,14 @@ impl IntegrationHeadInjector for SourcepointIntegration {
         // The trap is transparent: the getter returns the (patched) value and
         // the setter accepts any shape the SDK expects.  We also handle the
         // case where `window._sp_` is already set before our script runs.
+        //
+        // Limitations:
+        // - Only intercepts top-level assignment (`window._sp_ = …`).  Nested
+        //   mutation like `window._sp_.config.baseEndpoint = "…"` after the
+        //   initial assignment is not caught.  The JS body regex rewriter
+        //   covers that case for string literals in bundled code.
+        // - `s.replace()` replaces only the first occurrence per call, which
+        //   is fine for the current set of scalar URL config fields.
         vec![format!(
             concat!(
                 "<script>",
@@ -871,7 +926,32 @@ mod tests {
         };
         assert!(
             cfg.validate().is_err(),
-            "should reject cdn_origin not on *.privacy-mgmt.com"
+            "should reject cdn_origin not on cdn.privacy-mgmt.com"
+        );
+    }
+
+    #[test]
+    fn rejects_cdn_origin_with_non_http_scheme() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(cfg.validate().is_err(), "should reject non-HTTP(S) scheme");
+    }
+
+    #[test]
+    fn rejects_cdn_origin_with_different_subdomain() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "should reject subdomain other than cdn.privacy-mgmt.com"
         );
     }
 
@@ -885,7 +965,21 @@ mod tests {
         };
         assert!(
             cfg.validate().is_ok(),
-            "should accept cdn_origin on *.privacy-mgmt.com"
+            "should accept cdn_origin on cdn.privacy-mgmt.com"
+        );
+    }
+
+    #[test]
+    fn accepts_http_cdn_origin() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "should accept http scheme for cdn_origin"
         );
     }
 
@@ -897,6 +991,54 @@ mod tests {
         assert_eq!(
             output, r#"return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}"#,
             "should rewrite single-quoted unified path"
+        );
+    }
+
+    #[test]
+    fn rewrites_absolute_redirect_location() {
+        let result = SourcepointIntegration::rewrite_redirect_location(
+            "https://cdn.privacy-mgmt.com/consent/tcfv2?foo=bar",
+            "https://cdn.privacy-mgmt.com/original",
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("/integrations/sourcepoint/cdn/consent/tcfv2?foo=bar"),
+            "should rewrite absolute CDN redirect"
+        );
+    }
+
+    #[test]
+    fn rewrites_protocol_relative_redirect_location() {
+        let result = SourcepointIntegration::rewrite_redirect_location(
+            "//cdn.privacy-mgmt.com/consent/tcfv2",
+            "https://cdn.privacy-mgmt.com/original",
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("/integrations/sourcepoint/cdn/consent/tcfv2"),
+            "should rewrite protocol-relative CDN redirect"
+        );
+    }
+
+    #[test]
+    fn ignores_redirect_to_other_host() {
+        let result = SourcepointIntegration::rewrite_redirect_location(
+            "https://example.com/other",
+            "https://cdn.privacy-mgmt.com/original",
+        );
+        assert_eq!(result, None, "should not rewrite redirect to non-CDN host");
+    }
+
+    #[test]
+    fn rewrites_relative_redirect_location() {
+        let result = SourcepointIntegration::rewrite_redirect_location(
+            "/consent/tcfv2/new-path",
+            "https://cdn.privacy-mgmt.com/original",
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("/integrations/sourcepoint/cdn/consent/tcfv2/new-path"),
+            "should rewrite relative redirect resolved against CDN base"
         );
     }
 }
