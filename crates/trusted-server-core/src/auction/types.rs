@@ -70,8 +70,10 @@ pub struct PublisherInfo {
 /// Privacy-preserving user information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    /// Stable EC ID (from cookie or freshly generated)
-    pub id: String,
+    /// Stable EC ID (from cookie or freshly generated).
+    /// `None` when EC is unavailable or consent denies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Decoded consent context for this request.
     ///
     /// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded

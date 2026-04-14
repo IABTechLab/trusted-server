@@ -512,4 +512,56 @@ mod tests {
         assert_eq!(json["errors"][0]["index"], 3);
         assert_eq!(json["errors"][0]["reason"], REASON_EC_ID_NOT_FOUND);
     }
+
+    #[test]
+    fn process_mappings_reports_not_found() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::NotFound)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 0, "should not accept when EC entry is missing");
+        assert_eq!(errors.len(), 1, "should report one error");
+        assert_eq!(errors[0].index, 0);
+        assert_eq!(
+            errors[0].reason, REASON_EC_ID_NOT_FOUND,
+            "should report ec_id_not_found for missing entries"
+        );
+    }
+
+    #[test]
+    fn process_mappings_reports_consent_withdrawn() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::ConsentWithdrawn)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 0, "should not accept when consent is withdrawn");
+        assert_eq!(errors.len(), 1, "should report one error");
+        assert_eq!(errors[0].index, 0);
+        assert_eq!(
+            errors[0].reason, REASON_CONSENT_WITHDRAWN,
+            "should report consent_withdrawn for tombstoned entries"
+        );
+    }
+
+    #[test]
+    fn process_mappings_counts_stale_as_accepted() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Stale)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(
+            accepted, 1,
+            "should count Stale as accepted (data already fresh)"
+        );
+        assert!(
+            errors.is_empty(),
+            "should report no errors for stale writes"
+        );
+    }
 }

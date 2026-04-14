@@ -60,9 +60,9 @@ pub async fn handle_auction(
     // withdrawn consent — forwarding that revoked ID to bidders would
     // defeat the consent gating.
     let ec_id = if ec_context.ec_allowed() {
-        ec_context.ec_value().unwrap_or("")
+        ec_context.ec_value()
     } else {
-        ""
+        None
     };
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
