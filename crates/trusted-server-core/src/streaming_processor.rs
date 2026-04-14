@@ -11,7 +11,7 @@
 //! This module is **platform-agnostic** (verified in PR 8). It has zero
 //! `fastly` imports. [`StreamingPipeline::process`] is generic over
 //! `R: Read + W: Write` — any reader or writer works, including
-//! `fastly::Body` (which implements `std::io::Read`) or standard
+//! any platform body type (which implements `std::io::Read`) or standard
 //! `std::io::Cursor<&[u8]>`.
 //!
 //! Future adapters (PR 16/17) do not need to implement any compression or
