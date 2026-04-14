@@ -689,7 +689,7 @@ impl PrebidAuctionProvider {
         };
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
-            id: Some(request.user.id.clone()),
+            id: request.user.id.clone(),
             // OpenRTB 2.6 top-level consent field
             consent: raw_tc.clone(),
             ext: UserExt {
@@ -1382,7 +1382,7 @@ mod tests {
                 page_url: Some("https://pub.example/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
                 eids: None,
             },
@@ -2865,7 +2865,7 @@ server_url = "https://prebid.example"
                 page_url: Some("https://example.com/page".to_string()),
             },
             user: UserInfo {
-                id: "synth-123".to_string(),
+                id: Some("synth-123".to_string()),
                 consent: None,
                 eids: None,
             },

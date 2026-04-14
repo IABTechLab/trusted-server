@@ -31,6 +31,21 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60
 # pull_sync_enabled = false
 
+# Integration test partners (used by crates/integration-tests)
+[[ec.partners]]
+id = "inttest"
+name = "Integration Test Partner"
+source_domain = "inttest.example.com"
+bidstream_enabled = true
+api_token = "inttest-api-key-1"
+
+[[ec.partners]]
+id = "inttest2"
+name = "Integration Test Partner 2"
+source_domain = "inttest2.example.com"
+bidstream_enabled = true
+api_token = "inttest2-api-key-2"
+
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
 # [response_headers]

@@ -677,7 +677,7 @@ mod tests {
                 page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
                 eids: None,
             },

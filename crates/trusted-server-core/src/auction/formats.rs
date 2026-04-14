@@ -20,8 +20,8 @@ use crate::constants::{
 use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
-use crate::platform::{GeoInfo, RuntimeServices};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -85,13 +85,11 @@ pub struct BannerUnit {
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
-    services: &RuntimeServices,
     req: &Request,
     consent: ConsentContext,
-    ec_id: &str,
-    geo: Option<GeoInfo>,
+    ec_id: Option<&str>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
-    let ec_id = ec_id.to_owned();
+    let ec_id = ec_id.map(str::to_owned);
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -138,8 +136,9 @@ pub fn convert_tsjs_to_auction_request(
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
-        ip: services.client_info.client_ip.map(|ip| ip.to_string()),
-        geo,
+        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
+        #[allow(deprecated)]
+        geo: GeoInfo::from_request(req),
     });
 
     // Forward allowed config entries from the JS request into the context map.
@@ -315,8 +314,8 @@ pub fn convert_to_openrtb_response(
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_body(body_bytes);
 
-    if !auction_request.user.id.is_empty() {
-        response.set_header(HEADER_X_TS_EC, &auction_request.user.id);
+    if let Some(ref ec_id) = auction_request.user.id {
+        response.set_header(HEADER_X_TS_EC, ec_id);
     }
 
     // Signal consent status independently of whether EIDs were resolved.
@@ -370,7 +369,7 @@ mod tests {
                 page_url: None,
             },
             user: UserInfo {
-                id: "test-ec-id".to_owned(),
+                id: Some("test-ec-id".to_owned()),
                 consent: None,
                 eids: None,
             },
@@ -475,9 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn response_omits_ec_header_when_ec_id_is_empty() {
+    fn response_omits_ec_header_when_ec_id_is_none() {
         let mut request = make_minimal_auction_request();
-        request.user.id.clear();
+        request.user.id = None;
 
         let settings = make_settings();
         let result = make_empty_result();
