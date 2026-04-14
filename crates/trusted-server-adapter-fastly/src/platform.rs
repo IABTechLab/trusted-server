@@ -31,7 +31,7 @@ use trusted_server_core::platform::{
 ///
 /// Stateless — the store name is supplied per call, matching the trait
 /// signature. This replaces the store-name-at-construction pattern of
-/// [`trusted_server_core::storage::FastlyConfigStore`].
+/// the legacy `FastlyConfigStore` (removed).
 ///
 /// # Write cost
 ///
@@ -81,8 +81,8 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 /// Fastly [`SecretStore`]-backed implementation of [`PlatformSecretStore`].
 ///
 /// Stateless — the store name is supplied per call. This replaces the
-/// store-name-at-construction pattern of
-/// [`trusted_server_core::storage::FastlySecretStore`].
+/// store-name-at-construction pattern of the legacy `FastlySecretStore`
+/// (removed).
 ///
 /// # Write cost
 ///

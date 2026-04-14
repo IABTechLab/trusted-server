@@ -56,7 +56,6 @@ pub mod request_signing;
 pub mod rsc_flight;
 pub mod settings;
 pub mod settings_data;
-pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod synthetic;
