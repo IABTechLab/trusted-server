@@ -6,6 +6,7 @@ use error_stack::Report;
 use fastly::http::StatusCode;
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -184,6 +185,8 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry =
+        PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry");
 
     let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_req);
@@ -191,6 +194,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &discovery_services,
         discovery_req,
     ))
@@ -207,6 +211,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &admin_services,
         admin_req,
     ))

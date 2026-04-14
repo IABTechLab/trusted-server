@@ -16,8 +16,11 @@ use crate::settings::Settings;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::partner::{PartnerRecord, PartnerStore};
-use super::sync_pixel::{current_timestamp, RateLimiter};
+use super::rate_limiter::RateLimiter;
+use super::registry::{PartnerConfig, PartnerRegistry};
+
+// `current_timestamp` is defined in the parent `ec` module.
+use super::current_timestamp;
 use super::EcContext;
 
 /// Inputs needed to dispatch pull sync after response flush.
@@ -69,7 +72,7 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
 pub fn dispatch_pull_sync(
     settings: &Settings,
     kv: &KvIdentityGraph,
-    partner_store: &PartnerStore,
+    registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     context: &PullSyncContext,
 ) {
@@ -85,16 +88,7 @@ pub fn dispatch_pull_sync(
         }
     };
 
-    // Use the _pull_enabled secondary index for O(1+N) reads instead of
-    // scanning all partners (§13.1). Falls back to list_registered() if
-    // the index is missing or unreadable.
-    let mut pull_partners = match partner_store.pull_enabled_partners() {
-        Ok(partners) => partners,
-        Err(err) => {
-            log::warn!("Pull sync: failed to list pull-enabled partners: {err:?}");
-            return;
-        }
-    };
+    let mut pull_partners = registry.pull_enabled_partners();
 
     // Sort by ID for deterministic ordering, then apply a rotating hourly
     // offset so that different partners get dispatch priority (§10.3).
@@ -119,11 +113,11 @@ pub fn dispatch_pull_sync(
     let mut in_flight: Vec<InFlightPull> = Vec::new();
 
     for partner in pull_partners {
-        if !is_partner_pull_eligible(&partner, kv_entry.as_ref(), now) {
+        if !is_partner_pull_eligible(partner, kv_entry.as_ref(), now) {
             continue;
         }
 
-        let Some(url) = validated_pull_sync_url(&partner) else {
+        let Some(url) = validated_pull_sync_url(partner) else {
             continue;
         };
 
@@ -183,7 +177,7 @@ pub fn dispatch_pull_sync(
         };
 
         in_flight.push(InFlightPull {
-            partner_id: partner.id,
+            partner_id: partner.id.clone(),
             pending,
         });
 
@@ -195,7 +189,7 @@ pub fn dispatch_pull_sync(
     drain_pull_batch(kv, context.ec_id(), &mut in_flight);
 }
 
-fn is_partner_pull_eligible(partner: &PartnerRecord, kv_entry: Option<&KvEntry>, now: u64) -> bool {
+fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>, now: u64) -> bool {
     let Some(entry) = kv_entry else {
         return true;
     };
@@ -207,7 +201,7 @@ fn is_partner_pull_eligible(partner: &PartnerRecord, kv_entry: Option<&KvEntry>,
     now.saturating_sub(existing.synced) >= partner.pull_sync_ttl_sec
 }
 
-fn validated_pull_sync_url(partner: &PartnerRecord) -> Option<Url> {
+fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     let pull_sync_url = partner.pull_sync_url.as_deref()?;
     let parsed = match Url::parse(pull_sync_url) {
         Ok(url) => url,
@@ -366,16 +360,14 @@ mod tests {
     use crate::consent::types::ConsentContext;
     use crate::ec::kv_types::KvEntry;
 
-    fn pull_partner(ttl_sec: u64) -> PartnerRecord {
-        PartnerRecord {
+    fn pull_partner(ttl_sec: u64) -> PartnerConfig {
+        PartnerConfig {
             id: "ssp_x".to_owned(),
             name: "SSP X".to_owned(),
-            allowed_return_domains: vec!["sync.example.com".to_owned()],
             api_key_hash: "deadbeef".to_owned(),
             bidstream_enabled: true,
             source_domain: "ssp.example.com".to_owned(),
             openrtb_atype: 3,
-            sync_rate_limit: 60,
             batch_rate_limit: 60,
             pull_sync_enabled: true,
             pull_sync_url: Some("https://sync.partner.test/pull".to_owned()),

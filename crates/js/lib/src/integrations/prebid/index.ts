@@ -290,6 +290,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       },
     };
 
+    // Chain a bidsBackHandler to collect Prebid User ID Module EIDs
+    // and persist them as a cookie for backend sync.
+    const originalBidsBack = opts.bidsBackHandler;
+    opts.bidsBackHandler = function (...args: unknown[]) {
+      syncPrebidEidsCookie();
+      if (typeof originalBidsBack === 'function') {
+        originalBidsBack.apply(this, args);
+      }
+    };
+
     return originalRequestBids(opts);
   };
 
@@ -330,6 +340,83 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   log.info('[tsjs-prebid] prebid initialized with trustedServer adapter');
 
   return pbjs;
+}
+
+// ---------------------------------------------------------------------------
+// Prebid EID cookie sync
+// ---------------------------------------------------------------------------
+
+/** Maximum cookie payload size in bytes (leave room for other cookies). */
+const MAX_EID_COOKIE_BYTES = 3072;
+
+/** Cookie name for persisted Prebid EIDs. */
+const EID_COOKIE_NAME = 'ts-eids';
+
+/** Cookie max-age in seconds (1 day). */
+const EID_COOKIE_MAX_AGE = 86400;
+
+interface PrebidEid {
+  source: string;
+  uids?: Array<{ id: string; atype?: number }>;
+}
+
+interface FlatEid {
+  source: string;
+  id: string;
+  atype: number;
+}
+
+/**
+ * Collects EIDs from Prebid's User ID Module and writes them as a
+ * base64-encoded JSON cookie (`ts-eids`) for backend ingestion.
+ */
+function syncPrebidEidsCookie(): void {
+  try {
+    if (typeof pbjs.getUserIdsAsEids !== 'function') {
+      return;
+    }
+
+    const rawEids: PrebidEid[] = pbjs.getUserIdsAsEids() ?? [];
+    if (rawEids.length === 0) {
+      return;
+    }
+
+    // Flatten to [{source, id, atype}] — take first uid per source.
+    const flat: FlatEid[] = [];
+    for (const eid of rawEids) {
+      const uid = eid.uids?.[0];
+      if (uid?.id && eid.source) {
+        flat.push({
+          source: eid.source,
+          id: uid.id,
+          atype: uid.atype ?? 3,
+        });
+      }
+    }
+
+    if (flat.length === 0) {
+      return;
+    }
+
+    // Encode as base64 JSON, respecting size limit.
+    let payload = flat;
+    let encoded = btoa(JSON.stringify(payload));
+    while (encoded.length > MAX_EID_COOKIE_BYTES && payload.length > 1) {
+      payload = payload.slice(0, payload.length - 1);
+      encoded = btoa(JSON.stringify(payload));
+    }
+
+    if (encoded.length > MAX_EID_COOKIE_BYTES) {
+      return; // Single EID too large — skip.
+    }
+
+    document.cookie =
+      `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+
+    log.debug(`[tsjs-prebid] synced ${payload.length} EIDs to cookie`);
+  } catch (err) {
+    log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+  }
 }
 
 // Self-initialize when loaded in a browser (same pattern as other integrations).
