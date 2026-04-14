@@ -19,15 +19,14 @@
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
-//! - [`partner`] — Partner registry (`PartnerRecord`, `PartnerStore`)
-//! - [`admin`] — Admin endpoints for partner management
-//! - [`sync_pixel`] — Pixel sync write endpoint (`GET /_ts/api/v1/sync`)
-//! - [`identify`] — Browser identity read endpoint (`GET /_ts/api/v1/identify`)
+//! - [`partner`] — Partner validation helpers (ID format, pull sync config)
+//! - [`registry`] — In-memory partner registry built from config
+//! - [`rate_limiter`] — Rate limiting abstraction (Fastly Edge Rate Limiting)
+//! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
-pub mod admin;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
@@ -39,8 +38,10 @@ pub mod identify;
 pub mod kv;
 pub mod kv_types;
 pub mod partner;
+pub mod prebid_eids;
 pub mod pull_sync;
-pub mod sync_pixel;
+pub mod rate_limiter;
+pub mod registry;
 
 /// Truncates an EC ID for safe inclusion in log messages.
 ///

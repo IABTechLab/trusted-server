@@ -16,6 +16,8 @@ use super::current_timestamp;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
+use super::prebid_eids::ingest_prebid_eids;
+use super::registry::PartnerRegistry;
 use super::EcContext;
 
 /// TS-managed response headers tied to EC identity output.
@@ -29,11 +31,16 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// Finalizes EC response behavior for all routes.
 ///
 /// Applies withdrawal handling, last-seen updates, cookie reconciliation,
-/// and cookie writes for new EC generation.
+/// Prebid EID ingestion, and cookie writes for new EC generation.
+///
+/// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
+/// from the request *before* routing consumes it.
 pub fn ec_finalize_response(
     settings: &Settings,
     ec_context: &EcContext,
     kv: Option<&KvIdentityGraph>,
+    registry: &PartnerRegistry,
+    eids_cookie: Option<&str>,
     response: &mut Response,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
@@ -92,6 +99,11 @@ pub fn ec_finalize_response(
                     log_id(ec_id)
                 );
             }
+
+            // Ingest Prebid EIDs from cookie if present.
+            if let Some(cookie) = eids_cookie {
+                ingest_prebid_eids(cookie, ec_id, graph, registry);
+            }
         }
 
         // Always set the EC header and refresh the cookie so downstream
@@ -103,6 +115,11 @@ pub fn ec_finalize_response(
 
     // Newly generated EC in this request.
     if ec_context.ec_generated() {
+        if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
+            if let Some(cookie) = eids_cookie {
+                ingest_prebid_eids(cookie, ec_id, graph, registry);
+            }
+        }
         set_ec_on_response(settings, ec_context, response);
     }
 }
@@ -253,7 +270,15 @@ mod tests {
         response.set_header("x-ts-ec", "stale");
         response.set_header("x-ts-eids", "[]");
 
-        ec_finalize_response(&settings, &ec_context, None, &mut response);
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            &mut response,
+        );
 
         assert!(
             response.get_header("x-ts-ec").is_none(),
@@ -288,7 +313,15 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, &ec_context, None, &mut response);
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            &mut response,
+        );
 
         let header = response
             .get_header("x-ts-ec")
@@ -321,7 +354,15 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, &ec_context, None, &mut response);
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            &mut response,
+        );
 
         let header = response
             .get_header("x-ts-ec")
@@ -354,7 +395,15 @@ mod tests {
         );
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, &ec_context, None, &mut response);
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            &mut response,
+        );
 
         let header = response
             .get_header("x-ts-ec")
@@ -375,7 +424,15 @@ mod tests {
         let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
         let mut response = Response::new();
 
-        ec_finalize_response(&settings, &ec_context, None, &mut response);
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            &mut response,
+        );
 
         assert!(
             response.get_header("x-ts-ec").is_none(),

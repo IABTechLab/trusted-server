@@ -11,7 +11,7 @@ use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
 use super::kv_types::KvEntry;
-use super::partner::PartnerStore;
+use super::registry::PartnerRegistry;
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
@@ -36,14 +36,8 @@ pub struct ResolvedPartnerId {
 ///
 /// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
 /// sorted by `synced` timestamp descending (most recent first).
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::KvStore`] if a partner registry lookup fails.
-pub fn resolve_partner_ids(
-    partner_store: &PartnerStore,
-    entry: &KvEntry,
-) -> Result<Vec<ResolvedPartnerId>, Report<TrustedServerError>> {
+#[must_use]
+pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
 
     for (partner_id, partner_uid) in &entry.ids {
@@ -51,7 +45,7 @@ pub fn resolve_partner_ids(
             continue;
         }
 
-        let Some(partner) = partner_store.get(partner_id)? else {
+        let Some(partner) = registry.get(partner_id) else {
             continue;
         };
         if !partner.bidstream_enabled {
@@ -62,13 +56,13 @@ pub fn resolve_partner_ids(
             partner_id: partner_id.clone(),
             uid: partner_uid.uid.clone(),
             synced: partner_uid.synced,
-            source_domain: partner.source_domain,
+            source_domain: partner.source_domain.clone(),
             openrtb_atype: partner.openrtb_atype,
         });
     }
 
     resolved.sort_by(|a, b| b.synced.cmp(&a.synced));
-    Ok(resolved)
+    resolved
 }
 
 /// Converts resolved partner IDs to `OpenRTB` `Eid` entries.

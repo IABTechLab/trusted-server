@@ -1,6 +1,7 @@
 //! Identity lookup endpoint (`GET /_ts/api/v1/identify`).
-
-use std::collections::HashMap;
+//!
+//! Partners authenticate with a Bearer token and receive only their own
+//! synced UID for the active EC ID.
 
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
@@ -8,22 +9,47 @@ use fastly::{Request, Response};
 use url::Url;
 
 use super::consent::ec_consent_granted;
-use crate::constants::{
-    HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
-};
+use crate::constants::HEADER_X_TS_EC;
 use crate::error::TrustedServerError;
-use crate::openrtb::Eid;
+use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
-use super::eids::{build_eids_header, resolve_partner_ids, to_eids};
 use super::kv::KvIdentityGraph;
 use super::log_id;
-use super::partner::PartnerStore;
+use super::partner::hash_api_key;
+use super::registry::{PartnerConfig, PartnerRegistry};
 use super::EcContext;
 
-const MAX_EXPOSE_PARTNER_HEADERS: usize = 20;
+/// Authenticates a request via Bearer token, returning the matching partner.
+fn authenticate_bearer<'r>(
+    registry: &'r PartnerRegistry,
+    req: &Request,
+) -> Option<&'r PartnerConfig> {
+    let header_value = req.get_header_str("authorization")?;
+    let token = parse_bearer_token(header_value)?;
+    let key_hash = hash_api_key(token);
+    registry.find_by_api_key_hash(&key_hash)
+}
+
+fn parse_bearer_token(header_value: &str) -> Option<&str> {
+    let mut parts = header_value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return None;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(token)
+}
 
 /// Handles `GET /_ts/api/v1/identify`.
+///
+/// Requires Bearer token authentication. Returns only the requesting
+/// partner's UID for the active EC ID.
 ///
 /// # Errors
 ///
@@ -31,48 +57,39 @@ const MAX_EXPOSE_PARTNER_HEADERS: usize = 20;
 pub fn handle_identify(
     settings: &Settings,
     kv: &KvIdentityGraph,
-    partner_store: &PartnerStore,
+    registry: &PartnerRegistry,
     req: &Request,
     ec_context: &EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let cors = classify_origin(req, settings);
-    if matches!(cors, CorsDecision::Denied) {
-        return Ok(Response::from_status(StatusCode::FORBIDDEN));
-    }
+    // Authenticate via Bearer token.
+    let Some(partner) = authenticate_bearer(registry, req) else {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({ "error": "invalid_token" }),
+        );
+    };
 
     if !ec_consent_granted(ec_context.consent()) {
-        let mut response = json_response(
+        return json_response(
             StatusCode::FORBIDDEN,
             &serde_json::json!({ "consent": "denied" }),
-        )?;
-        if let CorsDecision::Allowed(origin) = cors {
-            apply_cors_headers(&mut response, &origin);
-        }
-        return Ok(response);
+        );
     }
 
     let Some(ec_id) = ec_context.ec_value() else {
-        let mut response = Response::from_status(StatusCode::NO_CONTENT);
-        if let CorsDecision::Allowed(origin) = cors {
-            apply_cors_headers(&mut response, &origin);
-        }
-        return Ok(response);
+        return Ok(Response::from_status(StatusCode::NO_CONTENT));
     };
 
     let mut degraded = false;
-    let mut resolved = Vec::new();
+    let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
         Ok(Some((entry, generation))) => {
-            // Resolve partner IDs.
-            match resolve_partner_ids(partner_store, &entry) {
-                Ok(values) => {
-                    resolved = values;
-                }
-                Err(err) => {
-                    log::warn!("Identify partner resolution failed: {err:?}");
-                    degraded = true;
+            // Extract only this partner's UID.
+            if let Some(partner_uid) = entry.ids.get(&partner.id) {
+                if !partner_uid.uid.is_empty() {
+                    uid = Some(partner_uid.uid.clone());
                 }
             }
 
@@ -83,7 +100,6 @@ pub fn handle_identify(
                 }
                 Err(err) => {
                     log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
-                    // Non-fatal — cluster_size stays None, response is still useful.
                 }
             }
         }
@@ -97,56 +113,27 @@ pub fn handle_identify(
         }
     }
 
-    let mut uids = HashMap::new();
-    for item in &resolved {
-        uids.insert(item.partner_id.clone(), item.uid.clone());
-    }
+    let eid = uid.as_ref().map(|u| Eid {
+        source: partner.source_domain.clone(),
+        uids: vec![Uid {
+            id: u.clone(),
+            atype: Some(partner.openrtb_atype),
+            ext: None,
+        }],
+    });
 
-    let eids = to_eids(&resolved);
     let body = IdentifyResponse {
         ec: ec_id.to_owned(),
         consent: "ok".to_owned(),
         degraded,
-        uids,
-        eids,
+        partner_id: partner.id.clone(),
+        uid,
+        eid,
         cluster_size,
     };
 
     let mut response = json_response(StatusCode::OK, &body)?;
     response.set_header(HEADER_X_TS_EC, ec_id);
-    response.set_header(HEADER_X_TS_EC_CONSENT, "ok");
-
-    let mut expose_headers = vec![
-        "x-ts-ec".to_owned(),
-        "x-ts-eids".to_owned(),
-        "x-ts-ec-consent".to_owned(),
-        "x-ts-eids-truncated".to_owned(),
-    ];
-
-    for item in resolved.iter().take(MAX_EXPOSE_PARTNER_HEADERS) {
-        let header_name = format!("x-ts-{}", item.partner_id);
-        response.set_header(&header_name, &item.uid);
-        expose_headers.push(header_name);
-    }
-
-    let (encoded_eids, truncated) = build_eids_header(&resolved)?;
-    response.set_header(HEADER_X_TS_EIDS, encoded_eids);
-    if truncated {
-        response.set_header(HEADER_X_TS_EIDS_TRUNCATED, "true");
-    }
-
-    if let Some(size) = cluster_size {
-        response.set_header("x-ts-cluster-size", size.to_string());
-        expose_headers.push("x-ts-cluster-size".to_owned());
-    }
-
-    if let CorsDecision::Allowed(origin) = cors {
-        apply_cors_headers(&mut response, &origin);
-        response.set_header(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            expose_headers.join(", "),
-        );
-    }
 
     Ok(response)
 }
@@ -179,9 +166,11 @@ struct IdentifyResponse {
     ec: String,
     consent: String,
     degraded: bool,
-    uids: HashMap<String, String>,
-    eids: Vec<Eid>,
-    /// Network cluster size. `None` when not yet evaluated or unavailable.
+    partner_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eid: Option<Eid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cluster_size: Option<u32>,
 }
@@ -238,7 +227,7 @@ fn apply_cors_headers(response: &mut Response, origin: &str) {
     response.set_header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS");
     response.set_header(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "Cookie, X-ts-ec, X-consent-advertising",
+        "Authorization, X-ts-ec",
     );
     response.set_header(header::ACCESS_CONTROL_MAX_AGE, "600");
     response.set_header(header::VARY, "Origin");
@@ -249,7 +238,9 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-    use crate::ec::eids::{ResolvedPartnerId, MAX_EIDS_HEADER_BYTES};
+    use crate::ec::registry::PartnerRegistry;
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
@@ -259,6 +250,24 @@ mod tests {
             ..ConsentContext::default()
         };
         EcContext::new_for_test(ec_value.map(str::to_owned), consent)
+    }
+
+    fn make_test_partner(id: &str, api_token: &str) -> EcPartner {
+        EcPartner {
+            id: id.to_owned(),
+            name: format!("Partner {id}"),
+            source_domain: format!("{id}.example.com"),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Redacted::new(api_token.to_owned()),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }
     }
 
     #[test]
@@ -300,37 +309,60 @@ mod tests {
     }
 
     #[test]
-    fn eids_header_truncates_when_too_large() {
-        let mut resolved = Vec::new();
-        for idx in 0..64 {
-            resolved.push(ResolvedPartnerId {
-                partner_id: format!("p{idx}"),
-                uid: "x".repeat(200),
-                synced: 1000 - idx,
-                source_domain: format!("s{idx}.example.com"),
-                openrtb_atype: 3,
-            });
-        }
+    fn handle_identify_rejects_missing_bearer_token() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let registry = PartnerRegistry::empty();
+        let req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let (header, truncated) =
-            build_eids_header(&resolved).expect("should build capped eids header");
-        assert!(truncated, "should truncate oversized eids header payload");
-        assert!(
-            header.len() <= MAX_EIDS_HEADER_BYTES,
-            "should cap encoded header bytes"
+        let mut response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct unauthorized response");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should return 401 without Bearer token"
+        );
+        let body = serde_json::from_slice::<serde_json::Value>(&response.take_body_bytes())
+            .expect("should decode JSON body");
+        assert_eq!(
+            body["error"], "invalid_token",
+            "should return invalid_token error"
         );
     }
 
     #[test]
-    fn handle_identify_denied_consent_returns_403_json() {
+    fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partner_store = PartnerStore::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "real-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("origin", "https://www.test-publisher.com");
+        req.set_header("authorization", "Bearer wrong-token");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct unauthorized response");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::UNAUTHORIZED,
+            "should return 401 for invalid Bearer token"
+        );
+    }
+
+    #[test]
+    fn handle_identify_denied_consent_returns_403() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
         let ec_context = make_ec_context(Jurisdiction::Unknown, None);
 
-        let mut response = handle_identify(&settings, &kv, &partner_store, &req, &ec_context)
+        let mut response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct denied response");
 
         assert_eq!(
@@ -338,16 +370,8 @@ mod tests {
             StatusCode::FORBIDDEN,
             "should return 403 when consent denies EC"
         );
-        assert_eq!(
-            response
-                .get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .and_then(|v| v.to_str().ok()),
-            Some("https://www.test-publisher.com"),
-            "should include CORS allow-origin for approved publisher origin"
-        );
-
         let body = serde_json::from_slice::<serde_json::Value>(&response.take_body_bytes())
-            .expect("should decode denied JSON body");
+            .expect("should decode JSON body");
         assert_eq!(
             body,
             serde_json::json!({ "consent": "denied" }),
@@ -359,12 +383,13 @@ mod tests {
     fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partner_store = PartnerStore::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("origin", "https://www.test-publisher.com");
+        req.set_header("authorization", "Bearer my-token");
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let response = handle_identify(&settings, &kv, &partner_store, &req, &ec_context)
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct no-content response");
 
         assert_eq!(
@@ -372,25 +397,20 @@ mod tests {
             StatusCode::NO_CONTENT,
             "should return 204 when EC is unavailable"
         );
-        assert_eq!(
-            response
-                .get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .and_then(|v| v.to_str().ok()),
-            Some("https://www.test-publisher.com"),
-            "should include CORS allow-origin for approved publisher origin"
-        );
     }
 
     #[test]
     fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partner_store = PartnerStore::new("missing_store");
-        let req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let mut response = handle_identify(&settings, &kv, &partner_store, &req, &ec_context)
+        let mut response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct degraded identify response");
 
         assert_eq!(
@@ -402,24 +422,19 @@ mod tests {
             .expect("should decode identify response JSON");
 
         assert_eq!(body["ec"], ec_id, "should echo EC in body");
+        assert_eq!(body["partner_id"], "ssp_x", "should echo partner ID");
         assert_eq!(
             body["degraded"],
             serde_json::Value::Bool(true),
             "should mark response as degraded when KV read fails"
         );
-        assert_eq!(
-            body["uids"],
-            serde_json::json!({}),
-            "should emit empty uids"
-        );
-        assert_eq!(
-            body["eids"],
-            serde_json::json!([]),
-            "should emit empty eids"
+        assert!(
+            body.get("uid").is_none(),
+            "uid should be omitted when KV read fails"
         );
         assert!(
-            body.get("cluster_size").is_none(),
-            "cluster_size should be omitted when KV read fails"
+            body.get("eid").is_none(),
+            "eid should be omitted when KV read fails"
         );
     }
 
@@ -452,13 +467,6 @@ mod tests {
             response.get_status(),
             StatusCode::OK,
             "should allow preflight from publisher origin"
-        );
-        assert_eq!(
-            response
-                .get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .and_then(|v| v.to_str().ok()),
-            Some("https://www.test-publisher.com"),
-            "should include CORS allow-origin header"
         );
     }
 }

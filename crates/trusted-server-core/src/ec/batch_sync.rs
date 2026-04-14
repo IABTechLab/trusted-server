@@ -16,8 +16,9 @@ use crate::error::TrustedServerError;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
-use super::partner::{hash_api_key, PartnerRecord, PartnerStore};
-use super::sync_pixel::RateLimiter;
+use super::partner::hash_api_key;
+use super::rate_limiter::RateLimiter;
+use super::registry::{PartnerConfig, PartnerRegistry};
 
 const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
@@ -86,23 +87,15 @@ struct MappingError {
 // ---------------------------------------------------------------------------
 
 /// Extracts and validates a `Bearer` token from the `Authorization` header,
-/// returning the authenticated [`PartnerRecord`].
-fn authenticate_bearer(
-    partner_store: &PartnerStore,
+/// returning the authenticated [`PartnerConfig`].
+fn authenticate_bearer<'r>(
+    registry: &'r PartnerRegistry,
     req: &Request,
-) -> Result<Option<PartnerRecord>, Report<TrustedServerError>> {
-    let header_value = match req.get_header_str("authorization") {
-        Some(v) => v.to_owned(),
-        None => return Ok(None),
-    };
-
-    let token = match parse_bearer_token(&header_value) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
+) -> Option<&'r PartnerConfig> {
+    let header_value = req.get_header_str("authorization")?;
+    let token = parse_bearer_token(header_value)?;
     let key_hash = hash_api_key(token);
-    partner_store.find_by_api_key_hash(&key_hash)
+    registry.find_by_api_key_hash(&key_hash)
 }
 
 fn parse_bearer_token(header_value: &str) -> Option<&str> {
@@ -131,23 +124,22 @@ fn parse_bearer_token(header_value: &str) -> Option<&str> {
 /// Returns [`TrustedServerError`] on serialization or KV store failures.
 pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
-    partner_store: &PartnerStore,
+    registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, partner_store, rate_limiter, &mut req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, &mut req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
-    partner_store: &PartnerStore,
+    registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     req: &mut Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // 1. Authenticate
-    let partner = match authenticate_bearer(partner_store, req)? {
-        Some(p) => p,
-        None => return Ok(error_response(StatusCode::UNAUTHORIZED, "invalid_token")),
+    let Some(partner) = authenticate_bearer(registry, req) else {
+        return Ok(error_response(StatusCode::UNAUTHORIZED, "invalid_token"));
     };
 
     // 2. Rate limit (per-partner, per-minute via batch_rate_limit)
@@ -320,22 +312,20 @@ mod tests {
 
     #[test]
     fn authenticate_bearer_returns_none_for_missing_header() {
-        let partner_store = PartnerStore::new("test_store");
+        let registry = PartnerRegistry::empty();
         let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
 
-        let result =
-            authenticate_bearer(&partner_store, &req).expect("should not error on missing header");
+        let result = authenticate_bearer(&registry, &req);
         assert!(result.is_none(), "should return None without auth header");
     }
 
     #[test]
     fn authenticate_bearer_returns_none_for_malformed_header() {
-        let partner_store = PartnerStore::new("test_store");
+        let registry = PartnerRegistry::empty();
         let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
         req.set_header("authorization", "Basic dXNlcjpwYXNz");
 
-        let result = authenticate_bearer(&partner_store, &req)
-            .expect("should not error on malformed header");
+        let result = authenticate_bearer(&registry, &req);
         assert!(
             result.is_none(),
             "should return None for non-Bearer auth scheme"
@@ -344,12 +334,11 @@ mod tests {
 
     #[test]
     fn authenticate_bearer_returns_none_for_empty_token() {
-        let partner_store = PartnerStore::new("test_store");
+        let registry = PartnerRegistry::empty();
         let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
         req.set_header("authorization", "Bearer ");
 
-        let result =
-            authenticate_bearer(&partner_store, &req).expect("should not error on empty token");
+        let result = authenticate_bearer(&registry, &req);
         assert!(
             result.is_none(),
             "should return None for empty Bearer token"
@@ -466,14 +455,14 @@ mod tests {
     #[test]
     fn handle_batch_sync_rejects_missing_auth() {
         let kv = KvIdentityGraph::new("test_store");
-        let partner_store = PartnerStore::new("test_store");
+        let registry = PartnerRegistry::empty();
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
         let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
 
         let response =
-            handle_batch_sync(&kv, &partner_store, &limiter, req).expect("should return response");
+            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
         assert_eq!(
             response.get_status(),
             StatusCode::UNAUTHORIZED,
