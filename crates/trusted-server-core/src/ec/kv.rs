@@ -634,6 +634,7 @@ impl KvIdentityGraph {
                             },
                         );
                     } else {
+                        // log_id() truncates the EC ID — safe for logging.
                         log::debug!(
                             "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
                              for '{}', dropping domain '{domain}'",
@@ -786,6 +787,7 @@ impl KvIdentityGraph {
         if let Some(ref network) = entry.network {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
+                    // log_id() truncates the EC ID — safe for logging.
                     log::trace!(
                         "evaluate_cluster: cached cluster_size for '{}' \
                          (age={}s, ttl={recheck_secs}s)",
