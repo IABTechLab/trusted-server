@@ -1,5 +1,4 @@
 import { log } from '../core/log';
-
 import {
   DEFAULT_DOM_INSERTION_HANDLER_PRIORITY,
   registerDomInsertionHandler,

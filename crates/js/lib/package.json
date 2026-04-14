@@ -15,24 +15,25 @@
     "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
   },
   "dependencies": {
-    "prebid.js": "^10.26.0"
+    "prebid.js": "^11.5.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.13.0",
-    "@types/jsdom": "^27.0.0",
+    "@eslint/js": "^10.0.1",
+    "@types/jsdom": "^28.0.1",
     "@types/node": "^24.10.0",
-    "@typescript-eslint/eslint-plugin": "^8.6.0",
-    "@typescript-eslint/parser": "^8.6.0",
-    "eslint": "^9.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.2",
+    "@typescript-eslint/parser": "^8.58.2",
+    "esbuild": "^0.28.0",
+    "eslint": "^10.2.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-import": "^2.29.1",
     "eslint-plugin-jsdoc": "^62.8.0",
-    "eslint-plugin-unicorn": "^62.0.0",
-    "jsdom": "^28.0.0",
+    "eslint-plugin-perfectionist": "^5.8.0",
+    "eslint-plugin-unicorn": "^64.0.0",
+    "jsdom": "^29.0.2",
     "prettier": "^3.2.5",
-    "typescript": "^5.5.4",
-    "typescript-eslint": "^8.56.1",
-    "vite": "^7.3.1",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.58.2",
+    "vite": "^8.0.8",
     "vitest": "^4.0.8"
   }
 }

@@ -1,5 +1,4 @@
 import { log } from '../../core/log';
-
 import { installLockrGuard } from './script_guard';
 
 // Type definition for Lockr global

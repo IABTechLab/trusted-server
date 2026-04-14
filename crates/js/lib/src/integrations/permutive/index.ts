@@ -1,6 +1,5 @@
-import { log } from '../../core/log';
 import { registerContextProvider } from '../../core/context';
-
+import { log } from '../../core/log';
 import { installPermutiveGuard } from './script_guard';
 import { getPermutiveSegments } from './segments';
 

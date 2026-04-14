@@ -9,15 +9,12 @@ async function importGuardModule() {
 
 type GptWindow = Window & {
   googletag?: {
-    cmd: Array<() => void> & {
-      push: (...items: Array<() => void>) => number;
-      __tsPushed?: boolean;
-    };
+    cmd: Array<() => void>;
     _loaded_?: boolean;
   };
 };
 
-describe('GPT shim – patchCommandQueue', () => {
+describe('GPT shim - patchCommandQueue', () => {
   let win: GptWindow;
   let installGptShim: () => boolean;
 
@@ -165,9 +162,10 @@ describe('GPT shim – patchCommandQueue', () => {
   });
 });
 
-describe('GPT shim – runtime gating', () => {
+describe('GPT shim - runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;
+    __tsjs_installGptShim?: () => void;
     googletag?: { cmd: Array<() => void> };
   };
 
@@ -186,7 +184,7 @@ describe('GPT shim – runtime gating', () => {
     guard.resetGuardState();
     delete (window as GatedWindow).googletag;
     delete (window as GatedWindow).__tsjs_gpt_enabled;
-    delete (window as Record<string, unknown>).__tsjs_installGptShim;
+    delete (window as GatedWindow).__tsjs_installGptShim;
   });
 
   it('installs the shim when activation function is called (simulates server inline script)', async () => {
@@ -206,7 +204,7 @@ describe('GPT shim – runtime gating', () => {
     vi.resetModules();
     await import('../../../src/integrations/gpt/index');
 
-    expect(typeof (window as Record<string, unknown>).__tsjs_installGptShim).toBe('function');
+    expect(typeof (window as GatedWindow).__tsjs_installGptShim).toBe('function');
   });
 
   it('auto-installs the shim when the enable flag is set before import', async () => {

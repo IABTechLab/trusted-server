@@ -1,7 +1,8 @@
 // In-memory registry for ad units registered via tsjs (used by core + extensions).
 import type { AdUnit, Size } from './types';
-import { toArray } from './util';
+
 import { log } from './log';
+import { toArray } from './util';
 
 const registry = new Map<string, AdUnit>();
 

@@ -1,25 +1,21 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import { createBeaconGuard, BeaconGuardConfig } from '../../src/shared/beacon_guard';
 
 describe('Beacon Guard', () => {
   let originalSendBeacon: typeof navigator.sendBeacon;
   let originalFetch: typeof window.fetch;
-  let sendBeaconSpy: ReturnType<typeof vi.fn>;
-  let fetchSpy: ReturnType<typeof vi.fn>;
+  let sendBeaconSpy: Mock<typeof navigator.sendBeacon>;
+  let fetchSpy: Mock<typeof window.fetch>;
   let config: BeaconGuardConfig;
 
   beforeEach(() => {
-    // Save originals
     originalSendBeacon = navigator.sendBeacon;
     originalFetch = window.fetch;
 
-    // Create spies that simulate real sendBeacon/fetch behaviour
-    sendBeaconSpy = vi.fn((_url: string | URL, _data?: BodyInit | null) => true);
+    sendBeaconSpy = vi.fn<typeof navigator.sendBeacon>(() => true);
     navigator.sendBeacon = sendBeaconSpy;
 
-    fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-      Promise.resolve(new Response('', { status: 200 }))
-    );
+    fetchSpy = vi.fn<typeof window.fetch>(() => Promise.resolve(new Response('', { status: 200 })));
     window.fetch = fetchSpy;
 
     config = {
@@ -133,7 +129,7 @@ describe('Beacon Guard', () => {
       // The spy should receive a new Request with the rewritten URL
       const calledArg = fetchSpy.mock.calls[0][0];
       expect(calledArg).toBeInstanceOf(Request);
-      expect(calledArg.url).toContain('/proxy/g/collect?tid=G-TEST');
+      expect((calledArg as Request).url).toContain('/proxy/g/collect?tid=G-TEST');
     });
 
     it('should handle URL object input', async () => {

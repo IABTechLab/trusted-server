@@ -1,5 +1,4 @@
 import { log } from '../../core/log';
-
 import { installGptGuard } from './script_guard';
 
 /**

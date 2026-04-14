@@ -25,9 +25,10 @@ import 'prebid.js/modules/consentManagementUsp.js';
 // adapter handles them natively in the browser.
 import './_adapters.generated';
 
-import { log } from '../../core/log';
-import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid } from '../../core/auction';
+
+import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { log } from '../../core/log';
 
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';

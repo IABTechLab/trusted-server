@@ -1,7 +1,7 @@
 // Click guard runtime: detects mutated tracking URLs and rebuilds signed first-party clicks.
 import { log } from '../../core/log';
-import { creativeGlobal } from '../../shared/globals';
 import { delay, queueTask } from '../../shared/async';
+import { creativeGlobal } from '../../shared/globals';
 import { createMutationScheduler } from '../../shared/scheduler';
 
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;

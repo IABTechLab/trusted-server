@@ -1,12 +1,13 @@
 // Public tsjs core bundle: sets up the global API, queue, and default methods.
 export type { AdUnit, TsjsApi } from './types';
 import type { TsjsApi } from './types';
+
+import { setConfig, getConfig } from './config';
+import { log } from './log';
+import { installQueue } from './queue';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';
-import { log } from './log';
-import { setConfig, getConfig } from './config';
 import { requestAds } from './request';
-import { installQueue } from './queue';
 
 const VERSION = '0.1.0';
 

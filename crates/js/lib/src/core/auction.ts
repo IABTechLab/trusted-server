@@ -143,7 +143,11 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
  *
  * Returns an empty array on network or parse errors (non-throwing).
  */
-export async function sendAuction(endpoint: string, request: AdRequest): Promise<AuctionBid[]> {
+export async function sendAuction(
+  endpoint: string,
+  request: AdRequest,
+  options: { timeout?: number } = {}
+): Promise<AuctionBid[]> {
   if (typeof fetch !== 'function') {
     log.warn('auction: fetch not available');
     return [];
@@ -158,6 +162,7 @@ export async function sendAuction(endpoint: string, request: AdRequest): Promise
       credentials: 'same-origin',
       body: JSON.stringify(request),
       keepalive: true,
+      signal: options.timeout ? AbortSignal.timeout(options.timeout) : undefined,
     });
 
     const ct = res.headers.get('content-type') || '';

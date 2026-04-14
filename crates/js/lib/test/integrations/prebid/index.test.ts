@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+type TestBid = { bidder: string; params: Record<string, unknown> };
+type TestAdUnit = {
+  code?: string;
+  bids: TestBid[];
+  mediaTypes?: { banner?: { name?: string; sizes?: number[][] } };
+};
+
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
 const {
   mockSetConfig,
@@ -405,7 +412,7 @@ describe('prebid/installPrebidNpm', () => {
     it('injects trustedServer bidder into every ad unit', () => {
       const pbjs = installPrebidNpm();
 
-      const adUnits = [
+      const adUnits: TestAdUnit[] = [
         { bids: [{ bidder: 'appnexus', params: {} }] },
         { bids: [{ bidder: 'rubicon', params: {} }] },
       ];
@@ -469,7 +476,7 @@ describe('prebid/installPrebidNpm', () => {
     it('includes zone from mediaTypes.banner.name in trustedServer params', () => {
       const pbjs = installPrebidNpm();
 
-      const adUnits = [
+      const adUnits: TestAdUnit[] = [
         {
           code: 'ad-header-0',
           mediaTypes: { banner: { name: 'header', sizes: [[728, 90]] } },
@@ -494,7 +501,7 @@ describe('prebid/installPrebidNpm', () => {
     it('omits zone when mediaTypes.banner.name is not set', () => {
       const pbjs = installPrebidNpm();
 
-      const adUnits = [
+      const adUnits: TestAdUnit[] = [
         {
           code: 'ad-header-0',
           mediaTypes: { banner: { sizes: [[300, 250]] } },
@@ -510,7 +517,7 @@ describe('prebid/installPrebidNpm', () => {
     it('omits zone when ad unit has no mediaTypes', () => {
       const pbjs = installPrebidNpm();
 
-      const adUnits = [{ bids: [{ bidder: 'rubicon', params: {} }] }];
+      const adUnits: TestAdUnit[] = [{ bids: [{ bidder: 'rubicon', params: {} }] }];
       pbjs.requestBids({ adUnits } as any);
 
       expect(adUnits[0].bids).toHaveLength(1);
@@ -520,7 +527,7 @@ describe('prebid/installPrebidNpm', () => {
     it('clears stale zone when existing trustedServer bid is reused', () => {
       const pbjs = installPrebidNpm();
 
-      const adUnits = [
+      const adUnits: TestAdUnit[] = [
         {
           code: 'ad-header-0',
           mediaTypes: { banner: { name: 'header', sizes: [[300, 250]] } },
@@ -537,7 +544,7 @@ describe('prebid/installPrebidNpm', () => {
       expect(tsBid.params.zone).toBe('header');
       expect(tsBid.params.custom).toBe('keep');
 
-      delete adUnits[0].mediaTypes.banner.name;
+      delete adUnits[0].mediaTypes!.banner!.name;
       pbjs.requestBids({ adUnits } as any);
 
       tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;

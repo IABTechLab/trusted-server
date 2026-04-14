@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
 import {
   installGtmGuard,
@@ -364,17 +364,17 @@ describe('GTM Script Interception Guard', () => {
 describe('GTM Beacon Guard', () => {
   let originalSendBeacon: typeof navigator.sendBeacon;
   let originalFetch: typeof window.fetch;
-  let sendBeaconSpy: ReturnType<typeof vi.fn>;
-  let fetchSpy: ReturnType<typeof vi.fn>;
+  let sendBeaconSpy: Mock<typeof navigator.sendBeacon>;
+  let fetchSpy: Mock<typeof window.fetch>;
 
   beforeEach(() => {
     originalSendBeacon = navigator.sendBeacon;
     originalFetch = window.fetch;
 
-    sendBeaconSpy = vi.fn(() => true);
+    sendBeaconSpy = vi.fn<typeof navigator.sendBeacon>(() => true);
     navigator.sendBeacon = sendBeaconSpy;
 
-    fetchSpy = vi.fn(() => Promise.resolve(new Response('', { status: 200 })));
+    fetchSpy = vi.fn<typeof window.fetch>(() => Promise.resolve(new Response('', { status: 200 })));
     window.fetch = fetchSpy;
 
     resetBeaconGuardState();

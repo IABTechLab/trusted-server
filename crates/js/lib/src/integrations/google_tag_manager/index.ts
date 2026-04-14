@@ -1,5 +1,4 @@
 import { log } from '../../core/log';
-
 import { installGtmBeaconGuard } from './script_guard';
 import { installGtmGuard } from './script_guard';
 

@@ -1,9 +1,9 @@
+import { buildAdRequest, sendAuction } from './auction';
+import { collectContext } from './context';
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { log } from './log';
-import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
-import { buildAdRequest, sendAuction } from './auction';
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
@@ -26,15 +26,10 @@ export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
   maybeOpts?: RequestAdsOptions
 ): void {
-  let callback: RequestAdsCallback | undefined;
-  let opts: RequestAdsOptions | undefined;
-  if (typeof callbackOrOpts === 'function') {
-    callback = callbackOrOpts as RequestAdsCallback;
-    opts = maybeOpts;
-  } else {
-    opts = callbackOrOpts as RequestAdsOptions | undefined;
-    callback = opts?.bidsBackHandler;
-  }
+  const opts: RequestAdsOptions | undefined =
+    typeof callbackOrOpts === 'function' ? maybeOpts : callbackOrOpts;
+  const callback: RequestAdsCallback | undefined =
+    typeof callbackOrOpts === 'function' ? callbackOrOpts : opts?.bidsBackHandler;
 
   log.info('requestAds: called', { hasCallback: typeof callback === 'function' });
   try {
@@ -44,7 +39,7 @@ export function requestAds(
     log.debug('requestAds: payload', { units: adUnits.length, contextKeys: Object.keys(config) });
 
     // Use unified auction endpoint
-    void sendAuction('/auction', payload)
+    void sendAuction('/auction', payload, { timeout: opts?.timeout })
       .then((bids) => {
         log.info('requestAds: got bids', { count: bids.length });
         for (const bid of bids) {

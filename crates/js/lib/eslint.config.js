@@ -1,7 +1,7 @@
-// ESLint v9 flat config
+// ESLint flat config
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
-import importPlugin from 'eslint-plugin-import';
+import perfectionist from 'eslint-plugin-perfectionist';
 import jsdoc from 'eslint-plugin-jsdoc';
 import unicorn from 'eslint-plugin-unicorn';
 
@@ -25,7 +25,7 @@ export default [
       },
     },
     plugins: {
-      import: importPlugin,
+      perfectionist,
       jsdoc,
       unicorn,
       '@typescript-eslint': tseslint.plugin,
@@ -33,7 +33,7 @@ export default [
     rules: {
       'unicorn/prevent-abbreviations': 'off',
       'unicorn/filename-case': 'off',
-      'import/order': ['error', { 'newlines-between': 'always' }],
+      'perfectionist/sort-imports': ['error', { newlinesBetween: 1 }],
     },
   },
 ];

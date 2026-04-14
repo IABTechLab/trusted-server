@@ -1,11 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-declare global {
-  interface Window {
-    tsjs?: any;
-  }
-}
-
 const ORIGINAL_FETCH = global.fetch;
 
 describe('core/index', () => {
@@ -21,7 +15,7 @@ describe('core/index', () => {
 
   it('initializes tsjs API with expected surface', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs!;
     expect(api).toBeDefined();
     expect(typeof api.version).toBe('string');
     expect(Array.isArray(api.que)).toBe(true);
@@ -34,7 +28,7 @@ describe('core/index', () => {
   });
 
   it('flushes queued callbacks that existed before initialization', async () => {
-    const callback = vi.fn(function () {
+    const callback = vi.fn(function (this: unknown) {
       expect(this).toBe(window.tsjs);
     });
     (window as any).tsjs = { que: [callback] };
@@ -46,7 +40,7 @@ describe('core/index', () => {
 
   it('installs queue that executes callbacks immediately with api context', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs!;
     const fn = vi.fn();
 
     api.que.push(fn);
@@ -57,7 +51,7 @@ describe('core/index', () => {
 
   it('renders registered ad units using core rendering helpers', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs!;
 
     api.addAdUnits([
       { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } },
@@ -73,7 +67,7 @@ describe('core/index', () => {
   it('exposes requestAds from the core request module', async () => {
     const { requestAds } = await import('../../src/core/request');
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs!;
 
     expect(api.requestAds).toBe(requestAds);
   });

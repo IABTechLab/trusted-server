@@ -1,7 +1,8 @@
+import type { AdUnit } from './types';
+
 // Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
 // and inject creatives into sandboxed iframes.
 import { log } from './log';
-import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
 import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';

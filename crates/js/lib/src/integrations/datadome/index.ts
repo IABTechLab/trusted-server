@@ -1,5 +1,4 @@
 import { log } from '../../core/log';
-
 import { installDataDomeGuard } from './script_guard';
 
 /**
