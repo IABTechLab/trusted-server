@@ -9,7 +9,6 @@ use fastly::{Error, Request as FastlyRequest, Response as FastlyResponse};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::compat;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
@@ -31,6 +30,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod app;
+mod compat;
 mod error;
 mod logging;
 mod management_api;
