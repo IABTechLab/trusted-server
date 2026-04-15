@@ -492,6 +492,12 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
             if let Some(tcf) = effective_tcf(ctx) {
                 return tcf.has_storage_consent();
             }
+            // Check GPP US section for sale opt-out.
+            if let Some(gpp) = &ctx.gpp {
+                if let Some(opted_out) = gpp.us_sale_opt_out {
+                    return !opted_out;
+                }
+            }
             // Check US Privacy string for explicit opt-out.
             if let Some(usp) = &ctx.us_privacy {
                 return usp.opt_out_sale != PrivacyFlag::Yes;
@@ -1102,6 +1108,128 @@ mod tests {
         assert!(
             allows_ec_creation(&ctx),
             "TCF consent should take priority over US Privacy opt-out when both present"
+        );
+    }
+
+    #[test]
+    fn ec_allowed_us_state_gpp_no_sale_opt_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "US state + GPP US sale_opt_out=false should allow EC"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpp_sale_opted_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(true),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US state + GPP US sale_opt_out=true should block EC"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_gpp_us() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpc: true,
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC should block EC even when GPP US says no opt-out"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_tcf_takes_priority_over_gpp_us() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(true),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "TCF consent should take priority over GPP US opt-out"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_gpp_us_takes_priority_over_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::Yes,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "GPP US should take priority over us_privacy opt-out"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_gpp_no_us_section_falls_through_to_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: None,
+                us_sale_opt_out: None,
+            }),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::No,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "GPP without US section should fall through to us_privacy"
         );
     }
 }
