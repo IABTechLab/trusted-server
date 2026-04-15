@@ -72,11 +72,13 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     let eu_tcf = decode_tcf_from_gpp(&parsed);
 
     // The GPP header version is always 1 for current spec.
+    let us_sale_opt_out = decode_us_sale_opt_out(&parsed);
+
     Ok(GppConsent {
         version: 1,
         section_ids,
         eu_tcf,
-        us_sale_opt_out: None,
+        us_sale_opt_out,
     })
 }
 
@@ -96,6 +98,66 @@ fn decode_tcf_from_gpp(parsed: &iab_gpp::v1::GPPString) -> Option<TcfConsent> {
         Ok(tcf) => Some(tcf),
         Err(e) => {
             log::warn!("GPP contains TCF EU v2 section but decoding failed: {e}");
+            None
+        }
+    }
+}
+
+/// GPP section IDs that represent US state/national privacy sections.
+///
+/// Range 7–23 per the GPP v1 specification:
+/// 7=UsNat, 8=UsCa, 9=UsVa, 10=UsCo, 11=UsUt, 12=UsCt, 13=UsFl,
+/// 14=UsMt, 15=UsOr, 16=UsTx, 17=UsDe, 18=UsIa, 19=UsNe, 20=UsNh,
+/// 21=UsNj, 22=UsTn, 23=UsMn.
+const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
+
+/// Extracts the `sale_opt_out` signal from the first US section in a parsed
+/// GPP string.
+///
+/// Iterates through section IDs looking for any in the US range (7–23).
+/// For the first match, decodes the section and extracts `sale_opt_out`.
+///
+/// Returns `Some(true)` if the user opted out of sale, `Some(false)` if they
+/// did not, or `None` if no US section is present.
+fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
+    use iab_gpp::sections::us_common::OptOut;
+    use iab_gpp::sections::Section;
+
+    let us_section_id = parsed
+        .section_ids()
+        .find(|id| US_SECTION_ID_RANGE.contains(&(**id as u16)))?;
+
+    match parsed.decode_section(*us_section_id) {
+        Ok(section) => {
+            let sale_opt_out = match &section {
+                Section::UsNat(s) => match &s.core {
+                    iab_gpp::sections::usnat::Core::V1(c) => &c.sale_opt_out,
+                    iab_gpp::sections::usnat::Core::V2(c) => &c.sale_opt_out,
+                    _ => return None,
+                },
+                Section::UsCa(s) => &s.core.sale_opt_out,
+                Section::UsVa(s) => &s.core.sale_opt_out,
+                Section::UsCo(s) => &s.core.sale_opt_out,
+                Section::UsUt(s) => &s.core.sale_opt_out,
+                Section::UsCt(s) => &s.core.sale_opt_out,
+                Section::UsFl(s) => &s.core.sale_opt_out,
+                Section::UsMt(s) => &s.core.sale_opt_out,
+                Section::UsOr(s) => &s.core.sale_opt_out,
+                Section::UsTx(s) => &s.core.sale_opt_out,
+                Section::UsDe(s) => &s.core.sale_opt_out,
+                Section::UsIa(s) => &s.core.sale_opt_out,
+                Section::UsNe(s) => &s.core.sale_opt_out,
+                Section::UsNh(s) => &s.core.sale_opt_out,
+                Section::UsNj(s) => &s.core.sale_opt_out,
+                Section::UsTn(s) => &s.core.sale_opt_out,
+                Section::UsMn(s) => &s.core.sale_opt_out,
+                // Non-US sections — should not reach here given the ID filter.
+                _ => return None,
+            };
+            Some(*sale_opt_out == OptOut::OptedOut)
+        }
+        Err(e) => {
+            log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
             None
         }
     }
@@ -238,6 +300,32 @@ mod tests {
         assert!(
             parse_gpp_sid_cookie("abc,def").is_none(),
             "all-invalid should be None"
+        );
+    }
+
+    #[test]
+    fn decodes_us_sale_opt_out_not_opted_out() {
+        let result = decode_gpp_string("DBABLA~BVQqAAAAAgA.QA");
+        match &result {
+            Ok(gpp) => {
+                assert_eq!(
+                    gpp.us_sale_opt_out,
+                    Some(false),
+                    "should extract sale_opt_out=false from UsNat section"
+                );
+            }
+            Err(e) => {
+                panic!("GPP decode failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_us_section_returns_none() {
+        let result = decode_gpp_string(GPP_TCF_AND_USP).expect("should decode GPP");
+        assert_eq!(
+            result.us_sale_opt_out, None,
+            "should return None when no US section (7-23) is present"
         );
     }
 }
