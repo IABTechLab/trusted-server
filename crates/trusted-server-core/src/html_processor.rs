@@ -7,13 +7,14 @@
 //!
 //! # Platform notes
 //!
-//! This module is **platform-agnostic** (verified in the content rewriting verification). It has zero
+//! This module is **platform-agnostic** (verified 2026-03-31; see
+//! `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`). It has zero
 //! `fastly` imports and depends only on `lol_html`, `std`, and crate-internal
-//! types. [`create_html_processor`] returns an `impl` [`StreamProcessor`]
+//! types. [`create_html_processor`] returns an impl [`StreamProcessor`]
 //! whose `process_chunk` method operates on `&[u8]` slices with no
 //! platform body type involved.
 //!
-//! Future adapters (subsequent adapter migrations) do not need to implement any content-rewriting
+//! Future adapters (Cloudflare Workers, Axum, Spin) do not need to implement any content-rewriting
 //! interface. See `crate::platform` module doc for the authoritative note.
 
 use std::cell::Cell;

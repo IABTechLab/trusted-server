@@ -16,8 +16,9 @@
 //! ## Platform-Agnostic Components
 //!
 //! The following components were evaluated for platform-specific behavior
-//! (the content rewriting verification) and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (subsequent adapter migrations) need not provide
+//! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
+//! and found to have a platform-agnostic rewriting pipeline. No
+//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
