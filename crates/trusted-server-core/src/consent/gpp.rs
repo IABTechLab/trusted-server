@@ -76,6 +76,7 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
         version: 1,
         section_ids,
         eu_tcf,
+        us_sale_opt_out: None,
     })
 }
 
