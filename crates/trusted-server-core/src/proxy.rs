@@ -631,19 +631,26 @@ async fn proxy_with_redirects(
                 })?,
         );
 
+        // Collect outbound headers using insert-semantics so additional_headers override any
+        // header set by copy_request_headers, matching the old set_header() replace behavior.
+        let mut outbound_headers = http::HeaderMap::new();
         if request_headers.copy_request_headers {
             for header_name in PROXY_FORWARD_HEADERS {
                 if let Some(v) = req.get_header(&header_name) {
-                    builder = builder.header(header_name.as_str(), v.as_bytes());
+                    outbound_headers.insert(header_name, v.clone());
                 }
             }
-            builder = builder.header(
-                HEADER_ACCEPT_ENCODING.as_str(),
-                SUPPORTED_ENCODINGS.as_bytes(),
+            outbound_headers.insert(
+                HEADER_ACCEPT_ENCODING,
+                HeaderValue::from_static(SUPPORTED_ENCODINGS),
             );
         }
         for (name, value) in request_headers.additional_headers {
-            builder = builder.header(name.clone(), value.clone());
+            // insert() replaces any existing value, matching set_header() semantics.
+            outbound_headers.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &outbound_headers {
+            builder = builder.header(name, value);
         }
         let body_bytes = body.map(<[u8]>::to_vec).unwrap_or_default();
         let edge_req =
