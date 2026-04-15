@@ -1,4 +1,4 @@
-use chrono::{Local, SecondsFormat};
+use chrono::{SecondsFormat, Utc};
 use log_fastly::Logger;
 
 /// Extracts the final `::` segment from a Rust module path for use as a log label.
@@ -6,11 +6,12 @@ use log_fastly::Logger;
 /// Falls back to the full target string when the input contains no separator or
 /// when the separator appears at the trailing position (e.g. `"foo::"`), which
 /// would otherwise produce an empty label in log output.
-pub(crate) fn target_label(target: &str) -> &str {
-    target.rsplit_once("::").map_or(
-        target,
-        |(_, last)| if last.is_empty() { target } else { last },
-    )
+fn target_label(target: &str) -> &str {
+    match target.rsplit_once("::") {
+        Some((head, "")) => head,
+        Some((_, last)) => last,
+        None => target,
+    }
 }
 
 /// Initialises the Fastly-backed `fern` logger and installs it as the global logger.
@@ -34,7 +35,7 @@ pub(crate) fn init_logger() {
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
-                Local::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 record.level(),
                 target_label(record.target()),
                 message
@@ -69,8 +70,8 @@ mod tests {
         assert_eq!(target_label(""), "", "should handle empty strings");
         assert_eq!(
             target_label("trailing::"),
-            "trailing::",
-            "should fall back to full target when segment after :: is empty"
+            "trailing",
+            "should strip separator when trailing segment is empty"
         );
     }
 }

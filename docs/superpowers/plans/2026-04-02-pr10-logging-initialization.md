@@ -54,7 +54,7 @@ mod tests {
 Also add a production skeleton so the file compiles but the test fails:
 
 ```rust
-pub(crate) fn target_label(target: &str) -> &str {
+fn target_label(target: &str) -> &str {
     target
 }
 ```
@@ -74,13 +74,15 @@ Expected: FAIL because `target_label()` returns the full target instead of the f
 Replace the skeleton with the real adapter-local module:
 
 ```rust
-use chrono::{Local, SecondsFormat};
+use chrono::{SecondsFormat, Utc};
 use log_fastly::Logger;
 
-pub(crate) fn target_label(target: &str) -> &str {
-    target
-        .rsplit_once("::")
-        .map_or(target, |(_, last)| if last.is_empty() { target } else { last })
+fn target_label(target: &str) -> &str {
+    match target.rsplit_once("::") {
+        Some((head, "")) => head,
+        Some((_, last)) => last,
+        None => target,
+    }
 }
 
 pub(crate) fn init_logger() {
@@ -95,7 +97,7 @@ pub(crate) fn init_logger() {
         .format(|out, _message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
-                Local::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 record.level(),
                 target_label(record.target()),
                 record.args()
