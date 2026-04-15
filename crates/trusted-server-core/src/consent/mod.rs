@@ -686,6 +686,7 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(gpp_last_updated_ds, gpp_allows_eids)),
+                us_sale_opt_out: None,
             }),
             ..ConsentContext::default()
         }
@@ -818,6 +819,7 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(0, true)),
+                us_sale_opt_out: None,
             }),
             ..ConsentContext::default()
         };
@@ -900,6 +902,7 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf_with_storage(true)),
+                us_sale_opt_out: None,
             }),
             gdpr_applies: true,
             ..ConsentContext::default()
