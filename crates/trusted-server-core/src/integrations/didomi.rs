@@ -101,11 +101,12 @@ impl DidomiIntegration {
     fn copy_headers(
         &self,
         backend: &DidomiBackend,
+        client_ip: Option<std::net::IpAddr>,
         original_req: &Request,
         proxy_req: &mut Request,
     ) {
-        if let Some(client_ip) = original_req.get_client_ip_addr() {
-            proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
+        if let Some(ip) = client_ip {
+            proxy_req.set_header("X-Forwarded-For", ip.to_string());
         }
 
         for header_name in [
@@ -199,7 +200,7 @@ impl IntegrationProxy for DidomiIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
-        _services: &RuntimeServices,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
@@ -217,7 +218,12 @@ impl IntegrationProxy for DidomiIntegration {
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        self.copy_headers(&backend, &req, &mut proxy_req);
+        self.copy_headers(
+            &backend,
+            services.client_info.client_ip,
+            &req,
+            &mut proxy_req,
+        );
 
         if matches!(req.get_method(), &Method::POST | &Method::PUT) {
             if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
@@ -244,6 +250,7 @@ mod tests {
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::Method;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
@@ -287,5 +294,39 @@ mod tests {
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
+    }
+
+    #[test]
+    fn copy_headers_sets_x_forwarded_for_from_client_ip() {
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Sdk;
+        let original_req = Request::new(Method::GET, "https://example.com/test");
+        let mut proxy_req = Request::new(Method::GET, "https://sdk.privacy-center.org/test");
+        let client_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+
+        integration.copy_headers(&backend, client_ip, &original_req, &mut proxy_req);
+
+        assert_eq!(
+            proxy_req
+                .get_header("X-Forwarded-For")
+                .and_then(|v| v.to_str().ok()),
+            Some("1.2.3.4"),
+            "should set X-Forwarded-For from client_ip"
+        );
+    }
+
+    #[test]
+    fn copy_headers_omits_x_forwarded_for_when_no_client_ip() {
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Sdk;
+        let original_req = Request::new(Method::GET, "https://example.com/test");
+        let mut proxy_req = Request::new(Method::GET, "https://sdk.privacy-center.org/test");
+
+        integration.copy_headers(&backend, None, &original_req, &mut proxy_req);
+
+        assert!(
+            proxy_req.get_header("X-Forwarded-For").is_none(),
+            "should omit X-Forwarded-For when client_ip is None"
+        );
     }
 }

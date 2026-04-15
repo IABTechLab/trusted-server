@@ -145,6 +145,7 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
+                client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
             };
@@ -323,6 +324,7 @@ impl AuctionOrchestrator {
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
+                client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
             };
@@ -689,10 +691,12 @@ mod tests {
     fn create_test_context<'a>(
         settings: &'a crate::settings::Settings,
         req: &'a Request,
+        client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
         AuctionContext {
             settings,
             request: req,
+            client_info,
             timeout_ms: 2000,
             provider_responses: None,
         }
@@ -785,7 +789,15 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
+        let context = create_test_context(
+            &settings,
+            &req,
+            &crate::platform::ClientInfo {
+                client_ip: None,
+                tls_protocol: None,
+                tls_cipher: None,
+            },
+        );
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())
