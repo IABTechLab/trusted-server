@@ -16,7 +16,7 @@ use super::current_timestamp;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
-use super::prebid_eids::ingest_prebid_eids;
+use super::prebid_eids::{ingest_prebid_eids, ingest_sharedid_cookie};
 use super::registry::PartnerRegistry;
 use super::EcContext;
 
@@ -41,6 +41,7 @@ pub fn ec_finalize_response(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
     response: &mut Response,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
@@ -104,6 +105,9 @@ pub fn ec_finalize_response(
             if let Some(cookie) = eids_cookie {
                 ingest_prebid_eids(cookie, ec_id, graph, registry);
             }
+            if let Some(cookie) = sharedid_cookie {
+                ingest_sharedid_cookie(cookie, ec_id, graph, registry);
+            }
         }
 
         // Always set the EC header and refresh the cookie so downstream
@@ -118,6 +122,9 @@ pub fn ec_finalize_response(
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
             if let Some(cookie) = eids_cookie {
                 ingest_prebid_eids(cookie, ec_id, graph, registry);
+            }
+            if let Some(cookie) = sharedid_cookie {
+                ingest_sharedid_cookie(cookie, ec_id, graph, registry);
             }
         }
         set_ec_on_response(settings, ec_context, response);
@@ -277,6 +284,7 @@ mod tests {
             None,
             &test_registry,
             None,
+            None,
             &mut response,
         );
 
@@ -320,6 +328,7 @@ mod tests {
             None,
             &test_registry,
             None,
+            None,
             &mut response,
         );
 
@@ -360,6 +369,7 @@ mod tests {
             &ec_context,
             None,
             &test_registry,
+            None,
             None,
             &mut response,
         );
@@ -402,6 +412,7 @@ mod tests {
             None,
             &test_registry,
             None,
+            None,
             &mut response,
         );
 
@@ -430,6 +441,7 @@ mod tests {
             &ec_context,
             None,
             &test_registry,
+            None,
             None,
             &mut response,
         );
