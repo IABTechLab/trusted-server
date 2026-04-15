@@ -21,8 +21,8 @@ log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
-urlencoding = { workspace = true }
 trusted-server-js = { path = "../js" }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 edgezero-core = { workspace = true, features = ["test-utils"] }

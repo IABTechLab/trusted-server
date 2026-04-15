@@ -183,11 +183,18 @@ fn signing_store_ids(settings: &Settings) -> Result<(&str, &str), Report<Trusted
         })
 }
 
-/// Rotates the current active kid by generating and saving a new one
+/// Rotates the current active kid by generating and saving a new one.
+///
+/// # Response contract
+///
+/// Returns `200 OK` with `success: true` on success, or `500 Internal Server Error`
+/// with `success: false` and a populated `error` field when rotation fails. Unlike
+/// [`handle_verify_signature`], the error field contains internal detail — this is
+/// intentional because this endpoint is auth-gated and operator-facing only.
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing, JSON parsing fails, or key rotation fails.
+/// Returns an error if the request signing settings are missing or JSON parsing fails.
 pub fn handle_rotate_key(
     settings: &Settings,
     services: &RuntimeServices,
@@ -286,11 +293,19 @@ pub struct DeactivateKeyResponse {
     pub error: Option<String>,
 }
 
-/// Deactivates an active key
+/// Deactivates or deletes an active signing key.
+///
+/// # Response contract
+///
+/// Returns `200 OK` with `success: true` on success, or `500 Internal Server Error`
+/// with `success: false` and a populated `error` field when deactivation fails. Like
+/// [`handle_rotate_key`] and unlike [`handle_verify_signature`], the error field
+/// contains internal detail — this is intentional because this endpoint is
+/// auth-gated and operator-facing only.
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing, JSON parsing fails, or key deactivation fails.
+/// Returns an error if the request signing settings are missing or JSON parsing fails.
 pub fn handle_deactivate_key(
     settings: &Settings,
     services: &RuntimeServices,
@@ -543,20 +558,27 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(mut resp) => {
-                let body = resp.take_body_str();
-                let response: RotateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize rotate response");
-                log::debug!(
-                    "Rotation response: success={}, message={}",
-                    response.success,
-                    response.message
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when store writes fail"
+        );
+
+        let body = resp.take_body_str();
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store writes fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -571,20 +593,27 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
         req.set_body(body_json);
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(mut resp) => {
-                let body = resp.take_body_str();
-                let response: RotateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize rotate response");
-                log::debug!(
-                    "Custom KID rotation: success={}, new_kid={}",
-                    response.success,
-                    response.new_kid
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when store writes fail"
+        );
+
+        let body = resp.take_body_str();
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store writes fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -611,20 +640,27 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(mut resp) => {
-                let body = resp.take_body_str();
-                let response: DeactivateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize deactivate response");
-                log::debug!(
-                    "Deactivate response: success={}, message={}",
-                    response.success,
-                    response.message
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when active-kids cannot be read"
+        );
+
+        let body = resp.take_body_str();
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store reads fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -641,20 +677,31 @@ mod tests {
         let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
         req.set_body(body_json);
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(mut resp) => {
-                let body = resp.take_body_str();
-                let response: DeactivateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize deactivate response");
-                log::debug!(
-                    "Delete response: success={}, deleted={}",
-                    response.success,
-                    response.deleted
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when active-kids cannot be read"
+        );
+
+        let body = resp.take_body_str();
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store reads fail"
+        );
+        assert!(
+            !response.deleted,
+            "should not report deletion when the operation failed"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -692,32 +739,14 @@ mod tests {
             "https://test.com/.well-known/trusted-server.json",
         );
 
-        let services = noop_services();
-        let result = handle_trusted_server_discovery(&settings, &services, req);
-        match result {
-            Ok(mut resp) => {
-                assert_eq!(resp.get_status(), StatusCode::OK);
-                assert_eq!(
-                    resp.get_content_type(),
-                    Some(fastly::mime::APPLICATION_JSON),
-                    "should return application/json content type"
-                );
-                let body = resp.take_body_str();
+        // noop_services() config store always returns Err, so the discovery
+        // handler propagates the error rather than absorbing it into a 500.
+        let result = handle_trusted_server_discovery(&settings, &noop_services(), req);
 
-                // Parse the discovery document
-                let discovery: serde_json::Value =
-                    serde_json::from_str(&body).expect("should parse discovery document");
-
-                // Verify structure - only version and jwks
-                assert_eq!(discovery["version"], "1.0");
-                assert!(discovery["jwks"].is_object());
-
-                // Verify no extra fields
-                assert!(discovery.get("endpoints").is_none());
-                assert!(discovery.get("capabilities").is_none());
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        assert!(
+            result.is_err(),
+            "should propagate store errors when JWKS cannot be retrieved"
+        );
     }
 
     #[test]

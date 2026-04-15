@@ -30,25 +30,21 @@ pub fn get_current_key_id(
 
 /// Parses an Ed25519 signing key from secret-store bytes.
 ///
-/// Request-signing rotation stores private keys as base64 text in the secret
-/// store so Fastly can decode them on write, while some tests may inject raw
-/// 32-byte key material directly. This reader accepts both encodings:
-/// exactly 32 bytes are treated as raw key bytes, and longer values are
-/// treated as base64-encoded bytes.
-fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, Report<TrustedServerError>> {
-    let bytes = if key_bytes.len() > 32 {
-        general_purpose::STANDARD.decode(&key_bytes).map_err(|_| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Failed to decode base64 key".into(),
-            })
-        })?
-    } else {
-        key_bytes
-    };
+/// Request-signing rotation always stores private keys as standard base64 text
+/// via [`crate::request_signing::rotation::KeyRotationManager`]. A non-base64
+/// value in the secret store indicates data corruption and is surfaced as an
+/// explicit error rather than silently falling back to a length heuristic.
+fn parse_ed25519_signing_key(key_bytes: &[u8]) -> Result<SigningKey, Report<TrustedServerError>> {
+    let bytes = general_purpose::STANDARD.decode(key_bytes).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "signing key is not valid base64 — corrupt key material in secret store"
+                .into(),
+        })
+    })?;
 
     let key_array: [u8; 32] = bytes.try_into().map_err(|_| {
         Report::new(TrustedServerError::Configuration {
-            message: "Invalid key length (expected 32 bytes for Ed25519)".into(),
+            message: "signing key must be 32 bytes after base64 decoding".into(),
         })
     })?;
 
@@ -151,7 +147,7 @@ impl RequestSigner {
                 message: format!("failed to get signing key for kid: {}", key_id),
             })?;
 
-        let signing_key = parse_ed25519_signing_key(key_bytes)?;
+        let signing_key = parse_ed25519_signing_key(&key_bytes)?;
 
         Ok(Self {
             key: signing_key,

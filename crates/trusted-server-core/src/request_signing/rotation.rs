@@ -46,10 +46,10 @@ impl KeyRotationManager {
     /// defined in [`super::JWKS_CONFIG_STORE_NAME`] and
     /// [`crate::request_signing::SIGNING_SECRET_STORE_NAME`].
     #[must_use]
-    pub fn new(config_store_id: impl Into<String>, secret_store_id: impl Into<String>) -> Self {
+    pub fn new(config_store_id: &str, secret_store_id: &str) -> Self {
         Self {
-            config_store_id: StoreId::from(config_store_id.into()),
-            secret_store_id: StoreId::from(secret_store_id.into()),
+            config_store_id: StoreId::from(config_store_id),
+            secret_store_id: StoreId::from(secret_store_id),
         }
     }
 
@@ -72,8 +72,24 @@ impl KeyRotationManager {
             .get(&JWKS_STORE_NAME, "current-kid")
             .ok();
 
+        // Step 1: write private key. Nothing to roll back on failure.
         self.store_private_key(services, &new_kid, &keypair.signing_key)?;
-        self.store_public_jwk(services, &new_kid, &jwk)?;
+
+        // Step 2: write public JWK. Roll back the private key on failure so no
+        // orphaned key material is left in the secret store.
+        if let Err(err) = self.store_public_jwk(services, &new_kid, &jwk) {
+            if let Err(rollback_err) = services
+                .secret_store()
+                .delete(&self.secret_store_id, &new_kid)
+            {
+                log::warn!(
+                    "rotate_key: rollback of private key '{}' failed after JWK write error: {}",
+                    new_kid,
+                    rollback_err
+                );
+            }
+            return Err(err);
+        }
 
         let mut active_kids = read_active_kids(services).unwrap_or_default();
         if let Some(prev) = &previous_kid {
@@ -85,8 +101,36 @@ impl KeyRotationManager {
             active_kids.push(new_kid.clone());
         }
 
+        // Step 3: publish the new kid in active-kids BEFORE flipping current-kid.
+        // Roll back both artifacts on failure so the new kid never appears in JWKS
+        // without a reachable private key.
+        if let Err(err) = self.update_active_kids(services, &active_kids) {
+            if let Err(rollback_err) = services
+                .config_store()
+                .delete(&self.config_store_id, &new_kid)
+            {
+                log::warn!(
+                    "rotate_key: rollback of JWK '{}' failed after active-kids write error: {}",
+                    new_kid,
+                    rollback_err
+                );
+            }
+            if let Err(rollback_err) = services
+                .secret_store()
+                .delete(&self.secret_store_id, &new_kid)
+            {
+                log::warn!(
+                    "rotate_key: rollback of private key '{}' failed after active-kids write error: {}",
+                    new_kid,
+                    rollback_err
+                );
+            }
+            return Err(err);
+        }
+
+        // Step 4: flip current-kid last. A failure here leaves the old kid still
+        // active and the new kid visible in JWKS but unused — a recoverable state.
         self.update_current_kid(services, &new_kid)?;
-        self.update_active_kids(services, &active_kids)?;
 
         Ok(KeyRotationResult {
             new_kid,
@@ -209,18 +253,22 @@ impl KeyRotationManager {
     ) -> Result<(), Report<TrustedServerError>> {
         self.deactivate_key(services, kid)?;
 
-        services
-            .config_store()
-            .delete(&self.config_store_id, kid)
-            .change_context(TrustedServerError::Configuration {
-                message: "failed to delete JWK from config store".into(),
-            })?;
-
+        // Delete the private key first. A failure here leaves the JWK in the
+        // config store but no private key — the key is verifiable but cannot
+        // sign, which is safer than orphaned key material with no JWK. Both
+        // deletes treat 404 as success so retries converge after partial failures.
         services
             .secret_store()
             .delete(&self.secret_store_id, kid)
             .change_context(TrustedServerError::Configuration {
                 message: "failed to delete signing key from secret store".into(),
+            })?;
+
+        services
+            .config_store()
+            .delete(&self.config_store_id, kid)
+            .change_context(TrustedServerError::Configuration {
+                message: "failed to delete JWK from config store".into(),
             })?;
 
         Ok(())
@@ -237,6 +285,7 @@ pub fn generate_date_based_kid() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use error_stack::Report;
@@ -310,6 +359,8 @@ mod tests {
     struct SpySecretStore {
         creates: Mutex<Vec<(String, String, String)>>,
         deletes: Mutex<Vec<(String, String)>>,
+        /// Fail `create` after this many successful calls. `usize::MAX` means never fail.
+        fail_after_n_creates: AtomicUsize,
     }
 
     impl SpySecretStore {
@@ -317,6 +368,17 @@ mod tests {
             Self {
                 creates: Mutex::new(vec![]),
                 deletes: Mutex::new(vec![]),
+                fail_after_n_creates: AtomicUsize::new(usize::MAX),
+            }
+        }
+
+        /// Returns a store whose `create` succeeds for the first `n` calls, then
+        /// returns an error. Use `n = 0` to fail immediately.
+        fn with_create_failure_after(n: usize) -> Self {
+            Self {
+                creates: Mutex::new(vec![]),
+                deletes: Mutex::new(vec![]),
+                fail_after_n_creates: AtomicUsize::new(n),
             }
         }
     }
@@ -332,6 +394,13 @@ mod tests {
             name: &str,
             value: &str,
         ) -> Result<(), Report<PlatformError>> {
+            let remaining = self.fail_after_n_creates.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return Err(Report::new(PlatformError::SecretStore));
+            }
+            if remaining != usize::MAX {
+                self.fail_after_n_creates.fetch_sub(1, Ordering::SeqCst);
+            }
             self.creates.lock().expect("should lock creates").push((
                 store_id.to_string(),
                 name.to_string(),
@@ -466,5 +535,48 @@ mod tests {
         assert_eq!(result.previous_kid, Some("ts-2023-12-31".to_string()));
         assert_eq!(result.active_kids.len(), 2);
         assert_eq!(result.jwk.prm.kid, Some("test-key".to_string()));
+    }
+
+    #[test]
+    fn rotate_key_fails_when_private_key_store_write_fails() {
+        let config_store = SpyConfigStore::new(HashMap::new());
+        let secret_store = SpySecretStore::with_create_failure_after(0);
+        let services = build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.rotate_key(&services, Some("new-kid".to_string()));
+
+        assert!(
+            result.is_err(),
+            "should fail when the secret store rejects the private key write"
+        );
+    }
+
+    #[test]
+    fn delete_key_removes_secret_before_jwk() {
+        let mut data = HashMap::new();
+        data.insert("active-kids".to_string(), "kid-a, kid-b".to_string());
+        data.insert(
+            "kid-a".to_string(),
+            r#"{"kty":"OKP","crv":"Ed25519"}"#.to_string(),
+        );
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services = build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        manager
+            .delete_key(&services, "kid-a")
+            .expect("should delete key successfully");
+
+        // After deletion, the JWK entry should be gone from the config store.
+        let jwk_gone = services
+            .config_store()
+            .get(&crate::request_signing::JWKS_STORE_NAME, "kid-a");
+        assert!(
+            jwk_gone.is_err(),
+            "should remove JWK from the config store after deletion"
+        );
     }
 }

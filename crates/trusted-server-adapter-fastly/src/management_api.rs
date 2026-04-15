@@ -20,6 +20,7 @@ use std::io::Read;
 
 use base64::{engine::general_purpose, Engine as _};
 use error_stack::{Report, ResultExt};
+use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
 
@@ -28,7 +29,7 @@ use crate::platform::FastlyPlatformSecretStore;
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
 const API_KEYS_STORE: &str = "api-keys";
 const API_KEY_ENTRY: &str = "api_key";
-const SECRET_UPSERT_METHOD: &str = "PUT";
+const SECRET_UPSERT_METHOD: &str = "POST";
 const ERROR_BODY_LIMIT: usize = 200;
 
 fn encode_path_segment(value: &str) -> String {
@@ -66,6 +67,7 @@ fn build_secret_payload(secret_name: &str, secret_value: &str) -> String {
     serde_json::json!({
         "name": secret_name,
         "secret": general_purpose::STANDARD.encode(secret_value.as_bytes()),
+        "method": "create_or_recreate",
     })
     .to_string()
 }
@@ -218,9 +220,12 @@ impl FastlyManagementApiClient {
 
     /// Delete a config store item.
     ///
+    /// Returns `Ok(())` if the item does not exist (404), so retries after
+    /// partial failures converge without error.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or returns an unexpected status.
+    /// Returns an error if the API request fails or returns an unexpected non-2xx status.
     pub(crate) fn delete_config_item(
         &self,
         store_id: &str,
@@ -231,6 +236,10 @@ impl FastlyManagementApiClient {
         let mut response = self.make_request("DELETE", &path, None, "application/json", || {
             PlatformError::ConfigStore
         })?;
+
+        if response.get_status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
 
         let entity_description = format!("key '{}'", key);
         check_response(
@@ -290,9 +299,12 @@ impl FastlyManagementApiClient {
 
     /// Delete a secret store entry.
     ///
+    /// Returns `Ok(())` if the secret does not exist (404), so retries after
+    /// partial failures converge without error.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or returns an unexpected status.
+    /// Returns an error if the API request fails or returns an unexpected non-2xx status.
     pub(crate) fn delete_secret(
         &self,
         store_id: &str,
@@ -303,6 +315,10 @@ impl FastlyManagementApiClient {
         let mut response = self.make_request("DELETE", &path, None, "application/json", || {
             PlatformError::SecretStore
         })?;
+
+        if response.get_status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
 
         let entity_description = format!("name '{}'", secret_name);
         check_response(
@@ -348,10 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn secret_upsert_method_uses_put() {
+    fn secret_upsert_method_uses_post() {
         assert_eq!(
-            SECRET_UPSERT_METHOD, "PUT",
-            "should use PUT so secret writes can overwrite existing entries"
+            SECRET_UPSERT_METHOD, "POST",
+            "should use POST with create_or_recreate body so re-rotation does not 405"
         );
     }
 
@@ -366,6 +382,10 @@ mod tests {
             json["secret"],
             base64::engine::general_purpose::STANDARD.encode("raw-secret-value"),
             "should base64-encode the secret payload for the Fastly API"
+        );
+        assert_eq!(
+            json["method"], "create_or_recreate",
+            "should request upsert semantics so re-rotation of the same kid succeeds"
         );
     }
 
