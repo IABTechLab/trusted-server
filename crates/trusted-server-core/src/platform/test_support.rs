@@ -247,6 +247,12 @@ impl PlatformHttpClient for StubHttpClient {
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
+    /// Always marks the first pending request in the input as ready (FIFO order).
+    ///
+    /// This differs from Fastly's production `select()`, which returns whichever
+    /// request completes first and makes no ordering guarantees. Tests that rely on
+    /// this stub should not depend on "first-pushed = first-ready" semantics, and
+    /// should document their ordering assumptions explicitly if order matters.
     async fn select(
         &self,
         mut pending_requests: Vec<PlatformPendingRequest>,

@@ -24,7 +24,13 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
 
-/// Headers copied from the original client request to the upstream proxy request.
+/// Headers copied from the original client request to the upstream proxy request
+/// when `copy_request_headers` is enabled.
+///
+/// `Accept-Encoding` is also overridden in the same code path, but with a fixed
+/// value ([`SUPPORTED_ENCODINGS`]) rather than forwarding the client's preference.
+/// Both forwarded headers and the Accept-Encoding override are applied together in
+/// the `copy_request_headers` branch of the proxy request builder.
 const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_USER_AGENT,
     HEADER_ACCEPT,
@@ -1258,6 +1264,12 @@ mod tests {
     use fastly::http::{header, HeaderValue, Method, StatusCode};
     use fastly::{Request, Response};
 
+    /// Test double that always returns a streaming (non-buffered) response body.
+    ///
+    /// Used to exercise the `Body::Stream` error path in
+    /// `platform_response_to_fastly`, which cannot materialise a streaming body
+    /// into a `fastly::Response`. Only `send` is implemented; `send_async` and
+    /// `select` return `PlatformError::Unsupported`.
     struct StreamingResponseHttpClient;
 
     #[async_trait::async_trait(?Send)]

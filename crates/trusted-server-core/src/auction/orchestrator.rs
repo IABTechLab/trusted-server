@@ -634,6 +634,15 @@ mod tests {
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
     };
+
+    // All-None ClientInfo used across tests that don't need real IP/TLS data.
+    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
+    // the temporary-lifetime issue that arises with &ClientInfo::default().
+    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
+        client_ip: None,
+        tls_protocol: None,
+        tls_cipher: None,
+    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::Request;
@@ -789,15 +798,7 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(
-            &settings,
-            &req,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_context(&settings, &req, &EMPTY_CLIENT_INFO);
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())

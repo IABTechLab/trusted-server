@@ -244,6 +244,13 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`PlatformPendingRequest`] for the full
+/// explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
