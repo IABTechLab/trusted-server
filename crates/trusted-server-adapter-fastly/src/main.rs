@@ -38,7 +38,7 @@ mod management_api;
 mod middleware;
 mod platform;
 
-use crate::app::TrustedServerApp;
+use crate::app::{open_consent_kv, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 use edgezero_core::app::Hooks as _;
@@ -229,7 +229,17 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            handle_auction(settings, orchestrator, runtime_services, req).await
+            let consent_kv = open_consent_kv(&settings.consent);
+            handle_auction(
+                settings,
+                orchestrator,
+                runtime_services,
+                consent_kv
+                    .as_ref()
+                    .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                req,
+            )
+            .await
         }
 
         // tsjs endpoints

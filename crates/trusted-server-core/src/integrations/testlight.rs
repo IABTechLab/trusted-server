@@ -424,52 +424,54 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_uses_platform_http_client_with_http_request() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"ok":true}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let integration = TestlightIntegration::new(TestlightConfig {
-            enabled: true,
-            endpoint: "https://example.com/openrtb".to_string(),
-            timeout_ms: 1000,
-            shim_src: tsjs::tsjs_unified_script_src(),
-            rewrite_scripts: true,
+    #[test]
+    fn handle_uses_platform_http_client_with_http_request() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, br#"{"ok":true}"#.to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let integration = TestlightIntegration::new(TestlightConfig {
+                enabled: true,
+                endpoint: "https://example.com/openrtb".to_string(),
+                timeout_ms: 1000,
+                shim_src: tsjs::tsjs_unified_script_src(),
+                rewrite_scripts: true,
+            });
+            let mut req = http::Request::builder()
+                .method(Method::POST)
+                .uri("https://edge.example.com/integrations/testlight/auction")
+                .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
+                .expect("should build request");
+            req.headers_mut().insert(
+                crate::constants::HEADER_X_SYNTHETIC_ID.clone(),
+                http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
+            );
+
+            let response = integration
+                .handle(&settings, &services, req)
+                .await
+                .expect("should proxy Testlight request");
+
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "should return stubbed upstream status"
+            );
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "should route outbound request through PlatformHttpClient"
+            );
+            let response_json: serde_json::Value =
+                serde_json::from_slice(&response.into_body().into_bytes())
+                    .expect("should parse JSON response");
+            assert_eq!(
+                response_json["ok"], true,
+                "should preserve the upstream JSON response body"
+            );
         });
-        let mut req = http::Request::builder()
-            .method(Method::POST)
-            .uri("https://edge.example.com/integrations/testlight/auction")
-            .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
-            .expect("should build request");
-        req.headers_mut().insert(
-            crate::constants::HEADER_X_SYNTHETIC_ID.clone(),
-            http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
-        );
-
-        let response = integration
-            .handle(&settings, &services, req)
-            .await
-            .expect("should proxy Testlight request");
-
-        assert_eq!(
-            response.status(),
-            http::StatusCode::OK,
-            "should return stubbed upstream status"
-        );
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should route outbound request through PlatformHttpClient"
-        );
-        let response_json: serde_json::Value =
-            serde_json::from_slice(&response.into_body().into_bytes())
-                .expect("should parse JSON response");
-        assert_eq!(
-            response_json["ok"], true,
-            "should preserve the upstream JSON response body"
-        );
     }
 }

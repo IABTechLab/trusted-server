@@ -127,7 +127,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 }
 
 /// Open the consent KV store named in `config`, returning `None` when not configured or unavailable.
-fn open_consent_kv(
+pub(crate) fn open_consent_kv(
     config: &trusted_server_core::consent_config::ConsentConfig,
 ) -> Option<FastlyConsentKvStore> {
     config
@@ -237,9 +237,18 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let req = ctx.into_request();
-                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
+                let consent_kv = open_consent_kv(&s.settings.consent);
+                Ok(handle_auction(
+                    &s.settings,
+                    &s.orchestrator,
+                    &services,
+                    consent_kv
+                        .as_ref()
+                        .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
+                    req,
+                )
+                .await
+                .unwrap_or_else(|e| http_error(&e)))
             }
         };
 

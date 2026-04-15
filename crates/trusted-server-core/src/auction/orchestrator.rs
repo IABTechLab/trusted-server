@@ -763,43 +763,45 @@ mod tests {
     // of requiring real platform backends. An `#[ignore]` integration test
     // exercising the full path via Viceroy would also catch regressions.
 
-    #[tokio::test]
-    async fn test_no_providers_configured() {
-        let config = AuctionConfig {
-            enabled: true,
-            providers: vec![],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-            allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
-        };
+    #[test]
+    fn test_no_providers_configured() {
+        futures::executor::block_on(async {
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec![],
+                mediator: None,
+                timeout_ms: 2000,
+                creative_store: "creative_store".to_string(),
+                allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+            };
 
-        let orchestrator = AuctionOrchestrator::new(config);
+            let orchestrator = AuctionOrchestrator::new(config);
 
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://test.com/test")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let context = create_test_context(
-            &settings,
-            &req,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://test.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = create_test_context(
+                &settings,
+                &req,
+                &crate::platform::ClientInfo {
+                    client_ip: None,
+                    tls_protocol: None,
+                    tls_cipher: None,
+                },
+            );
 
-        let result = orchestrator
-            .run_auction(&request, &context, &noop_services())
-            .await;
+            let result = orchestrator
+                .run_auction(&request, &context, &noop_services())
+                .await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(format!("{}", err).contains("No providers configured"));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(format!("{}", err).contains("No providers configured"));
+        });
     }
 
     #[test]
