@@ -92,6 +92,58 @@ pub fn ingest_prebid_eids(
     }
 }
 
+/// `SharedID` EID source domain used for partner registry lookup.
+const SHAREDID_SOURCE_DOMAIN: &str = "sharedid.org";
+
+/// Ingests a raw `sharedId` cookie value into the KV identity graph.
+///
+/// Prebid's `SharedID` module writes a `sharedId` cookie directly in the
+/// browser. This function reads that value and stores it under the
+/// configured `SharedID` partner.
+///
+/// Best-effort: all errors are logged and swallowed.
+pub fn ingest_sharedid_cookie(
+    cookie_value: &str,
+    ec_id: &str,
+    kv: &KvIdentityGraph,
+    registry: &PartnerRegistry,
+) {
+    let cookie_value = cookie_value.trim();
+    if cookie_value.is_empty() {
+        return;
+    }
+
+    let Some(partner) = registry.find_by_source_domain(SHAREDID_SOURCE_DOMAIN) else {
+        log::debug!("SharedID: no partner configured for source '{SHAREDID_SOURCE_DOMAIN}'");
+        return;
+    };
+
+    let now = super::current_timestamp();
+
+    // Debounce: skip if this partner was synced recently.
+    if let Ok(Some((entry, _))) = kv.get(ec_id) {
+        if let Some(existing) = entry.ids.get(&partner.id) {
+            if now.saturating_sub(existing.synced) < SYNC_DEBOUNCE_SECS {
+                log::debug!(
+                    "SharedID: debouncing partner '{}' (synced {}s ago)",
+                    partner.id,
+                    now.saturating_sub(existing.synced)
+                );
+                return;
+            }
+        }
+    }
+
+    match kv.upsert_partner_id(ec_id, &partner.id, cookie_value, now) {
+        Ok(_) => {
+            log::debug!("SharedID: synced partner '{}'", partner.id);
+        }
+        Err(err) => {
+            log::warn!("SharedID: failed to sync partner '{}': {err:?}", partner.id);
+        }
+    }
+}
+
 /// Decodes base64 JSON → `Vec<CookieEid>`.
 fn decode_eids(encoded: &str) -> Result<Vec<CookieEid>, String> {
     let bytes = BASE64

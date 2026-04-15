@@ -7,8 +7,8 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
-    COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+    COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -153,6 +153,7 @@ async fn route_request(
 
     // Extract the Prebid EIDs cookie before routing consumes the request.
     let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
 
     // Derive device signals from TLS/H2/UA for bot detection.
     // This is pure in-memory computation — no KV I/O.
@@ -222,6 +223,7 @@ async fn route_request(
                     kv_graph.as_ref(),
                     partner_registry,
                     eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
                     &mut response,
                 );
             }
@@ -361,6 +363,7 @@ async fn route_request(
             kv_graph.as_ref(),
             partner_registry,
             eids_cookie.as_deref(),
+            sharedid_cookie.as_deref(),
             &mut response,
         );
     }

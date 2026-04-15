@@ -31,6 +31,14 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60
 # pull_sync_enabled = false
 
+[[ec.partners]]
+id = "sharedid"
+name = "Prebid SharedID"
+source_domain = "sharedid.org"
+openrtb_atype = 1
+bidstream_enabled = true
+api_token = "sharedid-internal-token"
+
 # Integration test partners (used by crates/integration-tests)
 [[ec.partners]]
 id = "inttest"

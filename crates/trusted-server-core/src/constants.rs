@@ -2,6 +2,7 @@ use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
 pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
