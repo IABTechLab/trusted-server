@@ -12,6 +12,24 @@
 //! - [`PlatformBackend`] — dynamic backend registration
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
+//!
+//! ## Platform-Agnostic Components
+//!
+//! The following components were evaluated for platform-specific behavior
+//! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
+//! and found to have a platform-agnostic rewriting pipeline. No
+//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
+//! any content-rewriting implementation:
+//!
+//! - **Content rewriting** — `html_processor`, `streaming_processor`,
+//!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
+//!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
+//!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
+//!   accepts any reader, including `fastly::Body` (which implements
+//!   `std::io::Read`).
+//!
+//!   No `PlatformContentRewriter` trait exists or is needed.
+//!
 
 mod error;
 mod http;
