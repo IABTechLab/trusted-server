@@ -486,7 +486,7 @@ pub async fn proxy_request(
 }
 
 fn append_synthetic_id(req: &Request, target_url_parsed: &mut url::Url) {
-    let http_req = compat::from_fastly_request_ref(req);
+    let http_req = compat::from_fastly_headers_ref(req);
     let synthetic_id_param = match get_synthetic_id(&http_req) {
         Ok(id) => id,
         Err(e) => {
@@ -802,7 +802,7 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
 
-    let http_req = compat::from_fastly_request_ref(&req);
+    let http_req = compat::from_fastly_headers_ref(&req);
     let synthetic_id = match get_synthetic_id(&http_req) {
         Ok(id) => id,
         Err(e) => {

@@ -90,7 +90,9 @@ pub fn convert_tsjs_to_auction_request(
     geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let synthetic_id = synthetic_id.to_owned();
-    let http_req = compat::from_fastly_request_ref(req);
+    // TODO(PR 15): Remove this conversion once the auction hot path is migrated to http::Request.
+    // endpoints.rs already converts this, but we do it again here as a temporary bridge.
+    let http_req = compat::from_fastly_headers_ref(req);
     let fresh_id = generate_synthetic_id(settings, services, &http_req).change_context(
         TrustedServerError::Auction {
             message: "Failed to generate fresh ID".to_string(),

@@ -121,7 +121,7 @@ async fn route_request(
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    let auth_req = compat::from_fastly_request_ref(&req);
+    let auth_req = compat::from_fastly_headers_ref(&req);
     match enforce_basic_auth(settings, &auth_req) {
         Ok(Some(response)) => {
             let mut response = compat::to_fastly_response(response);

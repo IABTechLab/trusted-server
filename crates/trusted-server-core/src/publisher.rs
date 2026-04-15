@@ -116,7 +116,7 @@ pub fn handle_tsjs_dynamic(
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
-    let http_req = compat::from_fastly_request_ref(req);
+    let http_req = compat::from_fastly_headers_ref(req);
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid)
@@ -304,7 +304,7 @@ pub fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    let http_req = compat::from_fastly_request_ref(&req);
+    let http_req = compat::from_fastly_headers_ref(&req);
 
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
     let request_info = RequestInfo::from_request(&http_req, &services.client_info);
@@ -700,7 +700,7 @@ mod tests {
             format!("synthetic_id={cookie_synthetic_id}; other=value"),
         );
 
-        let http_req = compat::from_fastly_request_ref(&req);
+        let http_req = compat::from_fastly_headers_ref(&req);
         let cookie_jar = handle_request_cookies(&http_req).expect("should parse cookies");
         let existing_ssc_cookie = cookie_jar
             .as_ref()

@@ -47,7 +47,7 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
-    let http_req = compat::from_fastly_request_ref(&req);
+    let http_req = compat::from_fastly_headers_ref(&req);
 
     // Generate synthetic ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
