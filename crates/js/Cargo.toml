@@ -10,8 +10,10 @@ build = "build.rs"
 workspace = true
 
 [lib]
+doctest = false
 name = "trusted_server_js"
 path = "src/lib.rs"
+test = false
 
 [package.metadata]
 repository = "https://example.invalid/trusted-server"

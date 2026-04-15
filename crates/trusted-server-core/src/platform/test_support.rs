@@ -190,7 +190,7 @@ impl PlatformBackend for StubBackend {
 // StubHttpClient
 // ---------------------------------------------------------------------------
 
-/// Canned response carried by a [`StubPendingResponse`] through `send_async`
+/// Canned response carried by a [`PlatformPendingRequest`] through `send_async`
 /// and resolved by [`StubHttpClient::select`].
 struct StubPendingResponse {
     backend_name: String,
@@ -214,6 +214,8 @@ pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     // (status_code, body_bytes) — kept Send by avoiding Body::Stream
     responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    // Headers captured per send call, stored as (name, value) string pairs.
+    request_headers: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl StubHttpClient {
@@ -221,6 +223,7 @@ impl StubHttpClient {
         Self {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
+            request_headers: Mutex::new(Vec::new()),
         }
     }
 
@@ -236,6 +239,16 @@ impl StubHttpClient {
     pub fn recorded_backend_names(&self) -> Vec<String> {
         self.calls.lock().expect("should lock calls").clone()
     }
+
+    /// Return the request headers captured per `send` call, in order.
+    ///
+    /// Each entry is the set of `(name, value)` pairs from one call.
+    pub fn recorded_request_headers(&self) -> Vec<Vec<(String, String)>> {
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .clone()
+    }
 }
 
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
@@ -249,6 +262,22 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(request.backend_name.clone());
+
+        let headers: Vec<(String, String)> = request
+            .request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .push(headers);
 
         let (status, body_bytes) = self
             .responses
@@ -290,6 +319,12 @@ impl PlatformHttpClient for StubHttpClient {
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
+    /// Always marks the first pending request in the input as ready (FIFO order).
+    ///
+    /// This differs from Fastly's production `select()`, which returns whichever
+    /// request completes first and makes no ordering guarantees. Tests that rely on
+    /// this stub should not depend on "first-pushed = first-ready" semantics, and
+    /// should document their ordering assumptions explicitly if order matters.
     async fn select(
         &self,
         mut pending_requests: Vec<PlatformPendingRequest>,
@@ -435,8 +470,7 @@ pub(crate) fn build_services_with_http_client(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 
@@ -570,7 +604,7 @@ mod tests {
             host: "example.com".to_string(),
             port: None,
             certificate_check: true,
-            first_byte_timeout: Duration::from_secs(15),
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");

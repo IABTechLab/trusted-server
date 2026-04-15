@@ -20,7 +20,7 @@ log = { workspace = true }
 log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-trusted-server-core = { path = "../trusted-server-core" }
+trusted-server-core = { workspace = true }
 trusted-server-js = { path = "../js" }
 urlencoding = { workspace = true }
 
