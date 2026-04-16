@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
@@ -52,6 +55,24 @@ vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
+
+// User ID Module core + submodules — no-op mocks so jsdom does not try to
+// execute the real Prebid code paths.
+vi.mock('prebid.js/modules/userId.js', () => ({}));
+vi.mock('prebid.js/modules/sharedIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/criteoIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/33acrossIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/pubProvidedIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/quantcastIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/id5IdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/identityLinkIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/liveIntentIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/uid2IdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/euidIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/intentIqIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/lotamePanoramaIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/connectIdSystem.js', () => ({}));
+vi.mock('prebid.js/modules/merkleIdSystem.js', () => ({}));
 
 // Mock the build-generated adapter imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
@@ -1039,9 +1060,7 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
   it('defaults atype to 3 when the uid omits it', () => {
     wireBidsBackHandler();
     const pbjs = installPrebidNpm();
-    mockGetUserIdsAsEids.mockReturnValue([
-      { source: 'example.com', uids: [{ id: 'no-atype' }] },
-    ]);
+    mockGetUserIdsAsEids.mockReturnValue([{ source: 'example.com', uids: [{ id: 'no-atype' }] }]);
 
     pbjs.requestBids({ adUnits: [] } as any);
 
@@ -1146,4 +1165,41 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
 
     expect(originalHandler).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('prebid/index.ts User ID Module imports (regression guard)', () => {
+  const REQUIRED_IMPORTS = [
+    'prebid.js/modules/userId.js',
+    'prebid.js/modules/sharedIdSystem.js',
+    'prebid.js/modules/criteoIdSystem.js',
+    'prebid.js/modules/33acrossIdSystem.js',
+    'prebid.js/modules/pubProvidedIdSystem.js',
+    'prebid.js/modules/quantcastIdSystem.js',
+    'prebid.js/modules/id5IdSystem.js',
+    'prebid.js/modules/identityLinkIdSystem.js',
+    'prebid.js/modules/liveIntentIdSystem.js',
+    'prebid.js/modules/uid2IdSystem.js',
+    'prebid.js/modules/euidIdSystem.js',
+    'prebid.js/modules/intentIqIdSystem.js',
+    'prebid.js/modules/lotamePanoramaIdSystem.js',
+    'prebid.js/modules/connectIdSystem.js',
+    'prebid.js/modules/merkleIdSystem.js',
+  ];
+
+  // Source-text check: these mocks make the runtime pbjs mock a no-op for the
+  // User ID Module, so there is no way to assert `typeof getUserIdsAsEids ===
+  // 'function'` at import time from within Vitest. Reading the source file
+  // directly is the most reliable way to catch accidental removal of an
+  // import, which is the exact regression that motivated this work.
+  // Vitest runs with `process.cwd()` set to the package root (`crates/js/lib`)
+  // where `package.json` lives.
+  const SOURCE_PATH = resolve(process.cwd(), 'src/integrations/prebid/index.ts');
+  const source = readFileSync(SOURCE_PATH, 'utf8');
+
+  for (const module of REQUIRED_IMPORTS) {
+    it(`statically imports ${module}`, () => {
+      const pattern = new RegExp(`import\\s+['"]${module.replace(/\./g, '\\.')}['"]`);
+      expect(source).toMatch(pattern);
+    });
+  }
 });
