@@ -1,12 +1,3 @@
-//! Publisher response handler.
-//!
-//! **Note on platform coupling:** This module is currently coupled to
-//! `fastly::Body`/`Request`/`Response` at its handler boundaries — for example,
-//! `process_response_streaming` accepts and returns `fastly::Body`. This is an
-//! HTTP-type coupling that will be addressed in the HTTP-type migration alongside
-//! all other `fastly::Request`/`Response`/`Body` migrations. It is not a
-//! content-rewriting concern.
-
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -307,7 +298,7 @@ pub fn handle_publisher_request(
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req, &services.client_info);
+    let request_info = RequestInfo::from_request(&req);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
@@ -444,7 +435,6 @@ pub fn handle_publisher_request(
 mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
-    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
 
