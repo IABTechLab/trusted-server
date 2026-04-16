@@ -34,7 +34,12 @@ import 'prebid.js/modules/quantcastIdSystem.js';
 // Param-based submodules — inert until publisher setConfig supplies params.
 import 'prebid.js/modules/id5IdSystem.js';
 import 'prebid.js/modules/identityLinkIdSystem.js';
-import 'prebid.js/modules/liveIntentIdSystem.js';
+// NOTE: `liveIntentIdSystem.js` is intentionally not imported. Its upstream
+// module uses a dynamic `require()` inside a build-flag-guarded branch that
+// Prebid's own gulp pipeline dead-codes via constant folding; esbuild leaves
+// the `require()` call in the bundle, which throws at browser runtime. Re-
+// enabling it requires an esbuild resolver plugin (or switching to Prebid's
+// own build pipeline). Tracked as a follow-up in the design spec.
 import 'prebid.js/modules/uid2IdSystem.js';
 import 'prebid.js/modules/euidIdSystem.js';
 import 'prebid.js/modules/intentIqIdSystem.js';

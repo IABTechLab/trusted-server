@@ -66,7 +66,6 @@ vi.mock('prebid.js/modules/pubProvidedIdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/quantcastIdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/id5IdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/identityLinkIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/liveIntentIdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/uid2IdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/euidIdSystem.js', () => ({}));
 vi.mock('prebid.js/modules/intentIqIdSystem.js', () => ({}));
@@ -1177,7 +1176,6 @@ describe('prebid/index.ts User ID Module imports (regression guard)', () => {
     'prebid.js/modules/quantcastIdSystem.js',
     'prebid.js/modules/id5IdSystem.js',
     'prebid.js/modules/identityLinkIdSystem.js',
-    'prebid.js/modules/liveIntentIdSystem.js',
     'prebid.js/modules/uid2IdSystem.js',
     'prebid.js/modules/euidIdSystem.js',
     'prebid.js/modules/intentIqIdSystem.js',
