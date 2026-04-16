@@ -49,7 +49,6 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -239,13 +238,12 @@ impl GptIntegration {
     async fn proxy_gpt_asset(
         &self,
         settings: &Settings,
-        services: &RuntimeServices,
         req: Request,
         target_url: &str,
         context: &str,
     ) -> Result<Response, Report<TrustedServerError>> {
         let config = Self::build_proxy_config(target_url, &req);
-        let response = proxy_request(settings, req, config, services)
+        let response = proxy_request(settings, req, config)
             .await
             .change_context(Self::error(context))?;
 
@@ -289,14 +287,12 @@ impl GptIntegration {
     async fn handle_script_serving(
         &self,
         settings: &Settings,
-        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let script_url = &self.config.script_url;
         log::info!("Fetching GPT script from: {}", script_url);
         self.proxy_gpt_asset(
             settings,
-            services,
             req,
             script_url,
             &format!("Failed to fetch GPT script from {script_url}"),
@@ -313,7 +309,6 @@ impl GptIntegration {
     async fn handle_pagead_proxy(
         &self,
         settings: &Settings,
-        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let original_path = req.get_path();
@@ -325,7 +320,6 @@ impl GptIntegration {
         log::info!("GPT proxy: forwarding to {}", target_url);
         self.proxy_gpt_asset(
             settings,
-            services,
             req,
             &target_url,
             &format!("Failed to fetch GPT resource from {target_url}"),
@@ -382,17 +376,16 @@ impl IntegrationProxy for GptIntegration {
     async fn handle(
         &self,
         settings: &Settings,
-        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
 
         if path == "/integrations/gpt/script" {
-            self.handle_script_serving(settings, services, req).await
+            self.handle_script_serving(settings, req).await
         } else if path.starts_with("/integrations/gpt/pagead/")
             || path.starts_with("/integrations/gpt/tag/")
         {
-            self.handle_pagead_proxy(settings, services, req).await
+            self.handle_pagead_proxy(settings, req).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown GPT route: {}",
