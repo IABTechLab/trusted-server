@@ -1025,6 +1025,17 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
     expect(getTsEidsCookie()).toBeUndefined();
   });
 
+  it('clears an existing cookie when getUserIdsAsEids returns empty array', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    document.cookie = 'ts-eids=stale; Path=/';
+    mockGetUserIdsAsEids.mockReturnValue([]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    expect(getTsEidsCookie()).toBeUndefined();
+  });
+
   it('writes ts-eids cookie with base64-encoded flat JSON for normal payload', () => {
     wireBidsBackHandler();
     const pbjs = installPrebidNpm();
@@ -1130,6 +1141,34 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
     expect(getTsEidsCookie()).toBeUndefined();
   });
 
+  it('clears an existing cookie when flattening yields no valid EIDs', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    document.cookie = 'ts-eids=stale; Path=/';
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'missing-id.example', uids: [{ id: '', atype: 3 }] },
+      { source: '', uids: [{ id: 'missing-source', atype: 3 }] },
+      { source: 'empty-uids.example', uids: [] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    expect(getTsEidsCookie()).toBeUndefined();
+  });
+
+  it('clears an existing cookie when a single oversized entry cannot be written', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    document.cookie = 'ts-eids=stale; Path=/';
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'too-big.example', uids: [{ id: 'x'.repeat(4000), atype: 3 }] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    expect(getTsEidsCookie()).toBeUndefined();
+  });
+
   it('does not throw when getUserIdsAsEids is undefined (pre-fix production state)', () => {
     wireBidsBackHandler();
     const pbjs = installPrebidNpm();
@@ -1137,6 +1176,20 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
     (mockPbjs as any).getUserIdsAsEids = undefined;
 
     expect(() => pbjs.requestBids({ adUnits: [] } as any)).not.toThrow();
+    expect(getTsEidsCookie()).toBeUndefined();
+
+    // Restore for subsequent tests.
+    (mockPbjs as any).getUserIdsAsEids = mockGetUserIdsAsEids;
+  });
+
+  it('clears an existing cookie when getUserIdsAsEids is undefined', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    document.cookie = 'ts-eids=stale; Path=/';
+    (mockPbjs as any).getUserIdsAsEids = undefined;
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
     expect(getTsEidsCookie()).toBeUndefined();
 
     // Restore for subsequent tests.
