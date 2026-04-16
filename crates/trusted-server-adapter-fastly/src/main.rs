@@ -94,13 +94,6 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     let runtime_services = build_runtime_services(&req, kv_store);
-    let geo_info = runtime_services
-        .geo()
-        .lookup(runtime_services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
     let http_req = compat::from_fastly_request(req);
 
     let mut response = futures::executor::block_on(route_request(
@@ -111,6 +104,18 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
         http_req,
     ))
     .unwrap_or_else(|e| http_error_response(&e));
+
+    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+        None
+    } else {
+        runtime_services
+            .geo()
+            .lookup(runtime_services.client_info().client_ip)
+            .unwrap_or_else(|e| {
+                log::warn!("geo lookup failed: {e}");
+                None
+            })
+    };
 
     finalize_response(&settings, geo_info.as_ref(), &mut response);
 
@@ -232,16 +237,11 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     }
 
     for (key, value) in &settings.response_headers {
-        let header_name = HeaderName::from_bytes(key.as_bytes());
-        let header_value = HeaderValue::from_str(value);
-        if let (Ok(header_name), Ok(header_value)) = (header_name, header_value) {
-            response.headers_mut().insert(header_name, header_value);
-        } else {
-            log::warn!(
-                "Skipping invalid configured response header value for {}",
-                key
-            );
-        }
+        let header_name = HeaderName::from_bytes(key.as_bytes())
+            .expect("settings.response_headers validated at load time");
+        let header_value =
+            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
+        response.headers_mut().insert(header_name, header_value);
     }
 }
 

@@ -37,6 +37,10 @@ pub enum TrustedServerError {
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
 
+    /// Request payload exceeded maximum allowed size.
+    #[display("Request payload too large: {message}")]
+    RequestTooLarge { message: String },
+
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
@@ -107,6 +111,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::SyntheticId { .. } => StatusCode::INTERNAL_SERVER_ERROR,

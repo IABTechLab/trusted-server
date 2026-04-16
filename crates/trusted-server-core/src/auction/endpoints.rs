@@ -58,11 +58,10 @@ pub async fn handle_auction(
         },
     )?;
 
-    // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
-        .lookup(services.client_info.client_ip)
+        .lookup(services.client_info().client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
