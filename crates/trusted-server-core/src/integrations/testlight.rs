@@ -14,7 +14,6 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
@@ -141,7 +140,6 @@ impl IntegrationProxy for TestlightIntegration {
     async fn handle(
         &self,
         settings: &Settings,
-        services: &RuntimeServices,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let mut payload = serde_json::from_slice::<TestlightRequestBody>(&req.take_body_bytes())
@@ -174,7 +172,7 @@ impl IntegrationProxy for TestlightIntegration {
             HeaderValue::from_static("application/json"),
         ));
 
-        let mut response = proxy_request(settings, req, proxy_config, services)
+        let mut response = proxy_request(settings, req, proxy_config)
             .await
             .change_context(Self::error("Failed to contact upstream integration"))?;
 
