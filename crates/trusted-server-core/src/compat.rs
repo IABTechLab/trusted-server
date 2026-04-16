@@ -557,4 +557,52 @@ mod tests {
             "should set expected expiry cookie"
         );
     }
+
+    #[test]
+    fn to_fastly_request_with_streaming_body_produces_empty_body() {
+        // Stream bodies cannot cross the compat boundary: the Fastly SDK has no
+        // streaming body API, so the shim drops the stream and logs a warning.
+        // This test pins that silent-drop behaviour so it cannot become
+        // accidentally load-bearing.  (Removal target: PR 15.)
+        let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+            b"data",
+        )]));
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/")
+            .body(body)
+            .expect("should build request");
+
+        let mut fastly_req = to_fastly_request(http_req);
+
+        assert!(
+            fastly_req.take_body_bytes().is_empty(),
+            "streaming body should be silently dropped; compat shim produces empty body"
+        );
+    }
+
+    #[test]
+    fn to_fastly_response_with_streaming_body_produces_empty_body() {
+        // Same constraint as to_fastly_request: streaming bodies are dropped at
+        // the compat boundary.  (Removal target: PR 15.)
+        let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+            b"data",
+        )]));
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(body)
+            .expect("should build response");
+
+        let mut fastly_resp = to_fastly_response(http_resp);
+
+        assert_eq!(
+            fastly_resp.get_status().as_u16(),
+            200,
+            "should copy status code"
+        );
+        assert!(
+            fastly_resp.take_body_bytes().is_empty(),
+            "streaming body should be silently dropped; compat shim produces empty body"
+        );
+    }
 }

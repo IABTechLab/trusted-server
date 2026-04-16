@@ -126,33 +126,27 @@ const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
 /// If `preserve_encoding` is true, the Content-Encoding header is kept (for compressed responses).
 /// If false, Content-Encoding is stripped (for decompressed responses).
 fn rebuild_response_with_body(
-    beresp: &Response<EdgeBody>,
+    beresp: Response<EdgeBody>,
     content_type: &'static str,
     body: Vec<u8>,
     preserve_encoding: bool,
 ) -> Response<EdgeBody> {
-    let status = beresp.status();
-    let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
-        .headers()
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    let mut resp = Response::new(EdgeBody::from(body));
-    *resp.status_mut() = status;
-    for (name, value) in headers {
-        // Always skip Content-Length (size changed) and Content-Type (we set it)
-        if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
-            continue;
-        }
-        // Skip Content-Encoding only if we're not preserving it
-        if name == header::CONTENT_ENCODING && !preserve_encoding {
-            continue;
-        }
-        resp.headers_mut().append(name, value);
+    let (mut parts, _) = beresp.into_parts();
+
+    // Always skip Content-Length (size changed) and Content-Type (we set it)
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_TYPE);
+
+    // Skip Content-Encoding only if we're not preserving it
+    if !preserve_encoding {
+        parts.headers.remove(header::CONTENT_ENCODING);
     }
-    resp.headers_mut()
+
+    parts
+        .headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    resp
+
+    Response::from_parts(parts, EdgeBody::from(body))
 }
 
 /// Process a response body through a streaming pipeline with the given processor.
@@ -182,7 +176,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
         })?;
 
     Ok(rebuild_response_with_body(
-        &beresp,
+        beresp,
         content_type,
         output,
         compression != Compression::None,
@@ -886,7 +880,16 @@ pub async fn handle_first_party_proxy_sign(
     let req_url = req.uri().to_string();
 
     let payload = if method == Method::POST {
-        let body = String::from_utf8(req.into_body().into_bytes().to_vec()).change_context(
+        let body_bytes = req.into_body().into_bytes();
+        if body_bytes.len() > 65536 {
+            return Err(Report::new(TrustedServerError::RequestTooLarge {
+                message: format!(
+                    "payload size {} exceeds limit of 65536 bytes",
+                    body_bytes.len()
+                ),
+            }));
+        }
+        let body = String::from_utf8(body_bytes.to_vec()).change_context(
             TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
             },
@@ -1000,7 +1003,16 @@ pub async fn handle_first_party_proxy_rebuild(
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
-        let body = String::from_utf8(req.into_body().into_bytes().to_vec()).change_context(
+        let body_bytes = req.into_body().into_bytes();
+        if body_bytes.len() > 65536 {
+            return Err(Report::new(TrustedServerError::RequestTooLarge {
+                message: format!(
+                    "payload size {} exceeds limit of 65536 bytes",
+                    body_bytes.len()
+                ),
+            }));
+        }
+        let body = String::from_utf8(body_bytes.to_vec()).change_context(
             TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
             },
@@ -1153,7 +1165,9 @@ pub async fn handle_first_party_proxy_rebuild(
             added,
             removed,
         })
-        .unwrap_or_else(|_| "{}".to_string());
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to serialize rebuild response".to_string(),
+        })?;
         let mut response = Response::new(EdgeBody::from(json));
         *response.status_mut() = StatusCode::OK;
         response.headers_mut().insert(
@@ -1280,7 +1294,7 @@ fn reconstruct_and_validate_signed_target(
 mod tests {
     use super::{
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-        handle_first_party_proxy_sign, is_host_allowed, proxy_request,
+        handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
     };
     use crate::constants::HEADER_ACCEPT;
@@ -1291,6 +1305,40 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
     use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+
+    #[test]
+    fn test_rebuild_response_with_body_preserves_multiple_headers() {
+        let mut response = Response::new(EdgeBody::empty());
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("session=123"));
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("tracker=456"));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+
+        let rebuilt =
+            rebuild_response_with_body(response, "application/json", b"{}".to_vec(), false);
+
+        let cookies: Vec<_> = rebuilt
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect();
+        assert_eq!(cookies, vec!["session=123", "tracker=456"]);
+        assert_eq!(
+            rebuilt
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/json"
+        );
+    }
 
     fn build_http_request(method: Method, uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
         HttpRequest::builder()

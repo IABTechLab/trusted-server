@@ -59,11 +59,10 @@ pub async fn handle_auction(
         },
     )?;
 
-    // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
-        .lookup(services.client_info.client_ip)
+        .lookup(services.client_info().client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
@@ -87,13 +86,14 @@ pub async fn handle_auction(
         geo,
     )?;
 
+    // Body already parsed above; provider context only needs request metadata.
     let fastly_req = compat::to_fastly_request_ref(&http_req);
 
     // Create auction context
     let context = AuctionContext {
         settings,
         request: &fastly_req,
-        client_info: &services.client_info,
+        client_info: services.client_info(),
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
