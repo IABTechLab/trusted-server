@@ -21,8 +21,9 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -146,7 +147,9 @@ impl LockrIntegration {
             ))));
         }
 
-        let sdk_body = lockr_response.into_body().into_bytes();
+        let sdk_body = collect_body(lockr_response.into_body(), LOCKR_INTEGRATION_ID)
+            .await
+            .change_context(Self::error("Failed to read Lockr SDK response body"))?;
         log::info!("Fetched Lockr SDK ({} bytes)", sdk_body.len());
 
         // TODO: Cache in KV store (future enhancement)
@@ -164,7 +167,7 @@ impl LockrIntegration {
             .header("X-Lockr-SDK-Proxy", "true")
             .header("X-Lockr-SDK-Mode", "trust-server")
             .header("X-SDK-Source", sdk_url)
-            .body(EdgeBody::from(sdk_body.to_vec()))
+            .body(EdgeBody::from(sdk_body))
             .change_context(Self::error("Failed to build Lockr SDK response"))
     }
 
@@ -197,7 +200,11 @@ impl LockrIntegration {
         log::info!("Forwarding to Lockr API: {}", target_url);
 
         let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            body
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, LOCKR_INTEGRATION_ID)
+                    .await
+                    .change_context(Self::error("Lockr API request body too large"))?;
+            EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };
@@ -261,11 +268,14 @@ impl LockrIntegration {
                 .and_then(|value| value.to_str().ok())
         });
         if let Some(origin) = origin {
-            to.insert(
-                header::ORIGIN,
-                HeaderValue::from_str(origin)
-                    .expect("should build origin header from valid configuration"),
-            );
+            match HeaderValue::from_str(origin) {
+                Ok(value) => {
+                    to.insert(header::ORIGIN, value);
+                }
+                Err(error) => {
+                    log::warn!("Skipping invalid Lockr origin header value '{origin}': {error}");
+                }
+            }
         }
 
         for (name, value) in from {

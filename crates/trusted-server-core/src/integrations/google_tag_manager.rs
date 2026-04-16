@@ -40,6 +40,8 @@ const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 #[derive(Debug)]
 enum PayloadSizeError {
     TooLarge { actual: usize, max: usize },
+    /// Transport error while reading a streaming body chunk.
+    StreamRead(String),
 }
 
 /// Regex pattern for validating GTM container IDs.
@@ -307,11 +309,8 @@ impl GoogleTagManagerIntegration {
                 let mut body_bytes = Vec::new();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|error| {
-                        log::error!("Error reading request body: {}", error);
-                        PayloadSizeError::TooLarge {
-                            actual: 0,
-                            max: max_size,
-                        }
+                        log::error!("Error reading request body stream: {}", error);
+                        PayloadSizeError::StreamRead(error.to_string())
                     })?;
 
                     if body_bytes.len() + chunk.len() > max_size {
@@ -333,7 +332,6 @@ impl GoogleTagManagerIntegration {
             }
         }
     }
-
 }
 
 fn build(
@@ -468,6 +466,13 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                     .change_context(Self::error(
                         "Failed to build GTM payload-too-large response",
                     ));
+            }
+            Err(PayloadSizeError::StreamRead(error)) => {
+                log::error!("Returning 502: failed to read GTM request body stream: {error}");
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(EdgeBody::empty())
+                    .change_context(Self::error("Failed to build GTM bad-gateway response"));
             }
         };
 

@@ -68,8 +68,9 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -298,7 +299,9 @@ impl DataDomeIntegration {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .cloned();
-        let body = backend_resp.response.into_body().into_bytes();
+        let body = collect_body(backend_resp.response.into_body(), DATADOME_INTEGRATION_ID)
+            .await
+            .change_context(Self::error("Failed to read DataDome SDK response body"))?;
         let rewritten = self.rewrite_script_content(&String::from_utf8_lossy(&body));
 
         // Build response with caching headers
@@ -354,7 +357,11 @@ impl DataDomeIntegration {
             .change_context(Self::error("Invalid API URL"))?;
 
         let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
-            body
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DATADOME_INTEGRATION_ID)
+                    .await
+                    .change_context(Self::error("DataDome API request body too large"))?;
+            EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };

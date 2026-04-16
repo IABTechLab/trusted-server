@@ -11,7 +11,8 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    ensure_integration_backend, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body_bounded, ensure_integration_backend, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -239,7 +240,11 @@ impl IntegrationProxy for DidomiIntegration {
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
         let request_body = if matches!(parts.method, Method::POST | Method::PUT) {
-            body
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DIDOMI_INTEGRATION_ID)
+                    .await
+                    .change_context(Self::error("Didomi request body too large"))?;
+            EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };
