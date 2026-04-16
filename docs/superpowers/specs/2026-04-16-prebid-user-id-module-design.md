@@ -59,7 +59,6 @@ the relevant params):
 
 - `prebid.js/modules/id5IdSystem.js`
 - `prebid.js/modules/identityLinkIdSystem.js`
-- `prebid.js/modules/liveIntentIdSystem.js`
 - `prebid.js/modules/uid2IdSystem.js`
 - `prebid.js/modules/euidIdSystem.js`
 - `prebid.js/modules/intentIqIdSystem.js`
@@ -67,12 +66,19 @@ the relevant params):
 - `prebid.js/modules/connectIdSystem.js`
 - `prebid.js/modules/merkleIdSystem.js`
 
-Total: 1 core + 14 submodules = 15 new imports.
+Total: 1 core + 13 submodules = 14 new imports.
 
-> **Note (2026-04-16, during implementation):** `pubCommonIdSystem.js`, which
-> was originally planned as a legacy/compatibility submodule, was removed from
-> Prebid.js in 10.x (consolidated into `sharedIdSystem`). It is not importable
-> from our pinned Prebid 10.26.0 and has been dropped from this plan.
+> **Notes (2026-04-16, during implementation):**
+>
+> - `pubCommonIdSystem.js`, originally planned as a legacy/compatibility
+>   submodule, was removed from Prebid.js in 10.x (consolidated into
+>   `sharedIdSystem`). Not importable from our pinned Prebid 10.26.0; dropped.
+> - `liveIntentIdSystem.js` was dropped from the day-1 bundle. Its upstream
+>   module uses a dynamic `require()` inside a build-flag-guarded branch that
+>   Prebid's own gulp pipeline dead-codes via constant folding; esbuild leaves
+>   the `require()` call in the bundle, which throws `ReferenceError: require
+>   is not defined` at browser runtime. Re-enabling requires an esbuild
+>   resolver plugin (or Prebid's own build pipeline). Tracked as a follow-up.
 
 No changes to `installPrebidNpm`, no changes to the `bidsBackHandler` shim, no
 changes to `syncPrebidEidsCookie`. The existing cookie-writing path is already
@@ -196,3 +202,8 @@ auction. Publishers without `userSync.userIds` configured see no change.
 3. **Partner alignment tooling** — a startup-time check that warns when a
    bundled ID submodule has no matching `[[ec.partners]]` entry, or vice
    versa.
+4. **Re-enable `liveIntentIdSystem.js`** — requires either an esbuild
+   resolver plugin that rewrites the dynamic `require('../libraries/
+   liveIntentId/idSystem.js')` inside `loadModule()` to a static import, or
+   adopting Prebid's own gulp build pipeline for the vendored bundle.
+   Out-of-scope for the initial ship.
