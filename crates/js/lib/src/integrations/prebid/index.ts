@@ -18,34 +18,17 @@ import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
-// Prebid User ID Module — core + submodules. The core module exposes
-// `pbjs.getUserIdsAsEids`; submodules self-register at import time and
-// activate when the publisher's origin-side `pbjs.setConfig({ userSync:
-// { userIds: [...] } })` call runs during `processQueue()`.
+// Prebid User ID Module core — always bundled. Exposes
+// `pbjs.getUserIdsAsEids` and registers the submodule machinery that each
+// ID submodule in `_user_ids.generated.ts` hooks into. ID submodules
+// activate only when the publisher's origin-side `pbjs.setConfig({
+// userSync: { userIds: [...] } })` call runs during `processQueue()`.
 import 'prebid.js/modules/userId.js';
 
-// Zero-config / auto-populating submodules (resolve without publisher params).
-import 'prebid.js/modules/sharedIdSystem.js';
-import 'prebid.js/modules/criteoIdSystem.js';
-import 'prebid.js/modules/33acrossIdSystem.js';
-import 'prebid.js/modules/pubProvidedIdSystem.js';
-import 'prebid.js/modules/quantcastIdSystem.js';
-
-// Param-based submodules — inert until publisher setConfig supplies params.
-import 'prebid.js/modules/id5IdSystem.js';
-import 'prebid.js/modules/identityLinkIdSystem.js';
-// NOTE: `liveIntentIdSystem.js` is intentionally not imported. Its upstream
-// module uses a dynamic `require()` inside a build-flag-guarded branch that
-// Prebid's own gulp pipeline dead-codes via constant folding; esbuild leaves
-// the `require()` call in the bundle, which throws at browser runtime. Re-
-// enabling it requires an esbuild resolver plugin (or switching to Prebid's
-// own build pipeline). Tracked as a follow-up in the design spec.
-import 'prebid.js/modules/uid2IdSystem.js';
-import 'prebid.js/modules/euidIdSystem.js';
-import 'prebid.js/modules/intentIqIdSystem.js';
-import 'prebid.js/modules/lotamePanoramaIdSystem.js';
-import 'prebid.js/modules/connectIdSystem.js';
-import 'prebid.js/modules/merkleIdSystem.js';
+// Prebid User ID submodules — self-register with the core on import.
+// The set of submodules is controlled by the TSJS_PREBID_USER_IDS env var
+// at build time. See _user_ids.generated.ts (written by build-all.mjs).
+import './_user_ids.generated';
 
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at

@@ -190,10 +190,13 @@ auction. Publishers without `userSync.userIds` configured see no change.
 
 ## Follow-ups
 
-1. **Build-time configurability** — introduce `_user_ids.generated.ts`
+1. ~~**Build-time configurability** — introduce `_user_ids.generated.ts`
    driven by a `TSJS_PREBID_USER_IDS` env var, mirroring the existing
    `TSJS_PREBID_ADAPTERS` / `_adapters.generated.ts` pattern. Allows
-   operators to slim the bundle per deployment.
+   operators to slim the bundle per deployment.~~ **Implemented
+   2026-04-16** — see `docs/guide/integrations/prebid.md` "Build-time
+   submodule selection" and the `generatePrebidUserIds()` function in
+   `crates/js/lib/build-all.mjs`.
 2. **Server-injected `userSync.userIds`** — extend `trusted-server.toml`
    with a `[[integrations.prebid.user_ids]]` array. Rust serializes into
    `window.__tsjs_prebid.userIds`. JS applies via `pbjs.setConfig` before
