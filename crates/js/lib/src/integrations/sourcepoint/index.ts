@@ -33,12 +33,14 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
   return null;
 }
 
+const GPP_COOKIE_MAX_AGE = 86400;
+
 function writeCookie(name: string, value: string): void {
-  document.cookie = `${name}=${value}; path=/; SameSite=Lax`;
+  document.cookie = `${name}=${value}; path=/; Secure; SameSite=Lax; Max-Age=${GPP_COOKIE_MAX_AGE}`;
 }
 
 function clearCookie(name: string): void {
-  document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax`;
+  document.cookie = `${name}=; path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
 /**
