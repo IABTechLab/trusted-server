@@ -1,3 +1,16 @@
+// Strips lines whose first non-whitespace token is `//`.
+//
+// Known limitations (both produce false positives, never false negatives):
+// - String literals: `"fastly::Request"` in a test assertion would trigger a
+//   spurious failure even though it is not a real Fastly dependency.
+// - Block comments: `/* fastly::Request */` is not stripped. A banned pattern
+//   inside a block comment causes a spurious failure; one hidden *outside* a
+//   block comment is still caught by the non-comment portions of the line.
+//
+// False positives are safe for a guard test — they cause a noisy failure that
+// forces investigation rather than letting a real regression slip through
+// silently. False negatives are not possible with the current banned-pattern
+// list because none of the migrated files use block comments in practice.
 fn strip_line_comments(source: &str) -> String {
     source
         .lines()

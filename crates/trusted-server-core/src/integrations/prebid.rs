@@ -710,7 +710,7 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let http_req = compat::from_fastly_request_ref(context.request);
+        let http_req = compat::from_fastly_headers_ref(context.request);
         let request_info = RequestInfo::from_request(&http_req, context.client_info);
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
@@ -1009,7 +1009,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             &context.settings.request_signing
         {
             if request_signing_config.enabled {
-                let http_req = compat::from_fastly_request_ref(context.request);
+                let http_req = compat::from_fastly_headers_ref(context.request);
                 let request_info = RequestInfo::from_request(&http_req, context.client_info);
                 let signer = RequestSigner::from_services(context.services)?;
                 let params =

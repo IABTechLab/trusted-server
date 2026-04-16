@@ -158,31 +158,29 @@ pub fn forward_cookie_header(
     to: &mut Request<EdgeBody>,
     strip_consent: bool,
 ) {
-    let Some(cookie_value) = from.headers().get(header::COOKIE) else {
-        return;
-    };
-
-    if !strip_consent {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
-        return;
-    }
-
-    match cookie_value.to_str() {
-        Ok(s) => {
-            let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty() {
-                to.headers_mut().insert(
-                    header::COOKIE,
-                    http::HeaderValue::from_str(&stripped)
-                        .expect("should build stripped Cookie header value"),
-                );
-            }
-        }
-        Err(_) => {
-            // Non-UTF-8 Cookie header — forward as-is
+    for cookie_value in from.headers().get_all(header::COOKIE) {
+        if !strip_consent {
             to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
+                .append(header::COOKIE, cookie_value.clone());
+            continue;
+        }
+
+        match cookie_value.to_str() {
+            Ok(s) => {
+                let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
+                if !stripped.is_empty() {
+                    to.headers_mut().append(
+                        header::COOKIE,
+                        http::HeaderValue::from_str(&stripped)
+                            .expect("should build stripped Cookie header value"),
+                    );
+                }
+            }
+            Err(_) => {
+                // Non-UTF-8 Cookie header — forward as-is
+                to.headers_mut()
+                    .append(header::COOKIE, cookie_value.clone());
+            }
         }
     }
 }

@@ -51,7 +51,7 @@ pub fn from_fastly_request(mut req: fastly::Request) -> http::Request<EdgeBody> 
 /// # Panics
 ///
 /// Panics if the Fastly request URL cannot be parsed as an `http::Uri`.
-pub fn from_fastly_request_ref(req: &fastly::Request) -> http::Request<EdgeBody> {
+pub fn from_fastly_headers_ref(req: &fastly::Request) -> http::Request<EdgeBody> {
     build_http_request(req, EdgeBody::empty())
 }
 
@@ -62,7 +62,7 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
     let (parts, body) = req.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in &parts.headers {
-        fastly_req.set_header(name.as_str(), value.as_bytes());
+        fastly_req.append_header(name.as_str(), value.as_bytes());
     }
 
     match body {
@@ -155,9 +155,7 @@ pub fn sanitize_fastly_forwarded_headers(req: &mut fastly::Request) {
 pub fn copy_fastly_custom_headers(from: &fastly::Request, to: &mut fastly::Request) {
     for (name, value) in from.get_headers() {
         let name_str = name.as_str();
-        if (name_str.starts_with("x-") || name_str.starts_with("X-"))
-            && !INTERNAL_HEADERS.contains(&name_str)
-        {
+        if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
             to.append_header(name_str, value);
         }
     }
@@ -265,12 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn from_fastly_request_ref_copies_headers() {
+    fn from_fastly_headers_ref_copies_headers() {
         let mut fastly_req =
             fastly::Request::new(fastly::http::Method::GET, "https://example.com/path");
         fastly_req.set_header("x-custom", "value");
 
-        let http_req = from_fastly_request_ref(&fastly_req);
+        let http_req = from_fastly_headers_ref(&fastly_req);
 
         assert_eq!(http_req.uri().path(), "/path", "should copy path");
         assert_eq!(
@@ -284,13 +282,13 @@ mod tests {
     }
 
     #[test]
-    fn from_fastly_request_ref_preserves_duplicate_headers() {
+    fn from_fastly_headers_ref_preserves_duplicate_headers() {
         let mut fastly_req =
             fastly::Request::new(fastly::http::Method::GET, "https://example.com/path");
         fastly_req.append_header("x-custom", "first");
         fastly_req.append_header("x-custom", "second");
 
-        let http_req = from_fastly_request_ref(&fastly_req);
+        let http_req = from_fastly_headers_ref(&fastly_req);
         let values: Vec<_> = http_req
             .headers()
             .get_all("x-custom")
@@ -306,10 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn from_fastly_request_ref_body_is_empty() {
+    fn from_fastly_headers_ref_body_is_empty() {
         let fastly_req = fastly::Request::new(fastly::http::Method::POST, "https://example.com/");
 
-        let http_req = from_fastly_request_ref(&fastly_req);
+        let http_req = from_fastly_headers_ref(&fastly_req);
 
         assert_eq!(http_req.method(), http::Method::POST, "should copy method");
         assert_once_body_eq(http_req.into_body(), b"");
@@ -342,6 +340,30 @@ mod tests {
             fastly_req.take_body_bytes().as_slice(),
             b"payload",
             "should copy body bytes"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_preserves_duplicate_headers() {
+        let http_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .header("x-custom", "first")
+            .header("x-custom", "second")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let fastly_req = to_fastly_request(http_req);
+
+        let values: Vec<_> = fastly_req
+            .get_headers()
+            .filter(|(name, _)| name.as_str() == "x-custom")
+            .map(|(_, value)| value.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate headers"
         );
     }
 
