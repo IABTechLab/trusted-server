@@ -19,7 +19,7 @@ build = """
 
 [local_server]
     address = "127.0.0.1:7676"
-    
+
     [local_server.backends]
 
     [local_server.kv_stores]
@@ -42,6 +42,12 @@ build = """
         [[local_server.kv_stores.ec_identity_store]]
             key = "placeholder"
             data = "placeholder"
+
+        # Pre-seeded test EC entry for local script testing (test-prebid-eids.sh).
+        # Matches the TEST_EC_ID used in that script.
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
+            data = '{"v":1,"created":1700000000,"last_seen":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US"}}'
 
     [local_server.secret_stores]
         [[local_server.secret_stores.signing_keys]]
