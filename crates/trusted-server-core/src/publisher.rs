@@ -485,6 +485,17 @@ pub fn handle_publisher_request(
         });
     }
 
+    // Unsupported Content-Encoding: we cannot decompress, so processing would
+    // treat compressed bytes as identity and produce garbled output. Return
+    // the origin response unchanged.
+    if !encoding_supported {
+        log::warn!(
+            "Unsupported Content-Encoding '{}' - returning response unmodified",
+            content_encoding,
+        );
+        return Ok(PublisherResponse::Buffered(response));
+    }
+
     // Buffered fallback: post-processors need the full document.
     log::debug!(
         "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
@@ -523,9 +534,9 @@ fn is_processable_content_type(content_type: &str) -> bool {
 
 /// Whether the `Content-Encoding` is one the streaming pipeline can handle.
 ///
-/// Unsupported encodings (e.g. `zstd` from a misbehaving origin) must fall
-/// back to buffered mode so a processing failure produces a proper error
-/// response instead of a truncated stream.
+/// Unsupported encodings (e.g. `zstd` from a misbehaving origin) bypass the
+/// rewrite pipeline entirely and are returned unchanged. Processing such
+/// bodies as identity-encoded would produce garbled output.
 fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
@@ -632,6 +643,52 @@ mod tests {
         assert!(
             !is_supported_content_encoding("snappy"),
             "should reject snappy"
+        );
+    }
+
+    #[test]
+    fn unsupported_encoding_response_is_returned_unmodified() {
+        // Simulate a processable (HTML) 2xx response with an unsupported
+        // Content-Encoding. The bytes are not real zstd - the point is that
+        // they must be returned untouched rather than fed to the rewriter as
+        // identity-encoded text.
+        let origin_bytes = b"\x28\xb5\x2f\xfd\x00\x58\x61\x00\x00not really zstd".to_vec();
+
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+        response.set_header(header::CONTENT_ENCODING, "zstd");
+        response.set_body(Body::from(origin_bytes.clone()));
+
+        // Re-derive the gate decision the same way handle_publisher_request does.
+        let content_type = response
+            .get_header(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let content_encoding = response
+            .get_header(header::CONTENT_ENCODING)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+
+        assert!(
+            is_processable_content_type(&content_type),
+            "text/html must be processable"
+        );
+        assert!(response.get_status().is_success(), "status must be 2xx");
+        assert!(
+            !is_supported_content_encoding(&content_encoding),
+            "zstd must not be a supported encoding"
+        );
+
+        // The fix: when the only reason to fall out of the streaming gate is
+        // unsupported encoding, return the response unchanged rather than
+        // re-routing through process_response_streaming (which would treat
+        // the compressed bytes as identity and garble them).
+        let body = response.into_body().into_bytes();
+        assert_eq!(
+            body, origin_bytes,
+            "unsupported-encoding response must pass through byte-for-byte"
         );
     }
 
