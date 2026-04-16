@@ -1154,11 +1154,11 @@ impl AuctionProvider for PrebidAuctionProvider {
         let status = response.status();
 
         // Parse response — collect_body handles both Once and Stream variants safely.
-        let body_bytes = collect_body(response.into_body(), "prebid").await.change_context(
-            TrustedServerError::Prebid {
+        let body_bytes = collect_body(response.into_body(), "prebid")
+            .await
+            .change_context(TrustedServerError::Prebid {
                 message: "Failed to read Prebid response body".to_string(),
-            },
-        )?;
+            })?;
 
         if !status.is_success() {
             log::warn!("Prebid returned non-success status: {}", status,);

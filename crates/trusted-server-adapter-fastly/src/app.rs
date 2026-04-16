@@ -26,6 +26,7 @@ use std::sync::Arc;
 use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderValue, Response};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -57,28 +58,29 @@ use crate::platform::{
 // AppState
 // ---------------------------------------------------------------------------
 
-/// Application state built once at startup and shared across all requests.
+/// Application state built once per Wasm instance and shared for its lifetime.
+///
+/// In Fastly Compute each request spawns a new Wasm instance, so this struct is
+/// effectively per-request. It holds pre-parsed settings and all service handles.
 pub struct AppState {
-    pub(crate) settings: Arc<Settings>,
-    pub(crate) orchestrator: Arc<AuctionOrchestrator>,
-    pub(crate) registry: Arc<IntegrationRegistry>,
-    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    settings: Arc<Settings>,
+    orchestrator: Arc<AuctionOrchestrator>,
+    registry: Arc<IntegrationRegistry>,
+    kv_store: Arc<dyn PlatformKvStore>,
 }
 
-/// Build the application state, loading settings and constructing all
-/// per-application components.
+/// Build the application state, loading settings and constructing all per-application components.
 ///
-/// On any construction failure the function panics — these are programming
-/// errors or unrecoverable misconfiguration that cannot be handled at request
-/// time.
-fn build_state() -> Arc<AppState> {
-    let settings = get_settings().expect("should load trusted-server settings at startup");
+/// # Errors
+///
+/// Returns an error when settings, the auction orchestrator, or the integration
+/// registry fail to initialise.
+fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let settings = get_settings()?;
 
-    let orchestrator =
-        build_orchestrator(&settings).expect("should build auction orchestrator from settings");
+    let orchestrator = build_orchestrator(&settings)?;
 
-    let registry = IntegrationRegistry::new(&settings)
-        .expect("should build integration registry from settings");
+    let registry = IntegrationRegistry::new(&settings)?;
 
     let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
         Ok(store) => store,
@@ -91,12 +93,12 @@ fn build_state() -> Arc<AppState> {
         }
     };
 
-    Arc::new(AppState {
+    Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         kv_store,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +138,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 /// The near-identical function in `main.rs` is intentional: the legacy path
 /// uses fastly HTTP types while this path uses `edgezero_core` types. The
 /// duplication will be removed when `legacy_main` is deleted in PR 15.
-fn http_error(report: &Report<TrustedServerError>) -> Response {
+pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
 
@@ -148,6 +150,39 @@ fn http_error(report: &Report<TrustedServerError>) -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+// ---------------------------------------------------------------------------
+// Startup error fallback
+// ---------------------------------------------------------------------------
+
+/// Returns a [`RouterService`] that responds to every route with the startup error.
+///
+/// Called when [`build_state`] fails so that request handling degrades to a
+/// structured HTTP error response rather than an unrecoverable panic.
+fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
+    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
+    let status = e.current_context().status_code();
+
+    let make = move |msg: Arc<String>| {
+        move |_ctx: RequestContext| {
+            let body = edgezero_core::body::Body::from((*msg).clone());
+            let mut resp = Response::new(body);
+            *resp.status_mut() = status;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            async move { Ok::<Response, EdgeError>(resp) }
+        }
+    };
+
+    RouterService::builder()
+        .get("/", make(Arc::clone(&message)))
+        .post("/", make(Arc::clone(&message)))
+        .get("/{*rest}", make(Arc::clone(&message)))
+        .post("/{*rest}", make(Arc::clone(&message)))
+        .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +198,13 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = build_state();
+        let state = match build_state() {
+            Ok(s) => s,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return startup_error_router(e);
+            }
+        };
 
         // Each handler below follows the same pattern: clone state, build
         // per-request services, consume the context into the request, call the
@@ -357,7 +398,10 @@ impl Hooks for TrustedServerApp {
         };
 
         RouterService::builder()
-            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(FinalizeResponseMiddleware::new(
+                Arc::clone(&state.settings),
+                Arc::new(FastlyPlatformGeo),
+            ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)

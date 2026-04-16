@@ -208,15 +208,12 @@ impl PermutiveIntegration {
         log::info!("Forwarding {} to {}", route_name, target_url);
 
         let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            let bytes = collect_body_bounded(
-                body,
-                INTEGRATION_MAX_BODY_BYTES,
-                PERMUTIVE_INTEGRATION_ID,
-            )
-            .await
-            .change_context(Self::error(format!(
-                "Permutive {route_name} request body too large"
-            )))?;
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, PERMUTIVE_INTEGRATION_ID)
+                    .await
+                    .change_context(Self::error(format!(
+                        "Permutive {route_name} request body too large"
+                    )))?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

@@ -779,7 +779,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -800,7 +800,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -828,7 +828,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "log",
  "proc-macro2",

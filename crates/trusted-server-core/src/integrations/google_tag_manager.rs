@@ -39,7 +39,10 @@ const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// Error type for payload size validation
 #[derive(Debug)]
 enum PayloadSizeError {
-    TooLarge { actual: usize, max: usize },
+    TooLarge {
+        actual: usize,
+        max: usize,
+    },
     /// Transport error while reading a streaming body chunk.
     StreamRead(String),
 }
