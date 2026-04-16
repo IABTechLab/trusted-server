@@ -12,6 +12,7 @@ use crate::constants::HEADER_X_TS_EC;
 use crate::cookies::set_ec_cookie;
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -243,6 +244,13 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`PlatformPendingRequest`] for the full
+/// explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
@@ -258,6 +266,7 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
 
@@ -652,11 +661,12 @@ impl IntegrationRegistry {
         method: &Method,
         path: &str,
         settings: &Settings,
+        services: &RuntimeServices,
         mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Generate EC ID before consuming request
-            let ec_id_result = get_or_generate_ec_id(settings, &req);
+            let ec_id_result = get_or_generate_ec_id(settings, services, &req);
 
             // Set EC ID header on the request so integrations can read it.
             // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
@@ -665,7 +675,7 @@ impl IntegrationRegistry {
                 req.set_header(HEADER_X_TS_EC, ec_id.as_str());
             }
 
-            let mut result = proxy.handle(settings, req).await;
+            let mut result = proxy.handle(settings, services, req).await;
 
             // Set EC ID header on successful responses
             if let Ok(ref mut response) = result {
@@ -950,6 +960,7 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::noop_services;
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -967,6 +978,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
@@ -1250,6 +1262,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             // Return a simple response without the EC ID header.
@@ -1279,6 +1292,7 @@ mod tests {
             &Method::GET,
             "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ));
 
@@ -1311,6 +1325,58 @@ mod tests {
     }
 
     #[test]
+    fn handle_proxy_replaces_invalid_ec_request_header_with_matching_response_cookie() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
+        req.set_header(HEADER_X_TS_EC, "evil;injected");
+
+        let result = futures::executor::block_on(registry.handle_proxy(
+            &Method::GET,
+            "/integrations/test/ec",
+            &settings,
+            &noop_services(),
+            req,
+        ))
+        .expect("should handle proxy request");
+
+        let response = result.expect("handler should succeed");
+        let response_header = response
+            .get_header(HEADER_X_TS_EC)
+            .expect("response should have x-ts-ec header")
+            .to_str()
+            .expect("header should be valid UTF-8")
+            .to_string();
+        let cookie_header = response
+            .get_header(header::SET_COOKIE)
+            .expect("response should have Set-Cookie header")
+            .to_str()
+            .expect("header should be valid UTF-8");
+        let cookie_value = cookie_header
+            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
+            .and_then(|s| s.split_once(';').map(|(value, _)| value))
+            .expect("should contain the ts-ec cookie value");
+
+        assert_ne!(
+            response_header, "evil;injected",
+            "should not reflect the tampered request header"
+        );
+        assert_eq!(
+            response_header, cookie_value,
+            "response header and cookie should carry the same effective EC ID"
+        );
+    }
+
+    #[test]
     fn handle_proxy_always_sets_cookie() {
         let settings = create_test_settings();
         let routes = vec![(
@@ -1329,6 +1395,7 @@ mod tests {
             &Method::GET,
             "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ))
         .expect("should handle proxy request");
@@ -1379,6 +1446,7 @@ mod tests {
             &Method::POST,
             "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ));
 
