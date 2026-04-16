@@ -6,9 +6,9 @@ const {
   mockProcessQueue,
   mockRequestBids,
   mockRegisterBidAdapter,
+  mockGetUserIdsAsEids,
   mockPbjs,
   mockGetBidAdapter,
-  mockGetUserIdsAsEids,
   mockAdapterManager,
 } = vi.hoisted(() => {
   const mockSetConfig = vi.fn();
@@ -16,7 +16,9 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
-  const mockGetUserIdsAsEids = vi.fn();
+  const mockGetUserIdsAsEids = vi.fn(
+    () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
+  );
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
@@ -33,9 +35,9 @@ const {
     mockProcessQueue,
     mockRequestBids,
     mockRegisterBidAdapter,
+    mockGetUserIdsAsEids,
     mockPbjs,
     mockGetBidAdapter,
-    mockGetUserIdsAsEids,
     mockAdapterManager,
   };
 });
@@ -967,5 +969,181 @@ describe('prebid/client-side bidders', () => {
     expect(hasAdapterError).toBe(false);
 
     errorSpy.mockRestore();
+  });
+});
+
+describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
+    // Restore the pbjs→mock wiring in case a prior test blanked it out.
+    (mockPbjs as any).getUserIdsAsEids = mockGetUserIdsAsEids;
+    delete (window as any).__tsjs_prebid;
+    // Wipe any leftover ts-eids cookie from previous tests.
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
+  });
+
+  afterEach(() => {
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
+  });
+
+  /**
+   * Helper: make mockRequestBids actually invoke the injected bidsBackHandler
+   * so the shim's post-auction sync path runs.
+   */
+  function wireBidsBackHandler(): void {
+    mockRequestBids.mockImplementation((opts: any) => {
+      if (typeof opts?.bidsBackHandler === 'function') {
+        opts.bidsBackHandler();
+      }
+    });
+  }
+
+  function getTsEidsCookie(): string | undefined {
+    const match = document.cookie.split('; ').find((c) => c.startsWith('ts-eids='));
+    return match ? match.split('=').slice(1).join('=') : undefined;
+  }
+
+  it('writes no cookie when getUserIdsAsEids returns empty array', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    mockGetUserIdsAsEids.mockReturnValue([]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    expect(getTsEidsCookie()).toBeUndefined();
+  });
+
+  it('writes ts-eids cookie with base64-encoded flat JSON for normal payload', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'sharedid.org', uids: [{ id: 'shared-abc', atype: 1 }] },
+      { source: 'id5-sync.com', uids: [{ id: 'id5-xyz', atype: 3 }] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    const encoded = getTsEidsCookie();
+    expect(encoded).toBeDefined();
+    const decoded = JSON.parse(atob(encoded!));
+    expect(decoded).toEqual([
+      { source: 'sharedid.org', id: 'shared-abc', atype: 1 },
+      { source: 'id5-sync.com', id: 'id5-xyz', atype: 3 },
+    ]);
+  });
+
+  it('defaults atype to 3 when the uid omits it', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'example.com', uids: [{ id: 'no-atype' }] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    const decoded = JSON.parse(atob(getTsEidsCookie()!));
+    expect(decoded).toEqual([{ source: 'example.com', id: 'no-atype', atype: 3 }]);
+  });
+
+  it('skips EID entries that are missing id or source', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'good.example', uids: [{ id: 'keep', atype: 1 }] },
+      { source: 'empty-uids.example', uids: [] },
+      { source: '', uids: [{ id: 'no-source', atype: 1 }] },
+      { source: 'no-id.example', uids: [{ id: '', atype: 1 }] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    const decoded = JSON.parse(atob(getTsEidsCookie()!));
+    expect(decoded).toEqual([{ source: 'good.example', id: 'keep', atype: 1 }]);
+  });
+
+  it('takes the first uid per source when multiple are present', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    mockGetUserIdsAsEids.mockReturnValue([
+      {
+        source: 'multi.example',
+        uids: [
+          { id: 'first', atype: 1 },
+          { id: 'second', atype: 2 },
+        ],
+      },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    const decoded = JSON.parse(atob(getTsEidsCookie()!));
+    expect(decoded).toEqual([{ source: 'multi.example', id: 'first', atype: 1 }]);
+  });
+
+  it('trims EIDs from the tail when the cookie payload would exceed 3072 bytes', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+
+    // Build ~20 entries each ~200 bytes → definitely exceeds 3072-byte cap
+    // once base64-encoded.
+    const big = Array.from({ length: 20 }, (_, i) => ({
+      source: `source-${i}.example`,
+      uids: [{ id: 'x'.repeat(200) + String(i), atype: 3 }],
+    }));
+    mockGetUserIdsAsEids.mockReturnValue(big);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    const encoded = getTsEidsCookie();
+    expect(encoded).toBeDefined();
+    expect(encoded!.length).toBeLessThanOrEqual(3072);
+
+    const decoded = JSON.parse(atob(encoded!));
+    // At least one entry kept, strictly fewer than original count.
+    expect(decoded.length).toBeGreaterThan(0);
+    expect(decoded.length).toBeLessThan(big.length);
+    // Head of the list is preserved (trimming happens from the tail).
+    expect(decoded[0].source).toBe('source-0.example');
+  });
+
+  it('writes no cookie when a single entry alone exceeds the cap', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+
+    // Single entry large enough to blow past 3072 bytes after base64.
+    mockGetUserIdsAsEids.mockReturnValue([
+      { source: 'too-big.example', uids: [{ id: 'x'.repeat(4000), atype: 3 }] },
+    ]);
+
+    pbjs.requestBids({ adUnits: [] } as any);
+
+    expect(getTsEidsCookie()).toBeUndefined();
+  });
+
+  it('does not throw when getUserIdsAsEids is undefined (pre-fix production state)', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    // Simulate a build that forgot the userId core module.
+    (mockPbjs as any).getUserIdsAsEids = undefined;
+
+    expect(() => pbjs.requestBids({ adUnits: [] } as any)).not.toThrow();
+    expect(getTsEidsCookie()).toBeUndefined();
+
+    // Restore for subsequent tests.
+    (mockPbjs as any).getUserIdsAsEids = mockGetUserIdsAsEids;
+  });
+
+  it('calls the original bidsBackHandler after syncing EIDs', () => {
+    wireBidsBackHandler();
+    const pbjs = installPrebidNpm();
+    const originalHandler = vi.fn();
+
+    pbjs.requestBids({ adUnits: [], bidsBackHandler: originalHandler } as any);
+
+    expect(originalHandler).toHaveBeenCalledTimes(1);
   });
 });
