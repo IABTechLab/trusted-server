@@ -240,12 +240,11 @@ remains in place — no need to bypass it.
 
 Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 `html_post_processors`. Script rewriters run inside `lol_html` element handlers
-and currently require buffered mode because `lol_html` fragments text nodes
-across chunk boundaries (see [Phase 3](#text-node-fragmentation-phase-3)).
-`html_post_processors` require the full document for post-processing.
-The streaming gate checks `has_html_post_processors()` for the
-post-processor path; `create_html_processor` separately gates the adapter mode
-on `script_rewriters`. Currently only Next.js registers a post-processor.
+during streaming and are now fragment-safe (resolved in
+[Phase 3](#text-node-fragmentation-phase-3)). `html_post_processors` require
+the full document for post-processing. The streaming gate checks
+`has_html_post_processors()` for the post-processor path. Currently only
+Next.js registers a post-processor.
 
 ## Text Node Fragmentation (Phase 3)
 
@@ -254,14 +253,16 @@ HTML incrementally. Script rewriters (`NextJsNextDataRewriter`,
 `GoogleTagManagerIntegration`) expect complete text content — if a domain string
 is split across chunks, the rewrite silently fails.
 
-**Phase 1 workaround**: `HtmlRewriterAdapter` has two modes. `new()` streams
-per chunk (no script rewriters). `new_buffered()` accumulates input and
-processes in one `write()` call (script rewriters registered).
-`create_html_processor` selects the mode automatically.
+**Resolved in Phase 3**: Each script rewriter is now fragment-safe. They
+accumulate text fragments internally via `Mutex<String>` until
+`is_last_in_text_node` is true, then process the complete text. Intermediate
+fragments return `RemoveNode` (suppressed from output); the final fragment
+emits the full rewritten content via `Replace`. If no rewrite is needed,
+the full accumulated content is still emitted via `Replace` (since
+intermediate fragments were already removed from the output).
 
-**Phase 3** will make each script rewriter fragment-safe by accumulating text
-fragments internally via `is_last_in_text_node`. This removes the buffered
-fallback and enables streaming for all configurations. See #584.
+The `HtmlRewriterAdapter` buffered mode (`new_buffered()`) has been removed.
+`create_html_processor` always uses the streaming adapter.
 
 ## Rollback Strategy
 
@@ -371,3 +372,54 @@ hex // compare this between baseline and feature branch
 - Compare against Viceroy results to account for real network conditions.
 - Monitor WASM heap usage via Fastly dashboard.
 - Verify no regressions on static endpoints or auction.
+
+### Results (getpurpose.ai, median over 5 runs, Chrome 1440x900)
+
+Measured via Chrome DevTools Protocol against prod (v135, buffered) and
+staging (v136, streaming). Chrome `--host-resolver-rules` used to route
+`getpurpose.ai` to the staging Fastly edge (167.82.83.52).
+
+| Metric                     | Production (v135, buffered) | Staging (v136, streaming) | Delta              |
+| -------------------------- | --------------------------- | ------------------------- | ------------------ |
+| **TTFB**                   | 54 ms                       | 35 ms                     | **-19 ms (-35%)**  |
+| **First Paint**            | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **First Contentful Paint** | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **DOM Content Loaded**     | 286 ms                      | 282 ms                    | -4 ms (~same)      |
+| **DOM Complete**           | 1060 ms                     | 663 ms                    | **-397 ms (-37%)** |
+
+## Phase 4: Binary Pass-Through Streaming
+
+Non-processable content (images, fonts, video, `application/octet-stream`)
+currently passes through `handle_publisher_request` unchanged via the
+`Buffered` path, buffering the entire body in memory before sending. For
+large binaries (1-10 MB images), this is wasteful.
+
+Phase 4 adds a `PublisherResponse::PassThrough` variant that signals the
+adapter to stream the body directly via `io::copy` into `StreamingBody`
+with no processing pipeline. This eliminates peak memory for binary
+responses and improves DOM Complete for image-heavy pages.
+
+### Streaming gate (updated)
+
+```
+is_success (2xx)
+├── should_process && (!is_html || !has_post_processors) → Stream (pipeline)
+├── should_process && is_html && has_post_processors     → Buffered (post-processors)
+└── !should_process                                      → PassThrough (io::copy)
+
+!is_success
+└── any content type                                     → Buffered (error page)
+```
+
+### `PublisherResponse` enum (updated)
+
+```rust
+pub enum PublisherResponse {
+    Buffered(Response),
+    Stream { response, body, params },
+    PassThrough { response, body },
+}
+```
+
+`Content-Length` is preserved for `PassThrough` since the body is
+unmodified — no need for chunked transfer encoding.
