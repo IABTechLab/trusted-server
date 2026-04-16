@@ -243,7 +243,7 @@ Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 and currently require buffered mode because `lol_html` fragments text nodes
 across chunk boundaries (see [Phase 3](#text-node-fragmentation-phase-3)).
 `html_post_processors` require the full document for post-processing.
-The streaming gate checks `html_post_processors().is_empty()` for the
+The streaming gate checks `has_html_post_processors()` for the
 post-processor path; `create_html_processor` separately gates the adapter mode
 on `script_rewriters`. Currently only Next.js registers a post-processor.
 

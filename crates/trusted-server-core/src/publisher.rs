@@ -7,6 +7,8 @@
 //! all other `fastly::Request`/`Response`/`Body` migrations. It is not a
 //! content-rewriting concern.
 
+use std::io::Write;
+
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -178,12 +180,21 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
 }
 
-/// Process response body in streaming fashion with compression preservation
-fn process_response_streaming(
+/// Process response body through the streaming pipeline.
+///
+/// Selects the appropriate processor based on content type (HTML rewriter,
+/// RSC Flight rewriter, or URL replacer) and pipes chunks from `body`
+/// through it into `output`. The caller decides what `output` is — a
+/// `Vec<u8>` for buffered responses, or a `StreamingBody` for streaming.
+///
+/// # Errors
+///
+/// Returns an error if processor creation or chunk processing fails.
+fn process_response_streaming<W: Write>(
     body: Body,
+    output: &mut W,
     params: &ProcessResponseParams,
-) -> Result<Body, Report<TrustedServerError>> {
-    // Check if this is HTML content
+) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
     log::debug!(
@@ -195,15 +206,14 @@ fn process_response_streaming(
         params.origin_host
     );
 
-    // Determine compression type
     let compression = Compression::from_content_encoding(params.content_encoding);
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: 8192,
+    };
 
-    // Create output body to collect results
-    let mut output = Vec::new();
-
-    // Choose processor based on content type
     if is_html {
-        // Use HTML rewriter for HTML content
         let processor = create_html_stream_processor(
             params.origin_host,
             params.request_host,
@@ -211,57 +221,26 @@ fn process_response_streaming(
             params.settings,
             params.integration_registry,
         )?;
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else if is_rsc_flight {
-        // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
-        // corrupt the stream by changing byte lengths without updating the prefixes.
         let processor = RscFlightUrlRewriter::new(
             params.origin_host,
             params.origin_url,
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else {
-        // Use simple text replacer for non-HTML content
         let replacer = create_url_replacer(
             params.origin_host,
             params.origin_url,
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, replacer);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, replacer).process(body, output)?;
     }
 
-    log::debug!(
-        "Streaming processing complete - output size: {} bytes",
-        output.len()
-    );
-    Ok(Body::from(output))
+    Ok(())
 }
 
 /// Create a unified HTML stream processor
@@ -285,23 +264,87 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
-/// Proxies requests to the publisher's origin server.
+/// Result of publisher request handling, indicating whether the response
+/// body should be streamed or has already been buffered.
+pub enum PublisherResponse {
+    /// Response is fully buffered and ready to send via `send_to_client()`.
+    Buffered(Response),
+    /// Response headers are ready. The caller must:
+    /// 1. Call `finalize_response()` on the response
+    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
+    /// 3. Call `stream_publisher_body()` with the body and streaming writer
+    /// 4. Call `StreamingBody::finish()`
+    Stream {
+        /// Response with all headers set (EC ID, cookies, etc.)
+        /// but body not yet written. `Content-Length` already removed.
+        response: Response,
+        /// Origin body to be piped through the streaming pipeline.
+        body: Body,
+        /// Parameters for `process_response_streaming`.
+        params: OwnedProcessResponseParams,
+    },
+}
+
+/// Owned version of [`ProcessResponseParams`] for returning from
+/// `handle_publisher_request` without lifetime issues.
+pub struct OwnedProcessResponseParams {
+    pub(crate) content_encoding: String,
+    pub(crate) origin_host: String,
+    pub(crate) origin_url: String,
+    pub(crate) request_host: String,
+    pub(crate) request_scheme: String,
+    pub(crate) content_type: String,
+}
+
+/// Stream the publisher response body through the processing pipeline.
 ///
-/// This function forwards incoming requests to the configured origin URL,
-/// preserving headers and request body. It's used as a fallback for routes
-/// not explicitly handled by the trusted server.
+/// Called by the adapter after `stream_to_client()` has committed the
+/// response headers. Writes processed chunks directly to `output`.
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if:
-/// - The proxy request fails
-/// - The origin backend is unreachable
+/// Returns an error if processing fails mid-stream. Since headers are
+/// already committed, the caller should log the error and drop the
+/// `StreamingBody` (client sees a truncated response).
+pub fn stream_publisher_body<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<(), Report<TrustedServerError>> {
+    let borrowed = ProcessResponseParams {
+        content_encoding: &params.content_encoding,
+        origin_host: &params.origin_host,
+        origin_url: &params.origin_url,
+        request_host: &params.request_host,
+        request_scheme: &params.request_scheme,
+        settings,
+        content_type: &params.content_type,
+        integration_registry,
+    };
+    process_response_streaming(body, output, &borrowed)
+}
+
+/// Proxies requests to the publisher's origin server.
+///
+/// Returns a [`PublisherResponse`] indicating whether the response can be
+/// streamed or must be sent buffered. The streaming path is chosen when:
+/// - The backend returns a 2xx status
+/// - The response has a processable content type
+/// - The response uses a supported `Content-Encoding` (gzip, deflate, br)
+/// - No HTML post-processors are registered (the streaming gate)
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if the proxy request fails or the
+/// origin backend is unreachable.
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
     mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
@@ -362,7 +405,7 @@ pub fn handle_publisher_request(
             .map(|_| services.kv_store()),
     });
     let ec_allowed = allows_ec_creation(&consent_context);
-    log::trace!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed);
+    log::debug!("Proxy ec_allowed: {}", ec_allowed);
 
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
@@ -385,99 +428,169 @@ pub fn handle_publisher_request(
             message: "Failed to proxy request to origin".to_string(),
         })?;
 
-    // Log all response headers for debugging
     log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
         log::debug!("  {}: {:?}", name, value);
     }
 
-    // Check if the response has a text-based content type that we should process
+    // Set EC ID / cookie headers BEFORE body processing.
+    // These are body-independent (computed from request cookies + consent).
+    apply_ec_headers(
+        settings,
+        services,
+        &mut response,
+        &ec_id,
+        ec_allowed,
+        existing_ec_cookie.as_deref(),
+        &consent_context,
+    );
+
     let content_type = response
         .get_header(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_string();
 
-    let should_process = content_type.contains("text/")
-        || content_type.contains("application/javascript")
-        || content_type.contains("application/json");
+    let should_process = is_processable_content_type(&content_type);
+    let is_success = response.get_status().is_success();
 
-    if should_process && !request_host.is_empty() {
-        // Check if the response is compressed
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_lowercase();
-
-        // Log response details for debugging
+    if !should_process || request_host.is_empty() || !is_success {
         log::debug!(
-            "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+            "Skipping response processing - should_process: {}, request_host: '{}', status: {}",
+            should_process,
+            request_host,
+            response.get_status(),
+        );
+        return Ok(PublisherResponse::Buffered(response));
+    }
+
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    // Streaming gate: can we stream this response?
+    // - 2xx status (non-success already returned Buffered above)
+    // - Supported Content-Encoding (unsupported would fail mid-stream)
+    // - No HTML post-processors registered (they need the full document)
+    // - Non-HTML content always streams (post-processors only apply to HTML)
+    let is_html = content_type.contains("text/html");
+    let has_post_processors = integration_registry.has_html_post_processors();
+    let encoding_supported = is_supported_content_encoding(&content_encoding);
+    let can_stream = encoding_supported && (!is_html || !has_post_processors);
+
+    if can_stream {
+        log::debug!(
+            "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
             content_type, content_encoding, request_host, origin_host
         );
 
-        // Take the response body for streaming processing
         let body = response.take_body();
+        response.remove_header(header::CONTENT_LENGTH);
 
-        // Process the body using streaming approach
-        let params = ProcessResponseParams {
-            content_encoding: &content_encoding,
-            origin_host: &origin_host,
-            origin_url: &settings.publisher.origin_url,
-            request_host,
-            request_scheme,
-            settings,
-            content_type: &content_type,
-            integration_registry,
-        };
-        match process_response_streaming(body, &params) {
-            Ok(processed_body) => {
-                // Set the processed body back
-                response.set_body(processed_body);
-
-                // Remove Content-Length as the size has likely changed
-                response.remove_header(header::CONTENT_LENGTH);
-
-                // Keep Content-Encoding header since we're returning compressed content
-                log::debug!(
-                    "Preserved Content-Encoding: {} for compressed response",
-                    content_encoding
-                );
-
-                log::debug!("Completed streaming processing of response body");
-            }
-            Err(e) => {
-                log::error!("Failed to process response body: {:?}", e);
-                // Return an error response
-                return Err(e);
-            }
-        }
-    } else {
-        log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}'",
-            should_process,
-            request_host
-        );
+        return Ok(PublisherResponse::Stream {
+            response,
+            body,
+            params: OwnedProcessResponseParams {
+                content_encoding,
+                origin_host,
+                origin_url: settings.publisher.origin_url.clone(),
+                request_host: request_host.to_string(),
+                request_scheme: request_scheme.to_string(),
+                content_type,
+            },
+        });
     }
 
-    // Consent-gated EC creation:
-    // - Consent given → set EC ID header + cookie.
-    // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
-    // - Consent absent + no cookie → do nothing.
+    // Unsupported Content-Encoding: we cannot decompress, so processing would
+    // treat compressed bytes as identity and produce garbled output. Return
+    // the origin response unchanged.
+    if !encoding_supported {
+        log::warn!(
+            "Unsupported Content-Encoding '{}' - returning response unmodified",
+            content_encoding,
+        );
+        return Ok(PublisherResponse::Buffered(response));
+    }
+
+    // Buffered fallback: post-processors need the full document.
+    log::debug!(
+        "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+        content_type, content_encoding, request_host, origin_host
+    );
+
+    let body = response.take_body();
+    let params = ProcessResponseParams {
+        content_encoding: &content_encoding,
+        origin_host: &origin_host,
+        origin_url: &settings.publisher.origin_url,
+        request_host,
+        request_scheme,
+        settings,
+        content_type: &content_type,
+        integration_registry,
+    };
+    let mut output = Vec::new();
+    process_response_streaming(body, &mut output, &params)?;
+
+    response.set_header(header::CONTENT_LENGTH, output.len().to_string());
+    response.set_body(Body::from(output));
+
+    Ok(PublisherResponse::Buffered(response))
+}
+
+/// Whether the content type requires processing (URL rewriting, HTML injection).
+///
+/// Text-based and JavaScript/JSON responses are processable; binary types
+/// (images, fonts, video, etc.) pass through unchanged.
+fn is_processable_content_type(content_type: &str) -> bool {
+    content_type.contains("text/")
+        || content_type.contains("application/javascript")
+        || content_type.contains("application/json")
+}
+
+/// Whether the `Content-Encoding` is one the streaming pipeline can handle.
+///
+/// Unsupported encodings (e.g. `zstd` from a misbehaving origin) bypass the
+/// rewrite pipeline entirely and are returned unchanged. Processing such
+/// bodies as identity-encoded would produce garbled output.
+fn is_supported_content_encoding(encoding: &str) -> bool {
+    matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
+}
+
+/// Apply EC ID and cookie headers to the response.
+///
+/// Extracted so headers can be set before streaming begins (headers must
+/// be finalized before `stream_to_client()` commits them).
+///
+/// Consent-gated EC creation:
+/// - Consent given → set EC ID header + cookie.
+/// - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
+/// - Consent absent + no cookie → do nothing.
+fn apply_ec_headers(
+    settings: &Settings,
+    services: &RuntimeServices,
+    response: &mut Response,
+    ec_id: &str,
+    ec_allowed: bool,
+    existing_ec_cookie: Option<&str>,
+    consent_context: &crate::consent::ConsentContext,
+) {
     if ec_allowed {
         // Fastly's HeaderValue API rejects \r, \n, and \0, so the EC ID
         // cannot inject additional response headers.
-        response.set_header(HEADER_X_TS_EC, ec_id.as_str());
+        response.set_header(HEADER_X_TS_EC, ec_id);
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        set_ec_cookie(settings, &mut response, ec_id.as_str());
-    } else if let Some(cookie_ec_id) = existing_ec_cookie.as_deref() {
+        set_ec_cookie(settings, response, ec_id);
+    } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        expire_ec_cookie(settings, &mut response);
+        expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -487,8 +600,6 @@ pub fn handle_publisher_request(
             consent_context.jurisdiction,
         );
     }
-
-    Ok(response)
 }
 
 #[cfg(test)]
@@ -517,19 +628,87 @@ mod tests {
             ("application/octet-stream", false),
         ];
 
-        for (content_type, should_process) in test_cases {
-            let result = content_type.contains("text/html")
-                || content_type.contains("text/css")
-                || content_type.contains("text/javascript")
-                || content_type.contains("application/javascript")
-                || content_type.contains("application/json");
-
+        for (content_type, expected) in test_cases {
             assert_eq!(
-                result, should_process,
-                "Content-Type '{}' should_process: expected {}, got {}",
-                content_type, should_process, result
+                is_processable_content_type(content_type),
+                expected,
+                "Content-Type '{content_type}' should_process: expected {expected}",
             );
         }
+    }
+
+    #[test]
+    fn supported_content_encoding_accepts_known_values() {
+        assert!(is_supported_content_encoding(""), "should accept empty");
+        assert!(
+            is_supported_content_encoding("identity"),
+            "should accept identity"
+        );
+        assert!(is_supported_content_encoding("gzip"), "should accept gzip");
+        assert!(
+            is_supported_content_encoding("deflate"),
+            "should accept deflate"
+        );
+        assert!(is_supported_content_encoding("br"), "should accept br");
+    }
+
+    #[test]
+    fn supported_content_encoding_rejects_unknown_values() {
+        assert!(!is_supported_content_encoding("zstd"), "should reject zstd");
+        assert!(
+            !is_supported_content_encoding("compress"),
+            "should reject compress"
+        );
+        assert!(
+            !is_supported_content_encoding("snappy"),
+            "should reject snappy"
+        );
+    }
+
+    #[test]
+    fn unsupported_encoding_response_is_returned_unmodified() {
+        // Simulate a processable (HTML) 2xx response with an unsupported
+        // Content-Encoding. The bytes are not real zstd - the point is that
+        // they must be returned untouched rather than fed to the rewriter as
+        // identity-encoded text.
+        let origin_bytes = b"\x28\xb5\x2f\xfd\x00\x58\x61\x00\x00not really zstd".to_vec();
+
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+        response.set_header(header::CONTENT_ENCODING, "zstd");
+        response.set_body(Body::from(origin_bytes.clone()));
+
+        // Re-derive the gate decision the same way handle_publisher_request does.
+        let content_type = response
+            .get_header(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let content_encoding = response
+            .get_header(header::CONTENT_ENCODING)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+
+        assert!(
+            is_processable_content_type(&content_type),
+            "text/html must be processable"
+        );
+        assert!(response.get_status().is_success(), "status must be 2xx");
+        assert!(
+            !is_supported_content_encoding(&content_encoding),
+            "zstd must not be a supported encoding"
+        );
+
+        // The fix: when the only reason to fall out of the streaming gate is
+        // unsupported encoding, return the response unchanged rather than
+        // re-routing through process_response_streaming (which would treat
+        // the compressed bytes as identity and garble them).
+        let body = response.into_body().into_bytes();
+        assert_eq!(
+            body, origin_bytes,
+            "unsupported-encoding response must pass through byte-for-byte"
+        );
     }
 
     #[test]
