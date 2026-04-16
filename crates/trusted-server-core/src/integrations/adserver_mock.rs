@@ -21,7 +21,9 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
 use crate::error::TrustedServerError;
-use crate::integrations::{ensure_integration_backend_with_timeout, predict_backend_name_for_url};
+use crate::integrations::{
+    collect_body, ensure_integration_backend_with_timeout, predict_backend_name_for_url,
+};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -359,7 +361,7 @@ impl AuctionProvider for AdServerMockProvider {
         Ok(pending)
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
@@ -371,7 +373,12 @@ impl AuctionProvider for AdServerMockProvider {
             return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
         }
 
-        let body_bytes = response.into_body().into_bytes();
+        // collect_body handles both Once and Stream variants safely.
+        let body_bytes = collect_body(response.into_body(), "adserver_mock")
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to read AdServer Mock response body".to_string(),
+            })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse mediation response".to_string(),

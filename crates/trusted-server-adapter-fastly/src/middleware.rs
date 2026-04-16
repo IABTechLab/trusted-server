@@ -24,10 +24,8 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::platform::PlatformGeo as _;
+use trusted_server_core::platform::PlatformGeo;
 use trusted_server_core::settings::Settings;
-
-use crate::platform::FastlyPlatformGeo;
 
 // ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
@@ -46,17 +44,15 @@ use crate::platform::FastlyPlatformGeo;
 /// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
-// Used in Task 4 when app.rs registers the middleware chain.
-#[allow(dead_code)]
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
+    geo: Arc<dyn PlatformGeo>,
 }
 
 impl FinalizeResponseMiddleware {
-    /// Creates a new [`FinalizeResponseMiddleware`] with the given settings.
-    #[allow(dead_code)]
-    pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+    /// Creates a new [`FinalizeResponseMiddleware`] with the given settings and geo lookup service.
+    pub fn new(settings: Arc<Settings>, geo: Arc<dyn PlatformGeo>) -> Self {
+        Self { settings, geo }
     }
 }
 
@@ -65,7 +61,7 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
 
-        let geo_info = FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+        let geo_info = self.geo.lookup(client_ip).unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
         });
@@ -87,20 +83,19 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and return [`EdgeError::internal`].
+/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
 ///
 /// # Errors
 ///
-/// Returns [`EdgeError::internal`] when [`enforce_basic_auth`] returns an error report.
-// Used in Task 4 when app.rs registers the middleware chain.
-#[allow(dead_code)]
+/// When [`enforce_basic_auth`] returns an error report, converts it to a 500 HTTP
+/// response so that [`FinalizeResponseMiddleware`] can still inject standard TS
+/// headers before the response reaches the client.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
 
 impl AuthMiddleware {
     /// Creates a new [`AuthMiddleware`] with the given settings.
-    #[allow(dead_code)]
     pub fn new(settings: Arc<Settings>) -> Self {
         Self { settings }
     }
@@ -114,12 +109,7 @@ impl Middleware for AuthMiddleware {
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                // `EdgeError::internal` requires `E: Into<anyhow::Error>`.
-                // `std::io::Error` satisfies this bound without pulling in anyhow
-                // as a direct dependency (which the project convention forbids).
-                return Err(EdgeError::internal(std::io::Error::other(format!(
-                    "auth check failed: {report}"
-                ))));
+                return Ok(crate::app::http_error(&report));
             }
         }
 
@@ -141,9 +131,6 @@ impl Middleware for AuthMiddleware {
 /// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. `settings.response_headers` — operator-configured overrides applied last
-// Called from FinalizeResponseMiddleware::handle and from tests.
-// This function is gated behind #[allow(dead_code)] until Task 4 wires app.rs.
-#[allow(dead_code)]
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_info: Option<&GeoInfo>,

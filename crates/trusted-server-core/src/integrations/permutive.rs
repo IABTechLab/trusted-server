@@ -16,8 +16,9 @@ use validator::Validate;
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    ensure_integration_backend, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -148,7 +149,9 @@ impl PermutiveIntegration {
             ))));
         }
 
-        let sdk_body = permutive_response.into_body().into_bytes();
+        let sdk_body = collect_body(permutive_response.into_body(), PERMUTIVE_INTEGRATION_ID)
+            .await
+            .change_context(Self::error("Failed to read Permutive SDK response body"))?;
         log::info!(
             "Successfully fetched Permutive SDK: {} bytes",
             sdk_body.len()
@@ -168,7 +171,7 @@ impl PermutiveIntegration {
             )
             .header("X-Permutive-SDK-Proxy", "true")
             .header("X-SDK-Source", &sdk_url)
-            .body(EdgeBody::from(sdk_body.to_vec()))
+            .body(EdgeBody::from(sdk_body))
             .change_context(Self::error("Failed to build Permutive SDK response"))
     }
 
@@ -205,7 +208,13 @@ impl PermutiveIntegration {
         log::info!("Forwarding {} to {}", route_name, target_url);
 
         let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            body
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, PERMUTIVE_INTEGRATION_ID)
+                    .await
+                    .change_context(Self::error(format!(
+                        "Permutive {route_name} request body too large"
+                    )))?;
+            EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };

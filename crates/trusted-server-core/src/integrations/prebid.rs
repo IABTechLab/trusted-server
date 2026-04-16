@@ -21,9 +21,10 @@ use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    ensure_integration_backend_with_timeout, predict_backend_name_for_url, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
+    collect_body, ensure_integration_backend_with_timeout, predict_backend_name_for_url,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
 };
 use crate::openrtb::{
     to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
@@ -1145,7 +1146,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         Ok(pending)
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
@@ -1153,8 +1154,12 @@ impl AuctionProvider for PrebidAuctionProvider {
         let response = response.response;
         let status = response.status();
 
-        // Parse response
-        let body_bytes = response.into_body().into_bytes();
+        // Parse response — collect_body handles both Once and Stream variants safely.
+        let body_bytes = collect_body(response.into_body(), "prebid")
+            .await
+            .change_context(TrustedServerError::Prebid {
+                message: "Failed to read Prebid response body".to_string(),
+            })?;
 
         if !status.is_success() {
             log::warn!("Prebid returned non-success status: {}", status,);

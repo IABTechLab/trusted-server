@@ -37,11 +37,13 @@ pub trait AuctionProvider: Send + Sync {
     /// Parse the response from the provider into an `AuctionResponse`.
     ///
     /// Called by the orchestrator after the [`PlatformPendingRequest`] completes.
+    /// Declared async so implementations can safely drain streaming response bodies
+    /// without panicking on the `Body::Stream` variant.
     ///
     /// # Errors
     ///
     /// Returns an error if the response cannot be parsed into a valid `AuctionResponse`.
-    fn parse_response(
+    async fn parse_response(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,

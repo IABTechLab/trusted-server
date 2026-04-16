@@ -361,7 +361,7 @@ pub async fn handle_publisher_request(
     // and falls back to stored consent when cookies are absent.
     let geo = services
         .geo()
-        .lookup(services.client_info.client_ip)
+        .lookup(services.client_info().client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
