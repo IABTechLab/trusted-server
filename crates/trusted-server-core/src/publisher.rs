@@ -274,10 +274,10 @@ pub enum PublisherResponse {
         /// Parameters for `process_response_streaming`.
         params: OwnedProcessResponseParams,
     },
-    /// Non-processable 2xx response (images, fonts, video). The caller must:
-    /// 1. Reattach the body via `response.set_body(body)`
-    /// 2. Call `finalize_response()` on the response
-    /// 3. Call `response.send_to_client()`
+    /// Non-processable 2xx response (images, fonts, video). The adapter must
+    /// reattach the body via `response.set_body(body)` before returning.
+    /// `finalize_response()` and `send_to_client()` are applied at the outer
+    /// response-dispatch level, not in this arm.
     ///
     /// `Content-Length` is preserved — the body is unmodified. Using
     /// `send_to_client()` instead of `stream_to_client()` avoids chunked
@@ -451,23 +451,33 @@ pub fn handle_publisher_request(
         .to_string();
 
     let should_process = is_processable_content_type(&content_type);
-    let is_success = response.get_status().is_success();
+    let status = response.get_status();
+    let is_success = status.is_success();
 
     if !should_process || request_host.is_empty() || !is_success {
         log::debug!(
             "Skipping response processing - should_process: {}, request_host: '{}', status: {}",
             should_process,
             request_host,
-            response.get_status(),
+            status,
         );
 
         // Stream non-processable 2xx responses directly to avoid buffering
         // large binaries (images, fonts, video) in memory.
         // Content-Length is preserved — the body is unmodified, so the
         // browser knows the exact size for progress/layout.
-        // Exclude 204 No Content — it must not have a message body.
-        let status = response.get_status();
-        if status.is_success() && status != StatusCode::NO_CONTENT && !should_process {
+        // Exclude 204 No Content (RFC 9110 §15.3.5) and 205 Reset Content
+        // (RFC 9110 §15.3.6) — both prohibit a message body.
+        if is_success
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
+            && !should_process
+        {
+            log::debug!(
+                "Pass-through binary response - Content-Type: '{}', status: {}",
+                content_type,
+                status,
+            );
             let body = response.take_body();
             return Ok(PublisherResponse::PassThrough { response, body });
         }
@@ -800,15 +810,32 @@ mod tests {
 
     #[test]
     fn pass_through_gate_excludes_204_no_content() {
-        // 204 must not have a message body; stream_to_client would add
-        // chunked Transfer-Encoding which violates HTTP spec.
+        // 204 must not have a message body (RFC 9110 §15.3.5); sending one
+        // would violate the HTTP spec.
         let status = StatusCode::NO_CONTENT;
         let should_process = false;
-        let should_pass_through =
-            status.is_success() && status != StatusCode::NO_CONTENT && !should_process;
+        let should_pass_through = status.is_success()
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
+            && !should_process;
         assert!(
             !should_pass_through,
             "204 No Content should not use PassThrough"
+        );
+    }
+
+    #[test]
+    fn pass_through_gate_excludes_205_reset_content() {
+        // 205 must not generate content (RFC 9110 §15.3.6).
+        let status = StatusCode::RESET_CONTENT;
+        let should_process = false;
+        let should_pass_through = status.is_success()
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
+            && !should_process;
+        assert!(
+            !should_pass_through,
+            "205 Reset Content should not use PassThrough"
         );
     }
 
