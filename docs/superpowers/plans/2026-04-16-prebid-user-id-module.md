@@ -391,6 +391,7 @@ Append this `describe` block to `crates/js/lib/test/integrations/prebid/index.te
 
 ```ts
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
 describe('prebid/index.ts User ID Module imports (regression guard)', () => {
@@ -418,7 +419,10 @@ describe('prebid/index.ts User ID Module imports (regression guard)', () => {
   // 'function'` at import time from within Vitest. Reading the source file
   // directly is the most reliable way to catch accidental removal of an
   // import, which is the exact regression that motivated this work.
-  const SOURCE_PATH = resolve(__dirname, '../../../src/integrations/prebid/index.ts');
+  // The package is ESM (`"type": "module"`), so `__dirname` is not defined —
+  // resolve relative to this file via `import.meta.url`.
+  const THIS_DIR = fileURLToPath(new URL('.', import.meta.url));
+  const SOURCE_PATH = resolve(THIS_DIR, '../../../src/integrations/prebid/index.ts');
   const source = readFileSync(SOURCE_PATH, 'utf8');
 
   for (const module of REQUIRED_IMPORTS) {
