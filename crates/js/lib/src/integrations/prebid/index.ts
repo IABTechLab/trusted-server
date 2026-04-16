@@ -463,6 +463,7 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
 function syncPrebidEidsCookie(): void {
   try {
     if (typeof pbjs.getUserIdsAsEids !== 'function') {
+      clearPrebidEidsCookie();
       return;
     }
 

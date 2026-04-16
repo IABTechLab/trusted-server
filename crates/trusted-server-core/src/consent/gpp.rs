@@ -111,56 +111,73 @@ fn decode_tcf_from_gpp(parsed: &iab_gpp::v1::GPPString) -> Option<TcfConsent> {
 /// 21=UsNj, 22=UsTn, 23=UsMn.
 const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
 
-/// Extracts the `sale_opt_out` signal from the first US section in a parsed
-/// GPP string.
+/// Extracts the `sale_opt_out` signal across all US sections in a parsed GPP
+/// string.
 ///
-/// Iterates through section IDs looking for any in the US range (7–23).
-/// For the first match, decodes the section and extracts `sale_opt_out`.
+/// Iterates through section IDs looking for any in the US range (7–23),
+/// decodes each US section, and aggregates the result conservatively:
 ///
-/// Returns `Some(true)` if the user opted out of sale, `Some(false)` if they
-/// did not, or `None` if no US section is present.
+/// - `Some(true)` if any decodable US section says the user opted out of sale
+/// - `Some(false)` if at least one decodable US section says they did not opt
+///   out and none say they opted out
+/// - `None` if no US section is present or no decodable US section yields a
+///   usable `sale_opt_out` signal
 fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
+    let mut saw_not_opted_out = false;
+
+    for us_section_id in parsed
+        .section_ids()
+        .filter(|id| US_SECTION_ID_RANGE.contains(&(**id as u16)))
+    {
+        match parsed.decode_section(*us_section_id) {
+            Ok(section) => match us_sale_opt_out_from_section(&section) {
+                Some(true) => return Some(true),
+                Some(false) => saw_not_opted_out = true,
+                None => {}
+            },
+            Err(e) => {
+                log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
+            }
+        }
+    }
+
+    if saw_not_opted_out {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
     use iab_gpp::sections::us_common::OptOut;
     use iab_gpp::sections::Section;
 
-    let us_section_id = parsed
-        .section_ids()
-        .find(|id| US_SECTION_ID_RANGE.contains(&(**id as u16)))?;
+    let sale_opt_out = match section {
+        Section::UsNat(s) => match &s.core {
+            iab_gpp::sections::usnat::Core::V1(c) => &c.sale_opt_out,
+            iab_gpp::sections::usnat::Core::V2(c) => &c.sale_opt_out,
+            _ => return None,
+        },
+        Section::UsCa(s) => &s.core.sale_opt_out,
+        Section::UsVa(s) => &s.core.sale_opt_out,
+        Section::UsCo(s) => &s.core.sale_opt_out,
+        Section::UsUt(s) => &s.core.sale_opt_out,
+        Section::UsCt(s) => &s.core.sale_opt_out,
+        Section::UsFl(s) => &s.core.sale_opt_out,
+        Section::UsMt(s) => &s.core.sale_opt_out,
+        Section::UsOr(s) => &s.core.sale_opt_out,
+        Section::UsTx(s) => &s.core.sale_opt_out,
+        Section::UsDe(s) => &s.core.sale_opt_out,
+        Section::UsIa(s) => &s.core.sale_opt_out,
+        Section::UsNe(s) => &s.core.sale_opt_out,
+        Section::UsNh(s) => &s.core.sale_opt_out,
+        Section::UsNj(s) => &s.core.sale_opt_out,
+        Section::UsTn(s) => &s.core.sale_opt_out,
+        Section::UsMn(s) => &s.core.sale_opt_out,
+        _ => return None,
+    };
 
-    match parsed.decode_section(*us_section_id) {
-        Ok(section) => {
-            let sale_opt_out = match &section {
-                Section::UsNat(s) => match &s.core {
-                    iab_gpp::sections::usnat::Core::V1(c) => &c.sale_opt_out,
-                    iab_gpp::sections::usnat::Core::V2(c) => &c.sale_opt_out,
-                    _ => return None,
-                },
-                Section::UsCa(s) => &s.core.sale_opt_out,
-                Section::UsVa(s) => &s.core.sale_opt_out,
-                Section::UsCo(s) => &s.core.sale_opt_out,
-                Section::UsUt(s) => &s.core.sale_opt_out,
-                Section::UsCt(s) => &s.core.sale_opt_out,
-                Section::UsFl(s) => &s.core.sale_opt_out,
-                Section::UsMt(s) => &s.core.sale_opt_out,
-                Section::UsOr(s) => &s.core.sale_opt_out,
-                Section::UsTx(s) => &s.core.sale_opt_out,
-                Section::UsDe(s) => &s.core.sale_opt_out,
-                Section::UsIa(s) => &s.core.sale_opt_out,
-                Section::UsNe(s) => &s.core.sale_opt_out,
-                Section::UsNh(s) => &s.core.sale_opt_out,
-                Section::UsNj(s) => &s.core.sale_opt_out,
-                Section::UsTn(s) => &s.core.sale_opt_out,
-                Section::UsMn(s) => &s.core.sale_opt_out,
-                // Non-US sections — should not reach here given the ID filter.
-                _ => return None,
-            };
-            Some(*sale_opt_out == OptOut::OptedOut)
-        }
-        Err(e) => {
-            log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
-            None
-        }
-    }
+    Some(*sale_opt_out == OptOut::OptedOut)
 }
 
 /// Parses a `__gpp_sid` cookie value into a vector of section IDs.
@@ -320,12 +337,136 @@ mod tests {
         }
     }
 
+    fn encode_fibonacci_integer(mut value: u16) -> String {
+        let mut fibs = vec![1_u16];
+        let mut next = 2_u16;
+        while next <= value {
+            fibs.push(next);
+            next = if fibs.len() == 1 {
+                2
+            } else {
+                fibs[fibs.len() - 1] + fibs[fibs.len() - 2]
+            };
+        }
+
+        let mut bits = vec![false; fibs.len()];
+        for (idx, fib) in fibs.iter().enumerate().rev() {
+            if *fib <= value {
+                value -= *fib;
+                bits[idx] = true;
+            }
+        }
+        bits.push(true);
+
+        bits.into_iter()
+            .map(|bit| if bit { '1' } else { '0' })
+            .collect()
+    }
+
+    fn encode_header(section_ids: &[u16]) -> String {
+        const BASE64_URL: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let mut bits = String::from("000011000001");
+        bits.push_str(&format!("{:012b}", section_ids.len()));
+
+        let mut previous = 0_u16;
+        for &section_id in section_ids {
+            bits.push('0');
+            bits.push_str(&encode_fibonacci_integer(section_id - previous));
+            previous = section_id;
+        }
+
+        while bits.len() % 6 != 0 {
+            bits.push('0');
+        }
+
+        bits.as_bytes()
+            .chunks(6)
+            .map(|chunk| {
+                let value = u8::from_str_radix(
+                    core::str::from_utf8(chunk).expect("should encode header bits as utf8"),
+                    2,
+                )
+                .expect("should parse 6-bit chunk");
+                char::from(BASE64_URL[value as usize])
+            })
+            .collect()
+    }
+
+    fn gpp_with_sections(sections: &[(u16, &str)]) -> String {
+        let ids = sections.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let header = encode_header(&ids);
+        let section_payloads = sections.iter().map(|(_, raw)| *raw).collect::<Vec<_>>();
+        format!("{header}~{}", section_payloads.join("~"))
+    }
+
     #[test]
     fn no_us_section_returns_none() {
         let result = decode_gpp_string(GPP_TCF_AND_USP).expect("should decode GPP");
         assert_eq!(
             result.us_sale_opt_out, None,
             "should return None when no US section (7-23) is present"
+        );
+    }
+
+    #[test]
+    fn later_us_section_opt_out_overrides_earlier_non_opt_out() {
+        let gpp = gpp_with_sections(&[(7, "BVQqAAAAAgA.QA"), (9, "BVVVVVVVVWA.AA")]);
+
+        let result = decode_gpp_string(&gpp).expect("should decode multi-section US GPP");
+
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(true),
+            "should treat any later decodable opt-out as authoritative"
+        );
+    }
+
+    #[test]
+    fn multiple_us_sections_without_opt_out_return_false() {
+        let gpp = gpp_with_sections(&[(7, "BVQqAAAAAgA.QA"), (9, "BVgVVVVVVWA.AA")]);
+
+        let result = decode_gpp_string(&gpp).expect("should decode multi-section US GPP");
+
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(false),
+            "should return false when decodable US sections consistently do not opt out"
+        );
+    }
+
+    #[test]
+    fn valid_opt_out_wins_even_if_another_us_section_is_undecodable() {
+        let gpp = gpp_with_sections(&[(7, "BVQqAAAAAgA.QA"), (9, "not-a-valid-usva-section")]);
+
+        let result = decode_gpp_string(&gpp).expect("should decode GPP header with raw sections");
+
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(false),
+            "should keep a valid non-opt-out signal even when another US section fails to decode"
+        );
+
+        let gpp = gpp_with_sections(&[(7, "not-a-valid-usnat-section"), (9, "BVVVVVVVVWA.AA")]);
+        let result = decode_gpp_string(&gpp).expect("should decode GPP header with raw sections");
+
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(true),
+            "should let a valid opt-out win even when another US section fails to decode"
+        );
+    }
+
+    #[test]
+    fn only_undecodable_us_sections_return_none() {
+        let gpp = gpp_with_sections(&[(7, "not-a-valid-usnat-section"), (9, "also-invalid")]);
+
+        let result = decode_gpp_string(&gpp).expect("should decode GPP header with raw sections");
+
+        assert_eq!(
+            result.us_sale_opt_out, None,
+            "should return None when no decodable US section yields sale_opt_out"
         );
     }
 }

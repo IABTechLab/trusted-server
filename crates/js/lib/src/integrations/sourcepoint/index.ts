@@ -1,6 +1,8 @@
 import { log } from '../../core/log';
 
 const SP_CONSENT_PREFIX = '_sp_user_consent_';
+const GPP_COOKIE_NAME = '__gpp';
+const GPP_SID_COOKIE_NAME = '__gpp_sid';
 
 interface SourcepointGppData {
   gppString: string;
@@ -20,10 +22,12 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
     if (!raw) continue;
 
     try {
-      return JSON.parse(raw) as SourcepointConsentPayload;
+      const payload = JSON.parse(raw) as SourcepointConsentPayload;
+      if (payload.gppData?.gppString) {
+        return payload;
+      }
     } catch {
       log.debug('sourcepoint: failed to parse localStorage value', { key });
-      return null;
     }
   }
   return null;
@@ -31,6 +35,10 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
 
 function writeCookie(name: string, value: string): void {
   document.cookie = `${name}=${value}; path=/; SameSite=Lax`;
+}
+
+function clearCookie(name: string): void {
+  document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax`;
 }
 
 /**
@@ -46,20 +54,26 @@ export function mirrorSourcepointConsent(): boolean {
 
   const payload = findSourcepointConsent();
   if (!payload?.gppData) {
+    clearCookie(GPP_COOKIE_NAME);
+    clearCookie(GPP_SID_COOKIE_NAME);
     log.debug('sourcepoint: no GPP data found in localStorage');
     return false;
   }
 
   const { gppString, applicableSections } = payload.gppData;
   if (!gppString) {
+    clearCookie(GPP_COOKIE_NAME);
+    clearCookie(GPP_SID_COOKIE_NAME);
     log.debug('sourcepoint: gppString is empty');
     return false;
   }
 
-  writeCookie('__gpp', gppString);
+  writeCookie(GPP_COOKIE_NAME, gppString);
 
   if (Array.isArray(applicableSections) && applicableSections.length > 0) {
-    writeCookie('__gpp_sid', applicableSections.join(','));
+    writeCookie(GPP_SID_COOKIE_NAME, applicableSections.join(','));
+  } else {
+    clearCookie(GPP_SID_COOKIE_NAME);
   }
 
   log.info('sourcepoint: mirrored GPP consent to cookies', {
