@@ -67,12 +67,12 @@ the relevant params):
 - `prebid.js/modules/connectIdSystem.js`
 - `prebid.js/modules/merkleIdSystem.js`
 
-**Legacy / compatibility:**
+Total: 1 core + 14 submodules = 15 new imports.
 
-- `prebid.js/modules/pubCommonIdSystem.js` — deprecated in favor of SharedID
-  but still present in some publisher configs.
-
-Total: 1 core + 15 submodules = 16 new imports.
+> **Note (2026-04-16, during implementation):** `pubCommonIdSystem.js`, which
+> was originally planned as a legacy/compatibility submodule, was removed from
+> Prebid.js in 10.x (consolidated into `sharedIdSystem`). It is not importable
+> from our pinned Prebid 10.26.0 and has been dropped from this plan.
 
 No changes to `installPrebidNpm`, no changes to the `bidsBackHandler` shim, no
 changes to `syncPrebidEidsCookie`. The existing cookie-writing path is already
