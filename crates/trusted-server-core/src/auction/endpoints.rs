@@ -8,6 +8,7 @@ use crate::auction::formats::AdRequest;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
+use crate::integrations::{collect_body_bounded, INTEGRATION_MAX_BODY_BYTES};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::synthetic::get_or_generate_synthetic_id;
@@ -37,9 +38,15 @@ pub async fn handle_auction(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = req.into_parts();
 
-    // Parse request body
+    // Parse request body — use a bounded read so streaming bodies cannot exhaust memory.
+    let body_bytes =
+        collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, "auction")
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to read auction request body".to_string(),
+            })?;
     let body: AdRequest =
-        serde_json::from_slice(&body.into_bytes()).change_context(TrustedServerError::Auction {
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
         })?;
 
@@ -58,11 +65,10 @@ pub async fn handle_auction(
         },
     )?;
 
-    // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
-        .lookup(services.client_info.client_ip)
+        .lookup(services.client_info().client_ip)
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None

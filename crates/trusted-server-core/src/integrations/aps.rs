@@ -16,6 +16,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::collect_body;
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::IntegrationConfig;
 
@@ -537,7 +538,7 @@ impl AuctionProvider for ApsAuctionProvider {
         Ok(pending)
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
@@ -550,8 +551,12 @@ impl AuctionProvider for ApsAuctionProvider {
             return Ok(AuctionResponse::error("aps", response_time_ms));
         }
 
-        // Parse response body
-        let body_bytes = response.into_body().into_bytes();
+        // Parse response body — collect_body handles both Once and Stream variants safely.
+        let body_bytes = collect_body(response.into_body(), "aps")
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to read APS response body".to_string(),
+            })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse APS response JSON".to_string(),

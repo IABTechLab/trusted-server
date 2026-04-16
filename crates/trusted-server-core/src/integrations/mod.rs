@@ -73,6 +73,9 @@ pub(crate) fn ensure_integration_backend(
         })
 }
 
+/// Maximum body size accepted by integration proxy endpoints (256 KiB).
+pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
+
 /// Drains an [`EdgeBody`] into a byte vector.
 ///
 /// # Errors
@@ -93,6 +96,57 @@ pub(crate) async fn collect_body(
                         message: format!("Failed to read response body: {error}"),
                     })
                 })?;
+                body_bytes.extend_from_slice(&chunk);
+            }
+            Ok(body_bytes)
+        }
+    }
+}
+
+/// Drains an [`EdgeBody`] into a byte vector, rejecting bodies larger than
+/// `max_bytes` with [`TrustedServerError::RequestTooLarge`].
+///
+/// Use this instead of [`collect_body`] for inbound request bodies where an
+/// unbounded read would allow clients to exhaust memory.
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - The body exceeds `max_bytes`.
+/// - A streaming body chunk cannot be read (mapped to an `Integration` error).
+pub(crate) async fn collect_body_bounded(
+    body: EdgeBody,
+    max_bytes: usize,
+    integration: &'static str,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    match body {
+        EdgeBody::Once(bytes) => {
+            if bytes.len() > max_bytes {
+                return Err(Report::new(TrustedServerError::RequestTooLarge {
+                    message: format!(
+                        "{integration}: request body ({} bytes) exceeds the {max_bytes} byte limit",
+                        bytes.len(),
+                    ),
+                }));
+            }
+            Ok(bytes.to_vec())
+        }
+        EdgeBody::Stream(mut stream) => {
+            let mut body_bytes = Vec::new();
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.map_err(|error| {
+                    Report::new(TrustedServerError::Integration {
+                        integration: integration.to_string(),
+                        message: format!("Failed to read request body: {error}"),
+                    })
+                })?;
+                if body_bytes.len() + chunk.len() > max_bytes {
+                    return Err(Report::new(TrustedServerError::RequestTooLarge {
+                        message: format!(
+                            "{integration}: request body exceeds the {max_bytes} byte limit",
+                        ),
+                    }));
+                }
                 body_bytes.extend_from_slice(&chunk);
             }
             Ok(body_bytes)

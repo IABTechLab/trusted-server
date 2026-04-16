@@ -19,7 +19,7 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
     for (header_name, value) in from.headers() {
         let name_str = header_name.as_str();
         if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
-            to.headers_mut().insert(header_name.clone(), value.clone());
+            to.headers_mut().append(header_name.clone(), value.clone());
         }
     }
 }
@@ -772,6 +772,34 @@ mod tests {
         assert!(
             target.headers().get("x-geo-country").is_none(),
             "Should filter x-geo-country"
+        );
+    }
+
+    #[test]
+    fn copy_custom_headers_preserves_duplicate_values() {
+        let mut from = build_request(Method::GET, "https://example.com");
+        from.headers_mut().append(
+            HeaderName::from_bytes(b"x-custom-data").expect("should build header name"),
+            HeaderValue::from_str("first").expect("should build header value"),
+        );
+        from.headers_mut().append(
+            HeaderName::from_bytes(b"x-custom-data").expect("should build header name"),
+            HeaderValue::from_str("second").expect("should build header value"),
+        );
+
+        let mut target = build_request(Method::GET, "https://target.com");
+        copy_custom_headers(&from, &mut target);
+
+        let values: Vec<_> = target
+            .headers()
+            .get_all("x-custom-data")
+            .iter()
+            .map(|v| v.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate x-header values"
         );
     }
 
