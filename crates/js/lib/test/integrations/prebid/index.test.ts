@@ -56,25 +56,13 @@ vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// User ID Module core + submodules — no-op mocks so jsdom does not try to
-// execute the real Prebid code paths.
+// User ID Module core — no-op mock so jsdom does not try to execute the
+// real Prebid code paths.
 vi.mock('prebid.js/modules/userId.js', () => ({}));
-vi.mock('prebid.js/modules/sharedIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/criteoIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/33acrossIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/pubProvidedIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/quantcastIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/id5IdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/identityLinkIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/uid2IdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/euidIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/intentIqIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/lotamePanoramaIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/connectIdSystem.js', () => ({}));
-vi.mock('prebid.js/modules/merkleIdSystem.js', () => ({}));
 
-// Mock the build-generated adapter imports (no-op in tests)
+// Mock the build-generated adapter and User ID submodule imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
+vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({}));
 
 import {
   collectBidders,
@@ -1166,38 +1154,49 @@ describe('prebid/syncPrebidEidsCookie (via bidsBackHandler)', () => {
   });
 });
 
-describe('prebid/index.ts User ID Module imports (regression guard)', () => {
-  const REQUIRED_IMPORTS = [
-    'prebid.js/modules/userId.js',
-    'prebid.js/modules/sharedIdSystem.js',
-    'prebid.js/modules/criteoIdSystem.js',
-    'prebid.js/modules/33acrossIdSystem.js',
-    'prebid.js/modules/pubProvidedIdSystem.js',
-    'prebid.js/modules/quantcastIdSystem.js',
-    'prebid.js/modules/id5IdSystem.js',
-    'prebid.js/modules/identityLinkIdSystem.js',
-    'prebid.js/modules/uid2IdSystem.js',
-    'prebid.js/modules/euidIdSystem.js',
-    'prebid.js/modules/intentIqIdSystem.js',
-    'prebid.js/modules/lotamePanoramaIdSystem.js',
-    'prebid.js/modules/connectIdSystem.js',
-    'prebid.js/modules/merkleIdSystem.js',
+describe('prebid User ID Module imports (regression guard)', () => {
+  // `userId.js` is the core module — bundled unconditionally via a static
+  // import in index.ts, never operator-configurable. Guard it there.
+  const INDEX_PATH = resolve(process.cwd(), 'src/integrations/prebid/index.ts');
+  const indexSource = readFileSync(INDEX_PATH, 'utf8');
+
+  it('index.ts statically imports the User ID core module', () => {
+    expect(indexSource).toMatch(/import\s+['"]prebid\.js\/modules\/userId\.js['"]/);
+  });
+
+  it('index.ts statically imports the generated User ID submodule file', () => {
+    expect(indexSource).toMatch(/import\s+['"]\.\/_user_ids\.generated['"]/);
+  });
+
+  // The submodule list is operator-controlled via TSJS_PREBID_USER_IDS, but
+  // the default ship-set must keep resolving without env var action. Read
+  // the generated file produced by `node build-all.mjs` with no env override
+  // and assert every default submodule is imported. If this file is missing,
+  // the developer has not yet run the build — skip with a clear message.
+  const GENERATED_PATH = resolve(process.cwd(), 'src/integrations/prebid/_user_ids.generated.ts');
+  const DEFAULT_SUBMODULES = [
+    'sharedIdSystem',
+    'criteoIdSystem',
+    '33acrossIdSystem',
+    'pubProvidedIdSystem',
+    'quantcastIdSystem',
+    'id5IdSystem',
+    'identityLinkIdSystem',
+    'uid2IdSystem',
+    'euidIdSystem',
+    'intentIqIdSystem',
+    'lotamePanoramaIdSystem',
+    'connectIdSystem',
+    'merkleIdSystem',
   ];
 
-  // Source-text check: these mocks make the runtime pbjs mock a no-op for the
-  // User ID Module, so there is no way to assert `typeof getUserIdsAsEids ===
-  // 'function'` at import time from within Vitest. Reading the source file
-  // directly is the most reliable way to catch accidental removal of an
-  // import, which is the exact regression that motivated this work.
-  // Vitest runs with `process.cwd()` set to the package root (`crates/js/lib`)
-  // where `package.json` lives.
-  const SOURCE_PATH = resolve(process.cwd(), 'src/integrations/prebid/index.ts');
-  const source = readFileSync(SOURCE_PATH, 'utf8');
-
-  for (const module of REQUIRED_IMPORTS) {
-    it(`statically imports ${module}`, () => {
-      const pattern = new RegExp(`import\\s+['"]${module.replace(/\./g, '\\.')}['"]`);
-      expect(source).toMatch(pattern);
+  for (const name of DEFAULT_SUBMODULES) {
+    it(`_user_ids.generated.ts imports ${name}.js by default`, () => {
+      const generated = readFileSync(GENERATED_PATH, 'utf8');
+      const pattern = new RegExp(
+        `import\\s+['"]prebid\\.js/modules/${name.replace(/\./g, '\\.')}\\.js['"]`
+      );
+      expect(generated).toMatch(pattern);
     });
   }
 });
