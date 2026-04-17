@@ -14,6 +14,7 @@ env:
   ORIGIN_PORT: 8888
   ARTIFACTS_DIR: /tmp/integration-test-artifacts
   WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-adapter-fastly.wasm
+  AXUM_ARTIFACT_PATH: /tmp/integration-test-artifacts/axum/trusted-server-axum
   DOCKER_ARTIFACT_PATH: /tmp/integration-test-artifacts/docker/test-images.tar
 
 jobs:
@@ -32,8 +33,9 @@ jobs:
 
       - name: Package integration test artifacts
         run: |
-          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")"
+          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")"
           cp target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm "$WASM_ARTIFACT_PATH"
+          cp target/debug/trusted-server-axum "$AXUM_ARTIFACT_PATH"
           docker save \
             --output "$DOCKER_ARTIFACT_PATH" \
             test-wordpress:latest test-nextjs:latest
@@ -80,6 +82,7 @@ jobs:
           -- --include-ignored --skip test_wordpress_fastly --skip test_nextjs_fastly --test-threads=1
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           RUST_LOG: info
 
