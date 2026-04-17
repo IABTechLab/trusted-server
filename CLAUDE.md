@@ -15,6 +15,7 @@ real-time bidding integration, and publisher-side JavaScript injection.
 crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
+  trusted-server-adapter-axum/          # Axum dev server entry point (native binary, excluded from workspace)
   js/            # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -49,6 +50,12 @@ fastly compute serve
 
 # Deploy to Fastly
 fastly compute publish
+
+# Run Axum dev server (native — no Viceroy)
+cargo run -p trusted-server-adapter-axum
+
+# Test Axum adapter only
+cargo test -p trusted-server-adapter-axum
 ```
 
 ### Testing & Quality
