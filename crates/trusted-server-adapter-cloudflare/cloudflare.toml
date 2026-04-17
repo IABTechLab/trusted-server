@@ -1,0 +1,21 @@
+[app]
+name = "trusted-server"
+version = "0.1.0"
+kind = "http"
+
+[adapters.cloudflare]
+
+[stores.kv]
+name = "trusted_server_kv"
+[stores.kv.adapters]
+cloudflare = "TRUSTED_SERVER_KV"
+
+[stores.config]
+name = "trusted_server_config"
+[stores.config.adapters]
+cloudflare = "TRUSTED_SERVER_CONFIG"
+
+[stores.secrets]
+name = "trusted_server_secrets"
+[stores.secrets.adapters.cloudflare]
+enabled = true

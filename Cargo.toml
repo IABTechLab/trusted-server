@@ -4,6 +4,7 @@ members = [
     "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
     "crates/trusted-server-adapter-axum",
+    "crates/trusted-server-adapter-cloudflare",
     "crates/js",
     "crates/openrtb",
 ]

@@ -148,6 +148,43 @@ pub struct PlatformSelectResult {
     pub remaining: Vec<PlatformPendingRequest>,
 }
 
+/// A [`PlatformHttpClient`] stand-in used when outbound HTTP is not available
+/// on the current platform (e.g. Cloudflare Workers, where the proxy client is
+/// managed by the edgezero dispatch layer instead).
+///
+/// Every method returns [`PlatformError::HttpClient`], ensuring that code paths
+/// that reach this stub receive a typed error. Adapter crates should use this
+/// type rather than defining their own stub so the fallback behaviour is
+/// consistent across all platform implementations.
+pub struct UnavailableHttpClient;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for UnavailableHttpClient {
+    async fn send(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+
+    async fn send_async(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+
+    async fn select(
+        &self,
+        _pending_requests: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+}
+
 /// Outbound HTTP client abstraction.
 ///
 /// Supports both single-request sends ([`Self::send`]) and async fan-out
