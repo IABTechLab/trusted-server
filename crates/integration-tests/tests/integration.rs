@@ -134,3 +134,19 @@ fn test_nextjs_fastly() {
     let framework = frameworks::nextjs::NextJs;
     test_combination(&runtime, &framework).expect("should pass Next.js on Fastly");
 }
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_wordpress_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Axum");
+}
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_nextjs_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Axum");
+}

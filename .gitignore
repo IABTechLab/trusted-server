@@ -2,6 +2,9 @@
 /bin
 /pkg
 /target
+
+# EdgeZero local KV store (created by axum dev server)
+.edgezero/
 /crates/integration-tests/target
 
 # env
