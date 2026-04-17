@@ -5,7 +5,7 @@
 //! drives it through the Tower `Service` interface.
 
 use axum::body::Body as AxumBody;
-use axum::http::{Request, StatusCode};
+use axum::http::Request;
 use edgezero_adapter_axum::EdgeZeroAxumService;
 use edgezero_core::app::Hooks as _;
 use tower::{Service as _, ServiceExt as _};
