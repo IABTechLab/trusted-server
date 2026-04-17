@@ -15,7 +15,8 @@ real-time bidding integration, and publisher-side JavaScript injection.
 crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
-  trusted-server-adapter-axum/          # Axum dev server entry point (native binary, excluded from workspace)
+  trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
+  trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   js/            # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -56,6 +57,15 @@ cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
 cargo test -p trusted-server-adapter-axum
+
+# Check Cloudflare adapter (native)
+cargo check -p trusted-server-adapter-cloudflare
+
+# Check Cloudflare adapter (WASM target)
+cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+
+# Test Cloudflare adapter
+cargo test -p trusted-server-adapter-cloudflare
 ```
 
 ### Testing & Quality
