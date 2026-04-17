@@ -27,23 +27,9 @@ cd trusted-server
 
 Trusted Server supports two local development modes:
 
-### Option A — Axum dev server (recommended for local development)
+### Option A — Fastly Compute via Viceroy
 
-No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
-
-```bash
-# Copy and edit the environment file
-cp .env.dev .env
-
-# Build and start the dev server
-cargo run -p trusted-server-adapter-axum
-```
-
-The server will be available at `http://localhost:8787`.
-
-### Option B — Fastly Compute via Viceroy
-
-Simulates the Fastly production environment locally.
+Simulates the full Fastly production environment locally.
 
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
@@ -58,6 +44,20 @@ fastly compute serve
 ```
 
 The server will be available at `http://localhost:7676`.
+
+### Option B — Axum dev server
+
+No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
+
+```bash
+# Copy and edit the environment file
+cp .env.dev .env
+
+# Build and start the dev server
+cargo run -p trusted-server-adapter-axum
+```
+
+The server will be available at `http://localhost:8787`.
 
 ### Build the Project
 
