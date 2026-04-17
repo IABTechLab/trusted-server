@@ -1,4 +1,0 @@
-# Override the workspace-root default target (wasm32-wasip1) with the native host target.
-# This crate requires a native build; it cannot compile for WASM.
-[build]
-target = "aarch64-apple-darwin"

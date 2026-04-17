@@ -44,7 +44,7 @@ jobs:
         run: cargo install --git https://github.com/fastly/Viceroy viceroy
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
 
   test-axum:
     name: cargo test (axum native)

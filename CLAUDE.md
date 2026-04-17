@@ -61,8 +61,9 @@ cargo test -p trusted-server-adapter-axum
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests (uses viceroy)
-cargo test --workspace
+# Run all Rust tests (Fastly/WASM crates via Viceroy, axum separately)
+cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+cargo test -p trusted-server-adapter-axum
 
 # Format
 cargo fmt --all -- --check

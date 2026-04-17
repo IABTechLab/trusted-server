@@ -3,17 +3,15 @@ resolver = "2"
 members = [
     "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
+    "crates/trusted-server-adapter-axum",
     "crates/js",
     "crates/openrtb",
 ]
-# These crates require a native target and are excluded from the WASM workspace.
+# Native-only crates excluded from the workspace:
 # - integration-tests: Run via ./scripts/integration-tests.sh
-# - trusted-server-adapter-axum: Run via `cargo build/test -p trusted-server-adapter-axum`
-#   (or the CI test-axum job)
 # - openrtb-codegen: code-generation tool, native only
 exclude = [
     "crates/integration-tests",
-    "crates/trusted-server-adapter-axum",
     "crates/openrtb-codegen",
 ]
 
