@@ -6,11 +6,14 @@ members = [
     "crates/js",
     "crates/openrtb",
 ]
-# integration-tests is intentionally excluded from workspace members because it
-# requires a native target (testcontainers, reqwest) while the workspace default
-# is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
+# These crates require a native target and are excluded from the WASM workspace.
+# - integration-tests: Run via ./scripts/integration-tests.sh
+# - trusted-server-adapter-axum: Run via `cargo build/test -p trusted-server-adapter-axum`
+#   (or the CI test-axum job)
+# - openrtb-codegen: code-generation tool, native only
 exclude = [
     "crates/integration-tests",
+    "crates/trusted-server-adapter-axum",
     "crates/openrtb-codegen",
 ]
 
@@ -78,6 +81,7 @@ matchit = "0.9"
 mime = "0.3"
 pin-project-lite = "0.2"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 regex = "1.12.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"

@@ -1,0 +1,12 @@
+/Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/deps/serde-0bceecd3f007506d.d: /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/build/serde-990ba98d1a425341/out/private.rs
+
+/Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/deps/libserde-0bceecd3f007506d.rmeta: /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/build/serde-990ba98d1a425341/out/private.rs
+
+/Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/prk-jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/build/serde-990ba98d1a425341/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/prk-jr/Desktop/opensource/rust/trusted-server/crates/trusted-server-adapter-axum/target/aarch64-apple-darwin/debug/build/serde-990ba98d1a425341/out
