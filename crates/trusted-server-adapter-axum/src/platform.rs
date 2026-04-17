@@ -5,10 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,10 +175,7 @@ impl PlatformBackend for AxumPlatformBackend {
 pub struct AxumPlatformGeo;
 
 impl PlatformGeo for AxumPlatformGeo {
-    fn lookup(
-        &self,
-        _client_ip: Option<IpAddr>,
-    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -211,6 +207,12 @@ pub struct AxumPlatformHttpClient {
 
 impl AxumPlatformHttpClient {
     /// Create a new client with sensible dev-server timeouts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `reqwest::Client` cannot be built (should not
+    /// happen with the default TLS configuration on any supported platform).
+    #[must_use]
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -226,9 +228,8 @@ impl AxumPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let uri = request.request.uri().to_string();
-        let method =
-            reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
-                .change_context(PlatformError::HttpClient)?;
+        let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
+            .change_context(PlatformError::HttpClient)?;
 
         let mut builder = self.client.request(method, &uri);
         for (name, value) in request.request.headers() {
@@ -439,7 +440,9 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
         };
         let name1 = backend.predict_name(&spec).expect("should return a name");
-        let name2 = backend.predict_name(&spec).expect("should return same name");
+        let name2 = backend
+            .predict_name(&spec)
+            .expect("should return same name");
         assert!(!name1.is_empty(), "should return a non-empty name");
         assert_eq!(name1, name2, "should be deterministic");
     }

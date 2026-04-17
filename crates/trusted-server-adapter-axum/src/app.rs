@@ -3,11 +3,11 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderValue, Response};
+use edgezero_core::http::{HeaderValue, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::RuntimeServices;
@@ -285,14 +285,7 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(
-                        &s.settings,
-                        &s.registry,
-                        &services,
-                        None,
-                        req,
-                    )
-                    .await
+                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -319,14 +312,7 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(
-                        &s.settings,
-                        &s.registry,
-                        &services,
-                        None,
-                        req,
-                    )
-                    .await
+                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))

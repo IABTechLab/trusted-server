@@ -27,6 +27,7 @@ pub struct FinalizeResponseMiddleware {
 
 impl FinalizeResponseMiddleware {
     /// Creates a new [`FinalizeResponseMiddleware`] with the given settings.
+    #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
         Self { settings }
     }
@@ -57,6 +58,7 @@ pub struct AuthMiddleware {
 
 impl AuthMiddleware {
     /// Creates a new [`AuthMiddleware`] with the given settings.
+    #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
         Self { settings }
     }
