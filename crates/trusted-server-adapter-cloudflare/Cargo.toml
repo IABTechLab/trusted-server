@@ -23,7 +23,7 @@ error-stack = { workspace = true }
 log = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../js" }
-worker = { version = "0.6", default-features = false, features = ["http"], optional = true }
+worker = { version = "0.7", default-features = false, features = ["http"], optional = true }
 
 [dev-dependencies]
 edgezero-core = { workspace = true }
