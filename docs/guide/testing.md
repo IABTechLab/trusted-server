@@ -6,14 +6,22 @@ Learn how to test Trusted Server locally and in CI/CD.
 
 ### Viceroy
 
-Viceroy is the local test runtime for Fastly Compute applications. It simulates the Fastly environment locally.
+Viceroy is the local test runtime for Fastly Compute applications. It simulates the Fastly environment locally and is required for running the WASM crate tests.
 
 ```bash
 # Install viceroy
 cargo install viceroy
 
-# Run tests (viceroy is invoked automatically)
-cargo test
+# Run WASM crate tests (viceroy is invoked automatically)
+cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+```
+
+### Axum adapter tests
+
+The Axum adapter runs as a native binary — no Viceroy or WASM toolchain needed:
+
+```bash
+cargo test -p trusted-server-adapter-axum
 ```
 
 ### Test Organization
@@ -47,40 +55,54 @@ mod tests {
 ### Unit Tests
 
 ```bash
-# Run all tests
-cargo test
+# Run all WASM crate tests (requires Viceroy)
+cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
 
-# Run specific test by name
-cargo test test_generate_synthetic_id
+# Run Axum adapter tests (native, no Viceroy needed)
+cargo test -p trusted-server-adapter-axum
 
-# Run tests with output visible
-cargo test -- --nocapture
-
-# Run tests for specific crate
+# Run tests for a specific crate
 cargo test -p trusted-server-core
 
 # Run tests matching a pattern
 cargo test synthetic
+
+# Show test output
+cargo test -- --nocapture
 ```
 
 ### Integration Tests
 
-```bash
-# Run all integration tests
-cargo test --test '*'
+The integration test suite runs the full pipeline against Docker containers using both the Fastly (Viceroy) and Axum runtimes:
 
-# Run with single thread (useful for debugging)
-cargo test -- --test-threads=1
+```bash
+# Build both runtimes and run all integration tests
+./scripts/integration-tests.sh
+
+# Run a single test
+./scripts/integration-tests.sh test_wordpress_axum
+./scripts/integration-tests.sh test_wordpress_fastly
 ```
 
 ### Local Server Testing
 
+**Axum dev server** (no Fastly CLI required):
+
 ```bash
-# Start local server
+# Start the Axum dev server
+cargo run -p trusted-server-adapter-axum
+
+# Test endpoints with curl
+curl http://localhost:8787/.well-known/trusted-server.json
+```
+
+**Fastly Viceroy** (requires Fastly CLI):
+
+```bash
+# Start local Fastly simulator
 fastly compute serve
 
 # Test endpoints with curl
-curl http://localhost:7676/health
 curl http://localhost:7676/.well-known/trusted-server.json
 ```
 
@@ -261,20 +283,29 @@ cargo tarpaulin --out Html
 Tests run automatically on pull requests and main branch commits. See `.github/workflows/` for the complete CI configuration.
 
 ```yaml
-# Example workflow
+# Example workflow (see .github/workflows/test.yml for the full version)
 name: Test
 on: [push, pull_request]
 jobs:
-  test:
+  test-rust: # Fastly/WASM crates — requires Viceroy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-action@stable
       - name: Run tests
-        run: cargo test
+        run: cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test-axum: # Axum native adapter — no Viceroy needed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Axum adapter
+        run: cargo build -p trusted-server-adapter-axum
+      - name: Run Axum adapter tests
+        run: cargo test -p trusted-server-adapter-axum
 ```
 
 ## Debugging Tests

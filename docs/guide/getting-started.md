@@ -7,9 +7,12 @@ Get up and running with Trusted Server quickly.
 Before you begin, ensure you have:
 
 - Rust 1.91.1 (see `.tool-versions`)
+- Basic familiarity with Rust and WebAssembly
+
+**For Fastly deployment** (optional for local dev):
+
 - Fastly CLI installed
 - A Fastly account and API key
-- Basic familiarity with WebAssembly
 
 ## Installation
 
@@ -20,17 +23,41 @@ git clone https://github.com/IABTechLab/trusted-server.git
 cd trusted-server
 ```
 
-### Fastly CLI Setup
+## Local Development
 
-Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly).
+Trusted Server supports two local development modes:
 
-### Install Viceroy (Test Runtime)
+### Option A — Axum dev server (recommended for local development)
+
+No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
+
+```bash
+# Copy and edit the environment file
+cp .env.dev .env
+
+# Build and start the dev server
+cargo run -p trusted-server-adapter-axum
+```
+
+The server will be available at `http://localhost:8787`.
+
+### Option B — Fastly Compute via Viceroy
+
+Simulates the Fastly production environment locally.
+
+Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
 cargo install viceroy
 ```
 
-## Local Development
+Start the local Fastly simulator:
+
+```bash
+fastly compute serve
+```
+
+The server will be available at `http://localhost:7676`.
 
 ### Build the Project
 
@@ -41,16 +68,12 @@ cargo build
 ### Run Tests
 
 ```bash
-cargo test
+# Fastly/WASM crates (requires Viceroy)
+cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+
+# Axum native adapter
+cargo test -p trusted-server-adapter-axum
 ```
-
-### Start Local Server
-
-```bash
-fastly compute serve
-```
-
-The server will be available at `http://localhost:7676`.
 
 ## Configuration
 
