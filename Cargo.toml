@@ -93,5 +93,6 @@ url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
+web-time = "1"
 which = "8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

@@ -3,7 +3,8 @@
 use error_stack::{Report, ResultExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformPendingRequest, RuntimeServices};
@@ -621,6 +622,9 @@ impl OrchestrationResult {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    use web_time::Instant;
+
     use crate::auction::config::AuctionConfig;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
@@ -827,7 +831,7 @@ mod tests {
 
     #[test]
     fn remaining_budget_returns_full_timeout_immediately() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = super::remaining_budget_ms(start, 2000);
         // Should be very close to 2000 (allow a few ms for test execution)
         assert!(
@@ -839,7 +843,7 @@ mod tests {
     #[test]
     fn remaining_budget_saturates_at_zero() {
         // Create an instant in the past by sleeping briefly with a tiny timeout
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         // Use a timeout of 0 — elapsed will always exceed it
         let result = super::remaining_budget_ms(start, 0);
         assert_eq!(result, 0, "should return 0 when timeout is 0");
@@ -847,8 +851,8 @@ mod tests {
 
     #[test]
     fn remaining_budget_decreases_over_time() {
-        let start = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
         let result = super::remaining_budget_ms(start, 2000);
         assert!(
             result < 2000,
