@@ -25,6 +25,10 @@ inputs:
     description: Build the framework Docker images used by integration tests.
     required: false
     default: "true"
+  build-cloudflare:
+    description: Build the Cloudflare Workers bundle (wasm32-unknown-unknown) for integration tests.
+    required: false
+    default: "false"
 
 outputs:
   node-version:
@@ -104,3 +108,18 @@ runs:
           --build-arg NODE_VERSION=${{ steps.node-version.outputs.node-version }} \
           -t test-nextjs:latest \
           crates/integration-tests/fixtures/frameworks/nextjs/
+
+    - name: Add wasm32-unknown-unknown target for Cloudflare build
+      if: ${{ inputs.build-cloudflare == 'true' }}
+      shell: bash
+      run: rustup target add wasm32-unknown-unknown
+
+    - name: Build Cloudflare Workers bundle
+      if: ${{ inputs.build-cloudflare == 'true' }}
+      shell: bash
+      env:
+        TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:${{ inputs.origin-port }}
+        TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+        TRUSTED_SERVER__SYNTHETIC__SECRET_KEY: integration-test-secret-key
+        TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+      run: bash crates/trusted-server-adapter-cloudflare/build.sh
