@@ -1,4 +1,5 @@
 pub mod axum;
+pub mod cloudflare;
 pub mod fastly;
 
 use crate::common::runtime::{RuntimeEnvironment, TestError, TestResult};
@@ -22,6 +23,7 @@ type RuntimeFactory = fn() -> Box<dyn RuntimeEnvironment>;
 pub static RUNTIME_ENVIRONMENTS: &[RuntimeFactory] = &[
     || Box::new(fastly::FastlyViceroy),
     || Box::new(axum::AxumDevServer),
+    || Box::new(cloudflare::CloudflareWorkers),
 ];
 
 /// Readiness polling configuration for runtimes and frontend containers.

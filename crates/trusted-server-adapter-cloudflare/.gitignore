@@ -1,2 +1,4 @@
 target/
 .edgezero/
+.wrangler/
+.env.cloudflare.dev

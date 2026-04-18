@@ -62,7 +62,7 @@ cargo test -p trusted-server-adapter-axum
 cargo check -p trusted-server-adapter-cloudflare
 
 # Check Cloudflare adapter (WASM target)
-cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown
 
 # Test Cloudflare adapter
 cargo test -p trusted-server-adapter-cloudflare

@@ -95,8 +95,8 @@ impl SigningParams {
             request_id,
             request_host,
             request_scheme,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp: web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         }
@@ -443,8 +443,8 @@ mod tests {
             "https".to_string(),
         );
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .expect("should get system time")
             .as_millis() as u64;
 

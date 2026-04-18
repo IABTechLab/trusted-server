@@ -5,7 +5,8 @@ use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -1511,7 +1512,8 @@ mod tests {
     #[test]
     fn reconstruct_rejects_expired_tsexp() {
         futures::executor::block_on(async {
-            use std::time::{Duration, SystemTime, UNIX_EPOCH};
+            use std::time::Duration;
+            use web_time::{SystemTime, UNIX_EPOCH};
 
             let settings = create_test_settings();
             let tsurl = "https://cdn.example/asset.js";

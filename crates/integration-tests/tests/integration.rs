@@ -136,6 +136,22 @@ fn test_nextjs_fastly() {
 }
 
 #[test]
+#[ignore = "requires Docker and a running `wrangler dev` instance; see environments/cloudflare.rs"]
+fn test_wordpress_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires Docker and a running `wrangler dev` instance; see environments/cloudflare.rs"]
+fn test_nextjs_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Cloudflare Workers");
+}
+
+#[test]
 #[ignore = "requires Docker and pre-built trusted-server-axum binary"]
 fn test_wordpress_axum() {
     let runtime = environments::axum::AxumDevServer;

@@ -1,11 +1,18 @@
 name = "trusted-server"
-main = "../../target/wasm32-unknown-unknown/release/trusted_server_adapter_cloudflare.wasm"
+main = "build/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "bash build.sh"
 
 [[kv_namespaces]]
 binding = "TRUSTED_SERVER_KV"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
+# TRUSTED_SERVER_CONFIG is consumed by the edgezero layer as a JSON-encoded env
+# var for local dev. On a deployed Worker this will be replaced by a proper KV
+# namespace or config store binding once edgezero config-store wiring is added
+# (tracked: NoopConfigStore in platform.rs).
 TRUSTED_SERVER_CONFIG = '{"publisher.domain":"your-publisher.com"}'

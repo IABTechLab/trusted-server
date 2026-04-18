@@ -7,13 +7,15 @@ kind = "http"
 
 [stores.kv]
 name = "trusted_server_kv"
-[stores.kv.adapters]
-cloudflare = "TRUSTED_SERVER_KV"
+
+[stores.kv.adapters.cloudflare]
+name = "TRUSTED_SERVER_KV"
 
 [stores.config]
 name = "trusted_server_config"
-[stores.config.adapters]
-cloudflare = "TRUSTED_SERVER_CONFIG"
+
+[stores.config.adapters.cloudflare]
+name = "TRUSTED_SERVER_CONFIG"
 
 [stores.secrets]
 name = "trusted_server_secrets"
