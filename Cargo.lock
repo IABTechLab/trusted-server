@@ -3631,6 +3631,7 @@ name = "trusted-server-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "edgezero-adapter-cloudflare",
  "edgezero-core",
  "error-stack",

@@ -1,11 +1,14 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
+use edgezero_core::{ConfigStoreHandle, KvHandle, KvPage, KvStore};
 use error_stack::Report;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableKvStore,
+    ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore,
+    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,26 +22,22 @@ use trusted_server_core::platform::{
 };
 
 // ---------------------------------------------------------------------------
-// Noop stubs for host-target builds (native CI, unit tests)
+// Noop stubs — used when a handle is absent (native CI, missing binding)
 // ---------------------------------------------------------------------------
 
-// TODO: wire edgezero-adapter-cloudflare's CloudflareConfigStore / CloudflareSecretStore
-// for the wasm32 path so that key rotation (/admin/keys/rotate|deactivate) and
-// signing config work on deployed Workers. Until then, all config/secret reads
-// return errors on both native and WASM32 targets.
 struct NoopConfigStore;
 
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
 }
 
@@ -46,15 +45,15 @@ struct NoopSecretStore;
 
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
     fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("unavailable on host target"))
+        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 }
 
@@ -70,11 +69,89 @@ impl PlatformBackend for NoopBackend {
     }
 }
 
-struct NoopGeo;
+// ---------------------------------------------------------------------------
+// edgezero handle adapters — no #[cfg] needed; platform-specific store
+// construction is handled by edgezero's run_app before we receive the ctx.
+// ---------------------------------------------------------------------------
 
-impl PlatformGeo for NoopGeo {
-    fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(None)
+/// Bridges edgezero's [`ConfigStoreHandle`] (injected by `run_app` from the
+/// `TRUSTED_SERVER_CONFIG` env-var binding) to [`PlatformConfigStore`].
+///
+/// Reads delegate through the handle. Writes are unsupported on all current
+/// adapter targets and return errors.
+///
+/// Note: Cloudflare config is a single flat JSON env-var binding — all keys
+/// live in one namespace. The `store_name` argument is intentionally ignored;
+/// callers cannot route to a different store by passing a different name.
+struct ConfigStoreHandleAdapter(ConfigStoreHandle);
+
+impl PlatformConfigStore for ConfigStoreHandleAdapter {
+    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        self.0
+            .get(key)
+            .map_err(|e| {
+                Report::new(PlatformError::ConfigStore)
+                    .attach(format!("config store lookup failed: {e}"))
+            })?
+            .ok_or_else(|| {
+                Report::new(PlatformError::ConfigStore).attach(format!("key not found: {key}"))
+            })
+    }
+
+    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported"))
+    }
+
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported"))
+    }
+}
+
+/// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
+/// `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
+///
+/// Delegates all operations through `KvHandle`'s raw-bytes API, which includes
+/// key/value validation before forwarding to the underlying store.
+///
+/// Note: key/value validation runs twice — once inside this `KvHandle` and once
+/// inside the `KvHandle` that `RuntimeServices::kv_handle()` constructs from
+/// this adapter. The overhead is negligible (string length checks only) and
+/// avoided by the fact that we reuse the already-opened `env.kv()` handle from
+/// `run_app` rather than opening a new one.
+struct KvHandleAdapter(KvHandle);
+
+#[async_trait::async_trait(?Send)]
+impl KvStore for KvHandleAdapter {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        self.0.get_bytes(key).await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        self.0.put_bytes(key, value).await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        self.0.put_bytes_with_ttl(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.0.delete(key).await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        self.0.list_keys_page(prefix, cursor, limit).await
     }
 }
 
@@ -250,14 +327,73 @@ impl PlatformHttpClient for CloudflareHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// CloudflareSecretStoreAdapter — WASM target only
+//
+// Secrets are the one platform surface that cannot be bridged through an
+// edgezero handle: `SecretHandle::get_bytes` is async, but
+// `PlatformSecretStore::get_bytes` is sync. The Cloudflare `env.secret()`
+// call IS synchronous at the JS level, so we call it directly here.
+// ---------------------------------------------------------------------------
+
+/// Bridges [`worker::Env`] secrets to [`PlatformSecretStore`] by calling
+/// `env.secret(key)` synchronously. Writes and deletes return errors.
+#[cfg(target_arch = "wasm32")]
+struct CloudflareSecretStoreAdapter {
+    env: worker::Env,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PlatformSecretStore for CloudflareSecretStoreAdapter {
+    fn get_bytes(
+        &self,
+        _store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        use worker::Error as WorkerError;
+        match self.env.secret(key) {
+            Ok(secret) => Ok(secret.to_string().into_bytes()),
+            Err(WorkerError::BindingError(_)) => Err(Report::new(PlatformError::SecretStore)
+                .attach(format!("secret binding not found: {key}"))),
+            Err(WorkerError::JsError(msg))
+                if msg.contains("does not contain binding") || msg.contains("is undefined") =>
+            {
+                Err(Report::new(PlatformError::SecretStore)
+                    .attach(format!("secret not found: {key}")))
+            }
+            Err(err) => Err(Report::new(PlatformError::SecretStore)
+                .attach(format!("secret lookup failed: {err}"))),
+        }
+    }
+
+    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store writes are not supported on Cloudflare Workers"))
+    }
+
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store writes are not supported on Cloudflare Workers"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// On native (host target, CI), the HTTP client degrades to [`UnavailableHttpClient`]
-/// since `worker::Fetch` is only available on `wasm32`. On the Workers runtime the
-/// real [`CloudflareHttpClient`] is used so outbound proxy requests succeed.
+/// Config and KV are sourced from the edgezero handles that `run_app` injects
+/// before routing — via the `TRUSTED_SERVER_CONFIG` env-var binding and the
+/// `TRUSTED_SERVER_KV` KV namespace declared in `cloudflare.toml`. No
+/// platform-specific `#[cfg]` is required for these two stores.
+///
+/// Secrets still require direct `worker::Env` access because
+/// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
+/// is sync; the underlying `env.secret()` call is synchronous at the JS level.
+///
+/// Geo information is read from Cloudflare's injected request headers
+/// (`cf-ipcountry`, etc.) which are present on all plans; headers absent on
+/// the native host target simply produce empty/zero defaults.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
@@ -266,19 +402,120 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
+    // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
+    let config_store: Arc<dyn PlatformConfigStore> = ctx
+        .config_store()
+        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
+        .unwrap_or_else(|| Arc::new(NoopConfigStore));
+
+    // KV: use the KvHandle injected by run_app — no #[cfg] needed.
+    let kv_store: Arc<dyn PlatformKvStore> = ctx
+        .kv_handle()
+        .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
+        .unwrap_or_else(|| Arc::new(UnavailableKvStore));
+
+    // Secrets: still requires wasm32-specific env.secret() (async/sync mismatch).
+    #[cfg(target_arch = "wasm32")]
+    let secret_store: Arc<dyn PlatformSecretStore> =
+        edgezero_adapter_cloudflare::CloudflareRequestContext::get(ctx.request())
+            .map(|cf_ctx| {
+                Arc::new(CloudflareSecretStoreAdapter {
+                    env: cf_ctx.env().clone(),
+                }) as Arc<dyn PlatformSecretStore>
+            })
+            .unwrap_or_else(|| Arc::new(NoopSecretStore));
+    #[cfg(not(target_arch = "wasm32"))]
+    let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
+
+    // Geo: read Cloudflare-injected headers — no #[cfg] needed; headers are
+    // simply absent on the native host target, producing Ok(None) from lookup().
+    let geo = build_geo(ctx);
+
     RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(UnavailableKvStore))
+        .config_store(config_store)
+        .secret_store(secret_store)
+        .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(geo))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
         })
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// Geo — reads Cloudflare-injected request headers (no #[cfg] needed)
+// ---------------------------------------------------------------------------
+
+/// Reads Cloudflare geo headers injected by the Workers runtime.
+///
+/// `cf-ipcountry` is available on all plans. `cf-ipcity`, `cf-ipcontinent`,
+/// `cf-iplatitude`, and `cf-iplongitude` require an Enterprise plan. Absent or
+/// unparseable values default to empty strings or `0.0`. Country code `XX`
+/// (Cloudflare's "unknown" sentinel) is treated as absent.
+struct CloudflareGeo {
+    country: String,
+    city: String,
+    continent: String,
+    latitude: f64,
+    longitude: f64,
+}
+
+impl PlatformGeo for CloudflareGeo {
+    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        if self.country.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(GeoInfo {
+            city: self.city.clone(),
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            latitude: self.latitude,
+            longitude: self.longitude,
+            metro_code: 0,
+            region: None,
+        }))
+    }
+}
+
+fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
+    let headers = ctx.request().headers();
+    let country = headers
+        .get("cf-ipcountry")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && *s != "XX")
+        .unwrap_or("")
+        .to_string();
+    let city = headers
+        .get("cf-ipcity")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let continent = headers
+        .get("cf-ipcontinent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let latitude = headers
+        .get("cf-iplatitude")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let longitude = headers
+        .get("cf-iplongitude")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    CloudflareGeo {
+        country,
+        city,
+        continent,
+        latitude,
+        longitude,
+    }
 }
 
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
@@ -341,6 +578,30 @@ mod tests {
         assert!(
             extract_client_ip(&ctx).is_none(),
             "should return None for an unparseable IP string"
+        );
+    }
+
+    #[test]
+    fn build_geo_returns_country_from_header() {
+        let ctx = make_ctx_with_header("cf-ipcountry", "US");
+        let geo = build_geo(&ctx);
+        assert_eq!(geo.country, "US", "should extract cf-ipcountry");
+    }
+
+    #[test]
+    fn build_geo_treats_xx_as_absent() {
+        let ctx = make_ctx_with_header("cf-ipcountry", "XX");
+        let geo = build_geo(&ctx);
+        assert!(geo.country.is_empty(), "XX should be treated as absent");
+    }
+
+    #[test]
+    fn build_geo_lookup_returns_none_when_country_absent() {
+        let ctx = make_ctx_without_header();
+        let geo = build_geo(&ctx);
+        assert!(
+            geo.lookup(None).unwrap().is_none(),
+            "should return None when no country header"
         );
     }
 }
