@@ -71,6 +71,9 @@ jobs:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
 
+      - name: Make binaries executable
+        run: chmod +x "$AXUM_ARTIFACT_PATH"
+
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 
