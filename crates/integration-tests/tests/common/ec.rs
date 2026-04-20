@@ -16,6 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+pub use trusted_server_core::ec::normalize_ec_id_for_kv as normalize_ec_id;
 
 // ---------------------------------------------------------------------------
 // Cookie-aware HTTP client
@@ -333,14 +334,6 @@ pub fn is_ec_cookie_expired(resp: &Response) -> bool {
         }
     }
     false
-}
-
-/// Normalizes an EC ID for KV key usage.
-pub fn normalize_ec_id(ec_id: &str) -> String {
-    let mut parts = ec_id.splitn(2, '.');
-    let hash = parts.next().unwrap_or_default();
-    let suffix = parts.next().unwrap_or_default();
-    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
 }
 
 // ---------------------------------------------------------------------------

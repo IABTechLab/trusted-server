@@ -20,3 +20,35 @@ use crate::consent::ConsentContext;
 pub fn ec_consent_granted(consent_context: &ConsentContext) -> bool {
     crate::consent::allows_ec_creation(consent_context)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consent::jurisdiction::Jurisdiction;
+
+    #[test]
+    fn ec_consent_granted_allows_non_regulated_requests() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            ec_consent_granted(&ctx),
+            "non-regulated requests should be allowed"
+        );
+    }
+
+    #[test]
+    fn ec_consent_granted_blocks_unknown_jurisdiction() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Unknown,
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !ec_consent_granted(&ctx),
+            "unknown jurisdiction should fail closed"
+        );
+    }
+}

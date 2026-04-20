@@ -69,7 +69,9 @@ use device::DeviceSignals;
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
 
-pub use generation::{ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id};
+pub use generation::{
+    ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id, normalize_ec_id_for_kv,
+};
 
 /// Parsed EC identity from an incoming request.
 ///

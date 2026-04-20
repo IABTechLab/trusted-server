@@ -235,6 +235,24 @@ mod tests {
     }
 
     #[test]
+    fn generate_same_ip_produces_consistent_hash_prefix() {
+        let settings = create_test_settings();
+        let first = generate_ec_id(&settings, "192.168.1.1").expect("should generate first EC ID");
+        let second =
+            generate_ec_id(&settings, "192.168.1.1").expect("should generate second EC ID");
+
+        assert_eq!(
+            ec_hash(&first),
+            ec_hash(&second),
+            "same IP and passphrase should produce the same HMAC prefix"
+        );
+        assert_ne!(
+            first, second,
+            "random suffix should differ between generated EC IDs"
+        );
+    }
+
+    #[test]
     fn ec_hash_extracts_prefix() {
         let id = format!("{}.Ab12z9", "a".repeat(64));
         assert_eq!(ec_hash(&id), "a".repeat(64));

@@ -76,14 +76,14 @@ pub fn ec_finalize_response(
         }
 
         if let Some(graph) = kv {
-            for ec_id in &ids_to_withdraw {
+            apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
                 if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
                     log::error!(
                         "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
                         log_id(ec_id),
                     );
                 }
-            }
+            });
         }
 
         return;
@@ -188,6 +188,15 @@ fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
     hashes
 }
 
+fn apply_withdrawal_tombstones<F>(ec_ids: &HashSet<String>, mut write_tombstone: F)
+where
+    F: FnMut(&str),
+{
+    for ec_id in ec_ids {
+        write_tombstone(ec_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +228,90 @@ mod tests {
 
     fn sample_ec_id(suffix: &str) -> String {
         format!("{}.{suffix}", "a".repeat(64))
+    }
+
+    #[test]
+    fn withdrawal_ec_ids_returns_cookie_ec_only_when_active_missing() {
+        let cookie_ec = sample_ec_id("cook1e");
+        let ec_context = make_context(None, Some(&cookie_ec), true, false, Jurisdiction::Unknown);
+
+        let ids = withdrawal_ec_ids(&ec_context);
+
+        assert_eq!(ids.len(), 1, "should include exactly one EC ID");
+        assert!(
+            ids.contains(&cookie_ec),
+            "should include the cookie EC value"
+        );
+    }
+
+    #[test]
+    fn withdrawal_ec_ids_deduplicates_matching_cookie_and_active_ec() {
+        let ec_id = sample_ec_id("same01");
+        let ec_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::Unknown,
+        );
+
+        let ids = withdrawal_ec_ids(&ec_context);
+
+        assert_eq!(ids.len(), 1, "should deduplicate identical EC IDs");
+        assert!(ids.contains(&ec_id), "should retain the shared EC ID");
+    }
+
+    #[test]
+    fn withdrawal_ec_ids_includes_both_cookie_and_active_when_different() {
+        let active_ec = sample_ec_id("activ1");
+        let cookie_ec = sample_ec_id("cook1e");
+        let ec_context = make_context(
+            Some(&active_ec),
+            Some(&cookie_ec),
+            true,
+            false,
+            Jurisdiction::Unknown,
+        );
+
+        let ids = withdrawal_ec_ids(&ec_context);
+
+        assert_eq!(ids.len(), 2, "should include both distinct EC IDs");
+        assert!(ids.contains(&active_ec), "should include active EC ID");
+        assert!(ids.contains(&cookie_ec), "should include cookie EC ID");
+    }
+
+    #[test]
+    fn withdrawal_ec_ids_filters_invalid_values() {
+        let valid_ec = sample_ec_id("valid1");
+        let ec_context = make_context(
+            Some(&valid_ec),
+            Some("not-an-ec-id"),
+            true,
+            false,
+            Jurisdiction::Unknown,
+        );
+
+        let ids = withdrawal_ec_ids(&ec_context);
+
+        assert_eq!(ids.len(), 1, "should ignore malformed EC values");
+        assert!(ids.contains(&valid_ec), "should keep the valid EC ID");
+    }
+
+    #[test]
+    fn apply_withdrawal_tombstones_invokes_writer_for_each_ec_id() {
+        let first = sample_ec_id("first1");
+        let second = sample_ec_id("second");
+        let mut ids = HashSet::new();
+        ids.insert(first.clone());
+        ids.insert(second.clone());
+
+        let mut written = Vec::new();
+        apply_withdrawal_tombstones(&ids, |ec_id| written.push(ec_id.to_owned()));
+        written.sort();
+
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(written, expected, "should write a tombstone for each EC ID");
     }
 
     #[test]
