@@ -99,13 +99,11 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported"))
+        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported"))
+        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 }
 
@@ -174,8 +172,19 @@ struct CloudflarePendingResponse {
 
 /// [`worker::Fetch`]-backed HTTP client for the Cloudflare Workers runtime.
 ///
-/// `send_async` eagerly awaits (sequential fan-out) — acceptable for Workers
-/// since Cloudflare's own runtime handles true parallelism at the event level.
+/// # Sequential fan-out and auction latency
+///
+/// `send_async` eagerly awaits each request before returning, so parallel
+/// fan-out (e.g. auction DSP calls) becomes sequential: total latency is
+/// `sum(DSP_i)` rather than `max(DSP_i)`. With a 300 ms auction budget and
+/// three DSPs averaging 80 ms each, all three return in time; with five DSPs
+/// the last two may be cut off by the orchestrator's remaining-budget check.
+///
+/// Cloudflare Workers does support concurrent `fetch` calls via `Promise.all`,
+/// but the `?Send` bound on `PlatformHttpClient` prevents using `join!` across
+/// requests here. A future revision could implement true fan-out by spawning all
+/// futures inside `select` before polling, at the cost of a more complex
+/// implementation.
 ///
 /// Individual fetch calls have no explicit timeout. The Workers runtime enforces
 /// a global CPU time limit per invocation (default 30 s wall-clock on paid plans)
@@ -349,19 +358,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
         _store_name: &StoreName,
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
-        use worker::Error as WorkerError;
         match self.env.secret(key) {
             Ok(secret) => Ok(secret.to_string().into_bytes()),
-            Err(WorkerError::BindingError(_)) => Err(Report::new(PlatformError::SecretStore)
-                .attach(format!("secret binding not found: {key}"))),
-            Err(WorkerError::JsError(msg))
-                if msg.contains("does not contain binding") || msg.contains("is undefined") =>
-            {
-                Err(Report::new(PlatformError::SecretStore)
-                    .attach(format!("secret not found: {key}")))
-            }
             Err(err) => Err(Report::new(PlatformError::SecretStore)
-                .attach(format!("secret lookup failed: {err}"))),
+                .attach(format!("secret lookup failed for key `{key}`: {err}"))),
         }
     }
 
@@ -602,6 +602,37 @@ mod tests {
         assert!(
             geo.lookup(None).unwrap().is_none(),
             "should return None when no country header"
+        );
+    }
+
+    #[test]
+    fn build_geo_lookup_returns_some_with_populated_country() {
+        let req = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .header("cf-ipcountry", HeaderValue::from_static("US"))
+            .header("cf-ipcity", HeaderValue::from_static("New York"))
+            .header("cf-ipcontinent", HeaderValue::from_static("NA"))
+            .header("cf-iplatitude", HeaderValue::from_static("40.71"))
+            .header("cf-iplongitude", HeaderValue::from_static("-74.01"))
+            .body(edgezero_core::body::Body::empty())
+            .unwrap();
+        let ctx = RequestContext::new(req, PathParams::default());
+        let geo = build_geo(&ctx);
+        let info = geo
+            .lookup(None)
+            .unwrap()
+            .expect("should return GeoInfo when country is set");
+        assert_eq!(info.country, "US", "should populate country");
+        assert_eq!(info.city, "New York", "should populate city");
+        assert_eq!(info.continent, "NA", "should populate continent");
+        assert!(
+            (info.latitude - 40.71).abs() < 0.01,
+            "should populate latitude"
+        );
+        assert!(
+            (info.longitude - (-74.01)).abs() < 0.01,
+            "should populate longitude"
         );
     }
 }

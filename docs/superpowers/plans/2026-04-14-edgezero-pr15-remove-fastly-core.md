@@ -16,23 +16,24 @@
 
 Read these before starting — do not guess:
 
-| What to read | Path | Why |
-|---|---|---|
-| Core Cargo.toml | `crates/trusted-server-core/Cargo.toml` | Exact dep names to remove |
-| Core lib.rs | `crates/trusted-server-core/src/lib.rs` | Module declarations to remove |
-| Adapter main.rs | `crates/trusted-server-adapter-fastly/src/main.rs` | `compat::` call sites (lines 12, 159, 169, 182) |
-| Core compat.rs | `crates/trusted-server-core/src/compat.rs` | Functions to port |
-| Core geo.rs | `crates/trusted-server-core/src/geo.rs` | `geo_from_fastly` impl (lines 25–35) |
-| Core backend.rs | `crates/trusted-server-core/src/backend.rs` | Entire module to port |
-| Adapter platform.rs | `crates/trusted-server-adapter-fastly/src/platform.rs` | Import lines to update (17, 18, 362) |
-| Adapter management_api.rs | `crates/trusted-server-adapter-fastly/src/management_api.rs` | `BackendConfig` import (line 55) |
-| Core consent/kv.rs | `crates/trusted-server-core/src/consent/kv.rs` | Verify any `fastly::kv_store` usage |
+| What to read              | Path                                                         | Why                                             |
+| ------------------------- | ------------------------------------------------------------ | ----------------------------------------------- |
+| Core Cargo.toml           | `crates/trusted-server-core/Cargo.toml`                      | Exact dep names to remove                       |
+| Core lib.rs               | `crates/trusted-server-core/src/lib.rs`                      | Module declarations to remove                   |
+| Adapter main.rs           | `crates/trusted-server-adapter-fastly/src/main.rs`           | `compat::` call sites (lines 12, 159, 169, 182) |
+| Core compat.rs            | `crates/trusted-server-core/src/compat.rs`                   | Functions to port                               |
+| Core geo.rs               | `crates/trusted-server-core/src/geo.rs`                      | `geo_from_fastly` impl (lines 25–35)            |
+| Core backend.rs           | `crates/trusted-server-core/src/backend.rs`                  | Entire module to port                           |
+| Adapter platform.rs       | `crates/trusted-server-adapter-fastly/src/platform.rs`       | Import lines to update (17, 18, 362)            |
+| Adapter management_api.rs | `crates/trusted-server-adapter-fastly/src/management_api.rs` | `BackendConfig` import (line 55)                |
+| Core consent/kv.rs        | `crates/trusted-server-core/src/consent/kv.rs`               | Verify any `fastly::kv_store` usage             |
 
 ---
 
 ## File Map
 
 ### Files to **delete** from `crates/trusted-server-core/src/`
+
 - `compat.rs` — Fastly conversion scaffolding, scheduled for deletion in PR 15
 - `backend.rs` — Fastly-coupled backend builder, moved to adapter
 - `storage/config_store.rs` — Legacy `FastlyConfigStore` (call sites migrated to platform traits)
@@ -40,19 +41,23 @@ Read these before starting — do not guess:
 - `storage/mod.rs` — Empty after above deletions
 
 ### Files to **modify** in `crates/trusted-server-core/src/`
+
 - `lib.rs` — Remove `pub mod compat;`, `pub mod backend;`, `pub mod storage;`
 - `geo.rs` — Remove `use fastly::geo::Geo;` and `pub fn geo_from_fastly`
 
 ### Files to **create** in `crates/trusted-server-adapter-fastly/src/`
+
 - `compat.rs` — The 3 conversion functions that adapter's `main.rs` needs
 - `backend.rs` — Full `BackendConfig` moved from core
 
 ### Files to **modify** in `crates/trusted-server-adapter-fastly/src/`
+
 - `main.rs` — Add `mod compat;`, update import from `trusted_server_core::compat` to `crate::compat`
 - `platform.rs` — Remove `use trusted_server_core::geo::geo_from_fastly;`, add inline private function; remove `use trusted_server_core::backend::BackendConfig;`, add `use crate::backend::BackendConfig;`
 - `management_api.rs` — Update `use trusted_server_core::backend::BackendConfig` → `use crate::backend::BackendConfig`
 
 ### Files to **modify** (Cargo.toml)
+
 - `crates/trusted-server-core/Cargo.toml` — Remove `fastly`, move `tokio` → `[dev-dependencies]`
 
 ---
@@ -89,6 +94,7 @@ Expected: `Finished` with no errors.
 **Context:** Adapter's `main.rs` uses `trusted_server_core::compat` for 3 functions in `legacy_main()`: `sanitize_fastly_forwarded_headers`, `from_fastly_request`, and `to_fastly_response`. All three deal with `fastly::Request` / `fastly::Response` — they belong in the adapter. The remaining ~8 functions in core's `compat.rs` are unused by the adapter and can be dropped entirely.
 
 **Files:**
+
 - Create: `crates/trusted-server-adapter-fastly/src/compat.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 - Delete: `crates/trusted-server-core/src/compat.rs`
@@ -97,6 +103,7 @@ Expected: `Finished` with no errors.
 - [ ] **Step 2.1: Read core's `compat.rs` fully**
 
 Read `crates/trusted-server-core/src/compat.rs` lines 1–560. You need the exact implementations of:
+
 - `sanitize_fastly_forwarded_headers` — strips spoofable forwarded headers from a `fastly::Request`
 - `from_fastly_request` — converts owned `fastly::Request` → `http::Request<EdgeBody>`
 - `to_fastly_response` — converts `http::Response<EdgeBody>` → `fastly::Response`
@@ -186,6 +193,7 @@ git commit -m "Move compat conversion fns to adapter, delete core compat.rs"
 **Context:** Core's `geo.rs` imports `fastly::geo::Geo` solely for `geo_from_fastly`. The adapter's `platform.rs` (line 18) imports this function from core and calls it at line 362. Moving it inline into `platform.rs` as a `pub(crate)` or private function is the minimal change — no new file required.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/geo.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
 
@@ -232,6 +240,7 @@ Then remove the import line `use trusted_server_core::geo::geo_from_fastly;` (li
 - [ ] **Step 3.3: Remove `geo_from_fastly` and the fastly import from core's `geo.rs`**
 
 In `crates/trusted-server-core/src/geo.rs`:
+
 - Remove: `use fastly::geo::Geo;`
 - Remove: the entire `pub fn geo_from_fastly(geo: &Geo) -> GeoInfo { ... }` function and its doc comment
 
@@ -260,6 +269,7 @@ git commit -m "Move geo_from_fastly from core to adapter platform"
 **Context:** Core's `backend.rs` exists solely to create dynamic Fastly backends (`fastly::backend::Backend`). Both `platform.rs` (line 17) and `management_api.rs` (line 55) in the adapter import `BackendConfig` from core. Moving the entire module to the adapter is a clean cut with minimal ripple.
 
 **Files:**
+
 - Create: `crates/trusted-server-adapter-fastly/src/backend.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs` (add `mod backend;`)
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
@@ -291,6 +301,7 @@ Add `mod backend;` to `crates/trusted-server-adapter-fastly/src/main.rs`.
 - [ ] **Step 4.4: Update imports in `platform.rs` and `management_api.rs`**
 
 In `crates/trusted-server-adapter-fastly/src/platform.rs` (line 17):
+
 ```rust
 // Remove:
 use trusted_server_core::backend::BackendConfig;
@@ -299,6 +310,7 @@ use crate::backend::BackendConfig;
 ```
 
 In `crates/trusted-server-adapter-fastly/src/management_api.rs` (line 55):
+
 ```rust
 // Remove:
 use trusted_server_core::backend::BackendConfig;
@@ -349,6 +361,7 @@ git commit -m "Move BackendConfig from core to adapter backend module"
 **Context:** `crates/trusted-server-core/src/storage/` exports `FastlyConfigStore` and `FastlySecretStore`. The adapter does not import either — it uses the platform traits (`PlatformConfigStore`, `PlatformSecretStore`) directly. Core's `platform/mod.rs` is also trait-only and has no dependency on these legacy types. The storage doc comment confirms: "will be removed once all call sites have migrated to platform traits."
 
 **Files:**
+
 - Delete: `crates/trusted-server-core/src/storage/config_store.rs`
 - Delete: `crates/trusted-server-core/src/storage/secret_store.rs`
 - Delete: `crates/trusted-server-core/src/storage/mod.rs`
@@ -399,6 +412,7 @@ git commit -m "Delete legacy FastlyConfigStore and FastlySecretStore from core"
 **Context:** The initial audit flagged possible `fastly::kv_store::KVStore` usage at line 230 of `consent/kv.rs`. The top of the file (lines 1–50) shows no fastly imports — the reference may be via fully-qualified path or may have been a hallucination. Verify before removing `fastly` from Cargo.toml.
 
 **Files:**
+
 - Inspect: `crates/trusted-server-core/src/consent/kv.rs`
 - Possibly modify: same file
 
@@ -413,6 +427,7 @@ grep -n "fastly" crates/trusted-server-core/src/consent/kv.rs
 - [ ] **Step 6.2b (if fastly:: appears): Investigate and move**
 
 Read the lines around each match. The KV store usage in consent likely goes through the `PlatformKvStore` trait (from `edgezero-core`). If raw `fastly::kv_store::KVStore` calls exist:
+
 - Understand what function uses it (likely `open_store` or `fingerprint_unchanged`)
 - Move that function to adapter's consent integration or abstract via a trait closure / callback passed in from the adapter
 - The goal is zero `fastly::` references in core
@@ -437,6 +452,7 @@ git commit -m "Remove fastly::kv_store usage from core consent module"
 **Context:** `tokio` appears in `[dependencies]` (line 45 of core's `Cargo.toml`). The audit found zero tokio usage in production code — all 30 uses are `#[tokio::test]` attributes in test modules. Moving it to `[dev-dependencies]` removes it from the production dependency graph for wasm builds.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/Cargo.toml`
 
 - [ ] **Step 7.1: Confirm no production tokio usage**
@@ -454,11 +470,13 @@ Expected: no results. If any appear, investigate and refactor before proceeding.
 In `crates/trusted-server-core/Cargo.toml`:
 
 Remove from `[dependencies]`:
+
 ```toml
 tokio = { workspace = true }
 ```
 
 Add to `[dev-dependencies]` (alongside `tokio-test`):
+
 ```toml
 tokio = { workspace = true }
 ```
@@ -493,6 +511,7 @@ git commit -m "Move tokio to dev-dependencies in core (test-only usage)"
 **Context:** After Tasks 2–6, core should have zero `fastly::` references. Now remove the dependency.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/Cargo.toml`
 
 - [ ] **Step 8.1: Confirm zero remaining fastly references in core**
@@ -514,6 +533,7 @@ If `log-fastly` appears, remove it alongside `fastly` in the next step.
 - [ ] **Step 8.2: Remove `fastly` (and `log-fastly` if present) from core's `Cargo.toml`**
 
 In `crates/trusted-server-core/Cargo.toml`, remove:
+
 ```toml
 fastly = { workspace = true }
 # Also remove if present:

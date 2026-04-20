@@ -12,7 +12,7 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
 # TRUSTED_SERVER_CONFIG is consumed by the edgezero layer as a JSON-encoded env
-# var for local dev. On a deployed Worker this will be replaced by a proper KV
-# namespace or config store binding once edgezero config-store wiring is added
-# (tracked: NoopConfigStore in platform.rs).
+# var binding. At runtime it is bridged to PlatformConfigStore via
+# ConfigStoreHandleAdapter — replace the placeholder values with your publisher
+# settings before deploying.
 TRUSTED_SERVER_CONFIG = '{"publisher.domain":"your-publisher.com"}'
