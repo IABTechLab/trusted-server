@@ -236,6 +236,7 @@ Use `bid_param_override_rules` for the canonical ordered override format. Each r
 **Behavior**:
 
 - Rules can match on `when.bidder`, `when.zone`, or both
+- Matching is exact and case-sensitive — `when.bidder = "Kargo"` will not match a runtime bidder named `kargo`
 - Rules are evaluated in declaration order
 - Later matching rules win on overlapping keys
 - Compatibility fields from `bid_param_overrides` and `bid_param_zone_overrides` are normalized into earlier rules, so explicit canonical rules take precedence on conflicts
