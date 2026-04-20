@@ -52,8 +52,6 @@ pub enum TestError {
     #[display("Expected HTTP status {expected}, got {actual}")]
     UnexpectedStatusCode { expected: u16, actual: u16 },
 
-    #[display("Partner registration failed")]
-    PartnerRegistrationFailed,
 
     #[display("JSON field assertion failed: {field}")]
     JsonFieldMismatch { field: String },
