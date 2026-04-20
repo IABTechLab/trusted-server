@@ -631,7 +631,7 @@ impl KvIdentityGraph {
 
         let Some(domain) = validated_stored_domain(domain) else {
             log::warn!(
-                "update_last_seen: skipping invalid publisher domain for '{}': '{domain}'",
+                "update_last_seen: skipping invalid publisher domain for '{}'",
                 log_id(ec_id),
             );
             return Ok(());
@@ -658,10 +658,9 @@ impl KvIdentityGraph {
                         );
                     } else {
                         // log_id() truncates the EC ID — safe for logging.
-                        // lgtm[rust/cleartext-logging] -- false positive: only the redacted 8-char prefix is logged.
                         log::debug!(
                             "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
-                             for '{}', dropping domain '{domain}'",
+                             for '{}', dropping additional domain",
                             log_id(ec_id),
                         );
                     }
