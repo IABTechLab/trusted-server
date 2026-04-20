@@ -268,6 +268,8 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut fastly::Response) {
 
 #[cfg(test)]
 mod tests {
+    use fastly::http::HeaderValue;
+
     use crate::test_support::tests::create_test_settings;
 
     use super::*;
@@ -345,6 +347,28 @@ mod tests {
             .expect("should have cookie jar");
 
         assert!(jar.iter().count() == 0);
+    }
+
+    #[test]
+    fn test_handle_request_cookies_invalid_utf8_header_value() {
+        let mut req = Request::get("http://example.com");
+        req.set_header(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"session=\xFF")
+                .expect("should allow non-UTF-8 cookie header bytes"),
+        );
+
+        let error = handle_request_cookies(&req).expect_err("should reject invalid UTF-8");
+        let trusted_server_error = error.current_context();
+
+        assert!(
+            matches!(
+                trusted_server_error,
+                TrustedServerError::InvalidHeaderValue { message }
+                    if message == "Cookie header contains invalid UTF-8"
+            ),
+            "should return InvalidHeaderValue for invalid UTF-8 cookie headers",
+        );
     }
 
     #[test]

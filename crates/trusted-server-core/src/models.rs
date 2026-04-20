@@ -55,7 +55,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_callback_deserialization() {
+    fn test_callback_deserialization_renames_type_field() {
         let json_data = json!({
             "type": "impression",
             "url": "https://example.com/track/impression"
@@ -63,22 +63,9 @@ mod tests {
 
         let callback: Callback =
             serde_json::from_value(json_data).expect("should deserialize callback");
+
         assert_eq!(callback.callback_type, "impression");
         assert_eq!(callback.url, "https://example.com/track/impression");
-    }
-
-    #[test]
-    fn test_callback_type_field_rename() {
-        // Test that "type" is correctly renamed to callback_type
-        let json_str = r#"{
-            "type": "click",
-            "url": "https://example.com/track/click"
-        }"#;
-
-        let callback: Callback =
-            serde_json::from_str(json_str).expect("should deserialize callback from str");
-        assert_eq!(callback.callback_type, "click");
-        assert_eq!(callback.url, "https://example.com/track/click");
     }
 
     #[test]

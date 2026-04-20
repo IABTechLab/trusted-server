@@ -136,7 +136,115 @@ impl IntoHttpResponse for TrustedServerError {
 
 #[cfg(test)]
 mod tests {
+    use http::StatusCode;
+
     use super::*;
+
+    #[test]
+    fn status_code_maps_each_error_variant_to_expected_http_response() {
+        let cases = [
+            (
+                TrustedServerError::BadRequest {
+                    message: "missing field".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::Configuration {
+                    message: "invalid config".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Auction {
+                    message: "bid timeout".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Gam {
+                    message: "upstream error".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::GdprConsent {
+                    message: "missing consent string".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::InvalidUtf8 {
+                    message: "byte 0xff".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::InvalidHeaderValue {
+                    message: "non-ascii".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::KvStore {
+                    store_name: "users".into(),
+                    message: "timeout".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::Prebid {
+                    message: "adapter error".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Integration {
+                    integration: "foo".into(),
+                    message: "connection refused".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Proxy {
+                    message: "upstream refused".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Forbidden {
+                    message: "missing credentials".into(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::AllowlistViolation {
+                    host: "blocked.example.com".into(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::Settings {
+                    message: "parse failed".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Ec {
+                    message: "seed missing".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (error, expected_status) in cases {
+            assert_eq!(
+                error.status_code(),
+                expected_status,
+                "should map {error:?} to the expected HTTP status",
+            );
+        }
+    }
 
     #[test]
     fn server_errors_return_generic_message() {
