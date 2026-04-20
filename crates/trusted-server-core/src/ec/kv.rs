@@ -8,6 +8,7 @@
 //! per-operation error handling policy in the spec §7.5.
 
 use std::collections::HashMap;
+use std::thread;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt};
@@ -18,11 +19,12 @@ use crate::error::TrustedServerError;
 use super::current_timestamp;
 use super::generation::ec_hash;
 use super::kv_types::{
-    KvDomainVisit, KvEntry, KvMetadata, KvNetwork, KvPubProperties, MAX_SEEN_DOMAINS,
+    validated_stored_domain, KvDomainVisit, KvEntry, KvMetadata, KvNetwork, KvPubProperties,
+    MAX_SEEN_DOMAINS,
 };
 
 /// Maximum number of CAS retry attempts before giving up.
-const MAX_CAS_RETRIES: u32 = 3;
+const MAX_CAS_RETRIES: u32 = 5;
 
 /// Minimum interval (seconds) between `last_seen` KV writes for the same key.
 /// Prevents write thrashing under bursty traffic — Fastly KV enforces a
@@ -59,6 +61,15 @@ pub enum UpsertResult {
 }
 
 use super::log_id;
+
+fn cas_retry_delay(attempt: u32, ec_id: &str) -> Duration {
+    let backoff_ms = 5_u64.saturating_mul(1_u64 << attempt.min(4));
+    let jitter_ms = ec_hash(ec_id)
+        .bytes()
+        .fold(0_u64, |acc, byte| acc.wrapping_add(u64::from(byte)))
+        % 8;
+    Duration::from_millis(backoff_ms + jitter_ms)
+}
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
@@ -312,6 +323,7 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
+                    thread::sleep(cas_retry_delay(attempt, ec_id));
                     // Re-read to get fresh generation.
                     match self.get(ec_id)? {
                         Some((refreshed, gen)) => {
@@ -394,6 +406,7 @@ impl KvIdentityGraph {
                         attempt + 1,
                         MAX_CAS_RETRIES,
                     );
+                    thread::sleep(cas_retry_delay(attempt, ec_id));
                     continue;
                 }
             };
@@ -438,6 +451,7 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
+                    thread::sleep(cas_retry_delay(attempt, ec_id));
                     // Loop will re-read on next iteration.
                 }
                 Err(err) => {
@@ -524,6 +538,7 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
+                    thread::sleep(cas_retry_delay(attempt, ec_id));
                 }
                 Err(err) => {
                     return Err(
@@ -614,11 +629,19 @@ impl KvIdentityGraph {
 
         entry.last_seen = timestamp;
 
+        let Some(domain) = validated_stored_domain(domain) else {
+            log::warn!(
+                "update_last_seen: skipping invalid publisher domain for '{}': '{domain}'",
+                log_id(ec_id),
+            );
+            return Ok(());
+        };
+
         // Update publisher domain visit history.
         // When `pub_properties` is `None` (entry created before this field
         // was added), backfill it with the current domain as origin.
         match entry.pub_properties {
-            Some(ref mut props) => match props.seen_domains.get_mut(domain) {
+            Some(ref mut props) => match props.seen_domains.get_mut(&domain) {
                 Some(visit) => {
                     visit.last = timestamp;
                     visit.visits = visit.visits.saturating_add(1);
@@ -626,7 +649,7 @@ impl KvIdentityGraph {
                 None => {
                     if props.seen_domains.len() < MAX_SEEN_DOMAINS {
                         props.seen_domains.insert(
-                            domain.to_owned(),
+                            domain.clone(),
                             KvDomainVisit {
                                 first: timestamp,
                                 last: timestamp,
@@ -635,6 +658,7 @@ impl KvIdentityGraph {
                         );
                     } else {
                         // log_id() truncates the EC ID — safe for logging.
+                        // lgtm[rust/cleartext-logging] -- false positive: only the redacted 8-char prefix is logged.
                         log::debug!(
                             "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
                              for '{}', dropping domain '{domain}'",
@@ -646,7 +670,7 @@ impl KvIdentityGraph {
             None => {
                 let mut seen_domains = HashMap::new();
                 seen_domains.insert(
-                    domain.to_owned(),
+                    domain.clone(),
                     KvDomainVisit {
                         first: timestamp,
                         last: timestamp,
@@ -654,7 +678,7 @@ impl KvIdentityGraph {
                     },
                 );
                 entry.pub_properties = Some(KvPubProperties {
-                    origin_domain: domain.to_owned(),
+                    origin_domain: domain,
                     seen_domains,
                 });
             }
@@ -788,6 +812,7 @@ impl KvIdentityGraph {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
                     // log_id() truncates the EC ID — safe for logging.
+                    // lgtm[rust/cleartext-logging] -- false positive: only the redacted 8-char prefix is logged.
                     log::trace!(
                         "evaluate_cluster: cached cluster_size for '{}' \
                          (age={}s, ttl={recheck_secs}s)",
@@ -870,11 +895,33 @@ mod tests {
 
     #[test]
     fn constants_have_expected_values() {
-        assert_eq!(MAX_CAS_RETRIES, 3);
+        assert_eq!(MAX_CAS_RETRIES, 5);
         assert_eq!(LAST_SEEN_DEBOUNCE_SECS, 300);
         assert_eq!(ENTRY_TTL, Duration::from_secs(31_536_000));
         assert_eq!(TOMBSTONE_TTL, Duration::from_secs(86_400));
         assert_eq!(CLUSTER_LIST_LIMIT, 100);
+    }
+
+    #[test]
+    fn cas_retry_delay_grows_with_attempts() {
+        let first = cas_retry_delay(
+            0,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
+        );
+        let second = cas_retry_delay(
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
+        );
+        let third = cas_retry_delay(
+            2,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
+        );
+
+        assert!(
+            first < second,
+            "retry delay should increase after first conflict"
+        );
+        assert!(second < third, "retry delay should continue increasing");
     }
 
     #[test]

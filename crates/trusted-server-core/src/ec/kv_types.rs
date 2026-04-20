@@ -6,7 +6,7 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,13 @@ use crate::geo::GeoInfo;
 pub const SCHEMA_VERSION: u8 = 1;
 
 /// Maximum number of domains tracked in [`KvPubProperties::seen_domains`].
-/// When the cap is reached, new domains are silently dropped.
+///
+/// When the cap is reached, additional newer domains are silently dropped and
+/// the earliest retained set remains unchanged.
 pub const MAX_SEEN_DOMAINS: usize = 50;
+
+/// Maximum allowed hostname length for publisher domains stored in KV.
+pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 
 /// Maximum allowed length (in bytes) for a partner UID across all sync
 /// mechanisms (pixel, batch, pull). Defined centrally to ensure consistent
@@ -55,8 +60,8 @@ pub struct KvEntry {
     pub network: Option<KvNetwork>,
     /// Map of partner ID namespace → synced UID record.
     /// Populated by pixel sync, batch sync, and pull sync operations.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub ids: HashMap<String, KvPartnerId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ids: BTreeMap<String, KvPartnerId>,
 }
 
 /// Consent state within a KV entry.
@@ -206,6 +211,50 @@ pub struct KvMetadata {
     pub known_browser: Option<bool>,
 }
 
+/// Validates a publisher domain before storing it in KV.
+///
+/// Applies a lightweight hostname-shape check and lowercases ASCII labels so
+/// stored values remain bounded and consistent.
+#[must_use]
+pub(crate) fn validated_stored_domain(domain: &str) -> Option<String> {
+    if domain.is_empty() || domain.len() > MAX_STORED_DOMAIN_LENGTH {
+        return None;
+    }
+    if !domain.is_ascii() {
+        return None;
+    }
+
+    let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > MAX_STORED_DOMAIN_LENGTH {
+        return None;
+    }
+
+    let mut labels = normalized.split('.');
+    let mut saw_label = false;
+    for label in &mut labels {
+        saw_label = true;
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+
+        let bytes = label.as_bytes();
+        let first = bytes.first().copied().expect("should have non-empty label");
+        let last = bytes.last().copied().expect("should have non-empty label");
+        if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+            return None;
+        }
+        if !bytes
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+    }
+
+    saw_label.then_some(normalized)
+}
+
 impl KvEntry {
     /// Creates a new live entry from the current request context.
     ///
@@ -213,15 +262,22 @@ impl KvEntry {
     /// used to initialize the [`KvPubProperties`] origin and first visit.
     #[must_use]
     pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
-        let mut seen_domains = HashMap::new();
-        seen_domains.insert(
-            domain.to_owned(),
-            KvDomainVisit {
-                first: now,
-                last: now,
-                visits: 1,
-            },
-        );
+        let pub_properties = validated_stored_domain(domain).map(|validated_domain| {
+            let mut seen_domains = HashMap::new();
+            seen_domains.insert(
+                validated_domain.clone(),
+                KvDomainVisit {
+                    first: now,
+                    last: now,
+                    visits: 1,
+                },
+            );
+
+            KvPubProperties {
+                origin_domain: validated_domain,
+                seen_domains,
+            }
+        });
 
         Self {
             v: SCHEMA_VERSION,
@@ -234,13 +290,10 @@ impl KvEntry {
                 updated: now,
             },
             geo: KvGeo::from_geo_info(geo),
-            pub_properties: Some(KvPubProperties {
-                origin_domain: domain.to_owned(),
-                seen_domains,
-            }),
+            pub_properties,
             device: None,
             network: None,
-            ids: HashMap::new(),
+            ids: BTreeMap::new(),
         }
     }
 
@@ -251,7 +304,7 @@ impl KvEntry {
     /// `create_or_revive` failed on EC generation).
     #[must_use]
     pub fn minimal(partner_id: &str, uid: &str, synced: u64) -> Self {
-        let mut ids = HashMap::new();
+        let mut ids = BTreeMap::new();
         ids.insert(
             partner_id.to_owned(),
             KvPartnerId {
@@ -311,7 +364,7 @@ impl KvEntry {
             pub_properties: None,
             device: None,
             network: None,
-            ids: HashMap::new(),
+            ids: BTreeMap::new(),
         }
     }
 }
@@ -528,6 +581,43 @@ mod tests {
         assert!(entry.geo.region.is_none());
         assert!(entry.geo.asn.is_none());
         assert!(entry.geo.dma.is_none());
+    }
+
+    #[test]
+    fn validated_stored_domain_accepts_and_normalizes_ascii_hostnames() {
+        assert_eq!(
+            validated_stored_domain("Example.COM."),
+            Some("example.com".to_owned()),
+            "should lowercase and trim a trailing dot"
+        );
+    }
+
+    #[test]
+    fn validated_stored_domain_rejects_invalid_shapes() {
+        assert!(
+            validated_stored_domain("bad_domain").is_none(),
+            "underscores should be rejected"
+        );
+        assert!(
+            validated_stored_domain("-example.com").is_none(),
+            "labels should not start with hyphens"
+        );
+        assert!(
+            validated_stored_domain(&"a".repeat(MAX_STORED_DOMAIN_LENGTH + 1)).is_none(),
+            "overlong hostnames should be rejected"
+        );
+    }
+
+    #[test]
+    fn new_entry_skips_pub_properties_for_invalid_domain() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let entry = KvEntry::new(&consent, Some(&geo), 1000, "bad_domain");
+
+        assert!(
+            entry.pub_properties.is_none(),
+            "invalid stored domains should not be persisted into pub_properties"
+        );
     }
 
     #[test]
