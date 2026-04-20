@@ -87,7 +87,7 @@ pub async fn handle_auction(
     let had_eids = eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids = gate_eids_by_consent(eids, auction_request.user.consent.as_ref());
     if had_eids && auction_request.user.eids.is_none() {
-        log::debug!("Auction EIDs stripped by TCF consent gating");
+        log::warn!("Auction EIDs stripped by TCF consent gating");
     }
 
     // Create auction context
