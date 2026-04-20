@@ -187,45 +187,147 @@ impl PlatformBackend for FastlyPlatformBackend {
 }
 
 // ---------------------------------------------------------------------------
+// FastlyPlatformHttpClient — helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a platform-neutral [`edgezero_core::http::Request`] to a [`fastly::Request`].
+///
+/// Only buffered `Body::Once` bodies are supported on this path.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::HttpClient`] when the request body is streaming.
+fn edge_request_to_fastly(
+    request: edgezero_core::http::Request,
+) -> Result<fastly::Request, Report<PlatformError>> {
+    let (parts, body) = request.into_parts();
+    let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
+    for (name, value) in parts.headers.iter() {
+        fastly_req.append_header(name.as_str(), value.as_bytes());
+    }
+    match body {
+        edgezero_core::body::Body::Once(bytes) => {
+            if !bytes.is_empty() {
+                fastly_req.set_body(bytes.to_vec());
+            }
+        }
+        edgezero_core::body::Body::Stream(_) => {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("streaming request body is not supported by Fastly request conversion"));
+        }
+    }
+    Ok(fastly_req)
+}
+
+/// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
+fn fastly_response_to_platform(
+    mut resp: fastly::Response,
+    backend_name: impl Into<String>,
+) -> Result<PlatformResponse, Report<PlatformError>> {
+    let status = resp.get_status();
+    let mut builder = edgezero_core::http::response_builder().status(status);
+    for (name, value) in resp.get_headers() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let body_bytes = resp.take_body_bytes();
+    let edge_response = builder
+        .body(edgezero_core::body::Body::from(body_bytes))
+        .change_context(PlatformError::HttpClient)?;
+    Ok(PlatformResponse::new(edge_response).with_backend_name(backend_name))
+}
+
+// ---------------------------------------------------------------------------
 // FastlyPlatformHttpClient
 // ---------------------------------------------------------------------------
 
-/// Placeholder Fastly implementation of [`PlatformHttpClient`].
+/// Fastly implementation of [`PlatformHttpClient`].
 ///
-/// The Fastly-backed `send` / `send_async` / `select` behavior lands in a
-/// follow-up PR once the orchestrator migration is complete. Until then all
-/// methods return [`PlatformError::Unsupported`].
-///
-/// Implementation lands in #487 (PR 6: Backend + HTTP client traits).
+/// - [`send`](PlatformHttpClient::send) — converts the platform request to a
+///   `fastly::Request`, calls `.send()`, and wraps the response.
+/// - [`send_async`](PlatformHttpClient::send_async) — same conversion but
+///   calls `.send_async()` and wraps the `fastly::PendingRequest`.
+/// - [`select`](PlatformHttpClient::select) — downcasts each
+///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
+///   `fastly::http::request::select()`.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
     async fn send(
         &self,
-        _request: PlatformHttpRequest,
+        request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        log::warn!("FastlyPlatformHttpClient::send called before #487 lands");
-        Err(Report::new(PlatformError::Unsupported)
-            .attach("FastlyPlatformHttpClient::send is not yet implemented"))
+        let backend_name = request.backend_name.clone();
+        let fastly_req = edge_request_to_fastly(request.request)?;
+        let fastly_resp = fastly_req
+            .send(&backend_name)
+            .change_context(PlatformError::HttpClient)?;
+        fastly_response_to_platform(fastly_resp, backend_name)
     }
 
     async fn send_async(
         &self,
-        _request: PlatformHttpRequest,
+        request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        log::warn!("FastlyPlatformHttpClient::send_async called before #487 lands");
-        Err(Report::new(PlatformError::Unsupported)
-            .attach("FastlyPlatformHttpClient::send_async is not yet implemented"))
+        let backend_name = request.backend_name.clone();
+        let fastly_req = edge_request_to_fastly(request.request)?;
+        let pending = fastly_req
+            .send_async(&backend_name)
+            .change_context(PlatformError::HttpClient)?;
+        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
     async fn select(
         &self,
-        _pending_requests: Vec<PlatformPendingRequest>,
+        pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        log::warn!("FastlyPlatformHttpClient::select called before #487 lands");
-        Err(Report::new(PlatformError::Unsupported)
-            .attach("FastlyPlatformHttpClient::select is not yet implemented"))
+        use fastly::http::request::{select, PendingRequest};
+
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select called with an empty pending_requests list"));
+        }
+
+        let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
+
+        for platform_req in pending_requests {
+            let inner = platform_req.downcast::<PendingRequest>().map_err(|platform_req| {
+                let backend_name = platform_req.backend_name().unwrap_or("<unknown>");
+                Report::new(PlatformError::HttpClient).attach(format!(
+                    "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
+                ))
+            })?;
+            fastly_pending.push(inner);
+        }
+
+        let (result, remaining_fastly) = select(fastly_pending);
+
+        // Fastly's select() does not preserve input order for remaining requests,
+        // so positional backend-name re-association is unreliable. Backend names
+        // are re-derived from get_backend_name() when each remaining request completes.
+        let remaining: Vec<PlatformPendingRequest> = remaining_fastly
+            .into_iter()
+            .map(PlatformPendingRequest::new)
+            .collect();
+
+        let ready = match result {
+            Ok(fastly_resp) => {
+                let backend_name = fastly_resp
+                    .get_backend_name()
+                    .unwrap_or_else(|| {
+                        log::warn!("select: response has no backend name, correlation will fail");
+                        ""
+                    })
+                    .to_string();
+                fastly_response_to_platform(fastly_resp, backend_name)
+            }
+            Err(e) => {
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("fastly select error: {e}")))
+            }
+        };
+
+        Ok(PlatformSelectResult { ready, remaining })
     }
 }
 
@@ -286,7 +388,6 @@ pub fn build_runtime_services(
 ///
 /// Returns [`KvError::Unavailable`] when the store does not exist, or
 /// [`KvError::Internal`] when the Fastly SDK fails to open it.
-#[allow(dead_code)]
 pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
     FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
@@ -297,9 +398,12 @@ pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvErr
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
     use edgezero_core::key_value_store::NoopKvStore;
 
     use super::*;
@@ -416,6 +520,134 @@ mod tests {
             services.client_info().client_ip,
             cloned.client_info().client_ip,
             "should preserve client_ip through clone"
+        );
+    }
+
+    // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn fastly_platform_http_client_send_returns_error_for_unregistered_backend() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(Body::empty())
+            .expect("should build test request");
+        let err = futures::executor::block_on(
+            client.send(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should return error for unregistered backend");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_async_returns_error_for_unregistered_backend() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(Body::empty())
+            .expect("should build test request");
+        let err = futures::executor::block_on(
+            client.send_async(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should return error for unregistered backend");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_select_returns_error_for_empty_list() {
+        let client = FastlyPlatformHttpClient;
+        let err = futures::executor::block_on(client.select(vec![]))
+            .expect_err("should return error for empty pending list");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_select_returns_error_for_wrong_inner_type() {
+        let client = FastlyPlatformHttpClient;
+        // Wrap a non-PendingRequest type to trigger the downcast failure.
+        let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
+        let err = futures::executor::block_on(client.select(vec![wrong]))
+            .expect_err("should return error for wrong inner type");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("origin-a"),
+            "should include backend name in error report: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(Body::from_stream(futures::stream::empty::<
+                Result<_, io::Error>,
+            >()))
+            .expect("should build streaming test request");
+
+        let err = futures::executor::block_on(
+            client.send(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should reject streaming request bodies before sending");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("streaming request body"),
+            "should describe the unsupported streaming body: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_async_returns_error_for_streaming_body() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(Body::from_stream(futures::stream::empty::<
+                Result<_, io::Error>,
+            >()))
+            .expect("should build streaming test request");
+
+        let err = futures::executor::block_on(
+            client.send_async(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should reject streaming request bodies before launching async send");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("streaming request body"),
+            "should describe the unsupported streaming body: {err:?}"
         );
     }
 }

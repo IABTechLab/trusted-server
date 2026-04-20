@@ -1,3 +1,12 @@
+//! Publisher response handler.
+//!
+//! **Note on platform coupling:** This module is currently coupled to
+//! `fastly::Body`/`Request`/`Response` at its handler boundaries — for example,
+//! `process_response_streaming` accepts and returns `fastly::Body`. This is an
+//! HTTP-type coupling that will be addressed in the HTTP-type migration alongside
+//! all other `fastly::Request`/`Response`/`Body` migrations. It is not a
+//! content-rewriting concern.
+
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -10,6 +19,7 @@ use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
+use crate::platform::RuntimeServices;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -289,6 +299,7 @@ fn create_html_stream_processor(
 pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -297,7 +308,7 @@ pub fn handle_publisher_request(
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req);
+    let request_info = RequestInfo::from_request(&req, &services.client_info);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
@@ -324,21 +335,31 @@ pub fn handle_publisher_request(
     // Generate EC identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let ec_id = get_or_generate_ec_id(settings, &req)?;
+    let ec_id = get_or_generate_ec_id(settings, services, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
     // (for OpenRTB forwarding) and decoded data (for enforcement).
     // When a consent_store is configured, this also persists consent to KV
     // and falls back to stored consent when cookies are absent.
-    #[allow(deprecated)]
-    let geo = crate::geo::GeoInfo::from_request(&req);
+    let geo = services
+        .geo()
+        .lookup(services.client_info.client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
         req: &req,
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
     });
     let ec_allowed = allows_ec_creation(&consent_context);
     log::trace!("Proxy EC ID: {}, ec_allowed: {}", ec_id, ec_allowed);
@@ -457,8 +478,8 @@ pub fn handle_publisher_request(
             consent_context.jurisdiction,
         );
         expire_ec_cookie(settings, &mut response);
-        if let Some(store_name) = &settings.consent.consent_store {
-            crate::consent::kv::delete_consent_from_kv(store_name, cookie_ec_id);
+        if settings.consent.consent_store.is_some() {
+            crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
     } else {
         log::debug!(
@@ -474,6 +495,7 @@ pub fn handle_publisher_request(
 mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistry;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
 
@@ -672,7 +694,8 @@ mod tests {
             .and_then(|jar| jar.get(COOKIE_TS_EC))
             .map(|cookie| cookie.value().to_owned());
 
-        let resolved_ec_id = get_or_generate_ec_id(&settings, &req).expect("should resolve EC ID");
+        let resolved_ec_id =
+            get_or_generate_ec_id(&settings, &noop_services(), &req).expect("should resolve EC ID");
 
         assert_eq!(
             existing_ec_cookie.as_deref(),
