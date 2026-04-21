@@ -8,11 +8,15 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 
 use super::kv::KvIdentityGraph;
+use super::kv_types::MAX_UID_LENGTH;
 use super::registry::PartnerRegistry;
 
 /// Minimum seconds between KV writes for the same partner on the same EC.
 /// Prevents write thrashing when a user hits many pages quickly.
 const SYNC_DEBOUNCE_SECS: u64 = 300;
+
+/// Maximum raw `ts-eids` cookie size accepted before base64 decode.
+const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
 
 /// A single flattened EID from the `ts-eids` cookie.
 #[derive(Debug, Deserialize)]
@@ -37,6 +41,14 @@ pub fn ingest_prebid_eids(
     registry: &PartnerRegistry,
 ) {
     if registry.is_empty() {
+        return;
+    }
+
+    if eids_cookie_exceeds_size_limit(cookie_value) {
+        log::debug!(
+            "Prebid EIDs: ts-eids cookie too large ({} bytes)",
+            cookie_value.len()
+        );
         return;
     }
 
@@ -113,6 +125,14 @@ pub fn ingest_sharedid_cookie(
         return;
     }
 
+    if sharedid_cookie_exceeds_size_limit(cookie_value) {
+        log::debug!(
+            "SharedID: cookie exceeds MAX_UID_LENGTH ({} bytes)",
+            cookie_value.len()
+        );
+        return;
+    }
+
     let Some(partner) = registry.find_by_source_domain(SHAREDID_SOURCE_DOMAIN) else {
         log::debug!("SharedID: no partner configured for source '{SHAREDID_SOURCE_DOMAIN}'");
         return;
@@ -142,6 +162,14 @@ pub fn ingest_sharedid_cookie(
             log::warn!("SharedID: failed to sync partner '{}': {err:?}", partner.id);
         }
     }
+}
+
+fn eids_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
+    cookie_value.len() > MAX_EIDS_COOKIE_BYTES
+}
+
+fn sharedid_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
+    cookie_value.len() > MAX_UID_LENGTH
 }
 
 /// Decodes base64 JSON → `Vec<CookieEid>`.
@@ -184,5 +212,35 @@ mod tests {
         let encoded = BASE64.encode(b"not json");
         let result = decode_eids(&encoded);
         assert!(result.is_err(), "should reject invalid JSON");
+    }
+
+    #[test]
+    fn ts_eids_cookie_rejects_oversized_payloads() {
+        let oversized = "x".repeat(MAX_EIDS_COOKIE_BYTES + 1);
+        let exact_limit = "x".repeat(MAX_EIDS_COOKIE_BYTES);
+
+        assert!(
+            eids_cookie_exceeds_size_limit(&oversized),
+            "should reject cookies larger than the raw size cap"
+        );
+        assert!(
+            !eids_cookie_exceeds_size_limit(&exact_limit),
+            "should allow cookies exactly at the raw size cap"
+        );
+    }
+
+    #[test]
+    fn sharedid_cookie_rejects_values_larger_than_uid_limit() {
+        let oversized = "x".repeat(MAX_UID_LENGTH + 1);
+        let exact_limit = "x".repeat(MAX_UID_LENGTH);
+
+        assert!(
+            sharedid_cookie_exceeds_size_limit(&oversized),
+            "should reject sharedId values larger than MAX_UID_LENGTH"
+        );
+        assert!(
+            !sharedid_cookie_exceeds_size_limit(&exact_limit),
+            "should allow sharedId values exactly at MAX_UID_LENGTH"
+        );
     }
 }

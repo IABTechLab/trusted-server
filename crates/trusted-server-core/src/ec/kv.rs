@@ -810,12 +810,9 @@ impl KvIdentityGraph {
         if let Some(ref network) = entry.network {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
-                    // log_id() truncates the EC ID — safe for logging.
-                    // lgtm[rust/cleartext-logging] -- false positive: only the redacted 8-char prefix is logged.
                     log::trace!(
-                        "evaluate_cluster: cached cluster_size for '{}' \
+                        "evaluate_cluster: using cached cluster_size \
                          (age={}s, ttl={recheck_secs}s)",
-                        log_id(ec_id),
                         now.saturating_sub(checked),
                     );
                     return Ok(network.cluster_size);
