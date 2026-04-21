@@ -316,7 +316,7 @@ pub fn save_consent_to_kv(
 
     match futures::executor::block_on(store.put_bytes_with_ttl(ec_id, body, ttl)) {
         Ok(()) => {
-            log::info!("Saved consent to KV store (fp={fp}, ttl={max_age_days}d)");
+            log::info!("Saved consent to KV store");
         }
         Err(e) => {
             log::warn!("Failed to write consent to KV store: {e}");
