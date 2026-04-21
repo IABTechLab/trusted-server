@@ -60,6 +60,9 @@ pub async fn handle_auction(
     let ec_id = if ec_context.ec_allowed() {
         ec_context.ec_value()
     } else {
+        // Intentionally omit persistent identity when EC is disallowed.
+        // This keeps the no-consent / GPC path conservative rather than
+        // introducing a secondary session-scoped identifier surface here.
         None
     };
     let consent_context = ec_context.consent().clone();
