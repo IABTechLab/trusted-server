@@ -810,11 +810,7 @@ impl KvIdentityGraph {
         if let Some(ref network) = entry.network {
             if let Some(checked) = network.cluster_checked {
                 if now.saturating_sub(checked) < recheck_secs {
-                    log::trace!(
-                        "evaluate_cluster: using cached cluster_size \
-                         (age={}s, ttl={recheck_secs}s)",
-                        now.saturating_sub(checked),
-                    );
+                    log::trace!("evaluate_cluster: using cached cluster_size");
                     return Ok(network.cluster_size);
                 }
             }
