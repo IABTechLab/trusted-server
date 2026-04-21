@@ -70,6 +70,14 @@ impl DeviceSignals {
     /// platform string (`platform_class`). Raw HTTP clients (curl, Python
     /// requests, Go net/http, headless scrapers) typically lack one or both.
     ///
+    /// # Threat model
+    ///
+    /// This heuristic is intentionally aimed at filtering obvious
+    /// missing-signal traffic, not at resisting deliberate spoofing. A bot
+    /// that forges plausible JA4 and UA inputs may still pass; deeper
+    /// consistency checks can be added later if product requirements demand
+    /// stronger spoof resistance.
+    ///
     /// `known_browser` is still computed and stored on [`KvDevice`] for
     /// analytics but does not gate identity operations.
     #[must_use]

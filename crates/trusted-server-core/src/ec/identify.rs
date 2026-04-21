@@ -8,6 +8,7 @@ use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use url::Url;
 
+use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
 use crate::constants::HEADER_X_TS_EC;
 use crate::error::TrustedServerError;
@@ -16,35 +17,8 @@ use crate::settings::Settings;
 
 use super::kv::KvIdentityGraph;
 use super::log_id;
-use super::partner::hash_api_key;
-use super::registry::{PartnerConfig, PartnerRegistry};
+use super::registry::PartnerRegistry;
 use super::EcContext;
-
-/// Authenticates a request via Bearer token, returning the matching partner.
-fn authenticate_bearer<'r>(
-    registry: &'r PartnerRegistry,
-    req: &Request,
-) -> Option<&'r PartnerConfig> {
-    let header_value = req.get_header_str("authorization")?;
-    let token = parse_bearer_token(header_value)?;
-    let key_hash = hash_api_key(token);
-    registry.find_by_api_key_hash(&key_hash)
-}
-
-fn parse_bearer_token(header_value: &str) -> Option<&str> {
-    let mut parts = header_value.split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
-        return None;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-
-    Some(token)
-}
 
 /// Handles `GET /_ts/api/v1/identify`.
 ///

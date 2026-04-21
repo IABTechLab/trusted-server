@@ -155,13 +155,30 @@ impl KvIdentityGraph {
 
         let generation = response.current_generation();
         let body_bytes = response.take_body_bytes();
+        let entry = Self::deserialize_entry(&self.store_name, ec_id, &body_bytes)?;
+
+        Ok(Some((entry, generation)))
+    }
+
+    fn deserialize_entry(
+        store_name: &str,
+        ec_id: &str,
+        body_bytes: &[u8],
+    ) -> Result<KvEntry, Report<TrustedServerError>> {
         let entry: KvEntry =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::KvStore {
-                store_name: self.store_name.clone(),
+            serde_json::from_slice(body_bytes).change_context(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
                 message: format!("Failed to deserialize entry for key '{ec_id}'"),
             })?;
 
-        Ok(Some((entry, generation)))
+        entry.validate().map_err(|message| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
+                message: format!("Loaded invalid entry for key '{ec_id}': {message}"),
+            })
+        })?;
+
+        Ok(entry)
     }
 
     /// Reads only the metadata for an EC ID key (no body streaming).
@@ -935,6 +952,27 @@ mod tests {
         // Verify metadata is valid JSON.
         let _: KvMetadata =
             serde_json::from_str(&meta).expect("should deserialize metadata back to KvMetadata");
+    }
+
+    #[test]
+    fn deserialize_entry_rejects_invalid_legacy_values() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+                synced: 1000,
+            },
+        );
+        let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
+
+        let err = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
+            .expect_err("should reject invalid legacy entry values");
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains("Loaded invalid entry"),
+            "should report validation failure for loaded entries"
+        );
     }
 
     #[test]

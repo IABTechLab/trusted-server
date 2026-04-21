@@ -367,6 +367,54 @@ impl KvEntry {
             ids: BTreeMap::new(),
         }
     }
+
+    /// Validates a deserialized entry loaded from KV.
+    ///
+    /// Rejects legacy or corrupt records that exceed the current bounded
+    /// storage contract rather than re-serializing them at unbounded size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing the first bounds or shape violation
+    /// found in the deserialized record.
+    pub fn validate(&self) -> Result<(), String> {
+        for (partner_id, partner_uid) in &self.ids {
+            if partner_uid.uid.len() > MAX_UID_LENGTH {
+                return Err(format!(
+                    "partner ID '{partner_id}' exceeds MAX_UID_LENGTH ({})",
+                    partner_uid.uid.len()
+                ));
+            }
+        }
+
+        if let Some(pub_properties) = &self.pub_properties {
+            if validated_stored_domain(&pub_properties.origin_domain).as_deref()
+                != Some(pub_properties.origin_domain.as_str())
+            {
+                return Err(format!(
+                    "origin_domain '{}' is invalid for stored KV data",
+                    pub_properties.origin_domain
+                ));
+            }
+
+            if pub_properties.seen_domains.len() > MAX_SEEN_DOMAINS {
+                return Err(format!(
+                    "seen_domains exceeds MAX_SEEN_DOMAINS ({})",
+                    pub_properties.seen_domains.len()
+                ));
+            }
+
+            for domain in pub_properties.seen_domains.keys() {
+                if validated_stored_domain(domain).as_deref() != Some(domain.as_str()) {
+                    return Err(format!(
+                        "seen_domains contains invalid stored domain '{domain}'"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl KvMetadata {
@@ -617,6 +665,76 @@ mod tests {
         assert!(
             entry.pub_properties.is_none(),
             "invalid stored domains should not be persisted into pub_properties"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_oversized_partner_uid() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            KvPartnerId {
+                uid: "x".repeat(MAX_UID_LENGTH + 1),
+                synced: 1000,
+            },
+        );
+
+        let err = entry
+            .validate()
+            .expect_err("should reject oversized partner UIDs");
+        assert!(
+            err.contains("MAX_UID_LENGTH"),
+            "should describe the UID length validation failure"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_seen_domains_over_cap() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
+        let pub_properties = entry
+            .pub_properties
+            .as_mut()
+            .expect("should initialize pub_properties");
+
+        for idx in 0..MAX_SEEN_DOMAINS {
+            pub_properties.seen_domains.insert(
+                format!("extra-{idx}.example.com"),
+                KvDomainVisit {
+                    first: 1000,
+                    last: 1000,
+                    visits: 1,
+                },
+            );
+        }
+
+        let err = entry
+            .validate()
+            .expect_err("should reject entries with too many seen domains");
+        assert!(
+            err.contains("MAX_SEEN_DOMAINS"),
+            "should describe the seen_domains bound violation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_stored_domain_shapes() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
+        let pub_properties = entry
+            .pub_properties
+            .as_mut()
+            .expect("should initialize pub_properties");
+        pub_properties.origin_domain = "bad_domain".to_owned();
+
+        let err = entry
+            .validate()
+            .expect_err("should reject invalid stored origin domains");
+        assert!(
+            err.contains("origin_domain"),
+            "should report the invalid stored origin_domain"
         );
     }
 

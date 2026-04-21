@@ -371,6 +371,10 @@ async fn route_request(
     finalize_response(settings, geo_info.as_ref(), &mut response);
 
     let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
+        // Pull sync is intentionally refreshed only from successful organic
+        // browser traffic. This keeps the trigger narrow in the current PR;
+        // broadening it to auction-heavy or SPA-only flows is a follow-up
+        // product decision rather than an implicit behavior change here.
         build_pull_sync_context(&ec_context)
     } else {
         None
