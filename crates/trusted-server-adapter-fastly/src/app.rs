@@ -70,7 +70,7 @@ use crate::platform::{
 ///
 /// In Fastly Compute each request spawns a new Wasm instance, so this struct is
 /// effectively per-request. It holds pre-parsed settings and all service handles.
-pub struct AppState {
+struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
