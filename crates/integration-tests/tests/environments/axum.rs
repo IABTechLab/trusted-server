@@ -6,12 +6,8 @@ use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-/// Fixed port the Axum dev server binds to, as set in `axum.toml`.
-///
-/// The port is baked into the binary at compile time via `include_str!("../axum.toml")`
-/// so it cannot be overridden at runtime. Integration tests run with
-/// `--test-threads=1`, ensuring this port is never double-allocated.
-const AXUM_PORT: u16 = 8787;
+/// Default port the Axum dev server binds to when no `PORT` env var is supplied.
+const AXUM_DEFAULT_PORT: u16 = 8787;
 
 /// Axum native dev-server runtime environment.
 ///
@@ -33,8 +29,10 @@ impl RuntimeEnvironment for AxumDevServer {
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let binary = self.binary_path();
+        let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
         let mut child = Command::new(&binary)
+            .env("PORT", port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -56,7 +54,7 @@ impl RuntimeEnvironment for AxumDevServer {
         }
 
         let handle = AxumHandle { child };
-        let base_url = format!("http://127.0.0.1:{AXUM_PORT}");
+        let base_url = format!("http://127.0.0.1:{port}");
 
         // The Axum dev server returns 403 at root (no publisher config in test env),
         // so we poll until we get any HTTP response rather than a specific status.

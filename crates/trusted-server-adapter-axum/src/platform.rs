@@ -293,6 +293,11 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        // Dev-server divergence: execution is eager — errors surface here, not at
+        // select() time. On Fastly the request is in-flight until select() resolves it.
+        log::debug!(
+            "AxumPlatformHttpClient::send_async: executing eagerly (Fastly surfaces errors at select)"
+        );
         let backend_name = request.backend_name.clone();
         let response = self.execute(request).await?;
 
@@ -326,6 +331,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
+        // Dev-server divergence: pops index 0 unconditionally — not "first to complete".
+        // Safe here because send_async already ran eagerly, but any test verifying
+        // parallel fan-out ordering against the Fastly runtime should use a real
+        // Fastly environment.
+        log::debug!(
+            "AxumPlatformHttpClient::select: returning index 0 (sequential, not parallel fan-out)"
+        );
         let ready_platform = pending_requests.remove(0);
         let pending = ready_platform
             .downcast::<AxumPendingResponse>()
