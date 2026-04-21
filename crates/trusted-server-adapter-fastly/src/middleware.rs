@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderName, HeaderValue, Response};
+use edgezero_core::http::{HeaderName, HeaderValue, Response, StatusCode};
+use edgezero_core::response::IntoResponse;
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
@@ -61,12 +62,23 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
 
-        let geo_info = self.geo.lookup(client_ip).unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
+        let mut response = match next.run(ctx).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("request handler failed: {e:?}");
+                e.into_response()
+            }
+        };
 
-        let mut response = next.run(ctx).await?;
+        // Skip geo lookup for authentication rejections — the lookup is unnecessary for 401s.
+        let geo_info = if response.status() != StatusCode::UNAUTHORIZED {
+            self.geo.lookup(client_ip).unwrap_or_else(|e| {
+                log::warn!("geo lookup failed: {e}");
+                None
+            })
+        } else {
+            None
+        };
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
 

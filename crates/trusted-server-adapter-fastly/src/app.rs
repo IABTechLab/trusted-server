@@ -20,6 +20,14 @@
 //! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | GET | `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST | `/{*rest}` | integration proxy or publisher fallback |
+//! | HEAD | `/{*rest}` | publisher fallback (cache validation) |
+//! | OPTIONS | `/{*rest}` | publisher fallback (CORS preflight) |
+//!
+//! # Startup error handling
+//!
+//! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
+//! that responds to all routes with the startup error. This router does **not**
+//! attach middleware — startup errors are returned without geo or TS headers.
 
 use std::sync::Arc;
 
@@ -27,7 +35,7 @@ use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderValue, Response};
+use edgezero_core::http::{header, HeaderValue, Method, Response};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -417,6 +425,11 @@ impl Hooks for TrustedServerApp {
             // explicit root routes so `/` reaches the publisher fallback too.
             .get("/", get_fallback.clone())
             .post("/", post_fallback.clone())
+            // HEAD and OPTIONS reach the publisher origin for cache validation and CORS preflight.
+            .route("/", Method::HEAD, get_fallback.clone())
+            .route("/{*rest}", Method::HEAD, get_fallback.clone())
+            .route("/", Method::OPTIONS, get_fallback.clone())
+            .route("/{*rest}", Method::OPTIONS, get_fallback.clone())
             .get("/{*rest}", get_fallback)
             .post("/{*rest}", post_fallback)
             .build()
