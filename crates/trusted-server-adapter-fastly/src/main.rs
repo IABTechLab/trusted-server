@@ -109,8 +109,7 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
 /// the `edgezero_enabled` config flag is absent or `false`.
 ///
 /// The thin fastly↔http conversion layer (via `compat::from_fastly_request` /
-/// `compat::to_fastly_response`) lives here in the adapter crate. `compat.rs`
-/// will be deleted in PR 15 once this legacy path is retired.
+/// `compat::to_fastly_response`) lives here in the adapter crate.
 ///
 /// # Errors
 ///

@@ -146,8 +146,7 @@ pub(crate) fn open_consent_kv(
 /// mirroring [`crate::http_error_response`] exactly.
 ///
 /// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types. The
-/// duplication will be removed when `legacy_main` is deleted in PR 15.
+/// uses fastly HTTP types while this path uses `edgezero_core` types.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);

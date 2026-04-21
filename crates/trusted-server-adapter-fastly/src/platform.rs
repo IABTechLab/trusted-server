@@ -415,7 +415,7 @@ impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return None,
             Err(e) => {
-                log::debug!("Consent KV lookup miss for '{key}': {e}");
+                log::warn!("Consent KV lookup failed for '{key}': {e}");
                 return None;
             }
         };

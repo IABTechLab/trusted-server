@@ -592,18 +592,18 @@ impl AuctionProvider for ApsAuctionProvider {
     }
 
     fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        let name = predict_backend_name_for_url(
+        predict_backend_name_for_url(
             &self.config.endpoint,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        );
-        if name.is_none() {
+        )
+        .inspect_err(|e| {
             log::error!(
-                "Failed to predict backend name for APS endpoint '{}'",
+                "Failed to predict backend name for APS endpoint '{}': {e:?}",
                 self.config.endpoint
             );
-        }
-        name
+        })
+        .ok()
     }
 }
 

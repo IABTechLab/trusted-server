@@ -1214,18 +1214,18 @@ impl AuctionProvider for PrebidAuctionProvider {
     }
 
     fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        let name = predict_backend_name_for_url(
+        predict_backend_name_for_url(
             &self.config.server_url,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        );
-        if name.is_none() {
+        )
+        .inspect_err(|e| {
             log::error!(
-                "Failed to predict backend name for Prebid server URL '{}'",
+                "Failed to predict backend name for Prebid server URL '{}': {e:?}",
                 self.config.server_url
             );
-        }
-        name
+        })
+        .ok()
     }
 }
 

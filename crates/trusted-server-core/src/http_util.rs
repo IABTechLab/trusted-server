@@ -29,7 +29,7 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
 /// On Fastly Compute the service is the edge - there is no upstream proxy that
 /// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
 /// to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection.
-pub(crate) const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
+pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
     "x-forwarded-proto",

@@ -126,27 +126,31 @@ pub(crate) fn ensure_integration_backend_with_timeout(
 /// `backend_{scheme}_{host}_{port}{cert_suffix}_t{timeout_ms}` with `.` and `:`
 /// replaced by `_`.
 ///
-/// Returns `None` when the URL cannot be parsed or is missing a host.
+/// # Errors
+///
+/// Returns an error when the URL cannot be parsed or is missing a host component.
 pub(crate) fn predict_backend_name_for_url(
     url: &str,
     certificate_check: bool,
     first_byte_timeout: Duration,
-) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
+) -> Result<String, Report<TrustedServerError>> {
+    let parsed = Url::parse(url).change_context(TrustedServerError::Proxy {
+        message: format!("Invalid backend URL: {url}"),
+    })?;
     let scheme = parsed.scheme();
-    let host = parsed.host_str()?;
+    let host = parsed.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: format!("Backend URL missing host: {url}"),
+        })
+    })?;
 
-    let default_port = if scheme.eq_ignore_ascii_case("https") {
-        443u16
-    } else {
-        80u16
-    };
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
     let port = parsed.port().unwrap_or(default_port);
 
     let name_base = format!("{}_{}_{}", scheme, host, port);
     let cert_suffix = if certificate_check { "" } else { "_nocert" };
     let timeout_ms = first_byte_timeout.as_millis();
-    Some(format!(
+    Ok(format!(
         "backend_{}{}_t{}",
         name_base.replace(['.', ':'], "_"),
         cert_suffix,
