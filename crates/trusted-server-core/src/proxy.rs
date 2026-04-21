@@ -437,8 +437,6 @@ struct ProxyRequestHeaders<'a> {
     ///
     /// Empty slice means open mode (all hosts allowed). Populated by first-party
     /// handlers; integration proxies leave it empty.
-    #[allow(dead_code)]
-    // Wired up separately; field added ahead of the redirect-guard integration.
     allowed_domains: &'a [String],
 }
 
@@ -601,7 +599,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -728,7 +726,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host

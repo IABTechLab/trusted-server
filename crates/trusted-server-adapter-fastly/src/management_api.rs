@@ -20,7 +20,7 @@ use std::io::Read;
 
 use base64::{engine::general_purpose, Engine as _};
 use error_stack::{Report, ResultExt};
-use fastly::http::StatusCode;
+use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
 
@@ -29,7 +29,6 @@ use crate::platform::FastlyPlatformSecretStore;
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
 const API_KEYS_STORE: &str = "api-keys";
 const API_KEY_ENTRY: &str = "api_key";
-const SECRET_UPSERT_METHOD: &str = "POST";
 const ERROR_BODY_LIMIT: usize = 200;
 
 fn encode_path_segment(value: &str) -> String {
@@ -83,15 +82,15 @@ fn check_response(
     entity_description: &str,
     store_id: &str,
 ) -> Result<(), Report<PlatformError>> {
+    if response.get_status().is_success() {
+        return Ok(());
+    }
+
     let mut body = String::new();
     response
         .get_body_mut()
         .read_to_string(&mut body)
         .change_context(error_kind())?;
-
-    if response.get_status().is_success() {
-        return Ok(());
-    }
 
     Err(Report::new(error_kind()).attach(format!(
         "{} failed with HTTP {} - {} for {} in store '{}'",
@@ -145,7 +144,7 @@ impl FastlyManagementApiClient {
 
     fn make_request(
         &self,
-        method: &str,
+        method: Method,
         path: &str,
         body: Option<String>,
         content_type: &str,
@@ -153,16 +152,7 @@ impl FastlyManagementApiClient {
     ) -> Result<Response, Report<PlatformError>> {
         let url = format!("{}{}", self.base_url, path);
 
-        let mut request = match method {
-            "GET" => Request::get(&url),
-            "POST" => Request::post(&url),
-            "PUT" => Request::put(&url),
-            "DELETE" => Request::delete(&url),
-            _ => {
-                return Err(Report::new(error_kind())
-                    .attach(format!("unsupported HTTP method: {}", method)))
-            }
-        };
+        let mut request = Request::new(method, &url);
 
         request = request
             .with_header("Fastly-Key", &self.api_key)
@@ -194,7 +184,7 @@ impl FastlyManagementApiClient {
         let payload = build_config_item_payload(value);
 
         let mut response = self.make_request(
-            "PUT",
+            Method::PUT,
             &path,
             Some(payload),
             "application/x-www-form-urlencoded",
@@ -233,9 +223,10 @@ impl FastlyManagementApiClient {
     ) -> Result<(), Report<PlatformError>> {
         let path = build_config_item_path(store_id, key);
 
-        let mut response = self.make_request("DELETE", &path, None, "application/json", || {
-            PlatformError::ConfigStore
-        })?;
+        let mut response =
+            self.make_request(Method::DELETE, &path, None, "application/json", || {
+                PlatformError::ConfigStore
+            })?;
 
         if response.get_status() == StatusCode::NOT_FOUND {
             return Ok(());
@@ -273,7 +264,7 @@ impl FastlyManagementApiClient {
         let payload = build_secret_payload(secret_name, secret_value);
 
         let mut response = self.make_request(
-            SECRET_UPSERT_METHOD,
+            Method::POST,
             &path,
             Some(payload),
             "application/json",
@@ -312,9 +303,10 @@ impl FastlyManagementApiClient {
     ) -> Result<(), Report<PlatformError>> {
         let path = build_secret_path(store_id, secret_name);
 
-        let mut response = self.make_request("DELETE", &path, None, "application/json", || {
-            PlatformError::SecretStore
-        })?;
+        let mut response =
+            self.make_request(Method::DELETE, &path, None, "application/json", || {
+                PlatformError::SecretStore
+            })?;
 
         if response.get_status() == StatusCode::NOT_FOUND {
             return Ok(());
@@ -360,14 +352,6 @@ mod tests {
         assert_eq!(
             path, "/resources/stores/config/store%2Fid/item/current%3Fkid%2B%231",
             "should percent-encode reserved path characters"
-        );
-    }
-
-    #[test]
-    fn secret_upsert_method_uses_post() {
-        assert_eq!(
-            SECRET_UPSERT_METHOD, "POST",
-            "should use POST with create_or_recreate body so re-rotation does not 405"
         );
     }
 

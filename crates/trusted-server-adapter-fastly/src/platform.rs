@@ -36,13 +36,11 @@ use trusted_server_core::platform::{
 ///
 /// # Write cost
 ///
-/// `put` and `delete` construct a
-/// [`crate::management_api::FastlyManagementApiClient`] on every call, which
-/// opens the `"api-keys"` secret store to read the management API key. On
-/// Fastly Compute, the SDK caches the open handle so repeated opens within a
-/// single request are cheap. Callers that issue many writes in one request
-/// should be aware that each call performs a synchronous outbound API request
-/// to the Fastly management API.
+/// `put` and `delete` each perform a synchronous outbound HTTPS request to the
+/// Fastly management API (`api.fastly.com`). Callers that issue many writes in
+/// one request pay one round-trip per call. The `"api-keys"` secret store is
+/// opened per call to read the management token; the Fastly Compute SDK caches
+/// the open handle so that cost is negligible.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {

@@ -165,15 +165,20 @@ pub struct RotateKeyResponse {
     pub error: Option<String>,
 }
 
-fn signing_store_ids(settings: &Settings) -> Result<(&str, &str), Report<TrustedServerError>> {
+struct SigningStoreIds<'a> {
+    config_store_id: &'a str,
+    secret_store_id: &'a str,
+}
+
+fn signing_store_ids(
+    settings: &Settings,
+) -> Result<SigningStoreIds<'_>, Report<TrustedServerError>> {
     settings
         .request_signing
         .as_ref()
-        .map(|setting| {
-            (
-                setting.config_store_id.as_str(),
-                setting.secret_store_id.as_str(),
-            )
+        .map(|setting| SigningStoreIds {
+            config_store_id: setting.config_store_id.as_str(),
+            secret_store_id: setting.secret_store_id.as_str(),
         })
         .ok_or_else(|| {
             TrustedServerError::Configuration {
@@ -200,7 +205,10 @@ pub fn handle_rotate_key(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = signing_store_ids(settings)?;
+    let SigningStoreIds {
+        config_store_id,
+        secret_store_id,
+    } = signing_store_ids(settings)?;
 
     let body = req.take_body_str();
     let rotate_req: RotateKeyRequest = if body.is_empty() {
@@ -311,7 +319,10 @@ pub fn handle_deactivate_key(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = signing_store_ids(settings)?;
+    let SigningStoreIds {
+        config_store_id,
+        secret_store_id,
+    } = signing_store_ids(settings)?;
 
     let body = req.take_body_str();
     let deactivate_req: DeactivateKeyRequest =
