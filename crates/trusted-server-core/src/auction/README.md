@@ -520,7 +520,7 @@ impl AuctionProvider for YourAuctionProvider {
         todo!()
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
@@ -570,7 +570,7 @@ assert!(result.total_time_ms < 2000);
 
 ## Performance Considerations
 
-- **Parallel Execution**: Currently runs sequentially in Fastly Compute (no tokio runtime), but structured for easy parallelization
+- **Parallel Execution**: Providers are launched concurrently via `select()` over `PendingRequest`s; responses are processed as they become ready within the auction deadline
 - **Timeouts**: Each provider has independent timeout; global timeout enforced at flow level
 - **Error Handling**: Provider failures don't fail entire auction; partial results returned
 

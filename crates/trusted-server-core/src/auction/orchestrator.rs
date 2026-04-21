@@ -401,7 +401,10 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(platform_response, response_time_ms).await {
+                        match provider
+                            .parse_response(platform_response, response_time_ms)
+                            .await
+                        {
                             Ok(auction_response) => {
                                 log::info!(
                                     "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
