@@ -13,6 +13,7 @@
 //!
 //! # Module structure
 //!
+//! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
@@ -26,6 +27,8 @@
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
+
+mod auth;
 
 pub mod batch_sync;
 pub mod consent;
@@ -406,9 +409,13 @@ impl EcContext {
         self.cookie_ec_value.as_deref()
     }
 
-    /// Returns true when both cookie and active EC are present and differ.
+    /// Returns `true` when the request carried a cookie EC and the selected
+    /// active EC differs from that cookie value.
+    ///
+    /// This captures the header-overrides-cookie case used during response
+    /// finalization to decide whether the browser cookie should be rewritten.
     #[must_use]
-    pub fn has_cookie_mismatch(&self) -> bool {
+    pub fn cookie_differs_from_active_ec(&self) -> bool {
         matches!(
             (self.cookie_ec_value.as_deref(), self.ec_value.as_deref()),
             (Some(cookie), Some(active)) if cookie != active
