@@ -792,14 +792,14 @@ impl IntegrationRegistry {
 
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
-    /// Always includes "creative" (JS-only, no Rust-side registration).
+    /// Always includes JS-only modules with no Rust-side registration.
     /// Excludes integrations that have no JS module (e.g., "nextjs").
     #[must_use]
     pub fn js_module_ids(&self) -> Vec<&'static str> {
         // Rust-only integrations with no corresponding JS module
         const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
         // JS-only modules always included (no Rust-side registration)
-        const JS_ALWAYS: &[&str] = &["creative"];
+        const JS_ALWAYS: &[&str] = &["creative", "sourcepoint"];
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_immediate_excludes_prebid() {
+    fn js_module_ids_immediate_excludes_prebid_and_includes_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1404,6 +1404,14 @@ mod tests {
         assert!(
             all.contains(&"prebid"),
             "should include prebid in full list"
+        );
+        assert!(
+            immediate.contains(&"creative"),
+            "should include creative in immediate IDs"
+        );
+        assert!(
+            immediate.contains(&"sourcepoint"),
+            "should include sourcepoint in immediate IDs"
         );
         assert!(
             !immediate.contains(&"prebid"),

@@ -40,7 +40,7 @@ No Rust-side `IntegrationRegistration` (same pattern as `creative`).
 **On page load:**
 
 1. Scan `localStorage` keys matching `_sp_user_consent_*`.
-2. Take the first match, parse the JSON value.
+2. Take the first valid match, parse the JSON value.
 3. Extract `gppData.gppString` and `gppData.applicableSections` from the payload.
 4. Write first-party cookies:
    - `__gpp=<gpp string>` (path `/`, `SameSite=Lax`)
@@ -48,8 +48,10 @@ No Rust-side `IntegrationRegistration` (same pattern as `creative`).
 5. Log what was written for debugging.
 
 Cookies are session-scoped (no `max-age` / `expires`) since the source of truth
-stays in `localStorage` and we re-mirror on each page load. The integration runs
-once — no polling or event listeners.
+stays in `localStorage` and we re-mirror on each page load. This design assumes
+a single active Sourcepoint property per page; if multiple `_sp_user_consent_*`
+entries coexist, the first valid one wins. The integration runs once — no
+polling or event listeners.
 
 ### 2. Server-side: GPP US section decoding
 
