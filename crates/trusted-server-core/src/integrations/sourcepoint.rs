@@ -158,6 +158,13 @@ fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
         return Err(err);
     }
 
+    let path = url.path();
+    if !matches!(path, "" | "/") {
+        let mut err = ValidationError::new("disallowed_path");
+        err.message = Some("cdn_origin must not include a path".into());
+        return Err(err);
+    }
+
     Ok(())
 }
 
@@ -278,11 +285,16 @@ impl SourcepointIntegration {
             .query()
             .map(|q| format!("?{q}"))
             .unwrap_or_default();
+        let fragment = resolved
+            .fragment()
+            .map(|fragment| format!("#{fragment}"))
+            .unwrap_or_default();
         Some(format!(
-            "{}{}{}",
+            "{}{}{}{}",
             SOURCEPOINT_CDN_PREFIX,
             resolved.path(),
-            query
+            query,
+            fragment
         ))
     }
 
@@ -340,6 +352,27 @@ impl SourcepointIntegration {
             .get_header_str(header::CONTENT_TYPE)
             .is_some_and(|ct| ct.contains("javascript") || ct.contains("ecmascript"))
     }
+
+    fn rewrite_javascript_response(&self, response: &mut Response, rewritten: String) {
+        response.remove_header(header::CONTENT_ENCODING);
+        response.remove_header(header::CONTENT_LENGTH);
+
+        // Rewritten JS bundles are static, versioned assets (paths like
+        // `/unified/4.40.1/…`), so we apply a fixed public cache policy
+        // regardless of what upstream sent. This intentionally diverges from the
+        // passthrough path's `apply_cache_headers` (which only sets a default
+        // when upstream omitted Cache-Control).
+        response.set_header(
+            header::CACHE_CONTROL,
+            format!("public, max-age={}", self.config.cache_ttl_seconds),
+        );
+        response.set_header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        );
+
+        response.set_body(rewritten);
+    }
 }
 
 fn parse_sourcepoint_url(url: &str) -> Option<Url> {
@@ -348,6 +381,9 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
         return None;
     }
 
+    // Keep in sync with JS normalization in:
+    // crates/js/lib/src/integrations/sourcepoint/script_guard.ts
+    // (protocol-relative + bare-domain handling + host-validation behavior).
     let normalized = if trimmed.starts_with("//") {
         format!("https:{trimmed}")
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -486,10 +522,7 @@ impl IntegrationProxy for SourcepointIntegration {
             log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
 
             // Guard against unexpectedly large responses to avoid unbounded
-            // memory consumption during rewriting.  When Content-Length is
-            // absent (e.g. chunked transfer encoding), we also skip the
-            // rewrite — reading an unknown-length body into memory has no
-            // upper bound.
+            // memory consumption during rewriting.
             let content_length = response
                 .get_header(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
@@ -499,7 +532,7 @@ impl IntegrationProxy for SourcepointIntegration {
                 Some(len) if len > MAX_REWRITE_BODY_SIZE => {
                     log::warn!(
                         "Sourcepoint: response body for {path} exceeds {} bytes \
-                         (Content-Length: {len}), skipping rewrite",
+                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
                         MAX_REWRITE_BODY_SIZE
                     );
                     self.apply_cache_headers(&mut response);
@@ -508,7 +541,7 @@ impl IntegrationProxy for SourcepointIntegration {
                 None => {
                     log::warn!(
                         "Sourcepoint: no Content-Length for {path}, \
-                         skipping rewrite to avoid unbounded memory read"
+                         skipping rewrite to avoid unbounded memory read (reason: missing_content_length)"
                     );
                     self.apply_cache_headers(&mut response);
                     return Ok(response);
@@ -521,8 +554,9 @@ impl IntegrationProxy for SourcepointIntegration {
                 Ok(text) => text,
                 Err(err) => {
                     log::warn!(
-                        "Sourcepoint: upstream body for {path} is not valid UTF-8, \
-                         passing through unmodified"
+                        "Sourcepoint: upstream body for {path} is not valid UTF-8 \
+                         at byte offset {}, passing through unmodified",
+                        err.utf8_error().valid_up_to()
                     );
                     response.set_body(err.into_bytes());
                     self.apply_cache_headers(&mut response);
@@ -531,37 +565,8 @@ impl IntegrationProxy for SourcepointIntegration {
             };
             let rewritten = Self::rewrite_script_content(&body);
 
-            let mut new_response = Response::new();
-            new_response.set_status(StatusCode::OK);
-            new_response.set_header(
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            );
-            // Rewritten JS bundles are static, versioned assets (paths like
-            // `/unified/4.40.1/…`), so we apply a fixed public cache policy
-            // regardless of what upstream sent.  This intentionally diverges
-            // from the passthrough path's `apply_cache_headers` (which only
-            // sets a default when upstream omitted Cache-Control).
-            new_response.set_header(
-                header::CACHE_CONTROL,
-                format!("public, max-age={}", self.config.cache_ttl_seconds),
-            );
-
-            // Preserve CORS headers from upstream so cross-origin consumers
-            // continue to work through the first-party proxy.
-            for header_name in [
-                header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                header::ACCESS_CONTROL_ALLOW_METHODS,
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            ] {
-                if let Some(value) = response.get_header(&header_name) {
-                    new_response.set_header(&header_name, value);
-                }
-            }
-
-            new_response.set_body(rewritten);
-            return Ok(new_response);
+            self.rewrite_javascript_response(&mut response, rewritten);
+            return Ok(response);
         }
 
         self.apply_cache_headers(&mut response);
@@ -600,8 +605,13 @@ impl IntegrationHeadInjector for SourcepointIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        let mut inserts = vec![format!(
+            "<script>window.__tsjs_sourcepoint={{\"rewriteSdk\":{}}};</script>",
+            self.config.rewrite_sdk
+        )];
+
         if !self.config.rewrite_sdk {
-            return vec![];
+            return inserts;
         }
 
         // Install a property trap on `window._sp_` so that when the
@@ -620,7 +630,7 @@ impl IntegrationHeadInjector for SourcepointIntegration {
         //   covers that case for string literals in bundled code.
         // - `s.replace()` replaces only the first occurrence per call, which
         //   is fine for the current set of scalar URL config fields.
-        vec![format!(
+        inserts.push(format!(
             concat!(
                 "<script>",
                 "(function(){{",
@@ -652,7 +662,9 @@ impl IntegrationHeadInjector for SourcepointIntegration {
             ),
             cdn_host = SOURCEPOINT_CDN_HOST,
             cdn_prefix = SOURCEPOINT_CDN_PREFIX,
-        )]
+        ));
+
+        inserts
     }
 }
 
@@ -856,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_sp_property_trap() {
+    fn head_injector_emits_config_script_plus_trap_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
@@ -867,37 +879,47 @@ mod tests {
         };
 
         let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 1, "should produce exactly one head insert");
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit config plus trap script when enabled"
+        );
 
-        let script = &inserts[0];
+        let config_script = &inserts[0];
         assert!(
-            script.starts_with("<script>") && script.ends_with("</script>"),
-            "should be wrapped in script tags: {script}",
+            config_script.contains("window.__tsjs_sourcepoint={\"rewriteSdk\":true}"),
+            "should emit rewrite SDK config script: {config_script}"
+        );
+
+        let trap_script = &inserts[1];
+        assert!(
+            trap_script.starts_with("<script>") && trap_script.ends_with("</script>"),
+            "should be wrapped in script tags: {trap_script}",
         );
         assert!(
-            script.contains("cdn.privacy-mgmt.com"),
-            "should reference the CDN host to rewrite: {script}",
+            trap_script.contains("cdn.privacy-mgmt.com"),
+            "should reference the CDN host to rewrite: {trap_script}",
         );
         assert!(
-            script.contains("/integrations/sourcepoint/cdn"),
-            "should contain the first-party CDN prefix: {script}",
+            trap_script.contains("/integrations/sourcepoint/cdn"),
+            "should contain the first-party CDN prefix: {trap_script}",
         );
         assert!(
-            script.contains("Object.defineProperty"),
-            "should install a property trap on window._sp_: {script}",
+            trap_script.contains("Object.defineProperty"),
+            "should install a property trap on window._sp_: {trap_script}",
         );
         assert!(
-            script.contains("baseEndpoint"),
-            "should patch baseEndpoint in the config: {script}",
+            trap_script.contains("baseEndpoint"),
+            "should patch baseEndpoint in the config: {trap_script}",
         );
         assert!(
-            script.contains("metricUrl"),
-            "should patch metricUrl: {script}",
+            trap_script.contains("metricUrl"),
+            "should patch metricUrl: {trap_script}",
         );
     }
 
     #[test]
-    fn head_injector_returns_empty_when_rewrite_disabled() {
+    fn head_injector_returns_config_when_rewrite_disabled() {
         let mut cfg = config(true);
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
@@ -910,9 +932,18 @@ mod tests {
         };
 
         let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts.len(),
+            1,
+            "should emit only config script when rewrite_sdk is false"
+        );
         assert!(
-            inserts.is_empty(),
-            "should not inject anything when rewrite_sdk is false"
+            inserts[0].contains("window.__tsjs_sourcepoint={\"rewriteSdk\":false}"),
+            "should flag rewriteSdk false"
+        );
+        assert!(
+            !inserts[0].contains("Object.defineProperty"),
+            "should not emit runtime trap when rewrite_sdk is disabled"
         );
     }
 
@@ -956,6 +987,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cdn_origin_with_path() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "should reject path components in cdn_origin"
+        );
+    }
+
+    #[test]
     fn accepts_valid_cdn_origin() {
         let cfg = SourcepointConfig {
             enabled: true,
@@ -981,6 +1026,42 @@ mod tests {
             cfg.validate().is_ok(),
             "should accept http scheme for cdn_origin"
         );
+    }
+
+    #[test]
+    fn rewrite_javascript_response_preserves_headers() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = Response::from_status(StatusCode::OK);
+
+        response.set_header(header::VARY, "Origin");
+        response.set_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "https://example.com");
+        response.set_header(header::CONTENT_ENCODING, "gzip");
+        response.set_header(header::CONTENT_LENGTH, "4");
+        response.set_header(header::CACHE_CONTROL, "no-store");
+
+        response.set_body("payload");
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/javascript; charset=utf-8")
+        );
+        let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some(expected_cache_control.as_str())
+        );
+        assert_eq!(response.get_header_str(header::VARY), Some("Origin"));
+        assert_eq!(
+            response.get_header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("https://example.com")
+        );
+        assert!(response.get_header(header::CONTENT_ENCODING).is_none());
+        assert!(response.get_header(header::CONTENT_LENGTH).is_none());
+
+        let body = response.take_body_bytes();
+        assert_eq!(String::from_utf8(body).unwrap(), "rewritten");
     }
 
     #[test]
@@ -1017,6 +1098,19 @@ mod tests {
             result.as_deref(),
             Some("/integrations/sourcepoint/cdn/consent/tcfv2"),
             "should rewrite protocol-relative CDN redirect"
+        );
+    }
+
+    #[test]
+    fn preserves_redirect_fragment_when_rewriting_location() {
+        let result = SourcepointIntegration::rewrite_redirect_location(
+            "https://cdn.privacy-mgmt.com/consent/tcfv2#hash",
+            "https://cdn.privacy-mgmt.com/original",
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("/integrations/sourcepoint/cdn/consent/tcfv2#hash"),
+            "should preserve fragment when rewriting redirect"
         );
     }
 
