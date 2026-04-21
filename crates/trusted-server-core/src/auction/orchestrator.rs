@@ -12,33 +12,6 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
-// # PR 15 removal target
-//
-// Mirrors compat::to_fastly_response — both should stay in sync until PR 15
-// removes the compat layer entirely.
-fn platform_response_to_fastly(
-    platform_resp: crate::platform::PlatformResponse,
-) -> fastly::Response {
-    let (parts, body) = platform_resp.response.into_parts();
-    debug_assert!(
-        matches!(&body, edgezero_core::body::Body::Once(_)),
-        "unexpected Body::Stream in platform response conversion: body will be empty"
-    );
-    let body_bytes = match body {
-        edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-        edgezero_core::body::Body::Stream(_) => {
-            log::warn!("streaming platform response body; body will be empty");
-            vec![]
-        }
-    };
-    let mut resp = fastly::Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.append_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    resp
-}
-
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,
@@ -197,7 +170,7 @@ impl AuctionOrchestrator {
                     .change_context(TrustedServerError::Auction {
                         message: format!("Mediator {} request failed", mediator.provider_name()),
                     })?;
-            let backend_response = platform_response_to_fastly(platform_resp);
+            let backend_response = crate::compat::to_fastly_response(platform_resp.response);
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
@@ -418,7 +391,7 @@ impl AuctionOrchestrator {
                 Ok(platform_response) => {
                     // Identify the provider from the backend name
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
-                    let response = platform_response_to_fastly(platform_response);
+                    let response = crate::compat::to_fastly_response(platform_response.response);
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)

@@ -2353,4 +2353,44 @@ mod tests {
             "should be AllowlistViolation error"
         );
     }
+
+    #[tokio::test]
+    async fn sign_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let oversized = vec![b'x'; 65537];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example/first-party/sign")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for oversized sign body"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let oversized = vec![b'x'; 65537];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example/first-party/proxy-rebuild")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for oversized rebuild body"
+        );
+    }
 }

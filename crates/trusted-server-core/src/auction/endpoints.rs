@@ -17,6 +17,8 @@ use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_reques
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
 
+const AUCTION_MAX_BODY_BYTES: usize = 65536;
+
 /// Handle auction request from /auction endpoint.
 ///
 /// This is the main entry point for running header bidding auctions.
@@ -39,8 +41,18 @@ pub async fn handle_auction(
     let (parts, body) = req.into_parts();
 
     // Parse request body
+    let body_bytes = body.into_bytes();
+    if body_bytes.len() > AUCTION_MAX_BODY_BYTES {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "auction payload {} exceeds limit of {}",
+                body_bytes.len(),
+                AUCTION_MAX_BODY_BYTES,
+            ),
+        }));
+    }
     let body: AdRequest =
-        serde_json::from_slice(&body.into_bytes()).change_context(TrustedServerError::Auction {
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
         })?;
 
