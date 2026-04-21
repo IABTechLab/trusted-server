@@ -152,6 +152,7 @@ fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<
     use iab_gpp::sections::us_common::OptOut;
     use iab_gpp::sections::Section;
 
+    // Keep this match in sync with new US-state variants added by `iab_gpp`.
     let sale_opt_out = match section {
         Section::UsNat(s) => match &s.core {
             iab_gpp::sections::usnat::Core::V1(c) => &c.sale_opt_out,

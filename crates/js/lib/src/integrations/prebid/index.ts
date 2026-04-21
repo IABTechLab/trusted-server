@@ -18,13 +18,6 @@ import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
-// Prebid User ID Module core — always bundled. Exposes
-// `pbjs.getUserIdsAsEids` and registers the submodule machinery that each
-// ID submodule in `_user_ids.generated.ts` hooks into. ID submodules
-// activate only when the publisher's origin-side `pbjs.setConfig({
-// userSync: { userIds: [...] } })` call runs during `processQueue()`.
-import 'prebid.js/modules/userId.js';
-
 // Prebid User ID submodules — self-register with the core on import.
 // The set of submodules is controlled by the TSJS_PREBID_USER_IDS env var
 // at build time. See _user_ids.generated.ts (written by build-all.mjs).

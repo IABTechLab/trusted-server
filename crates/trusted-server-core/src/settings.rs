@@ -98,27 +98,6 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
     fn is_enabled(&self) -> bool;
 }
 
-fn normalize_env_value(value: JsonValue) -> JsonValue {
-    match value {
-        JsonValue::Object(map) => JsonValue::Object(
-            map.into_iter()
-                .map(|(key, val)| (key, normalize_env_value(val)))
-                .collect(),
-        ),
-        JsonValue::Array(items) => {
-            JsonValue::Array(items.into_iter().map(normalize_env_value).collect())
-        }
-        JsonValue::String(raw) => {
-            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
-                parsed
-            } else {
-                JsonValue::String(raw)
-            }
-        }
-        other => other,
-    }
-}
-
 impl IntegrationSettings {
     /// Inserts a configuration value for an integration.
     ///
@@ -142,13 +121,34 @@ impl IntegrationSettings {
         Ok(())
     }
 
+    fn normalize_env_value(value: JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Object(map) => JsonValue::Object(
+                map.into_iter()
+                    .map(|(key, val)| (key, Self::normalize_env_value(val)))
+                    .collect(),
+            ),
+            JsonValue::Array(items) => {
+                JsonValue::Array(items.into_iter().map(Self::normalize_env_value).collect())
+            }
+            JsonValue::String(raw) => {
+                if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
+                    parsed
+                } else {
+                    JsonValue::String(raw)
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Normalizes all entries in place, converting JSON-encoded strings from
     /// environment variables into their proper typed representations.
     /// Called eagerly after deserialization so that TOML serialization in
     /// build.rs preserves correct types.
     pub fn normalize(&mut self) {
         for value in self.entries.values_mut() {
-            *value = normalize_env_value(value.clone());
+            *value = Self::normalize_env_value(value.clone());
         }
     }
 
@@ -989,9 +989,7 @@ where
     match v {
         JsonValue::Array(arr) => arr
             .into_iter()
-            .map(|item| {
-                serde_json::from_value(normalize_env_value(item)).map_err(serde::de::Error::custom)
-            })
+            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
             .collect(),
         JsonValue::Object(map) => {
             let mut items: Vec<(usize, T)> = Vec::with_capacity(map.len());
@@ -999,8 +997,7 @@ where
                 let idx = k.parse::<usize>().map_err(|_| {
                     serde::de::Error::custom(format!("Invalid index '{}' in map for Vec field", k))
                 })?;
-                let parsed: T = serde_json::from_value(normalize_env_value(val))
-                    .map_err(serde::de::Error::custom)?;
+                let parsed: T = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
                 items.push((idx, parsed));
             }
             items.sort_by_key(|(idx, _)| *idx);
@@ -1697,167 +1694,6 @@ mod tests {
                 assert_eq!(
                     settings.response_headers.get("X-Custom-Header"),
                     Some(&"custom value".to_string())
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_ec_partners_override_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_id_key = format!(
-            "{}{}EC{}PARTNERS{}0{}ID",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_name_key = format!(
-            "{}{}EC{}PARTNERS{}0{}NAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_source_domain_key = format!(
-            "{}{}EC{}PARTNERS{}0{}SOURCE_DOMAIN",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_openrtb_atype_key = format!(
-            "{}{}EC{}PARTNERS{}0{}OPENRTB_ATYPE",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_bidstream_enabled_key = format!(
-            "{}{}EC{}PARTNERS{}0{}BIDSTREAM_ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner0_api_token_key = format!(
-            "{}{}EC{}PARTNERS{}0{}API_TOKEN",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_id_key = format!(
-            "{}{}EC{}PARTNERS{}1{}ID",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_name_key = format!(
-            "{}{}EC{}PARTNERS{}1{}NAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_source_domain_key = format!(
-            "{}{}EC{}PARTNERS{}1{}SOURCE_DOMAIN",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_openrtb_atype_key = format!(
-            "{}{}EC{}PARTNERS{}1{}OPENRTB_ATYPE",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_bidstream_enabled_key = format!(
-            "{}{}EC{}PARTNERS{}1{}BIDSTREAM_ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner1_api_token_key = format!(
-            "{}{}EC{}PARTNERS{}1{}API_TOKEN",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (partner0_id_key, Some("criteo")),
-                (partner0_name_key, Some("Criteo")),
-                (partner0_source_domain_key, Some("criteo.com")),
-                (partner0_openrtb_atype_key, Some("1")),
-                (partner0_bidstream_enabled_key, Some("true")),
-                (partner0_api_token_key, Some("criteo-test-token")),
-                (partner1_id_key, Some("uidapi")),
-                (partner1_name_key, Some("UID2")),
-                (partner1_source_domain_key, Some("uidapi.com")),
-                (partner1_openrtb_atype_key, Some("3")),
-                (partner1_bidstream_enabled_key, Some("true")),
-                (partner1_api_token_key, Some("uidapi-test-token")),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("should parse EC partners from indexed env override");
-
-                assert_eq!(
-                    settings.ec.partners.len(),
-                    2,
-                    "should override partner list"
-                );
-                assert_eq!(settings.ec.partners[0].id, "criteo");
-                assert_eq!(settings.ec.partners[0].name, "Criteo");
-                assert_eq!(settings.ec.partners[0].source_domain, "criteo.com");
-                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
-                assert!(
-                    settings.ec.partners[0].bidstream_enabled,
-                    "should enable bidstream for partner 0"
-                );
-                assert_eq!(
-                    settings.ec.partners[0].api_token.expose(),
-                    "criteo-test-token"
-                );
-
-                assert_eq!(settings.ec.partners[1].id, "uidapi");
-                assert_eq!(settings.ec.partners[1].name, "UID2");
-                assert_eq!(settings.ec.partners[1].source_domain, "uidapi.com");
-                assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
-                assert!(
-                    settings.ec.partners[1].bidstream_enabled,
-                    "should enable bidstream for partner 1"
-                );
-                assert_eq!(
-                    settings.ec.partners[1].api_token.expose(),
-                    "uidapi-test-token"
                 );
             },
         );

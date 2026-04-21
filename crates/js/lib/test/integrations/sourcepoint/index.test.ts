@@ -6,7 +6,7 @@ describe('integrations/sourcepoint', () => {
   function clearAllCookies(): void {
     document.cookie.split(';').forEach((c) => {
       const name = c.split('=')[0].trim();
-      if (name) document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+      if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
     });
   }
 
@@ -26,7 +26,7 @@ describe('integrations/sourcepoint', () => {
     localStorage.clear();
   });
 
-  it('mirrors __gpp and __gpp_sid from _sp_user_consent_* localStorage', () => {
+  it('mirrors __gpp and __gpp_sid from _sp_user_consent_* localStorage as session cookies', () => {
     const payload = {
       gppData: {
         gppString: 'DBABLA~BVQqAAAAAgA.QA',

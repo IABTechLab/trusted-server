@@ -14,6 +14,8 @@ interface SourcepointConsentPayload {
 }
 
 function findSourcepointConsent(): SourcepointConsentPayload | null {
+  // Sourcepoint stores one consent payload per property under `_sp_user_consent_*`.
+  // We intentionally take the first valid match and mirror that origin-scoped payload.
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
     if (!key?.startsWith(SP_CONSENT_PREFIX)) continue;
@@ -33,13 +35,13 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
   return null;
 }
 
-const GPP_COOKIE_MAX_AGE = 86400;
-
 function writeCookie(name: string, value: string): void {
-  document.cookie = `${name}=${value}; path=/; Secure; SameSite=Lax; Max-Age=${GPP_COOKIE_MAX_AGE}`;
+  document.cookie = `${name}=${value}; path=/; Secure; SameSite=Lax`;
 }
 
 function clearCookie(name: string): void {
+  // Trusted Server is the only intended writer for these mirrored cookies, so
+  // clearing the origin-scoped cookie is sufficient for this integration.
   document.cookie = `${name}=; path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
