@@ -11,8 +11,9 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, AttributeRewriteAction, IntegrationAttributeContext,
+    collect_body, collect_body_bounded, AttributeRewriteAction, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -178,7 +179,9 @@ impl IntegrationProxy for TestlightIntegration {
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
-        let payload_bytes = collect_body(body, TESTLIGHT_INTEGRATION_ID).await?;
+        let payload_bytes =
+            collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, TESTLIGHT_INTEGRATION_ID)
+                .await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
         // Read synthetic ID from header (set by registry) or cookie
