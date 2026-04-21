@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
 
+use super::auth::authenticate_bearer;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
-use super::partner::hash_api_key;
 use super::rate_limiter::RateLimiter;
-use super::registry::{PartnerConfig, PartnerRegistry};
+use super::registry::PartnerRegistry;
 
 const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
@@ -80,37 +80,6 @@ struct BatchSyncResponse {
 struct MappingError {
     index: usize,
     reason: &'static str,
-}
-
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
-
-/// Extracts and validates a `Bearer` token from the `Authorization` header,
-/// returning the authenticated [`PartnerConfig`].
-fn authenticate_bearer<'r>(
-    registry: &'r PartnerRegistry,
-    req: &Request,
-) -> Option<&'r PartnerConfig> {
-    let header_value = req.get_header_str("authorization")?;
-    let token = parse_bearer_token(header_value)?;
-    let key_hash = hash_api_key(token);
-    registry.find_by_api_key_hash(&key_hash)
-}
-
-fn parse_bearer_token(header_value: &str) -> Option<&str> {
-    let mut parts = header_value.split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
-        return None;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-
-    Some(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,56 +262,6 @@ mod tests {
         let valid = format!("{}.ABC123", "a".repeat(64));
         assert!(is_valid_ec_id(&valid));
         assert!(!is_valid_ec_id(&"a".repeat(64)));
-    }
-
-    #[test]
-    fn parse_bearer_token_accepts_case_insensitive_scheme() {
-        assert_eq!(parse_bearer_token("Bearer tok"), Some("tok"));
-        assert_eq!(parse_bearer_token("bearer tok"), Some("tok"));
-        assert_eq!(parse_bearer_token("BEARER tok"), Some("tok"));
-    }
-
-    #[test]
-    fn parse_bearer_token_rejects_invalid_shapes() {
-        assert_eq!(parse_bearer_token("Bearer"), None);
-        assert_eq!(parse_bearer_token("Bearer "), None);
-        assert_eq!(parse_bearer_token("Basic abc"), None);
-        assert_eq!(parse_bearer_token("Bearer a b"), None);
-    }
-
-    #[test]
-    fn authenticate_bearer_returns_none_for_missing_header() {
-        let registry = PartnerRegistry::empty();
-        let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
-
-        let result = authenticate_bearer(&registry, &req);
-        assert!(result.is_none(), "should return None without auth header");
-    }
-
-    #[test]
-    fn authenticate_bearer_returns_none_for_malformed_header() {
-        let registry = PartnerRegistry::empty();
-        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
-        req.set_header("authorization", "Basic dXNlcjpwYXNz");
-
-        let result = authenticate_bearer(&registry, &req);
-        assert!(
-            result.is_none(),
-            "should return None for non-Bearer auth scheme"
-        );
-    }
-
-    #[test]
-    fn authenticate_bearer_returns_none_for_empty_token() {
-        let registry = PartnerRegistry::empty();
-        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
-        req.set_header("authorization", "Bearer ");
-
-        let result = authenticate_bearer(&registry, &req);
-        assert!(
-            result.is_none(),
-            "should return None for empty Bearer token"
-        );
     }
 
     struct MockRateLimiter {

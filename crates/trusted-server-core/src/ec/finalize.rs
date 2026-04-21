@@ -33,6 +33,11 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// Applies withdrawal handling, last-seen updates, cookie reconciliation,
 /// Prebid EID ingestion, and cookie writes for new EC generation.
 ///
+/// On consent withdrawal, the browser response clears the EC cookie
+/// immediately and the EC identity-graph KV tombstone is the authoritative
+/// revocation marker. Consent-store deletion is best-effort cleanup of shadow
+/// consent state and does not block tombstone writes.
+///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
 pub fn ec_finalize_response(
@@ -50,7 +55,8 @@ pub fn ec_finalize_response(
     if !consent_allows_ec && ec_context.cookie_was_present() {
         clear_ec_on_response(settings, response);
 
-        // Compute once — used for both consent store cleanup and tombstoning.
+        // Compute once — used for both best-effort consent-store cleanup and
+        // the authoritative identity-graph tombstones.
         let ids_to_withdraw = withdrawal_ec_ids(ec_context);
 
         if let Some(store_name) = settings.consent.consent_store.as_deref() {
@@ -75,6 +81,9 @@ pub fn ec_finalize_response(
             }
         }
 
+        // The identity-graph tombstone is the authoritative withdrawal marker
+        // for subsequent EC behavior. Consent-store cleanup above is a
+        // best-effort shadow-state deletion and does not block revocation.
         if let Some(graph) = kv {
             apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
                 if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {

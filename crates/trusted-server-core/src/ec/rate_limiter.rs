@@ -19,6 +19,12 @@ pub const RATE_COUNTER_NAME: &str = "counter_store";
 pub trait RateLimiter {
     /// Returns `true` when the rate limit has been exceeded for the given key.
     ///
+    /// `hourly_limit` is currently approximated via a 60-second Fastly counter
+    /// window, so the effective budget rounds up to the next whole request per
+    /// minute. For example, `65/hr` becomes `2/min` (`120/hr` effective), and
+    /// any positive limit below `60/hr` rounds up to `1/min` (`60/hr`
+    /// effective).
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError`] on rate counter I/O failure.
@@ -38,6 +44,16 @@ pub trait RateLimiter {
         // hourly API used by pixel sync.
         self.exceeded(key, per_minute_limit.saturating_mul(60))
     }
+}
+
+fn hourly_limit_to_per_minute_limit(hourly_limit: u32) -> u32 {
+    let per_minute_limit = hourly_limit.saturating_add(59) / 60;
+    per_minute_limit.max(1)
+}
+
+#[cfg(test)]
+fn effective_hourly_limit(hourly_limit: u32) -> u32 {
+    hourly_limit_to_per_minute_limit(hourly_limit).saturating_mul(60)
 }
 
 /// Fastly Edge Rate Limiting implementation of [`RateLimiter`].
@@ -62,8 +78,7 @@ impl RateLimiter for FastlyRateLimiter {
         //
         // Follow-up: move to exact 1-hour enforcement once platform counters
         // expose longer windows or we add a dedicated KV-backed hour bucket.
-        let per_minute_limit = hourly_limit.saturating_add(59) / 60;
-        let per_minute_limit = per_minute_limit.max(1);
+        let per_minute_limit = hourly_limit_to_per_minute_limit(hourly_limit);
 
         let current = self
             .counter
@@ -87,5 +102,48 @@ impl RateLimiter for FastlyRateLimiter {
         })?;
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hourly_limit_rounds_up_to_whole_requests_per_minute() {
+        assert_eq!(
+            hourly_limit_to_per_minute_limit(65),
+            2,
+            "should round 65/hr up to 2/min"
+        );
+        assert_eq!(
+            effective_hourly_limit(65),
+            120,
+            "should expose the resulting effective hourly budget"
+        );
+    }
+
+    #[test]
+    fn small_positive_hourly_limits_round_up_to_sixty_per_hour() {
+        assert_eq!(
+            hourly_limit_to_per_minute_limit(1),
+            1,
+            "should round any positive sub-60 hourly limit up to 1/min"
+        );
+        assert_eq!(
+            effective_hourly_limit(1),
+            60,
+            "should enforce a 60/hr effective minimum with the current counter window"
+        );
+    }
+
+    #[test]
+    fn effective_hourly_limit_stays_within_hourly_plus_fifty_nine() {
+        for hourly_limit in [1, 10, 59, 60, 61, 65, 119, 120, 121, 600] {
+            assert!(
+                effective_hourly_limit(hourly_limit) <= hourly_limit.saturating_add(59),
+                "effective hourly limit should never overshoot by more than 59 requests"
+            );
+        }
     }
 }

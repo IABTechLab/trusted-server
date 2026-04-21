@@ -61,7 +61,11 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
         });
     }
 
-    resolved.sort_by(|a, b| b.synced.cmp(&a.synced));
+    resolved.sort_by(|a, b| {
+        b.synced
+            .cmp(&a.synced)
+            .then_with(|| a.partner_id.cmp(&b.partner_id))
+    });
     resolved
 }
 
@@ -146,6 +150,64 @@ pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<Trusted
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
+
+    fn make_test_partner(id: &str, source_domain: &str) -> EcPartner {
+        EcPartner {
+            id: id.to_owned(),
+            name: format!("Partner {id}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Redacted::new(format!("token-{id}")),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }
+    }
+
+    #[test]
+    fn resolve_partner_ids_uses_partner_id_as_tie_breaker_for_equal_timestamps() {
+        let partners = vec![
+            make_test_partner("zeta", "zeta.example.com"),
+            make_test_partner("alpha", "alpha.example.com"),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "zeta".to_owned(),
+            super::super::kv_types::KvPartnerId {
+                uid: "uid-z".to_owned(),
+                synced: 42,
+            },
+        );
+        entry.ids.insert(
+            "alpha".to_owned(),
+            super::super::kv_types::KvPartnerId {
+                uid: "uid-a".to_owned(),
+                synced: 42,
+            },
+        );
+
+        let resolved = resolve_partner_ids(&registry, &entry);
+        let partner_ids: Vec<&str> = resolved
+            .iter()
+            .map(|item| item.partner_id.as_str())
+            .collect();
+
+        assert_eq!(
+            partner_ids,
+            vec!["alpha", "zeta"],
+            "should sort equal timestamps deterministically by partner ID"
+        );
+    }
 
     #[test]
     fn to_eids_maps_resolved_ids_correctly() {
