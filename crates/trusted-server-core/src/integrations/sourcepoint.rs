@@ -165,6 +165,18 @@ fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
         return Err(err);
     }
 
+    if url.query().is_some() {
+        let mut err = ValidationError::new("disallowed_query");
+        err.message = Some("cdn_origin must not include a query string".into());
+        return Err(err);
+    }
+
+    if url.fragment().is_some() {
+        let mut err = ValidationError::new("disallowed_fragment");
+        err.message = Some("cdn_origin must not include a fragment".into());
+        return Err(err);
+    }
+
     Ok(())
 }
 
@@ -997,6 +1009,34 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "should reject path components in cdn_origin"
+        );
+    }
+
+    #[test]
+    fn rejects_cdn_origin_with_query() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "should reject query strings in cdn_origin"
+        );
+    }
+
+    #[test]
+    fn rejects_cdn_origin_with_fragment() {
+        let cfg = SourcepointConfig {
+            enabled: true,
+            rewrite_sdk: true,
+            cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
+            cache_ttl_seconds: default_cache_ttl(),
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "should reject fragments in cdn_origin"
         );
     }
 
