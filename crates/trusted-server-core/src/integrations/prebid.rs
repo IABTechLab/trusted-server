@@ -506,17 +506,12 @@ fn expand_trusted_server_bidders(
 ///
 /// When `params` is a JSON object, each top-level key in `override_obj` is
 /// inserted or replaced in `params`. Nested objects are replaced wholesale —
-/// they are not recursed into. When `params` is not an object, it is replaced
-/// entirely with the override object.
+/// they are not recursed into. When `params` is not an object, it is left
+/// untouched to preserve pre-existing behavior.
 fn merge_bidder_param_object(params: &mut Json, override_obj: &serde_json::Map<String, Json>) {
-    match params {
-        Json::Object(base) => {
-            for (k, v) in override_obj {
-                base.insert(k.clone(), v.clone());
-            }
-        }
-        _ => {
-            *params = Json::Object(override_obj.clone());
+    if let Json::Object(base) = params {
+        for (k, v) in override_obj {
+            base.insert(k.clone(), v.clone());
         }
     }
 }
@@ -577,7 +572,7 @@ impl BidParamOverrideEngine {
         }
 
         for rule in &config.bid_param_override_rules {
-            rules.push(CompiledBidParamOverrideRule::try_from(rule.clone())?);
+            rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
         }
 
         Ok(Self { rules })
@@ -671,6 +666,14 @@ impl TryFrom<BidParamOverrideRule> for CompiledBidParamOverrideRule {
     type Error = Report<TrustedServerError>;
 
     fn try_from(rule: BidParamOverrideRule) -> Result<Self, Self::Error> {
+        Self::try_from(&rule)
+    }
+}
+
+impl TryFrom<&BidParamOverrideRule> for CompiledBidParamOverrideRule {
+    type Error = Report<TrustedServerError>;
+
+    fn try_from(rule: &BidParamOverrideRule) -> Result<Self, Self::Error> {
         Self::new(
             rule.when.bidder.as_deref(),
             rule.when.zone.as_deref(),

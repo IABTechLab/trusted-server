@@ -240,6 +240,7 @@ Use `bid_param_override_rules` for the canonical ordered override format. Each r
 - Rules are evaluated in declaration order
 - Later matching rules win on overlapping keys
 - Compatibility fields from `bid_param_overrides` and `bid_param_zone_overrides` are normalized into earlier rules, so explicit canonical rules take precedence on conflicts
+- `set` values may be `null` (e.g. `set = { placementId = null }`); `null` is inserted into outgoing bidder params wholesale — behavior varies by PBS adapter, so verify adapter handling before relying on this
 
 **Example**:
 
@@ -371,7 +372,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
 - Sets the top-level `test: 1` flag when `test_mode` is enabled
 - Appends `debug_query_params` to page URL when configured
-- Applies `bid_param_zone_overrides` to `imp.ext.prebid.bidder` before request dispatch
+- Applies `bid_param_overrides`, `bid_param_zone_overrides`, and `bid_param_override_rules` via the unified override engine before request dispatch
 - Signs requests when request signing is enabled
 
 ## Best Practices
