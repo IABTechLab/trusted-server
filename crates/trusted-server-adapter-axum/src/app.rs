@@ -10,7 +10,6 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -24,7 +23,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::build_runtime_services;
+use crate::platform::{AxumPlatformHttpClient, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -35,6 +34,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    http_client: Arc<AxumPlatformHttpClient>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -52,15 +52,8 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        http_client: Arc::new(AxumPlatformHttpClient::new()),
     }))
-}
-
-// ---------------------------------------------------------------------------
-// Per-request RuntimeServices
-// ---------------------------------------------------------------------------
-
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +98,7 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     };
 
     RouterService::builder()
+        .middleware(FinalizeResponseMiddleware::new(Arc::new(Settings::default())))
         .get("/", make(Arc::clone(&message)))
         .post("/", make(Arc::clone(&message)))
         .get("/{*rest}", make(Arc::clone(&message)))
@@ -138,7 +132,7 @@ impl Hooks for TrustedServerApp {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -150,7 +144,7 @@ impl Hooks for TrustedServerApp {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -162,7 +156,7 @@ impl Hooks for TrustedServerApp {
         let rotate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_rotate_key(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -174,7 +168,7 @@ impl Hooks for TrustedServerApp {
         let deactivate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_deactivate_key(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -186,7 +180,7 @@ impl Hooks for TrustedServerApp {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(
                     handle_auction(&s.settings, &s.orchestrator, &services, None, req)
@@ -201,7 +195,7 @@ impl Hooks for TrustedServerApp {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -214,7 +208,7 @@ impl Hooks for TrustedServerApp {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -227,7 +221,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_get_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -240,7 +234,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_post_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -253,7 +247,7 @@ impl Hooks for TrustedServerApp {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -268,7 +262,7 @@ impl Hooks for TrustedServerApp {
         let get_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();
@@ -297,7 +291,7 @@ impl Hooks for TrustedServerApp {
         let post_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx, Arc::clone(&s.http_client));
                 let req = ctx.into_request();
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();

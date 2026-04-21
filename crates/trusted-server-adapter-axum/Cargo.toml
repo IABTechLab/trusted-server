@@ -22,13 +22,12 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { path = "../trusted-server-core" }
-trusted-server-js = { path = "../js" }
 
 [dev-dependencies]
 axum = "0.8"
+temp-env = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
 reqwest = { workspace = true }

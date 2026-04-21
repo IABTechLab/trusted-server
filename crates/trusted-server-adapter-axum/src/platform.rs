@@ -237,18 +237,18 @@ impl AxumPlatformHttpClient {
         }
 
         let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
+        match body {
+            edgezero_core::body::Body::Once(bytes) => {
+                if !bytes.is_empty() {
+                    builder = builder.body(bytes);
+                }
+            }
             edgezero_core::body::Body::Stream(_) => {
                 log::warn!(
                     "AxumPlatformHttpClient: Body::Stream is not supported; \
                      outbound request body will be empty"
                 );
-                vec![]
             }
-        };
-        if !body_bytes.is_empty() {
-            builder = builder.body(body_bytes);
         }
 
         let resp = builder
@@ -358,13 +358,17 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 ///
 /// # Degraded features in dev
 ///
-/// KV store is [`NoopKvStore`] — any route touching synthetic-ID or consent KV
-/// will degrade gracefully. A `warn` log is emitted once per process.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
+/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
+/// emitted once per process.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+    http_client: Arc<AxumPlatformHttpClient>,
+) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!(
-            "Axum dev server: KV store is unavailable (NoopKvStore). \
+            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
              Routes that depend on synthetic-ID or consent KV will degrade gracefully."
         );
     });
@@ -378,7 +382,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .secret_store(Arc::new(AxumPlatformSecretStore))
         .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
         .backend(Arc::new(AxumPlatformBackend))
-        .http_client(Arc::new(AxumPlatformHttpClient::new()))
+        .http_client(http_client)
         .geo(Arc::new(AxumPlatformGeo))
         .client_info(ClientInfo {
             client_ip,
@@ -399,13 +403,17 @@ mod tests {
 
     #[test]
     fn config_store_reads_from_env_var() {
-        // SAFETY: single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY", "test-value") };
-        let store = AxumPlatformConfigStore;
-        let result = store
-            .get(&StoreName::from("my-store"), "my-key")
-            .expect("should read env var");
-        assert_eq!(result, "test-value", "should return env var value");
+        temp_env::with_var(
+            "TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY",
+            Some("test-value"),
+            || {
+                let store = AxumPlatformConfigStore;
+                let result = store
+                    .get(&StoreName::from("my-store"), "my-key")
+                    .expect("should read env var");
+                assert_eq!(result, "test-value", "should return env var value");
+            },
+        );
     }
 
     #[test]
@@ -420,13 +428,17 @@ mod tests {
 
     #[test]
     fn secret_store_reads_bytes_from_env_var() {
-        // SAFETY: single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("TRUSTED_SERVER_SECRET_MY_SECRETS_MY_SECRET", "hello") };
-        let store = AxumPlatformSecretStore;
-        let result = store
-            .get_bytes(&StoreName::from("my-secrets"), "my-secret")
-            .expect("should read env var as bytes");
-        assert_eq!(result, b"hello", "should return raw bytes");
+        temp_env::with_var(
+            "TRUSTED_SERVER_SECRET_MY_SECRETS_MY_SECRET",
+            Some("hello"),
+            || {
+                let store = AxumPlatformSecretStore;
+                let result = store
+                    .get_bytes(&StoreName::from("my-secrets"), "my-secret")
+                    .expect("should read env var as bytes");
+                assert_eq!(result, b"hello", "should return raw bytes");
+            },
+        );
     }
 
     #[test]
@@ -458,8 +470,8 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
         };
         assert_eq!(
-            backend.predict_name(&spec).unwrap(),
-            backend.ensure(&spec).unwrap(),
+            backend.predict_name(&spec).expect("should return name"),
+            backend.ensure(&spec).expect("should return name"),
             "ensure should equal predict_name"
         );
     }
@@ -470,7 +482,7 @@ mod tests {
         let no_ip = geo.lookup(None).expect("should not error");
         assert!(no_ip.is_none(), "should return None for no IP");
         let with_ip = geo
-            .lookup(Some("127.0.0.1".parse().unwrap()))
+            .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
             .expect("should not error");
         assert!(with_ip.is_none(), "should return None for any IP");
     }

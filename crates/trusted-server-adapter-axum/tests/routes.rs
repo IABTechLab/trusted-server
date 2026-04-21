@@ -31,7 +31,13 @@ async fn discovery_endpoint_is_routed() {
         .body(AxumBody::empty())
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
 
     assert_ne!(
         resp.status().as_u16(),
@@ -51,7 +57,13 @@ async fn verify_signature_endpoint_is_routed() {
         .body(AxumBody::from("{}"))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
 
     assert_ne!(
         resp.status().as_u16(),
@@ -71,7 +83,13 @@ async fn admin_rotate_key_is_routed() {
         .body(AxumBody::from("{}"))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
 
     assert_ne!(
         resp.status().as_u16(),
@@ -91,7 +109,13 @@ async fn admin_deactivate_key_is_routed() {
         .body(AxumBody::from("{}"))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
 
     assert_ne!(
         resp.status().as_u16(),
@@ -112,7 +136,13 @@ async fn admin_rotate_key_returns_non_5xx() {
         .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
     let status = resp.status().as_u16();
 
     assert_ne!(status, 404, "admin/keys/rotate must be routed");
@@ -135,7 +165,13 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
         .body(AxumBody::empty())
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
     let status = resp.status().as_u16();
 
     assert!(
@@ -159,7 +195,13 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
         .body(AxumBody::from("{}"))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
 
     assert_eq!(
         resp.headers()
@@ -185,7 +227,13 @@ async fn admin_route_returns_non_404_non_5xx() {
         .body(AxumBody::from("{}"))
         .expect("should build request");
 
-    let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
     let status = resp.status().as_u16();
 
     assert_ne!(status, 404, "admin route must be routed");
