@@ -410,8 +410,7 @@ function syncPrebidEidsCookie(): void {
       return; // Single EID too large — skip.
     }
 
-    document.cookie =
-      `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
 
     log.debug(`[tsjs-prebid] synced ${payload.length} EIDs to cookie`);
   } catch (err) {

@@ -316,17 +316,10 @@ pub fn save_consent_to_kv(
 
     match futures::executor::block_on(store.put_bytes_with_ttl(ec_id, body, ttl)) {
         Ok(()) => {
-            // lgtm[rust/cleartext-logging] -- false positive: log_id() only emits a redacted EC ID prefix.
-            log::info!(
-                "Saved consent to KV store for '{}' (fp={fp}, ttl={max_age_days}d)",
-                log_id(ec_id)
-            );
+            log::info!("Saved consent to KV store (fp={fp}, ttl={max_age_days}d)");
         }
         Err(e) => {
-            log::warn!(
-                "Failed to write consent to KV store for '{}': {e}",
-                log_id(ec_id)
-            );
+            log::warn!("Failed to write consent to KV store: {e}");
         }
     }
 }
