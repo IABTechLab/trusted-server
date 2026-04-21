@@ -3,8 +3,8 @@
 // Pure processing functions for URL normalization, filtering, wildcard
 // detection, slug generation, and TOML formatting. No external dependencies.
 //
-// The slug algorithm is duplicated from scripts/js-asset-slug.mjs. Both files
-// must produce identical output. Any changes must be synchronized.
+// This file is the canonical slug-generation implementation. Standalone CLIs
+// import from here to avoid drift.
 
 import { createHash } from "node:crypto";
 import { posix } from "node:path";

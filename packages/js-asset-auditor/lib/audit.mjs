@@ -11,30 +11,35 @@
 //
 // Options:
 //   --diff              Compare against existing js-assets.toml
+//   --domain <domain>   Override publisher domain used for slug generation
 //   --settle <ms>       Settle window after page load (default: 6000)
 //   --first-party <h>   Additional first-party hosts (comma-separated)
 //   --no-filter         Bypass heuristic filtering
-//   --headed            Run browser visibly for debugging
+//   --headless          Run browser headlessly
 //   --output <path>     Output file path (default: js-assets.toml)
+//   --config [path]     Generate trusted-server.toml (default path: trusted-server.toml)
+//   --force             Overwrite config file when used with --config
 //
 // Prerequisites:
 //   cd packages/js-asset-auditor && npm install && npx playwright install chromium
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { processAssets } from "./process.mjs";
+
+const USAGE =
+  "Usage: audit-js-assets <url> [--diff] [--domain <domain>] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headless] [--output <path>] [--config [path]] [--force]";
 
 // ---------------------------------------------------------------------------
 // Config reading
 // ---------------------------------------------------------------------------
 
-function readPublisherDomain(repoRoot) {
-  const content = readFileSync(
-    resolve(repoRoot, "trusted-server.toml"),
-    "utf-8",
-  );
+export function readPublisherDomain(repoRoot, configPath = "trusted-server.toml") {
+  const resolvedPath = resolve(repoRoot, configPath);
+  const content = readFileSync(resolvedPath, "utf-8");
   const lines = content.split("\n");
   let inPublisher = false;
+
   for (const line of lines) {
     if (/^\[publisher\]/.test(line)) {
       inPublisher = true;
@@ -45,20 +50,44 @@ function readPublisherDomain(repoRoot) {
       continue;
     }
     if (inPublisher) {
-      const m = line.match(/^domain\s*=\s*"([^"]+)"/);
-      if (m) return m[1];
+      const match = line.match(/^domain\s*=\s*"([^"]+)"/);
+      if (match) return match[1];
     }
   }
+
   throw new Error(
-    "Could not find [publisher].domain in trusted-server.toml",
+    `Could not find [publisher].domain in ${configPath}`,
   );
+}
+
+function inferDomainFromTarget(target) {
+  try {
+    const host = new URL(target).hostname;
+    return host.startsWith("www.") ? host.slice(4) : host;
+  } catch {
+    return target;
+  }
+}
+
+function exitWithUsage(message) {
+  console.error(message);
+  console.error(USAGE);
+  process.exit(1);
+}
+
+function requireFlagValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    exitWithUsage(`${flag} requires a value`);
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = {
     url: null,
     domain: null,
@@ -75,24 +104,34 @@ function parseArgs(argv) {
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--domain") {
-      args.domain = argv[++i];
+      args.domain = requireFlagValue(argv, i, "--domain");
+      i += 1;
     } else if (arg === "--diff") {
       args.diff = true;
     } else if (arg === "--settle") {
-      args.settle = parseInt(argv[++i], 10);
+      const settleValue = requireFlagValue(argv, i, "--settle");
+      const parsedSettle = Number.parseInt(settleValue, 10);
+      if (!Number.isFinite(parsedSettle) || parsedSettle < 0) {
+        exitWithUsage("--settle requires a non-negative integer value");
+      }
+      args.settle = parsedSettle;
+      i += 1;
     } else if (arg === "--first-party") {
-      args.firstParty = argv[++i].split(",").filter(Boolean);
+      const firstPartyValue = requireFlagValue(argv, i, "--first-party");
+      args.firstParty = firstPartyValue.split(",").filter(Boolean);
+      i += 1;
     } else if (arg === "--no-filter") {
       args.noFilter = true;
     } else if (arg === "--headless") {
       args.headless = true;
     } else if (arg === "--output") {
-      args.output = argv[++i];
+      args.output = requireFlagValue(argv, i, "--output");
+      i += 1;
     } else if (arg === "--config") {
-      // --config with optional path: default to "trusted-server.toml"
       const next = argv[i + 1];
       if (next && !next.startsWith("--")) {
-        args.config = argv[++i];
+        args.config = next;
+        i += 1;
       } else {
         args.config = "trusted-server.toml";
       }
@@ -101,16 +140,12 @@ function parseArgs(argv) {
     } else if (!arg.startsWith("--") && !args.url) {
       args.url = arg.startsWith("http") ? arg : `https://${arg}`;
     } else {
-      console.error(`Unknown argument: ${arg}`);
-      process.exit(1);
+      exitWithUsage(`Unknown argument: ${arg}`);
     }
   }
 
   if (!args.url) {
-    console.error(
-      "Usage: audit-js-assets <url> [--diff] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headless] [--output <path>] [--config [path]] [--force]",
-    );
-    process.exit(1);
+    exitWithUsage("Missing required <url> argument");
   }
 
   return args;
@@ -129,15 +164,18 @@ export async function main() {
   if (!domain) {
     try {
       domain = readPublisherDomain(repoRoot);
-    } catch {
-      // No config file — infer from target URL
-      try {
-        const host = new URL(args.url).hostname;
-        domain = host.startsWith("www.") ? host.slice(4) : host;
-      } catch {
-        domain = args.url;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        domain = inferDomainFromTarget(args.url);
+        console.error(
+          `No trusted-server.toml found, inferring publisher domain from target URL: ${domain}`,
+        );
+      } else {
+        console.error(
+          `Failed to read publisher domain from trusted-server.toml: ${error.message}`,
+        );
+        process.exit(1);
       }
-      console.error(`No trusted-server.toml found, using domain: ${domain}`);
     }
   }
 
@@ -151,18 +189,18 @@ export async function main() {
     process.exit(1);
   }
 
-  console.error(`Launching browser...`);
+  console.error("Launching browser...");
   let browser;
   try {
     browser = await chromium.launch({ headless: args.headless });
-  } catch (err) {
-    if (err.message.includes("Executable doesn't exist")) {
+  } catch (error) {
+    if (error.message.includes("Executable doesn't exist")) {
       console.error(
         "Chromium not installed. Run:\n  cd packages/js-asset-auditor && npx playwright install chromium",
       );
       process.exit(1);
     }
-    throw err;
+    throw error;
   }
 
   try {
@@ -171,9 +209,9 @@ export async function main() {
 
     const scriptUrls = [];
     page.on("response", (response) => {
-      const req = response.request();
-      if (req.resourceType() === "script") {
-        scriptUrls.push(req.url());
+      const request = response.request();
+      if (request.resourceType() === "script") {
+        scriptUrls.push(request.url());
       }
     });
 
@@ -184,16 +222,14 @@ export async function main() {
     await page.waitForTimeout(args.settle);
 
     const headScriptUrls = await page.evaluate(() =>
-      Array.from(
-        document.head.querySelectorAll("script[src]"),
-      ).map((s) => s.src),
+      Array.from(document.head.querySelectorAll("script[src]")).map(
+        (script) => script.src,
+      ),
     );
 
     console.error(
       `Found ${scriptUrls.length} network scripts, ${headScriptUrls.length} head scripts`,
     );
-
-    await browser.close();
 
     console.error("Processing assets...");
     const result = processAssets(
@@ -220,22 +256,12 @@ export async function main() {
         : result.summary.new.length;
     console.error(`Wrote ${args.output} (${count} entries)`);
 
-    // Integration detection & config generation
     if (args.config) {
-      const { detectIntegrations, generateConfig } = await import(
-        "./detect.mjs"
-      );
+      const { detectIntegrations, generateConfig } = await import("./detect.mjs");
       const detection = detectIntegrations(scriptUrls);
 
       if (detection.integrations.length > 0) {
-        // Check if config file already exists
-        let fileExists = false;
-        try {
-          readFileSync(args.config);
-          fileExists = true;
-        } catch {
-          // File doesn't exist — safe to write
-        }
+        const fileExists = existsSync(args.config);
 
         if (fileExists && !args.force) {
           console.error(
@@ -252,24 +278,23 @@ export async function main() {
         console.error("No integrations detected — skipping config generation");
       }
 
-      result.summary.integrations = detection.integrations.map((i) => ({
-        id: i.id,
-        label: i.label,
-        category: i.category,
-        extracted: i.extracted,
-        todos: i.todos,
+      result.summary.integrations = detection.integrations.map((integration) => ({
+        id: integration.id,
+        label: integration.label,
+        category: integration.category,
+        extracted: integration.extracted,
+        todos: integration.todos,
       }));
     }
 
     console.log(JSON.stringify(result.summary));
   } finally {
-    if (browser.isConnected()) {
+    if (browser?.isConnected()) {
       await browser.close();
     }
   }
 }
 
-// Run when invoked directly
 const isDirectExecution =
   process.argv[1] &&
   new URL(process.argv[1], "file://").href === import.meta.url;

@@ -87,17 +87,17 @@ The following origin categories are excluded silently. The terminal summary repo
 
 **Matching:** Filter entries match if the request URL's host ends with the filter entry, with a dot-boundary check. For example, `googletagmanager.com` in the filter matches `www.googletagmanager.com` but not `evil-googletagmanager.com`.
 
-| Category            | Excluded origins                                                                              |
-| ------------------- | --------------------------------------------------------------------------------------------- |
-| Framework CDNs      | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com`                |
-| Error tracking      | `sentry.io`, `bugsnag.com`, `rollbar.com`                                                     |
-| Font services       | `fonts.googleapis.com`, `fonts.gstatic.com`                                                   |
-| Social embeds       | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`                              |
-| Google ad rendering | `pagead2.googlesyndication.com`, `tpc.googlesyndication.com`, `s0.2mdn.net`,                  |
-|                     | `googleads.g.doubleclick.net`, `www.googleadservices.com`                                     |
-| Ad fraud detection  | `adtrafficquality.google`                                                                     |
-| Ad verification     | `adsafeprotected.com`, `moatads.com`, `doubleverify.com`                                      |
-| reCAPTCHA           | `recaptcha.net`, `www.google.com/recaptcha/*`, `www.gstatic.com/recaptcha/*`                   |
+| Category            | Excluded origins                                                               |
+| ------------------- | ------------------------------------------------------------------------------ |
+| Framework CDNs      | `cdnjs.cloudflare.com`, `ajax.googleapis.com`, `cdn.jsdelivr.net`, `unpkg.com` |
+| Error tracking      | `sentry.io`, `bugsnag.com`, `rollbar.com`                                      |
+| Font services       | `fonts.googleapis.com`, `fonts.gstatic.com`                                    |
+| Social embeds       | `platform.twitter.com`, `platform.x.com`, `connect.facebook.net`               |
+| Google ad rendering | `pagead2.googlesyndication.com`, `tpc.googlesyndication.com`, `s0.2mdn.net`,   |
+|                     | `googleads.g.doubleclick.net`, `www.googleadservices.com`                      |
+| Ad fraud detection  | `adtrafficquality.google`                                                      |
+| Ad verification     | `adsafeprotected.com`, `moatads.com`, `doubleverify.com`                       |
+| reCAPTCHA           | `recaptcha.net`, `www.google.com/recaptcha/*`, `www.gstatic.com/recaptcha/*`   |
 
 **Path-prefix matching:** Some hosts (e.g., `www.google.com`) serve both filterable and non-filterable resources. Entries with a path suffix (e.g., `www.google.com/recaptcha/*`) match only when the URL's path begins with the specified prefix. Plain host entries use dot-boundary suffix matching as before.
 
@@ -136,7 +136,7 @@ The pipe (`|`) separator is required — it cannot appear in domain names or at 
 
 **Rationale:** Fully opaque and hash-derived — no human naming required, no ambiguity for cryptic vendor filenames. The KV metadata (`origin_url`, `content_type`, `asset_slug`) serves as the lookup table. Operators can query `js-asset:{slug}` in the KV store to retrieve full provenance. The terminal summary also prints slug → origin_url at generation time.
 
-**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. The reference implementation lives in `packages/js-asset-auditor/lib/slug.mjs` (standalone CLI) and `packages/js-asset-auditor/lib/process.mjs` (processing library), with a copy in `scripts/js-asset-slug.mjs`. Any changes must be synchronized across all files and the Rust proxy.
+**Important:** This algorithm must produce identical output to the Proxy's KV key derivation. The canonical implementation lives in `packages/js-asset-auditor/lib/process.mjs`. The standalone CLIs in `packages/js-asset-auditor/lib/slug.mjs` and `scripts/js-asset-slug.mjs` import from that shared implementation to avoid drift. Any proxy-side implementation must stay aligned with this logic.
 
 ### Wildcard detection
 
@@ -241,16 +241,16 @@ When invoked with `--config [path]`, the CLI also detects known integrations fro
 
 Integration detection runs on raw URLs (before normalization) to preserve query parameters needed for field extraction.
 
-| URL Pattern                                        | Integration            | Extracted Fields                          |
-| -------------------------------------------------- | ---------------------- | ----------------------------------------- |
-| `securepubads.g.doubleclick.net/tag/js/gpt*`       | `gpt`                  | `script_url`                              |
-| `www.googletagmanager.com/gtm.js?id=GTM-XXX`       | `google_tag_manager`   | `container_id` from `?id=`               |
-| `sdk.privacy-center.org`                           | `didomi`               | (defaults)                                |
-| `js.datadome.co`                                   | `datadome`             | (defaults)                                |
-| `aim.loc.kr/*identity-lockr*.js`                   | `lockr`                | `sdk_url`                                 |
-| `*.edge.permutive.app/*-web.js`                    | `permutive`            | `organization_id`, `workspace_id` from URL |
-| `*/prebid.js`, `*/prebidjs.js` (+ .min variants)  | `prebid`               | (detect only)                             |
-| `c.amazon-adsystem.com/aax2/apstag*`               | `aps`                  | (detect only)                             |
+| URL Pattern                                      | Integration          | Extracted Fields                           |
+| ------------------------------------------------ | -------------------- | ------------------------------------------ |
+| `securepubads.g.doubleclick.net/tag/js/gpt*`     | `gpt`                | `script_url`                               |
+| `www.googletagmanager.com/gtm.js?id=GTM-XXX`     | `google_tag_manager` | `container_id` from `?id=`                 |
+| `sdk.privacy-center.org`                         | `didomi`             | (defaults)                                 |
+| `js.datadome.co`                                 | `datadome`           | (defaults)                                 |
+| `aim.loc.kr/*identity-lockr*.js`                 | `lockr`              | `sdk_url`                                  |
+| `*.edge.permutive.app/*-web.js`                  | `permutive`          | `organization_id`, `workspace_id` from URL |
+| `*/prebid.js`, `*/prebidjs.js` (+ .min variants) | `prebid`             | (detect only)                              |
+| `c.amazon-adsystem.com/aax2/apstag*`             | `aps`                | (detect only)                              |
 
 ### Field categories
 
@@ -283,7 +283,7 @@ container_id = "GTM-TRCJMD6"  # auto-detected
 [integrations.lockr]
 enabled = true
 sdk_url = "https://aim.loc.kr/identity-lockr-trust-server.js"  # auto-detected
-app_id = ""  # TODO: set your Lockr Identity app_id
+# app_id = ""  # TODO: set your Lockr Identity app_id
 # api_endpoint = "https://identity.loc.kr"
 ```
 
