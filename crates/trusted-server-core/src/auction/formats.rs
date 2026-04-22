@@ -18,8 +18,8 @@ use crate::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
 use crate::creative;
 use crate::edge_cookie::generate_ec_id;
 use crate::error::TrustedServerError;
-use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::platform::{GeoInfo, RuntimeServices};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -83,14 +83,17 @@ pub struct BannerUnit {
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
+    services: &RuntimeServices,
     req: &Request,
     consent: ConsentContext,
     ec_id: &str,
+    geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.to_owned();
-    let fresh_id = generate_ec_id(settings, req).change_context(TrustedServerError::Auction {
-        message: "Failed to generate fresh EC ID".to_string(),
-    })?;
+    let fresh_id =
+        generate_ec_id(settings, services).change_context(TrustedServerError::Auction {
+            message: "Failed to generate fresh EC ID".to_string(),
+        })?;
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -137,9 +140,8 @@ pub fn convert_tsjs_to_auction_request(
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
-        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        #[allow(deprecated)]
-        geo: GeoInfo::from_request(req),
+        ip: services.client_info.client_ip.map(|ip| ip.to_string()),
+        geo,
     });
 
     // Forward allowed config entries from the JS request into the context map.

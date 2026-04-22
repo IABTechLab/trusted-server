@@ -12,6 +12,24 @@
 //! - [`PlatformBackend`] — dynamic backend registration
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
+//!
+//! ## Platform-Agnostic Components
+//!
+//! The following components were evaluated for platform-specific behavior
+//! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
+//! and found to have a platform-agnostic rewriting pipeline. No
+//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
+//! any content-rewriting implementation:
+//!
+//! - **Content rewriting** — `html_processor`, `streaming_processor`,
+//!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
+//!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
+//!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
+//!   accepts any reader, including `fastly::Body` (which implements
+//!   `std::io::Read`).
+//!
+//!   No `PlatformContentRewriter` trait exists or is needed.
+//!
 
 mod error;
 mod http;
@@ -36,6 +54,7 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -43,7 +62,7 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::key_value_store::KvPage;
 
-    use super::test_support::noop_services;
+    use super::test_support::{noop_services, noop_services_with_client_ip};
     use super::*;
 
     struct MarkerKvStore(&'static str);
@@ -127,7 +146,7 @@ mod tests {
 
     #[test]
     fn runtime_services_with_kv_store_replaces_only_the_new_clone() {
-        let services = noop_services();
+        let services = noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
         let replaced = services
             .clone()
             .with_kv_store(Arc::new(MarkerKvStore("replaced")));
@@ -145,6 +164,11 @@ mod tests {
             replaced_value,
             Some(Bytes::from_static(b"replaced")),
             "should expose the replacement KV store through kv_store()"
+        );
+        assert_eq!(
+            replaced.client_info().client_ip,
+            services.client_info().client_ip,
+            "should preserve client_info through with_kv_store"
         );
     }
 
