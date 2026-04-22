@@ -4,7 +4,7 @@ use std::sync::Arc;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
 use fastly::http::StatusCode;
-use fastly::Request;
+use fastly::{mime, Request};
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
@@ -247,5 +247,66 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         publisher_resp.get_status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "should scope consent store failures to the consent-dependent routes"
+    );
+}
+
+#[test]
+fn ja4_debug_route_returns_plain_text_fallback_response() {
+    let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/_ts/debug/ja4");
+    let runtime_services = test_runtime_services(&req);
+    let mut response = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        req,
+    ))
+    .expect("should route ja4 debug request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should return 200 OK for the ja4 debug route"
+    );
+    assert_eq!(
+        response.get_content_type(),
+        Some(mime::TEXT_PLAIN_UTF_8),
+        "should return plain text content for the ja4 debug route"
+    );
+
+    let body = response.take_body_str();
+
+    assert!(
+        body.contains("ja4:         unavailable"),
+        "should include the JA4 fallback when Fastly omits the fingerprint"
+    );
+    assert!(
+        body.contains("h2_fp:       unavailable"),
+        "should include the H2 fingerprint fallback when Fastly omits it"
+    );
+    assert!(
+        body.contains("cipher:      unavailable"),
+        "should include the cipher fallback when Fastly omits it"
+    );
+    assert!(
+        body.contains("tls_version: unavailable"),
+        "should include the TLS version fallback when Fastly omits it"
+    );
+    assert!(
+        body.contains("user-agent:  none"),
+        "should include the user-agent fallback when the header is absent"
+    );
+    assert!(
+        body.contains("ch-mobile:   not sent"),
+        "should include the mobile client hints fallback when the header is absent"
+    );
+    assert!(
+        body.contains("ch-platform: not sent"),
+        "should include the platform client hints fallback when the header is absent"
     );
 }
