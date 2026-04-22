@@ -14,6 +14,7 @@ use sha2::Sha256;
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
 use crate::cookies::{ec_id_has_only_allowed_chars, handle_request_cookies};
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -67,12 +68,13 @@ fn generate_random_suffix(length: usize) -> String {
 /// - [`TrustedServerError::Ec`] if HMAC generation fails
 pub fn generate_ec_id(
     settings: &Settings,
-    req: &Request,
+    services: &RuntimeServices,
 ) -> Result<String, Report<TrustedServerError>> {
     // Fallback to "unknown" when client IP is unavailable (e.g., local testing).
     // All such requests share the same HMAC base; the random suffix provides uniqueness.
-    let client_ip = req
-        .get_client_ip_addr()
+    let client_ip = services
+        .client_info
+        .client_ip
         .map(normalize_ip)
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -146,6 +148,7 @@ pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerEr
 /// Returns an error if ID generation fails.
 pub fn get_or_generate_ec_id(
     settings: &Settings,
+    services: &RuntimeServices,
     req: &Request,
 ) -> Result<String, Report<TrustedServerError>> {
     if let Some(id) = get_ec_id(req)? {
@@ -153,7 +156,7 @@ pub fn get_or_generate_ec_id(
     }
 
     // If no existing EC ID found, generate a fresh one
-    let ec_id = generate_ec_id(settings, req)?;
+    let ec_id = generate_ec_id(settings, services)?;
     log::trace!("No existing EC ID, generated: {}", ec_id);
     Ok(ec_id)
 }
@@ -164,6 +167,7 @@ mod tests {
     use fastly::http::{HeaderName, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -236,13 +240,31 @@ mod tests {
     #[test]
     fn test_generate_ec_id() {
         let settings: Settings = create_test_settings();
-        let req = create_test_request(vec![]);
 
-        let ec_id = generate_ec_id(&settings, &req).expect("should generate EC ID");
+        let ec_id = generate_ec_id(&settings, &noop_services()).expect("should generate EC ID");
         log::debug!("Generated EC ID: {}", ec_id);
         assert!(
             is_ec_id_format(&ec_id),
             "should match EC ID format: {{64hex}}.{{6alnum}}"
+        );
+    }
+
+    #[test]
+    fn test_generate_ec_id_uses_client_ip() {
+        let settings = create_test_settings();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+
+        let id_with_ip = generate_ec_id(&settings, &noop_services_with_client_ip(ip))
+            .expect("should generate EC ID with client IP");
+        let id_without_ip = generate_ec_id(&settings, &noop_services())
+            .expect("should generate EC ID without client IP");
+
+        let hmac_with_ip = id_with_ip.split_once('.').expect("should contain dot").0;
+        let hmac_without_ip = id_without_ip.split_once('.').expect("should contain dot").0;
+
+        assert_ne!(
+            hmac_with_ip, hmac_without_ip,
+            "should produce different HMAC when client IP differs"
         );
     }
 
@@ -290,7 +312,8 @@ mod tests {
         let ec_id = get_ec_id(&req).expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_ec_id".to_string()));
 
-        let ec_id = get_or_generate_ec_id(&settings, &req).expect("should reuse header EC ID");
+        let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
+            .expect("should reuse header EC ID");
         assert_eq!(ec_id, "existing_ec_id");
     }
 
@@ -305,7 +328,8 @@ mod tests {
         let ec_id = get_ec_id(&req).expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_cookie_id".to_string()));
 
-        let ec_id = get_or_generate_ec_id(&settings, &req).expect("should reuse cookie EC ID");
+        let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
+            .expect("should reuse cookie EC ID");
         assert_eq!(ec_id, "existing_cookie_id");
     }
 
@@ -321,7 +345,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![]);
 
-        let ec_id = get_or_generate_ec_id(&settings, &req).expect("should get or generate EC ID");
+        let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
+            .expect("should get or generate EC ID");
         assert!(!ec_id.is_empty());
     }
 
@@ -348,7 +373,7 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(vec![(HEADER_X_TS_EC, "evil;injected")]);
 
-        let ec_id = get_or_generate_ec_id(&settings, &req)
+        let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
             .expect("should generate fresh ID on invalid header");
         assert_ne!(
             ec_id, "evil;injected",

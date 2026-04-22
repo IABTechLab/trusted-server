@@ -2593,28 +2593,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-stream"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eca58d7bba4a75707817a2c44174253f9236b2d5fbd055602e9d5c07c139a047"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "toml"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,10 +2704,7 @@ dependencies = [
  "futures",
  "log",
  "log-fastly",
- "serde",
- "serde_json",
  "trusted-server-core",
- "trusted-server-js",
 ]
 
 [[package]]
@@ -2758,10 +2733,8 @@ dependencies = [
  "iab_gpp",
  "jose-jwk",
  "log",
- "log-fastly",
  "lol_html",
  "matchit",
- "pin-project-lite",
  "rand",
  "regex",
  "serde",
@@ -2770,7 +2743,6 @@ dependencies = [
  "subtle",
  "temp-env",
  "tokio",
- "tokio-test",
  "toml 1.0.7+spec-1.1.0",
  "trusted-server-js",
  "trusted-server-openrtb",
