@@ -373,10 +373,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 /// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
 /// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
 /// emitted once per process.
-pub fn build_runtime_services(
-    ctx: &edgezero_core::context::RequestContext,
-    http_client: Arc<AxumPlatformHttpClient>,
-) -> RuntimeServices {
+pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!(
@@ -394,7 +391,12 @@ pub fn build_runtime_services(
         .secret_store(Arc::new(AxumPlatformSecretStore))
         .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
         .backend(Arc::new(AxumPlatformBackend))
-        .http_client(http_client)
+        // Keep the HTTP client request-scoped in the dev adapter. Axum still
+        // drops outbound `Body::Stream` requests, and sharing a pooled client
+        // across requests regressed the Next.js server-action -> API-route
+        // integration flow by reusing a poisoned connection after the truncated
+        // POST. Revisit pooling only after streamed request bodies are handled.
+        .http_client(Arc::new(AxumPlatformHttpClient::new()))
         .geo(Arc::new(AxumPlatformGeo))
         .client_info(ClientInfo {
             client_ip,

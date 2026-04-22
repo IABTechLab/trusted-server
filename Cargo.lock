@@ -3582,6 +3582,7 @@ dependencies = [
  "error-stack",
  "log",
  "reqwest 0.12.28",
+ "simple_logger",
  "temp-env",
  "tokio",
  "tower 0.4.13",

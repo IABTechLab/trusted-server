@@ -22,6 +22,7 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
+simple_logger = "5"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { path = "../trusted-server-core" }
 

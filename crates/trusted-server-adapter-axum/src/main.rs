@@ -6,6 +6,7 @@ fn main() {
     // a fresh OS port each run and avoid TIME_WAIT flakiness. The standard
     // `run_app` path is kept for normal development (reads config from axum.toml).
     if let Some(port) = port_from_env() {
+        let _ = simple_logger::SimpleLogger::new().init();
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let config = edgezero_adapter_axum::AxumDevServerConfig {
             addr,
@@ -13,7 +14,7 @@ fn main() {
         };
         let router = TrustedServerApp::routes();
         if let Err(err) = edgezero_adapter_axum::AxumDevServer::with_config(router, config).run() {
-            eprintln!("trusted-server-adapter-axum failed: {err}");
+            log::error!("trusted-server-adapter-axum failed: {err}");
             std::process::exit(1);
         }
     } else if let Err(err) =
