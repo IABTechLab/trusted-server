@@ -27,7 +27,7 @@ import './_adapters.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
-import type { AuctionBid } from '../../core/auction';
+import type { AuctionBid, AuctionEid } from '../../core/auction';
 
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
@@ -145,6 +145,62 @@ type TrustedServerRequest = {
   tsjsBidRequests: TrustedServerBidRequest[];
 };
 
+type PrebidUserIdEid = {
+  source?: unknown;
+  uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
+};
+
+function sanitizeAuctionUid(uid: {
+  id?: unknown;
+  atype?: unknown;
+  ext?: unknown;
+}): AuctionEid['uids'][number] | undefined {
+  if (typeof uid?.id !== 'string' || uid.id.length === 0) {
+    return undefined;
+  }
+
+  const sanitizedUid: AuctionEid['uids'][number] = { id: uid.id };
+
+  if (Number.isInteger(uid.atype) && uid.atype >= 0 && uid.atype <= 255) {
+    sanitizedUid.atype = uid.atype;
+  }
+
+  if (uid.ext && typeof uid.ext === 'object' && !Array.isArray(uid.ext)) {
+    sanitizedUid.ext = uid.ext as Record<string, unknown>;
+  }
+
+  return sanitizedUid;
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
+function collectAuctionEids(): AuctionEid[] | undefined {
+  if (typeof pbjs.getUserIdsAsEids !== 'function') {
+    return undefined;
+  }
+
+  const rawEids = (pbjs.getUserIdsAsEids() ?? []) as PrebidUserIdEid[];
+  const eids: AuctionEid[] = [];
+
+  for (const eid of rawEids) {
+    if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+      continue;
+    }
+
+    const uids = Array.isArray(eid.uids) ? eid.uids.map(sanitizeAuctionUid).filter(isDefined) : [];
+
+    if (uids.length === 0) {
+      continue;
+    }
+
+    eids.push({ source: eid.source, uids });
+  }
+
+  return eids.length > 0 ? eids : undefined;
+}
+
 /**
  * Install the Prebid integration.
  *
@@ -178,7 +234,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      const payload = buildAdRequest(validBidRequests);
+      const payload = buildAdRequest(validBidRequests, { eids: collectAuctionEids() });
       return {
         method: 'POST',
         url: auctionEndpoint,

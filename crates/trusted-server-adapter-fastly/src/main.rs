@@ -18,6 +18,7 @@ use trusted_server_core::ec::partner::PartnerStore;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::sync_pixel::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
@@ -103,6 +104,15 @@ fn main() -> Result<(), Error> {
         }
     };
 
+    let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
+        Ok(registry) => registry,
+        Err(e) => {
+            log::error!("Failed to build partner registry: {:?}", e);
+            to_error_response(&e).send_to_client();
+            return Ok(());
+        }
+    };
+
     // Start with an unavailable KV slot. Consent-dependent routes lazily
     // replace it with the configured store at dispatch time so unrelated
     // routes stay available when consent persistence is misconfigured.
@@ -114,6 +124,7 @@ fn main() -> Result<(), Error> {
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &runtime_services,
         req,
     ))?;
@@ -184,6 +195,7 @@ async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
+    partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
     mut req: Request,
 ) -> Result<RouteOutcome, Error> {
@@ -320,13 +332,17 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            let partner_store = require_partner_store(settings).ok();
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(partner_registry)
+            };
             (
                 handle_auction(
                     settings,
                     orchestrator,
                     kv_graph.as_ref(),
-                    partner_store.as_ref(),
+                    registry_ref,
                     &ec_context,
                     runtime_services,
                     req,
