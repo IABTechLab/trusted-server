@@ -21,17 +21,20 @@ Add the following to `trusted-server.toml`:
 enabled = true
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
+# Optional: forward a custom Sourcepoint authCookie name upstream.
+# auth_cookie_name = "sp_auth"
 cache_ttl_seconds = 3600
 ```
 
 ### Configuration Options
 
-| Option              | Type    | Default                        | Description                                                                       |
-| ------------------- | ------- | ------------------------------ | --------------------------------------------------------------------------------- |
-| `enabled`           | boolean | `false`                        | Enable the Sourcepoint integration                                                |
-| `rewrite_sdk`       | boolean | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                         |
-| `cdn_origin`        | string  | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                            |
-| `cache_ttl_seconds` | integer | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers |
+| Option              | Type             | Default                        | Description                                                                                 |
+| ------------------- | ---------------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
+| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                          |
+| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                   |
+| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                      |
+| `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies |
+| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers           |
 
 ## Endpoints
 
@@ -54,6 +57,12 @@ When `rewrite_sdk = true`, Trusted Server rewrites matching Sourcepoint URLs in 
 ## Client-Side Guard
 
 Single-page apps often insert CMP scripts after the initial HTML response. The `sourcepoint` tsjs module installs a DOM insertion guard so dynamically inserted Sourcepoint script and preload URLs are rewritten to first-party paths before the browser fetches them.
+
+## Cookie Forwarding and Caching
+
+Trusted Server forwards only Sourcepoint's documented cookie names upstream, plus the optional `auth_cookie_name` when configured. Unrelated publisher cookies are deliberately excluded so first-party application state is not leaked to Sourcepoint.
+
+Responses that include `Set-Cookie` are forced to `Cache-Control: private, no-store` so cookie-bearing Sourcepoint traffic is never marked as publicly cacheable content by the proxy.
 
 ## Notes
 

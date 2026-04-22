@@ -139,6 +139,7 @@ rewrite_sdk = true
 enabled = true
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
+# auth_cookie_name = "sp_auth"
 cache_ttl_seconds = 3600
 ```
 

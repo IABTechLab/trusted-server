@@ -26,6 +26,9 @@ describe('Sourcepoint SDK Script Interception Guard', () => {
     expect(isSourcepointUrl('https://cdn.privacy-mgmt.com/wrapper/v2/messages')).toBe(true);
     expect(isSourcepointUrl('//cdn.privacy-mgmt.com/mms/v2/get_site_data')).toBe(true);
     expect(isSourcepointUrl('cdn.privacy-mgmt.com/consent/tcfv2')).toBe(true);
+    expect(isSourcepointUrl('https://cdn.privacy-mgmt.com:443/wrapper/v2/messages')).toBe(true);
+    expect(isSourcepointUrl('http://cdn.privacy-mgmt.com:80/consent/tcfv2')).toBe(true);
+    expect(isSourcepointUrl('https://cdn.privacy-mgmt.com:8443/wrapper/v2/messages')).toBe(true);
     expect(isSourcepointUrl('https://example.com/script.js')).toBe(false);
     expect(isSourcepointUrl('https://geo.privacymanager.io/')).toBe(false);
   });

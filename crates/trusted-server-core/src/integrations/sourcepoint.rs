@@ -47,6 +47,25 @@ const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
 /// unmodified to avoid unbounded memory consumption.
 const MAX_REWRITE_BODY_SIZE: u64 = 5 * 1024 * 1024;
 
+/// Sourcepoint cookie names that are safe to round-trip to the upstream CDN.
+///
+/// This intentionally excludes unrelated publisher cookies to avoid leaking
+/// first-party application state to Sourcepoint. A custom `authCookie` name
+/// can be added via [`SourcepointConfig::auth_cookie_name`].
+const SOURCEPOINT_COOKIE_ALLOWLIST: &[&str] = &[
+    "consentUUID",
+    "euconsent-v2",
+    "dnsDisplayed",
+    "ccpaApplies",
+    "signedLspa",
+    "_sp_su",
+    "consentDate",
+    "usnatUUID",
+    "consentDateUsnat",
+    "globalcmpUUID",
+    "consentDateGlobalcmp",
+];
+
 /// Matches quoted references to `cdn.privacy-mgmt.com` URLs in script content.
 ///
 /// Pattern breakdown:
@@ -102,6 +121,12 @@ pub struct SourcepointConfig {
     #[serde(default = "default_cdn_origin")]
     #[validate(custom(function = "validate_cdn_origin"))]
     pub cdn_origin: String,
+    /// Optional custom Sourcepoint auth cookie name to forward upstream.
+    ///
+    /// Sourcepoint's standard cookie set is allowlisted automatically.
+    /// Configure this only when the CMP uses a custom `authCookie` name and
+    /// that cookie must round-trip through the first-party proxy.
+    pub auth_cookie_name: Option<String>,
     /// Cache TTL for Sourcepoint static responses in seconds.
     #[serde(default = "default_cache_ttl")]
     #[validate(range(min = 60, max = 86400))]
@@ -264,9 +289,58 @@ impl SourcepointIntegration {
                 proxy_req.set_header(&header_name, value);
             }
         }
+
+        if let Some(filtered_cookie_header) = self.filtered_sourcepoint_cookie_header(original_req)
+        {
+            proxy_req.set_header(header::COOKIE, &filtered_cookie_header);
+        }
+    }
+
+    fn filtered_sourcepoint_cookie_header(&self, original_req: &Request) -> Option<String> {
+        let cookie_header = original_req.get_header(header::COOKIE)?;
+        let cookie_header = match cookie_header.to_str() {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!(
+                    "Sourcepoint: request Cookie header is not valid UTF-8, skipping upstream cookie forwarding"
+                );
+                return None;
+            }
+        };
+
+        let filtered = cookie_header
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| {
+                let name = pair.split('=').next().unwrap_or_default().trim();
+                self.should_forward_sourcepoint_cookie(name)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    }
+
+    fn should_forward_sourcepoint_cookie(&self, cookie_name: &str) -> bool {
+        SOURCEPOINT_COOKIE_ALLOWLIST.contains(&cookie_name)
+            || self.config.auth_cookie_name.as_deref() == Some(cookie_name)
+    }
+
+    fn response_sets_cookie(response: &Response) -> bool {
+        response.get_header(header::SET_COOKIE).is_some()
     }
 
     fn apply_cache_headers(&self, response: &mut Response) {
+        if Self::response_sets_cookie(response) {
+            response.set_header(header::CACHE_CONTROL, "private, no-store");
+            return;
+        }
+
         if response.get_header(header::CACHE_CONTROL).is_none()
             && response.get_status().is_success()
         {
@@ -369,15 +443,19 @@ impl SourcepointIntegration {
         response.remove_header(header::CONTENT_ENCODING);
         response.remove_header(header::CONTENT_LENGTH);
 
-        // Rewritten JS bundles are static, versioned assets (paths like
-        // `/unified/4.40.1/…`), so we apply a fixed public cache policy
-        // regardless of what upstream sent. This intentionally diverges from the
-        // passthrough path's `apply_cache_headers` (which only sets a default
-        // when upstream omitted Cache-Control).
-        response.set_header(
-            header::CACHE_CONTROL,
-            format!("public, max-age={}", self.config.cache_ttl_seconds),
-        );
+        if Self::response_sets_cookie(response) {
+            response.set_header(header::CACHE_CONTROL, "private, no-store");
+        } else {
+            // Rewritten JS bundles are static, versioned assets (paths like
+            // `/unified/4.40.1/…`), so we apply a fixed public cache policy
+            // regardless of what upstream sent. This intentionally diverges from the
+            // passthrough path's `apply_cache_headers` (which only sets a default
+            // when upstream omitted Cache-Control).
+            response.set_header(
+                header::CACHE_CONTROL,
+                format!("public, max-age={}", self.config.cache_ttl_seconds),
+            );
+        }
         response.set_header(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
@@ -693,6 +771,7 @@ mod tests {
             enabled,
             rewrite_sdk: true,
             cdn_origin: default_cdn_origin(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         }
     }
@@ -965,6 +1044,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "http://169.254.169.254".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -979,6 +1059,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(cfg.validate().is_err(), "should reject non-HTTP(S) scheme");
@@ -990,6 +1071,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -1004,6 +1086,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -1018,6 +1101,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -1032,6 +1116,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -1046,6 +1131,7 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
@@ -1060,11 +1146,79 @@ mod tests {
             enabled: true,
             rewrite_sdk: true,
             cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
+            auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
         assert!(
             cfg.validate().is_ok(),
             "should accept http scheme for cdn_origin"
+        );
+    }
+
+    #[test]
+    fn forwards_only_allowlisted_sourcepoint_cookies() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
+        req.set_header(
+            header::COOKIE,
+            "consentUUID=uuid123; session_id=secret; euconsent-v2=tcf; _sp_su=1; theme=dark",
+        );
+
+        assert_eq!(
+            integration
+                .filtered_sourcepoint_cookie_header(&req)
+                .as_deref(),
+            Some("consentUUID=uuid123; euconsent-v2=tcf; _sp_su=1"),
+            "should forward only Sourcepoint cookie names"
+        );
+    }
+
+    #[test]
+    fn forwards_configured_auth_cookie_name() {
+        let mut cfg = config(true);
+        cfg.auth_cookie_name = Some("sp_auth".to_string());
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
+        req.set_header(
+            header::COOKIE,
+            "sp_auth=token123; session_id=secret; consentUUID=uuid123",
+        );
+
+        assert_eq!(
+            integration
+                .filtered_sourcepoint_cookie_header(&req)
+                .as_deref(),
+            Some("sp_auth=token123; consentUUID=uuid123"),
+            "should forward configured Sourcepoint auth cookie alongside built-in cookies"
+        );
+    }
+
+    #[test]
+    fn drops_unrelated_publisher_cookies_from_upstream_request() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
+        req.set_header(header::COOKIE, "session_id=secret; theme=dark");
+
+        assert_eq!(
+            integration.filtered_sourcepoint_cookie_header(&req),
+            None,
+            "should omit upstream Cookie header when no Sourcepoint cookies are present"
+        );
+    }
+
+    #[test]
+    fn apply_cache_headers_uses_private_no_store_for_cookie_setting_responses() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::SET_COOKIE, "consentUUID=uuid123; Path=/");
+        response.set_header(header::CACHE_CONTROL, "public, max-age=3600");
+
+        integration.apply_cache_headers(&mut response);
+
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "should prevent public caching for cookie-setting responses"
         );
     }
 
@@ -1101,7 +1255,31 @@ mod tests {
         assert!(response.get_header(header::CONTENT_LENGTH).is_none());
 
         let body = response.take_body_bytes();
-        assert_eq!(String::from_utf8(body).unwrap(), "rewritten");
+        assert_eq!(
+            String::from_utf8(body).expect("should decode rewritten JavaScript response"),
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn rewrite_javascript_response_uses_private_no_store_for_cookie_setting_responses() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::SET_COOKIE, "consentUUID=uuid123; Path=/");
+        response.set_header(header::CACHE_CONTROL, "public, max-age=3600");
+        response.set_body("payload");
+
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "should avoid public caching when rewritten response still sets cookies"
+        );
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/javascript; charset=utf-8")
+        );
     }
 
     #[test]

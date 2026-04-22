@@ -13,9 +13,9 @@ function normalizeSourcepointUrl(url: string): string | null {
 
   // Keep in sync with Rust `parse_sourcepoint_url()` in:
   // crates/trusted-server-core/src/integrations/sourcepoint.rs
-  // (protocol-relative + bare-host handling + strict host-check behavior).
+  // (protocol-relative + bare-host handling + hostname-only host checks).
   // Bare domain or path — attempt to parse as https URL.
-  // The host === check in isSourcepointUrl rejects non-matching domains.
+  // The hostname === check in isSourcepointUrl rejects non-matching domains.
   return `https://${trimmed}`;
 }
 
@@ -32,7 +32,7 @@ function parseSourcepointUrl(url: string): URL | null {
 
 export function isSourcepointUrl(url: string): boolean {
   const parsed = parseSourcepointUrl(url);
-  return parsed?.host === SOURCEPOINT_CDN_HOST;
+  return parsed?.hostname === SOURCEPOINT_CDN_HOST;
 }
 
 export function rewriteSourcepointUrl(originalUrl: string): string {
