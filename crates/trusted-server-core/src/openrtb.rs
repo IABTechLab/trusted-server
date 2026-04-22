@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auction::types::OrchestratorExt;
@@ -69,7 +69,7 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
@@ -78,7 +78,7 @@ pub struct Eid {
 }
 
 /// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Uid {
     /// The identifier value.
     pub id: String,

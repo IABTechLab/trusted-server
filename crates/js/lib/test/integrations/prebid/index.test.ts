@@ -8,6 +8,7 @@ const {
   mockRegisterBidAdapter,
   mockPbjs,
   mockGetBidAdapter,
+  mockGetUserIdsAsEids,
   mockAdapterManager,
 } = vi.hoisted(() => {
   const mockSetConfig = vi.fn();
@@ -15,11 +16,13 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
+  const mockGetUserIdsAsEids = vi.fn();
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
+    getUserIdsAsEids: mockGetUserIdsAsEids,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -32,6 +35,7 @@ const {
     mockRegisterBidAdapter,
     mockPbjs,
     mockGetBidAdapter,
+    mockGetUserIdsAsEids,
     mockAdapterManager,
   };
 });
@@ -196,6 +200,8 @@ describe('prebid/installPrebidNpm', () => {
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
     delete (window as any).__tsjs_prebid;
   });
 
@@ -275,6 +281,97 @@ describe('prebid/installPrebidNpm', () => {
       const payload = JSON.parse(result.data);
       expect(payload.adUnits).toHaveLength(1);
       expect(payload.adUnits[0].code).toBe('div-gpt-1');
+      expect(payload.eids).toBeUndefined();
+    });
+
+    it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'id5-sync.com',
+          uids: [{ id: 'ID5_abc', atype: 1 }],
+        },
+        {
+          source: 'sharedid.org',
+          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
+        },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.eids).toEqual([
+        {
+          source: 'id5-sync.com',
+          uids: [{ id: 'ID5_abc', atype: 1 }],
+        },
+        {
+          source: 'sharedid.org',
+          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('buildRequests preserves uid ext and sanitizes invalid atype values', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'adserver.org',
+          uids: [
+            {
+              id: 'uid-with-ext',
+              atype: 1,
+              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+            },
+            {
+              id: 'uid-bad-atype',
+              atype: 999,
+              ext: { keep: true },
+            },
+            {
+              id: 'uid-float-atype',
+              atype: 1.5,
+            },
+          ],
+        },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.eids).toEqual([
+        {
+          source: 'adserver.org',
+          uids: [
+            {
+              id: 'uid-with-ext',
+              atype: 1,
+              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+            },
+            {
+              id: 'uid-bad-atype',
+              ext: { keep: true },
+            },
+            {
+              id: 'uid-float-atype',
+            },
+          ],
+        },
+      ]);
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -565,6 +662,8 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     vi.clearAllMocks();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
     delete (window as any).__tsjs_prebid;
   });
 
@@ -605,6 +704,8 @@ describe('prebid/client-side bidders', () => {
     vi.clearAllMocks();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
     // By default, pretend all adapters are registered
     mockGetBidAdapter.mockReturnValue({});
     delete (window as any).__tsjs_prebid;
