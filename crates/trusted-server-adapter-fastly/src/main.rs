@@ -161,16 +161,20 @@ async fn route_request(
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => handle_first_party_proxy(settings, req).await,
-        (Method::GET, "/first-party/click") => handle_first_party_click(settings, req).await,
+        (Method::GET, "/first-party/proxy") => {
+            handle_first_party_proxy(settings, runtime_services, req).await
+        }
+        (Method::GET, "/first-party/click") => {
+            handle_first_party_click(settings, runtime_services, req).await
+        }
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, req).await
+            handle_first_party_proxy_sign(settings, runtime_services, req).await
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, req).await
+            handle_first_party_proxy_rebuild(settings, runtime_services, req).await
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
-            .handle_proxy(&m, path, settings, req)
+            .handle_proxy(&m, path, settings, runtime_services, req)
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
