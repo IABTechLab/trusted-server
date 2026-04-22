@@ -28,13 +28,13 @@ cache_ttl_seconds = 3600
 
 ### Configuration Options
 
-| Option              | Type             | Default                        | Description                                                                                 |
-| ------------------- | ---------------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
-| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                          |
-| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                   |
-| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                      |
+| Option              | Type             | Default                        | Description                                                                                  |
+| ------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
+| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                           |
+| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                    |
+| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                       |
 | `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies |
-| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers           |
+| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers            |
 
 ## Endpoints
 
