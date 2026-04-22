@@ -1,19 +1,15 @@
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{
-    header, HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
+    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Error, Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::auction::AuctionOrchestrator;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::compat;
-use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
-};
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
@@ -28,7 +24,6 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 
 mod app;
 mod error;
@@ -37,9 +32,10 @@ mod management_api;
 mod middleware;
 mod platform;
 
-use crate::app::TrustedServerApp;
+use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
-use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+use crate::middleware::apply_finalize_headers;
+use crate::platform::build_runtime_services;
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
@@ -116,58 +112,25 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
 /// Propagates [`fastly::Error`] from the Fastly SDK.
 // TODO: delete after Phase 5 EdgeZero cutover — see issue #495
 fn legacy_main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
-    let settings = match get_settings() {
-        Ok(s) => s,
+    let state = match build_state() {
+        Ok(state) => state,
         Err(e) => {
-            log::error!("Failed to load settings: {:?}", e);
+            log::error!("Failed to build application state: {:?}", e);
             return Ok(to_error_response(&e));
         }
     };
-    log::debug!("Settings {settings:?}");
-
-    // Build the auction orchestrator once at startup
-    let orchestrator = match build_orchestrator(&settings) {
-        Ok(orchestrator) => orchestrator,
-        Err(e) => {
-            log::error!("Failed to build auction orchestrator: {:?}", e);
-            return Ok(to_error_response(&e));
-        }
-    };
-
-    let integration_registry = match IntegrationRegistry::new(&settings) {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("Failed to create integration registry: {:?}", e);
-            return Ok(to_error_response(&e));
-        }
-    };
-
-    let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
-        Ok(s) => s,
-        Err(e) => {
-            // Degrade gracefully: routes that do not touch synthetic IDs
-            // (e.g. /.well-known/, /verify-signature, /admin/keys/*) must
-            // still succeed even when the KV store is unavailable.
-            // Handlers that call kv_handle() will receive KvError::Unavailable.
-            log::warn!(
-                "KV store '{}' unavailable, synthetic ID routes will return errors: {e}",
-                settings.synthetic.opid_store
-            );
-            std::sync::Arc::new(UnavailableKvStore)
-                as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>
-        }
-    };
+    log::debug!("Settings {:?}", state.settings);
     // Strip client-spoofable forwarded headers at the edge before building
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let runtime_services = build_runtime_services(&req, kv_store);
+    let runtime_services = build_runtime_services(&req, std::sync::Arc::clone(&state.kv_store));
     let http_req = compat::from_fastly_request(req);
 
     let mut response = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
+        &state.settings,
+        &state.orchestrator,
+        &state.registry,
         &runtime_services,
         http_req,
     ))
@@ -185,7 +148,7 @@ fn legacy_main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
             })
     };
 
-    finalize_response(&settings, geo_info.as_ref(), &mut response);
+    finalize_response(&state.settings, geo_info.as_ref(), &mut response);
 
     Ok(compat::to_fastly_response(response))
 }
@@ -282,35 +245,7 @@ async fn route_request(
 /// version/staging, then operator-configured `settings.response_headers`.
 /// This means operators can intentionally override any managed header.
 fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
-    if let Some(geo) = geo_info {
-        geo.set_response_headers(response);
-    } else {
-        response.headers_mut().insert(
-            HEADER_X_GEO_INFO_AVAILABLE,
-            HeaderValue::from_static("false"),
-        );
-    }
-
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-        }
-    }
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response
-            .headers_mut()
-            .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
-    }
-
-    for (key, value) in &settings.response_headers {
-        let header_name = HeaderName::from_bytes(key.as_bytes())
-            .expect("settings.response_headers validated at load time");
-        let header_value =
-            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
-        response.headers_mut().insert(header_name, header_value);
-    }
+    apply_finalize_headers(settings, geo_info, response);
 }
 
 fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
