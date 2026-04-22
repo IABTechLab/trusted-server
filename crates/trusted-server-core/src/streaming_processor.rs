@@ -348,9 +348,8 @@ impl StreamProcessor for HtmlRewriterAdapter {
 
     /// No-op. `HtmlRewriterAdapter` is single-use: the rewriter consumes its
     /// [`Settings`](lol_html::Settings) on construction and cannot be recreated.
-    /// Calling [`process_chunk`](StreamProcessor::process_chunk) after
-    /// [`process_chunk`](StreamProcessor::process_chunk) with `is_last = true`
-    /// will produce empty output.
+    /// Calling [`process_chunk`](StreamProcessor::process_chunk) after finalization
+    /// (`is_last = true`) will produce empty output — the rewriter is already done.
     fn reset(&mut self) {}
 }
 

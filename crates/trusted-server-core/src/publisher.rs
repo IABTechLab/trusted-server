@@ -300,6 +300,75 @@ pub enum PublisherResponse {
     },
 }
 
+/// Routing decision for a proxied response.
+///
+/// Computed purely from response metadata — no side effects, no body is
+/// consumed. [`handle_publisher_request`] calls [`classify_response_route`]
+/// once and dispatches to the matching [`PublisherResponse`] arm. Tests
+/// exercise the classifier directly so the gate formula lives in one place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResponseRoute {
+    /// 2xx non-processable (images, fonts, video), not 204/205. Origin body
+    /// is streamed unmodified via [`PublisherResponse::PassThrough`].
+    PassThrough,
+    /// 2xx processable, supported encoding, and either non-HTML or no HTML
+    /// post-processors registered. Routed through [`PublisherResponse::Stream`].
+    Stream,
+    /// Response returned unmodified via [`PublisherResponse::Buffered`] — covers
+    /// non-2xx, 204/205, empty request host with non-processable content, and
+    /// unsupported encodings.
+    BufferedUnmodified,
+    /// HTML with post-processors registered. Runs the full pipeline into a
+    /// buffer, then returns [`PublisherResponse::Buffered`] with the processed body.
+    BufferedProcessed,
+}
+
+/// Decide how a proxied response should be routed.
+///
+/// Pure: no header mutation, no body consumed. All inputs are extracted
+/// from the origin response at the call site.
+pub(crate) fn classify_response_route(
+    status: StatusCode,
+    content_type: &str,
+    content_encoding: &str,
+    request_host: &str,
+    has_post_processors: bool,
+) -> ResponseRoute {
+    let should_process = is_processable_content_type(content_type);
+    let is_success = status.is_success();
+
+    if !should_process || request_host.is_empty() || !is_success {
+        // 2xx non-processable (not 204/205) streams the origin body directly.
+        // 204 No Content (RFC 9110 §15.3.5) and 205 Reset Content (§15.3.6)
+        // prohibit a message body, so they fall through to Buffered.
+        if is_success
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
+            && !should_process
+        {
+            return ResponseRoute::PassThrough;
+        }
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    let is_html = content_type.contains("text/html");
+    let encoding_supported = is_supported_content_encoding(content_encoding);
+    let can_stream = encoding_supported && (!is_html || !has_post_processors);
+
+    if can_stream {
+        return ResponseRoute::Stream;
+    }
+
+    // Unsupported Content-Encoding: we cannot decompress, so processing would
+    // treat compressed bytes as identity and produce garbled output.
+    if !encoding_supported {
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    // HTML with post-processors: need the full document to inject.
+    ResponseRoute::BufferedProcessed
+}
+
 /// Owned version of [`ProcessResponseParams`] for returning from
 /// `handle_publisher_request` without lifetime issues.
 pub struct OwnedProcessResponseParams {
@@ -468,115 +537,108 @@ pub fn handle_publisher_request(
         .unwrap_or_default()
         .to_string();
 
-    let should_process = is_processable_content_type(&content_type);
     let status = response.get_status();
-    let is_success = status.is_success();
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+    let has_post_processors = integration_registry.has_html_post_processors();
 
-    if !should_process || request_host.is_empty() || !is_success {
-        log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}', status: {}",
-            should_process,
-            request_host,
-            status,
-        );
+    let route = classify_response_route(
+        status,
+        &content_type,
+        &content_encoding,
+        request_host,
+        has_post_processors,
+    );
 
-        // Stream non-processable 2xx responses directly to avoid buffering
-        // large binaries (images, fonts, video) in memory.
-        // Content-Length is preserved — the body is unmodified, so the
-        // browser knows the exact size for progress/layout.
-        // Exclude 204 No Content (RFC 9110 §15.3.5) and 205 Reset Content
-        // (RFC 9110 §15.3.6) — both prohibit a message body.
-        if is_success
-            && status != StatusCode::NO_CONTENT
-            && status != StatusCode::RESET_CONTENT
-            && !should_process
-        {
+    match route {
+        ResponseRoute::PassThrough => {
             log::debug!(
                 "Pass-through binary response - Content-Type: '{}', status: {}",
                 content_type,
                 status,
             );
             let body = response.take_body();
-            return Ok(PublisherResponse::PassThrough { response, body });
+            Ok(PublisherResponse::PassThrough { response, body })
         }
+        ResponseRoute::BufferedUnmodified => {
+            // Misconfiguration: processable content returned unrewritten because
+            // we have no Host header to rewrite URLs against. Surface at WARN so
+            // mis-proxied pages are visible in production logs.
+            if is_processable_content_type(&content_type)
+                && status.is_success()
+                && request_host.is_empty()
+            {
+                log::warn!(
+                    "Empty request host — returning processable content unmodified (Content-Type: '{}', status: {}). Check proxy Host header.",
+                    content_type,
+                    status,
+                );
+            } else if !is_supported_content_encoding(&content_encoding) {
+                log::warn!(
+                    "Unsupported Content-Encoding '{}' - returning response unmodified",
+                    content_encoding,
+                );
+            } else {
+                log::debug!(
+                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
+                    content_type,
+                    request_host,
+                    status,
+                );
+            }
+            Ok(PublisherResponse::Buffered(response))
+        }
+        ResponseRoute::Stream => {
+            log::debug!(
+                "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                content_type, content_encoding, request_host, origin_host
+            );
 
-        return Ok(PublisherResponse::Buffered(response));
+            let body = response.take_body();
+            response.remove_header(header::CONTENT_LENGTH);
+
+            Ok(PublisherResponse::Stream {
+                response,
+                body,
+                params: OwnedProcessResponseParams {
+                    content_encoding,
+                    origin_host,
+                    origin_url: settings.publisher.origin_url.clone(),
+                    request_host: request_host.to_string(),
+                    request_scheme: request_scheme.to_string(),
+                    content_type,
+                },
+            })
+        }
+        ResponseRoute::BufferedProcessed => {
+            log::debug!(
+                "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                content_type, content_encoding, request_host, origin_host
+            );
+
+            let body = response.take_body();
+            let params = ProcessResponseParams {
+                content_encoding: &content_encoding,
+                origin_host: &origin_host,
+                origin_url: &settings.publisher.origin_url,
+                request_host,
+                request_scheme,
+                settings,
+                content_type: &content_type,
+                integration_registry,
+            };
+            let mut output = Vec::new();
+            process_response_streaming(body, &mut output, &params)?;
+
+            response.set_header(header::CONTENT_LENGTH, output.len().to_string());
+            response.set_body(Body::from(output));
+
+            Ok(PublisherResponse::Buffered(response))
+        }
     }
-
-    let content_encoding = response
-        .get_header(header::CONTENT_ENCODING)
-        .map(|h| h.to_str().unwrap_or_default())
-        .unwrap_or_default()
-        .to_lowercase();
-
-    // Streaming gate: can we stream this response?
-    // - 2xx status (non-success already returned Buffered above)
-    // - Supported Content-Encoding (unsupported would fail mid-stream)
-    // - No HTML post-processors registered (they need the full document)
-    // - Non-HTML content always streams (post-processors only apply to HTML)
-    let is_html = content_type.contains("text/html");
-    let has_post_processors = integration_registry.has_html_post_processors();
-    let encoding_supported = is_supported_content_encoding(&content_encoding);
-    let can_stream = encoding_supported && (!is_html || !has_post_processors);
-
-    if can_stream {
-        log::debug!(
-            "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-            content_type, content_encoding, request_host, origin_host
-        );
-
-        let body = response.take_body();
-        response.remove_header(header::CONTENT_LENGTH);
-
-        return Ok(PublisherResponse::Stream {
-            response,
-            body,
-            params: OwnedProcessResponseParams {
-                content_encoding,
-                origin_host,
-                origin_url: settings.publisher.origin_url.clone(),
-                request_host: request_host.to_string(),
-                request_scheme: request_scheme.to_string(),
-                content_type,
-            },
-        });
-    }
-
-    // Unsupported Content-Encoding: we cannot decompress, so processing would
-    // treat compressed bytes as identity and produce garbled output. Return
-    // the origin response unchanged.
-    if !encoding_supported {
-        log::warn!(
-            "Unsupported Content-Encoding '{}' - returning response unmodified",
-            content_encoding,
-        );
-        return Ok(PublisherResponse::Buffered(response));
-    }
-
-    // Buffered fallback: post-processors need the full document.
-    log::debug!(
-        "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-        content_type, content_encoding, request_host, origin_host
-    );
-
-    let body = response.take_body();
-    let params = ProcessResponseParams {
-        content_encoding: &content_encoding,
-        origin_host: &origin_host,
-        origin_url: &settings.publisher.origin_url,
-        request_host,
-        request_scheme,
-        settings,
-        content_type: &content_type,
-        integration_registry,
-    };
-    let mut output = Vec::new();
-    process_response_streaming(body, &mut output, &params)?;
-
-    response.set_header(header::CONTENT_LENGTH, output.len().to_string());
-    response.set_body(Body::from(output));
-
-    Ok(PublisherResponse::Buffered(response))
 }
 
 /// Whether the content type requires processing (URL rewriting, HTML injection).
@@ -706,47 +768,18 @@ mod tests {
 
     #[test]
     fn unsupported_encoding_response_is_returned_unmodified() {
-        // Simulate a processable (HTML) 2xx response with an unsupported
-        // Content-Encoding. The bytes are not real zstd - the point is that
-        // they must be returned untouched rather than fed to the rewriter as
-        // identity-encoded text.
-        let origin_bytes = b"\x28\xb5\x2f\xfd\x00\x58\x61\x00\x00not really zstd".to_vec();
-
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
-        response.set_header(header::CONTENT_ENCODING, "zstd");
-        response.set_body(Body::from(origin_bytes.clone()));
-
-        // Re-derive the gate decision the same way handle_publisher_request does.
-        let content_type = response
-            .get_header(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_lowercase();
-
-        assert!(
-            is_processable_content_type(&content_type),
-            "text/html must be processable"
-        );
-        assert!(response.get_status().is_success(), "status must be 2xx");
-        assert!(
-            !is_supported_content_encoding(&content_encoding),
-            "zstd must not be a supported encoding"
-        );
-
-        // The fix: when the only reason to fall out of the streaming gate is
-        // unsupported encoding, return the response unchanged rather than
-        // re-routing through process_response_streaming (which would treat
-        // the compressed bytes as identity and garble them).
-        let body = response.into_body().into_bytes();
+        // Processable (HTML) 2xx with unsupported encoding must route to
+        // BufferedUnmodified — feeding zstd-compressed bytes to the rewriter
+        // as identity would produce garbled output.
         assert_eq!(
-            body, origin_bytes,
-            "unsupported-encoding response must pass through byte-for-byte"
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "zstd",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
@@ -801,134 +834,129 @@ mod tests {
         }
     }
 
+    // Gate tests — exercise `classify_response_route` directly, the same
+    // function `handle_publisher_request` calls. If the gate formula changes,
+    // both production and tests are affected identically: no silent drift.
+
     #[test]
-    fn streaming_gate_allows_2xx_html_without_post_processors() {
-        let is_html = true;
-        let has_post_processors = false;
-        let encoding_supported = is_supported_content_encoding("gzip");
-        assert!(
-            encoding_supported && (!is_html || !has_post_processors),
-            "should stream 2xx HTML without post-processors"
+    fn route_streams_2xx_html_without_post_processors() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
         );
     }
 
     #[test]
-    fn streaming_gate_blocks_html_with_post_processors() {
-        let is_html = true;
-        let has_post_processors = true;
-        let encoding_supported = is_supported_content_encoding("gzip");
-        let can_stream = encoding_supported && (!is_html || !has_post_processors);
-        assert!(
-            !can_stream,
-            "should not stream HTML when post-processors are registered"
+    fn route_buffers_html_with_post_processors_for_processing() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedProcessed,
         );
     }
 
     #[test]
-    fn streaming_gate_allows_non_html_with_post_processors() {
-        let is_html = false;
-        let has_post_processors = true;
-        let encoding_supported = is_supported_content_encoding("gzip");
-        let can_stream = encoding_supported && (!is_html || !has_post_processors);
-        assert!(
-            can_stream,
-            "should stream non-HTML even with post-processors (they only apply to HTML)"
+    fn route_streams_non_html_even_with_post_processors_registered() {
+        // Post-processors only apply to HTML; JSON/JS can still stream.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "application/json",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::Stream,
         );
     }
 
     #[test]
-    fn streaming_gate_blocks_unsupported_encoding() {
-        let is_html = false;
-        let has_post_processors = false;
-        let encoding_supported = is_supported_content_encoding("zstd");
-        let can_stream = encoding_supported && (!is_html || !has_post_processors);
-        assert!(
-            !can_stream,
-            "should not stream when content-encoding is unsupported"
+    fn route_buffers_unmodified_on_unsupported_encoding() {
+        // Unsupported encoding cannot be streamed (would be fed to rewriter
+        // as identity and produce garbled output).
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "text/html", "zstd", "example.com", false,),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
     #[test]
-    fn pass_through_gate_streams_non_processable_2xx() {
-        // Non-processable (image) + 2xx → PassThrough
-        let should_process = false;
-        let is_success = true;
-        let should_pass_through = is_success && !should_process;
-        assert!(
-            should_pass_through,
-            "should pass-through non-processable 2xx responses (images, fonts)"
+    fn route_passes_through_non_processable_2xx() {
+        // Binary content (images, fonts) on 2xx streams the origin body direct.
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "image/png", "", "example.com", false,),
+            ResponseRoute::PassThrough,
         );
     }
 
     #[test]
-    fn pass_through_gate_buffers_non_processable_error() {
-        // Non-processable (image) + 4xx → Buffered
-        let should_process = false;
-        let is_success = false;
-        let should_pass_through = is_success && !should_process;
-        assert!(
-            !should_pass_through,
-            "should buffer non-processable error responses"
+    fn route_buffers_non_processable_error_responses() {
+        // Non-2xx never pass through — response needs to reach the client
+        // as-is (with any error body the origin produced).
+        assert_eq!(
+            classify_response_route(StatusCode::NOT_FOUND, "image/png", "", "example.com", false,),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
     #[test]
-    fn pass_through_gate_does_not_apply_to_processable_content() {
-        // Processable (HTML) + 2xx → Stream (not PassThrough)
-        let should_process = true;
-        let is_success = true;
-        let should_pass_through = is_success && !should_process;
-        assert!(
-            !should_pass_through,
-            "processable content should go through Stream, not PassThrough"
+    fn route_excludes_204_from_pass_through() {
+        // 204 No Content (RFC 9110 §15.3.5) prohibits a message body.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "image/png",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
     #[test]
-    fn pass_through_gate_excludes_204_no_content() {
-        // 204 must not have a message body (RFC 9110 §15.3.5); sending one
-        // would violate the HTTP spec.
-        let status = StatusCode::NO_CONTENT;
-        let should_process = false;
-        let should_pass_through = status.is_success()
-            && status != StatusCode::NO_CONTENT
-            && status != StatusCode::RESET_CONTENT
-            && !should_process;
-        assert!(
-            !should_pass_through,
-            "204 No Content should not use PassThrough"
+    fn route_excludes_205_from_pass_through() {
+        // 205 Reset Content (RFC 9110 §15.3.6) prohibits a message body.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::RESET_CONTENT,
+                "image/png",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
     #[test]
-    fn pass_through_gate_excludes_205_reset_content() {
-        // 205 must not generate content (RFC 9110 §15.3.6).
-        let status = StatusCode::RESET_CONTENT;
-        let should_process = false;
-        let should_pass_through = status.is_success()
-            && status != StatusCode::NO_CONTENT
-            && status != StatusCode::RESET_CONTENT
-            && !should_process;
-        assert!(
-            !should_pass_through,
-            "205 Reset Content should not use PassThrough"
+    fn route_passes_through_non_processable_even_with_empty_request_host() {
+        // Empty request_host blocks URL rewriting but pass-through does no
+        // rewriting, so a non-processable 2xx still streams through.
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "image/png", "", "", false,),
+            ResponseRoute::PassThrough,
         );
     }
 
     #[test]
-    fn pass_through_gate_applies_with_empty_request_host() {
-        // Non-processable 2xx with empty request_host still gets PassThrough.
-        // The empty-host path only blocks processing (URL rewriting needs a host);
-        // pass-through doesn't process, so the host is irrelevant.
-        let should_process = false;
-        let is_success = true;
-        // In production, empty host enters the early-return block via
-        // `!should_process || request_host.is_empty()`. The PassThrough guard
-        // checks `is_success && !should_process` — host is irrelevant.
-        let should_pass_through = is_success && !should_process;
-        assert!(
-            should_pass_through,
-            "non-processable 2xx with empty host should still pass-through"
+    fn route_buffers_processable_content_with_empty_request_host() {
+        // Misconfiguration case — URL rewriting needs a host, so the
+        // processable response falls back to unmodified pass-through.
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "text/html", "gzip", "", false,),
+            ResponseRoute::BufferedUnmodified,
         );
     }
 
