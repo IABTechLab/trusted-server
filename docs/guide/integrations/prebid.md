@@ -223,6 +223,60 @@ The build script (`build-all.mjs`) validates that each adapter exists in `prebid
 Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a rebuild with the adapter included in `TSJS_PREBID_ADAPTERS`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
 :::
 
+## Identity Forwarding
+
+Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
+
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
+3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
+4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
+5. The `ts-eids` cookie is still ingested after the response so later requests can reuse the IDs even when the current auction does not provide them again.
+
+This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
+
+### Identity flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser / Prebid.js
+    participant T as Trusted Server /auction
+    participant K as EC + KV identity graph
+    participant P as Prebid Server
+
+    B->>B: User ID modules resolve EIDs
+    B->>T: POST /auction\n(adUnits + current-request eids)
+    T->>K: Resolve EC-backed partner IDs
+    K-->>T: KV-derived EIDs
+    T->>T: Merge + dedupe client + KV EIDs
+    T->>T: Apply consent gating
+    T->>P: OpenRTB request\nuser.ext.eids = merged set
+    P-->>T: OpenRTB bid response
+    T-->>B: Auction response
+    T->>K: Ingest ts-eids cookie for future requests
+```
+
+### Merge and deduplication rules
+
+- Client-request EIDs and KV-resolved EIDs are merged by `source`
+- UIDs are deduplicated by `source + id`
+- If the same UID appears in both places, it is sent only once downstream
+- Distinct UIDs under the same source are preserved
+- Consent gating is applied to the **merged** set before forwarding
+
+### What reaches Prebid Server
+
+The downstream Prebid Server request includes:
+
+- `user.id` when EC forwarding is allowed
+- `user.ext.eids` containing the merged, deduplicated EID set
+- forwarded browser cookies (subject to consent-forwarding mode)
+
+In practice, this gives operators both:
+
+- **same-request identity transparency** for Prebid User ID Module output, and
+- **future-request continuity** through cookie ingestion and KV-backed partner resolution.
+
 ## Endpoints
 
 ### GET /first-party/ad
@@ -290,6 +344,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
 - Injects EC ID in the user object
+- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields

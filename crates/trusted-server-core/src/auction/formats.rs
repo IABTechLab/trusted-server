@@ -36,6 +36,7 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
+    pub eids: Option<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]

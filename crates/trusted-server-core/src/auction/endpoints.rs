@@ -2,6 +2,7 @@
 
 use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
+use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::consent::gate_eids_by_consent;
@@ -11,7 +12,7 @@ use crate::ec::log_id;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
-use crate::openrtb::Eid;
+use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
@@ -67,6 +68,9 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
+    // Parse client-provided EIDs from the current request body.
+    let client_eids = parse_client_auction_eids(body.eids.as_ref());
+
     // Resolve partner EIDs from the KV identity graph when the user has
     // a valid EC and both KV and partner stores are available.
     let eids = resolve_auction_eids(kv, registry, ec_context);
@@ -75,10 +79,13 @@ pub async fn handle_auction(
     let mut auction_request =
         convert_tsjs_to_auction_request(&body, settings, &req, consent_context, ec_id)?;
 
-    // Apply consent gating to the resolved EIDs before attaching them to the
-    // auction request. `gate_eids_by_consent` checks TCF Purpose 1 + 4.
-    let had_eids = eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids = gate_eids_by_consent(eids, auction_request.user.consent.as_ref());
+    // Merge current-request client EIDs with KV-resolved EIDs, then apply
+    // consent gating before attaching them to the auction request.
+    // `gate_eids_by_consent` checks TCF Purpose 1 + 4.
+    let merged_eids = merge_auction_eids(client_eids, eids);
+    let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+    auction_request.user.eids =
+        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!("Auction EIDs stripped by TCF consent gating");
     }
@@ -146,11 +153,141 @@ fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
+fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
+    let Some(JsonValue::Array(entries)) = raw else {
+        return None;
+    };
+
+    let mut eids = Vec::new();
+
+    for entry in entries {
+        let JsonValue::Object(entry) = entry else {
+            log::debug!("Auction EIDs: dropping malformed client EID entry");
+            continue;
+        };
+
+        let Some(source) = entry
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .filter(|source| !source.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+
+        let Some(JsonValue::Array(raw_uids)) = entry.get("uids") else {
+            continue;
+        };
+
+        let uids: Vec<_> = raw_uids
+            .iter()
+            .filter_map(parse_client_auction_uid)
+            .collect();
+        if uids.is_empty() {
+            continue;
+        }
+
+        eids.push(Eid { source, uids });
+    }
+
+    if eids.is_empty() {
+        None
+    } else {
+        Some(eids)
+    }
+}
+
+fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
+    let JsonValue::Object(uid) = raw else {
+        return None;
+    };
+
+    let id = uid
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .filter(|id| !id.is_empty())?
+        .to_owned();
+
+    let atype = uid
+        .get("atype")
+        .and_then(JsonValue::as_u64)
+        .and_then(|atype| u8::try_from(atype).ok());
+
+    let ext = match uid.get("ext") {
+        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
+        _ => None,
+    };
+
+    Some(Uid { id, atype, ext })
+}
+
+fn merge_auction_eids(
+    client_eids: Option<Vec<Eid>>,
+    resolved_eids: Option<Vec<Eid>>,
+) -> Option<Vec<Eid>> {
+    let mut merged = Vec::new();
+
+    for eid in resolved_eids
+        .into_iter()
+        .flatten()
+        .chain(client_eids.into_iter().flatten())
+    {
+        if eid.source.is_empty() {
+            continue;
+        }
+
+        let source_index = match merged
+            .iter()
+            .position(|existing: &Eid| existing.source == eid.source)
+        {
+            Some(index) => index,
+            None => {
+                merged.push(Eid {
+                    source: eid.source.clone(),
+                    uids: Vec::new(),
+                });
+                merged.len() - 1
+            }
+        };
+
+        for uid in eid.uids {
+            if uid.id.is_empty() {
+                continue;
+            }
+
+            if let Some(existing_uid) = merged[source_index]
+                .uids
+                .iter_mut()
+                .find(|existing| existing.id == uid.id)
+            {
+                if existing_uid.atype.is_none() {
+                    existing_uid.atype = uid.atype;
+                }
+                if existing_uid.ext.is_none() {
+                    existing_uid.ext = uid.ext;
+                }
+            } else {
+                merged[source_index].uids.push(uid);
+            }
+        }
+    }
+
+    merged.retain(|eid| !eid.uids.is_empty());
+
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::openrtb::Uid;
+    use serde_json::json;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
         EcContext::new_for_test(
@@ -226,6 +363,185 @@ mod tests {
         assert!(
             eids.is_empty(),
             "should return empty vec on KV error (degraded mode)"
+        );
+    }
+
+    #[test]
+    fn parse_client_auction_eids_ignores_malformed_entries() {
+        let raw = json!([
+            {
+                "source": "id5-sync.com",
+                "uids": [{ "id": "ID5_abc", "atype": 1 }]
+            },
+            {
+                "source": "broken.example",
+                "uids": "not-an-array"
+            },
+            {
+                "source": "sharedid.org",
+                "uids": [{ "id": "shared_123" }, { "id": "" }]
+            }
+        ]);
+
+        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
+
+        assert_eq!(parsed.len(), 2, "should keep only valid EID entries");
+        assert_eq!(parsed[0].source, "id5-sync.com");
+        assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
+        assert_eq!(parsed[1].source, "sharedid.org");
+        assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
+    }
+
+    #[test]
+    fn parse_client_auction_eids_preserves_uid_ext_and_sanitizes_invalid_atype() {
+        let raw = json!([
+            {
+                "source": "adserver.org",
+                "uids": [
+                    {
+                        "id": "uid-with-ext",
+                        "atype": 1,
+                        "ext": { "provider": "liveintent.com", "rtiPartner": "TDID" }
+                    },
+                    {
+                        "id": "uid-bad-atype",
+                        "atype": 999,
+                        "ext": { "keep": true }
+                    },
+                    {
+                        "id": "uid-float-atype",
+                        "atype": 1.5
+                    }
+                ]
+            }
+        ]);
+
+        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
+
+        assert_eq!(parsed.len(), 1, "should keep valid source");
+        assert_eq!(parsed[0].uids.len(), 3, "should keep valid UIDs");
+        assert_eq!(
+            parsed[0].uids[0].atype,
+            Some(1),
+            "should preserve valid atype"
+        );
+        assert_eq!(
+            parsed[0].uids[0].ext,
+            Some(json!({ "provider": "liveintent.com", "rtiPartner": "TDID" })),
+            "should preserve uid ext"
+        );
+        assert_eq!(
+            parsed[0].uids[1].atype, None,
+            "should drop out-of-range atype without dropping uid"
+        );
+        assert_eq!(
+            parsed[0].uids[1].ext,
+            Some(json!({ "keep": true })),
+            "should preserve ext when atype is invalid"
+        );
+        assert_eq!(
+            parsed[0].uids[2].atype, None,
+            "should drop non-integer atype without dropping uid"
+        );
+    }
+
+    #[test]
+    fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
+        let client_eids = Some(vec![Eid {
+            source: "id5-sync.com".to_string(),
+            uids: vec![Uid {
+                id: "ID5_abc".to_string(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let resolved_eids = Some(vec![
+            Eid {
+                source: "id5-sync.com".to_string(),
+                uids: vec![Uid {
+                    id: "ID5_abc".to_string(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+            Eid {
+                source: "liveramp.com".to_string(),
+                uids: vec![Uid {
+                    id: "LR_xyz".to_string(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+        ]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(merged.len(), 2, "should retain distinct EID sources");
+        assert_eq!(merged[0].source, "id5-sync.com");
+        assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
+        assert_eq!(merged[1].source, "liveramp.com");
+        assert_eq!(merged[1].uids[0].id, "LR_xyz");
+    }
+
+    #[test]
+    fn merge_auction_eids_preserves_multiple_uids_per_source() {
+        let client_eids = Some(vec![Eid {
+            source: "sharedid.org".to_string(),
+            uids: vec![Uid {
+                id: "shared_client".to_string(),
+                atype: None,
+                ext: None,
+            }],
+        }]);
+        let resolved_eids = Some(vec![Eid {
+            source: "sharedid.org".to_string(),
+            uids: vec![Uid {
+                id: "shared_server".to_string(),
+                atype: Some(3),
+                ext: None,
+            }],
+        }]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(merged.len(), 1, "should merge same-source entries");
+        assert_eq!(merged[0].uids.len(), 2, "should preserve distinct UIDs");
+        assert_eq!(merged[0].uids[0].id, "shared_server");
+        assert_eq!(merged[0].uids[1].id, "shared_client");
+    }
+
+    #[test]
+    fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
+        let client_eids = Some(vec![Eid {
+            source: "adserver.org".to_string(),
+            uids: vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: Some(1),
+                ext: Some(json!({ "provider": "client" })),
+            }],
+        }]);
+        let resolved_eids = Some(vec![Eid {
+            source: "adserver.org".to_string(),
+            uids: vec![Uid {
+                id: "shared_uid".to_string(),
+                atype: Some(3),
+                ext: Some(json!({ "provider": "server" })),
+            }],
+        }]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(merged.len(), 1, "should merge duplicate source");
+        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
+        assert_eq!(
+            merged[0].uids[0].atype,
+            Some(3),
+            "should prefer resolved atype"
+        );
+        assert_eq!(
+            merged[0].uids[0].ext,
+            Some(json!({ "provider": "server" })),
+            "should prefer resolved ext"
         );
     }
 }

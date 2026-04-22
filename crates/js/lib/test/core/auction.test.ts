@@ -77,6 +77,45 @@ describe('auction/buildAdRequest', () => {
     expect(result.adUnits).toEqual([]);
   });
 
+  it('includes auction-level eids when provided', () => {
+    const result = buildAdRequest(
+      [
+        {
+          code: 'div-1',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ],
+      {
+        eids: [
+          {
+            source: 'adserver.org',
+            uids: [
+              {
+                id: 'uid-123',
+                atype: 1,
+                ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+              },
+            ],
+          },
+        ],
+      }
+    );
+
+    expect(result.eids).toEqual([
+      {
+        source: 'adserver.org',
+        uids: [
+          {
+            id: 'uid-123',
+            atype: 1,
+            ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+          },
+        ],
+      },
+    ]);
+  });
+
   it('handles units without mediaTypes', () => {
     const units = [{ code: 'div-1', bids: [{ bidder: 'appnexus' }] }];
     const result = buildAdRequest(units);
