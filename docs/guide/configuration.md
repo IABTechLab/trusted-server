@@ -4,11 +4,11 @@ Learn how to configure Trusted Server for your deployment.
 
 ## Overview
 
-Trusted Server uses a flexible configuration system based on:
+Trusted Server uses a runtime configuration system based on:
 
-1. **TOML Files** - `trusted-server.toml` for base configuration
-2. **Environment Variables** - Build-time overrides with `TRUSTED_SERVER__` prefix (baked into the binary by `build.rs`)
-3. **Fastly Stores** - KV/Config/Secret stores for runtime data
+1. **TOML authoring** - `trusted-server.toml` for local authoring in development
+2. **Config store deployment** - canonical TOML stored at runtime under the fixed key `ts-config`
+3. **Fastly stores** - KV/Config/Secret stores for runtime data
 
 ## Quick Start
 
@@ -27,18 +27,13 @@ proxy_secret = "your-secure-secret-here"
 secret_key = "your-hmac-secret"
 ```
 
-### Environment Variable Overrides
+### Runtime loading model
 
-Override any setting at build time. Environment variables are merged into the
-config by `build.rs` and baked into the compiled binary — they are **not** read
-at runtime.
-
-```bash
-# Format: TRUSTED_SERVER__SECTION__FIELD
-export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
-```
+- **Production** reads canonical TOML from the configured platform config store
+- **Development** authors a local `trusted-server.toml`, then projects its
+  canonical form into the local simulated config store before startup
+- Application settings are **not** merged from `TRUSTED_SERVER__*` environment
+  variables at build time anymore
 
 ### Generate Secure Secrets
 
@@ -49,11 +44,12 @@ openssl rand -base64 32
 
 ## Configuration Files
 
-| File                  | Purpose                         |
-| --------------------- | ------------------------------- |
-| `trusted-server.toml` | Main application configuration  |
-| `fastly.toml`         | Fastly Compute service settings |
-| `.env.dev`            | Local development overrides     |
+| File                          | Purpose                                               |
+| ----------------------------- | ----------------------------------------------------- |
+| `trusted-server.toml`         | Local development authoring file (untracked)          |
+| `trusted-server.example.toml` | Tracked template for authoring real config            |
+| `fastly.toml`                 | Fastly Compute service settings                       |
+| `.env.dev`                    | Local development environment variables (non-app cfg) |
 
 ## Key Sections
 
@@ -95,11 +91,15 @@ client_side_bidders = ["rubicon"]
 
 The sections below consolidate the full configuration reference on this page.
 
-## Environment Variable Overrides (Build-Time)
+## Runtime config store
 
-Environment variables with the `TRUSTED_SERVER__` prefix are merged into the
-base TOML configuration by `build.rs` at compile time. The resulting config is
-embedded in the binary. Changing an environment variable requires a rebuild.
+Application configuration is loaded at runtime from a config store entry whose
+key is always `ts-config`. The payload stored under that key is canonical TOML.
+Changing application settings no longer requires rebuilding the WASM binary.
+
+> **Note:** Older revisions of this guide referred to build-time
+> `TRUSTED_SERVER__*` application-setting overrides. That mechanism has been
+> removed for application configuration.
 
 ### Format
 
@@ -1043,28 +1043,29 @@ trusted-server.dev.toml      # Development overrides
 
 **Environment Variables Not Applied**:
 
-- Env vars are applied at **build time** only — rebuild after changing them
-- Verify prefix: `TRUSTED_SERVER__`
-- Check separator: `__` (double underscore)
-- Confirm variable is exported: `echo $VARIABLE_NAME`
-- Try explicit string: `VARIABLE='value'` not `VARIABLE=value`
+- Validate the authored TOML before projecting it into the config store
+- Re-render the local Fastly/Viceroy config after changing `trusted-server.toml`
+- Confirm the local rendered manifest contains `local_server.config_stores.ts_config_store`
+- Confirm the `ts-config` key contains the expected canonical TOML
 
 ### Debug Configuration
 
-**Print Loaded Config** (test only):
-
-```rust
-use trusted_server_core::settings_data::get_settings;
-
-let settings = get_settings()?;
-println!("{:#?}", settings);
-```
-
-**Check Environment**:
+**Canonicalize local config**:
 
 ```bash
-# List all TRUSTED_SERVER variables
-env | grep TRUSTED_SERVER
+cargo run --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  -p trusted-server-core \
+  --bin ts-config-canonicalize \
+  -- trusted-server.toml
+```
+
+**Render local Fastly config**:
+
+```bash
+python3 scripts/render-fastly-local-config.py \
+  --app-config trusted-server.toml \
+  --template fastly.toml \
+  --output fastly.local.toml
 ```
 
 **Validate TOML**:

@@ -1,4 +1,4 @@
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method};
 use fastly::{Request, Response};
 
@@ -13,7 +13,7 @@ use trusted_server_core::constants::{
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{RuntimeServices, StoreName};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -25,8 +25,10 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::runtime_config::{
+    load_runtime_config, APPLICATION_CONFIG_KEY, APPLICATION_CONFIG_STORE_NAME,
+};
+use trusted_server_core::settings::{EdgeCookie, Publisher, Settings};
 
 mod error;
 mod logging;
@@ -51,24 +53,34 @@ fn main() {
 
     let req = Request::from_client();
 
-    // Keep the health probe independent from settings loading and routing so
-    // readiness checks still get a cheap liveness response during startup.
-    if req.get_method() == Method::GET && req.get_path() == "/health" {
-        Response::from_status(200)
-            .with_body_text_plain("ok")
-            .send_to_client();
-        return;
-    }
+    // Start with an unavailable KV slot. Consent-dependent routes lazily
+    // replace it with the configured store at dispatch time so unrelated
+    // routes stay available when consent persistence is misconfigured.
+    let kv_store = std::sync::Arc::new(UnavailableKvStore)
+        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
+    let runtime_services = build_runtime_services(&req, kv_store);
 
-    let settings = match get_settings() {
-        Ok(s) => s,
+    let loaded_config = match load_settings_from_config_store(&runtime_services) {
+        Ok(config) => config,
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
             to_error_response(&e).send_to_client();
             return;
         }
     };
+    let settings = loaded_config.settings;
+    log::debug!("Loaded runtime config hash={}", loaded_config.config_hash);
     log::debug!("Settings {settings:?}");
+
+    // `/health` intentionally depends on successful runtime config loading.
+    // A missing or invalid `ts-config` payload means the service is not ready
+    // to serve application traffic, so health checks should fail as well.
+    if req.get_method() == Method::GET && req.get_path() == "/health" {
+        Response::from_status(200)
+            .with_body_text_plain("ok")
+            .send_to_client();
+        return;
+    }
 
     // Short-circuit the ja4 debug probe before finalize_response so that
     // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
@@ -99,13 +111,6 @@ fn main() {
             return;
         }
     };
-
-    // Start with an unavailable KV slot. Consent-dependent routes lazily
-    // replace it with the configured store at dispatch time so unrelated
-    // routes stay available when consent persistence is misconfigured.
-    let kv_store = std::sync::Arc::new(UnavailableKvStore)
-        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
-    let runtime_services = build_runtime_services(&req, kv_store);
 
     // route_request may send the response directly (streaming path) or
     // return it for us to send (buffered path).
@@ -162,6 +167,45 @@ fn build_ja4_debug_response(req: &Request) -> Response {
         .with_body(body)
 }
 
+fn load_settings_from_config_store(
+    runtime_services: &RuntimeServices,
+) -> Result<trusted_server_core::runtime_config::LoadedRuntimeConfig, Report<TrustedServerError>> {
+    let store_name = StoreName::from(APPLICATION_CONFIG_STORE_NAME);
+    let payload = runtime_services
+        .config_store()
+        .get(&store_name, APPLICATION_CONFIG_KEY)
+        .change_context(TrustedServerError::Configuration {
+            message: format!(
+                "Failed to read application config from store `{}` key `{}`",
+                APPLICATION_CONFIG_STORE_NAME, APPLICATION_CONFIG_KEY
+            ),
+        })?;
+
+    let loaded = load_runtime_config(&payload)?;
+
+    if !loaded.settings.proxy.certificate_check {
+        log::warn!(
+            "INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified"
+        );
+    }
+
+    if EdgeCookie::is_placeholder_secret_key(loaded.settings.edge_cookie.secret_key.expose()) {
+        log::warn!(
+            "INSECURE: edge_cookie.secret_key is set to a default placeholder — \
+             HMAC-SHA256 signatures can be forged"
+        );
+    }
+
+    if Publisher::is_placeholder_proxy_secret(loaded.settings.publisher.proxy_secret.expose()) {
+        log::warn!(
+            "INSECURE: publisher.proxy_secret is set to a default placeholder — \
+             XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone"
+        );
+    }
+
+    Ok(loaded)
+}
+
 async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
@@ -184,7 +228,7 @@ async fn route_request(
             None
         });
 
-    // `get_settings()` should already have rejected invalid handler regexes.
+    // Runtime config loading should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     let auth_req = compat::from_fastly_headers_ref(&req);

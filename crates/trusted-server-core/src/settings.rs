@@ -1,3 +1,4 @@
+#[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
@@ -6,6 +7,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
+use toml::Table as TomlTable;
 use url::Url;
 use validator::{Validate, ValidationError};
 
@@ -14,10 +16,27 @@ use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 
+/// Known top-level keys for the application configuration document.
+pub const TOP_LEVEL_APPLICATION_CONFIG_KEYS: &[&str] = &[
+    "auction",
+    "consent",
+    "edge_cookie",
+    "handlers",
+    "integrations",
+    "proxy",
+    "publisher",
+    "request_signing",
+    "response_headers",
+    "rewrite",
+];
+
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Publisher {
     pub domain: String,
     #[validate(custom(function = validate_cookie_domain))]
@@ -81,6 +100,36 @@ pub struct IntegrationSettings {
 
 pub trait IntegrationConfig: DeserializeOwned + Validate {
     fn is_enabled(&self) -> bool;
+}
+
+/// Parse the root TOML document and reject unknown top-level keys.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the payload is malformed
+/// TOML or contains unsupported top-level fields.
+pub(crate) fn parse_toml_document(toml_str: &str) -> Result<TomlTable, Report<TrustedServerError>> {
+    let document: TomlTable =
+        toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
+            message: "Failed to deserialize TOML configuration".to_string(),
+        })?;
+
+    let unknown_keys: Vec<String> = document
+        .keys()
+        .filter(|key| !TOP_LEVEL_APPLICATION_CONFIG_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect();
+
+    if unknown_keys.is_empty() {
+        return Ok(document);
+    }
+
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "Unknown top-level configuration field(s): {}",
+            unknown_keys.join(", ")
+        ),
+    }))
 }
 
 impl IntegrationSettings {
@@ -206,6 +255,7 @@ impl DerefMut for IntegrationSettings {
 /// Edge Cookie configuration.
 #[allow(unused)]
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeCookie {
     #[validate(custom(function = EdgeCookie::validate_secret_key))]
     pub secret_key: Redacted<String>,
@@ -238,6 +288,7 @@ impl EdgeCookie {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
     /// URLs from these domains will not be proxied through first-party endpoints.
@@ -274,6 +325,7 @@ impl Rewrite {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -322,6 +374,7 @@ impl Handler {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
@@ -334,6 +387,7 @@ fn default_request_signing_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
     /// Defaults to true for secure production use.
@@ -441,15 +495,15 @@ pub struct Settings {
 
 #[allow(unused)]
 impl Settings {
-    /// Creates a new [`Settings`] instance from a pre-built TOML string.
-    ///
-    /// Use this for the runtime path where the TOML has already been
-    /// fully resolved (env vars baked in by build.rs).
+    /// Creates a new [`Settings`] instance from a runtime TOML string.
     ///
     /// # Errors
     ///
-    /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    /// - [`TrustedServerError::Configuration`] if the TOML is invalid, contains unknown fields,
+    ///   or is missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        parse_toml_document(toml_str)?;
+
         let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
@@ -466,13 +520,18 @@ impl Settings {
     /// Creates a new [`Settings`] instance from a TOML string, applying
     /// environment variable overrides using the `TRUSTED_SERVER__` prefix.
     ///
-    /// Used by build.rs to merge the base config with env vars before
-    /// baking the result into the binary.
+    /// Test-only compatibility helper retained for unit tests that still cover
+    /// legacy env-override parsing semantics.
     ///
     /// # Errors
     ///
-    /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    /// Returns [`TrustedServerError::Configuration`] if the TOML is invalid,
+    /// the merged configuration fails to deserialize, or required validation
+    /// checks fail.
+    #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        parse_toml_document(toml_str)?;
+
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
             .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
@@ -495,13 +554,6 @@ impl Settings {
         settings.integrations.normalize();
         settings.proxy.normalize();
         settings.consent.validate();
-
-        settings.validate().map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("Build-time configuration validation failed: {err}"),
-            })
-        })?;
-
         settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
 
@@ -1290,8 +1342,7 @@ mod tests {
     fn test_settings_extra_fields() {
         let toml_str = crate_test_settings_str() + "\nhello = 1";
 
-        let settings = Settings::from_toml(&toml_str);
-        assert!(settings.is_ok(), "Extra fields should be ignored");
+        let _error = Settings::from_toml(&toml_str).expect_err("should reject unknown field");
     }
 
     #[test]

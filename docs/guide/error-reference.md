@@ -22,14 +22,16 @@ Common errors, their causes, and solutions when working with Trusted Server.
 Failed to load settings: ParseError
 ```
 
-**Cause:** Invalid TOML syntax in `trusted-server.toml`
+**Cause:** Invalid application TOML in the runtime config store payload (`ts-config`),
+or failure to read that payload from the configured config store.
 
 **Solution:**
 
-1. Validate TOML syntax using an online validator
-2. Check for missing quotes around strings
-3. Ensure array syntax uses square brackets: `["item1", "item2"]`
-4. Verify section headers use brackets: `[section]`
+1. Validate the authored `trusted-server.toml` before deployment
+2. Re-render local Fastly/Viceroy config after changing `trusted-server.toml`
+3. Check for missing quotes around strings
+4. Ensure array syntax uses square brackets: `["item1", "item2"]`
+5. Verify section headers use brackets: `[section]`
 
 **Example Fix:**
 
@@ -97,33 +99,36 @@ server_url = "https://prebid-server.example.com"
 
 ---
 
-### Environment variable override failed
+### Runtime config store payload failed
 
 **Error Message:**
 
 ```
-Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
+Failed to load settings
 ```
 
-**Cause:** Environment variable format doesn't match expected type
+**Cause:** The runtime `ts-config` payload is missing, malformed, or does not
+match the expected application-config schema.
 
-**Solution:** Use correct format for the field type:
+**Solution:** Validate and canonicalize the TOML before projecting it into the
+config store:
 
 ```bash
-# For strings
-TRUSTED_SERVER__PUBLISHER__DOMAIN="example.com"
-
-# For numbers
-TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
-
-# For booleans
-TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
-
-# For arrays (comma-separated)
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon"
+cargo run --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  -p trusted-server-core \
+  --bin ts-config-canonicalize \
+  -- trusted-server.toml
 ```
 
-See [Configuration Reference](./configuration.md) for complete patterns.
+For local Fastly/Viceroy development, regenerate the rendered manifest after
+editing `trusted-server.toml`:
+
+```bash
+scripts/fastly-dev.sh --skip-build
+```
+
+Application settings are no longer loaded from `TRUSTED_SERVER__*`
+configuration environment variables at build time.
 
 ---
 

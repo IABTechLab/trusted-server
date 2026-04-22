@@ -5,7 +5,11 @@ import { stopContainer, stopViceroy } from "./helpers/infra.js";
 const STATE_FILE = resolve(__dirname, ".browser-test-state.json");
 
 async function globalTeardown(): Promise<void> {
-  let state: { containerId?: string; viceroyPid?: number };
+  let state: {
+    containerId?: string;
+    renderedConfigPath?: string;
+    viceroyPid?: number;
+  };
   try {
     state = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
   } catch {
@@ -21,6 +25,14 @@ async function globalTeardown(): Promise<void> {
   if (state.containerId) {
     console.log(`[global-teardown] Stopping container ${state.containerId.slice(0, 12)}...`);
     stopContainer(state.containerId);
+  }
+
+  if (state.renderedConfigPath) {
+    try {
+      unlinkSync(state.renderedConfigPath);
+    } catch {
+      // Already removed
+    }
   }
 
   try {

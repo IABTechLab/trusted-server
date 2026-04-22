@@ -22,7 +22,6 @@ pub mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_backend = "publisher_origin"
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 

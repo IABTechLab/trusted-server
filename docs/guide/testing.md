@@ -77,12 +77,17 @@ cargo test -- --test-threads=1
 
 ```bash
 # Start local server
-fastly compute serve
+scripts/fastly-dev.sh
 
 # Test endpoints with curl
 curl http://localhost:7676/health
 curl http://localhost:7676/.well-known/trusted-server.json
 ```
+
+`GET /health` now depends on successful runtime config loading from the local
+config store. If `trusted-server.toml` cannot be canonicalized and projected
+into `ts-config`, the service is considered unhealthy and `/health` will return
+an error instead of `200 ok`.
 
 ## Real Test Examples
 

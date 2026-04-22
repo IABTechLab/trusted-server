@@ -19,11 +19,9 @@ secret_key = "trusted-server"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
+# Configure these directly in the runtime TOML payload stored under `ts-config`.
 # [response_headers]
 # X-Custom-Header = "custom header value"
-#
-# Or via environment variable (JSON preserves header name casing and hyphens):
-# TRUSTED_SERVER__RESPONSE_HEADERS='{"X-Robots-Tag": "noindex", "X-Custom-Header": "custom value"}'
 
 # Request Signing Configuration
 # Enable signing of OpenRTB requests and other API calls

@@ -168,8 +168,8 @@ fixtures/
 
 1. A Docker container starts for the frontend framework, mapped to a fixed
    origin port (default 8888)
-2. The WASM binary is pre-built with `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL`
-   pointing to `http://127.0.0.1:8888` so the proxy knows where to forward
+2. A rendered Viceroy config projects the integration-test application config
+   into the local config store under the fixed `ts-config` key
 3. Viceroy spawns with the WASM binary on a random port
 4. **HTTP tests**: reqwest sends requests to Viceroy and asserts on responses
 5. **Browser tests**: Playwright opens Chromium pointing at Viceroy and verifies
@@ -177,8 +177,8 @@ fixtures/
 
 ### Why `--test-threads=1` / `workers: 1`
 
-All tests share the same fixed origin port (8888). The trusted server config is
-baked into the WASM binary at compile time with this port, so only one Docker
+All tests share the same fixed origin port (8888). The integration-test app
+config fixture points Trusted Server at this port, so only one Docker
 container can be bound to it at a time.
 
 ## CI

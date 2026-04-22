@@ -1,5 +1,7 @@
 import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { execFileSync } from "node:child_process";
 import {
   startContainer,
   startViceroy,
@@ -16,14 +18,24 @@ const WASM_PATH =
     "../../../target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm",
   );
 
-const VICEROY_CONFIG =
-  process.env.VICEROY_CONFIG_PATH ||
-  resolve(__dirname, "../fixtures/configs/viceroy-template.toml");
+const VICEROY_TEMPLATE = resolve(
+  __dirname,
+  "../fixtures/configs/viceroy-template.toml",
+);
+const APP_CONFIG = resolve(
+  __dirname,
+  "../fixtures/configs/trusted-server.integration.toml",
+);
+const RENDER_SCRIPT = resolve(
+  __dirname,
+  "../../../scripts/render-fastly-local-config.py",
+);
 
 /** Persist current state so global-teardown can always clean up. */
 function writeState(state: {
   baseUrl?: string;
   containerId?: string;
+  renderedConfigPath?: string;
   viceroyPid?: number;
   framework: string;
 }): void {
@@ -33,6 +45,7 @@ function writeState(state: {
 async function globalSetup(): Promise<void> {
   const framework = process.env.TEST_FRAMEWORK || "nextjs";
   let containerId: string | undefined;
+  let renderedConfig: string | undefined;
   let viceroyPid: number | undefined;
 
   try {
@@ -43,8 +56,22 @@ async function globalSetup(): Promise<void> {
     // even if Viceroy startup fails below.
     writeState({ containerId, framework });
 
+    renderedConfig = resolve(
+      tmpdir(),
+      `trusted-server-browser-${Date.now()}.toml`,
+    );
+    execFileSync("python3", [
+      RENDER_SCRIPT,
+      "--app-config",
+      APP_CONFIG,
+      "--template",
+      VICEROY_TEMPLATE,
+      "--output",
+      renderedConfig,
+    ]);
+
     console.log(`[global-setup] Starting Viceroy (WASM: ${WASM_PATH})...`);
-    const viceroy = await startViceroy(WASM_PATH, VICEROY_CONFIG);
+    const viceroy = await startViceroy(WASM_PATH, renderedConfig);
     viceroyPid = viceroy.process.pid;
 
     console.log(`[global-setup] Viceroy ready at ${viceroy.baseUrl}`);
@@ -53,6 +80,7 @@ async function globalSetup(): Promise<void> {
     writeState({
       baseUrl: viceroy.baseUrl,
       containerId,
+      renderedConfigPath: renderedConfig,
       viceroyPid,
       framework,
     });
@@ -61,6 +89,12 @@ async function globalSetup(): Promise<void> {
     console.error("[global-setup] Setup failed, cleaning up...");
     if (viceroyPid) await stopViceroy(viceroyPid);
     if (containerId) stopContainer(containerId);
+    try {
+      const { unlinkSync } = await import("node:fs");
+      if (renderedConfig) unlinkSync(renderedConfig);
+    } catch {
+      // Rendered config may not exist
+    }
 
     // Remove partial state file since we cleaned up manually
     try {
