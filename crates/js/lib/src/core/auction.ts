@@ -68,10 +68,7 @@ export interface AuctionBid {
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAdRequest(
-  units: any[],
-  options?: { eids?: AuctionEid[] }
-): AdRequest {
+export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }): AdRequest {
   const unitMap = new Map<string, AdRequestUnit>();
 
   for (const u of units) {
