@@ -35,23 +35,35 @@ pub fn handle_identify(
     req: &Request,
     ec_context: &EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
+    let allowed_origin = match classify_origin(req, settings) {
+        CorsDecision::Denied => return Ok(Response::from_status(StatusCode::FORBIDDEN)),
+        CorsDecision::NoOrigin => None,
+        CorsDecision::Allowed(origin) => Some(origin),
+    };
+
     // Authenticate via Bearer token.
     let Some(partner) = authenticate_bearer(registry, req) else {
-        return json_response(
+        return json_response_with_origin(
             StatusCode::UNAUTHORIZED,
             &serde_json::json!({ "error": "invalid_token" }),
+            allowed_origin.as_deref(),
         );
     };
 
     if !ec_consent_granted(ec_context.consent()) {
-        return json_response(
+        return json_response_with_origin(
             StatusCode::FORBIDDEN,
             &serde_json::json!({ "consent": "denied" }),
+            allowed_origin.as_deref(),
         );
     }
 
     let Some(ec_id) = ec_context.ec_value() else {
-        return Ok(Response::from_status(StatusCode::NO_CONTENT));
+        let response = Response::from_status(StatusCode::NO_CONTENT);
+        return Ok(apply_cors_headers_if_allowed(
+            response,
+            allowed_origin.as_deref(),
+        ));
     };
 
     let mut degraded = false;
@@ -106,7 +118,7 @@ pub fn handle_identify(
         cluster_size,
     };
 
-    let mut response = json_response(StatusCode::OK, &body)?;
+    let mut response = json_response_with_origin(StatusCode::OK, &body, allowed_origin.as_deref())?;
     response.set_header(HEADER_X_TS_EC, ec_id);
 
     Ok(response)
@@ -149,17 +161,20 @@ struct IdentifyResponse {
     cluster_size: Option<u32>,
 }
 
-fn json_response<T: serde::Serialize>(
+fn json_response_with_origin<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
+    allowed_origin: Option<&str>,
 ) -> Result<Response, Report<TrustedServerError>> {
     let body = serde_json::to_string(body).change_context(TrustedServerError::EdgeCookie {
         message: "Failed to serialize identify response".to_owned(),
     })?;
 
-    Ok(Response::from_status(status)
+    let response = Response::from_status(status)
         .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body(body))
+        .with_body(body);
+
+    Ok(apply_cors_headers_if_allowed(response, allowed_origin))
 }
 
 enum CorsDecision {
@@ -177,6 +192,10 @@ fn classify_origin(req: &Request, settings: &Settings) -> CorsDecision {
         return CorsDecision::Denied;
     };
 
+    if origin_url.scheme() != "https" {
+        return CorsDecision::Denied;
+    }
+
     let Some(host) = origin_url.host_str() else {
         return CorsDecision::Denied;
     };
@@ -193,6 +212,13 @@ fn classify_origin(req: &Request, settings: &Settings) -> CorsDecision {
     }
 
     CorsDecision::Denied
+}
+
+fn apply_cors_headers_if_allowed(mut response: Response, allowed_origin: Option<&str>) -> Response {
+    if let Some(origin) = allowed_origin {
+        apply_cors_headers(&mut response, origin);
+    }
+    response
 }
 
 fn apply_cors_headers(response: &mut Response, origin: &str) {
@@ -271,6 +297,19 @@ mod tests {
     }
 
     #[test]
+    fn classify_origin_rejects_http_scheme() {
+        let settings = create_test_settings();
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("origin", "http://www.test-publisher.com");
+
+        let decision = classify_origin(&req, &settings);
+        assert!(
+            matches!(decision, CorsDecision::Denied),
+            "should deny non-https publisher origin"
+        );
+    }
+
+    #[test]
     fn classify_origin_allows_absent_origin_header() {
         let settings = create_test_settings();
         let req = Request::new("GET", "https://edge.test-publisher.com/identify");
@@ -292,6 +331,12 @@ mod tests {
 
         let mut response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct unauthorized response");
+
+        assert_eq!(
+            response.get_header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "should omit CORS headers when Origin is absent"
+        );
 
         assert_eq!(
             response.get_status(),
@@ -409,6 +454,58 @@ mod tests {
         assert!(
             body.get("eid").is_none(),
             "eid should be omitted when KV read fails"
+        );
+    }
+
+    #[test]
+    fn handle_identify_denies_mismatched_browser_origin() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
+        req.set_header("origin", "https://evil.example");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct forbidden response");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::FORBIDDEN,
+            "should reject GET from non-publisher origin"
+        );
+    }
+
+    #[test]
+    fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
+        req.set_header("origin", "https://www.test-publisher.com");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct no-content response with CORS headers");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::NO_CONTENT,
+            "should preserve identify response status for allowed browser origin"
+        );
+        assert_eq!(
+            response.get_header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("https://www.test-publisher.com"),
+            "should reflect allowed browser origin on GET responses"
+        );
+        assert_eq!(
+            response.get_header_str(header::VARY),
+            Some("Origin"),
+            "should vary on Origin for browser-direct identify responses"
         );
     }
 
