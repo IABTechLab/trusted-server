@@ -6,7 +6,7 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -129,8 +129,8 @@ pub struct KvPubProperties {
     pub origin_domain: String,
     /// Per-domain visit history, keyed by apex domain.
     /// Updated on each organic request; capped at [`MAX_SEEN_DOMAINS`] entries.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub seen_domains: HashMap<String, KvDomainVisit>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen_domains: BTreeMap<String, KvDomainVisit>,
 }
 
 /// Coarse, non-PII device signals derived from TLS handshake and UA.
@@ -263,7 +263,7 @@ impl KvEntry {
     #[must_use]
     pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
         let pub_properties = validated_stored_domain(domain).map(|validated_domain| {
-            let mut seen_domains = HashMap::new();
+            let mut seen_domains = BTreeMap::new();
             seen_domains.insert(
                 validated_domain.clone(),
                 KvDomainVisit {
@@ -715,6 +715,46 @@ mod tests {
         assert!(
             err.contains("MAX_SEEN_DOMAINS"),
             "should describe the seen_domains bound violation"
+        );
+    }
+
+    #[test]
+    fn seen_domains_serialize_in_deterministic_key_order() {
+        let consent = sample_consent_context();
+        let geo = sample_geo_info();
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
+        let pub_properties = entry
+            .pub_properties
+            .as_mut()
+            .expect("should initialize pub_properties");
+
+        pub_properties.seen_domains.insert(
+            "z.example.com".to_owned(),
+            KvDomainVisit {
+                first: 1000,
+                last: 1000,
+                visits: 1,
+            },
+        );
+        pub_properties.seen_domains.insert(
+            "a.example.com".to_owned(),
+            KvDomainVisit {
+                first: 1000,
+                last: 1000,
+                visits: 1,
+            },
+        );
+
+        let json = serde_json::to_string(&entry).expect("should serialize KV entry");
+        let a_index = json
+            .find("a.example.com")
+            .expect("should contain a.example.com");
+        let z_index = json
+            .find("z.example.com")
+            .expect("should contain z.example.com");
+        assert!(
+            a_index < z_index,
+            "should serialize seen_domains in lexical key order"
         );
     }
 
