@@ -51,6 +51,8 @@ build = """
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]
+            # "true" / "1" enable the EdgeZero path. Missing, unreadable, or
+            # any other value falls back to the legacy entry point.
             edgezero_enabled = "true"
 
         [local_server.config_stores.jwks_store]

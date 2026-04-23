@@ -75,6 +75,9 @@ pub struct VerifySignatureResponse {
     pub error: Option<String>,
 }
 
+const VERIFY_MAX_BODY_BYTES: usize = 4096;
+const ADMIN_MAX_BODY_BYTES: usize = 4096;
+
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures
 ///
@@ -87,6 +90,15 @@ pub fn handle_verify_signature(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let body = req.into_body().into_bytes();
+    if body.len() > VERIFY_MAX_BODY_BYTES {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "verify-signature payload {} exceeds limit of {}",
+                body.len(),
+                VERIFY_MAX_BODY_BYTES,
+            ),
+        }));
+    }
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -168,6 +180,15 @@ pub fn handle_rotate_key(
     };
 
     let body = req.into_body().into_bytes();
+    if body.len() > ADMIN_MAX_BODY_BYTES {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "rotate-key payload {} exceeds limit of {}",
+                body.len(),
+                ADMIN_MAX_BODY_BYTES,
+            ),
+        }));
+    }
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
     } else {
@@ -268,6 +289,15 @@ pub fn handle_deactivate_key(
     };
 
     let body = req.into_body().into_bytes();
+    if body.len() > ADMIN_MAX_BODY_BYTES {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "deactivate-key payload {} exceeds limit of {}",
+                body.len(),
+                ADMIN_MAX_BODY_BYTES,
+            ),
+        }));
+    }
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),

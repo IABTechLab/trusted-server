@@ -8,13 +8,15 @@ use crate::auction::formats::AdRequest;
 use crate::consent;
 use crate::consent::kv::ConsentKvOps;
 use crate::error::TrustedServerError;
-use crate::integrations::{collect_body_bounded, INTEGRATION_MAX_BODY_BYTES};
+use crate::integrations::collect_body_bounded;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
+
+const AUCTION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Handle auction request from /auction endpoint.
 ///
@@ -45,7 +47,7 @@ pub async fn handle_auction(
     let (parts, body) = req.into_parts();
 
     // Parse request body — use a bounded read so streaming bodies cannot exhaust memory.
-    let body_bytes = collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, "auction")
+    let body_bytes = collect_body_bounded(body, AUCTION_MAX_BODY_BYTES, "auction")
         .await
         .change_context(TrustedServerError::Auction {
             message: "Failed to read auction request body".to_string(),

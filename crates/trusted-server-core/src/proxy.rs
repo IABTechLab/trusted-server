@@ -413,6 +413,12 @@ struct ProxyRequestHeaders<'a> {
     services: &'a RuntimeServices,
 }
 
+struct ProxyRedirectPolicy<'a> {
+    follow_redirects: bool,
+    stream_passthrough: bool,
+    allowed_domains: &'a [String],
+}
+
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
@@ -437,7 +443,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
-        allowed_domains: _,
+        allowed_domains,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -454,14 +460,17 @@ pub async fn proxy_request(
         settings,
         &req,
         target_url_parsed,
-        follow_redirects,
         body.as_deref(),
         ProxyRequestHeaders {
             additional_headers: &headers,
             copy_request_headers,
             services,
         },
-        stream_passthrough,
+        ProxyRedirectPolicy {
+            follow_redirects,
+            stream_passthrough,
+            allowed_domains,
+        },
     )
     .await
 }
@@ -539,10 +548,9 @@ async fn proxy_with_redirects(
     settings: &Settings,
     req: &Request<EdgeBody>,
     target_url_parsed: url::Url,
-    follow_redirects: bool,
     body: Option<&[u8]>,
     request_headers: ProxyRequestHeaders<'_>,
-    stream_passthrough: bool,
+    redirect_policy: ProxyRedirectPolicy<'_>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const MAX_REDIRECTS: usize = 4;
 
@@ -570,7 +578,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+        if !redirect_is_permitted(redirect_policy.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -635,8 +643,14 @@ async fn proxy_with_redirects(
 
         let beresp = platform_resp.response;
 
-        if !follow_redirects {
-            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
+        if !redirect_policy.follow_redirects {
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         }
 
         let status = beresp.status();
@@ -650,7 +664,13 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         }
 
         let Some(location) = beresp
@@ -659,7 +679,13 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         };
 
         if redirect_attempt == MAX_REDIRECTS {
@@ -680,7 +706,13 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         }
 
         let next_host = match next_url.host_str() {
@@ -691,7 +723,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+        if !redirect_is_permitted(redirect_policy.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -1292,6 +1324,9 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
     use super::{
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
@@ -1300,7 +1335,11 @@ mod tests {
     use crate::constants::HEADER_ACCEPT;
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{build_services_with_http_client, noop_services};
+    use crate::platform::{
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult,
+    };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
@@ -1363,6 +1402,79 @@ mod tests {
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
         String::from_utf8(response.into_body().into_bytes().to_vec())
             .expect("response body should be valid UTF-8")
+    }
+
+    struct QueuedHttpResponse {
+        status: u16,
+        headers: Vec<(header::HeaderName, HeaderValue)>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct HeaderAwareStubHttpClient {
+        responses: Mutex<VecDeque<QueuedHttpResponse>>,
+    }
+
+    impl HeaderAwareStubHttpClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn push_response(
+            &self,
+            status: u16,
+            headers: Vec<(header::HeaderName, HeaderValue)>,
+            body: Vec<u8>,
+        ) {
+            self.responses
+                .lock()
+                .expect("should lock queued responses")
+                .push_back(QueuedHttpResponse {
+                    status,
+                    headers,
+                    body,
+                });
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for HeaderAwareStubHttpClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let queued = self
+                .responses
+                .lock()
+                .expect("should lock queued responses")
+                .pop_front()
+                .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+
+            let mut builder = edgezero_core::http::response_builder().status(queued.status);
+            for (name, value) in queued.headers {
+                builder = builder.header(name, value);
+            }
+
+            let response = builder
+                .body(EdgeBody::from(queued.body))
+                .expect("should build stub HTTP response");
+
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
     }
 
     fn build_http_response(status: StatusCode, body: EdgeBody) -> Response<EdgeBody> {
@@ -2135,6 +2247,87 @@ mod tests {
         });
     }
 
+    #[test]
+    fn proxy_request_allows_open_mode_when_settings_allowlist_is_non_empty() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.proxy.allowed_domains = vec!["allowed.example".to_string()];
+
+            let stub = Arc::new(HeaderAwareStubHttpClient::new());
+            stub.push_response(200, Vec::new(), b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = build_http_request(Method::GET, "https://edge.example/");
+
+            let response = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://blocked.example/resource.js",
+                    follow_redirects: false,
+                    forward_synthetic_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await
+            .expect("open mode should ignore settings.proxy.allowed_domains");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "ok");
+        });
+    }
+
+    #[test]
+    fn proxy_request_uses_config_allowlist_for_redirect_hops() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.proxy.allowed_domains = vec!["origin.example".to_string()];
+
+            let stub = Arc::new(HeaderAwareStubHttpClient::new());
+            stub.push_response(
+                302,
+                vec![(
+                    header::LOCATION,
+                    HeaderValue::from_static("https://redirected.example/final.js"),
+                )],
+                Vec::new(),
+            );
+            stub.push_response(200, Vec::new(), b"redirected".to_vec());
+
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = build_http_request(Method::GET, "https://edge.example/");
+
+            let response = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://origin.example/start.js",
+                    follow_redirects: true,
+                    forward_synthetic_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await
+            .expect("open mode should allow redirect hops outside settings allowlist");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
     // --- is_host_allowed ---
 
     #[test]
@@ -2350,12 +2543,9 @@ mod tests {
 
     // --- initial target allowlist enforcement (integration-level) ---
     //
-    // NOTE: A test for Nth-hop redirect blocking (i.e. exercising the
-    // `redirect_is_permitted` check that fires *after* receiving a 302
-    // response) requires a Viceroy backend fixture that returns a redirect.
-    // That infrastructure is not available here. The unit tests above for
-    // `redirect_is_permitted` and `ip_literal_blocked_by_domain_allowlist`
-    // cover the blocking logic used at every hop.
+    // The unit tests above cover the host-matching logic itself. The tests
+    // below verify that proxy_request threads config.allowed_domains through
+    // the initial target check and redirect hops.
 
     #[test]
     fn proxy_initial_target_blocked_by_allowlist() {
@@ -2388,6 +2578,50 @@ mod tests {
                     TrustedServerError::AllowlistViolation { .. }
                 ),
                 "should be AllowlistViolation error"
+            );
+        });
+    }
+
+    #[test]
+    fn sign_rejects_oversized_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let oversized = vec![b'x'; 65537];
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/sign")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(oversized))
+                .expect("should build request");
+            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject oversized body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should return 413 for oversized sign body"
+            );
+        });
+    }
+
+    #[test]
+    fn rebuild_rejects_oversized_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let oversized = vec![b'x'; 65537];
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(oversized))
+                .expect("should build request");
+            let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject oversized body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should return 413 for oversized rebuild body"
             );
         });
     }
