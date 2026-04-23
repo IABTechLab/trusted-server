@@ -141,7 +141,7 @@ pub fn dispatch_pull_sync(
             }
         }
 
-        let Some(token) = partner.ts_pull_token.as_deref() else {
+        let Some(token) = partner.ts_pull_token.as_ref() else {
             log::warn!(
                 "Pull sync: partner '{}' enabled but missing ts_pull_token",
                 partner.id
@@ -151,7 +151,7 @@ pub fn dispatch_pull_sync(
 
         let request_url = build_pull_request_url(url, context.ec_id());
         let mut request = Request::new(Method::GET, request_url.as_str());
-        request.set_header("authorization", format!("Bearer {token}"));
+        request.set_header("authorization", format!("Bearer {}", token.expose()));
 
         let backend_name =
             match BackendConfig::from_url(request_url.as_str(), settings.proxy.certificate_check) {
@@ -359,6 +359,7 @@ mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
     use crate::ec::kv_types::KvEntry;
+    use crate::redacted::Redacted;
 
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
@@ -374,7 +375,7 @@ mod tests {
             pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
-            ts_pull_token: Some("token".to_owned()),
+            ts_pull_token: Some(Redacted::new("token".to_owned())),
         }
     }
 

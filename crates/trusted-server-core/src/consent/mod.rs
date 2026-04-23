@@ -170,6 +170,8 @@ fn apply_expiration_check(ctx: &mut ConsentContext, config: &ConsentConfig) {
         return;
     }
 
+    // lgtm[rust/cleartext-logging]
+    // This warning logs consent age metadata only; no raw consent string is emitted.
     log::warn!(
         "TCF consent expired (age: {age_days}d, max: {}d)",
         config.max_consent_age_days

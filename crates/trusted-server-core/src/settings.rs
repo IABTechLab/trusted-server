@@ -350,6 +350,10 @@ impl Ec {
     }
 
     /// Minimum passphrase length for HMAC key strength.
+    ///
+    /// This lower bound is only meant to reject obviously bad values; operators
+    /// are still expected to use a high-entropy random passphrase per the EC
+    /// setup and key-rotation documentation.
     const MIN_PASSPHRASE_LENGTH: usize = 8;
 
     /// Validates that the passphrase is not empty and meets minimum length.
