@@ -44,10 +44,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::Request;
 
 use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
+use crate::cookies::handle_request_cookies;
+use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::platform::RuntimeServices;
+use crate::settings::Settings;
+use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Number of deciseconds in one day (86 400 seconds × 10).
 const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
@@ -78,6 +84,56 @@ pub struct ConsentPipelineInput<'a> {
     ///
     /// When `None`, KV fallback and KV writes are skipped silently.
     pub kv_ops: Option<&'a dyn kv::ConsentKvOps>,
+}
+
+/// Request-scoped inputs and derived state for the consent pipeline.
+pub(crate) struct RequestConsentState {
+    pub(crate) cookie_jar: Option<CookieJar>,
+    pub(crate) synthetic_id: String,
+    pub(crate) geo: Option<GeoInfo>,
+    pub(crate) consent_context: ConsentContext,
+}
+
+/// Prepare request-scoped consent state for handlers that need consent-aware processing.
+///
+/// Parses cookies, resolves the synthetic ID, performs geo lookup with
+/// fail-open logging, and builds the [`ConsentContext`] using the provided
+/// `kv_ops` implementation when consent persistence is enabled for this request.
+///
+/// # Errors
+///
+/// Returns an error when request cookies cannot be parsed or synthetic ID
+/// generation fails.
+pub(crate) fn prepare_request_consent_state(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
+    kv_ops: Option<&dyn kv::ConsentKvOps>,
+) -> Result<RequestConsentState, Report<TrustedServerError>> {
+    let cookie_jar = handle_request_cookies(req)?;
+    let synthetic_id = get_or_generate_synthetic_id(settings, services, req)?;
+    let geo = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    let consent_context = build_consent_context(&ConsentPipelineInput {
+        jar: cookie_jar.as_ref(),
+        req,
+        config: &settings.consent,
+        geo: geo.as_ref(),
+        synthetic_id: Some(synthetic_id.as_str()),
+        kv_ops,
+    });
+
+    Ok(RequestConsentState {
+        cookie_jar,
+        synthetic_id,
+        geo,
+        consent_context,
+    })
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -522,8 +578,7 @@ fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
 /// Attempts to load consent from the KV Store when cookie signals are empty.
 ///
 /// Returns `Some(ConsentContext)` if a valid entry was found and decoded,
-/// `None` otherwise. Requires both `consent_store` and `synthetic_id` to
-/// be configured.
+/// `None` otherwise. Requires both `kv_ops` and `synthetic_id`.
 fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
     let kv = input.kv_ops?;
     let synthetic_id = input.synthetic_id?;

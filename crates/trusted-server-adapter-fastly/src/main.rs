@@ -38,9 +38,9 @@ mod management_api;
 mod middleware;
 mod platform;
 
-use crate::app::{open_consent_kv, TrustedServerApp};
+use crate::app::TrustedServerApp;
 use crate::error::to_error_response;
-use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+use crate::platform::{build_runtime_services, open_consent_kv, open_kv_store, UnavailableKvStore};
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
@@ -278,11 +278,7 @@ async fn route_request(
                 path
             );
 
-            let consent_kv = settings
-                .consent
-                .consent_store
-                .as_deref()
-                .and_then(crate::platform::FastlyConsentKvStore::open);
+            let consent_kv = open_consent_kv(&settings.consent);
             handle_publisher_request(
                 settings,
                 integration_registry,

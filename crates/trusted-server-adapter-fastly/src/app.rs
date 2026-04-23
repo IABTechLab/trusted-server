@@ -48,10 +48,10 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::open_kv_store;
+use crate::platform::{open_consent_kv, open_kv_store};
 use crate::platform::{
-    FastlyConsentKvStore, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -126,16 +126,6 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             tls_cipher: None,
         })
         .build()
-}
-
-/// Open the consent KV store named in `config`, returning `None` when not configured or unavailable.
-pub(crate) fn open_consent_kv(
-    config: &trusted_server_core::consent_config::ConsentConfig,
-) -> Option<FastlyConsentKvStore> {
-    config
-        .consent_store
-        .as_deref()
-        .and_then(FastlyConsentKvStore::open)
 }
 
 // ---------------------------------------------------------------------------

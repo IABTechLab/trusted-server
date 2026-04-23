@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use error_stack::Report;
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformPendingRequest, PlatformResponse};
+use crate::platform::{PlatformPendingRequest, PlatformResponse, RuntimeServices};
 
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
@@ -67,9 +67,10 @@ pub trait AuctionProvider: Send + Sync {
     ///
     /// `timeout_ms` is the effective timeout that will be used when the backend
     /// is registered in [`request_bids`](Self::request_bids).  It must be
-    /// forwarded to `predict_backend_name_for_url` so the predicted name matches
-    /// the actual registration (the timeout is part of the name).
-    fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+    /// forwarded to [`crate::platform::PlatformBackend::predict_name`] through
+    /// `services` so the predicted name matches the actual platform backend
+    /// registration.
+    fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
         None
     }
 }

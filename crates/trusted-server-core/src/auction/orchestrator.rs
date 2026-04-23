@@ -309,7 +309,7 @@ impl AuctionOrchestrator {
             // Get the backend name for this provider to map responses back.
             // Must be computed after effective_timeout since the timeout is
             // part of the backend name.
-            let backend_name = match provider.backend_name(effective_timeout) {
+            let backend_name = match provider.backend_name(services, effective_timeout) {
                 Some(name) => name,
                 None => {
                     log::warn!(

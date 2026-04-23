@@ -4,11 +4,8 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 
-use crate::consent::{
-    allows_ssc_creation, build_consent_context, kv::ConsentKvOps, ConsentPipelineInput,
-};
+use crate::consent::{allows_ssc_creation, kv::ConsentKvOps, prepare_request_consent_state};
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
-use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -17,7 +14,7 @@ use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
-use crate::synthetic::{get_or_generate_synthetic_id, is_valid_synthetic_id};
+use crate::synthetic::is_valid_synthetic_id;
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -302,6 +299,11 @@ fn create_html_stream_processor(
 /// preserving headers and request body. It's used as a fallback for routes
 /// not explicitly handled by the trusted server.
 ///
+/// When `kv_ops` is provided, consent processing may fall back to persisted KV
+/// consent and write cookie-derived consent changes back through that
+/// implementation. When `kv_ops` is `None`, the request uses only live request
+/// signals and skips KV persistence.
+///
 /// This is `async` because it uses `services.http_client().send(...).await` rather
 /// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
 /// route handler in `block_on`, so behavior is equivalent — the change reflects the
@@ -338,46 +340,21 @@ pub async fn handle_publisher_request(
         req.headers().get("x-forwarded-proto"),
     );
 
-    // Parse cookies once for reuse by both consent extraction and synthetic ID logic.
-    let cookie_jar = handle_request_cookies(&req)?;
+    let consent_state = prepare_request_consent_state(settings, services, &req, kv_ops)?;
 
     // Capture the current SSC cookie value for revocation handling.
     // This must come from the cookie itself (not the x-synthetic-id header)
     // to ensure KV deletion targets the same identifier being revoked.
-    let existing_ssc_cookie = cookie_jar
+    let existing_ssc_cookie = consent_state
+        .cookie_jar
         .as_ref()
         .and_then(|jar| jar.get(COOKIE_SYNTHETIC_ID))
         .map(|cookie| cookie.value().to_owned());
 
-    // Generate synthetic identifiers before the request body is consumed.
-    // Always generated for internal use (KV lookups, logging) even when
-    // consent is absent — the cookie is only *set* when consent allows it.
-    let synthetic_id = get_or_generate_synthetic_id(settings, services, &req)?;
-
-    // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
-    // from the incoming request. The ConsentContext carries both raw strings
-    // (for OpenRTB forwarding) and decoded data (for enforcement).
-    // When a consent_store is configured, this also persists consent to KV
-    // and falls back to stored consent when cookies are absent.
-    let geo = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    let consent_context = build_consent_context(&ConsentPipelineInput {
-        jar: cookie_jar.as_ref(),
-        req: &req,
-        config: &settings.consent,
-        geo: geo.as_ref(),
-        synthetic_id: Some(synthetic_id.as_str()),
-        kv_ops,
-    });
-    let ssc_allowed = allows_ssc_creation(&consent_context);
+    let ssc_allowed = allows_ssc_creation(&consent_state.consent_context);
     log::debug!(
         "Proxy synthetic IDs - trusted: {}, ssc_allowed: {}",
-        synthetic_id,
+        consent_state.synthetic_id,
         ssc_allowed,
     );
 
@@ -522,7 +499,7 @@ pub async fn handle_publisher_request(
     // - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
     // - Consent absent + no cookie → do nothing.
     if ssc_allowed {
-        match HeaderValue::from_str(synthetic_id.as_str()) {
+        match HeaderValue::from_str(consent_state.synthetic_id.as_str()) {
             Ok(header_value) => {
                 response
                     .headers_mut()
@@ -531,13 +508,17 @@ pub async fn handle_publisher_request(
             Err(_) => {
                 log::warn!(
                     "Rejecting synthetic ID response header: value of {} bytes is not a valid header value",
-                    synthetic_id.len()
+                    consent_state.synthetic_id.len()
                 );
             }
         }
         // Cookie persistence is skipped if the synthetic ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        crate::cookies::set_synthetic_cookie(settings, &mut response, synthetic_id.as_str());
+        crate::cookies::set_synthetic_cookie(
+            settings,
+            &mut response,
+            consent_state.synthetic_id.as_str(),
+        );
     } else if let Some(cookie_synthetic_id) = existing_ssc_cookie.as_deref() {
         // Always expire the cookie — consent is withdrawn regardless of whether the
         // stored value is well-formed.
@@ -545,7 +526,7 @@ pub async fn handle_publisher_request(
         if is_valid_synthetic_id(cookie_synthetic_id) {
             log::info!(
                 "SSC revoked: consent withdrawn (jurisdiction={})",
-                consent_context.jurisdiction,
+                consent_state.consent_context.jurisdiction,
             );
             if let Some(kv) = kv_ops {
                 kv.delete_entry(cookie_synthetic_id);
@@ -554,13 +535,13 @@ pub async fn handle_publisher_request(
             log::warn!(
                 "SSC cookie has invalid format, skipping KV deletion (len={}, jurisdiction={})",
                 cookie_synthetic_id.len(),
-                consent_context.jurisdiction,
+                consent_state.consent_context.jurisdiction,
             );
         }
     } else {
         log::debug!(
             "SSC skipped: no consent and no existing cookie (jurisdiction={})",
-            consent_context.jurisdiction,
+            consent_state.consent_context.jurisdiction,
         );
     }
 
@@ -570,10 +551,12 @@ pub async fn handle_publisher_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::handle_request_cookies;
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         build_services_with_http_client, noop_services, StubHttpClient,
     };
+    use crate::synthetic::get_or_generate_synthetic_id;
     use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
     use edgezero_core::body::Body as EdgeBody;
     use http::{header, Method, Request as HttpRequest, StatusCode};

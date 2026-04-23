@@ -21,7 +21,7 @@ use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_body, ensure_integration_backend_with_timeout, predict_backend_name_for_url,
+    collect_body, ensure_integration_backend_with_timeout, predict_integration_backend_name,
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
@@ -1213,9 +1213,11 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        predict_backend_name_for_url(
+    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+        predict_integration_backend_name(
+            services,
             &self.config.server_url,
+            PREBID_INTEGRATION_ID,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
@@ -1286,7 +1288,13 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{
+        build_services_with_http_client, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
+        StubHttpClient,
+    };
+    use crate::platform::{
+        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
+    };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
@@ -1314,6 +1322,57 @@ mod tests {
             bid_param_zone_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
+    }
+
+    struct PredictOnlyBackend;
+
+    impl PlatformBackend for PredictOnlyBackend {
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(format!(
+                "predicted_{}_{}_{}",
+                spec.scheme,
+                spec.host,
+                spec.first_byte_timeout.as_millis()
+            ))
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("unused".to_string())
+        }
+    }
+
+    fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(backend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo {
+                client_ip: None,
+                tls_protocol: None,
+                tls_cipher: None,
+            })
+            .build()
+    }
+
+    #[test]
+    fn prebid_backend_name_delegates_to_platform_backend_prediction() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let services = services_with_backend(PredictOnlyBackend);
+
+        let backend_name = provider
+            .backend_name(&services, 123)
+            .expect("should predict backend name through platform backend");
+
+        assert_eq!(
+            backend_name, "predicted_https_prebid.example_123",
+            "should use PlatformBackend::predict_name instead of duplicating the naming scheme"
+        );
     }
 
     fn create_test_auction_request() -> AuctionRequest {

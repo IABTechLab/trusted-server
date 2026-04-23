@@ -15,6 +15,7 @@ use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use crate::backend::BackendConfig;
+use trusted_server_core::consent_config::ConsentConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -384,25 +385,31 @@ impl PlatformGeo for FastlyPlatformGeo {
 /// Uses the synchronous Fastly KV Store API so it is compatible with the
 /// non-async consent pipeline ([`trusted_server_core::consent::build_consent_context`]).
 pub struct FastlyConsentKvStore {
-    store: fastly::kv_store::KVStore,
+    store_name: String,
 }
 
 impl FastlyConsentKvStore {
-    /// Open a Fastly KV Store by name for consent persistence.
+    /// Create a Fastly KV Store wrapper by name for consent persistence.
     ///
-    /// Returns `None` when the store does not exist or cannot be opened;
-    /// a warning is logged in that case. Callers should treat `None` as "KV
-    /// disabled" and pass `kv_ops: None` to the consent pipeline.
+    /// The underlying Fastly KV Store is opened separately for each operation
+    /// so transient open failures do not disable consent persistence for the
+    /// whole request.
     #[must_use]
     pub fn open(store_name: &str) -> Option<Self> {
-        match fastly::kv_store::KVStore::open(store_name) {
-            Ok(Some(store)) => Some(Self { store }),
+        Some(Self {
+            store_name: store_name.to_string(),
+        })
+    }
+
+    fn open_store(&self) -> Option<fastly::kv_store::KVStore> {
+        match fastly::kv_store::KVStore::open(&self.store_name) {
+            Ok(Some(store)) => Some(store),
             Ok(None) => {
-                log::warn!("Consent KV store '{store_name}' not found");
+                log::warn!("Consent KV store '{}' not found", self.store_name);
                 None
             }
             Err(e) => {
-                log::warn!("Failed to open consent KV store '{store_name}': {e}");
+                log::warn!("Failed to open consent KV store '{}': {e}", self.store_name);
                 None
             }
         }
@@ -411,7 +418,8 @@ impl FastlyConsentKvStore {
 
 impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
     fn load_entry(&self, key: &str) -> Option<trusted_server_core::consent::kv::KvConsentEntry> {
-        let mut response = match self.store.lookup(key) {
+        let store = self.open_store()?;
+        let mut response = match store.lookup(key) {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return None,
             Err(e) => {
@@ -439,23 +447,36 @@ impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
             log::warn!("Failed to serialize consent entry for '{key}'");
             return;
         };
-        match self
-            .store
-            .build_insert()
-            .time_to_live(ttl)
-            .execute(key, body)
-        {
+        let Some(store) = self.open_store() else {
+            return;
+        };
+        match store.build_insert().time_to_live(ttl).execute(key, body) {
             Ok(()) => log::info!("Saved consent to KV store for '{key}'"),
             Err(e) => log::warn!("Failed to write consent to KV store for '{key}': {e}"),
         }
     }
 
     fn delete_entry(&self, key: &str) {
-        match self.store.delete(key) {
+        let Some(store) = self.open_store() else {
+            return;
+        };
+        match store.delete(key) {
             Ok(()) => log::info!("Deleted consent KV entry for '{key}' (consent revoked)"),
             Err(e) => log::warn!("Failed to delete consent KV entry for '{key}': {e}"),
         }
     }
+}
+
+/// Create a consent KV wrapper from configuration.
+///
+/// Returns [`None`] when consent persistence is not configured. The returned
+/// wrapper opens the Fastly KV Store separately for each operation.
+#[must_use]
+pub(crate) fn open_consent_kv(config: &ConsentConfig) -> Option<FastlyConsentKvStore> {
+    config
+        .consent_store
+        .as_deref()
+        .and_then(FastlyConsentKvStore::open)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +539,16 @@ mod tests {
 
     fn noop_kv_store() -> Arc<dyn PlatformKvStore> {
         Arc::new(NoopKvStore)
+    }
+
+    #[test]
+    fn consent_kv_open_returns_wrapper_without_opening_store() {
+        let kv = FastlyConsentKvStore::open("__missing_consent_store_for_lazy_open_test__");
+
+        assert!(
+            kv.is_some(),
+            "should defer Fastly KV open until individual consent operations"
+        );
     }
 
     // --- FastlyPlatformBackend::predict_name --------------------------------

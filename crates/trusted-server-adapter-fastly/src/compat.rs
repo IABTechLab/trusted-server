@@ -87,10 +87,22 @@ mod tests {
 
         sanitize_fastly_forwarded_headers(&mut req);
 
-        assert!(req.get_header("forwarded").is_none(), "should strip forwarded");
-        assert!(req.get_header("x-forwarded-host").is_none(), "should strip x-forwarded-host");
-        assert!(req.get_header("x-forwarded-proto").is_none(), "should strip x-forwarded-proto");
-        assert!(req.get_header("fastly-ssl").is_none(), "should strip fastly-ssl");
+        assert!(
+            req.get_header("forwarded").is_none(),
+            "should strip forwarded"
+        );
+        assert!(
+            req.get_header("x-forwarded-host").is_none(),
+            "should strip x-forwarded-host"
+        );
+        assert!(
+            req.get_header("x-forwarded-proto").is_none(),
+            "should strip x-forwarded-proto"
+        );
+        assert!(
+            req.get_header("fastly-ssl").is_none(),
+            "should strip fastly-ssl"
+        );
         assert!(req.get_header("host").is_some(), "should preserve host");
     }
 
@@ -108,7 +120,11 @@ mod tests {
 
         let mut fastly_resp = to_fastly_response(http_resp);
 
-        assert_eq!(fastly_resp.get_status().as_u16(), 200, "should preserve status");
+        assert_eq!(
+            fastly_resp.get_status().as_u16(),
+            200,
+            "should preserve status"
+        );
         assert!(
             fastly_resp.take_body_bytes().is_empty(),
             "should produce empty body for streaming response"

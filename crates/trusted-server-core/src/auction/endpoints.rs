@@ -7,12 +7,10 @@ use http::{Request, Response};
 use crate::auction::formats::AdRequest;
 use crate::consent;
 use crate::consent::kv::ConsentKvOps;
-use crate::cookies::handle_request_cookies;
 use crate::error::TrustedServerError;
 use crate::integrations::{collect_body_bounded, INTEGRATION_MAX_BODY_BYTES};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
-use crate::synthetic::get_or_generate_synthetic_id;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::types::AuctionContext;
@@ -24,10 +22,16 @@ use super::AuctionOrchestrator;
 /// It orchestrates bids from multiple providers (Prebid, APS, GAM, etc.) and returns
 /// the winning bids in `OpenRTB` format with creative HTML inline in the `adm` field.
 ///
+/// When `kv_ops` is provided, consent processing may load fallback consent
+/// from KV and write cookie-sourced consent changes back through that
+/// implementation. When `kv_ops` is `None`, consent processing remains
+/// request-local and skips KV fallback/write-through.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The request body cannot be parsed
+/// - Request-scoped consent preparation fails
 /// - The auction request conversion fails (e.g., invalid ad units)
 /// - The auction execution fails
 /// - The response cannot be serialized
@@ -58,30 +62,11 @@ pub async fn handle_auction(
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
 
-    // Generate synthetic ID early so the consent pipeline can use it for
-    // KV Store fallback/write operations.
-    let synthetic_id = get_or_generate_synthetic_id(settings, services, &http_req).change_context(
-        TrustedServerError::Auction {
-            message: "Failed to generate synthetic ID".to_string(),
-        },
-    )?;
-
-    let cookie_jar = handle_request_cookies(&http_req)?;
-    let geo = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    let consent_context = consent::build_consent_context(&consent::ConsentPipelineInput {
-        jar: cookie_jar.as_ref(),
-        req: &http_req,
-        config: &settings.consent,
-        geo: geo.as_ref(),
-        synthetic_id: Some(synthetic_id.as_str()),
-        kv_ops,
-    });
+    let consent_state =
+        consent::prepare_request_consent_state(settings, services, &http_req, kv_ops)
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to prepare request consent state".to_string(),
+            })?;
 
     // Convert tsjs request format to auction request
     let auction_request = convert_tsjs_to_auction_request(
@@ -89,9 +74,9 @@ pub async fn handle_auction(
         settings,
         services,
         &http_req,
-        consent_context,
-        &synthetic_id,
-        geo,
+        consent_state.consent_context,
+        &consent_state.synthetic_id,
+        consent_state.geo,
     )?;
 
     // Create auction context
