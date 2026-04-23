@@ -1,11 +1,13 @@
+//! Fastly-specific logger wiring for the trusted-server adapter.
+
 use chrono::{SecondsFormat, Utc};
 use log_fastly::Logger;
 
 /// Extracts the final `::` segment from a Rust module path for use as a log label.
 ///
-/// Falls back to the full target string when the input contains no separator or
-/// when the separator appears at the trailing position (e.g. `"foo::"`), which
-/// would otherwise produce an empty label in log output.
+/// When the input has no `::` separator, returns the full target. When the
+/// separator is at the trailing position (e.g. `"foo::"`), returns the head
+/// segment (`"foo"`) to avoid emitting an empty label.
 fn target_label(target: &str) -> &str {
     match target.rsplit_once("::") {
         Some((head, "")) => head,
@@ -22,7 +24,8 @@ fn target_label(target: &str) -> &str {
 ///
 /// # Panics
 ///
-/// Panics if the logger cannot be built or if a global logger has already been set.
+/// Panics if the Fastly logger cannot be built or if the global logger has already
+/// been set.
 pub(crate) fn init_logger() {
     let logger = Logger::builder()
         .default_endpoint("tslog")

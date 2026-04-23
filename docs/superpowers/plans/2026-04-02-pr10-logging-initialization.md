@@ -94,13 +94,13 @@ pub(crate) fn init_logger() {
         .expect("should build Logger");
 
     fern::Dispatch::new()
-        .format(|out, _message, record| {
+        .format(|out, message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
                 Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 record.level(),
                 target_label(record.target()),
-                record.args()
+                message
             ));
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
