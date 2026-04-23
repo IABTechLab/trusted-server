@@ -7,7 +7,7 @@ use error_stack::{Report, ResultExt};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::error::TrustedServerError;
+use crate::error::{IntoHttpResponse, TrustedServerError};
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
@@ -170,6 +170,8 @@ struct SigningStoreIds<'a> {
     secret_store_id: &'a str,
 }
 
+const MAX_KID_LENGTH: usize = 128;
+
 fn signing_store_ids(
     settings: &Settings,
 ) -> Result<SigningStoreIds<'_>, Report<TrustedServerError>> {
@@ -188,14 +190,35 @@ fn signing_store_ids(
         })
 }
 
+fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+    if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("kid must be 1..={MAX_KID_LENGTH} characters"),
+        }));
+    }
+
+    if !kid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must contain only ASCII alphanumerics, '-', '_', '.', ':'".into(),
+        }));
+    }
+
+    Ok(())
+}
+
 /// Rotates the current active kid by generating and saving a new one.
 ///
 /// # Response contract
 ///
-/// Returns `200 OK` with `success: true` on success, or `500 Internal Server Error`
-/// with `success: false` and a populated `error` field when rotation fails. Unlike
-/// [`handle_verify_signature`], the error field contains internal detail — this is
-/// intentional because this endpoint is auth-gated and operator-facing only.
+/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
+/// invalid operator-supplied `kid`, or `500 Internal Server Error` when rotation
+/// fails. Failure responses include `success: false` and a populated `error`
+/// field. Unlike [`handle_verify_signature`], the error field contains internal
+/// detail — this is intentional because this endpoint is auth-gated and
+/// operator-facing only.
 ///
 /// # Errors
 ///
@@ -220,8 +243,14 @@ pub fn handle_rotate_key(
     };
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
+    let validation_result = if let Some(kid) = rotate_req.kid.as_deref() {
+        validate_kid(kid)
+    } else {
+        Ok(())
+    };
+    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
 
-    match manager.rotate_key(services, rotate_req.kid) {
+    match result {
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
@@ -250,6 +279,7 @@ pub fn handle_rotate_key(
                 .with_body(response_json))
         }
         Err(e) => {
+            let status = e.current_context().status_code();
             let response = RotateKeyResponse {
                 success: false,
                 message: "Key rotation failed".to_string(),
@@ -266,7 +296,7 @@ pub fn handle_rotate_key(
                 })
             })?;
 
-            Ok(Response::from_status(500)
+            Ok(Response::from_status(status)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
@@ -305,11 +335,12 @@ pub struct DeactivateKeyResponse {
 ///
 /// # Response contract
 ///
-/// Returns `200 OK` with `success: true` on success, or `500 Internal Server Error`
-/// with `success: false` and a populated `error` field when deactivation fails. Like
-/// [`handle_rotate_key`] and unlike [`handle_verify_signature`], the error field
-/// contains internal detail — this is intentional because this endpoint is
-/// auth-gated and operator-facing only.
+/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
+/// invalid operator-supplied `kid`, or `500 Internal Server Error` when
+/// deactivation fails. Failure responses include `success: false` and a populated
+/// `error` field. Like [`handle_rotate_key`] and unlike
+/// [`handle_verify_signature`], the error field contains internal detail — this
+/// is intentional because this endpoint is auth-gated and operator-facing only.
 ///
 /// # Errors
 ///
@@ -332,11 +363,13 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    let result = if deactivate_req.delete {
-        manager.delete_key(services, &deactivate_req.kid)
-    } else {
-        manager.deactivate_key(services, &deactivate_req.kid)
-    };
+    let result = validate_kid(&deactivate_req.kid).and_then(|()| {
+        if deactivate_req.delete {
+            manager.delete_key(services, &deactivate_req.kid)
+        } else {
+            manager.deactivate_key(services, &deactivate_req.kid)
+        }
+    });
 
     match result {
         Ok(()) => {
@@ -369,6 +402,7 @@ pub fn handle_deactivate_key(
                 .with_body(response_json))
         }
         Err(e) => {
+            let status = e.current_context().status_code();
             let response = DeactivateKeyResponse {
                 success: false,
                 message: if deactivate_req.delete {
@@ -388,7 +422,7 @@ pub fn handle_deactivate_key(
                 })
             })?;
 
-            Ok(Response::from_status(500)
+            Ok(Response::from_status(status)
                 .with_content_type(fastly::mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
@@ -638,6 +672,44 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_rotate_key_rejects_invalid_kid() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let req_body = RotateKeyRequest {
+            kid: Some("bad,kid".to_string()),
+        };
+
+        let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
+        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
+        req.set_body(body_json);
+
+        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response for invalid kid");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::BAD_REQUEST,
+            "should reject malformed kid as a bad request"
+        );
+
+        let body = resp.take_body_str();
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when supplied kid is invalid"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("kid must contain only")),
+            "should explain the kid character restrictions"
+        );
+    }
+
+    #[test]
     fn test_handle_deactivate_key_request() {
         let settings = crate::test_support::tests::create_test_settings();
 
@@ -723,6 +795,72 @@ mod tests {
 
         let result = handle_deactivate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
+    }
+
+    #[test]
+    fn test_handle_deactivate_key_rejects_invalid_kid() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let req_body = DeactivateKeyRequest {
+            kid: "bad kid".to_string(),
+            delete: false,
+        };
+
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
+        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
+        req.set_body(body_json);
+
+        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response for invalid kid");
+
+        assert_eq!(
+            resp.get_status(),
+            StatusCode::BAD_REQUEST,
+            "should reject malformed kid as a bad request"
+        );
+
+        let body = resp.take_body_str();
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when supplied kid is invalid"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("kid must contain only")),
+            "should explain the kid character restrictions"
+        );
+    }
+
+    #[test]
+    fn validate_kid_accepts_allowed_operator_supplied_ids() {
+        validate_kid("azAZ09-_.:").expect("should accept allowed kid characters");
+    }
+
+    #[test]
+    fn validate_kid_rejects_empty_ids() {
+        let result = validate_kid("");
+
+        assert!(result.is_err(), "should reject empty kid values");
+    }
+
+    #[test]
+    fn validate_kid_rejects_overlong_ids() {
+        let result = validate_kid(&"a".repeat(129));
+
+        assert!(result.is_err(), "should reject kids longer than 128 chars");
+    }
+
+    #[test]
+    fn validate_kid_rejects_csv_separator() {
+        let result = validate_kid("kid-a,kid-b");
+
+        assert!(result.is_err(), "should reject commas in kid values");
     }
 
     #[test]

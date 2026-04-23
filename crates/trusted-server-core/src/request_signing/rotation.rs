@@ -5,9 +5,11 @@
 //! [`RuntimeServices`].
 
 use base64::{engine::general_purpose, Engine};
+use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt};
 use jose_jwk::Jwk;
+use uuid::Uuid;
 
 use super::{read_active_kids, Keypair};
 use crate::error::TrustedServerError;
@@ -63,14 +65,25 @@ impl KeyRotationManager {
         services: &RuntimeServices,
         kid: Option<String>,
     ) -> Result<KeyRotationResult, Report<TrustedServerError>> {
-        let new_kid = kid.unwrap_or_else(generate_date_based_kid);
-
-        let keypair = Keypair::generate();
-        let jwk = keypair.get_jwk(new_kid.clone());
         let previous_kid = services
             .config_store()
             .get(&JWKS_STORE_NAME, "current-kid")
             .ok();
+        let active_kids = read_active_kids(services).unwrap_or_default();
+        let new_kid = match kid {
+            Some(kid) => {
+                if self.key_exists(services, &kid, &active_kids) {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!("kid '{}' already exists; choose a unique kid", kid),
+                    }));
+                }
+                kid
+            }
+            None => self.generate_unique_date_based_kid(services, &active_kids),
+        };
+
+        let keypair = Keypair::generate();
+        let jwk = keypair.get_jwk(new_kid.clone());
 
         // Step 1: write private key. Nothing to roll back on failure.
         self.store_private_key(services, &new_kid, &keypair.signing_key)?;
@@ -91,12 +104,7 @@ impl KeyRotationManager {
             return Err(err);
         }
 
-        let mut active_kids = read_active_kids(services).unwrap_or_default();
-        if let Some(prev) = &previous_kid {
-            if prev != &new_kid && !active_kids.iter().any(|kid| kid == prev) {
-                active_kids.push(prev.clone());
-            }
-        }
+        let mut active_kids = active_kids;
         if !active_kids.iter().any(|kid| kid == &new_kid) {
             active_kids.push(new_kid.clone());
         }
@@ -138,6 +146,24 @@ impl KeyRotationManager {
             active_kids,
             jwk,
         })
+    }
+
+    fn key_exists(&self, services: &RuntimeServices, kid: &str, active_kids: &[String]) -> bool {
+        active_kids.iter().any(|active_kid| active_kid == kid)
+            || services.config_store().get(&JWKS_STORE_NAME, kid).is_ok()
+    }
+
+    fn generate_unique_date_based_kid(
+        &self,
+        services: &RuntimeServices,
+        active_kids: &[String],
+    ) -> String {
+        let base_kid = generate_date_based_kid();
+        if !self.key_exists(services, &base_kid, active_kids) {
+            return base_kid;
+        }
+
+        format!("{base_kid}-{}", Uuid::new_v4().simple())
     }
 
     fn store_private_key(
@@ -229,6 +255,8 @@ impl KeyRotationManager {
         services: &RuntimeServices,
         kid: &str,
     ) -> Result<(), Report<TrustedServerError>> {
+        self.ensure_not_current_key(services, kid, "deactivate")?;
+
         let mut active_kids = self.list_active_keys(services)?;
         active_kids.retain(|k| k != kid);
 
@@ -251,6 +279,7 @@ impl KeyRotationManager {
         services: &RuntimeServices,
         kid: &str,
     ) -> Result<(), Report<TrustedServerError>> {
+        self.ensure_not_current_key(services, kid, "delete")?;
         self.deactivate_key(services, kid)?;
 
         // Delete the private key first. A failure here leaves the JWK in the
@@ -273,12 +302,32 @@ impl KeyRotationManager {
 
         Ok(())
     }
+
+    fn ensure_not_current_key(
+        &self,
+        services: &RuntimeServices,
+        kid: &str,
+        operation: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if services
+            .config_store()
+            .get(&JWKS_STORE_NAME, "current-kid")
+            .is_ok_and(|current| current == kid)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cannot {operation} '{kid}' because it is the current signing key; rotate first"
+                ),
+            }));
+        }
+
+        Ok(())
+    }
 }
 
 /// Generates a date-based key ID in the format `ts-YYYY-MM-DD`.
 #[must_use]
 pub fn generate_date_based_kid() -> String {
-    use chrono::Utc;
     format!("ts-{}", Utc::now().format("%Y-%m-%d"))
 }
 
@@ -286,7 +335,7 @@ pub fn generate_date_based_kid() -> String {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use error_stack::Report;
 
@@ -302,25 +351,61 @@ mod tests {
     // Spy stores: record put/create/delete calls, serve preset get values
     // ---------------------------------------------------------------------------
 
+    #[derive(Clone)]
     struct SpyConfigStore {
+        inner: Arc<SpyConfigStoreInner>,
+    }
+
+    struct SpyConfigStoreInner {
         data: Mutex<HashMap<String, String>>,
         puts: Mutex<Vec<(String, String, String)>>,
         deletes: Mutex<Vec<(String, String)>>,
+        /// Fail `put` after this many successful calls. `usize::MAX` means never fail.
+        fail_after_n_puts: AtomicUsize,
     }
 
     impl SpyConfigStore {
         fn new(initial: HashMap<String, String>) -> Self {
             Self {
-                data: Mutex::new(initial),
-                puts: Mutex::new(vec![]),
-                deletes: Mutex::new(vec![]),
+                inner: Arc::new(SpyConfigStoreInner {
+                    data: Mutex::new(initial),
+                    puts: Mutex::new(vec![]),
+                    deletes: Mutex::new(vec![]),
+                    fail_after_n_puts: AtomicUsize::new(usize::MAX),
+                }),
             }
+        }
+
+        /// Returns a store whose `put` succeeds for the first `n` calls, then
+        /// returns an error. Use `n = 0` to fail immediately.
+        fn with_put_failure_after(n: usize) -> Self {
+            Self {
+                inner: Arc::new(SpyConfigStoreInner {
+                    data: Mutex::new(HashMap::new()),
+                    puts: Mutex::new(vec![]),
+                    deletes: Mutex::new(vec![]),
+                    fail_after_n_puts: AtomicUsize::new(n),
+                }),
+            }
+        }
+
+        fn puts(&self) -> Vec<(String, String, String)> {
+            self.inner.puts.lock().expect("should lock puts").clone()
+        }
+
+        fn deletes(&self) -> Vec<(String, String)> {
+            self.inner
+                .deletes
+                .lock()
+                .expect("should lock deletes")
+                .clone()
         }
     }
 
     impl PlatformConfigStore for SpyConfigStore {
         fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-            self.data
+            self.inner
+                .data
                 .lock()
                 .expect("should lock data")
                 .get(key)
@@ -334,12 +419,20 @@ mod tests {
             key: &str,
             value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            self.puts.lock().expect("should lock puts").push((
+            let remaining = self.inner.fail_after_n_puts.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return Err(Report::new(PlatformError::ConfigStore));
+            }
+            if remaining != usize::MAX {
+                self.inner.fail_after_n_puts.fetch_sub(1, Ordering::SeqCst);
+            }
+            self.inner.puts.lock().expect("should lock puts").push((
                 store_id.to_string(),
                 key.to_string(),
                 value.to_string(),
             ));
-            self.data
+            self.inner
+                .data
                 .lock()
                 .expect("should lock data")
                 .insert(key.to_string(), value.to_string());
@@ -347,16 +440,26 @@ mod tests {
         }
 
         fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-            self.deletes
+            self.inner
+                .deletes
                 .lock()
                 .expect("should lock deletes")
                 .push((store_id.to_string(), key.to_string()));
-            self.data.lock().expect("should lock data").remove(key);
+            self.inner
+                .data
+                .lock()
+                .expect("should lock data")
+                .remove(key);
             Ok(())
         }
     }
 
+    #[derive(Clone)]
     struct SpySecretStore {
+        inner: Arc<SpySecretStoreInner>,
+    }
+
+    struct SpySecretStoreInner {
         creates: Mutex<Vec<(String, String, String)>>,
         deletes: Mutex<Vec<(String, String)>>,
         /// Fail `create` after this many successful calls. `usize::MAX` means never fail.
@@ -366,9 +469,11 @@ mod tests {
     impl SpySecretStore {
         fn new() -> Self {
             Self {
-                creates: Mutex::new(vec![]),
-                deletes: Mutex::new(vec![]),
-                fail_after_n_creates: AtomicUsize::new(usize::MAX),
+                inner: Arc::new(SpySecretStoreInner {
+                    creates: Mutex::new(vec![]),
+                    deletes: Mutex::new(vec![]),
+                    fail_after_n_creates: AtomicUsize::new(usize::MAX),
+                }),
             }
         }
 
@@ -376,10 +481,28 @@ mod tests {
         /// returns an error. Use `n = 0` to fail immediately.
         fn with_create_failure_after(n: usize) -> Self {
             Self {
-                creates: Mutex::new(vec![]),
-                deletes: Mutex::new(vec![]),
-                fail_after_n_creates: AtomicUsize::new(n),
+                inner: Arc::new(SpySecretStoreInner {
+                    creates: Mutex::new(vec![]),
+                    deletes: Mutex::new(vec![]),
+                    fail_after_n_creates: AtomicUsize::new(n),
+                }),
             }
+        }
+
+        fn creates(&self) -> Vec<(String, String, String)> {
+            self.inner
+                .creates
+                .lock()
+                .expect("should lock creates")
+                .clone()
+        }
+
+        fn deletes(&self) -> Vec<(String, String)> {
+            self.inner
+                .deletes
+                .lock()
+                .expect("should lock deletes")
+                .clone()
         }
     }
 
@@ -394,23 +517,26 @@ mod tests {
             name: &str,
             value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            let remaining = self.fail_after_n_creates.load(Ordering::SeqCst);
+            let remaining = self.inner.fail_after_n_creates.load(Ordering::SeqCst);
             if remaining == 0 {
                 return Err(Report::new(PlatformError::SecretStore));
             }
             if remaining != usize::MAX {
-                self.fail_after_n_creates.fetch_sub(1, Ordering::SeqCst);
+                self.inner
+                    .fail_after_n_creates
+                    .fetch_sub(1, Ordering::SeqCst);
             }
-            self.creates.lock().expect("should lock creates").push((
-                store_id.to_string(),
-                name.to_string(),
-                value.to_string(),
-            ));
+            self.inner
+                .creates
+                .lock()
+                .expect("should lock creates")
+                .push((store_id.to_string(), name.to_string(), value.to_string()));
             Ok(())
         }
 
         fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-            self.deletes
+            self.inner
+                .deletes
                 .lock()
                 .expect("should lock deletes")
                 .push((store_id.to_string(), name.to_string()));
@@ -505,6 +631,90 @@ mod tests {
     }
 
     #[test]
+    fn rotate_key_does_not_reactivate_deactivated_previous_kid() {
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), "kid-a".to_string());
+        data.insert("active-kids".to_string(), "kid-b".to_string());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services = build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let rotation = manager
+            .rotate_key(&services, Some("kid-c".to_string()))
+            .expect("should rotate key successfully");
+
+        assert_eq!(
+            rotation.active_kids,
+            vec!["kid-b".to_string(), "kid-c".to_string()],
+            "should not resurrect a previous kid that is no longer active"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_explicit_kid_that_is_already_active() {
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), "kid-b".to_string());
+        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.rotate_key(&services, Some("kid-a".to_string()));
+
+        assert!(
+            result.is_err(),
+            "should reject explicit rotation to an existing kid"
+        );
+        assert!(
+            secret_store.creates().is_empty(),
+            "should reject duplicate kids before writing private key material"
+        );
+        assert!(
+            config_store.puts().is_empty(),
+            "should reject duplicate kids before writing config store entries"
+        );
+    }
+
+    #[test]
+    fn rotate_key_uniquifies_generated_kid_when_date_based_kid_is_active() {
+        let base_kid = generate_date_based_kid();
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), base_kid.clone());
+        data.insert("active-kids".to_string(), base_kid.clone());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services = build_services_with_config_and_secret(config_store, secret_store);
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let rotation = manager
+            .rotate_key(&services, None)
+            .expect("should rotate with a uniquified generated kid");
+
+        assert_ne!(
+            rotation.new_kid, base_kid,
+            "should not reuse an active date-based kid"
+        );
+        assert!(
+            rotation.new_kid.starts_with(&format!("{base_kid}-")),
+            "should preserve the date-based kid prefix for generated collisions"
+        );
+        assert!(
+            rotation.active_kids.contains(&base_kid),
+            "should keep the existing kid active"
+        );
+        assert!(
+            rotation.active_kids.contains(&rotation.new_kid),
+            "should add the uniquified generated kid"
+        );
+    }
+
+    #[test]
     fn deactivate_key_fails_when_only_one_key_remains() {
         let mut data = HashMap::new();
         data.insert("active-kids".to_string(), "only-key".to_string());
@@ -549,6 +759,101 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail when the secret store rejects the private key write"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rolls_back_secret_when_jwk_write_fails() {
+        let config_store = SpyConfigStore::with_put_failure_after(0);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.rotate_key(&services, Some("rollback-kid".to_string()));
+
+        assert!(result.is_err(), "should fail when JWK write fails");
+        assert_eq!(
+            secret_store.deletes(),
+            vec![("sec-id".to_string(), "rollback-kid".to_string())],
+            "should roll back private key material after JWK write failure"
+        );
+        assert!(
+            config_store.deletes().is_empty(),
+            "should not roll back a JWK that was never stored"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rolls_back_secret_and_jwk_when_active_kids_write_fails() {
+        let config_store = SpyConfigStore::with_put_failure_after(1);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.rotate_key(&services, Some("rollback-kid".to_string()));
+
+        assert!(result.is_err(), "should fail when active-kids write fails");
+        assert_eq!(
+            config_store.deletes(),
+            vec![("cfg-id".to_string(), "rollback-kid".to_string())],
+            "should roll back the stored JWK after active-kids write failure"
+        );
+        assert_eq!(
+            secret_store.deletes(),
+            vec![("sec-id".to_string(), "rollback-kid".to_string())],
+            "should roll back private key material after active-kids write failure"
+        );
+    }
+
+    #[test]
+    fn deactivate_key_rejects_current_kid() {
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), "kid-a".to_string());
+        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.deactivate_key(&services, "kid-a");
+
+        assert!(result.is_err(), "should reject deactivating current-kid");
+        assert!(
+            config_store.puts().is_empty(),
+            "should reject current-kid deactivation before updating active-kids"
+        );
+        assert!(
+            secret_store.deletes().is_empty(),
+            "should not touch secret store during failed deactivation"
+        );
+    }
+
+    #[test]
+    fn delete_key_rejects_current_kid_before_deleting_storage() {
+        let mut data = HashMap::new();
+        data.insert("current-kid".to_string(), "kid-a".to_string());
+        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+
+        let config_store = SpyConfigStore::new(data);
+        let secret_store = SpySecretStore::new();
+        let services =
+            build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
+
+        let manager = KeyRotationManager::new("cfg-id", "sec-id");
+        let result = manager.delete_key(&services, "kid-a");
+
+        assert!(result.is_err(), "should reject deleting current-kid");
+        assert!(
+            secret_store.deletes().is_empty(),
+            "should reject current-kid deletion before deleting private key material"
+        );
+        assert!(
+            config_store.deletes().is_empty(),
+            "should reject current-kid deletion before deleting JWK storage"
         );
     }
 

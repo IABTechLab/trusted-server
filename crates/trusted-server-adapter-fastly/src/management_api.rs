@@ -142,6 +142,20 @@ impl FastlyManagementApiClient {
         })
     }
 
+    /// Construct a client from explicit components for tests.
+    #[cfg(test)]
+    pub(crate) fn with_components(
+        api_key: String,
+        base_url: &'static str,
+        backend_name: String,
+    ) -> Self {
+        Self {
+            api_key,
+            base_url,
+            backend_name,
+        }
+    }
+
     fn make_request(
         &self,
         method: Method,
@@ -385,11 +399,11 @@ mod tests {
 
     #[test]
     fn create_secret_uses_secret_store_error_for_transport_failures() {
-        let client = FastlyManagementApiClient {
-            api_key: "test-api-key".to_string(),
-            base_url: FASTLY_API_HOST,
-            backend_name: "missing-management-backend".to_string(),
-        };
+        let client = FastlyManagementApiClient::with_components(
+            "test-api-key".to_string(),
+            FASTLY_API_HOST,
+            "missing-management-backend".to_string(),
+        );
 
         let err = client
             .create_secret("store-id", "secret-name", "secret-value")
