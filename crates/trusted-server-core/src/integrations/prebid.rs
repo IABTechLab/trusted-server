@@ -137,7 +137,7 @@ pub struct PrebidIntegrationConfig {
     /// Canonical ordered bidder-param override rules.
     ///
     /// Each rule has structured `when` matchers and a non-empty `set` object
-    /// that is deep-merged into the bidder params when every matcher
+    /// that is shallow-merged into the bidder params when every matcher
     /// matches. Compatibility fields such as [`bid_param_overrides`](Self::bid_param_overrides)
     /// and [`bid_param_zone_overrides`](Self::bid_param_zone_overrides) are
     /// normalized into the same runtime rule engine before request handling.
@@ -508,11 +508,20 @@ fn expand_trusted_server_bidders(
 /// inserted or replaced in `params`. Nested objects are replaced wholesale —
 /// they are not recursed into. When `params` is not an object, it is left
 /// untouched to preserve pre-existing behavior.
-fn merge_bidder_param_object(params: &mut Json, override_obj: &serde_json::Map<String, Json>) {
+///
+/// Returns whether `params` was an object and the merge path ran.
+fn merge_bidder_param_object(
+    params: &mut Json,
+    override_obj: &serde_json::Map<String, Json>,
+) -> bool {
     if let Json::Object(base) = params {
         for (k, v) in override_obj {
             base.insert(k.clone(), v.clone());
         }
+
+        true
+    } else {
+        false
     }
 }
 
@@ -581,13 +590,20 @@ impl BidParamOverrideEngine {
     fn apply(&self, facts: BidParamOverrideFacts<'_>, params: &mut Json) {
         for rule in &self.rules {
             if rule.matches(facts) {
-                log::debug!(
-                    "prebid: applying bidder param override for bidder '{}' zone {:?}: keys {:?}",
-                    facts.bidder,
-                    facts.zone,
-                    rule.set.keys().collect::<Vec<_>>()
-                );
-                merge_bidder_param_object(params, &rule.set);
+                if merge_bidder_param_object(params, &rule.set) {
+                    log::debug!(
+                        "prebid: applying bidder param override for bidder '{}' zone {:?}: keys {:?}",
+                        facts.bidder,
+                        facts.zone,
+                        rule.set.keys().collect::<Vec<_>>()
+                    );
+                } else {
+                    log::debug!(
+                        "prebid: skipping bidder param override for bidder '{}' zone {:?}: params is not a JSON object",
+                        facts.bidder,
+                        facts.zone
+                    );
+                }
             }
         }
     }
@@ -3659,6 +3675,24 @@ set = { placementId = "explicit_header" }
             assert_eq!(
                 params["placementId"], "client",
                 "should leave params unchanged when facts do not match"
+            );
+        }
+
+        #[test]
+        fn merge_reports_skip_for_non_object_params() {
+            let mut params = json!("client-string");
+            let override_obj = json_object(json!({ "placementId": "server" }));
+
+            let merged = merge_bidder_param_object(&mut params, &override_obj);
+
+            assert!(
+                !merged,
+                "should report skip when bidder params are not an object"
+            );
+            assert_eq!(
+                params,
+                json!("client-string"),
+                "should leave non-object bidder params unchanged"
             );
         }
 

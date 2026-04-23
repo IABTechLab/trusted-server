@@ -47,7 +47,6 @@ debug = false
 # be statically imported in the JS bundle.
 client_side_bidders = ["rubicon"]
 
-# [integrations.prebid.bid_param_overrides]
 # Compatibility sugar for static per-bidder params merged into every outgoing
 # PBS request. These normalize into bid_param_override_rules internally.
 # Example:
