@@ -7,7 +7,7 @@
 //! (organic request paths) or propagate them (sync endpoints). See the
 //! per-operation error handling policy in the spec §7.5.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::thread;
 use std::time::Duration;
 
@@ -583,7 +583,8 @@ impl KvIdentityGraph {
     /// Also updates the [`KvPubProperties::seen_domains`] entry for the
     /// given `domain`, incrementing visits and updating the `last` timestamp.
     /// New domains are added if the [`MAX_SEEN_DOMAINS`] cap has not been
-    /// reached; otherwise the new domain is silently dropped.
+    /// reached; otherwise the new domain is silently dropped so the earliest
+    /// retained set remains stable.
     ///
     /// Skips the write if the stored `last_seen` is within
     /// [`LAST_SEEN_DEBOUNCE_SECS`] of the new timestamp, or if the entry
@@ -684,7 +685,7 @@ impl KvIdentityGraph {
                 }
             },
             None => {
-                let mut seen_domains = HashMap::new();
+                let mut seen_domains = BTreeMap::new();
                 seen_domains.insert(
                     domain.clone(),
                     KvDomainVisit {

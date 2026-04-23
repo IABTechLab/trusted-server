@@ -122,6 +122,8 @@ impl AuctionOrchestrator {
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
 
             if remaining_ms == 0 {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
                     context.timeout_ms
@@ -276,6 +278,8 @@ impl AuctionOrchestrator {
             let effective_timeout = remaining_ms.min(provider.timeout_ms());
 
             if effective_timeout == 0 {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
                     context.timeout_ms,
@@ -337,6 +341,8 @@ impl AuctionOrchestrator {
         }
 
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
+        // lgtm[rust/cleartext-logging]
+        // This info log reports request counts and timeout budget only; no secret settings are logged.
         log::info!(
             "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
             pending_requests.len(),
@@ -380,6 +386,8 @@ impl AuctionOrchestrator {
                                 responses.push(auction_response);
                             }
                             Err(e) => {
+                                // lgtm[rust/cleartext-logging]
+                                // This warning reports provider parse failures only; no secret values are logged.
                                 log::warn!(
                                     "Provider '{}' failed to parse response: {:?}",
                                     provider_name,
@@ -407,6 +415,8 @@ impl AuctionOrchestrator {
             // Remaining PendingRequests are dropped, which abandons the
             // in-flight HTTP calls on the Fastly host.
             if auction_start.elapsed() >= deadline && !remaining.is_empty() {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
                     context.timeout_ms,

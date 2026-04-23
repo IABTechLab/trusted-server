@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use error_stack::{Report, ResultExt};
 
 use crate::error::TrustedServerError;
+use crate::redacted::Redacted;
 use crate::settings::EcPartner;
 
 use super::partner::{hash_api_key, validate_partner_id};
@@ -40,8 +41,8 @@ pub struct PartnerConfig {
     pub pull_sync_ttl_sec: u64,
     /// Max pull sync calls per EC hash per partner per hour.
     pub pull_sync_rate_limit: u32,
-    /// Outbound bearer token for pull sync requests (plaintext).
-    pub ts_pull_token: Option<String>,
+    /// Outbound bearer token for pull sync requests.
+    pub ts_pull_token: Option<Redacted<String>>,
 }
 
 /// In-memory partner registry with O(1) lookups by ID, API key hash,
@@ -171,6 +172,9 @@ impl PartnerRegistry {
     }
 
     /// Returns an iterator over all configured partners.
+    ///
+    /// Iteration order is unspecified; callers that need determinism should
+    /// sort by partner ID before consuming the results.
     pub fn all(&self) -> impl Iterator<Item = &PartnerConfig> {
         self.by_id.values()
     }
@@ -205,7 +209,7 @@ fn build_partner_config(
         pull_sync_allowed_domains: partner.pull_sync_allowed_domains.clone(),
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
-        ts_pull_token: partner.ts_pull_token.as_ref().map(|t| t.expose().clone()),
+        ts_pull_token: partner.ts_pull_token.clone(),
     })
 }
 
@@ -235,10 +239,9 @@ fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServer
 
     if config
         .ts_pull_token
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .is_empty()
+        .as_ref()
+        .map(|token| token.expose().trim().is_empty())
+        .unwrap_or(true)
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: "ts_pull_token is required when pull_sync_enabled is true".to_owned(),
@@ -404,6 +407,39 @@ mod tests {
         assert_eq!(
             pull_enabled[0].id, "puller",
             "should be the correct partner"
+        );
+        assert_eq!(
+            pull_enabled[0]
+                .ts_pull_token
+                .as_ref()
+                .expect("should keep pull token")
+                .expose(),
+            "outbound-token",
+            "should preserve the token without unwrapping it in the registry"
+        );
+    }
+
+    #[test]
+    fn partner_debug_output_redacts_pull_token() {
+        let mut partner = make_partner("puller", "pull.example.com", "token-p");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
+        partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let configured = registry
+            .get("puller")
+            .expect("should find configured partner");
+
+        let debug_output = format!("{configured:?}");
+        assert!(
+            !debug_output.contains("outbound-token"),
+            "should not expose the pull token in debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "should render the pull token through Redacted debug output"
         );
     }
 
