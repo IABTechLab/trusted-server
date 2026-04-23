@@ -1,5 +1,5 @@
 use error_stack::Report;
-use fastly::http::Method;
+use fastly::http::{header, Method};
 use fastly::{Error, Request, Response};
 use log_fastly::Logger;
 
@@ -109,6 +109,7 @@ fn build_ja4_debug_response(req: &Request) -> Response {
     );
 
     Response::from_status(fastly::http::StatusCode::OK)
+        .with_header(header::CACHE_CONTROL, "no-store, private")
         .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
         .with_body(body)
 }
@@ -338,6 +339,11 @@ mod tests {
             response.get_content_type(),
             Some(mime::TEXT_PLAIN_UTF_8),
             "should return plain text content"
+        );
+        assert_eq!(
+            response.get_header_str("cache-control"),
+            Some("no-store, private"),
+            "should disable caching for the debug response"
         );
 
         let body = response.take_body_str();

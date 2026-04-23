@@ -278,6 +278,11 @@ fn ja4_debug_route_returns_plain_text_fallback_response() {
         Some(mime::TEXT_PLAIN_UTF_8),
         "should return plain text content for the ja4 debug route"
     );
+    assert_eq!(
+        response.get_header_str("cache-control"),
+        Some("no-store, private"),
+        "should disable caching for the ja4 debug route"
+    );
 
     let body = response.take_body_str();
 
