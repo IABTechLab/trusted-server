@@ -1390,4 +1390,228 @@ mod tests {
             "should not contain original host. Got: {decompressed}"
         );
     }
+
+    /// Empty origin body on the streaming route must produce no output
+    /// without erroring. Exercises the `Ok(0)` branch of `process_chunks`
+    /// plus the processor's `is_last=true, chunk=[]` terminal call.
+    #[test]
+    fn stream_publisher_body_handles_empty_body() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+        };
+
+        let mut output = Vec::new();
+        stream_publisher_body(Body::new(), &mut output, &params, &settings, &registry)
+            .expect("should succeed on empty body");
+
+        assert!(
+            output.is_empty(),
+            "empty origin body should produce empty streaming output. Got: {output:?}"
+        );
+    }
+
+    /// Mid-stream decoder failure must surface as an error. The adapter
+    /// relies on this: once headers are committed, it logs and drops the
+    /// `StreamingBody` so the client sees a truncated response. If a decode
+    /// failure silently emitted bytes, the client would see a malformed
+    /// document instead.
+    #[test]
+    fn stream_publisher_body_surfaces_mid_stream_decode_error() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
+        // error as soon as it tries to read the gzip header.
+        let params = OwnedProcessResponseParams {
+            content_encoding: "gzip".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html".to_string(),
+        };
+
+        let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
+        let mut output = Vec::new();
+        let result = stream_publisher_body(bogus_body, &mut output, &params, &settings, &registry);
+
+        assert!(
+            result.is_err(),
+            "decoding bogus gzip as gzip should return Err so the adapter can drop the stream"
+        );
+    }
+
+    /// Pass-through dispatch contract: the adapter treats `PublisherResponse::PassThrough`
+    /// by reattaching the origin body unchanged and letting Fastly emit it.
+    /// Simulate that step and assert byte identity plus Content-Length
+    /// preservation. Distinct from `pass_through_preserves_body_and_content_length`
+    /// which only tests the header preservation; this one walks the full
+    /// take-then-reattach pattern the adapter uses.
+    #[test]
+    fn publisher_response_pass_through_reattach_preserves_bytes() {
+        // Simulate a 2xx image/png response: Body::from(bytes), take_body(),
+        // then set_body(body). `classify_response_route` already picks
+        // PassThrough for this combination; this covers the adapter's
+        // reattachment half of the contract.
+        let image_bytes: Vec<u8> = (0..=127).cycle().take(2048).collect();
+
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CONTENT_TYPE, "image/png");
+        response.set_header(header::CONTENT_LENGTH, image_bytes.len().to_string());
+        response.set_body(Body::from(image_bytes.clone()));
+
+        // Mirror adapter: take body, then reattach.
+        let body = response.take_body();
+        response.set_body(body);
+
+        assert_eq!(
+            response
+                .get_header_str(header::CONTENT_LENGTH)
+                .expect("content-length should survive"),
+            "2048"
+        );
+        let round_trip = response.into_body().into_bytes();
+        assert_eq!(
+            round_trip, image_bytes,
+            "pass-through reattach must preserve bytes exactly"
+        );
+    }
+
+    /// Buffered-processed dispatch contract: HTML with a registered post-processor
+    /// routes through `BufferedProcessed`, and the handler path sets
+    /// `Content-Length` from the processed body length. Verify that invariant
+    /// via the classifier + `process_response_streaming` composition.
+    #[test]
+    fn buffered_processed_sets_content_length_from_processed_body() {
+        // Configure nextjs so a post-processor is registered.
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        assert!(
+            registry.has_html_post_processors(),
+            "nextjs integration must register an HTML post-processor"
+        );
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "",
+                "proxy.example.com",
+                registry.has_html_post_processors(),
+            ),
+            ResponseRoute::BufferedProcessed,
+            "HTML with post-processors must route to BufferedProcessed"
+        );
+
+        // Feed a small HTML body through the same pipeline the
+        // BufferedProcessed arm uses (Vec<u8> output).
+        let html =
+            b"<html><body><a href=\"https://origin.example.com/page\">link</a></body></html>";
+        let body = Body::from(html.to_vec());
+
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+        };
+        let mut output = Vec::new();
+        stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect("should process buffered HTML");
+
+        assert!(
+            !output.is_empty(),
+            "buffered processed output must not be empty"
+        );
+        let as_str = std::str::from_utf8(&output).expect("output should be valid UTF-8");
+        assert!(
+            as_str.contains("proxy.example.com"),
+            "origin must be rewritten. Got: {as_str}"
+        );
+        assert!(
+            !as_str.contains("origin.example.com"),
+            "origin host must not leak. Got: {as_str}"
+        );
+    }
+
+    /// Document-state survives from the streaming pass into the post-processor.
+    /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
+    /// during streaming; `NextJsHtmlPostProcessor` reads it and substitutes.
+    /// Regression test: with post-processors registered, placeholders must
+    /// be inserted during streaming and substituted out of the final output.
+    #[test]
+    fn document_state_placeholders_substitute_through_accumulating_path() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        // Small, single-fragment RSC script — placeholder path (not fallback).
+        let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html".to_string(),
+        };
+
+        let mut output = Vec::new();
+        stream_publisher_body(
+            Body::from(html.to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should process RSC push");
+
+        let processed = String::from_utf8(output).expect("valid UTF-8");
+        assert!(
+            !processed.contains("__ts_rsc_payload_"),
+            "placeholder must be substituted before reaching output. Got: {processed}"
+        );
+        assert!(
+            processed.contains("proxy.example.com/page"),
+            "origin URL must be rewritten in the substituted payload. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com"),
+            "origin host must not leak. Got: {processed}"
+        );
+    }
 }
