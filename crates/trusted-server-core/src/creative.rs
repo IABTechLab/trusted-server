@@ -775,6 +775,49 @@ mod tests {
         rewrite_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
     };
 
+    fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = format!(r#"<img {}="{}">"#, attr_name, attr_value);
+        rewrite_creative_html(&settings, &html)
+    }
+
+    fn assert_rewritten_srcset_attr_case(
+        case_name: &str,
+        attr_name: &str,
+        attr_value: &str,
+        expected_relative: &str,
+        expected_descriptors: &[&str],
+    ) {
+        let out = rewrite_srcset_attr(attr_name, attr_value);
+
+        assert!(
+            out.matches("/first-party/proxy?tsurl=").count() >= 2,
+            "case `{}` expected two rewritten {} candidates: {}",
+            case_name,
+            attr_name,
+            out
+        );
+        assert!(
+            out.contains(expected_relative),
+            "case `{}` expected relative {} candidate `{}` to be preserved in {}",
+            case_name,
+            attr_name,
+            expected_relative,
+            out
+        );
+
+        for descriptor in expected_descriptors {
+            assert!(
+                out.contains(descriptor),
+                "case `{}` expected {} descriptor `{}` in {}",
+                case_name,
+                attr_name,
+                descriptor,
+                out
+            );
+        }
+    }
+
     #[test]
     fn rewrites_width_height_attrs() {
         use crate::http_util::encode_url;
@@ -941,26 +984,50 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_srcset_absolute_candidates_and_preserves_descriptors() {
-        // Absolute + protocol-relative get rewritten to /first-party/proxy?tsurl=..., relative remains
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<img srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">"#;
-        let out = rewrite_creative_html(&settings, html);
+    fn rewrites_srcset_attribute_cases() {
+        struct SrcsetCase<'a> {
+            name: &'a str,
+            attr_value: &'a str,
+            expected_relative: &'a str,
+            expected_descriptors: &'a [&'a str],
+        }
 
-        // Should have at least two proxied candidates
-        let cnt = out.matches("/first-party/proxy?tsurl=").count();
-        assert!(
-            cnt >= 2,
-            "expected at least two rewritten candidates: {}",
-            out
-        );
+        let cases = [
+            SrcsetCase {
+                name: "absolute and protocol-relative candidates",
+                attr_value: "https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x",
+                expected_relative: "/local/img.png 1x",
+                expected_descriptors: &[" 1x", " 2x"],
+            },
+            SrcsetCase {
+                name: "no-space commas with fractional density",
+                attr_value: "https://cdn.example/img-1x.png 1x,//cdn.example/img-1_5x.png 1.5x,/local/img.png 2x",
+                expected_relative: "/local/img.png 2x",
+                expected_descriptors: &[" 1x", " 1.5x"],
+            },
+            SrcsetCase {
+                name: "relative middle candidate without leading slash",
+                attr_value: "https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x",
+                expected_relative: "local/b.png 2x",
+                expected_descriptors: &[" 1x", " 2x", " 3x"],
+            },
+            SrcsetCase {
+                name: "extra spaces normalize but preserve semantics",
+                attr_value: "  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  ",
+                expected_relative: "/local/c.png 1x",
+                expected_descriptors: &[" 1x", " 2x"],
+            },
+        ];
 
-        // Descriptors preserved
-        assert!(out.contains(" 1x"));
-        assert!(out.contains(" 2x"));
-
-        // Relative left as-is
-        assert!(out.contains("/local/img.png 1x"));
+        for case in cases {
+            assert_rewritten_srcset_attr_case(
+                case.name,
+                "srcset",
+                case.attr_value,
+                case.expected_relative,
+                case.expected_descriptors,
+            );
+        }
     }
 
     #[test]
@@ -984,59 +1051,6 @@ mod tests {
         assert!(out.contains("/local/img.webp 1x"));
         // Fallback img unchanged (relative)
         assert!(out.contains("<img src=\"/fallback.jpg\""));
-    }
-
-    #[test]
-    fn rewrites_srcset_no_space_commas_preserves_descriptors() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<img srcset="https://cdn.example/img-1x.png 1x,//cdn.example/img-1_5x.png 1.5x,/local/img.png 2x">"#;
-        let out = rewrite_creative_html(&settings, html);
-        // Absolute and protocol-relative candidates rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Descriptors preserved (including fractional)
-        assert!(out.contains(" 1x"));
-        assert!(out.contains(" 1.5x"));
-        // Relative left unchanged
-        assert!(out.contains("/local/img.png 2x"));
-    }
-
-    #[test]
-    fn rewrites_srcset_relative_no_space_middle() {
-        let settings = crate::test_support::tests::create_test_settings();
-        // Relative candidate (no leading slash) in the middle, no space after commas
-        let html =
-            r#"<img srcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x">"#;
-        let out = rewrite_creative_html(&settings, html);
-        // Two absolute/protocol-relative rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Relative preserved as-is
-        assert!(out.contains("local/b.png 2x"));
-    }
-
-    #[test]
-    fn rewrites_srcset_with_extra_spaces() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<img srcset="  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  ">"#;
-        let out = rewrite_creative_html(&settings, html);
-        // Two absolute/protocol-relative rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Relative preserved
-        assert!(out.contains("/local/c.png 1x"));
-        // Normalized spacing: single space before descriptor is acceptable
-        assert!(out.contains(" 1x"));
-        assert!(out.contains(" 2x"));
     }
 
     #[test]
@@ -1077,66 +1091,50 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_imagesrcset_absolute_candidates_and_preserves_descriptors() {
-        let settings = crate::test_support::tests::create_test_settings();
-        // Use a valid quoted attribute; the previous string had malformed escapes
-        let html = r#"<div imagesrcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x"></div>"#;
-        let out = rewrite_creative_html(&settings, html);
-        let cnt = out.matches("/first-party/proxy?tsurl=").count();
-        assert!(
-            cnt >= 1,
-            "expected at least one rewritten imagesrcset candidate: {}",
-            out
-        );
-        assert!(out.contains("/local/img.png 1x"));
-    }
+    fn rewrites_imagesrcset_attribute_cases() {
+        struct SrcsetCase<'a> {
+            name: &'a str,
+            attr_value: &'a str,
+            expected_relative: &'a str,
+            expected_descriptors: &'a [&'a str],
+        }
 
-    #[test]
-    fn rewrites_imagesrcset_no_space_commas() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<div imagesrcset="https://cdn.example/a.png 1x,//cdn.example/b.png 2x,/local/c.png 1x"></div>"#;
-        let out = rewrite_creative_html(&settings, html);
-        // At least two rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Relative preserved
-        assert!(out.contains("/local/c.png 1x"));
-    }
+        let cases = [
+            SrcsetCase {
+                name: "absolute and protocol-relative candidates",
+                attr_value: "https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x",
+                expected_relative: "/local/img.png 1x",
+                expected_descriptors: &[" 1x", " 2x"],
+            },
+            SrcsetCase {
+                name: "no-space commas",
+                attr_value: "https://cdn.example/a.png 1x,//cdn.example/b.png 2x,/local/c.png 1x",
+                expected_relative: "/local/c.png 1x",
+                expected_descriptors: &[" 1x", " 2x"],
+            },
+            SrcsetCase {
+                name: "relative middle candidate without leading slash",
+                attr_value: "https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x",
+                expected_relative: "local/b.png 2x",
+                expected_descriptors: &[" 1x", " 2x", " 3x"],
+            },
+            SrcsetCase {
+                name: "extra spaces normalize but preserve semantics",
+                attr_value: "  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  ",
+                expected_relative: "/local/c.png 1x",
+                expected_descriptors: &[" 1x", " 2x"],
+            },
+        ];
 
-    #[test]
-    fn rewrites_imagesrcset_relative_no_space_middle() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<div imagesrcset="https://cdn.example/a.png 1x,local/b.png 2x,//cdn.example/c.png 3x"></div>"#;
-        let out = rewrite_creative_html(&settings, html);
-        // Two absolute/protocol-relative rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Relative preserved
-        assert!(out.contains("local/b.png 2x"));
-    }
-
-    #[test]
-    fn rewrites_imagesrcset_with_extra_spaces() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<div imagesrcset="  https://cdn.example/a.png    1x  ,  //cdn.example/b.png   2x ,   /local/c.png   1x  "></div>"#;
-        let out = rewrite_creative_html(&settings, html);
-        // Two absolute/protocol-relative rewritten
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "{}",
-            out
-        );
-        // Relative preserved
-        assert!(out.contains("/local/c.png 1x"));
-        // Normalized spacing present
-        assert!(out.contains(" 1x"));
-        assert!(out.contains(" 2x"));
+        for case in cases {
+            assert_rewritten_srcset_attr_case(
+                case.name,
+                "imagesrcset",
+                case.attr_value,
+                case.expected_relative,
+                case.expected_descriptors,
+            );
+        }
     }
 
     #[test]
