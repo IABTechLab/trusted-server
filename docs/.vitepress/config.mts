@@ -106,6 +106,7 @@ export default withMermaid(
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },
+            { text: 'JS Asset Auditor', link: '/guide/js-asset-auditor' },
           ],
         },
         {

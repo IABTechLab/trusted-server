@@ -213,18 +213,39 @@ export function shortenUrl(url) {
 
 export function parseExistingToml(content) {
   const entries = [];
-  const blocks = content.split("[[js_assets]]");
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i];
-    const originMatch = block.match(/^origin_url\s*=\s*"([^"]+)"/m);
-    const slugMatch = block.match(/^slug\s*=\s*"([^"]+)"/m);
+  const lines = content.split("\n");
+  let currentBlock = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "[[js_assets]]" || trimmed === "# [[js_assets]]") {
+      if (currentBlock?.originUrl) {
+        entries.push(currentBlock);
+      }
+      currentBlock = { originUrl: "", slug: "" };
+      continue;
+    }
+
+    if (!currentBlock) {
+      continue;
+    }
+
+    const slugMatch = trimmed.match(/^#?\s*slug\s*=\s*"([^"]+)"$/);
+    if (slugMatch) {
+      currentBlock.slug = slugMatch[1];
+      continue;
+    }
+
+    const originMatch = trimmed.match(/^#?\s*origin_url\s*=\s*"([^"]+)"$/);
     if (originMatch) {
-      entries.push({
-        originUrl: originMatch[1],
-        slug: slugMatch ? slugMatch[1] : "",
-      });
+      currentBlock.originUrl = originMatch[1];
     }
   }
+
+  if (currentBlock?.originUrl) {
+    entries.push(currentBlock);
+  }
+
   return entries;
 }
 

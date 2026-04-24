@@ -43,6 +43,42 @@ test("generateConfig comments TODO fields so Prebid config stays parseable", () 
   );
 });
 
+
+test("generateConfig only auto-enables fully configured integrations", () => {
+  const config = generateConfig("publisher.com", "https://www.publisher.com", {
+    integrations: [
+      {
+        id: "gpt",
+        label: "Google Publisher Tags",
+        category: "full",
+        extracted: { script_url: "https://securepubads.g.doubleclick.net/tag/js/gpt.js" },
+        defaults: {},
+        todos: [],
+      },
+      {
+        id: "google_tag_manager",
+        label: "Google Tag Manager",
+        category: "partial",
+        extracted: {},
+        defaults: {},
+        todos: ["container_id"],
+      },
+      {
+        id: "prebid",
+        label: "Prebid Header Bidding",
+        category: "detect_only",
+        extracted: {},
+        defaults: { timeout_ms: 1000 },
+        todos: ["server_url", "bidders"],
+      },
+    ],
+  });
+
+  assert.match(config, /\[integrations\.gpt\]\nenabled = true/);
+  assert.match(config, /\[integrations\.google_tag_manager\]\nenabled = false/);
+  assert.match(config, /\[integrations\.prebid\]\nenabled = false/);
+});
+
 test("generateConfig escapes TOML strings safely", () => {
   const config = generateConfig("pub\\domain.com", 'https://example.com/?q="quoted"', {
     integrations: [

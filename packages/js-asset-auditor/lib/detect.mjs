@@ -237,6 +237,10 @@ function formatTomlValue(value) {
   return String(value);
 }
 
+function isIntegrationConfigComplete(integration) {
+  return integration.category === "full" || integration.todos.length === 0;
+}
+
 export function generateConfig(domain, targetUrl, detectionResult) {
   const today = new Date().toISOString().slice(0, 10);
   let toml = "";
@@ -257,7 +261,7 @@ export function generateConfig(domain, targetUrl, detectionResult) {
   for (const integration of detectionResult.integrations) {
     toml += `\n`;
     toml += `[integrations.${integration.id}]\n`;
-    toml += `enabled = true\n`;
+    toml += `enabled = ${isIntegrationConfigComplete(integration)}\n`;
 
     for (const [key, value] of Object.entries(integration.extracted)) {
       toml += `${key} = ${formatTomlValue(value)}  # auto-detected\n`;

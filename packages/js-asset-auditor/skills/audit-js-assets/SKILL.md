@@ -7,7 +7,7 @@ Audit a publisher page for third-party JS assets and generate `js-assets.toml` e
 
 Usage: /js-asset-auditor:audit-js-assets $ARGUMENTS
 
-`$ARGUMENTS`: `<url> [--diff] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headless] [--config [path]] [--force]`
+`$ARGUMENTS`: `<url> [--diff] [--domain <domain>] [--settle <ms>] [--first-party <host>,...] [--no-filter] [--headless] [--config [path]] [--force]`
 
 ---
 
@@ -21,7 +21,7 @@ Run the Playwright CLI via Bash, forwarding all arguments from `$ARGUMENTS`:
 audit-js-assets $ARGUMENTS
 ```
 
-The CLI reads `trusted-server.toml` for the publisher domain, opens a headless browser, collects script URLs, processes them, and writes `js-assets.toml`. Progress lines appear on stderr; a JSON summary prints to stdout.
+The CLI resolves the publisher domain from `--domain`, then `trusted-server.toml`, then the target URL if no config file exists. It opens a headed browser by default (use `--headless` to disable the UI), collects script URLs, processes them, and writes `js-assets.toml`. Progress lines appear on stderr; a JSON summary prints to stdout.
 
 If the command fails with "Playwright not installed" or "Chromium not installed", tell the user to run:
 

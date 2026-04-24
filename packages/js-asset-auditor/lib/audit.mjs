@@ -17,7 +17,7 @@
 //   --no-filter         Bypass heuristic filtering
 //   --headless          Run browser headlessly
 //   --output <path>     Output file path (default: js-assets.toml)
-//   --config [path]     Generate trusted-server.toml (default path: trusted-server.toml)
+//   --config [path]     Generate trusted-server.toml (default path: trusted-server.generated.toml)
 //   --force             Overwrite config file when used with --config
 //
 // Prerequisites:
@@ -26,6 +26,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { processAssets } from "./process.mjs";
+
+const DEFAULT_GENERATED_CONFIG_PATH = "trusted-server.generated.toml";
 
 const USAGE =
   "Usage: audit-js-assets <url> [--diff] [--domain <domain>] [--settle <ms>] [--first-party <hosts>] [--no-filter] [--headless] [--output <path>] [--config [path]] [--force]";
@@ -83,6 +85,46 @@ function requireFlagValue(argv, index, flag) {
   return value;
 }
 
+export function fail(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+export function resolvePublisherDomain(args, repoRoot) {
+  if (args.domain) {
+    console.error(
+      `Using publisher domain from --domain: ${args.domain}`,
+    );
+    return args.domain;
+  }
+
+  try {
+    const domain = readPublisherDomain(repoRoot);
+    console.error(
+      `Using publisher domain from trusted-server.toml: ${domain}`,
+    );
+    return domain;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      const domain = inferDomainFromTarget(args.url);
+      console.error(
+        `No trusted-server.toml found, inferring publisher domain from target URL: ${domain}`,
+      );
+      return domain;
+    }
+
+    fail(
+      `Failed to read publisher domain from trusted-server.toml: ${error.message}`,
+    );
+  }
+}
+
+export function ensureConfigPathWritable(configPath, force) {
+  if (existsSync(configPath) && !force) {
+    fail(`${configPath} already exists. Use --force to overwrite.`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
@@ -133,7 +175,7 @@ export function parseArgs(argv) {
         args.config = next;
         i += 1;
       } else {
-        args.config = "trusted-server.toml";
+        args.config = DEFAULT_GENERATED_CONFIG_PATH;
       }
     } else if (arg === "--force") {
       args.force = true;
@@ -159,25 +201,7 @@ export async function main() {
   const args = parseArgs(process.argv);
   const repoRoot = process.cwd();
 
-  // Resolve publisher domain: --domain flag > trusted-server.toml > infer from URL
-  let domain = args.domain;
-  if (!domain) {
-    try {
-      domain = readPublisherDomain(repoRoot);
-    } catch (error) {
-      if (error?.code === "ENOENT") {
-        domain = inferDomainFromTarget(args.url);
-        console.error(
-          `No trusted-server.toml found, inferring publisher domain from target URL: ${domain}`,
-        );
-      } else {
-        console.error(
-          `Failed to read publisher domain from trusted-server.toml: ${error.message}`,
-        );
-        process.exit(1);
-      }
-    }
-  }
+  const domain = resolvePublisherDomain(args, repoRoot);
 
   let chromium;
   try {
@@ -261,19 +285,12 @@ export async function main() {
       const detection = detectIntegrations(scriptUrls);
 
       if (detection.integrations.length > 0) {
-        const fileExists = existsSync(args.config);
-
-        if (fileExists && !args.force) {
-          console.error(
-            `${args.config} already exists. Use --force to overwrite.`,
-          );
-        } else {
-          const configToml = generateConfig(domain, args.url, detection);
-          writeFileSync(args.config, configToml);
-          console.error(
-            `Wrote ${args.config} (${detection.integrations.length} integrations detected)`,
-          );
-        }
+        ensureConfigPathWritable(args.config, args.force);
+        const configToml = generateConfig(domain, args.url, detection);
+        writeFileSync(args.config, configToml);
+        console.error(
+          `Wrote ${args.config} (${detection.integrations.length} integrations detected)`,
+        );
       } else {
         console.error("No integrations detected — skipping config generation");
       }

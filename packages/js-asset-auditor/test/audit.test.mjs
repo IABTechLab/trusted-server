@@ -4,7 +4,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { parseArgs, readPublisherDomain } from "../lib/audit.mjs";
+import {
+  ensureConfigPathWritable,
+  parseArgs,
+  readPublisherDomain,
+  resolvePublisherDomain,
+} from "../lib/audit.mjs";
 
 function captureExit(fn) {
   const originalExit = process.exit;
@@ -58,7 +63,7 @@ test("parseArgs keeps optional --config path semantics", () => {
   ]);
 
   assert.equal(args.url, "https://example.com");
-  assert.equal(args.config, "trusted-server.toml");
+  assert.equal(args.config, "trusted-server.generated.toml");
   assert.equal(args.diff, true);
 });
 
@@ -94,4 +99,50 @@ test("readPublisherDomain reads a valid config and fails on malformed content", 
     () => readPublisherDomain(repoRoot),
     /Could not find \[publisher\]\.domain/,
   );
+});
+
+test("resolvePublisherDomain reports the selected source", () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), "js-asset-auditor-"));
+  writeFileSync(
+    join(repoRoot, "trusted-server.toml"),
+    "[publisher]\ndomain = \"config-domain.test\"\n",
+  );
+
+  const originalError = console.error;
+  const calls = [];
+  console.error = (...args) => {
+    calls.push(args.join(" "));
+  };
+
+  try {
+    const fromFlag = resolvePublisherDomain(
+      { domain: "flag-domain.test", url: "https://example.com" },
+      repoRoot,
+    );
+    const fromConfig = resolvePublisherDomain(
+      { domain: null, url: "https://example.com" },
+      repoRoot,
+    );
+
+    assert.equal(fromFlag, "flag-domain.test");
+    assert.equal(fromConfig, "config-domain.test");
+    assert.match(calls[0], /Using publisher domain from --domain: flag-domain\.test/);
+    assert.match(
+      calls[1],
+      /Using publisher domain from trusted-server\.toml: config-domain\.test/,
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("ensureConfigPathWritable exits when config already exists without --force", () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), "js-asset-auditor-"));
+  const configPath = join(repoRoot, "trusted-server.generated.toml");
+  writeFileSync(configPath, "[publisher]\n");
+
+  const result = captureExit(() => ensureConfigPathWritable(configPath, false));
+
+  assert.equal(result.error.code, 1);
+  assert.match(result.stderr, /already exists\. Use --force to overwrite\./);
 });
