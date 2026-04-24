@@ -28,20 +28,19 @@ jobs:
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
-      - name: Get Viceroy cache key
-        id: viceroy-rev
-        run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
+      # Pin Viceroy to a tag that supports the repo's rustc pin (1.91.1).
+      # Upstream 0.16.6 bumped MSRV to rustc 1.95, so HEAD installs break CI.
+      # Keep in sync with .github/actions/setup-integration-test-env/action.yml.
       - name: Cache Viceroy binary
         id: cache-viceroy
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/viceroy
-          key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+          key: viceroy-${{ runner.os }}-v0.16.4
 
-      - name: Install Viceroy (from main since 0.14.3 is broken)
+      - name: Install Viceroy
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/fastly/Viceroy viceroy
+        run: cargo install --git https://github.com/fastly/Viceroy --tag v0.16.4 viceroy
 
       - name: Run tests
         run: cargo test --workspace
