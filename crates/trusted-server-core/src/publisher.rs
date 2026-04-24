@@ -1,10 +1,14 @@
 //! Publisher response handler.
 //!
 //! **Note on platform coupling:** This module is currently coupled to
-//! `fastly::Body`/`Request`/`Response` at its handler boundaries — for example,
-//! `process_response_streaming` accepts and returns `fastly::Body`. This is an
-//! HTTP-type coupling that will be addressed in the HTTP-type migration alongside
-//! all other `fastly::Request`/`Response`/`Body` migrations. It is not a
+//! `fastly::Body`/`Request`/`Response` at its handler boundaries — the entry
+//! points ([`handle_publisher_request`], [`stream_publisher_body`]) still
+//! accept and return `fastly::Body` and `fastly::Response`. The streaming
+//! processor itself is generic: [`process_response_streaming`] writes into
+//! any [`Write`] (a `Vec<u8>` for buffered routes, a `StreamingBody` for the
+//! streaming route). The HTTP-type coupling will be addressed in the
+//! platform HTTP-type migration alongside all other
+//! `fastly::Request`/`Response`/`Body` migrations. It is not a
 //! content-rewriting concern.
 
 use std::io::Write;
@@ -269,7 +273,11 @@ fn create_html_stream_processor(
 pub enum PublisherResponse {
     /// Response is fully buffered and ready to send via `send_to_client()`.
     Buffered(Response),
-    /// Response headers are ready. The caller must:
+    /// Response headers are ready for a streaming response. Covers processable
+    /// content on any status (2xx or non-2xx — e.g., branded 404/500 HTML and
+    /// error JSON still get URL rewriting) where the encoding is supported
+    /// and either the content is non-HTML or no HTML post-processors are
+    /// registered. The caller must:
     /// 1. Call `finalize_response()` on the response
     /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
     /// 3. Call `stream_publisher_body()` with the body and streaming writer
@@ -421,8 +429,10 @@ pub fn stream_publisher_body<W: Write>(
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
 /// - [`PassThrough`](PublisherResponse::PassThrough) — 2xx non-processable content
 ///   (images, fonts, video). Body reattached unmodified for `send_to_client()`.
-/// - [`Stream`](PublisherResponse::Stream) — 2xx processable content with supported
-///   `Content-Encoding` and no HTML post-processors. Body piped through the
+/// - [`Stream`](PublisherResponse::Stream) — processable content with supported
+///   `Content-Encoding` and either non-HTML or no HTML post-processors.
+///   Applies to both 2xx and non-2xx status (e.g., branded 404/500 HTML and
+///   error JSON still get origin URL rewriting). Body piped through the
 ///   streaming pipeline.
 /// - [`Buffered`](PublisherResponse::Buffered) — non-2xx responses, unsupported
 ///   encoding, or HTML with post-processors that need the full document.

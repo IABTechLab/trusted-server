@@ -136,10 +136,23 @@ fn validate_container_id(container_id: &str) -> Result<(), validator::Validation
 /// check in [`GoogleTagManagerIntegration::rewrite`] cannot drift apart.
 const GTM_SCRIPT_MARKERS: &[&str] = &["googletagmanager.com", "google-analytics.com"];
 
+/// Minimum trailing-prefix length required to engage the accumulation path.
+///
+/// Both markers share the prefix `"google"` (6 bytes); below that, the
+/// tail is ambiguous with common English (`g`, `go`) and minified tokens
+/// (`img`, `slug`, …) and would over-claim. Requiring ≥ 6 bytes means only
+/// fragments ending with `"google"` or a longer prefix (`"googletag"`,
+/// `"googletagmanager"`, etc.) engage accumulation. Fragments split *within*
+/// the common prefix (e.g. "go"|"ogletagmanager.com") will miss the rewrite,
+/// but this is extremely rare with the production 8 KB chunk size and is the
+/// explicit trade-off documented above.
+const GTM_MIN_PREFIX_LEN: usize = 6;
+
 /// Return true if `text` either already contains a GTM marker or ends with a
-/// non-empty proper prefix of one — i.e., the next fragment could still
-/// complete a match. Used to gate whether the GTM rewriter should claim
-/// ownership of a script's output via `RemoveNode`/`Replace`.
+/// proper prefix of one of length ≥ [`GTM_MIN_PREFIX_LEN`] — i.e., the next
+/// fragment could still complete a match. Used to gate whether the GTM
+/// rewriter should claim ownership of a script's output via
+/// `RemoveNode`/`Replace`.
 ///
 /// Returning false means the rewriter can safely return `Keep` and leave the
 /// script untouched, preserving any replacement a more-specific rewriter
@@ -149,10 +162,11 @@ fn might_contain_gtm_prefix(text: &str) -> bool {
         if text.contains(marker) {
             return true;
         }
-        // Walk proper prefixes of `marker` (longest first) and check whether
-        // `text` ends with any of them. Bounded by marker length, so O(n) per
-        // fragment in the marker-byte count.
-        for len in (1..marker.len()).rev() {
+        // Walk proper prefixes of `marker` from longest down to the minimum
+        // length. Below the minimum, trailing prefixes are too short to
+        // uniquely identify a GTM path and would over-claim unrelated
+        // scripts ending in "g", "go", "goo", "goog", or "googl".
+        for len in (GTM_MIN_PREFIX_LEN..marker.len()).rev() {
             if text.ends_with(&marker[..len]) {
                 return true;
             }
@@ -2005,21 +2019,113 @@ container_id = "GTM-DEFAULT"
         );
     }
 
+    /// Regression test for PR #618 P1: fragmented `__NEXT_DATA__` where an
+    /// intermediate fragment boundary lands on a short tail like `g` (which
+    /// used to be treated as a plausible GTM prefix) must NOT trigger GTM
+    /// accumulation. Otherwise GTM would claim the script and overwrite
+    /// `NextJs`'s URL rewrite with an unchanged Replace.
+    ///
+    /// The payload is crafted so a 32-byte chunk boundary lands at the end
+    /// of a word ending in `g` ("config"/"img"/"slug"/"thing"), and the
+    /// rewritable origin URL appears later in the payload.
+    #[test]
+    fn fragmented_next_data_with_trailing_g_survives_gtm() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use std::io::Cursor;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-GTAIL1"
+                }),
+            )
+            .expect("should update gtm config");
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // chunk_size=32 with this payload produces fragments whose tails
+        // include "config", "img", "slug", and "thing" — all ending in `g`.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"config":{"img":"slug","thing":"x","href":"https://origin.example.com/reviews"}}</script></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "Next.js rewrite must survive when fragments end in short `g`-tails. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "origin host must not leak through. Got: {processed}"
+        );
+    }
+
     #[test]
     fn might_contain_gtm_prefix_detects_full_match_and_boundary_prefix() {
         // Full marker present.
         assert!(might_contain_gtm_prefix("xxx googletagmanager.com yyy"));
         assert!(might_contain_gtm_prefix("x google-analytics.com"));
 
-        // Boundary: text ends with a proper prefix that could be completed by
-        // the next fragment.
+        // Boundary: text ends with a proper prefix of length ≥ GTM_MIN_PREFIX_LEN.
+        // "google" itself (6 bytes) is the shortest accepted trailing prefix.
         assert!(might_contain_gtm_prefix("src='https://www.google"));
-        assert!(might_contain_gtm_prefix("src='https://www.g"));
         assert!(might_contain_gtm_prefix("src='https://www.googletag"));
+        assert!(might_contain_gtm_prefix(
+            "src='https://www.googletagmanager"
+        ));
+    }
 
-        // No match and no plausible continuation.
-        assert!(!might_contain_gtm_prefix("console.log('hello world');"));
-        assert!(!might_contain_gtm_prefix(""));
-        assert!(!might_contain_gtm_prefix("}"));
+    #[test]
+    fn might_contain_gtm_prefix_rejects_short_ambiguous_tails() {
+        // Short tails (< GTM_MIN_PREFIX_LEN) are ambiguous with ordinary
+        // English or minified tokens and must NOT engage GTM accumulation.
+        // Previously these returned true because any non-empty prefix of a
+        // marker was accepted, which let GTM claim and clobber fragments
+        // from overlapping script rewriters (see PR #618 P1).
+        for text in [
+            "x",                  // "g"-less
+            "img",                // ends in 'g'
+            "slug",               // ends in 'g'
+            "config",             // ends in 'g'
+            "thing",              // ends in 'g'
+            "y go",               // ends in 'go'
+            "xgoo",               // ends in 'goo'
+            "xgoog",              // ends in 'goog'
+            "xgoogl",             // ends in 'googl'
+            "console.log('hi');", // no tail match at all
+            "",
+            "}",
+        ] {
+            assert!(
+                !might_contain_gtm_prefix(text),
+                "`{text}` should not engage GTM accumulation"
+            );
+        }
     }
 }
