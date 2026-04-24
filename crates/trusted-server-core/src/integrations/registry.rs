@@ -8,11 +8,12 @@ use fastly::http::Method;
 use fastly::{Request, Response};
 use matchit::Router;
 
-use crate::constants::HEADER_X_SYNTHETIC_ID;
-use crate::cookies::set_synthetic_cookie;
+use crate::constants::HEADER_X_TS_EC;
+use crate::cookies::set_ec_cookie;
+use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
-use crate::synthetic::get_or_generate_synthetic_id;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +244,13 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`PlatformPendingRequest`] for the full
+/// explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
@@ -258,6 +266,7 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
 
@@ -644,46 +653,45 @@ impl IntegrationRegistry {
 
     /// Dispatch a proxy request when an integration handles the path.
     ///
-    /// This method automatically sets the `x-synthetic-id` header and
-    /// `synthetic_id` cookie on successful responses.
+    /// This method automatically sets the `x-ts-ec` header and
+    /// `ts-ec` cookie on successful responses.
     #[must_use]
     pub async fn handle_proxy(
         &self,
         method: &Method,
         path: &str,
         settings: &Settings,
+        services: &RuntimeServices,
         mut req: Request,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Generate synthetic ID before consuming request
-            let synthetic_id_result = get_or_generate_synthetic_id(settings, &req);
+            // Generate EC ID before consuming request
+            let ec_id_result = get_or_generate_ec_id(settings, services, &req);
 
-            // Set synthetic ID header on the request so integrations can read it.
+            // Set EC ID header on the request so integrations can read it.
             // Header injection: Fastly's HeaderValue API rejects values containing \r, \n, or \0,
-            // so a crafted synthetic_id cannot inject additional request headers.
-            if let Ok(ref synthetic_id) = synthetic_id_result {
-                req.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
+            // so a crafted EC ID cannot inject additional request headers.
+            if let Ok(ref ec_id) = ec_id_result {
+                req.set_header(HEADER_X_TS_EC, ec_id.as_str());
             }
 
-            let mut result = proxy.handle(settings, req).await;
+            let mut result = proxy.handle(settings, services, req).await;
 
-            // Set synthetic ID header on successful responses
+            // Set EC ID header on successful responses
             if let Ok(ref mut response) = result {
-                match synthetic_id_result {
-                    Ok(ref synthetic_id) => {
+                match ec_id_result {
+                    Ok(ref ec_id) => {
                         // Response-header injection: Fastly's HeaderValue API rejects values
-                        // containing \r, \n, or \0, so a crafted synthetic_id cannot inject
+                        // containing \r, \n, or \0, so a crafted EC ID cannot inject
                         // additional response headers.
-                        response.set_header(HEADER_X_SYNTHETIC_ID, synthetic_id.as_str());
-                        // Cookie is intentionally not set when synthetic_id contains RFC 6265-illegal
-                        // characters (e.g. a crafted x-synthetic-id header value). The response header
+                        response.set_header(HEADER_X_TS_EC, ec_id.as_str());
+                        // Cookie is intentionally not set when EC ID contains RFC 6265-illegal
+                        // characters (e.g. a crafted x-ts-ec header value). The response header
                         // is still emitted; only cookie persistence is skipped.
-                        set_synthetic_cookie(settings, response, synthetic_id.as_str());
+                        set_ec_cookie(settings, response, ec_id.as_str());
                     }
                     Err(ref err) => {
-                        log::warn!(
-                            "Failed to generate synthetic ID for integration response: {err:?}"
-                        );
+                        log::warn!("Failed to generate EC ID for integration response: {err:?}");
                     }
                 }
             }
@@ -943,6 +951,7 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::noop_services;
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -960,6 +969,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
@@ -1213,29 +1223,29 @@ mod tests {
         assert!(!registry.has_route(&Method::POST, "/integrations/test/users"));
     }
 
-    // Tests for synthetic ID header on proxy responses
-    use crate::constants::COOKIE_SYNTHETIC_ID;
+    // Tests for EC ID header on proxy responses
+    use crate::constants::COOKIE_TS_EC;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::header;
 
     /// Mock proxy that returns a simple 200 OK response
-    struct SyntheticIdTestProxy;
+    struct EcTestProxy;
 
     #[async_trait(?Send)]
-    impl IntegrationProxy for SyntheticIdTestProxy {
+    impl IntegrationProxy for EcTestProxy {
         fn integration_name(&self) -> &'static str {
-            "synthetic_id_test"
+            "ec_test"
         }
 
         fn routes(&self) -> Vec<IntegrationEndpoint> {
             vec![
                 IntegrationEndpoint {
                     method: Method::GET,
-                    path: "/integrations/test/synthetic".to_string(),
+                    path: "/integrations/test/ec".to_string(),
                 },
                 IntegrationEndpoint {
                     method: Method::POST,
-                    path: "/integrations/test/synthetic".to_string(),
+                    path: "/integrations/test/ec".to_string(),
                 },
             ]
         }
@@ -1243,35 +1253,37 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
-            // Return a simple response without the synthetic ID header.
+            // Return a simple response without the EC ID header.
             // The registry's handle_proxy should add it.
             Ok(Response::from_status(fastly::http::StatusCode::OK).with_body("test response"))
         }
     }
 
     #[test]
-    fn handle_proxy_sets_synthetic_id_header_on_response() {
+    fn handle_proxy_sets_ec_id_header_on_response() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             (
-                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
-                "synthetic_id_test",
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
             ),
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        // Create a request without a synthetic ID cookie
-        let req = Request::get("https://test-publisher.com/integrations/test/synthetic");
+        // Create a request without an EC ID cookie
+        let req = Request::get("https://test-publisher.com/integrations/test/ec");
 
         // Call handle_proxy (uses futures executor in test environment)
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ));
 
@@ -1282,55 +1294,56 @@ mod tests {
 
         let response = response.unwrap();
 
-        // Verify x-synthetic-id header is present
+        // Verify x-ts-ec header is present
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
-            "Response should have x-synthetic-id header"
+            response.get_header(HEADER_X_TS_EC).is_some(),
+            "Response should have x-ts-ec header"
         );
 
         // Verify Set-Cookie header is present (since no cookie was in request)
         let set_cookie = response.get_header(header::SET_COOKIE);
         assert!(
             set_cookie.is_some(),
-            "Response should have Set-Cookie header for synthetic_id"
+            "Response should have Set-Cookie header for ts-ec"
         );
 
         let cookie_value = set_cookie.unwrap().to_str().unwrap();
         assert!(
-            cookie_value.contains(COOKIE_SYNTHETIC_ID),
-            "Set-Cookie should contain synthetic_id cookie, got: {}",
+            cookie_value.contains(COOKIE_TS_EC),
+            "Set-Cookie should contain ts-ec cookie, got: {}",
             cookie_value
         );
     }
 
     #[test]
-    fn handle_proxy_replaces_invalid_request_header_with_matching_response_cookie() {
+    fn handle_proxy_replaces_invalid_ec_request_header_with_matching_response_cookie() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             (
-                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
-                "synthetic_id_test",
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
             ),
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test-publisher.com/integrations/test/synthetic");
-        req.set_header(HEADER_X_SYNTHETIC_ID, "evil;injected");
+        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
+        req.set_header(HEADER_X_TS_EC, "evil;injected");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ))
         .expect("should handle proxy request");
 
         let response = result.expect("handler should succeed");
         let response_header = response
-            .get_header(HEADER_X_SYNTHETIC_ID)
-            .expect("response should have x-synthetic-id header")
+            .get_header(HEADER_X_TS_EC)
+            .expect("response should have x-ts-ec header")
             .to_str()
             .expect("header should be valid UTF-8")
             .to_string();
@@ -1340,9 +1353,9 @@ mod tests {
             .to_str()
             .expect("header should be valid UTF-8");
         let cookie_value = cookie_header
-            .strip_prefix(&format!("{}=", COOKIE_SYNTHETIC_ID))
+            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
             .and_then(|s| s.split_once(';').map(|(value, _)| value))
-            .expect("should contain the synthetic_id cookie value");
+            .expect("should contain the ts-ec cookie value");
 
         assert_ne!(
             response_header, "evil;injected",
@@ -1350,7 +1363,7 @@ mod tests {
         );
         assert_eq!(
             response_header, cookie_value,
-            "response header and cookie should carry the same effective synthetic ID"
+            "response header and cookie should carry the same effective EC ID"
         );
     }
 
@@ -1359,40 +1372,31 @@ mod tests {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
-            "/integrations/test/synthetic",
-            (
-                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
-                "test",
-            ),
+            "/integrations/test/ec",
+            (Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>, "test"),
         )];
 
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test.example.com/integrations/test/synthetic");
-        // Pre-existing cookie with a valid-format synthetic ID
-        req.set_header(
-            header::COOKIE,
-            format!(
-                "{}={}",
-                crate::constants::COOKIE_SYNTHETIC_ID,
-                crate::test_support::tests::VALID_SYNTHETIC_ID
-            ),
-        );
+        let mut req = Request::get("https://test.example.com/integrations/test/ec");
+        // Pre-existing cookie
+        req.set_header(header::COOKIE, "ts-ec=existing_id_12345");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ))
         .expect("should handle proxy request");
 
         let response = result.expect("proxy handle should succeed");
 
-        // Should still have x-synthetic-id header
+        // Should still have x-ts-ec header
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
-            "Response should still have x-synthetic-id header"
+            response.get_header(HEADER_X_TS_EC).is_some(),
+            "Response should still have x-ts-ec header"
         );
 
         // Should ALWAYS set the cookie again (per new requirements)
@@ -1406,8 +1410,8 @@ mod tests {
         if let Some(cookie) = set_cookie {
             let cookie_str = cookie.to_str().unwrap_or("");
             assert!(
-                cookie_str.contains(COOKIE_SYNTHETIC_ID),
-                "Should contain synthetic_id cookie, got: {}",
+                cookie_str.contains(COOKIE_TS_EC),
+                "Should contain ts-ec cookie, got: {}",
                 cookie_str
             );
         }
@@ -1418,21 +1422,22 @@ mod tests {
         let settings = create_test_settings();
         let routes = vec![(
             Method::POST,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             (
-                Arc::new(SyntheticIdTestProxy) as Arc<dyn IntegrationProxy>,
-                "synthetic_id_test",
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
             ),
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let req = Request::post("https://test-publisher.com/integrations/test/synthetic")
-            .with_body("test body");
+        let req =
+            Request::post("https://test-publisher.com/integrations/test/ec").with_body("test body");
 
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::POST,
-            "/integrations/test/synthetic",
+            "/integrations/test/ec",
             &settings,
+            &noop_services(),
             req,
         ));
 
@@ -1442,8 +1447,8 @@ mod tests {
 
         let response = response.unwrap();
         assert!(
-            response.get_header(HEADER_X_SYNTHETIC_ID).is_some(),
-            "POST response should have x-synthetic-id header"
+            response.get_header(HEADER_X_TS_EC).is_some(),
+            "POST response should have x-ts-ec header"
         );
     }
 

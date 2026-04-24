@@ -28,6 +28,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
     IntegrationScriptRewriter, ScriptRewriteAction,
 };
+use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -253,7 +254,7 @@ impl GoogleTagManagerIntegration {
         target_url: &'a str,
     ) -> Result<ProxyRequestConfig<'a>, PayloadSizeError> {
         let mut proxy_config = ProxyRequestConfig::new(target_url);
-        proxy_config.forward_synthetic_id = false;
+        proxy_config.forward_ec_id = false;
 
         // If it's a POST request (e.g. /collect beacon), we must manually attach the body
         // because ProxyRequestConfig doesn't automatically copy it from the source request.
@@ -372,6 +373,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -427,7 +429,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             }
         };
 
-        let mut response = proxy_request(settings, req, proxy_config)
+        let mut response = proxy_request(settings, req, proxy_config, services)
             .await
             .change_context(Self::error("Failed to proxy GTM request"))?;
 
@@ -514,6 +516,7 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
     use std::io::Cursor;
@@ -1113,7 +1116,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         let settings = make_settings();
         let response = integration
-            .handle(&settings, req)
+            .handle(&settings, &noop_services(), req)
             .await
             .expect("handle should not return error");
 
@@ -1148,7 +1151,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         let settings = make_settings();
         let response = integration
-            .handle(&settings, req)
+            .handle(&settings, &noop_services(), req)
             .await
             .expect("handle should not return error");
 
@@ -1315,11 +1318,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1351,11 +1351,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"
