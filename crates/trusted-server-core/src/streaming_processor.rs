@@ -23,7 +23,12 @@ use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
 
+use brotli::enc::writer::CompressorWriter;
+use brotli::enc::BrotliEncoderParams;
+use brotli::Decompressor;
 use error_stack::{Report, ResultExt};
+use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
 
 use crate::error::TrustedServerError;
 
@@ -139,9 +144,6 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         ) {
             (Compression::None, Compression::None) => self.process_chunks(input, output),
             (Compression::Gzip, Compression::Gzip) => {
-                use flate2::read::GzDecoder;
-                use flate2::write::GzEncoder;
-
                 let decoder = GzDecoder::new(input);
                 let mut encoder = GzEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
@@ -151,14 +153,9 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 Ok(())
             }
             (Compression::Gzip, Compression::None) => {
-                use flate2::read::GzDecoder;
-
                 self.process_chunks(GzDecoder::new(input), output)
             }
             (Compression::Deflate, Compression::Deflate) => {
-                use flate2::read::ZlibDecoder;
-                use flate2::write::ZlibEncoder;
-
                 let decoder = ZlibDecoder::new(input);
                 let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
@@ -168,15 +165,9 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 Ok(())
             }
             (Compression::Deflate, Compression::None) => {
-                use flate2::read::ZlibDecoder;
-
                 self.process_chunks(ZlibDecoder::new(input), output)
             }
             (Compression::Brotli, Compression::Brotli) => {
-                use brotli::enc::writer::CompressorWriter;
-                use brotli::enc::BrotliEncoderParams;
-                use brotli::Decompressor;
-
                 let decoder = Decompressor::new(input, 4096);
                 let params = BrotliEncoderParams {
                     quality: 4,
@@ -194,8 +185,6 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 Ok(())
             }
             (Compression::Brotli, Compression::None) => {
-                use brotli::Decompressor;
-
                 self.process_chunks(Decompressor::new(input, 4096), output)
             }
             _ => Err(Report::new(TrustedServerError::Proxy {

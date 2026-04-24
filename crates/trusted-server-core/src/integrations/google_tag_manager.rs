@@ -131,6 +131,36 @@ fn validate_container_id(container_id: &str) -> Result<(), validator::Validation
     }
 }
 
+/// GTM domain markers the script rewriter looks for. Kept in one place so the
+/// boundary-safe prefix check in [`might_contain_gtm_prefix`] and the full-match
+/// check in [`GoogleTagManagerIntegration::rewrite`] cannot drift apart.
+const GTM_SCRIPT_MARKERS: &[&str] = &["googletagmanager.com", "google-analytics.com"];
+
+/// Return true if `text` either already contains a GTM marker or ends with a
+/// non-empty proper prefix of one — i.e., the next fragment could still
+/// complete a match. Used to gate whether the GTM rewriter should claim
+/// ownership of a script's output via `RemoveNode`/`Replace`.
+///
+/// Returning false means the rewriter can safely return `Keep` and leave the
+/// script untouched, preserving any replacement a more-specific rewriter
+/// (e.g., `NextJsNextDataRewriter`) made on the same element.
+fn might_contain_gtm_prefix(text: &str) -> bool {
+    for marker in GTM_SCRIPT_MARKERS {
+        if text.contains(marker) {
+            return true;
+        }
+        // Walk proper prefixes of `marker` (longest first) and check whether
+        // `text` ends with any of them. Bounded by marker length, so O(n) per
+        // fragment in the marker-byte count.
+        for len in (1..marker.len()).rev() {
+            if text.ends_with(&marker[..len]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
     /// Accumulates text fragments when `lol_html` splits a text node across
@@ -507,10 +537,26 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        // Cheap gate: only engage the accumulation path for scripts whose
+        // running text could plausibly contain a GTM/GA domain. Unrelated
+        // scripts (the vast majority) return Keep on every fragment so they
+        // stay visible in `lol_html`'s output unchanged — and, critically,
+        // so a Replace from this rewriter does not clobber a Replace from
+        // another rewriter on the same element (e.g., `NextJsNextDataRewriter`
+        // on `script#__NEXT_DATA__`). See `might_contain_gtm_prefix` for the
+        // boundary-safe substring check.
+        let prior_and_current_might_match =
+            might_contain_gtm_prefix(&buf) || might_contain_gtm_prefix(content);
+
         if !ctx.is_last_in_text_node {
-            // Intermediate fragment — accumulate and suppress output.
-            buf.push_str(content);
-            return ScriptRewriteAction::RemoveNode;
+            // Intermediate fragment. Only accumulate + suppress when the script
+            // might still resolve to a GTM match. Otherwise return Keep so the
+            // fragment is emitted as-is by `lol_html` and untouched by us.
+            if prior_and_current_might_match {
+                buf.push_str(content);
+                return ScriptRewriteAction::RemoveNode;
+            }
+            return ScriptRewriteAction::keep();
         }
 
         // Last fragment. If we accumulated prior fragments, combine them.
@@ -527,7 +573,10 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         // Note: analytics.google.com is intentionally excluded — gtag.js stores
         // that domain as a bare string and constructs URLs dynamically, so
         // rewriting it in scripts produces broken URLs.
-        if text.contains("googletagmanager.com") || text.contains("google-analytics.com") {
+        if GTM_SCRIPT_MARKERS
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
             return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(text));
         }
 
@@ -1730,7 +1779,11 @@ container_id = "GTM-DEFAULT"
     }
 
     #[test]
-    fn non_gtm_fragmented_script_is_passed_through() {
+    fn non_gtm_fragmented_script_returns_keep_on_every_fragment() {
+        // A script with no GTM marker in flight (and no plausible prefix) must
+        // return `Keep` on every fragment. Returning `RemoveNode` +
+        // `Replace(unchanged)` would stomp on other rewriters' replacements
+        // when selectors overlap (see `GoogleTagManagerIntegration::rewrite`).
         let config = GoogleTagManagerConfig {
             enabled: true,
             container_id: "GTM-PASS1".to_string(),
@@ -1762,21 +1815,16 @@ container_id = "GTM-DEFAULT"
             IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
         assert_eq!(
             action1,
-            ScriptRewriteAction::RemoveNode,
-            "should suppress intermediate"
+            ScriptRewriteAction::Keep,
+            "non-GTM intermediate fragment should not be claimed"
         );
 
-        // Last fragment: should emit full unchanged content since it's not GTM.
         let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
-        match action2 {
-            ScriptRewriteAction::Replace(content) => {
-                assert_eq!(
-                    content, "console.log('hello world');",
-                    "should emit full accumulated non-GTM content"
-                );
-            }
-            other => panic!("expected Replace with passthrough, got {other:?}"),
-        }
+        assert_eq!(
+            action2,
+            ScriptRewriteAction::Keep,
+            "non-GTM final fragment should not be claimed"
+        );
     }
 
     /// Verify the accumulation buffer drains correctly between two consecutive
@@ -1822,7 +1870,9 @@ container_id = "GTM-DEFAULT"
         );
 
         // --- Second <script>: fragmented non-GTM script ---
-        // Buffer must be empty here — no leftover from the first element.
+        // Buffer must be empty here — no leftover from the first element. With
+        // no GTM marker in flight, both fragments return Keep so `lol_html`
+        // emits them unchanged and other rewriters remain unaffected.
         let other_frag1 = "console.log('hel";
         let other_frag2 = "lo');";
 
@@ -1830,20 +1880,16 @@ container_id = "GTM-DEFAULT"
             IntegrationScriptRewriter::rewrite(&*integration, other_frag1, &ctx_intermediate);
         assert_eq!(
             action,
-            ScriptRewriteAction::RemoveNode,
-            "second element intermediate should suppress"
+            ScriptRewriteAction::Keep,
+            "second element intermediate (non-GTM) should not be claimed"
         );
 
         let action = IntegrationScriptRewriter::rewrite(&*integration, other_frag2, &ctx_last);
-        match action {
-            ScriptRewriteAction::Replace(content) => {
-                assert_eq!(
-                    content, "console.log('hello');",
-                    "second element should contain only its own content, no GTM leftover"
-                );
-            }
-            other => panic!("expected Replace for second element, got {other:?}"),
-        }
+        assert_eq!(
+            action,
+            ScriptRewriteAction::Keep,
+            "second element final (non-GTM) should not be claimed"
+        );
     }
 
     /// Regression test: with a small chunk size, `lol_html` fragments the
@@ -1891,5 +1937,89 @@ container_id = "GTM-DEFAULT"
             !processed.contains("googletagmanager.com"),
             "should not contain original GTM domain. Got: {processed}"
         );
+    }
+
+    /// Regression test for the overlapping-rewriter bug: when both the GTM and
+    /// Next.js integrations are enabled and a `<script id="__NEXT_DATA__">`
+    /// payload is fragmented across chunk boundaries, the GTM rewriter must
+    /// NOT clobber the Next.js URL rewrite. In `lol_html`, multiple `text!`
+    /// handlers on overlapping selectors run in registration order and the
+    /// last `text.replace(...)` wins. Before the fix, GTM accumulated every
+    /// script's fragments and re-emitted the unchanged text on `is_last`,
+    /// overwriting Next.js's rewrite. The fix is to return `Keep` on scripts
+    /// that can't plausibly contain a GTM domain.
+    #[test]
+    fn fragmented_next_data_survives_with_gtm_enabled() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use std::io::Cursor;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-MIX1"
+                }),
+            )
+            .expect("should update gtm config");
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Small chunks force fragmentation of the __NEXT_DATA__ text node.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"href":"https://origin.example.com/reviews","title":"Hello World"}}}</script></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "Next.js rewrite must survive when GTM is also enabled. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "origin host must not leak through. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn might_contain_gtm_prefix_detects_full_match_and_boundary_prefix() {
+        // Full marker present.
+        assert!(might_contain_gtm_prefix("xxx googletagmanager.com yyy"));
+        assert!(might_contain_gtm_prefix("x google-analytics.com"));
+
+        // Boundary: text ends with a proper prefix that could be completed by
+        // the next fragment.
+        assert!(might_contain_gtm_prefix("src='https://www.google"));
+        assert!(might_contain_gtm_prefix("src='https://www.g"));
+        assert!(might_contain_gtm_prefix("src='https://www.googletag"));
+
+        // No match and no plausible continuation.
+        assert!(!might_contain_gtm_prefix("console.log('hello world');"));
+        assert!(!might_contain_gtm_prefix(""));
+        assert!(!might_contain_gtm_prefix("}"));
     }
 }

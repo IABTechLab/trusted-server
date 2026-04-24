@@ -311,12 +311,14 @@ pub(crate) enum ResponseRoute {
     /// 2xx non-processable (images, fonts, video), not 204/205. Origin body
     /// is streamed unmodified via [`PublisherResponse::PassThrough`].
     PassThrough,
-    /// 2xx processable, supported encoding, and either non-HTML or no HTML
-    /// post-processors registered. Routed through [`PublisherResponse::Stream`].
+    /// Processable content with supported encoding and either non-HTML or no
+    /// HTML post-processors registered. Covers both 2xx and non-2xx (e.g.,
+    /// branded 404/500 pages still get origin URL rewriting). Routed through
+    /// [`PublisherResponse::Stream`].
     Stream,
     /// Response returned unmodified via [`PublisherResponse::Buffered`] — covers
-    /// non-2xx, 204/205, empty request host with non-processable content, and
-    /// unsupported encodings.
+    /// 204/205 (RFC-prohibited bodies), empty request host with non-processable
+    /// content, and unsupported encodings.
     BufferedUnmodified,
     /// HTML with post-processors registered. Runs the full pipeline into a
     /// buffer, then returns [`PublisherResponse::Buffered`] with the processed body.
@@ -334,39 +336,43 @@ pub(crate) fn classify_response_route(
     request_host: &str,
     has_post_processors: bool,
 ) -> ResponseRoute {
-    let should_process = is_processable_content_type(content_type);
-    let is_success = status.is_success();
+    // 204 No Content (RFC 9110 §15.3.5) and 205 Reset Content (§15.3.6)
+    // prohibit a message body. Excluded first so no later arm can emit one
+    // regardless of Content-Type or post-processor registration.
+    if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
+        return ResponseRoute::BufferedUnmodified;
+    }
 
-    if !should_process || request_host.is_empty() || !is_success {
-        // 2xx non-processable (not 204/205) streams the origin body directly.
-        // 204 No Content (RFC 9110 §15.3.5) and 205 Reset Content (§15.3.6)
-        // prohibit a message body, so they fall through to Buffered.
-        if is_success
-            && status != StatusCode::NO_CONTENT
-            && status != StatusCode::RESET_CONTENT
-            && !should_process
-        {
+    let should_process = is_processable_content_type(content_type);
+
+    // Non-processable content: 2xx streams through unchanged; non-2xx falls
+    // back to buffered (the origin's error body reaches the client as-is).
+    if !should_process {
+        if status.is_success() {
             return ResponseRoute::PassThrough;
         }
         return ResponseRoute::BufferedUnmodified;
     }
 
-    let is_html = content_type.contains("text/html");
-    let encoding_supported = is_supported_content_encoding(content_encoding);
-    let can_stream = encoding_supported && (!is_html || !has_post_processors);
-
-    if can_stream {
-        return ResponseRoute::Stream;
+    // Processable content (2xx or non-2xx) still needs URL rewriting against
+    // a known request host — without one, fall back to unmodified.
+    if request_host.is_empty() {
+        return ResponseRoute::BufferedUnmodified;
     }
 
     // Unsupported Content-Encoding: we cannot decompress, so processing would
     // treat compressed bytes as identity and produce garbled output.
-    if !encoding_supported {
+    if !is_supported_content_encoding(content_encoding) {
         return ResponseRoute::BufferedUnmodified;
     }
 
-    // HTML with post-processors: need the full document to inject.
-    ResponseRoute::BufferedProcessed
+    let is_html = content_type.contains("text/html");
+    if is_html && has_post_processors {
+        // HTML with post-processors: need the full document to inject.
+        return ResponseRoute::BufferedProcessed;
+    }
+
+    ResponseRoute::Stream
 }
 
 /// Owned version of [`ProcessResponseParams`] for returning from
@@ -567,10 +573,7 @@ pub fn handle_publisher_request(
             // Misconfiguration: processable content returned unrewritten because
             // we have no Host header to rewrite URLs against. Surface at WARN so
             // mis-proxied pages are visible in production logs.
-            if is_processable_content_type(&content_type)
-                && status.is_success()
-                && request_host.is_empty()
-            {
+            if is_processable_content_type(&content_type) && request_host.is_empty() {
                 log::warn!(
                     "Empty request host — returning processable content unmodified (Content-Type: '{}', status: {}). Check proxy Host header.",
                     content_type,
@@ -937,6 +940,91 @@ mod tests {
                 false,
             ),
             ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn route_excludes_204_for_processable_content_types() {
+        // 204 must stay body-less even when Content-Type would otherwise route
+        // to Stream or BufferedProcessed.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "204 + HTML must not route to Stream",
+        );
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "204 + HTML + post-processors must not route to BufferedProcessed",
+        );
+    }
+
+    #[test]
+    fn route_excludes_205_for_processable_content_types() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::RESET_CONTENT,
+                "application/json",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "205 + JSON must not route to Stream",
+        );
+    }
+
+    #[test]
+    fn route_streams_non_2xx_processable_content() {
+        // Branded 404 or 500 HTML with origin URLs must still be rewritten.
+        // This matches the pre-streaming behavior on main.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NOT_FOUND,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+        );
+        assert_eq!(
+            classify_response_route(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+        );
+    }
+
+    #[test]
+    fn route_processes_non_2xx_html_with_post_processors() {
+        // Non-2xx HTML with post-processors still needs full-document processing
+        // for head injection, same as 2xx.
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NOT_FOUND,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedProcessed,
         );
     }
 
