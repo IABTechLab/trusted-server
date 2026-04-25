@@ -146,13 +146,9 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
 /// stripping consent cookies.
 ///
 /// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
-/// are removed before forwarding. If stripping leaves no cookies, the header
-/// is omitted entirely. Non-UTF-8 cookie headers are forwarded unchanged.
-///
-/// # Panics
-///
-/// Panics if the stripped cookie string cannot be converted into a valid HTTP
-/// `Cookie` header value.
+/// are removed before forwarding. If stripping leaves no cookies or yields an
+/// invalid header value, the stripped header is omitted. Non-UTF-8 cookie
+/// headers are forwarded unchanged.
 pub fn forward_cookie_header(
     from: &Request<EdgeBody>,
     to: &mut Request<EdgeBody>,
@@ -169,11 +165,9 @@ pub fn forward_cookie_header(
             Ok(s) => {
                 let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
                 if !stripped.is_empty() {
-                    to.headers_mut().append(
-                        header::COOKIE,
-                        http::HeaderValue::from_str(&stripped)
-                            .expect("should build stripped Cookie header value"),
-                    );
+                    if let Ok(value) = http::HeaderValue::from_str(&stripped) {
+                        to.headers_mut().append(header::COOKIE, value);
+                    }
                 }
             }
             Err(_) => {
