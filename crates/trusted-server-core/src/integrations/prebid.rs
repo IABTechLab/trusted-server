@@ -229,19 +229,25 @@ fn default_script_patterns() -> Vec<String> {
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
+    engine: BidParamOverrideEngine,
 }
 
 impl PrebidIntegration {
     fn try_new(config: PrebidIntegrationConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        // Validate eagerly so `register()` fails fast. `PrebidAuctionProvider::try_new`
-        // compiles the full engine from the same config when the auction provider is wired up.
-        validate_bid_param_override_config(&config)?;
-        Ok(Arc::new(Self { config }))
+        let engine = BidParamOverrideEngine::try_from_config(&config)?;
+        Ok(Arc::new(Self { config, engine }))
     }
 
     #[cfg(test)]
     fn new(config: PrebidIntegrationConfig) -> Arc<Self> {
         Self::try_new(config).expect("should compile prebid bid param overrides")
+    }
+
+    fn auction_provider(&self) -> PrebidAuctionProvider {
+        PrebidAuctionProvider {
+            config: self.config.clone(),
+            bid_param_override_engine: self.engine.clone(),
+        }
     }
 
     fn matches_script_url(&self, attr_value: &str) -> bool {
@@ -529,7 +535,7 @@ fn merge_bidder_param_object(
 // Generic bid-parameter override engine
 // ============================================================================
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct BidParamOverrideEngine {
     rules: Vec<CompiledBidParamOverrideRule>,
 }
@@ -582,6 +588,15 @@ impl BidParamOverrideEngine {
 
         for rule in &config.bid_param_override_rules {
             rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
+            if let Some(bidder) = &rule.when.bidder {
+                if !config.bidders.contains(bidder) && !config.client_side_bidders.contains(bidder)
+                {
+                    log::warn!(
+                        "prebid: bid_param_override_rules entry references unconfigured bidder \
+                         '{bidder}' — rule will never fire"
+                    );
+                }
+            }
         }
 
         Ok(Self { rules })
@@ -619,6 +634,7 @@ impl CompiledBidParamOverrideRule {
             None,
             set,
             &format!("integrations.prebid.bid_param_overrides.{bidder}"),
+            false,
         )
     }
 
@@ -632,6 +648,7 @@ impl CompiledBidParamOverrideRule {
             Some(zone),
             set,
             &format!("integrations.prebid.bid_param_zone_overrides.{bidder}.{zone}"),
+            false,
         )
     }
 
@@ -640,6 +657,7 @@ impl CompiledBidParamOverrideRule {
         zone: Option<&str>,
         set: &serde_json::Map<String, Json>,
         source: &str,
+        is_canonical: bool,
     ) -> Result<Self, Report<TrustedServerError>> {
         let bidder = bidder
             .map(|value| validate_override_matcher_string(value, "when.bidder", source))
@@ -657,7 +675,7 @@ impl CompiledBidParamOverrideRule {
         Ok(Self {
             bidder,
             zone,
-            set: non_empty_override_object(set, source)?,
+            set: non_empty_override_object(set, source, is_canonical)?,
         })
     }
 
@@ -695,14 +713,9 @@ impl TryFrom<&BidParamOverrideRule> for CompiledBidParamOverrideRule {
             rule.when.zone.as_deref(),
             &rule.set,
             "integrations.prebid.bid_param_override_rules[*]",
+            true,
         )
     }
-}
-
-fn validate_bid_param_override_config(
-    config: &PrebidIntegrationConfig,
-) -> Result<(), Report<TrustedServerError>> {
-    BidParamOverrideEngine::try_from_config(config).map(|_| ())
 }
 
 // Trims leading/trailing whitespace from config-side matcher strings so that
@@ -729,10 +742,12 @@ fn validate_override_matcher_string(
 fn non_empty_override_object(
     value: &serde_json::Map<String, Json>,
     source: &str,
+    is_canonical: bool,
 ) -> Result<serde_json::Map<String, Json>, Report<TrustedServerError>> {
     if value.is_empty() {
+        let suffix = if is_canonical { ".set" } else { "" };
         return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{source}.set must not be empty"),
+            message: format!("{source}{suffix} must not be empty"),
         }));
     }
 
@@ -789,14 +804,8 @@ pub struct PrebidAuctionProvider {
 }
 
 impl PrebidAuctionProvider {
-    /// Create a new Prebid auction provider.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `config` contains invalid bidder-param override rules. Use
-    /// [`Self::try_new`] when constructing from untrusted configuration.
-    #[must_use]
-    pub fn new(config: PrebidIntegrationConfig) -> Self {
+    #[cfg(test)]
+    fn new(config: PrebidIntegrationConfig) -> Self {
         Self::try_new(config).expect("should compile prebid bid param overrides")
     }
 
@@ -1503,31 +1512,23 @@ impl AuctionProvider for PrebidAuctionProvider {
 pub fn register_auction_provider(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+    let Some(integration) = build(settings)? else {
+        log::info!("Prebid auction provider not registered: integration not found or disabled");
+        return Ok(Vec::new());
+    };
 
-    match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
-        Ok(Some(config)) => {
-            log::info!(
-                "Registering Prebid auction provider (server_url={})",
-                config.server_url
-            );
-            if config.debug {
-                log::warn!(
-                    "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
-                     bidstatus) will be included in /auction responses"
-                );
-            }
-            providers.push(Arc::new(PrebidAuctionProvider::try_new(config)?));
-        }
-        Ok(None) => {
-            log::info!("Prebid auction provider not registered: integration not found or disabled");
-        }
-        Err(e) => {
-            return Err(e);
-        }
+    log::info!(
+        "Registering Prebid auction provider (server_url={})",
+        integration.config.server_url
+    );
+    if integration.config.debug {
+        log::warn!(
+            "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+             bidstatus) will be included in /auction responses"
+        );
     }
 
-    Ok(providers)
+    Ok(vec![Arc::new(integration.auction_provider())])
 }
 
 #[cfg(test)]
@@ -1687,9 +1688,7 @@ secret_key = "test-secret-key"
 
     #[test]
     fn attribute_rewriter_removes_prebid_scripts() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             request_host: "pub.example",
@@ -1706,9 +1705,7 @@ secret_key = "test-secret-key"
 
     #[test]
     fn attribute_rewriter_handles_query_strings_and_links() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "href",
             request_host: "pub.example",
@@ -3697,6 +3694,32 @@ set = { placementId = "explicit_header" }
         }
 
         #[test]
+        fn engine_apply_is_noop_for_non_object_params() {
+            let mut config = base_config();
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 42 })),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config).expect("should compile");
+            let mut params = json!("client-string");
+
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "criteo",
+                    zone: None,
+                },
+                &mut params,
+            );
+
+            assert_eq!(
+                params,
+                json!("client-string"),
+                "should leave non-object params unchanged when a matching rule exists"
+            );
+        }
+
+        #[test]
         fn engine_applies_later_rule_last_write_wins() {
             let mut config = base_config();
             config.bid_param_overrides.insert(
@@ -3970,5 +3993,53 @@ set = { placementId = "explicit_header" }
         assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0]["bidder"], "kargo");
         assert_eq!(statuses[1]["status"], "timeout");
+    }
+
+    #[test]
+    fn register_rejects_invalid_bid_param_override_rule() {
+        let toml = format!(
+            "{}\n{}",
+            TOML_BASE,
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = {}
+set = { networkId = 42 }
+"#
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let result = register(&settings);
+        assert!(
+            result.is_err(),
+            "should fail fast when a canonical rule has no matcher fields"
+        );
+    }
+
+    #[test]
+    fn register_auction_provider_rejects_invalid_bid_param_override_rule() {
+        let toml = format!(
+            "{}\n{}",
+            TOML_BASE,
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = {}
+set = { networkId = 42 }
+"#
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let result = register_auction_provider(&settings);
+        assert!(
+            result.is_err(),
+            "should fail fast when a canonical rule has no matcher fields"
+        );
     }
 }
