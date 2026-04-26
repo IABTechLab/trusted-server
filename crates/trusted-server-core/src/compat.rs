@@ -15,7 +15,7 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
     let uri: http::Uri = req
         .get_url_str()
         .parse()
-        .expect("should parse fastly request URL as URI");
+        .unwrap_or_else(|_| http::Uri::from_static("/"));
 
     let mut builder = http::Request::builder()
         .method(req.get_method().clone())
@@ -25,6 +25,8 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
         builder = builder.header(name.as_str(), value.as_bytes());
     }
 
+    // Cannot fail: URI is always valid (parsed above or the "/" fallback),
+    // and Fastly pre-validates all method and header values.
     builder
         .body(body)
         .expect("should build http request from fastly request")
@@ -112,6 +114,7 @@ pub fn from_fastly_response(mut resp: fastly::Response) -> http::Response<EdgeBo
         .body(EdgeBody::from(resp.take_body_bytes()))
         .expect("should build http response from fastly response")
 }
+
 
 /// Convert an `http::Response<EdgeBody>` into a `fastly::Response`.
 ///
@@ -240,29 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn from_fastly_request_copies_body() {
-        let mut fastly_req =
-            fastly::Request::new(fastly::http::Method::POST, "https://example.com/path");
-        fastly_req.set_header("content-type", "application/json");
-        fastly_req.set_body(r#"{"ok":true}"#);
-
-        let http_req = from_fastly_request(fastly_req);
-        let (parts, body) = http_req.into_parts();
-
-        assert_eq!(parts.method, http::Method::POST, "should copy method");
-        assert_eq!(parts.uri.path(), "/path", "should copy uri path");
-        assert_eq!(
-            parts
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json"),
-            "should copy headers"
-        );
-        assert_once_body_eq(body, br#"{"ok":true}"#);
-    }
-
-    #[test]
     fn from_fastly_headers_ref_copies_headers() {
         let mut fastly_req =
             fastly::Request::new(fastly::http::Method::GET, "https://example.com/path");
@@ -311,6 +291,29 @@ mod tests {
 
         assert_eq!(http_req.method(), http::Method::POST, "should copy method");
         assert_once_body_eq(http_req.into_body(), b"");
+    }
+
+    #[test]
+    fn from_fastly_request_copies_body() {
+        let mut fastly_req =
+            fastly::Request::new(fastly::http::Method::POST, "https://example.com/path");
+        fastly_req.set_header("content-type", "application/json");
+        fastly_req.set_body(r#"{"ok":true}"#);
+
+        let http_req = from_fastly_request(fastly_req);
+        let (parts, body) = http_req.into_parts();
+
+        assert_eq!(parts.method, http::Method::POST, "should copy method");
+        assert_eq!(parts.uri.path(), "/path", "should copy uri path");
+        assert_eq!(
+            parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "should copy headers"
+        );
+        assert_once_body_eq(body, br#"{"ok":true}"#);
     }
 
     #[test]
