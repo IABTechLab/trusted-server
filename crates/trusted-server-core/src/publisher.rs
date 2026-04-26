@@ -21,7 +21,7 @@ use crate::backend::BackendConfig;
 use crate::compat;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
+use crate::cookies::handle_request_cookies;
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
@@ -704,14 +704,14 @@ fn apply_ec_headers(
         response.set_header(HEADER_X_TS_EC, ec_id);
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        set_ec_cookie(settings, response, ec_id);
+        compat::set_fastly_synthetic_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        expire_ec_cookie(settings, response);
+        compat::expire_fastly_synthetic_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }

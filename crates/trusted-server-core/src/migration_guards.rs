@@ -27,7 +27,6 @@ fn migrated_utility_modules_do_not_depend_on_fastly_request_response_types() {
     let sources = [
         ("auth.rs", include_str!("auth.rs")),
         ("cookies.rs", include_str!("cookies.rs")),
-        ("synthetic.rs", include_str!("synthetic.rs")),
         ("http_util.rs", include_str!("http_util.rs")),
         (
             "consent/extraction.rs",

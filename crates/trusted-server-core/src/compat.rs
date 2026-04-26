@@ -125,7 +125,7 @@ pub fn forward_fastly_cookie_header(
     }
 }
 
-/// Set the synthetic ID cookie on a `fastly::Response`.
+/// Set the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
 pub fn set_fastly_synthetic_cookie(
@@ -133,17 +133,34 @@ pub fn set_fastly_synthetic_cookie(
     response: &mut fastly::Response,
     synthetic_id: &str,
 ) {
-    crate::cookies::set_ec_cookie(settings, response, synthetic_id);
+    if !crate::cookies::synthetic_id_cookie_value_is_safe(synthetic_id) {
+        log::warn!(
+            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
+            synthetic_id.len()
+        );
+        return;
+    }
+    response.append_header(
+        header::SET_COOKIE,
+        crate::cookies::create_ec_cookie(settings, synthetic_id),
+    );
 }
 
-/// Expire the synthetic ID cookie on a `fastly::Response`.
+/// Expire the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
 pub fn expire_fastly_synthetic_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
-    crate::cookies::expire_ec_cookie(settings, response);
+    response.append_header(
+        header::SET_COOKIE,
+        format!(
+            "{}=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+            crate::constants::COOKIE_TS_EC,
+            settings.publisher.cookie_domain,
+        ),
+    );
 }
 
 #[cfg(test)]
