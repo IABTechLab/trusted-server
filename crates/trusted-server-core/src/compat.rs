@@ -115,7 +115,6 @@ pub fn from_fastly_response(mut resp: fastly::Response) -> http::Response<EdgeBo
         .expect("should build http response from fastly response")
 }
 
-
 /// Convert an `http::Response<EdgeBody>` into a `fastly::Response`.
 ///
 /// # PR 15 removal target
