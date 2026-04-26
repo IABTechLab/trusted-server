@@ -27,10 +27,12 @@ JS, auction, discovery).
 Before committing to `stream_to_client()`, check:
 
 1. Backend status is success (2xx).
-2. For HTML content: `html_post_processors()` is empty — no registered
-   post-processors. Non-HTML content types (text/JSON, RSC Flight, binary) can
-   always stream regardless of post-processor registration, since
-   post-processors only apply to HTML.
+2. For HTML content: `has_html_post_processors()` returns false — no registered
+   post-processors. This method returns a `bool` directly, avoiding the
+   allocation of cloning the `Vec<Arc<dyn IntegrationHtmlPostProcessor>>` that
+   `html_post_processors()` performs. Non-HTML content types (text/JSON, RSC
+   Flight, binary) can always stream regardless of post-processor registration,
+   since post-processors only apply to HTML.
 
 If either check fails for the given content type, fall back to the current
 buffered path. This keeps the optimization transparent: same behavior for all
@@ -81,9 +83,11 @@ compressed paths should follow the same structure.
 
 #### C) `process_through_compression` finalization — prerequisite for B
 
-`process_through_compression` currently uses `drop(encoder)` which silently
-swallows errors. Today this affects deflate and brotli (which already use this
-path). The current `process_gzip_to_gzip` calls `encoder.finish()` explicitly —
+`process_through_compression` currently calls `flush()` (with error
+propagation) then `drop(encoder)` for finalization. The `flush()` only flushes
+buffered data but does not write compression trailers/footers — `drop()`
+handles finalization but silently swallows errors. Today this affects deflate
+and brotli (which already use this path). The current `process_gzip_to_gzip` calls `encoder.finish()` explicitly —
 but Step 1B moves gzip to `process_through_compression`, which would **regress**
 gzip from working `finish()` to broken `drop()`. This fix prevents that
 regression and also fixes the pre-existing issue for deflate/brotli.
@@ -93,13 +97,16 @@ before or with Step 1B.
 
 ### Step 2: Stream response to client
 
+> **Note:** Step 2 may need adjustment to align with the EC (Edge Compute)
+> implementation. Coordinate with the EC work before finalizing the approach.
+
 Change the publisher proxy path to use Fastly's `StreamingBody` API:
 
 1. Fetch from origin, receive response headers.
 2. Validate status — if backend error, return buffered error response via
    `send_to_client()`.
-3. Check streaming gate — if `html_post_processors()` is non-empty, fall back
-   to buffered path.
+3. Check streaming gate — if `has_html_post_processors()` returns true, fall
+   back to buffered path.
 4. Finalize all response headers. This requires reordering two things:
    - **Synthetic ID/cookie headers**: today set _after_ body processing in
      `handle_publisher_request`. Since they are body-independent (computed from
@@ -184,7 +191,7 @@ No decompression, no processing. Body streams through as read.
 ### Buffered fallback path (error responses or post-processors present)
 
 ```
-Origin returns 4xx/5xx OR html_post_processors() is non-empty
+Origin returns 4xx/5xx OR has_html_post_processors() is true
   → Current buffered path unchanged
   → send_to_client() with proper status and full body
 ```
@@ -233,9 +240,29 @@ remains in place — no need to bypass it.
 
 Clarification: `script_rewriters` (used by Next.js and GTM) are distinct from
 `html_post_processors`. Script rewriters run inside `lol_html` element handlers
-during streaming — they do not require buffering and are unaffected by this
-change. The streaming gate checks only `html_post_processors().is_empty()`, not
-script rewriters. Currently only Next.js registers a post-processor.
+during streaming and are now fragment-safe (resolved in
+[Phase 3](#text-node-fragmentation-phase-3)). `html_post_processors` require
+the full document for post-processing. The streaming gate checks
+`has_html_post_processors()` for the post-processor path. Currently only
+Next.js registers a post-processor.
+
+## Text Node Fragmentation (Phase 3)
+
+`lol_html` fragments text nodes across input chunk boundaries when processing
+HTML incrementally. Script rewriters (`NextJsNextDataRewriter`,
+`GoogleTagManagerIntegration`) expect complete text content — if a domain string
+is split across chunks, the rewrite silently fails.
+
+**Resolved in Phase 3**: Each script rewriter is now fragment-safe. They
+accumulate text fragments internally via `Mutex<String>` until
+`is_last_in_text_node` is true, then process the complete text. Intermediate
+fragments return `RemoveNode` (suppressed from output); the final fragment
+emits the full rewritten content via `Replace`. If no rewrite is needed,
+the full accumulated content is still emitted via `Replace` (since
+intermediate fragments were already removed from the output).
+
+The `HtmlRewriterAdapter` buffered mode (`new_buffered()`) has been removed.
+`create_html_processor` always uses the streaming adapter.
 
 ## Rollback Strategy
 
@@ -258,9 +285,9 @@ improvements.
 
 ### Integration tests (publisher.rs)
 
-- Streaming gate: when `html_post_processors()` is non-empty, response is
+- Streaming gate: when `has_html_post_processors()` is true, response is
   buffered.
-- Streaming gate: when `html_post_processors()` is empty, response streams.
+- Streaming gate: when `has_html_post_processors()` is false, response streams.
 - Backend error (4xx/5xx) returns buffered error response with correct status.
 - Binary content passes through without processing.
 
@@ -271,8 +298,128 @@ improvements.
 - Compare response bodies before/after to confirm byte-identical output for
   HTML, text, and binary.
 
-### Measurement (post-deploy)
+### Performance measurement via Chrome DevTools MCP
 
-- Compare TTFB and time-to-last-byte on staging before and after.
+Capture before/after metrics using Chrome DevTools MCP against Viceroy locally
+and staging. Run each measurement set on `main` (baseline) and the feature
+branch, then compare.
+
+#### Baseline capture (before — on `main`)
+
+1. Start local server: `fastly compute serve`
+2. Navigate to publisher proxy URL via `navigate_page`
+3. Capture network timing:
+   - `list_network_requests` — record TTFB (`responseStart - requestStart`),
+     total time (`responseEnd - requestStart`), and transfer size for the
+     document request
+   - Filter for the main document (`resourceType: Document`)
+4. Run Lighthouse audit:
+   - `lighthouse_audit` with categories `["performance"]`
+   - Record TTFB, LCP, Speed Index, Total Blocking Time
+5. Capture performance trace:
+   - `performance_start_trace` → load page → `performance_stop_trace`
+   - `performance_analyze_insight` — extract "Time to First Byte" and
+     "Network requests" insights
+6. Take memory snapshot:
+   - `take_memory_snapshot` — record JS heap size as a secondary check
+     (WASM heap is measured separately via Fastly dashboard)
+7. Repeat 3-5 times for stable medians
+
+#### Post-implementation capture (after — on feature branch)
+
+Repeat the same steps on the feature branch. Compare:
+
+| Metric             | Source                         | Expected change                                       |
+| ------------------ | ------------------------------ | ----------------------------------------------------- |
+| TTFB (document)    | Network timing                 | Minimal change (gated by backend response time)       |
+| Time to last byte  | Network timing (`responseEnd`) | Reduced — body streams incrementally                  |
+| LCP                | Lighthouse                     | Improved — browser receives `<head>` resources sooner |
+| Speed Index        | Lighthouse                     | Improved — progressive rendering starts earlier       |
+| Transfer size      | Network timing                 | Unchanged (same content, same compression)            |
+| Response body hash | `evaluate_script` with hash    | Identical — correctness check                         |
+
+#### Automated comparison script
+
+Use `evaluate_script` to compute a response body hash in the browser for
+correctness verification:
+
+```js
+// Run via evaluate_script after page load
+const response = await fetch(location.href)
+const buffer = await response.arrayBuffer()
+const hash = await crypto.subtle.digest('SHA-256', buffer)
+const hex = [...new Uint8Array(hash)]
+  .map((b) => b.toString(16).padStart(2, '0'))
+  .join('')
+hex // compare this between baseline and feature branch
+```
+
+#### What to watch for
+
+- **TTFB regression**: If TTFB increases, the header finalization reordering
+  may be adding latency. Investigate `finalize_response()` and synthetic ID
+  computation timing.
+- **Body mismatch**: If response body hashes differ between baseline and
+  feature branch, the streaming pipeline is producing different output.
+  Bisect between Step 1 and Step 2 to isolate.
+- **LCP unchanged**: If LCP doesn't improve, the `<head>` content may not be
+  reaching the browser earlier. Check whether `lol_html` emits the `<head>`
+  injection in the first chunk or buffers until more input arrives.
+
+### Measurement (post-deploy to staging)
+
+- Repeat Chrome DevTools MCP measurements against staging URL.
+- Compare against Viceroy results to account for real network conditions.
 - Monitor WASM heap usage via Fastly dashboard.
 - Verify no regressions on static endpoints or auction.
+
+### Results (getpurpose.ai, median over 5 runs, Chrome 1440x900)
+
+Measured via Chrome DevTools Protocol against prod (v135, buffered) and
+staging (v136, streaming). Chrome `--host-resolver-rules` used to route
+`getpurpose.ai` to the staging Fastly edge (167.82.83.52).
+
+| Metric                     | Production (v135, buffered) | Staging (v136, streaming) | Delta              |
+| -------------------------- | --------------------------- | ------------------------- | ------------------ |
+| **TTFB**                   | 54 ms                       | 35 ms                     | **-19 ms (-35%)**  |
+| **First Paint**            | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **First Contentful Paint** | 186 ms                      | 160 ms                    | -26 ms (-14%)      |
+| **DOM Content Loaded**     | 286 ms                      | 282 ms                    | -4 ms (~same)      |
+| **DOM Complete**           | 1060 ms                     | 663 ms                    | **-397 ms (-37%)** |
+
+## Phase 4: Binary Pass-Through Streaming
+
+Non-processable content (images, fonts, video, `application/octet-stream`)
+currently passes through `handle_publisher_request` unchanged via the
+`Buffered` path, buffering the entire body in memory before sending. For
+large binaries (1-10 MB images), this is wasteful.
+
+Phase 4 adds a `PublisherResponse::PassThrough` variant that signals the
+adapter to stream the body directly via `io::copy` into `StreamingBody`
+with no processing pipeline. This eliminates peak memory for binary
+responses and improves DOM Complete for image-heavy pages.
+
+### Streaming gate (updated)
+
+```
+is_success (2xx)
+├── should_process && (!is_html || !has_post_processors) → Stream (pipeline)
+├── should_process && is_html && has_post_processors     → Buffered (post-processors)
+└── !should_process                                      → PassThrough (io::copy)
+
+!is_success
+└── any content type                                     → Buffered (error page)
+```
+
+### `PublisherResponse` enum (updated)
+
+```rust
+pub enum PublisherResponse {
+    Buffered(Response),
+    Stream { response, body, params },
+    PassThrough { response, body },
+}
+```
+
+`Content-Length` is preserved for `PassThrough` since the body is
+unmodified — no need for chunked transfer encoding.

@@ -19,8 +19,16 @@
 //! streaming interface. See `crate::platform` module doc for the
 //! authoritative note.
 
-use error_stack::{Report, ResultExt};
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
+use std::rc::Rc;
+
+use brotli::enc::writer::CompressorWriter;
+use brotli::enc::BrotliEncoderParams;
+use brotli::Decompressor;
+use error_stack::{Report, ResultExt};
+use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
 
 use crate::error::TrustedServerError;
 
@@ -45,7 +53,7 @@ pub trait StreamProcessor {
 }
 
 /// Compression type for the stream
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
     Gzip,
@@ -66,7 +74,21 @@ impl Compression {
     }
 }
 
-/// Configuration for the streaming pipeline
+/// Configuration for the streaming pipeline.
+///
+/// # Supported compression combinations
+///
+/// | Input | Output | Behavior |
+/// |-------|--------|----------|
+/// | None | None | Pass-through processing |
+/// | Gzip | Gzip | Decompress → process → recompress |
+/// | Gzip | None | Decompress → process |
+/// | Deflate | Deflate | Decompress → process → recompress |
+/// | Deflate | None | Decompress → process |
+/// | Brotli | Brotli | Decompress → process → recompress |
+/// | Brotli | None | Decompress → process |
+///
+/// All other combinations return an error at runtime.
 pub struct PipelineConfig {
     /// Input compression type
     pub input_compression: Compression,
@@ -104,6 +126,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
 
     /// Process a stream from input to output
     ///
+    /// Handles all supported compression transformations by wrapping the raw
+    /// reader/writer in the appropriate decoder/encoder, then delegating to
+    /// [`Self::process_chunks`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the compression transformation is unsupported or if reading/writing fails.
@@ -116,44 +142,88 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
             self.config.input_compression,
             self.config.output_compression,
         ) {
-            (Compression::None, Compression::None) => self.process_uncompressed(input, output),
-            (Compression::Gzip, Compression::Gzip) => self.process_gzip_to_gzip(input, output),
-            (Compression::Gzip, Compression::None) => self.process_gzip_to_none(input, output),
+            (Compression::None, Compression::None) => self.process_chunks(input, output),
+            (Compression::Gzip, Compression::Gzip) => {
+                let decoder = GzDecoder::new(input);
+                let mut encoder = GzEncoder::new(output, flate2::Compression::default());
+                self.process_chunks(decoder, &mut encoder)?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finalize gzip encoder".to_string(),
+                })?;
+                Ok(())
+            }
+            (Compression::Gzip, Compression::None) => {
+                self.process_chunks(GzDecoder::new(input), output)
+            }
             (Compression::Deflate, Compression::Deflate) => {
-                self.process_deflate_to_deflate(input, output)
+                let decoder = ZlibDecoder::new(input);
+                let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
+                self.process_chunks(decoder, &mut encoder)?;
+                encoder.finish().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finalize deflate encoder".to_string(),
+                })?;
+                Ok(())
             }
             (Compression::Deflate, Compression::None) => {
-                self.process_deflate_to_none(input, output)
+                self.process_chunks(ZlibDecoder::new(input), output)
             }
             (Compression::Brotli, Compression::Brotli) => {
-                self.process_brotli_to_brotli(input, output)
+                let decoder = Decompressor::new(input, 4096);
+                let params = BrotliEncoderParams {
+                    quality: 4,
+                    lgwin: 22,
+                    ..Default::default()
+                };
+                let mut encoder = CompressorWriter::with_params(output, 4096, &params);
+                self.process_chunks(decoder, &mut encoder)?;
+                // CompressorWriter emits the brotli stream trailer via flush(),
+                // which process_chunks already called. into_inner() avoids a
+                // redundant flush on drop and makes finalization explicit.
+                // Note: unlike flate2's finish(), CompressorWriter has no
+                // fallible finalization method — flush() is the only option.
+                let _ = encoder.into_inner();
+                Ok(())
             }
-            (Compression::Brotli, Compression::None) => self.process_brotli_to_none(input, output),
+            (Compression::Brotli, Compression::None) => {
+                self.process_chunks(Decompressor::new(input, 4096), output)
+            }
             _ => Err(Report::new(TrustedServerError::Proxy {
                 message: "Unsupported compression transformation".to_string(),
             })),
         }
     }
 
-    /// Process uncompressed stream
-    fn process_uncompressed<R: Read, W: Write>(
+    /// Read chunks from `reader`, pass each through the processor, and write output to `writer`.
+    ///
+    /// This is the single unified chunk loop used by all compression paths.
+    /// The method calls `writer.flush()` before returning. For the `None → None`
+    /// path this is the only finalization needed. For compressed paths, the caller
+    /// must still call the encoder's type-specific finalization after this returns:
+    /// - **flate2** (`GzEncoder`, `ZlibEncoder`): call `finish()` — `flush()` does
+    ///   not write the gzip/deflate trailer.
+    /// - **brotli** (`CompressorWriter`): `flush()` does finalize the stream, so
+    ///   the caller only needs `into_inner()` to reclaim the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, processing, or writing any chunk fails.
+    fn process_chunks<R: Read, W: Write>(
         &mut self,
-        mut input: R,
-        mut output: W,
+        mut reader: R,
+        mut writer: W,
     ) -> Result<(), Report<TrustedServerError>> {
         let mut buffer = vec![0u8; self.config.chunk_size];
 
         loop {
-            match input.read(&mut buffer) {
+            match reader.read(&mut buffer) {
                 Ok(0) => {
-                    // End of stream - process any remaining data
                     let final_chunk = self.processor.process_chunk(&[], true).change_context(
                         TrustedServerError::Proxy {
                             message: "Failed to process final chunk".to_string(),
                         },
                     )?;
                     if !final_chunk.is_empty() {
-                        output.write_all(&final_chunk).change_context(
+                        writer.write_all(&final_chunk).change_context(
                             TrustedServerError::Proxy {
                                 message: "Failed to write final chunk".to_string(),
                             },
@@ -162,7 +232,6 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                     break;
                 }
                 Ok(n) => {
-                    // Process this chunk
                     let processed = self
                         .processor
                         .process_chunk(&buffer[..n], false)
@@ -170,7 +239,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                             message: "Failed to process chunk".to_string(),
                         })?;
                     if !processed.is_empty() {
-                        output
+                        writer
                             .write_all(&processed)
                             .change_context(TrustedServerError::Proxy {
                                 message: "Failed to write processed chunk".to_string(),
@@ -179,309 +248,98 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 }
                 Err(e) => {
                     return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read from input: {}", e),
+                        message: format!("Failed to read: {e}"),
                     }));
                 }
             }
         }
 
-        output.flush().change_context(TrustedServerError::Proxy {
+        writer.flush().change_context(TrustedServerError::Proxy {
             message: "Failed to flush output".to_string(),
         })?;
 
         Ok(())
     }
+}
 
-    /// Process gzip compressed stream
-    fn process_gzip_to_gzip<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
+/// Shared output buffer used as an [`lol_html::OutputSink`].
+///
+/// The `HtmlRewriter` invokes [`OutputSink::handle_chunk`] synchronously during
+/// each [`HtmlRewriter::write`] call, so the buffer is drained after every
+/// `process_chunk` invocation to emit output incrementally.
+struct RcVecSink(Rc<RefCell<Vec<u8>>>);
 
-        // Decompress input
-        let mut decoder = GzDecoder::new(input);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to decompress gzip".to_string(),
-            })?;
-
-        log::info!("Decompressed size: {} bytes", decompressed.len());
-
-        // Process the decompressed content
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("Processed size: {} bytes", processed.len());
-
-        // Recompress the output
-        let mut encoder = GzEncoder::new(output, Compression::default());
-        encoder
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write to gzip encoder".to_string(),
-            })?;
-        encoder.finish().change_context(TrustedServerError::Proxy {
-            message: "Failed to finish gzip encoder".to_string(),
-        })?;
-
-        Ok(())
-    }
-
-    /// Decompress input, process content, and write uncompressed output.
-    fn decompress_and_process<R: Read, W: Write>(
-        &mut self,
-        mut decoder: R,
-        mut output: W,
-        codec_name: &str,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .change_context(TrustedServerError::Proxy {
-                message: format!("Failed to decompress {codec_name}"),
-            })?;
-
-        log::info!(
-            "{codec_name} decompressed size: {} bytes",
-            decompressed.len()
-        );
-
-        let processed = self
-            .processor
-            .process_chunk(&decompressed, true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to process content".to_string(),
-            })?;
-
-        log::info!("{codec_name} processed size: {} bytes", processed.len());
-
-        output
-            .write_all(&processed)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to write output".to_string(),
-            })?;
-
-        Ok(())
-    }
-
-    /// Process gzip compressed input to uncompressed output (decompression only)
-    fn process_gzip_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::GzDecoder;
-
-        self.decompress_and_process(GzDecoder::new(input), output, "gzip")
-    }
-
-    /// Process deflate compressed stream
-    fn process_deflate_to_deflate<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::ZlibDecoder;
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-
-        let decoder = ZlibDecoder::new(input);
-        let encoder = ZlibEncoder::new(output, Compression::default());
-
-        self.process_through_compression(decoder, encoder)
-    }
-
-    /// Process deflate compressed input to uncompressed output (decompression only)
-    fn process_deflate_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use flate2::read::ZlibDecoder;
-
-        self.decompress_and_process(ZlibDecoder::new(input), output, "deflate")
-    }
-
-    /// Process brotli compressed stream
-    fn process_brotli_to_brotli<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use brotli::enc::writer::CompressorWriter;
-        use brotli::enc::BrotliEncoderParams;
-        use brotli::Decompressor;
-
-        let decoder = Decompressor::new(input, 4096);
-        let params = BrotliEncoderParams {
-            quality: 4,
-            lgwin: 22,
-            ..Default::default()
-        };
-        let encoder = CompressorWriter::with_params(output, 4096, &params);
-
-        self.process_through_compression(decoder, encoder)
-    }
-
-    /// Process brotli compressed input to uncompressed output (decompression only)
-    fn process_brotli_to_none<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        use brotli::Decompressor;
-
-        self.decompress_and_process(Decompressor::new(input, 4096), output, "brotli")
-    }
-
-    /// Generic processing through compression layers
-    fn process_through_compression<R: Read, W: Write>(
-        &mut self,
-        mut decoder: R,
-        mut encoder: W,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let mut buffer = vec![0u8; self.config.chunk_size];
-
-        loop {
-            match decoder.read(&mut buffer) {
-                Ok(0) => {
-                    // End of stream
-                    let final_chunk = self.processor.process_chunk(&[], true).change_context(
-                        TrustedServerError::Proxy {
-                            message: "Failed to process final chunk".to_string(),
-                        },
-                    )?;
-                    if !final_chunk.is_empty() {
-                        encoder.write_all(&final_chunk).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write final chunk".to_string(),
-                            },
-                        )?;
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    let processed = self
-                        .processor
-                        .process_chunk(&buffer[..n], false)
-                        .change_context(TrustedServerError::Proxy {
-                            message: "Failed to process chunk".to_string(),
-                        })?;
-                    if !processed.is_empty() {
-                        encoder.write_all(&processed).change_context(
-                            TrustedServerError::Proxy {
-                                message: "Failed to write processed chunk".to_string(),
-                            },
-                        )?;
-                    }
-                }
-                Err(e) => {
-                    return Err(Report::new(TrustedServerError::Proxy {
-                        message: format!("Failed to read from decoder: {}", e),
-                    }));
-                }
-            }
-        }
-
-        // Flush encoder (this also finishes compression)
-        encoder.flush().change_context(TrustedServerError::Proxy {
-            message: "Failed to flush encoder".to_string(),
-        })?;
-
-        // For GzEncoder and similar, we need to finish() to properly close the stream
-        // The flush above might not be enough
-        drop(encoder);
-
-        Ok(())
+impl lol_html::OutputSink for RcVecSink {
+    fn handle_chunk(&mut self, chunk: &[u8]) {
+        self.0.borrow_mut().extend_from_slice(chunk);
     }
 }
 
-/// Adapter to use `lol_html` `HtmlRewriter` as a `StreamProcessor`
-/// Important: Due to `lol_html`'s ownership model, we must accumulate input
-/// and process it all at once when the stream ends. This is a limitation
-/// of the `lol_html` library's API design.
+/// Adapter to use `lol_html` [`HtmlRewriter`](lol_html::HtmlRewriter) as a [`StreamProcessor`].
+///
+/// Output is emitted incrementally on every [`process_chunk`](StreamProcessor::process_chunk)
+/// call. Script rewriters that receive text from `lol_html` must be fragment-safe —
+/// they accumulate text fragments internally until `is_last_in_text_node` is true.
+///
+/// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
+/// is a no-op because the rewriter consumes its settings on construction.
 pub struct HtmlRewriterAdapter {
-    settings: lol_html::Settings<'static, 'static>,
-    accumulated_input: Vec<u8>,
+    rewriter: Option<lol_html::HtmlRewriter<'static, RcVecSink>>,
+    output: Rc<RefCell<Vec<u8>>>,
 }
 
 impl HtmlRewriterAdapter {
-    /// Create a new HTML rewriter adapter
+    /// Create a new HTML rewriter adapter that streams output per chunk.
     #[must_use]
     pub fn new(settings: lol_html::Settings<'static, 'static>) -> Self {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let sink = RcVecSink(Rc::clone(&output));
+        let rewriter = lol_html::HtmlRewriter::new(settings, sink);
         Self {
-            settings,
-            accumulated_input: Vec::new(),
+            rewriter: Some(rewriter),
+            output,
         }
     }
 }
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        // Accumulate input chunks
-        self.accumulated_input.extend_from_slice(chunk);
-
-        if !chunk.is_empty() {
-            log::debug!(
-                "Buffering chunk: {} bytes, total buffered: {} bytes",
-                chunk.len(),
-                self.accumulated_input.len()
-            );
+        match &mut self.rewriter {
+            Some(rewriter) => {
+                if !chunk.is_empty() {
+                    rewriter.write(chunk).map_err(|e| {
+                        log::error!("Failed to process HTML chunk: {e}");
+                        io::Error::other(format!("HTML processing failed: {e}"))
+                    })?;
+                }
+            }
+            None if !chunk.is_empty() => {
+                log::warn!(
+                    "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
+                    chunk.len()
+                );
+            }
+            None => {}
         }
 
-        // Only process when we have all the input
         if is_last {
-            log::info!(
-                "Processing complete document: {} bytes",
-                self.accumulated_input.len()
-            );
-
-            // Process all accumulated input at once
-            let mut output = Vec::new();
-
-            // Create rewriter with output sink
-            let mut rewriter = lol_html::HtmlRewriter::new(
-                std::mem::take(&mut self.settings),
-                |chunk: &[u8]| {
-                    output.extend_from_slice(chunk);
-                },
-            );
-
-            // Process the entire document
-            rewriter.write(&self.accumulated_input).map_err(|e| {
-                log::error!("Failed to process HTML: {}", e);
-                io::Error::other(format!("HTML processing failed: {}", e))
-            })?;
-
-            // Finalize the rewriter
-            rewriter.end().map_err(|e| {
-                log::error!("Failed to finalize: {}", e);
-                io::Error::other(format!("HTML finalization failed: {}", e))
-            })?;
-
-            log::debug!("Output size: {} bytes", output.len());
-            self.accumulated_input.clear();
-            Ok(output)
-        } else {
-            // Return empty until we have all input
-            // This is a limitation of lol_html's API
-            Ok(Vec::new())
+            if let Some(rewriter) = self.rewriter.take() {
+                rewriter.end().map_err(|e| {
+                    log::error!("Failed to finalize HTML: {e}");
+                    io::Error::other(format!("HTML finalization failed: {e}"))
+                })?;
+            }
         }
+
+        // Drain whatever lol_html produced since the last call
+        Ok(std::mem::take(&mut *self.output.borrow_mut()))
     }
 
-    fn reset(&mut self) {
-        self.accumulated_input.clear();
-    }
+    /// No-op. `HtmlRewriterAdapter` is single-use: the rewriter consumes its
+    /// [`Settings`](lol_html::Settings) on construction and cannot be recreated.
+    /// Calling [`process_chunk`](StreamProcessor::process_chunk) after finalization
+    /// (`is_last = true`) will produce empty output — the rewriter is already done.
+    fn reset(&mut self) {}
 }
 
 /// Adapter to use our existing `StreamingReplacer` as a `StreamProcessor`
@@ -497,6 +355,57 @@ impl StreamProcessor for StreamingReplacer {
 mod tests {
     use super::*;
     use crate::streaming_replacer::{Replacement, StreamingReplacer};
+
+    /// Verify that `lol_html` fragments text nodes when input chunks split
+    /// mid-text-node. Script rewriters must be fragment-safe — they accumulate
+    /// text fragments internally until `is_last_in_text_node` is true.
+    #[test]
+    fn lol_html_fragments_text_across_chunk_boundaries() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let fragments: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let fragments_clone = Rc::clone(&fragments);
+
+        let mut rewriter = lol_html::HtmlRewriter::new(
+            lol_html::Settings {
+                element_content_handlers: vec![lol_html::text!("script", move |text| {
+                    fragments_clone
+                        .borrow_mut()
+                        .push((text.as_str().to_string(), text.last_in_text_node()));
+                    Ok(())
+                })],
+                ..lol_html::Settings::default()
+            },
+            |_chunk: &[u8]| {},
+        );
+
+        // Split "googletagmanager.com/gtm.js" across two chunks
+        rewriter
+            .write(b"<script>google")
+            .expect("should write chunk1");
+        rewriter
+            .write(b"tagmanager.com/gtm.js</script>")
+            .expect("should write chunk2");
+        rewriter.end().expect("should end");
+
+        let frags = fragments.borrow();
+        // lol_html should emit at least 2 text fragments since input was split
+        assert!(
+            frags.len() >= 2,
+            "should fragment text across chunk boundaries, got {} fragments: {:?}",
+            frags.len(),
+            *frags
+        );
+        // No single fragment should contain the full domain
+        assert!(
+            !frags
+                .iter()
+                .any(|(text, _)| text.contains("googletagmanager.com")),
+            "no individual fragment should contain the full domain when split across chunks: {:?}",
+            *frags
+        );
+    }
 
     #[test]
     fn test_uncompressed_pipeline() {
@@ -547,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_html_rewriter_adapter_accumulates_until_last() {
+    fn test_html_rewriter_adapter_streams_incrementally() {
         use lol_html::{element, Settings};
 
         // Create a simple HTML rewriter that replaces text
@@ -561,32 +470,40 @@ mod tests {
 
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
-        // Test that intermediate chunks return empty
         let chunk1 = b"<html><body>";
         let result1 = adapter
             .process_chunk(chunk1, false)
             .expect("should process chunk1");
-        assert_eq!(result1.len(), 0, "Should return empty for non-last chunk");
 
         let chunk2 = b"<p>original</p>";
         let result2 = adapter
             .process_chunk(chunk2, false)
             .expect("should process chunk2");
-        assert_eq!(result2.len(), 0, "Should return empty for non-last chunk");
 
-        // Test that last chunk processes everything
         let chunk3 = b"</body></html>";
         let result3 = adapter
             .process_chunk(chunk3, true)
             .expect("should process final chunk");
+
+        // Concatenate all outputs and verify the final HTML is correct
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        all_output.extend_from_slice(&result3);
+
         assert!(
-            !result3.is_empty(),
-            "Should return processed content for last chunk"
+            !all_output.is_empty(),
+            "should produce non-empty concatenated output"
         );
 
-        let output = String::from_utf8(result3).expect("output should be valid UTF-8");
-        assert!(output.contains("replaced"), "Should have replaced content");
-        assert!(output.contains("<html>"), "Should have complete HTML");
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("replaced"),
+            "should have replaced content in concatenated output"
+        );
+        assert!(
+            output.contains("<html>"),
+            "should have complete HTML in concatenated output"
+        );
     }
 
     #[test]
@@ -603,59 +520,294 @@ mod tests {
         }
         large_html.push_str("</body></html>");
 
-        // Process in chunks
+        // Process in chunks and collect all output
         let chunk_size = 1024;
         let bytes = large_html.as_bytes();
-        let mut chunks = bytes.chunks(chunk_size);
-        let mut last_chunk = chunks.next().unwrap_or(&[]);
+        let mut chunks = bytes.chunks(chunk_size).peekable();
+        let mut all_output = Vec::new();
 
-        for chunk in chunks {
+        while let Some(chunk) = chunks.next() {
+            let is_last = chunks.peek().is_none();
             let result = adapter
-                .process_chunk(last_chunk, false)
-                .expect("should process intermediate chunk");
-            assert_eq!(result.len(), 0, "Intermediate chunks should return empty");
-            last_chunk = chunk;
+                .process_chunk(chunk, is_last)
+                .expect("should process chunk");
+            all_output.extend_from_slice(&result);
         }
 
-        // Process last chunk
-        let result = adapter
-            .process_chunk(last_chunk, true)
-            .expect("should process last chunk");
-        assert!(!result.is_empty(), "Last chunk should return content");
+        assert!(
+            !all_output.is_empty(),
+            "should produce non-empty output for large document"
+        );
 
-        let output = String::from_utf8(result).expect("output should be valid UTF-8");
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
         assert!(
             output.contains("Paragraph 999"),
-            "Should contain all content"
+            "should contain all content from large document"
         );
     }
 
     #[test]
-    fn test_html_rewriter_adapter_reset() {
+    fn test_html_rewriter_adapter_reset_then_finalize() {
         use lol_html::Settings;
 
         let settings = Settings::default();
         let mut adapter = HtmlRewriterAdapter::new(settings);
 
-        // Process some content
-        adapter
-            .process_chunk(b"<html>", false)
-            .expect("should process html tag");
-        adapter
-            .process_chunk(b"<body>test</body>", false)
-            .expect("should process body");
+        let result1 = adapter
+            .process_chunk(b"<html><body>test</body></html>", false)
+            .expect("should process html");
 
-        // Reset should clear accumulated input
+        // reset() is a documented no-op — adapter is single-use
         adapter.reset();
 
-        // After reset, adapter should be ready for new input
-        let result = adapter
-            .process_chunk(b"<p>new</p>", true)
-            .expect("should process new content after reset");
-        let output = String::from_utf8(result).expect("output should be valid UTF-8");
+        // Finalize still works; the rewriter is still alive
+        let result2 = adapter
+            .process_chunk(b"", true)
+            .expect("should finalize after reset");
+
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("test"),
+            "should produce correct output despite no-op reset"
+        );
+    }
+
+    #[test]
+    fn test_deflate_round_trip_produces_valid_output() {
+        // Verify that deflate-to-deflate produces valid output that decompresses
+        // correctly, confirming that encoder finalization works.
+        use flate2::read::ZlibDecoder;
+        use flate2::write::ZlibEncoder;
+        use std::io::{Read as _, Write as _};
+
+        let input_data = b"<html><body>hello world</body></html>";
+
+        // Compress input
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = ZlibEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Deflate,
+            output_compression: Compression::Deflate,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process deflate-to-deflate");
+
+        // Decompress output and verify correctness
+        let mut decompressed = Vec::new();
+        ZlibDecoder::new(&output[..])
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
         assert_eq!(
-            output, "<p>new</p>",
-            "Should only contain new input after reset"
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through deflate round-trip"
+        );
+    }
+
+    #[test]
+    fn test_gzip_to_gzip_produces_correct_output() {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use std::io::{Read as _, Write as _};
+
+        // Arrange
+        let input_data = b"<html><body>hello world</body></html>";
+
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        // Act
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process gzip-to-gzip");
+
+        // Assert
+        let mut decompressed = Vec::new();
+        GzDecoder::new(&output[..])
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
+        assert_eq!(
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through gzip round-trip"
+        );
+    }
+
+    #[test]
+    fn test_gzip_to_none_produces_correct_output() {
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        // Arrange
+        let input_data = b"<html><body>hello world</body></html>";
+
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        // Act
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process gzip-to-none");
+
+        // Assert
+        let result = String::from_utf8(output).expect("should be valid UTF-8 uncompressed output");
+        assert_eq!(
+            result, "<html><body>hi world</body></html>",
+            "should have replaced content after gzip decompression"
+        );
+    }
+
+    #[test]
+    fn test_brotli_round_trip_produces_valid_output() {
+        use brotli::enc::writer::CompressorWriter;
+        use brotli::Decompressor;
+        use std::io::{Read as _, Write as _};
+
+        let input_data = b"<html><body>hello world</body></html>";
+
+        // Compress input with brotli
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = CompressorWriter::new(&mut compressed_input, 4096, 4, 22);
+            enc.write_all(input_data)
+                .expect("should compress test input");
+            enc.flush().expect("should flush brotli encoder");
+        }
+
+        let replacer = StreamingReplacer::new(vec![Replacement {
+            find: "hello".to_string(),
+            replace_with: "hi".to_string(),
+        }]);
+
+        let config = PipelineConfig {
+            input_compression: Compression::Brotli,
+            output_compression: Compression::Brotli,
+            chunk_size: 8192,
+        };
+
+        let mut pipeline = StreamingPipeline::new(config, replacer);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("should process brotli-to-brotli");
+
+        // Decompress output and verify correctness
+        let mut decompressed = Vec::new();
+        Decompressor::new(&output[..], 4096)
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output — implies encoder was finalized correctly");
+
+        assert_eq!(
+            String::from_utf8(decompressed).expect("should be valid UTF-8"),
+            "<html><body>hi world</body></html>",
+            "should have replaced content through brotli round-trip"
+        );
+    }
+
+    #[test]
+    fn test_html_rewriter_adapter_emits_output_per_chunk() {
+        use lol_html::Settings;
+
+        let settings = Settings::default();
+        let mut adapter = HtmlRewriterAdapter::new(settings);
+
+        // Send three chunks — lol_html may buffer internally, so individual
+        // chunk outputs may vary by version. The contract is that concatenated
+        // output is correct, and that output is not deferred entirely to is_last.
+        let result1 = adapter
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let result2 = adapter
+            .process_chunk(b"<p>hello</p>", false)
+            .expect("should process chunk2");
+        let result3 = adapter
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        // At least one intermediate chunk should produce output (verifies
+        // we're not deferring everything to is_last like the old adapter).
+        assert!(
+            !result1.is_empty() || !result2.is_empty(),
+            "should emit some output before is_last"
+        );
+
+        // Concatenated output must be correct
+        let mut all_output = result1;
+        all_output.extend_from_slice(&result2);
+        all_output.extend_from_slice(&result3);
+
+        let output = String::from_utf8(all_output).expect("output should be valid UTF-8");
+        assert!(
+            output.contains("<html>"),
+            "should contain html tag in concatenated output"
+        );
+        assert!(
+            output.contains("<p>hello</p>"),
+            "should contain paragraph in concatenated output"
+        );
+        assert!(
+            output.contains("</html>"),
+            "should contain closing html tag in concatenated output"
         );
     }
 
@@ -694,6 +846,63 @@ mod tests {
         assert!(
             !result.contains("example.com"),
             "Should not contain original URL"
+        );
+    }
+
+    #[test]
+    fn test_gzip_pipeline_with_html_rewriter() {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use lol_html::{element, Settings};
+        use std::io::{Read as _, Write as _};
+
+        let settings = Settings {
+            element_content_handlers: vec![element!("a[href]", |el| {
+                if let Some(href) = el.get_attribute("href") {
+                    if href.contains("example.com") {
+                        el.set_attribute("href", &href.replace("example.com", "test.com"))?;
+                    }
+                }
+                Ok(())
+            })],
+            ..Settings::default()
+        };
+
+        let input = b"<html><body><a href=\"https://example.com\">Link</a></body></html>";
+
+        let mut compressed_input = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed_input, flate2::Compression::default());
+            enc.write_all(input).expect("should compress test input");
+            enc.finish().expect("should finish compression");
+        }
+
+        let adapter = HtmlRewriterAdapter::new(settings);
+        let config = PipelineConfig {
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(config, adapter);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(&compressed_input[..], &mut output)
+            .expect("pipeline should process gzip HTML");
+
+        let mut decompressed = Vec::new();
+        GzDecoder::new(&output[..])
+            .read_to_end(&mut decompressed)
+            .expect("should decompress output");
+
+        let result = String::from_utf8(decompressed).expect("output should be valid UTF-8");
+        assert!(
+            result.contains("https://test.com"),
+            "should have replaced URL through gzip HTML pipeline"
+        );
+        assert!(
+            !result.contains("example.com"),
+            "should not contain original URL after gzip HTML pipeline"
         );
     }
 }
