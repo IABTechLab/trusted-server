@@ -1,7 +1,6 @@
 use error_stack::Report;
 use fastly::http::Method;
 use fastly::{Request, Response};
-use log_fastly::Logger;
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
