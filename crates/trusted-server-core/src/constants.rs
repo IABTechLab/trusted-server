@@ -1,9 +1,10 @@
 use http::header::HeaderName;
 
-pub const COOKIE_SYNTHETIC_ID: &str = "synthetic_id";
+pub const COOKIE_TS_EC: &str = "ts-ec";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
-pub const HEADER_X_SYNTHETIC_ID: HeaderName = HeaderName::from_static("x-synthetic-id");
+pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
+pub const HEADER_X_TS_EC_FRESH: HeaderName = HeaderName::from_static("x-ts-ec-fresh");
 pub const HEADER_X_CONSENT_ADVERTISING: HeaderName =
     HeaderName::from_static("x-consent-advertising");
 pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -43,7 +44,8 @@ pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.
 pub const INTERNAL_HEADERS: &[&str] = &[
-    "x-synthetic-id",
+    "x-ts-ec",
+    "x-ts-ec-fresh",
     "x-pub-user-id",
     "x-subject-id",
     "x-consent-advertising",

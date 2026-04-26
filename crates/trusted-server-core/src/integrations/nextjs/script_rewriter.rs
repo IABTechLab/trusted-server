@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use error_stack::Report;
 use regex::{escape, Regex};
@@ -14,6 +14,14 @@ use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
     rewriter: UrlRewriter,
+    /// Accumulates text fragments when `lol_html` splits a text node across
+    /// chunk boundaries. Drained on `is_last_in_text_node`.
+    ///
+    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
+    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
+    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
+    /// per element — the buffer is always empty when a new element's text begins.
+    accumulated_text: Mutex<String>,
 }
 
 impl NextJsNextDataRewriter {
@@ -23,6 +31,7 @@ impl NextJsNextDataRewriter {
         Ok(Self {
             rewriter: UrlRewriter::new(&config.rewrite_attributes)?,
             config,
+            accumulated_text: Mutex::new(String::new()),
         })
     }
 
@@ -65,7 +74,33 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        self.rewrite_structured(content, ctx)
+        let mut buf = self
+            .accumulated_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if !ctx.is_last_in_text_node {
+            // Intermediate fragment — accumulate and suppress output.
+            buf.push_str(content);
+            return ScriptRewriteAction::RemoveNode;
+        }
+
+        // Last fragment. If nothing was accumulated, process directly.
+        if buf.is_empty() {
+            return self.rewrite_structured(content, ctx);
+        }
+
+        // Complete the accumulated text and process the full content.
+        // If rewrite_structured returns Keep, we must still emit the full
+        // accumulated text via Replace — intermediate fragments were already
+        // removed from lol_html's output via RemoveNode.
+        buf.push_str(content);
+        let full_content = std::mem::take(&mut *buf);
+        let action = self.rewrite_structured(&full_content, ctx);
+        if matches!(action, ScriptRewriteAction::Keep) {
+            return ScriptRewriteAction::replace(full_content);
+        }
+        action
     }
 }
 
@@ -463,5 +498,120 @@ mod tests {
 
         assert!(rewritten.contains("https://proxy.example.com/news"));
         assert!(rewritten.contains("//proxy.example.com/assets/logo.png"));
+    }
+
+    #[test]
+    fn fragmented_next_data_is_accumulated_and_rewritten() {
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
+        let document_state = IntegrationDocumentState::default();
+
+        let fragment1 = r#"{"props":{"pageProps":{"href":"https://origin."#;
+        let fragment2 = r#"example.com/reviews"}}}"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action1 = rewriter.rewrite(fragment1, &ctx_intermediate);
+        assert_eq!(
+            action1,
+            ScriptRewriteAction::RemoveNode,
+            "should suppress intermediate fragment"
+        );
+
+        let action2 = rewriter.rewrite(fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(rewritten) => {
+                assert!(
+                    rewritten.contains("ts.example.com"),
+                    "should rewrite origin to proxy host. Got: {rewritten}"
+                );
+                assert!(
+                    rewritten.contains("/reviews"),
+                    "should preserve path. Got: {rewritten}"
+                );
+                assert!(
+                    !rewritten.contains("origin.example.com"),
+                    "should not contain original host. Got: {rewritten}"
+                );
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unfragmented_next_data_works_without_accumulation() {
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
+        let document_state = IntegrationDocumentState::default();
+        let payload = r#"{"props":{"pageProps":{"href":"https://origin.example.com/page"}}}"#;
+
+        let ctx_single = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: true,
+            document_state: &document_state,
+        };
+
+        let action = rewriter.rewrite(payload, &ctx_single);
+        match action {
+            ScriptRewriteAction::Replace(rewritten) => {
+                assert!(
+                    rewritten.contains("ts.example.com"),
+                    "should rewrite. Got: {rewritten}"
+                );
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_next_data_without_rewritable_urls_preserves_content() {
+        let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
+        let document_state = IntegrationDocumentState::default();
+
+        // __NEXT_DATA__ JSON with no origin URLs — rewrite_structured returns Keep.
+        let fragment1 = r#"{"props":{"pageProps":{"title":"Hello"#;
+        let fragment2 = r#" World","count":42}}}"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script#__NEXT_DATA__",
+            request_host: "ts.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action1 = rewriter.rewrite(fragment1, &ctx_intermediate);
+        assert_eq!(action1, ScriptRewriteAction::RemoveNode);
+
+        // Last fragment: even though no URLs to rewrite, must emit full content
+        // because intermediate fragments were removed.
+        let action2 = rewriter.rewrite(fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(content) => {
+                let expected = format!("{fragment1}{fragment2}");
+                assert_eq!(
+                    content, expected,
+                    "should emit full accumulated content unchanged"
+                );
+            }
+            other => panic!("expected Replace with passthrough, got {other:?}"),
+        }
     }
 }
