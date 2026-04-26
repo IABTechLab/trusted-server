@@ -133,18 +133,7 @@ pub fn set_fastly_synthetic_cookie(
     response: &mut fastly::Response,
     synthetic_id: &str,
 ) {
-    if !crate::cookies::synthetic_id_cookie_value_is_safe(synthetic_id) {
-        log::warn!(
-            "Rejecting synthetic_id for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            synthetic_id.len()
-        );
-        return;
-    }
-
-    response.append_header(
-        header::SET_COOKIE,
-        crate::cookies::create_synthetic_cookie(settings, synthetic_id),
-    );
+    crate::cookies::set_ec_cookie(settings, response, synthetic_id);
 }
 
 /// Expire the synthetic ID cookie on a `fastly::Response`.
@@ -154,10 +143,7 @@ pub fn expire_fastly_synthetic_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
-    response.append_header(
-        header::SET_COOKIE,
-        crate::cookies::create_synthetic_id_expiry_cookie(settings),
-    );
+    crate::cookies::expire_ec_cookie(settings, response);
 }
 
 #[cfg(test)]
@@ -299,7 +285,7 @@ mod tests {
     fn copy_fastly_custom_headers_filters_internal() {
         let mut from_req = fastly::Request::new(fastly::http::Method::GET, "https://example.com");
         from_req.set_header("x-custom-data", "present");
-        from_req.set_header("x-synthetic-id", "should-not-copy");
+        from_req.set_header("x-ts-ec", "should-not-copy");
         let mut to_req = fastly::Request::new(fastly::http::Method::GET, "https://partner.com");
 
         copy_fastly_custom_headers(&from_req, &mut to_req);
@@ -312,7 +298,7 @@ mod tests {
             "should copy arbitrary x-header"
         );
         assert!(
-            to_req.get_header("x-synthetic-id").is_none(),
+            to_req.get_header("x-ts-ec").is_none(),
             "should not copy internal header"
         );
     }
@@ -352,7 +338,7 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "synthetic_id=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
+                "ts-ec=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
                 settings.publisher.cookie_domain
             )),
             "should set expected synthetic cookie"
@@ -373,7 +359,7 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "synthetic_id=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+                "ts-ec=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
                 settings.publisher.cookie_domain
             )),
             "should set expected expiry cookie"

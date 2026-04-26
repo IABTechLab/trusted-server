@@ -7,10 +7,10 @@ use crate::auction::formats::AdRequest;
 use crate::compat;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
+use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
-use crate::synthetic::get_or_generate_synthetic_id;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::types::AuctionContext;
@@ -49,11 +49,11 @@ pub async fn handle_auction(
 
     let http_req = compat::from_fastly_headers_ref(&req);
 
-    // Generate synthetic ID early so the consent pipeline can use it for
+    // Generate EC ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
-    let synthetic_id = get_or_generate_synthetic_id(settings, services, &http_req).change_context(
+    let ec_id = get_or_generate_ec_id(settings, services, &req).change_context(
         TrustedServerError::Auction {
-            message: "Failed to generate synthetic ID".to_string(),
+            message: "Failed to generate EC ID".to_string(),
         },
     )?;
 
@@ -71,7 +71,12 @@ pub async fn handle_auction(
         req: &http_req,
         config: &settings.consent,
         geo: geo.as_ref(),
-        synthetic_id: Some(synthetic_id.as_str()),
+        ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
     });
 
     // Convert tsjs request format to auction request
@@ -81,7 +86,7 @@ pub async fn handle_auction(
         services,
         &req,
         consent_context,
-        &synthetic_id,
+        &ec_id,
         geo,
     )?;
 
