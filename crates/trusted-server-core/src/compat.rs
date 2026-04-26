@@ -87,7 +87,7 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
 pub fn to_fastly_request_ref(req: &http::Request<EdgeBody>) -> fastly::Request {
     let mut fastly_req = fastly::Request::new(req.method().clone(), req.uri().to_string());
     for (name, value) in req.headers() {
-        fastly_req.set_header(name.as_str(), value.as_bytes());
+        fastly_req.append_header(name.as_str(), value.as_bytes());
     }
 
     fastly_req
@@ -436,6 +436,30 @@ mod tests {
         assert!(
             fastly_req.take_body_bytes().is_empty(),
             "borrowed conversion should not copy body bytes"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_ref_preserves_duplicate_headers() {
+        let http_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .header("x-custom", "first")
+            .header("x-custom", "second")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let fastly_req = to_fastly_request_ref(&http_req);
+
+        let values: Vec<_> = fastly_req
+            .get_headers()
+            .filter(|(name, _)| name.as_str() == "x-custom")
+            .map(|(_, value)| value.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate headers"
         );
     }
 
