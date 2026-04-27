@@ -739,7 +739,7 @@ mod tests {
         set_header(&mut req, "x-custom-1", "value1");
         // HeaderName is case-insensitive and normalized by `http`.
         set_header(&mut req, "X-Custom-2", "value2");
-        set_header(&mut req, "x-synthetic-id", "should not copy");
+        set_header(&mut req, "x-ts-ec", "should not copy");
         set_header(&mut req, "x-geo-country", "US");
 
         let mut target = build_request(Method::GET, "https://target.com");
@@ -766,8 +766,8 @@ mod tests {
             "Should copy arbitrary X-header (case insensitive)"
         );
         assert!(
-            target.headers().get("x-synthetic-id").is_none(),
-            "Should filter x-synthetic-id"
+            target.headers().get("x-ts-ec").is_none(),
+            "Should filter x-ts-ec"
         );
         assert!(
             target.headers().get("x-geo-country").is_none(),

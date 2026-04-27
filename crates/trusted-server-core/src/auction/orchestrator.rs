@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformPendingRequest, RuntimeServices};
+use crate::compat::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
@@ -157,20 +158,21 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
-            let select_result = services
+            let platform_resp = services
                 .http_client()
-                .select(vec![PlatformPendingRequest::new(pending)])
+                .wait(PlatformPendingRequest::new(pending))
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} request failed", mediator.provider_name()),
                 })?;
-            let platform_resp =
-                select_result
-                    .ready
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} request failed", mediator.provider_name()),
-                    })?;
-            let backend_response = crate::compat::to_fastly_response(platform_resp.response);
+            let backend_response = platform_response_to_fastly(platform_resp).change_context(
+                TrustedServerError::Auction {
+                    message: format!(
+                        "Mediator {} returned an unsupported response body",
+                        mediator.provider_name()
+                    ),
+                },
+            )?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
@@ -242,8 +244,9 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses `fastly::http::request::select()` to process responses as they
-    /// become ready, rather than waiting for each response sequentially.
+    /// Uses [`RuntimeServices::http_client`] and
+    /// [`crate::platform::PlatformHttpClient::select`] to process responses as
+    /// they become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
@@ -391,27 +394,41 @@ impl AuctionOrchestrator {
                 Ok(platform_response) => {
                     // Identify the provider from the backend name
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
-                    let response = crate::compat::to_fastly_response(platform_response.response);
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms) {
-                            Ok(auction_response) => {
-                                log::info!(
-                                    "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
-                                    auction_response.provider,
-                                    auction_response.bids.len(),
-                                    auction_response.status,
-                                    auction_response.response_time_ms
-                                );
-                                responses.push(auction_response);
+                        match platform_response_to_fastly(platform_response) {
+                            Ok(response) => {
+                                match provider.parse_response(response, response_time_ms) {
+                                    Ok(auction_response) => {
+                                        log::info!(
+                                        "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
+                                        auction_response.provider,
+                                        auction_response.bids.len(),
+                                        auction_response.status,
+                                        auction_response.response_time_ms
+                                    );
+                                        responses.push(auction_response);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Provider '{}' failed to parse response: {:?}",
+                                            provider_name,
+                                            e
+                                        );
+                                        responses.push(AuctionResponse::error(
+                                            provider_name,
+                                            response_time_ms,
+                                        ));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "Provider '{}' failed to parse response: {:?}",
+                                    "Provider '{}' returned an unsupported response body: {:?}",
                                     provider_name,
                                     e
                                 );
@@ -616,8 +633,18 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+    };
+
+    // All-None ClientInfo used across tests that don't need real IP/TLS data.
+    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
+    // the temporary-lifetime issue that arises with &ClientInfo::default().
+    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
+        client_ip: None,
+        tls_protocol: None,
+        tls_cipher: None,
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
@@ -671,23 +698,6 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
-    }
-
-    fn create_test_context<'a>(
-        settings: &'a crate::settings::Settings,
-        req: &'a Request,
-        client_info: &'a crate::platform::ClientInfo,
-    ) -> AuctionContext<'a> {
-        let services: &'static crate::platform::RuntimeServices =
-            Box::leak(Box::new(noop_services()));
-        AuctionContext {
-            settings,
-            request: req,
-            client_info,
-            timeout_ms: 2000,
-            provider_responses: None,
-            services,
-        }
     }
 
     #[test]
@@ -777,15 +787,7 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(
-            &settings,
-            &req,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())

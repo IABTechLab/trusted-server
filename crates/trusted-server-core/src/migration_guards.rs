@@ -27,7 +27,6 @@ fn migrated_utility_and_handler_modules_do_not_depend_on_fastly_request_response
     let sources = [
         ("auth.rs", include_str!("auth.rs")),
         ("cookies.rs", include_str!("cookies.rs")),
-        ("synthetic.rs", include_str!("synthetic.rs")),
         ("http_util.rs", include_str!("http_util.rs")),
         ("geo.rs", include_str!("geo.rs")),
         ("publisher.rs", include_str!("publisher.rs")),

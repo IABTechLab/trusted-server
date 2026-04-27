@@ -621,7 +621,7 @@ impl PrebidAuctionProvider {
                 // EIDs will be populated by identity providers; consent gating
                 // is applied via `gate_eids_by_consent` before they are set here.
                 eids: None,
-                synthetic_fresh: Some(request.user.fresh_id.clone()),
+                ec_fresh: Some(request.user.fresh_id.clone()),
             }
             .to_ext(),
             ..Default::default()
@@ -1217,8 +1217,18 @@ pub fn register_auction_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+    };
+
+    // All-None ClientInfo used across tests that don't need real IP/TLS data.
+    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
+    // the temporary-lifetime issue that arises with &ClientInfo::default().
+    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
+        client_ip: None,
+        tls_protocol: None,
+        tls_cipher: None,
     };
     use crate::consent::ConsentContext;
     use crate::geo::GeoInfo;
@@ -1290,17 +1300,7 @@ mod tests {
         request: &'a Request,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
-        use crate::platform::test_support::noop_services;
-        let services: &'static crate::platform::RuntimeServices =
-            Box::leak(Box::new(noop_services()));
-        AuctionContext {
-            settings,
-            request,
-            client_info,
-            timeout_ms: 1000,
-            provider_responses: None,
-            services,
-        }
+        shared_test_auction_context(settings, request, client_info, 1000)
     }
 
     fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
@@ -1321,7 +1321,7 @@ mod tests {
         )
     }
 
-    /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
+    /// Shared TOML prefix for config-parsing tests (publisher + ec sections).
     const TOML_BASE: &str = r#"
 [[handlers]]
 path = "^/admin"
@@ -1334,11 +1334,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
@@ -1718,15 +1715,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1778,15 +1767,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1820,15 +1801,7 @@ server_url = "https://prebid.example"
         });
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1860,15 +1833,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1923,15 +1888,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1956,15 +1913,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1988,15 +1937,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2040,15 +1981,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2098,15 +2031,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2144,15 +2069,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2180,15 +2097,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2211,15 +2120,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2245,15 +2146,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2474,15 +2367,7 @@ server_url = "https://prebid.example"
         let settings = make_settings();
         let mut request = Request::get("https://pub.example/auction");
         request.set_header("DNT", "1");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2508,15 +2393,7 @@ server_url = "https://prebid.example"
         let settings = make_settings();
         let mut request = Request::get("https://pub.example/auction");
         request.set_header("Accept-Language", "en-US,en;q=0.9,fr;q=0.8");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2546,15 +2423,7 @@ server_url = "https://prebid.example"
         let settings = make_settings();
         let mut request = Request::get("https://pub.example/auction");
         request.set_header("Accept-Language", "");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2590,15 +2459,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2633,15 +2494,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2674,15 +2527,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2712,15 +2557,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2747,15 +2584,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2786,15 +2615,7 @@ server_url = "https://prebid.example"
         let settings = make_settings();
         let mut request = Request::get("https://pub.example/auction");
         request.set_header("Referer", "https://google.com/search?q=test");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2818,15 +2639,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(
             &auction_request,

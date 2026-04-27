@@ -12,7 +12,7 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use error_stack::{Report, ResultExt};
@@ -132,13 +132,68 @@ fn validate_container_id(container_id: &str) -> Result<(), validator::Validation
     }
 }
 
+/// GTM domain markers the script rewriter looks for. Kept in one place so the
+/// boundary-safe prefix check in [`might_contain_gtm_prefix`] and the full-match
+/// check in [`GoogleTagManagerIntegration::rewrite`] cannot drift apart.
+const GTM_SCRIPT_MARKERS: &[&str] = &["googletagmanager.com", "google-analytics.com"];
+
+/// Minimum trailing-prefix length required to engage the accumulation path.
+///
+/// Both markers share the prefix `"google"` (6 bytes); below that, the
+/// tail is ambiguous with common English (`g`, `go`) and minified tokens
+/// (`img`, `slug`, …) and would over-claim. Requiring ≥ 6 bytes means only
+/// fragments ending with `"google"` or a longer prefix (`"googletag"`,
+/// `"googletagmanager"`, etc.) engage accumulation. Fragments split *within*
+/// the common prefix (e.g. "go"|"ogletagmanager.com") will miss the rewrite,
+/// but this is extremely rare with the production 8 KB chunk size and is the
+/// explicit trade-off documented above.
+const GTM_MIN_PREFIX_LEN: usize = 6;
+
+/// Return true if `text` either already contains a GTM marker or ends with a
+/// proper prefix of one of length ≥ [`GTM_MIN_PREFIX_LEN`] — i.e., the next
+/// fragment could still complete a match. Used to gate whether the GTM
+/// rewriter should claim ownership of a script's output via
+/// `RemoveNode`/`Replace`.
+///
+/// Returning false means the rewriter can safely return `Keep` and leave the
+/// script untouched, preserving any replacement a more-specific rewriter
+/// (e.g., `NextJsNextDataRewriter`) made on the same element.
+fn might_contain_gtm_prefix(text: &str) -> bool {
+    for marker in GTM_SCRIPT_MARKERS {
+        if text.contains(marker) {
+            return true;
+        }
+        // Walk proper prefixes of `marker` from longest down to the minimum
+        // length. Below the minimum, trailing prefixes are too short to
+        // uniquely identify a GTM path and would over-claim unrelated
+        // scripts ending in "g", "go", "goo", "goog", or "googl".
+        for len in (GTM_MIN_PREFIX_LEN..marker.len()).rev() {
+            if text.ends_with(&marker[..len]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub struct GoogleTagManagerIntegration {
     config: GoogleTagManagerConfig,
+    /// Accumulates text fragments when `lol_html` splits a text node across
+    /// chunk boundaries. Drained on `is_last_in_text_node`.
+    ///
+    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
+    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
+    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
+    /// per element — the buffer is always empty when a new element's text begins.
+    accumulated_text: Mutex<String>,
 }
 
 impl GoogleTagManagerIntegration {
     fn new(config: GoogleTagManagerConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        Arc::new(Self {
+            config,
+            accumulated_text: Mutex::new(String::new()),
+        })
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -255,7 +310,7 @@ impl GoogleTagManagerIntegration {
         target_url: &'a str,
     ) -> Result<ProxyRequestConfig<'a>, PayloadSizeError> {
         let mut proxy_config = ProxyRequestConfig::new(target_url);
-        proxy_config.forward_synthetic_id = false;
+        proxy_config.forward_ec_id = false;
 
         // If it's a POST request (e.g. /collect beacon), we must manually attach the body
         // because ProxyRequestConfig doesn't automatically copy it from the source request.
@@ -498,14 +553,59 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         "script" // Match all scripts to find inline GTM snippets
     }
 
-    fn rewrite(&self, content: &str, _ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+        let mut buf = self
+            .accumulated_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Cheap gate: only engage the accumulation path for scripts whose
+        // running text could plausibly contain a GTM/GA domain. Unrelated
+        // scripts (the vast majority) return Keep on every fragment so they
+        // stay visible in `lol_html`'s output unchanged — and, critically,
+        // so a Replace from this rewriter does not clobber a Replace from
+        // another rewriter on the same element (e.g., `NextJsNextDataRewriter`
+        // on `script#__NEXT_DATA__`). See `might_contain_gtm_prefix` for the
+        // boundary-safe substring check.
+        let prior_and_current_might_match =
+            might_contain_gtm_prefix(&buf) || might_contain_gtm_prefix(content);
+
+        if !ctx.is_last_in_text_node {
+            // Intermediate fragment. Only accumulate + suppress when the script
+            // might still resolve to a GTM match. Otherwise return Keep so the
+            // fragment is emitted as-is by `lol_html` and untouched by us.
+            if prior_and_current_might_match {
+                buf.push_str(content);
+                return ScriptRewriteAction::RemoveNode;
+            }
+            return ScriptRewriteAction::keep();
+        }
+
+        // Last fragment. If we accumulated prior fragments, combine them.
+        let full_content: Option<String> = if buf.is_empty() {
+            None
+        } else {
+            buf.push_str(content);
+            Some(std::mem::take(&mut *buf))
+        };
+        let text = full_content.as_deref().unwrap_or(content);
+
         // Look for the GTM snippet pattern.
         // Standard snippet contains: "googletagmanager.com/gtm.js"
         // Note: analytics.google.com is intentionally excluded — gtag.js stores
         // that domain as a bare string and constructs URLs dynamically, so
         // rewriting it in scripts produces broken URLs.
-        if content.contains("googletagmanager.com") || content.contains("google-analytics.com") {
-            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(content));
+        if GTM_SCRIPT_MARKERS
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(text));
+        }
+
+        // No GTM content — if we accumulated fragments, emit them unchanged.
+        // Intermediate fragments were already suppressed via RemoveNode.
+        if full_content.is_some() {
+            return ScriptRewriteAction::replace(text.to_string());
         }
 
         ScriptRewriteAction::keep()
@@ -1326,11 +1426,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1362,11 +1459,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"
@@ -1647,6 +1741,399 @@ container_id = "GTM-DEFAULT"
                 assert_eq!(message, "test failure");
             }
             other => panic!("Expected Integration error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fragmented_gtm_snippet_is_accumulated_and_rewritten() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-FRAG1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let document_state = IntegrationDocumentState::default();
+
+        // Simulate lol_html splitting the GTM snippet mid-domain.
+        let fragment1 = r#"(function(w,d,s,l,i){j.src='https://www.google"#;
+        let fragment2 = r#"tagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-FRAG1');"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        // Intermediate fragment: should be suppressed.
+        let action1 =
+            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        assert_eq!(
+            action1,
+            ScriptRewriteAction::RemoveNode,
+            "should suppress intermediate fragment"
+        );
+
+        // Last fragment: should emit full rewritten content.
+        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        match action2 {
+            ScriptRewriteAction::Replace(rewritten) => {
+                assert!(
+                    rewritten.contains("/integrations/google_tag_manager/gtm.js"),
+                    "should rewrite GTM URL. Got: {rewritten}"
+                );
+                assert!(
+                    !rewritten.contains("googletagmanager.com"),
+                    "should not contain original GTM domain. Got: {rewritten}"
+                );
+            }
+            other => panic!("expected Replace for fragmented GTM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_gtm_fragmented_script_returns_keep_on_every_fragment() {
+        // A script with no GTM marker in flight (and no plausible prefix) must
+        // return `Keep` on every fragment. Returning `RemoveNode` +
+        // `Replace(unchanged)` would stomp on other rewriters' replacements
+        // when selectors overlap (see `GoogleTagManagerIntegration::rewrite`).
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-PASS1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let document_state = IntegrationDocumentState::default();
+
+        let fragment1 = "console.log('hel";
+        let fragment2 = "lo world');";
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action1 =
+            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        assert_eq!(
+            action1,
+            ScriptRewriteAction::Keep,
+            "non-GTM intermediate fragment should not be claimed"
+        );
+
+        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        assert_eq!(
+            action2,
+            ScriptRewriteAction::Keep,
+            "non-GTM final fragment should not be claimed"
+        );
+    }
+
+    /// Verify the accumulation buffer drains correctly between two consecutive
+    /// `<script>` elements. The first is a fragmented GTM script, the second
+    /// is a fragmented non-GTM script. Both must produce correct output.
+    #[test]
+    fn accumulation_buffer_drains_between_consecutive_script_elements() {
+        let config = GoogleTagManagerConfig {
+            enabled: true,
+            container_id: "GTM-MULTI1".to_string(),
+            upstream_url: "https://www.googletagmanager.com".to_string(),
+            cache_max_age: default_cache_max_age(),
+            max_beacon_body_size: default_max_beacon_body_size(),
+        };
+        let integration = GoogleTagManagerIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+
+        // --- First <script>: fragmented GTM snippet ---
+        let gtm_frag1 = r#"j.src='https://www.google"#;
+        let gtm_frag2 = r#"tagmanager.com/gtm.js?id=GTM-MULTI1';"#;
+
+        let ctx_intermediate = IntegrationScriptContext {
+            selector: "script",
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            document_state: &document_state,
+        };
+        let ctx_last = IntegrationScriptContext {
+            is_last_in_text_node: true,
+            ..ctx_intermediate
+        };
+
+        let action =
+            IntegrationScriptRewriter::rewrite(&*integration, gtm_frag1, &ctx_intermediate);
+        assert_eq!(action, ScriptRewriteAction::RemoveNode);
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, gtm_frag2, &ctx_last);
+        assert!(
+            matches!(action, ScriptRewriteAction::Replace(ref s) if s.contains("/integrations/google_tag_manager/gtm.js")),
+            "first element: should rewrite GTM URL. Got: {action:?}"
+        );
+
+        // --- Second <script>: fragmented non-GTM script ---
+        // Buffer must be empty here — no leftover from the first element. With
+        // no GTM marker in flight, both fragments return Keep so `lol_html`
+        // emits them unchanged and other rewriters remain unaffected.
+        let other_frag1 = "console.log('hel";
+        let other_frag2 = "lo');";
+
+        let action =
+            IntegrationScriptRewriter::rewrite(&*integration, other_frag1, &ctx_intermediate);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::Keep,
+            "second element intermediate (non-GTM) should not be claimed"
+        );
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, other_frag2, &ctx_last);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::Keep,
+            "second element final (non-GTM) should not be claimed"
+        );
+    }
+
+    /// Regression test: with a small chunk size, `lol_html` fragments the
+    /// inline GTM script text node. The rewriter must accumulate fragments
+    /// and produce correct output through the full HTML pipeline.
+    #[test]
+    fn small_chunk_gtm_rewrite_survives_fragmentation() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-SMALL1"
+                }),
+            )
+            .expect("should update config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Use a very small chunk size to force fragmentation mid-domain.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><head><script>j.src='https://www.googletagmanager.com/gtm.js?id=GTM-SMALL1';</script></head><body></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("/integrations/google_tag_manager/gtm.js"),
+            "should rewrite fragmented GTM URL. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("googletagmanager.com"),
+            "should not contain original GTM domain. Got: {processed}"
+        );
+    }
+
+    /// Regression test for the overlapping-rewriter bug: when both the GTM and
+    /// Next.js integrations are enabled and a `<script id="__NEXT_DATA__">`
+    /// payload is fragmented across chunk boundaries, the GTM rewriter must
+    /// NOT clobber the Next.js URL rewrite. In `lol_html`, multiple `text!`
+    /// handlers on overlapping selectors run in registration order and the
+    /// last `text.replace(...)` wins. Before the fix, GTM accumulated every
+    /// script's fragments and re-emitted the unchanged text on `is_last`,
+    /// overwriting Next.js's rewrite. The fix is to return `Keep` on scripts
+    /// that can't plausibly contain a GTM domain.
+    #[test]
+    fn fragmented_next_data_survives_with_gtm_enabled() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use std::io::Cursor;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-MIX1"
+                }),
+            )
+            .expect("should update gtm config");
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Small chunks force fragmentation of the __NEXT_DATA__ text node.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"href":"https://origin.example.com/reviews","title":"Hello World"}}}</script></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "Next.js rewrite must survive when GTM is also enabled. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "origin host must not leak through. Got: {processed}"
+        );
+    }
+
+    /// Regression test for PR #618 P1: fragmented `__NEXT_DATA__` where an
+    /// intermediate fragment boundary lands on a short tail like `g` (which
+    /// used to be treated as a plausible GTM prefix) must NOT trigger GTM
+    /// accumulation. Otherwise GTM would claim the script and overwrite
+    /// `NextJs`'s URL rewrite with an unchanged Replace.
+    ///
+    /// The payload is crafted so a 32-byte chunk boundary lands at the end
+    /// of a word ending in `g` ("config"/"img"/"slug"/"thing"), and the
+    /// rewritable origin URL appears later in the payload.
+    #[test]
+    fn fragmented_next_data_with_trailing_g_survives_gtm() {
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use std::io::Cursor;
+
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-GTAIL1"
+                }),
+            )
+            .expect("should update gtm config");
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // chunk_size=32 with this payload produces fragments whose tails
+        // include "config", "img", "slug", and "thing" — all ending in `g`.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let html_input = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"config":{"img":"slug","thing":"x","href":"https://origin.example.com/reviews"}}</script></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "Next.js rewrite must survive when fragments end in short `g`-tails. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "origin host must not leak through. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn might_contain_gtm_prefix_detects_full_match_and_boundary_prefix() {
+        // Full marker present.
+        assert!(might_contain_gtm_prefix("xxx googletagmanager.com yyy"));
+        assert!(might_contain_gtm_prefix("x google-analytics.com"));
+
+        // Boundary: text ends with a proper prefix of length ≥ GTM_MIN_PREFIX_LEN.
+        // "google" itself (6 bytes) is the shortest accepted trailing prefix.
+        assert!(might_contain_gtm_prefix("src='https://www.google"));
+        assert!(might_contain_gtm_prefix("src='https://www.googletag"));
+        assert!(might_contain_gtm_prefix(
+            "src='https://www.googletagmanager"
+        ));
+    }
+
+    #[test]
+    fn might_contain_gtm_prefix_rejects_short_ambiguous_tails() {
+        // Short tails (< GTM_MIN_PREFIX_LEN) are ambiguous with ordinary
+        // English or minified tokens and must NOT engage GTM accumulation.
+        // Previously these returned true because any non-empty prefix of a
+        // marker was accepted, which let GTM claim and clobber fragments
+        // from overlapping script rewriters (see PR #618 P1).
+        for text in [
+            "x",                  // "g"-less
+            "img",                // ends in 'g'
+            "slug",               // ends in 'g'
+            "config",             // ends in 'g'
+            "thing",              // ends in 'g'
+            "y go",               // ends in 'go'
+            "xgoo",               // ends in 'goo'
+            "xgoog",              // ends in 'goog'
+            "xgoogl",             // ends in 'googl'
+            "console.log('hi');", // no tail match at all
+            "",
+            "}",
+        ] {
+            assert!(
+                !might_contain_gtm_prefix(text),
+                "`{text}` should not engage GTM accumulation"
+            );
         }
     }
 }
