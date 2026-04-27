@@ -17,7 +17,9 @@ If you cannot read `CLAUDE.md`, follow these rules:
 
 1. Present a plan and get approval before coding.
 2. Keep changes minimal — do not refactor unrelated code.
-3. Run `cargo test --workspace` after every code change.
+3. Run tests after every code change — two commands are required because the workspace contains both WASM-only and native-only crates:
+   - `cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1` (Fastly/core crates via Viceroy)
+   - `cargo test -p trusted-server-adapter-axum` (Axum dev server, native)
 4. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 5. Run JS tests with `cd crates/js/lib && npx vitest run` when touching JS/TS code.
 6. Use `error-stack` (`Report<E>`) for error handling — not anyhow, eyre, or thiserror.
