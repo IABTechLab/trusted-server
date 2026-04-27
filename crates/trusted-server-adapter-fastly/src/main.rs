@@ -113,9 +113,9 @@ fn main() -> Result<(), Error> {
         }
     };
 
-    // Start with an unavailable KV slot. Consent-dependent routes lazily
-    // replace it with the configured store at dispatch time so unrelated
-    // routes stay available when consent persistence is misconfigured.
+    // Start with an unavailable primary KV slot. EC-backed routes lazily
+    // replace it with the configured EC identity store at dispatch time so
+    // unrelated routes stay available when EC KV is unavailable.
     let kv_store = std::sync::Arc::new(UnavailableKvStore)
         as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
     let runtime_services = build_runtime_services(&req, kv_store);

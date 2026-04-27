@@ -21,10 +21,6 @@
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.consent_store]]
-            key = "placeholder"
-            data = "placeholder"
-
         [[local_server.kv_stores.ec_identity_store]]
             key = "placeholder"
             data = "placeholder"

@@ -233,16 +233,12 @@ impl EcContext {
         let client_ip = generation::extract_client_ip(req).ok();
         let http_req = compat::from_fastly_headers_ref(req);
 
-        // Build consent context. Pass the EC ID (if any) so the consent
-        // pipeline can use it for KV Store fallback/write operations.
+        // Build consent context from request-local cookies, headers, and geo.
         let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
             req: &http_req,
             config: &settings.consent,
             geo: geo_info,
-            ec_id: ec_value.as_deref(),
-            // EC module manages its own KV identity graph.
-            kv_store: None,
         });
 
         Ok(Self {

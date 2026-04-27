@@ -186,8 +186,9 @@ rewrite_script = true
 # mode = "restrictive"          # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
-# KV Store consent persistence (requires a KV store named "consent_store" in fastly.toml)
-# consent_store = "consent_store"
+# Consent is interpreted from request cookies, headers, geolocation, and these
+# policy settings. EC identity lifecycle state and withdrawal tombstones are
+# stored in the KV store configured by [ec].ec_store.
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]
