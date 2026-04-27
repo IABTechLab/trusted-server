@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
@@ -233,31 +234,43 @@ pub struct EcPartner {
     /// `OpenRTB` `source.domain` for EID entries (e.g. `"liveramp.com"`).
     pub source_domain: String,
     /// `OpenRTB` `atype` value (typically 3).
-    #[serde(default = "EcPartner::default_openrtb_atype")]
+    #[serde(
+        default = "EcPartner::default_openrtb_atype",
+        deserialize_with = "from_value_or_str"
+    )]
     pub openrtb_atype: u8,
     /// Whether this partner's UIDs appear in auction `user.eids`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
     /// Plaintext API token. Hashed at startup for auth lookups.
     /// Used by batch sync (inbound) and identify (inbound).
     pub api_token: Redacted<String>,
     /// Max batch sync API requests per partner per minute.
-    #[serde(default = "EcPartner::default_batch_rate_limit")]
+    #[serde(
+        default = "EcPartner::default_batch_rate_limit",
+        deserialize_with = "from_value_or_str"
+    )]
     pub batch_rate_limit: u32,
     /// Whether server-to-server pull sync is enabled for this partner.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "from_value_or_str")]
     pub pull_sync_enabled: bool,
     /// URL to call for pull sync. Required when `pull_sync_enabled`.
     #[serde(default)]
     pub pull_sync_url: Option<String>,
     /// Allowlist of domains TS may call for this partner's pull sync.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
     /// Seconds between pull sync refreshes.
-    #[serde(default = "EcPartner::default_pull_sync_ttl_sec")]
+    #[serde(
+        default = "EcPartner::default_pull_sync_ttl_sec",
+        deserialize_with = "from_value_or_str"
+    )]
     pub pull_sync_ttl_sec: u64,
     /// Max pull sync calls per EC hash per partner per hour.
-    #[serde(default = "EcPartner::default_pull_sync_rate_limit")]
+    #[serde(
+        default = "EcPartner::default_pull_sync_rate_limit",
+        deserialize_with = "from_value_or_str"
+    )]
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     #[serde(default)]
@@ -348,7 +361,7 @@ pub struct Ec {
     pub cluster_recheck_secs: u64,
 
     /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub partners: Vec<EcPartner>,
 }
@@ -880,6 +893,19 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
         validation_error
     })
 }
+fn from_value_or_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    match value {
+        JsonValue::String(value) => T::from_str(&value).map_err(serde::de::Error::custom),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
+}
+
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
 // This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
 // represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
@@ -1518,6 +1544,156 @@ mod tests {
                 assert_eq!(handler.path, "^/env-handler");
                 assert_eq!(handler.username.expose(), "env-user");
                 assert_eq!(handler.password.expose(), "env-pass");
+            },
+        );
+    }
+
+    #[test]
+    fn test_ec_partners_override_with_indexed_env() {
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_id_key = format!(
+            "{}{}EC{}PARTNERS{}0{}ID",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_name_key = format!(
+            "{}{}EC{}PARTNERS{}0{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_source_domain_key = format!(
+            "{}{}EC{}PARTNERS{}0{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_openrtb_atype_key = format!(
+            "{}{}EC{}PARTNERS{}0{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_bidstream_enabled_key = format!(
+            "{}{}EC{}PARTNERS{}0{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_api_token_key = format!(
+            "{}{}EC{}PARTNERS{}0{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_id_key = format!(
+            "{}{}EC{}PARTNERS{}1{}ID",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_name_key = format!(
+            "{}{}EC{}PARTNERS{}1{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_source_domain_key = format!(
+            "{}{}EC{}PARTNERS{}1{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_openrtb_atype_key = format!(
+            "{}{}EC{}PARTNERS{}1{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_bidstream_enabled_key = format!(
+            "{}{}EC{}PARTNERS{}1{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_api_token_key = format!(
+            "{}{}EC{}PARTNERS{}1{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_vars(
+            [
+                (origin_key, Some("https://origin.test-publisher.com")),
+                (partner_0_id_key, Some("envpartner0")),
+                (partner_0_name_key, Some("Env Partner 0")),
+                (partner_0_source_domain_key, Some("envpartner0.example.com")),
+                (partner_0_openrtb_atype_key, Some("1")),
+                (partner_0_bidstream_enabled_key, Some("true")),
+                (partner_0_api_token_key, Some("env-token-0")),
+                (partner_1_id_key, Some("envpartner1")),
+                (partner_1_name_key, Some("Env Partner 1")),
+                (partner_1_source_domain_key, Some("envpartner1.example.com")),
+                (partner_1_openrtb_atype_key, Some("3")),
+                (partner_1_bidstream_enabled_key, Some("false")),
+                (partner_1_api_token_key, Some("env-token-1")),
+            ],
+            || {
+                let settings = Settings::from_toml_and_env(&toml_str)
+                    .expect("Settings should load indexed EC partners from env");
+
+                assert_eq!(settings.ec.partners.len(), 2);
+                assert_eq!(settings.ec.partners[0].id, "envpartner0");
+                assert_eq!(settings.ec.partners[0].name, "Env Partner 0");
+                assert_eq!(
+                    settings.ec.partners[0].source_domain,
+                    "envpartner0.example.com"
+                );
+                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
+                assert!(settings.ec.partners[0].bidstream_enabled);
+                assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
+                assert_eq!(settings.ec.partners[1].id, "envpartner1");
+                assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
+                assert_eq!(
+                    settings.ec.partners[1].source_domain,
+                    "envpartner1.example.com"
+                );
+                assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
+                assert!(!settings.ec.partners[1].bidstream_enabled);
+                assert_eq!(settings.ec.partners[1].api_token.expose(), "env-token-1");
             },
         );
     }
