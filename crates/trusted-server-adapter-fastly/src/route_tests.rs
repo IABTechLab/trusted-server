@@ -140,9 +140,6 @@ fn create_test_settings() -> Settings {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [consent]
-            consent_store = "missing-consent-store"
-
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
@@ -180,7 +177,7 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
 }
 
 #[test]
-fn configured_missing_consent_store_only_breaks_consent_routes() {
+fn routes_use_request_local_consent() {
     let settings = create_test_settings();
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
@@ -202,7 +199,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     assert_eq!(
         discovery_resp.response.get_status(),
         StatusCode::OK,
-        "should keep discovery available when the consent store is unavailable"
+        "should keep discovery available with request-local consent"
     );
 
     let admin_req = Request::post("https://test.com/admin/keys/rotate");
@@ -219,11 +216,9 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     assert_eq!(
         admin_resp.response.get_status(),
         StatusCode::UNAUTHORIZED,
-        "should keep admin auth behavior unchanged when the consent store is unavailable"
+        "should keep admin auth behavior unchanged with request-local consent"
     );
 
-    // With the EC architecture, auction and publisher routes no longer
-    // pre-open the consent store at routing time. EC handles KV lazily,
-    // so a missing consent store does not block these routes from
-    // processing requests (consent degradation is graceful).
+    // Routes no longer depend on a separate consent KV store. Live consent is
+    // request-local, and EC lifecycle state uses the EC identity store only.
 }

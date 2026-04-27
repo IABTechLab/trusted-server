@@ -98,8 +98,10 @@ Note the store IDs - you'll need them for your `trusted-server.toml` configurati
 
 Edge Cookie flows require two KV stores:
 
-- Identity graph store (`ec_store`) - EC hash to partner IDs
+- Identity graph store (`ec_store`) - EC identity graph, partner IDs, minimal consent metadata, and withdrawal tombstones
 - Partner registry store (`partner_store`) - partner records and API-key hashes
+
+There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
 
 Create them:
 
@@ -129,7 +131,7 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `write_failed`, first check that both stores are present and linked to the active version.
+If EC sync returns `write_failed`, first check that both stores are present and linked to the active version. Legacy consent KV bindings can be removed once no deployment-specific tooling depends on them.
 
 ## Next Steps
 

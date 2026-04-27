@@ -9,7 +9,6 @@
 
 pub(crate) mod api_client;
 pub(crate) mod config_store;
-pub mod kv_store;
 pub(crate) mod secret_store;
 
 pub use api_client::FastlyApiClient;

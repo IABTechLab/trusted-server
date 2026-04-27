@@ -22,7 +22,7 @@ EC IDs use HMAC (Hash-based Message Authentication Code) to generate a determini
 
 ### Request Lifecycle
 
-Every request passes through four phases. EC generation only happens on organic routes (publisher proxy, integration proxy, auction) — read-only endpoints like `/identify` and `/batch-sync` skip generation entirely.
+Every request passes through four phases. EC generation only happens on organic routes (publisher proxy, integration proxy, auction) — read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
 
 ```mermaid
 sequenceDiagram
@@ -58,7 +58,7 @@ flowchart TD
     Start[ec_finalize_response] --> ConsentCheck{Consent<br/>allows EC?}
 
     ConsentCheck -- "No" --> CookiePresent{Cookie was<br/>present?}
-    CookiePresent -- "Yes" --> Withdraw["Expire ts-ec cookie<br/>Delete consent KV entries<br/>Write withdrawal tombstone (24h TTL)<br/>Strip all x-ts-* headers"]
+    CookiePresent -- "Yes" --> Withdraw["Expire ts-ec cookie<br/>Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Strip all x-ts-* headers"]
     CookiePresent -- "No" --> NoOp[No action]
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
@@ -68,7 +68,7 @@ flowchart TD
 
 ## Consent Model
 
-EC creation is gated by jurisdiction. The server detects jurisdiction from geolocation data attached to the request and applies the appropriate consent framework.
+EC creation is gated by jurisdiction. The server detects jurisdiction from geolocation data attached to the request and applies the appropriate consent framework. Live consent comes from request-local signals (`euconsent-v2`, `__gpp`, `__gpp_sid`, `us_privacy`, `Sec-GPC`) plus geolocation and policy defaults; there is no separate consent KV fallback.
 
 ```mermaid
 flowchart TD
@@ -100,6 +100,8 @@ flowchart TD
 - **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
+
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, partner IDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
 
 ## Partner Sync Channels
 
