@@ -49,6 +49,7 @@ vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager 
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
+vi.mock('prebid.js/modules/userId.js', () => ({}));
 
 // Mock the build-generated adapter imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
