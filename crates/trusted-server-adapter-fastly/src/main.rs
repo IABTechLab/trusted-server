@@ -241,13 +241,16 @@ async fn route_request(
             );
 
             match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(publisher_services) => {
-                    handle_publisher_request(settings, integration_registry, &publisher_services, req)
-                        .await
-                        .and_then(|pub_response| {
-                            resolve_publisher_response(pub_response, settings, integration_registry)
-                        })
-                }
+                Ok(publisher_services) => handle_publisher_request(
+                    settings,
+                    integration_registry,
+                    &publisher_services,
+                    req,
+                )
+                .await
+                .and_then(|pub_response| {
+                    resolve_publisher_response(pub_response, settings, integration_registry)
+                }),
                 Err(e) => Err(e),
             }
         }
@@ -268,9 +271,10 @@ pub(crate) fn resolve_publisher_response(
         } => {
             let mut output = Vec::new();
             stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            response
-                .headers_mut()
-                .insert(header::CONTENT_LENGTH, HeaderValue::from(output.len() as u64));
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from(output.len() as u64),
+            );
             *response.body_mut() = EdgeBody::from(output);
             Ok(response)
         }

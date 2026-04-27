@@ -1057,21 +1057,23 @@ impl AuctionProvider for PrebidAuctionProvider {
         let request_info = RequestInfo::from_request(context.request, context.client_info);
 
         // Create signer and compute signature if request signing is enabled
-        let signer_with_signature = if let Some(request_signing_config) =
-            &context.settings.request_signing
-        {
-            if request_signing_config.enabled {
-                let signer = RequestSigner::from_services(context.services)?;
-                let params =
-                    SigningParams::new(request.id.clone(), request_info.host.clone(), request_info.scheme.clone());
-                let signature = signer.sign_request(&params)?;
-                Some((signer, signature, params))
+        let signer_with_signature =
+            if let Some(request_signing_config) = &context.settings.request_signing {
+                if request_signing_config.enabled {
+                    let signer = RequestSigner::from_services(context.services)?;
+                    let params = SigningParams::new(
+                        request.id.clone(),
+                        request_info.host.clone(),
+                        request_info.scheme.clone(),
+                    );
+                    let signature = signer.sign_request(&params)?;
+                    Some((signer, signature, params))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Convert to OpenRTB with all enrichments
         let openrtb = self.to_openrtb(
