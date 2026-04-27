@@ -12,17 +12,21 @@ use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::get_settings;
 
 mod app;
 mod backend;
@@ -32,11 +36,13 @@ mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+#[cfg(test)]
+mod route_tests;
 
 use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::apply_finalize_headers;
-use crate::platform::{build_runtime_services, open_consent_kv};
+use crate::platform::{build_runtime_services, open_kv_store, FastlyPlatformGeo};
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
@@ -83,18 +89,35 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
     }) {
-        log::info!("routing request through EdgeZero path");
+        log::debug!("routing request through EdgeZero path");
         let app = TrustedServerApp::build_app();
         // Strip client-spoofable forwarded headers before handing off to the
         // EdgeZero dispatcher, mirroring the sanitization done in legacy_main.
         compat::sanitize_fastly_forwarded_headers(&mut req);
+        // Capture client IP before the request is consumed by dispatch.
+        let client_ip = req.get_client_ip_addr();
         // `run_app_with_config` and `run_app_with_logging` call `init_logger`
         // internally — a second `set_logger` call panics because our custom
         // fern logger is already initialised above.  `dispatch_with_config`
         // skips logger initialisation and injects the config store directly.
-        edgezero_adapter_fastly::dispatch_with_config(&app, req, "trusted_server_config")
+        let mut response = compat::from_fastly_response(
+            edgezero_adapter_fastly::dispatch_with_config(&app, req, "trusted_server_config")?,
+        );
+        // Apply finalize headers at the entry point so that router-level 405/404
+        // responses for unregistered HTTP methods (e.g. TRACE, WebDAV verbs)
+        // carry TS/geo headers, matching the legacy path's all-methods guarantee.
+        // For requests that ran through FinalizeResponseMiddleware, this is
+        // idempotent — header::insert overwrites with the same values.
+        if let Ok(settings) = get_settings() {
+            let geo_info = FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+                log::warn!("entry-point geo lookup failed: {e}");
+                None
+            });
+            apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+        }
+        Ok(compat::to_fastly_response(response))
     } else {
-        log::info!("routing request through legacy path");
+        log::debug!("routing request through legacy path");
         legacy_main(req)
     }
 }
@@ -199,17 +222,12 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            let consent_kv = open_consent_kv(&settings.consent);
-            handle_auction(
-                settings,
-                orchestrator,
-                runtime_services,
-                consent_kv
-                    .as_ref()
-                    .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
-                req,
-            )
-            .await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(auction_services) => {
+                    handle_auction(settings, orchestrator, &auction_services, req).await
+                }
+                Err(e) => Err(e),
+            }
         }
 
         // tsjs endpoints
@@ -241,19 +259,67 @@ async fn route_request(
                 path
             );
 
-            let consent_kv = open_consent_kv(&settings.consent);
-            handle_publisher_request(
-                settings,
-                integration_registry,
-                runtime_services,
-                consent_kv
-                    .as_ref()
-                    .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
-                req,
-            )
-            .await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(publisher_services) => handle_publisher_request(
+                    settings,
+                    integration_registry,
+                    &publisher_services,
+                    req,
+                )
+                .await
+                .and_then(|pub_response| {
+                    resolve_publisher_response(pub_response, settings, integration_registry)
+                }),
+                Err(e) => Err(e),
+            }
         }
     }
+}
+
+pub(crate) fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<HttpResponse, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from(output.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

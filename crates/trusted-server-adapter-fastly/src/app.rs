@@ -56,7 +56,6 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::{open_consent_kv, open_kv_store};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore,
@@ -90,16 +89,7 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 
     let registry = IntegrationRegistry::new(&settings)?;
 
-    let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
-        Ok(store) => store,
-        Err(e) => {
-            log::warn!(
-                "KV store '{}' unavailable, synthetic ID routes will return errors: {e}",
-                settings.synthetic.opid_store
-            );
-            Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        }
-    };
+    let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -193,17 +183,11 @@ async fn dispatch_fallback(
             });
     }
 
-    let consent_kv = open_consent_kv(&state.settings.consent);
-    handle_publisher_request(
-        &state.settings,
-        &state.registry,
-        services,
-        consent_kv
-            .as_ref()
-            .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
-        req,
-    )
-    .await
+    handle_publisher_request(&state.settings, &state.registry, services, req)
+        .await
+        .and_then(|pub_response| {
+            crate::resolve_publisher_response(pub_response, &state.settings, &state.registry)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -321,17 +305,7 @@ impl Hooks for TrustedServerApp {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             execute_handler(s, ctx, |state, services, req| async move {
-                let consent_kv = open_consent_kv(&state.settings.consent);
-                handle_auction(
-                    &state.settings,
-                    &state.orchestrator,
-                    &services,
-                    consent_kv
-                        .as_ref()
-                        .map(|kv| kv as &dyn trusted_server_core::consent::kv::ConsentKvOps),
-                    req,
-                )
-                .await
+                handle_auction(&state.settings, &state.orchestrator, &services, req).await
             })
         };
 
@@ -413,12 +387,14 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::startup_error_router;
+    use super::{startup_error_router, TrustedServerApp};
 
+    use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
     use error_stack::Report;
     use futures::executor::block_on;
+    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {
@@ -480,6 +456,79 @@ mod tests {
         assert!(
             !super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
             "OPTIONS should fall through to the publisher/integration fallback"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Full EdgeZero dispatch-path tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_auth_rejected_401_carries_finalize_headers() {
+        // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
+        // must still carry standard TS headers before reaching the client.
+        //
+        // The embedded trusted-server.toml protects `^/admin` with basic-auth.
+        // Sending the request without an Authorization header causes AuthMiddleware
+        // to short-circuit with a 401, which then bubbles through
+        // FinalizeResponseMiddleware for header injection.
+        //
+        // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
+        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
+        // short-circuits without calling any Fastly ABI.
+        let router = TrustedServerApp::routes();
+        let req = request_builder()
+            .method(Method::POST)
+            .uri("/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build test request");
+
+        let response = block_on(router.oneshot(req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "request without credentials should be rejected"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .and_then(|v| v.to_str().ok()),
+            Some("false"),
+            "FinalizeResponseMiddleware must run even for auth-rejected responses"
+        );
+    }
+
+    #[test]
+    fn dispatch_unregistered_method_returns_405_at_router_level() {
+        // Documents the known router-level behavior for unregistered HTTP methods:
+        // the RouterService returns 405 before the middleware chain runs, so
+        // FinalizeResponseMiddleware does not inject TS headers at this layer.
+        //
+        // The full-system guarantee (TS headers on ALL responses) is maintained
+        // by the entry-point finalize wrap in main.rs, which is idempotent for
+        // requests that did run through the middleware chain.
+        let router = TrustedServerApp::routes();
+        let req = request_builder()
+            .method(Method::from_bytes(b"TRACE").expect("should parse TRACE"))
+            .uri("/")
+            .body(Body::empty())
+            .expect("should build TRACE request");
+
+        let response = block_on(router.oneshot(req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "unregistered method should return 405 from the router layer"
+        );
+        assert!(
+            response
+                .headers()
+                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .is_none(),
+            "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
         );
     }
 }

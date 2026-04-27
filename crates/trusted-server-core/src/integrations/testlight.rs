@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
+use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     collect_body, collect_body_bounded, AttributeRewriteAction, IntegrationAttributeContext,
@@ -18,7 +19,6 @@ use crate::integrations::{
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
-use crate::synthetic::get_synthetic_id;
 use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
@@ -184,20 +184,20 @@ impl IntegrationProxy for TestlightIntegration {
                 .await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
-        // Read synthetic ID from header (set by registry) or cookie
-        let synthetic_id = get_synthetic_id(&req)
-            .change_context(Self::error("Failed to read synthetic ID"))?
+        // Read EC ID from header (set by registry) or cookie
+        let ec_id = get_ec_id(&req)
+            .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "Synthetic ID not found in request header or cookie — \
+                    "EC ID not found in request header or cookie — \
                      check that the integration registry propagated it",
                 ))
             })?;
 
-        let payload_bytes = Self::rewrite_request_body(&payload_bytes, &synthetic_id)?;
+        let payload_bytes = Self::rewrite_request_body(&payload_bytes, &ec_id)?;
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint);
-        proxy_config.forward_synthetic_id = false;
+        proxy_config.forward_ec_id = false;
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;
         proxy_config.headers.push((
@@ -427,54 +427,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_uses_platform_http_client_with_http_request() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, br#"{"ok":true}"#.to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let integration = TestlightIntegration::new(TestlightConfig {
-                enabled: true,
-                endpoint: "https://example.com/openrtb".to_string(),
-                timeout_ms: 1000,
-                shim_src: tsjs::tsjs_unified_script_src(),
-                rewrite_scripts: true,
-            });
-            let mut req = http::Request::builder()
-                .method(Method::POST)
-                .uri("https://edge.example.com/integrations/testlight/auction")
-                .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
-                .expect("should build request");
-            req.headers_mut().insert(
-                crate::constants::HEADER_X_SYNTHETIC_ID.clone(),
-                http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
-            );
-
-            let response = integration
-                .handle(&settings, &services, req)
-                .await
-                .expect("should proxy Testlight request");
-
-            assert_eq!(
-                response.status(),
-                http::StatusCode::OK,
-                "should return stubbed upstream status"
-            );
-            assert_eq!(
-                stub.recorded_backend_names(),
-                vec!["stub-backend".to_string()],
-                "should route outbound request through PlatformHttpClient"
-            );
-            let response_json: serde_json::Value =
-                serde_json::from_slice(&response.into_body().into_bytes())
-                    .expect("should parse JSON response");
-            assert_eq!(
-                response_json["ok"], true,
-                "should preserve the upstream JSON response body"
-            );
+    #[tokio::test]
+    async fn handle_uses_platform_http_client_with_http_request() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"ok":true}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = TestlightIntegration::new(TestlightConfig {
+            enabled: true,
+            endpoint: "https://example.com/openrtb".to_string(),
+            timeout_ms: 1000,
+            shim_src: tsjs::tsjs_unified_script_src(),
+            rewrite_scripts: true,
         });
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://edge.example.com/integrations/testlight/auction")
+            .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
+            .expect("should build request");
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC.clone(),
+            http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
+        );
+
+        let response = integration
+            .handle(&settings, &services, req)
+            .await
+            .expect("should proxy Testlight request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed upstream status"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should route outbound request through PlatformHttpClient"
+        );
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&response.into_body().into_bytes())
+                .expect("should parse JSON response");
+        assert_eq!(
+            response_json["ok"], true,
+            "should preserve the upstream JSON response body"
+        );
     }
 }

@@ -37,6 +37,19 @@ pub(crate) fn from_fastly_request(mut req: fastly::Request) -> HttpRequest {
     build_http_request(&req, body)
 }
 
+/// Convert a `fastly::Response` into an [`HttpResponse`].
+pub(crate) fn from_fastly_response(mut resp: fastly::Response) -> HttpResponse {
+    let status = resp.get_status();
+    let mut builder = edgezero_core::http::response_builder().status(status);
+    for (name, value) in resp.get_headers() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    builder
+        .body(EdgeBody::from(resp.take_body_bytes()))
+        .expect("should build http response from fastly response")
+}
+
+
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     let (parts, body) = resp.into_parts();

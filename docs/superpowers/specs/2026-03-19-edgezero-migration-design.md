@@ -145,10 +145,10 @@ files in `crates/trusted-server-core` and `crates/trusted-server-adapter-fastly`
 
 These are close to landing and unblock early migration phases.
 
-| Feature                  | Issues                                                                                                             | PR                                                    | Notes                                            |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ------------------------------------------------ |
-| KV Store Abstraction     | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050) | [#165](https://github.com/stackpop/edgezero/pull/165) | Covers counter_store, opid_store, creative_store |
-| Config Store Abstraction | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | [#209](https://github.com/stackpop/edgezero/pull/209) | Covers jwks_store, runtime config                |
+| Feature                  | Issues                                                                                                             | PR                                                    | Notes                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| KV Store Abstraction     | [#43-50](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2043%2044%2045%2046%2047%2048%2049%2050) | [#165](https://github.com/stackpop/edgezero/pull/165) | Covers the generic runtime KV abstraction used by current live KV call sites |
+| Config Store Abstraction | [#51-58](https://github.com/stackpop/edgezero/issues?q=is%3Aissue%20id%3A%2051%2052%2053%2054%2055%2056%2057%2058) | [#209](https://github.com/stackpop/edgezero/pull/209) | Covers jwks_store, runtime config                                            |
 
 > **Note:** EdgeZero Config Store and Secret Store provide **read** interfaces.
 > Management write CRUD (put/delete for config, create/delete for secrets) is a
@@ -869,7 +869,10 @@ Changes:
 - Implement `PlatformKvStore` for Fastly using direct KV store access
 - Replace direct KV usage in core with calls through
   `RuntimeServices::kv_store`
-- Migrate counter_store, opid_store, creative_store access
+- Migrate the remaining live core KV access through the generic runtime KV
+  slot (currently consent persistence)
+- `counter_store` and `opid_store` no longer have live runtime access paths
+  in the current repo; `creative_store` remains a deprecated config field
 - Update tests
 
 #### PR 6 — Extract backend creation and HTTP client behind traits

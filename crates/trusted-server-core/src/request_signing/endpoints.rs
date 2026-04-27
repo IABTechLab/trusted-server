@@ -8,7 +8,7 @@ use error_stack::{Report, ResultExt};
 use http::{header, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::error::TrustedServerError;
+use crate::error::{IntoHttpResponse, TrustedServerError};
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
@@ -59,18 +59,27 @@ pub fn handle_trusted_server_discovery(
     Ok(json_response(StatusCode::OK, json))
 }
 
+/// JSON request body for the signature verification endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VerifySignatureRequest {
+    /// Canonical payload that was signed.
     pub payload: String,
+    /// Base64-encoded Ed25519 signature to verify.
     pub signature: String,
+    /// Key identifier used to look up the public JWK.
     pub kid: String,
 }
 
+/// JSON response body for the signature verification endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VerifySignatureResponse {
+    /// Whether signature verification succeeded.
     pub verified: bool,
+    /// Key identifier that was used during verification.
     pub kid: String,
+    /// Human-readable verification result summary.
     pub message: String,
+    /// Error detail when verification fails unexpectedly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -83,7 +92,8 @@ const ADMIN_MAX_BODY_BYTES: usize = 4096;
 ///
 /// # Errors
 ///
-/// Returns an error if the request body cannot be parsed as JSON or if verification fails.
+/// Returns an error if the request body cannot be parsed as JSON or if the
+/// response body cannot be serialized.
 pub fn handle_verify_signature(
     _settings: &Settings,
     services: &RuntimeServices,
@@ -124,12 +134,15 @@ pub fn handle_verify_signature(
             message: "Signature verification failed".into(),
             error: Some("Invalid signature".into()),
         },
-        Err(e) => VerifySignatureResponse {
-            verified: false,
-            kid: verify_req.kid,
-            message: "Verification error".into(),
-            error: Some(format!("{}", e)),
-        },
+        Err(e) => {
+            log::warn!("signature verification failed: {e}");
+            VerifySignatureResponse {
+                verified: false,
+                kid: verify_req.kid,
+                message: "Verification error".into(),
+                error: Some("internal verification error".into()),
+            }
+        }
     };
 
     let response_json = serde_json::to_string(&response).map_err(|e| {
@@ -141,43 +154,101 @@ pub fn handle_verify_signature(
     Ok(json_response(StatusCode::OK, response_json))
 }
 
+/// JSON request body for the key-rotation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RotateKeyRequest {
+    /// Optional explicit key identifier for the new signing key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
 }
 
+/// JSON response body for the key-rotation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RotateKeyResponse {
+    /// Whether the rotation operation succeeded.
     pub success: bool,
+    /// Human-readable summary of the rotation result.
     pub message: String,
+    /// Newly generated or supplied key identifier.
     pub new_kid: String,
+    /// Previously active key identifier, if one existed.
     pub previous_kid: Option<String>,
+    /// Active key identifiers after the rotation completes.
     pub active_kids: Vec<String>,
+    /// Public JWK associated with the newly active key.
     pub jwk: serde_json::Value,
+    /// Error detail when rotation fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Rotates the current active kid by generating and saving a new one
+struct SigningStoreIds<'a> {
+    config_store_id: &'a str,
+    secret_store_id: &'a str,
+}
+
+const MAX_KID_LENGTH: usize = 128;
+
+fn signing_store_ids(
+    settings: &Settings,
+) -> Result<SigningStoreIds<'_>, Report<TrustedServerError>> {
+    settings
+        .request_signing
+        .as_ref()
+        .map(|setting| SigningStoreIds {
+            config_store_id: setting.config_store_id.as_str(),
+            secret_store_id: setting.secret_store_id.as_str(),
+        })
+        .ok_or_else(|| {
+            TrustedServerError::Configuration {
+                message: "missing signing storage configuration".to_string(),
+            }
+            .into()
+        })
+}
+
+fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+    if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("kid must be 1..={MAX_KID_LENGTH} characters"),
+        }));
+    }
+
+    if !kid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must contain only ASCII alphanumerics, '-', '_', '.', ':'".into(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// Rotates the current active kid by generating and saving a new one.
+///
+/// # Response contract
+///
+/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
+/// invalid operator-supplied `kid`, or `500 Internal Server Error` when rotation
+/// fails. Failure responses include `success: false` and a populated `error`
+/// field. Unlike [`handle_verify_signature`], the error field contains internal
+/// detail — this is intentional because this endpoint is auth-gated and
+/// operator-facing only.
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing, JSON parsing fails, or key rotation fails.
+/// Returns an error if the request signing settings are missing or JSON parsing fails.
 pub fn handle_rotate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
-        None => {
-            return Err(TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
-            }
-            .into());
-        }
-    };
+    let SigningStoreIds {
+        config_store_id,
+        secret_store_id,
+    } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
     if body.len() > ADMIN_MAX_BODY_BYTES {
@@ -198,8 +269,14 @@ pub fn handle_rotate_key(
     };
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
+    let validation_result = if let Some(kid) = rotate_req.kid.as_deref() {
+        validate_kid(kid)
+    } else {
+        Ok(())
+    };
+    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
 
-    match manager.rotate_key(services, rotate_req.kid) {
+    match result {
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
@@ -226,6 +303,7 @@ pub fn handle_rotate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            let status = e.current_context().status_code();
             let response = RotateKeyResponse {
                 success: false,
                 message: "Key rotation failed".to_string(),
@@ -242,51 +320,62 @@ pub fn handle_rotate_key(
                 })
             })?;
 
-            Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                response_json,
-            ))
+            Ok(json_response(status, response_json))
         }
     }
 }
 
+/// JSON request body for the key-deactivation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeactivateKeyRequest {
+    /// Key identifier to deactivate or delete.
     pub kid: String,
+    /// Whether the key should be deleted from storage after deactivation.
     #[serde(default)]
     pub delete: bool,
 }
 
+/// JSON response body for the key-deactivation endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeactivateKeyResponse {
+    /// Whether the deactivation or deletion succeeded.
     pub success: bool,
+    /// Human-readable summary of the operation result.
     pub message: String,
+    /// Key identifier that was deactivated or deleted.
     pub deactivated_kid: String,
+    /// Whether the key was deleted from storage.
     pub deleted: bool,
+    /// Active key identifiers remaining after the operation.
     pub remaining_active_kids: Vec<String>,
+    /// Error detail when the operation fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Deactivates an active key
+/// Deactivates or deletes an active signing key.
+///
+/// # Response contract
+///
+/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
+/// invalid operator-supplied `kid`, or `500 Internal Server Error` when
+/// deactivation fails. Failure responses include `success: false` and a populated
+/// `error` field. Like [`handle_rotate_key`] and unlike
+/// [`handle_verify_signature`], the error field contains internal detail — this
+/// is intentional because this endpoint is auth-gated and operator-facing only.
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing, JSON parsing fails, or key deactivation fails.
+/// Returns an error if the request signing settings are missing or JSON parsing fails.
 pub fn handle_deactivate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let (config_store_id, secret_store_id) = match &settings.request_signing {
-        Some(setting) => (&setting.config_store_id, &setting.secret_store_id),
-        None => {
-            return Err(TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
-            }
-            .into());
-        }
-    };
+    let SigningStoreIds {
+        config_store_id,
+        secret_store_id,
+    } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
     if body.len() > ADMIN_MAX_BODY_BYTES {
@@ -305,11 +394,13 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    let result = if deactivate_req.delete {
-        manager.delete_key(services, &deactivate_req.kid)
-    } else {
-        manager.deactivate_key(services, &deactivate_req.kid)
-    };
+    let result = validate_kid(&deactivate_req.kid).and_then(|()| {
+        if deactivate_req.delete {
+            manager.delete_key(services, &deactivate_req.kid)
+        } else {
+            manager.deactivate_key(services, &deactivate_req.kid)
+        }
+    });
 
     match result {
         Ok(()) => {
@@ -340,6 +431,7 @@ pub fn handle_deactivate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            let status = e.current_context().status_code();
             let response = DeactivateKeyResponse {
                 success: false,
                 message: if deactivate_req.delete {
@@ -359,27 +451,20 @@ pub fn handle_deactivate_key(
                 })
             })?;
 
-            Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                response_json,
-            ))
+            Ok(json_response(status, response_json))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
     use http::{header, Method, Request as HttpRequest, StatusCode};
 
     use crate::platform::{
-        test_support::{
-            build_services_with_config, build_services_with_config_and_secret, noop_services,
-        },
-        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+        test_support::{build_request_signing_services, build_services_with_config, noop_services},
+        PlatformConfigStore, PlatformError, StoreId, StoreName,
     };
 
     use super::*;
@@ -413,67 +498,6 @@ mod tests {
         );
     }
 
-    /// Build `RuntimeServices` pre-loaded with a real Ed25519 keypair for
-    /// testing signature creation and verification in endpoint handlers.
-    fn build_signing_services_for_test() -> crate::platform::RuntimeServices {
-        use base64::{engine::general_purpose, Engine};
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        struct MapConfigStore(HashMap<String, String>);
-        impl PlatformConfigStore for MapConfigStore {
-            fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-                self.0
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| Report::new(PlatformError::ConfigStore))
-            }
-            fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-        }
-
-        struct MapSecretStore(HashMap<String, Vec<u8>>);
-        impl PlatformSecretStore for MapSecretStore {
-            fn get_bytes(
-                &self,
-                _: &StoreName,
-                key: &str,
-            ) -> Result<Vec<u8>, Report<PlatformError>> {
-                self.0
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| Report::new(PlatformError::SecretStore))
-            }
-            fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-            fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-                Err(Report::new(PlatformError::Unsupported))
-            }
-        }
-
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
-        let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
-        let jwk_json = format!(
-            r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
-            x_b64
-        );
-
-        let mut cfg = HashMap::new();
-        cfg.insert("current-kid".to_string(), "test-kid".to_string());
-        cfg.insert("test-kid".to_string(), jwk_json);
-
-        let mut sec = HashMap::new();
-        sec.insert("test-kid".to_string(), key_b64.into_bytes());
-
-        build_services_with_config_and_secret(MapConfigStore(cfg), MapSecretStore(sec))
-    }
-
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
 
@@ -501,7 +525,7 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_valid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let services = build_signing_services_for_test();
+        let services = build_request_signing_services();
 
         let payload = "test message";
         let signer = crate::request_signing::RequestSigner::from_services(&services)
@@ -540,7 +564,7 @@ mod tests {
     #[test]
     fn test_handle_verify_signature_invalid() {
         let settings = crate::test_support::tests::create_test_settings();
-        let services = build_signing_services_for_test();
+        let services = build_request_signing_services();
 
         let signer = crate::request_signing::RequestSigner::from_services(&services)
             .expect("should create signer from services");
@@ -580,6 +604,50 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_verify_signature_hides_internal_error_details() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let verify_req = VerifySignatureRequest {
+            payload: "test message".to_string(),
+            signature: "any-signature".to_string(),
+            kid: "missing-kid".to_string(),
+        };
+
+        let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&body),
+        );
+
+        let services = noop_services();
+        let resp = handle_verify_signature(&settings, &services, req)
+            .expect("should return a verification response for internal errors");
+
+        assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
+
+        let resp_body = response_body_string(resp);
+        let verify_resp: VerifySignatureResponse =
+            serde_json::from_str(&resp_body).expect("should deserialize verify response");
+
+        assert!(
+            !verify_resp.verified,
+            "should mark internal verification errors as unverified"
+        );
+        assert_eq!(verify_resp.kid, "missing-kid");
+        assert_eq!(verify_resp.message, "Verification error");
+        assert_eq!(
+            verify_resp.error.as_deref(),
+            Some("internal verification error"),
+            "should return a generic error to unauthenticated callers"
+        );
+        assert!(
+            !resp_body.contains("failed"),
+            "should not leak internal error details in the response body"
+        );
+    }
+
+    #[test]
     fn test_handle_verify_signature_malformed_request() {
         let settings = crate::test_support::tests::create_test_settings();
 
@@ -598,20 +666,27 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(resp) => {
-                let body = response_body_string(resp);
-                let response: RotateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize rotate response");
-                log::debug!(
-                    "Rotation response: success={}, message={}",
-                    response.success,
-                    response.message
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when store writes fail"
+        );
+
+        let body = response_body_string(resp);
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store writes fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -629,20 +704,27 @@ mod tests {
             Some(&body_json),
         );
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(resp) => {
-                let body = response_body_string(resp);
-                let response: RotateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize rotate response");
-                log::debug!(
-                    "Custom KID rotation: success={}, new_kid={}",
-                    response.success,
-                    response.new_kid
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when store writes fail"
+        );
+
+        let body = response_body_string(resp);
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store writes fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -656,6 +738,47 @@ mod tests {
 
         let result = handle_rotate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
+    }
+
+    #[test]
+    fn test_handle_rotate_key_rejects_invalid_kid() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let req_body = RotateKeyRequest {
+            kid: Some("bad,kid".to_string()),
+        };
+
+        let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some(&body_json),
+        );
+
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
+            .expect("should return a response for invalid kid");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject malformed kid as a bad request"
+        );
+
+        let body = response_body_string(resp);
+        let response: RotateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize rotate response");
+
+        assert!(
+            !response.success,
+            "should report failure when supplied kid is invalid"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("kid must contain only")),
+            "should explain the kid character restrictions"
+        );
     }
 
     #[test]
@@ -675,20 +798,27 @@ mod tests {
             Some(&body_json),
         );
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(resp) => {
-                let body = response_body_string(resp);
-                let response: DeactivateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize deactivate response");
-                log::debug!(
-                    "Deactivate response: success={}, message={}",
-                    response.success,
-                    response.message
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when active-kids cannot be read"
+        );
+
+        let body = response_body_string(resp);
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store reads fail"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -708,20 +838,31 @@ mod tests {
             Some(&body_json),
         );
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
-        match result {
-            Ok(resp) => {
-                let body = response_body_string(resp);
-                let response: DeactivateKeyResponse =
-                    serde_json::from_str(&body).expect("should deserialize deactivate response");
-                log::debug!(
-                    "Delete response: success={}, deleted={}",
-                    response.success,
-                    response.deleted
-                );
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response even when stores are unavailable");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should return 500 when active-kids cannot be read"
+        );
+
+        let body = response_body_string(resp);
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when store reads fail"
+        );
+        assert!(
+            !response.deleted,
+            "should not report deletion when the operation failed"
+        );
+        assert!(
+            response.error.is_some(),
+            "should include error detail in failure response"
+        );
     }
 
     #[test]
@@ -735,6 +876,75 @@ mod tests {
 
         let result = handle_deactivate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
+    }
+
+    #[test]
+    fn test_handle_deactivate_key_rejects_invalid_kid() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let req_body = DeactivateKeyRequest {
+            kid: "bad kid".to_string(),
+            delete: false,
+        };
+
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
+
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response for invalid kid");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject malformed kid as a bad request"
+        );
+
+        let body = response_body_string(resp);
+        let response: DeactivateKeyResponse =
+            serde_json::from_str(&body).expect("should deserialize deactivate response");
+
+        assert!(
+            !response.success,
+            "should report failure when supplied kid is invalid"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("kid must contain only")),
+            "should explain the kid character restrictions"
+        );
+    }
+
+    #[test]
+    fn validate_kid_accepts_allowed_operator_supplied_ids() {
+        validate_kid("azAZ09-_.:").expect("should accept allowed kid characters");
+    }
+
+    #[test]
+    fn validate_kid_rejects_empty_ids() {
+        let result = validate_kid("");
+
+        assert!(result.is_err(), "should reject empty kid values");
+    }
+
+    #[test]
+    fn validate_kid_rejects_overlong_ids() {
+        let result = validate_kid(&"a".repeat(129));
+
+        assert!(result.is_err(), "should reject kids longer than 128 chars");
+    }
+
+    #[test]
+    fn validate_kid_rejects_csv_separator() {
+        let result = validate_kid("kid-a,kid-b");
+
+        assert!(result.is_err(), "should reject commas in kid values");
     }
 
     #[test]
@@ -763,28 +973,14 @@ mod tests {
             None,
         );
 
-        let services = noop_services();
-        let result = handle_trusted_server_discovery(&settings, &services, req);
-        match result {
-            Ok(resp) => {
-                assert_eq!(resp.status(), StatusCode::OK);
-                assert_json_content_type(&resp);
-                let body = response_body_string(resp);
+        // noop_services() config store always returns Err, so the discovery
+        // handler propagates the error rather than absorbing it into a 500.
+        let result = handle_trusted_server_discovery(&settings, &noop_services(), req);
 
-                // Parse the discovery document
-                let discovery: serde_json::Value =
-                    serde_json::from_str(&body).expect("should parse discovery document");
-
-                // Verify structure - only version and jwks
-                assert_eq!(discovery["version"], "1.0");
-                assert!(discovery["jwks"].is_object());
-
-                // Verify no extra fields
-                assert!(discovery.get("endpoints").is_none());
-                assert!(discovery.get("capabilities").is_none());
-            }
-            Err(e) => log::debug!("Expected error in test environment: {}", e),
-        }
+        assert!(
+            result.is_err(),
+            "should propagate store errors when JWKS cannot be retrieved"
+        );
     }
 
     #[test]

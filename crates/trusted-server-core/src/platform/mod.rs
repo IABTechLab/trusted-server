@@ -16,21 +16,17 @@
 //! ## Platform-Agnostic Components
 //!
 //! The following components were evaluated for platform-specific behavior
-//! (PR 8) and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (PR 16/17) need not provide
+//! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
+//! and found to have a platform-agnostic rewriting pipeline. No
+//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
-//!   is accessed via `StreamingPipeline::process<R: Read, W: Write>` which
-//!   accepts any reader including platform body types (which implement
+//!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
+//!   accepts any reader, including `fastly::Body` (which implements
 //!   `std::io::Read`).
-//!
-//!   The `publisher.rs` handler module is platform-coupled at its handler
-//!   layer — it accepts and returns `EdgeBody` in function signatures.
-//!   This is an HTTP-type coupling that will be addressed in future PRs.
-//!   It is not a content-rewriting concern.
 //!
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
@@ -58,8 +54,55 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::noop_services;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use edgezero_core::key_value_store::KvPage;
+
+    use super::test_support::{noop_services, noop_services_with_client_ip};
     use super::*;
+
+    struct MarkerKvStore(&'static str);
+
+    #[async_trait(?Send)]
+    impl PlatformKvStore for MarkerKvStore {
+        async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+            if key == "marker" {
+                Ok(Some(Bytes::from(self.0.to_string())))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Ok(KvPage::default())
+        }
+    }
 
     fn _assert_config_store_object_safe(_: &dyn PlatformConfigStore) {}
     fn _assert_secret_store_object_safe(_: &dyn PlatformSecretStore) {}
@@ -99,6 +142,34 @@ mod tests {
             .lookup(services.client_info().client_ip)
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
+    }
+
+    #[test]
+    fn runtime_services_with_kv_store_replaces_only_the_new_clone() {
+        let services = noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
+        let replaced = services
+            .clone()
+            .with_kv_store(Arc::new(MarkerKvStore("replaced")));
+
+        let original_value = futures::executor::block_on(services.kv_store().get_bytes("marker"))
+            .expect("should query the original noop store");
+        let replaced_value = futures::executor::block_on(replaced.kv_store().get_bytes("marker"))
+            .expect("should query the replaced marker store");
+
+        assert_eq!(
+            original_value, None,
+            "should keep the original RuntimeServices KV store unchanged"
+        );
+        assert_eq!(
+            replaced_value,
+            Some(Bytes::from_static(b"replaced")),
+            "should expose the replacement KV store through kv_store()"
+        );
+        assert_eq!(
+            replaced.client_info().client_ip,
+            services.client_info().client_ip,
+            "should preserve client_info through with_kv_store"
+        );
     }
 
     #[test]

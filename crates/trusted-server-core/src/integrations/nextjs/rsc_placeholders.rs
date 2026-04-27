@@ -54,12 +54,13 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             return ScriptRewriteAction::keep();
         }
 
-        // Only process complete (unfragmented) scripts during streaming.
-        // Fragmented scripts are handled by the post-processor which re-parses the final HTML.
-        // This avoids corrupting non-RSC scripts that happen to be fragmented during streaming.
+        // Deliberately does not accumulate fragments (unlike NextJsNextDataRewriter
+        // and GoogleTagManagerIntegration which use Mutex<String> buffers). RSC
+        // placeholder processing has a post-processor fallback that re-parses
+        // the final HTML at end-of-document, so fragmented scripts are safely
+        // deferred. Accumulation here would also risk corrupting non-RSC scripts
+        // that happen to be fragmented during streaming.
         if !ctx.is_last_in_text_node {
-            // Script is fragmented - skip placeholder processing.
-            // The post-processor will handle RSC scripts at end-of-document.
             return ScriptRewriteAction::keep();
         }
 
