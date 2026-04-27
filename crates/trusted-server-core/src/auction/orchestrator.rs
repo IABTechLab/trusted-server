@@ -158,19 +158,13 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
-            let select_result = services
+            let platform_resp = services
                 .http_client()
-                .select(vec![pending])
+                .wait(PlatformPendingRequest::new(pending))
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} request failed", mediator.provider_name()),
                 })?;
-            let platform_resp =
-                select_result
-                    .ready
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} request failed", mediator.provider_name()),
-                    })?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
@@ -243,8 +237,9 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses `services.http_client().select(...)` to process responses as they
-    /// become ready, rather than waiting for each response sequentially.
+    /// Uses [`RuntimeServices::http_client`] and
+    /// [`crate::platform::PlatformHttpClient::select`] to process responses as
+    /// they become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
@@ -417,7 +412,7 @@ impl AuctionOrchestrator {
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "Provider '{}' failed to parse response: {:?}",
+                                    "Provider '{}' returned an unsupported response body: {:?}",
                                     provider_name,
                                     e
                                 );
@@ -622,8 +617,18 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+    };
+
+    // All-None ClientInfo used across tests that don't need real IP/TLS data.
+    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
+    // the temporary-lifetime issue that arises with &ClientInfo::default().
+    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
+        client_ip: None,
+        tls_protocol: None,
+        tls_cipher: None,
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
@@ -676,23 +681,6 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
-    }
-
-    fn create_test_context<'a>(
-        settings: &'a crate::settings::Settings,
-        req: &'a http::Request<edgezero_core::body::Body>,
-        client_info: &'a crate::platform::ClientInfo,
-    ) -> AuctionContext<'a> {
-        let services: &'static crate::platform::RuntimeServices =
-            Box::leak(Box::new(noop_services()));
-        AuctionContext {
-            settings,
-            request: req,
-            client_info,
-            timeout_ms: 2000,
-            provider_responses: None,
-            services,
-        }
     }
 
     #[test]
@@ -787,15 +775,7 @@ mod tests {
             .uri("https://test.com/test")
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
-        let context = create_test_context(
-            &settings,
-            &req,
-            &crate::platform::ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-            },
-        );
+        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())

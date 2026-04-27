@@ -15,7 +15,7 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
     let uri: http::Uri = req
         .get_url_str()
         .parse()
-        .expect("should parse fastly request URL as URI");
+        .unwrap_or_else(|_| http::Uri::from_static("/"));
 
     let mut builder = http::Request::builder()
         .method(req.get_method().clone())
@@ -25,6 +25,8 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
         builder = builder.header(name.as_str(), value.as_bytes());
     }
 
+    // Cannot fail: URI is always valid (parsed above or the "/" fallback),
+    // and Fastly pre-validates all method and header values.
     builder
         .body(body)
         .expect("should build http request from fastly request")
@@ -87,7 +89,7 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
 pub fn to_fastly_request_ref(req: &http::Request<EdgeBody>) -> fastly::Request {
     let mut fastly_req = fastly::Request::new(req.method().clone(), req.uri().to_string());
     for (name, value) in req.headers() {
-        fastly_req.set_header(name.as_str(), value.as_bytes());
+        fastly_req.append_header(name.as_str(), value.as_bytes());
     }
 
     fastly_req
@@ -193,7 +195,7 @@ pub fn forward_fastly_cookie_header(
     }
 }
 
-/// Set the synthetic ID cookie on a `fastly::Response`.
+/// Set the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
 pub fn set_fastly_synthetic_cookie(
@@ -203,19 +205,18 @@ pub fn set_fastly_synthetic_cookie(
 ) {
     if !crate::cookies::synthetic_id_cookie_value_is_safe(synthetic_id) {
         log::warn!(
-            "Rejecting synthetic_id for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
+            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
             synthetic_id.len()
         );
         return;
     }
-
     response.append_header(
         header::SET_COOKIE,
-        crate::cookies::create_synthetic_cookie(settings, synthetic_id),
+        crate::cookies::create_ec_cookie(settings, synthetic_id),
     );
 }
 
-/// Expire the synthetic ID cookie on a `fastly::Response`.
+/// Expire the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
 pub fn expire_fastly_synthetic_cookie(
@@ -224,7 +225,11 @@ pub fn expire_fastly_synthetic_cookie(
 ) {
     response.append_header(
         header::SET_COOKIE,
-        crate::cookies::create_synthetic_id_expiry_cookie(settings),
+        format!(
+            "{}=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+            crate::constants::COOKIE_TS_EC,
+            settings.publisher.cookie_domain,
+        ),
     );
 }
 
@@ -237,29 +242,6 @@ mod tests {
             EdgeBody::Once(bytes) => assert_eq!(bytes.as_ref(), expected, "should copy body bytes"),
             EdgeBody::Stream(_) => panic!("expected non-streaming body"),
         }
-    }
-
-    #[test]
-    fn from_fastly_request_copies_body() {
-        let mut fastly_req =
-            fastly::Request::new(fastly::http::Method::POST, "https://example.com/path");
-        fastly_req.set_header("content-type", "application/json");
-        fastly_req.set_body(r#"{"ok":true}"#);
-
-        let http_req = from_fastly_request(fastly_req);
-        let (parts, body) = http_req.into_parts();
-
-        assert_eq!(parts.method, http::Method::POST, "should copy method");
-        assert_eq!(parts.uri.path(), "/path", "should copy uri path");
-        assert_eq!(
-            parts
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json"),
-            "should copy headers"
-        );
-        assert_once_body_eq(body, br#"{"ok":true}"#);
     }
 
     #[test]
@@ -311,6 +293,29 @@ mod tests {
 
         assert_eq!(http_req.method(), http::Method::POST, "should copy method");
         assert_once_body_eq(http_req.into_body(), b"");
+    }
+
+    #[test]
+    fn from_fastly_request_copies_body() {
+        let mut fastly_req =
+            fastly::Request::new(fastly::http::Method::POST, "https://example.com/path");
+        fastly_req.set_header("content-type", "application/json");
+        fastly_req.set_body(r#"{"ok":true}"#);
+
+        let http_req = from_fastly_request(fastly_req);
+        let (parts, body) = http_req.into_parts();
+
+        assert_eq!(parts.method, http::Method::POST, "should copy method");
+        assert_eq!(parts.uri.path(), "/path", "should copy uri path");
+        assert_eq!(
+            parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "should copy headers"
+        );
+        assert_once_body_eq(body, br#"{"ok":true}"#);
     }
 
     #[test]
@@ -440,6 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn to_fastly_request_ref_preserves_duplicate_headers() {
+        let http_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .header("x-custom", "first")
+            .header("x-custom", "second")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let fastly_req = to_fastly_request_ref(&http_req);
+
+        let values: Vec<_> = fastly_req
+            .get_headers()
+            .filter(|(name, _)| name.as_str() == "x-custom")
+            .map(|(_, value)| value.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate headers"
+        );
+    }
+
+    #[test]
     fn sanitize_fastly_forwarded_headers_strips_spoofable() {
         let mut req = fastly::Request::new(fastly::http::Method::GET, "https://example.com");
         req.set_header("forwarded", "host=evil.com");
@@ -499,7 +528,7 @@ mod tests {
     fn copy_fastly_custom_headers_filters_internal() {
         let mut from_req = fastly::Request::new(fastly::http::Method::GET, "https://example.com");
         from_req.set_header("x-custom-data", "present");
-        from_req.set_header("x-synthetic-id", "should-not-copy");
+        from_req.set_header("x-ts-ec", "should-not-copy");
         let mut to_req = fastly::Request::new(fastly::http::Method::GET, "https://partner.com");
 
         copy_fastly_custom_headers(&from_req, &mut to_req);
@@ -512,7 +541,7 @@ mod tests {
             "should copy arbitrary x-header"
         );
         assert!(
-            to_req.get_header("x-synthetic-id").is_none(),
+            to_req.get_header("x-ts-ec").is_none(),
             "should not copy internal header"
         );
     }
@@ -552,7 +581,7 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "synthetic_id=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
+                "ts-ec=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
                 settings.publisher.cookie_domain
             )),
             "should set expected synthetic cookie"
@@ -573,7 +602,7 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "synthetic_id=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+                "ts-ec=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
                 settings.publisher.cookie_domain
             )),
             "should set expected expiry cookie"

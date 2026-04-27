@@ -176,7 +176,7 @@ The auction system processes requests through a pipeline of transformations:
 POST /auction (AdRequest in Prebid.js format)
   │
   ├─ Parse body → AdRequest { adUnits[] }
-  ├─ Generate synthetic + fresh user IDs
+  ├─ Generate EC + fresh user IDs
   ├─ Convert adUnits → AdSlots with formats and bidder params
   ├─ Extract device info (User-Agent, geo)
   │
@@ -195,7 +195,7 @@ Convert OrchestrationResult → OpenRTB 2.x Response
   │
   ├─ Rewrite creative HTML with first-party proxy URLs
   ├─ Add ext.orchestrator metadata
-  └─ Set synthetic ID response headers
+  └─ Set EC ID response headers
 ```
 
 ### Key Components
@@ -332,7 +332,7 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 
 - `AdSlot` → `Imp` with `Banner { format: [Format { w, h }] }`
 - Bidder params from slot config → `ext.prebid.bidder` map
-- Synthetic and fresh user IDs injected into `User` object
+- EC and fresh user IDs injected into `User` object
 - Device info, geo data, and GPC signals included
 - Optional Ed25519 request signing (see [Request Signing](/guide/request-signing))
 
@@ -429,7 +429,7 @@ pub struct AuctionRequest {
     pub id: String,                                    // UUID
     pub slots: Vec<AdSlot>,                            // Ad placements
     pub publisher: PublisherInfo,                       // Domain, page URL
-    pub user: UserInfo,                                // Synthetic ID, fresh ID, consent
+    pub user: UserInfo,                                // EC ID, fresh ID, consent
     pub device: Option<DeviceInfo>,                    // UA, IP, geo
     pub site: Option<SiteInfo>,                        // Domain, page
     pub context: HashMap<String, serde_json::Value>,   // Additional metadata
@@ -549,11 +549,10 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
 }
 ```
 
-The response also includes synthetic ID headers:
+The response also includes EC ID headers:
 
-- `X-Synthetic-ID` — The persistent synthetic user ID
-- `X-Synthetic-Fresh` — A fresh ID generated for this session
-- `X-Synthetic-Trusted-Server` — Trusted Server marker
+- `X-TS-EC` — The persistent EC user ID
+- `X-TS-EC-Fresh` — A fresh ID generated for this session
 
 ## Creative Processing
 

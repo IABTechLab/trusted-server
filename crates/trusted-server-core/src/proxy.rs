@@ -1,3 +1,4 @@
+use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
@@ -12,11 +13,11 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
+use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
-use crate::synthetic::get_synthetic_id;
 
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
@@ -25,7 +26,13 @@ fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
     Cursor::new(body.into_bytes())
 }
 
-/// Headers copied from the original client request to the upstream proxy request.
+/// Headers copied from the original client request to the upstream proxy request
+/// when `copy_request_headers` is enabled.
+///
+/// `Accept-Encoding` is also overridden in the same code path, but with a fixed
+/// value ([`SUPPORTED_ENCODINGS`]) rather than forwarding the client's preference.
+/// Both forwarded headers and the Accept-Encoding override are applied together in
+/// the `copy_request_headers` branch of the proxy request builder.
 const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_USER_AGENT,
     HEADER_ACCEPT,
@@ -33,6 +40,7 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_REFERER,
     HEADER_X_FORWARDED_FOR,
 ];
+
 
 #[derive(Deserialize)]
 struct ProxySignReq {
@@ -52,8 +60,8 @@ pub struct ProxyRequestConfig<'a> {
     pub target_url: &'a str,
     /// Whether redirects should be followed automatically.
     pub follow_redirects: bool,
-    /// Whether to append the caller's synthetic ID as a query param.
-    pub forward_synthetic_id: bool,
+    /// Whether to append the caller's EC ID as a query param.
+    pub forward_ec_id: bool,
     /// Optional body to send to the origin.
     pub body: Option<Vec<u8>>,
     /// Additional headers to forward to the origin.
@@ -62,25 +70,22 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
-    /// Domain allowlist enforced on the initial target and every redirect hop.
+    /// Domains allowed for the initial request and any redirects.
     ///
-    /// An empty slice disables allowlist enforcement (open mode).
-    /// Integration proxies should pass `&[]`; first-party proxy passes
-    /// `&settings.proxy.allowed_domains`.
+    /// When empty every host is permitted (open mode). Integration proxies
+    /// should leave this empty; first-party handlers should pass
+    /// `&settings.proxy.allowed_domains` to enforce the publisher allowlist.
     pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
-    /// Build a proxy configuration that follows redirects and forwards the synthetic ID.
-    ///
-    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
-    /// first-party proxy by setting `allowed_domains` directly.
+    /// Build a proxy configuration that follows redirects and forwards the EC ID.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
             target_url,
             follow_redirects: true,
-            forward_synthetic_id: true,
+            forward_ec_id: true,
             body: None,
             headers: Vec::new(),
             copy_request_headers: true,
@@ -407,16 +412,22 @@ fn finalize_response(
     }
 }
 
+/// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
 struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
     copy_request_headers: bool,
     services: &'a RuntimeServices,
+    /// Domains permitted for the initial request and any redirects.
+    ///
+    /// Empty slice means open mode (all hosts allowed). Populated by first-party
+    /// handlers; integration proxies leave it empty.
+    allowed_domains: &'a [String],
 }
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
-/// the caller's synthetic ID as a `synthetic_id` query parameter to the target URL.
+/// the caller's EC ID as a `ts-ec` query parameter to the target URL.
 /// Optional bodies/headers can be supplied via [`ProxyRequestConfig`].
 ///
 /// # Errors
@@ -432,12 +443,12 @@ pub async fn proxy_request(
     let ProxyRequestConfig {
         target_url,
         follow_redirects,
-        forward_synthetic_id,
+        forward_ec_id,
         body,
         headers,
         copy_request_headers,
         stream_passthrough,
-        allowed_domains: _,
+        allowed_domains,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -446,8 +457,8 @@ pub async fn proxy_request(
         })
     })?;
 
-    if forward_synthetic_id {
-        append_synthetic_id(&req, &mut target_url_parsed);
+    if forward_ec_id {
+        append_ec_id(&req, &mut target_url_parsed);
     }
 
     proxy_with_redirects(
@@ -460,46 +471,48 @@ pub async fn proxy_request(
             additional_headers: &headers,
             copy_request_headers,
             services,
+            allowed_domains,
         },
         stream_passthrough,
     )
     .await
 }
 
-fn append_synthetic_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
-    let synthetic_id_param = match get_synthetic_id(req) {
+/// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
+fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k.as_ref() != "ts-ec")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    pairs.push(("ts-ec".to_string(), ec_id.to_string()));
+
+    url.set_query(None);
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in &pairs {
+        serializer.append_pair(k, v);
+    }
+    url.set_query(Some(&serializer.finish()));
+}
+
+fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
+    let ec_id_param = match get_ec_id(req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
+            log::warn!("failed to extract EC ID for forwarding: {:?}", e);
             None
         }
     };
 
-    if let Some(synthetic_id) = synthetic_id_param {
-        let mut pairs: Vec<(String, String)> = target_url_parsed
-            .query_pairs()
-            .filter(|(k, _)| k.as_ref() != "synthetic_id")
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-
-        pairs.push(("synthetic_id".to_string(), synthetic_id));
-
-        target_url_parsed.set_query(None);
-        if !pairs.is_empty() {
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            for (k, v) in &pairs {
-                serializer.append_pair(k, v);
-            }
-            let query_str = serializer.finish();
-            target_url_parsed.set_query(Some(&query_str));
-        }
-
+    if let Some(ec_id) = ec_id_param {
+        upsert_ec_query_param(target_url_parsed, &ec_id);
         log::debug!(
-            "forwarding synthetic_id to origin url {}",
+            "forwarding EC ID to origin url {}",
             target_url_parsed.as_str()
         );
     } else {
-        log::debug!("no synthetic_id to forward to origin");
+        log::debug!("no EC ID to forward to origin");
     }
 }
 
@@ -570,7 +583,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -588,7 +601,7 @@ async fn proxy_with_redirects(
                 host: host.to_string(),
                 port: parsed_url.port(),
                 certificate_check: settings.proxy.certificate_check,
-                first_byte_timeout: Duration::from_secs(15),
+                first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             })
             .change_context(TrustedServerError::Proxy {
                 message: "backend registration failed".to_string(),
@@ -602,19 +615,26 @@ async fn proxy_with_redirects(
                 })?,
         );
 
+        // Collect outbound headers using insert-semantics so additional_headers override any
+        // header set by copy_request_headers, matching the old set_header() replace behavior.
+        let mut outbound_headers = http::HeaderMap::new();
         if request_headers.copy_request_headers {
             for header_name in PROXY_FORWARD_HEADERS {
                 if let Some(v) = req.headers().get(&header_name) {
-                    builder = builder.header(header_name.as_str(), v.as_bytes());
+                    outbound_headers.insert(header_name, v.clone());
                 }
             }
-            builder = builder.header(
-                HEADER_ACCEPT_ENCODING.as_str(),
-                SUPPORTED_ENCODINGS.as_bytes(),
+            outbound_headers.insert(
+                HEADER_ACCEPT_ENCODING,
+                HeaderValue::from_static(SUPPORTED_ENCODINGS),
             );
         }
         for (name, value) in request_headers.additional_headers {
-            builder = builder.header(name.clone(), value.clone());
+            // insert() replaces any existing value, matching set_header() semantics.
+            outbound_headers.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &outbound_headers {
+            builder = builder.header(name, value);
         }
         let body_bytes = body.map(<[u8]>::to_vec).unwrap_or_default();
         let edge_req =
@@ -691,7 +711,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(&settings.proxy.allowed_domains, next_host) {
+        if !redirect_is_permitted(request_headers.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -750,7 +770,7 @@ pub async fn handle_first_party_proxy(
         ProxyRequestConfig {
             target_url: &target_url,
             follow_redirects: true,
-            forward_synthetic_id: true,
+            forward_ec_id: true,
             body: None,
             headers: Vec::new(),
             copy_request_headers: true,
@@ -783,44 +803,24 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
-    let synthetic_id = match get_synthetic_id(&req) {
+    let ec_id = match get_ec_id(&req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract synthetic ID for forwarding: {:?}", e);
+            log::warn!("failed to extract EC ID for forwarding: {:?}", e);
             None
         }
     };
 
     let mut redirect_target = full_for_token.clone();
-    if let Some(ref synthetic_id_value) = synthetic_id {
+    if let Some(ref ec_id_value) = ec_id {
         match url::Url::parse(&redirect_target) {
             Ok(mut url) => {
-                let mut pairs: Vec<(String, String)> = url
-                    .query_pairs()
-                    .filter(|(k, _)| k.as_ref() != "synthetic_id")
-                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                    .collect();
-                pairs.push(("synthetic_id".to_string(), synthetic_id_value.clone()));
-
-                url.set_query(None);
-                if !pairs.is_empty() {
-                    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-                    for (k, v) in &pairs {
-                        serializer.append_pair(k, v);
-                    }
-                    let query_str = serializer.finish();
-                    url.set_query(Some(&query_str));
-                }
-
-                let final_target = url.to_string();
-                log::debug!("forwarding synthetic_id to target url {}", final_target);
-                redirect_target = final_target;
+                upsert_ec_query_param(&mut url, ec_id_value);
+                redirect_target = url.to_string();
+                log::debug!("forwarding EC ID to target url {}", redirect_target);
             }
             Err(e) => {
-                log::warn!(
-                    "failed to parse target url for synthetic forwarding: {:?}",
-                    e
-                );
+                log::warn!("failed to parse target url for EC ID forwarding: {:?}", e);
             }
         }
     }
@@ -837,13 +837,13 @@ pub async fn handle_first_party_click(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
-        "redirect tsurl={} params_present={} target={} referer={} ua={} synthetic_id={}",
+        "redirect tsurl={} params_present={} target={} referer={} ua={} ec_id={}",
         tsurl,
         had_params,
         redirect_target,
         referer,
         ua,
-        synthetic_id.as_deref().unwrap_or("")
+        ec_id.as_deref().unwrap_or("")
     );
 
     // 302 redirect to target URL
@@ -1292,17 +1292,26 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
+        SUPPORTED_ENCODINGS,
     };
     use crate::constants::HEADER_ACCEPT;
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{build_services_with_http_client, noop_services};
+    use crate::platform::{
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult,
+    };
     use crate::test_support::tests::create_test_settings;
+    use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::http::response_builder as edge_response_builder;
     use error_stack::Report;
     use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 
@@ -1376,6 +1385,45 @@ mod tests {
             .headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
+    }
+
+    /// Test double that always returns a streaming (non-buffered) response body.
+    ///
+    /// Used to exercise the `Body::Stream` error path in
+    /// `platform_response_to_fastly`, which cannot materialise a streaming body
+    /// into a `fastly::Response`. Only `send` is implemented; `send_async` and
+    /// `select` return `PlatformError::Unsupported`.
+    struct StreamingResponseHttpClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for StreamingResponseHttpClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let edge_response = edge_response_builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::stream(futures::stream::iter(vec![
+                    Bytes::from_static(b"chunk"),
+                ])))
+                .expect("should build streaming test response");
+
+            Ok(PlatformResponse::new(edge_response).with_backend_name("stub-backend"))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
     }
 
     #[tokio::test]
@@ -1472,10 +1520,7 @@ mod tests {
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
-        assert!(
-            cfg.forward_synthetic_id,
-            "should forward synthetic id by default"
-        );
+        assert!(cfg.forward_ec_id, "should forward EC ID by default");
         assert_eq!(cfg.body.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(cfg.headers.len(), 1, "should include custom header");
         assert!(
@@ -1588,7 +1633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn click_appends_synthetic_id_when_present() {
+    async fn click_appends_ec_id_when_present() {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/a.png";
         let params = "foo=1";
@@ -1603,10 +1648,9 @@ mod tests {
                 sig
             ),
         );
-        let valid_synthetic_id = crate::test_support::tests::VALID_SYNTHETIC_ID;
         req.headers_mut().insert(
-            crate::constants::HEADER_X_SYNTHETIC_ID,
-            HeaderValue::from_static(valid_synthetic_id),
+            crate::constants::HEADER_X_TS_EC,
+            HeaderValue::from_static("ec-123"),
         );
 
         let resp = handle_first_party_click(&settings, &noop_services(), req)
@@ -1624,10 +1668,7 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(
-            pairs.remove("synthetic_id").as_deref(),
-            Some(valid_synthetic_id)
-        );
+        assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
         assert!(pairs.is_empty());
     }
 
@@ -2062,8 +2103,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_request_calls_platform_http_client_send() {
-        use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
-        use std::sync::Arc;
+        use crate::platform::test_support::StubHttpClient;
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"ok".to_vec());
@@ -2079,7 +2119,7 @@ mod tests {
             ProxyRequestConfig {
                 target_url: "https://example.com/resource",
                 follow_redirects: false,
-                forward_synthetic_id: false,
+                forward_ec_id: false,
                 body: None,
                 headers: Vec::new(),
                 copy_request_headers: false,
@@ -2096,6 +2136,157 @@ mod tests {
         assert_eq!(
             calls[0], "stub-backend",
             "should use backend name from StubBackend"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
+        use crate::platform::test_support::StubHttpClient;
+
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        req.headers_mut().insert(header::USER_AGENT, HeaderValue::from_static("test-agent/1.0"));
+        req.headers_mut().insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        req.headers_mut()
+            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+
+        let result = proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig {
+                target_url: "https://example.com/resource",
+                follow_redirects: false,
+                forward_ec_id: false,
+                body: None,
+                headers: Vec::new(),
+                copy_request_headers: true,
+                stream_passthrough: false,
+                allowed_domains: &[],
+            },
+            &services,
+        )
+        .await;
+
+        assert!(result.is_ok(), "should proxy successfully");
+        let all_headers = stub.recorded_request_headers();
+        assert_eq!(all_headers.len(), 1, "should have captured one request");
+        let sent = &all_headers[0];
+
+        let header_value = |name: &str| -> Option<String> {
+            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            header_value("user-agent").as_deref(),
+            Some("test-agent/1.0"),
+            "should forward User-Agent"
+        );
+        assert_eq!(
+            header_value("accept").as_deref(),
+            Some("text/html"),
+            "should forward Accept"
+        );
+        assert_eq!(
+            header_value("accept-language").as_deref(),
+            Some("en-US"),
+            "should forward Accept-Language"
+        );
+        assert_eq!(
+            header_value("accept-encoding").as_deref(),
+            Some(SUPPORTED_ENCODINGS),
+            "should override Accept-Encoding with supported encodings"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_request_passes_through_streaming_platform_response_body() {
+        // HTTP types can carry streaming bodies; proxy_request returns Ok even when
+        // the origin sends a streaming body (unlike the old Fastly path which required
+        // materialising the body before wrapping it in fastly::Response).
+        let services = build_services_with_http_client(
+            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+
+        let result = proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig {
+                target_url: "https://example.com/resource",
+                follow_redirects: false,
+                forward_ec_id: false,
+                body: None,
+                headers: Vec::new(),
+                copy_request_headers: false,
+                stream_passthrough: false,
+                allowed_domains: &[],
+            },
+            &services,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "should pass streaming body through with HTTP types: {result:?}"
+        );
+        assert_eq!(
+            result.expect("should succeed").status(),
+            StatusCode::OK,
+            "should preserve the origin status code"
+        );
+    }
+
+    #[test]
+    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
+        let mut beresp = Response::new(EdgeBody::empty());
+        *beresp.status_mut() = StatusCode::OK;
+        beresp
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("a=1; Path=/; Secure"));
+        beresp
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("b=2; Path=/; Secure"));
+
+        let rebuilt = rebuild_response_with_body(
+            beresp,
+            "text/html; charset=utf-8",
+            b"rewritten".to_vec(),
+            false,
+        );
+
+        let cookies: Vec<String> = rebuilt
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .into_iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("should preserve UTF-8 Set-Cookie header values")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            cookies,
+            vec![
+                "a=1; Path=/; Secure".to_string(),
+                "b=2; Path=/; Secure".to_string(),
+            ],
+            "should preserve every Set-Cookie value when rebuilding the response"
         );
     }
 

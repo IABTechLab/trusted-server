@@ -4,7 +4,7 @@ use edgezero_core::http::{
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
-use fastly::{Error, Request as FastlyRequest, Response as FastlyResponse};
+use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -22,7 +22,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -34,35 +36,48 @@ mod error;
 mod logging;
 mod management_api;
 mod platform;
+#[cfg(test)]
+mod route_tests;
 
 use crate::error::to_error_response;
+use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
-#[fastly::main]
-fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
-    logging::init_logger();
+/// Entry point for the Fastly Compute program.
+///
+/// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
+/// `#[fastly::main]` so we can call `send_to_client()` explicitly when needed.
+fn main() {
+    init_logger();
+
+    let mut req = FastlyRequest::from_client();
 
     // Keep the health probe independent from settings loading and routing so
     // readiness checks still get a cheap liveness response during startup.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        return Ok(FastlyResponse::from_status(200).with_body_text_plain("ok"));
+        FastlyResponse::from_status(200)
+            .with_body_text_plain("ok")
+            .send_to_client();
+        return;
     }
 
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return;
         }
     };
     log::debug!("Settings {settings:?}");
 
     // Build the auction orchestrator once at startup
     let orchestrator = match build_orchestrator(&settings) {
-        Ok(orchestrator) => orchestrator,
+        Ok(o) => o,
         Err(e) => {
             log::error!("Failed to build auction orchestrator: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return;
         }
     };
 
@@ -70,25 +85,13 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to create integration registry: {:?}", e);
-            return Ok(to_error_response(&e));
+            to_error_response(&e).send_to_client();
+            return;
         }
     };
 
-    let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
-        Ok(s) => s,
-        Err(e) => {
-            // Degrade gracefully: routes that do not touch synthetic IDs
-            // (e.g. /.well-known/, /verify-signature, /admin/keys/*) must
-            // still succeed even when the KV store is unavailable.
-            // Handlers that call kv_handle() will receive KvError::Unavailable.
-            log::warn!(
-                "KV store '{}' unavailable, synthetic ID routes will return errors: {e}",
-                settings.synthetic.opid_store
-            );
-            std::sync::Arc::new(UnavailableKvStore)
-                as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>
-        }
-    };
+    let kv_store = std::sync::Arc::new(UnavailableKvStore)
+        as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
     // Strip client-spoofable forwarded headers at the edge before building
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
@@ -119,7 +122,7 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
 
     finalize_response(&settings, geo_info.as_ref(), &mut response);
 
-    Ok(compat::to_fastly_response(response))
+    compat::to_fastly_response(response).send_to_client();
 }
 
 async fn route_request(
@@ -168,7 +171,12 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            handle_auction(settings, orchestrator, runtime_services, req).await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(auction_services) => {
+                    handle_auction(settings, orchestrator, &auction_services, req).await
+                }
+                Err(e) => Err(e),
+            }
         }
 
         // tsjs endpoints
@@ -200,9 +208,63 @@ async fn route_request(
                 path
             );
 
-            handle_publisher_request(settings, integration_registry, runtime_services, req).await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(publisher_services) => {
+                    handle_publisher_request(settings, integration_registry, &publisher_services, req)
+                        .await
+                        .and_then(|pub_response| {
+                            resolve_publisher_response(pub_response, settings, integration_registry)
+                        })
+                }
+                Err(e) => Err(e),
+            }
         }
     }
+}
+
+fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<HttpResponse, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(output.len() as u64));
+            *response.body_mut() = EdgeBody::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

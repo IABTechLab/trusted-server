@@ -47,12 +47,12 @@ JS bundles (served by publisher module):
 
 Behavior is covered by an extensive test suite in `crates/trusted-server-core/src/creative.rs`.
 
-## Synthetic Identifier Propagation
+## Edge Cookie (EC) Identifier Propagation
 
-- `synthetic.rs` generates a synthetic identifier per user request and exposes helpers:
-  - `generate_synthetic_id` — creates a fresh HMAC-based ID using request signals and appends a short random suffix (format: `64hex.6alnum`).
-  - `get_synthetic_id` — extracts an existing ID from the `x-synthetic-id` header or `synthetic_id` cookie.
-  - `get_or_generate_synthetic_id` — reuses the existing ID when present, otherwise creates one.
-- `publisher.rs::handle_publisher_request` stamps proxied origin responses with `x-synthetic-id`, and (when absent) issues the `synthetic_id` cookie so the browser keeps the identifier on subsequent requests.
-- `proxy.rs::handle_first_party_proxy` replays the identifier to third-party creative origins by appending `synthetic_id=<value>` to the reconstructed target URL, follows redirects (301/302/303/307/308) up to four hops, and keeps downstream fetches linked to the same user scope.
-- `proxy.rs::handle_first_party_click` adds `synthetic_id=<value>` to outbound click redirect URLs so analytics endpoints can associate clicks with impressions without third-party cookies.
+- `edge_cookie.rs` generates an edge cookie identifier per user request and exposes helpers:
+  - `generate_ec_id` — creates a fresh HMAC-based ID using the client IP address and appends a short random suffix (format: `64hex.6alnum`).
+  - `get_ec_id` — extracts an existing ID from the `x-ts-ec` header or `ts-ec` cookie.
+  - `get_or_generate_ec_id` — reuses the existing ID when present, otherwise creates one.
+- `publisher.rs::handle_publisher_request` stamps proxied origin responses with `x-ts-ec`, and (when absent) issues the `ts-ec` cookie so the browser keeps the identifier on subsequent requests.
+- `proxy.rs::handle_first_party_proxy` replays the identifier to third-party creative origins by appending `ts-ec=<value>` to the reconstructed target URL, follows redirects (301/302/303/307/308) up to four hops, and keeps downstream fetches linked to the same user scope.
+- `proxy.rs::handle_first_party_click` adds `ts-ec=<value>` to outbound click redirect URLs so analytics endpoints can associate clicks with impressions without third-party cookies.

@@ -1,3 +1,7 @@
+//! RSC flight data processor.
+//!
+//! See [`crate::platform`] module doc for platform notes.
+
 use std::io;
 
 use crate::host_rewrite::rewrite_bare_host_at_boundaries;

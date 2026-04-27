@@ -133,7 +133,7 @@ impl GptIntegration {
             .with_streaming()
             .without_forward_headers();
         config.follow_redirects = false;
-        config.forward_synthetic_id = false;
+        config.forward_ec_id = false;
 
         Self::apply_request_header_allowlist(config, req)
     }
@@ -660,7 +660,7 @@ mod tests {
     // -- GPT proxy configuration --
 
     #[test]
-    fn build_proxy_config_uses_streaming_without_synthetic_forwarding_or_redirects() {
+    fn build_proxy_config_uses_streaming_without_ec_forwarding_or_redirects() {
         let req = build_http_request(
             Method::GET,
             "https://edge.example.com/integrations/gpt/script",
@@ -675,8 +675,8 @@ mod tests {
             "should stream GPT assets verbatim without rewrite processing"
         );
         assert!(
-            !config.forward_synthetic_id,
-            "should not append synthetic_id to GPT asset requests"
+            !config.forward_ec_id,
+            "should not append EC ID to GPT asset requests"
         );
         assert!(
             !config.follow_redirects,

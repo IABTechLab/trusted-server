@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::settings::Settings;
+use crate::settings::{EdgeCookie, Publisher, Settings};
 
 pub use crate::auction_config_types::AuctionConfig;
 
@@ -40,17 +40,17 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         );
     }
 
-    if settings.synthetic.secret_key.expose() == "trusted-server" {
+    if EdgeCookie::is_placeholder_secret_key(settings.edge_cookie.secret_key.expose()) {
         log::warn!(
-            "INSECURE: synthetic.secret_key is set to the default placeholder — \
+            "INSECURE: edge_cookie.secret_key is set to a default placeholder — \
              HMAC-SHA256 signatures can be forged. \
-             Override via TRUSTED_SERVER__SYNTHETIC__SECRET_KEY at build time"
+             Override via TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY at build time"
         );
     }
 
-    if settings.publisher.proxy_secret.expose() == "change-me-proxy-secret" {
+    if Publisher::is_placeholder_proxy_secret(settings.publisher.proxy_secret.expose()) {
         log::warn!(
-            "INSECURE: publisher.proxy_secret is set to the default placeholder — \
+            "INSECURE: publisher.proxy_secret is set to a default placeholder — \
              XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone. \
              Override via TRUSTED_SERVER__PUBLISHER__PROXY_SECRET at build time"
         );
@@ -69,13 +69,8 @@ mod tests {
         // "change-me-proxy-secret"). This is expected — production builds override
         // them via TRUSTED_SERVER__* env vars at build time.
         let settings = get_settings().expect("should load settings from embedded TOML");
-        // Verify basic structure is loaded
         assert!(!settings.publisher.domain.is_empty());
         assert!(!settings.publisher.cookie_domain.is_empty());
         assert!(!settings.publisher.origin_url.is_empty());
-        assert!(!settings.synthetic.counter_store.is_empty());
-        assert!(!settings.synthetic.opid_store.is_empty());
-        assert!(!settings.synthetic.secret_key.expose().is_empty());
-        assert!(!settings.synthetic.template.is_empty());
     }
 }
