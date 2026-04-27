@@ -28,13 +28,13 @@ cache_ttl_seconds = 3600
 
 ### Configuration Options
 
-| Option              | Type             | Default                        | Description                                                                                  |
-| ------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
-| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                           |
-| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                    |
-| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                       |
-| `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies |
-| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers            |
+| Option              | Type             | Default                        | Description                                                                                                                                                                |
+| ------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                                                                                                         |
+| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                                                                                                  |
+| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                                                                                                     |
+| `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies. Names must be 1-64 characters and contain only letters, numbers, `_`, or `-` |
+| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers                                                                                          |
 
 ## Endpoints
 
@@ -53,6 +53,12 @@ When `rewrite_sdk = true`, Trusted Server rewrites matching Sourcepoint URLs in 
 <!-- Becomes -->
 <script src="https://publisher.example.com/integrations/sourcepoint/cdn/wrapperMessagingWithoutDetection.js"></script>
 ```
+
+If a publisher uses a Content Security Policy, `script-src` must allow the first-party Trusted Server host after rewriting. A policy that only allows `https://cdn.privacy-mgmt.com` can block the rewritten first-party script URLs.
+
+## Runtime Config Rewriting
+
+Trusted Server also injects a `window._sp_` property trap that rewrites known Sourcepoint URL-bearing config fields (`baseEndpoint`, `mmsDomain`, `wrapperAPIOrigin`, `cmpOrigin`, and `metricUrl`). If Sourcepoint introduces another URL-bearing field and third-party `cdn.privacy-mgmt.com` requests remain after enabling this integration, report the missed field so it can be added to the trap.
 
 ## Client-Side Guard
 

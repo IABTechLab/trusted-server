@@ -18,6 +18,7 @@
 //! |--------|------|----------|
 //! | `GET/POST` | `/integrations/sourcepoint/cdn/*` | `cdn.privacy-mgmt.com` |
 
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -36,6 +37,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
@@ -126,6 +128,7 @@ pub struct SourcepointConfig {
     /// Sourcepoint's standard cookie set is allowlisted automatically.
     /// Configure this only when the CMP uses a custom `authCookie` name and
     /// that cookie must round-trip through the first-party proxy.
+    #[validate(custom(function = "validate_auth_cookie_name"))]
     pub auth_cookie_name: Option<String>,
     /// Cache TTL for Sourcepoint static responses in seconds.
     #[serde(default = "default_cache_ttl")]
@@ -205,6 +208,32 @@ fn validate_cdn_origin(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_auth_cookie_name(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() || value.trim() != value {
+        let mut err = ValidationError::new("invalid_auth_cookie_name");
+        err.message =
+            Some("auth_cookie_name must be non-empty with no surrounding whitespace".into());
+        return Err(err);
+    }
+
+    if value.len() > 64 {
+        let mut err = ValidationError::new("invalid_auth_cookie_name");
+        err.message = Some("auth_cookie_name must be at most 64 characters".into());
+        return Err(err);
+    }
+
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        let mut err = ValidationError::new("invalid_auth_cookie_name");
+        err.message = Some("auth_cookie_name may contain only A-Z, a-z, 0-9, '_' and '-'".into());
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 struct SourcepointIntegration {
     config: Arc<SourcepointConfig>,
 }
@@ -266,8 +295,13 @@ impl SourcepointIntegration {
         ))
     }
 
-    fn copy_headers(&self, original_req: &Request, proxy_req: &mut Request) {
-        if let Some(client_ip) = original_req.get_client_ip_addr() {
+    fn copy_headers(
+        &self,
+        client_ip: Option<IpAddr>,
+        original_req: &Request,
+        proxy_req: &mut Request,
+    ) {
+        if let Some(client_ip) = client_ip {
             proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
         }
 
@@ -429,7 +463,7 @@ impl SourcepointIntegration {
     /// is a conservative preflight — false negatives just mean we skip the
     /// `Accept-Encoding: identity` optimisation for that request.
     fn is_likely_javascript_path(path: &str) -> bool {
-        path.ends_with(".js") || path.starts_with("/unified/") || path.starts_with("/wrapper/")
+        path.ends_with(".js") || path.starts_with("/unified/")
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
@@ -540,6 +574,7 @@ impl IntegrationProxy for SourcepointIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -558,7 +593,7 @@ impl IntegrationProxy for SourcepointIntegration {
             .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        self.copy_headers(&req, &mut proxy_req);
+        self.copy_headers(services.client_info.client_ip, &req, &mut proxy_req);
 
         // Request uncompressed content only for paths that are likely
         // JavaScript (the files we need to regex-rewrite).  All other CDN
@@ -944,7 +979,7 @@ mod tests {
         assert!(SourcepointIntegration::is_likely_javascript_path(
             "/unified/4.40.1/gdpr-tcf.bundle.js"
         ));
-        assert!(SourcepointIntegration::is_likely_javascript_path(
+        assert!(!SourcepointIntegration::is_likely_javascript_path(
             "/wrapper/v2/messages"
         ));
         assert!(SourcepointIntegration::is_likely_javascript_path(
@@ -999,13 +1034,15 @@ mod tests {
             trap_script.contains("Object.defineProperty"),
             "should install a property trap on window._sp_: {trap_script}",
         );
+        for config_field in ["baseEndpoint", "mmsDomain", "wrapperAPIOrigin", "cmpOrigin"] {
+            assert!(
+                trap_script.contains(&format!("o.config.{config_field}")),
+                "should patch config field {config_field}: {trap_script}",
+            );
+        }
         assert!(
-            trap_script.contains("baseEndpoint"),
-            "should patch baseEndpoint in the config: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("metricUrl"),
-            "should patch metricUrl: {trap_script}",
+            trap_script.contains("o.metricUrl"),
+            "should patch top-level metricUrl: {trap_script}",
         );
     }
 
@@ -1152,6 +1189,67 @@ mod tests {
         assert!(
             cfg.validate().is_ok(),
             "should accept http scheme for cdn_origin"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_auth_cookie_names() {
+        for auth_cookie_name in ["sp_auth", "sp-auth_01"] {
+            let cfg = SourcepointConfig {
+                enabled: true,
+                rewrite_sdk: true,
+                cdn_origin: default_cdn_origin(),
+                auth_cookie_name: Some(auth_cookie_name.to_string()),
+                cache_ttl_seconds: default_cache_ttl(),
+            };
+
+            assert!(
+                cfg.validate().is_ok(),
+                "should accept valid auth_cookie_name: {auth_cookie_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_auth_cookie_names() {
+        for auth_cookie_name in [
+            "",
+            "   ",
+            " sp_auth",
+            "sp_auth ",
+            "sp;auth",
+            "sp=auth",
+            "sp.auth",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let cfg = SourcepointConfig {
+                enabled: true,
+                rewrite_sdk: true,
+                cdn_origin: default_cdn_origin(),
+                auth_cookie_name: Some(auth_cookie_name.to_string()),
+                cache_ttl_seconds: default_cache_ttl(),
+            };
+
+            assert!(
+                cfg.validate().is_err(),
+                "should reject invalid auth_cookie_name: {auth_cookie_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_headers_sets_x_forwarded_for_from_runtime_client_ip() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let original_req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
+        let mut proxy_req = Request::new(Method::GET, "https://cdn.privacy-mgmt.com/wrapper.js");
+        let client_ip = "203.0.113.10".parse().expect("should parse test IP");
+
+        integration.copy_headers(Some(client_ip), &original_req, &mut proxy_req);
+
+        assert_eq!(
+            proxy_req.get_header_str("X-Forwarded-For"),
+            Some("203.0.113.10"),
+            "should forward platform-provided client IP"
         );
     }
 
