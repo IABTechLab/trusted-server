@@ -132,8 +132,8 @@ fn create_test_settings() -> Settings {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key"
 
             [request_signing]
             enabled = false
