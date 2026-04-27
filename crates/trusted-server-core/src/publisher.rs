@@ -1321,6 +1321,66 @@ mod tests {
     }
 
     #[test]
+    fn revocation_deletes_kv_entry_for_cookie_ec_id() {
+        use crate::platform::test_support::RecordingKvStore;
+
+        let mut settings = create_test_settings();
+        settings.consent.consent_store = Some("test-consent-store".to_string());
+
+        let recording = Arc::new(RecordingKvStore::new());
+        let services = noop_services()
+            .with_kv_store(Arc::clone(&recording) as Arc<dyn crate::platform::PlatformKvStore>);
+
+        let mut response = Response::new(EdgeBody::empty());
+        let consent_ctx = crate::consent::ConsentContext::default();
+
+        apply_ec_headers(
+            &settings,
+            &services,
+            &mut response,
+            "new-ec-id",
+            false,
+            Some("cookie-ec-id"),
+            &consent_ctx,
+        );
+
+        assert_eq!(
+            recording.deleted_keys(),
+            vec!["cookie-ec-id"],
+            "should delete KV entry for the revoked EC cookie ID"
+        );
+    }
+
+    #[test]
+    fn revocation_does_not_delete_kv_when_consent_store_absent() {
+        use crate::platform::test_support::RecordingKvStore;
+
+        let settings = create_test_settings();
+
+        let recording = Arc::new(RecordingKvStore::new());
+        let services = noop_services()
+            .with_kv_store(Arc::clone(&recording) as Arc<dyn crate::platform::PlatformKvStore>);
+
+        let mut response = Response::new(EdgeBody::empty());
+        let consent_ctx = crate::consent::ConsentContext::default();
+
+        apply_ec_headers(
+            &settings,
+            &services,
+            &mut response,
+            "new-ec-id",
+            false,
+            Some("cookie-ec-id"),
+            &consent_ctx,
+        );
+
+        assert!(
+            recording.deleted_keys().is_empty(),
+            "should not delete KV entry when no consent_store is configured"
+        );
+    }
+
+    #[test]
     fn tsjs_dynamic_returns_not_found_for_unknown_filename() {
         let settings = create_test_settings();
         let registry =

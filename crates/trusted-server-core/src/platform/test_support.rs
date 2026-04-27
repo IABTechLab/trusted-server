@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt};
 use rand::rngs::OsRng;
+
+use edgezero_core::key_value_store::{KvError, KvPage, KvStore as PlatformKvStore};
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -353,6 +356,67 @@ impl PlatformHttpClient for StubHttpClient {
             ready,
             remaining: pending_requests,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecordingKvStore
+// ---------------------------------------------------------------------------
+
+/// Test stub for [`PlatformKvStore`] that records `delete()` keys for assertion.
+///
+/// All other operations are no-ops: reads return `Ok(None)`, writes return `Ok(())`.
+pub(crate) struct RecordingKvStore {
+    deleted: Mutex<Vec<String>>,
+}
+
+impl RecordingKvStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            deleted: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Return the keys passed to `delete()`, in call order.
+    pub(crate) fn deleted_keys(&self) -> Vec<String> {
+        self.deleted.lock().expect("should lock deleted").clone()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformKvStore for RecordingKvStore {
+    async fn get_bytes(&self, _key: &str) -> Result<Option<bytes::Bytes>, KvError> {
+        Ok(None)
+    }
+
+    async fn put_bytes(&self, _key: &str, _value: bytes::Bytes) -> Result<(), KvError> {
+        Ok(())
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        _key: &str,
+        _value: bytes::Bytes,
+        _ttl: Duration,
+    ) -> Result<(), KvError> {
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.deleted
+            .lock()
+            .expect("should lock deleted")
+            .push(key.to_owned());
+        Ok(())
+    }
+
+    async fn list_keys_page(
+        &self,
+        _prefix: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<KvPage, KvError> {
+        Ok(KvPage::default())
     }
 }
 
