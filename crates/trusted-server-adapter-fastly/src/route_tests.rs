@@ -1,12 +1,12 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::compat;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
 use fastly::http::StatusCode;
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
-use crate::compat;
 use trusted_server_core::error::IntoHttpResponse;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{

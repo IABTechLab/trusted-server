@@ -49,7 +49,6 @@ pub(crate) fn from_fastly_response(mut resp: fastly::Response) -> HttpResponse {
         .expect("should build http response from fastly response")
 }
 
-
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     let (parts, body) = resp.into_parts();
