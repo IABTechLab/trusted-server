@@ -5,6 +5,12 @@
 **PRD reference:** `docs/internal/ssc-prd.md`
 **Last updated:** 2026-04-14
 
+> **Supersession note (issue #666):** Sections in this historical design spec
+> that describe a separate `consent_store` or consent KV fallback are obsolete.
+> Current runtime behavior interprets live consent from request cookies, headers,
+> geolocation, and policy defaults. `ec_identity_store` is the only KV-backed EC
+> lifecycle store and holds identity graph state plus withdrawal tombstones.
+
 ---
 
 ## Table of Contents

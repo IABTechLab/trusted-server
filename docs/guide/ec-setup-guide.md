@@ -32,6 +32,8 @@ partner_store = "ec_partner_store"
 Required behavior assumptions:
 
 - `ec_store` and `partner_store` are linked to the active Fastly service version
+- `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones
+- Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
 - Partner has `bidstream_enabled = true` if you want `user.ext.eids` in bidstream
 
 ## 2) Configure Demo Variables

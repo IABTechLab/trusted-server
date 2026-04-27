@@ -266,15 +266,15 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
 ### `[ec]`
 
-| Field           | Type           | Required | Description                                |
-| --------------- | -------------- | -------- | ------------------------------------------ |
-| `passphrase`    | String         | Yes      | Publisher passphrase used as HMAC key      |
-| `ec_store`      | String or null | No       | Fastly KV store name for EC identity graph |
-| `partner_store` | String or null | No       | Fastly KV store name for partner registry  |
+| Field           | Type           | Required | Description                                                     |
+| --------------- | -------------- | -------- | --------------------------------------------------------------- |
+| `passphrase`    | String         | Yes      | Publisher passphrase used as HMAC key                           |
+| `ec_store`      | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state |
+| `partner_store` | String or null | No       | Fastly KV store name for partner registry                       |
 
 **Example**:
 

@@ -4,8 +4,13 @@
 //!
 //! 1. **Extract** raw consent strings from cookies and HTTP headers.
 //! 2. **Decode** each signal into structured data (TCF v2, GPP, US Privacy).
-//! 3. **Build** a normalized [`ConsentContext`] that flows through the auction
-//!    pipeline and populates `OpenRTB` bid requests.
+//! 3. **Build** a request-local [`ConsentContext`] that flows through the
+//!    auction pipeline and populates `OpenRTB` bid requests.
+//!
+//! Consent is interpreted from request cookies, headers, geolocation, and
+//! publisher policy defaults. The consent pipeline does not read from or write
+//! to KV storage; EC identity lifecycle state is managed separately by the EC
+//! identity graph.
 //!
 //! # Supported signals
 //!
@@ -22,8 +27,6 @@
 //!     req: &req,
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
-//!     ec_id: Some("ec_abc123"),
-//!     kv_store: Some(runtime_services.kv_store()),
 //! });
 //! ```
 
@@ -34,7 +37,6 @@ pub mod tcf;
 pub mod types;
 pub mod us_privacy;
 
-pub use crate::storage::kv_store as kv;
 pub use extraction::extract_consent_signals;
 pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
@@ -67,17 +69,6 @@ pub struct ConsentPipelineInput<'a> {
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
     pub geo: Option<&'a GeoInfo>,
-    /// EC ID for KV Store consent persistence.
-    ///
-    /// When set along with `kv_store`, enables:
-    /// - **Read fallback**: loads consent from KV when cookies are absent.
-    /// - **Write-on-change**: persists cookie-sourced consent to KV.
-    pub ec_id: Option<&'a str>,
-    /// KV store for consent persistence.
-    ///
-    /// `None` when consent persistence is not configured for this request, or
-    /// when the caller intentionally skips consent KV access.
-    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -91,6 +82,10 @@ pub struct ConsentPipelineInput<'a> {
 /// 5. Constructs a US Privacy string from GPC when appropriate.
 /// 6. Builds a [`ConsentContext`] with both raw and decoded data.
 /// 7. Logs a summary for observability.
+///
+/// The returned context reflects request-local consent signals plus policy
+/// defaults only. This function does not load persisted consent from KV and
+/// does not persist consent to KV.
 ///
 /// Decoding failures are logged and the corresponding decoded field is set to
 /// `None` — the raw string is still preserved for proxy-mode forwarding.
@@ -125,23 +120,11 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
         };
     }
 
-    // KV Store fallback: if no cookie-based signals exist, try loading
-    // persisted consent from the KV Store.
-    if should_try_kv_fallback(&signals) {
-        if let Some(ctx) = try_kv_fallback(input) {
-            log_consent_context(&ctx);
-            return ctx;
-        }
-    }
-
     let mut ctx = build_context_from_signals(&signals);
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
     apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
-
-    // KV Store write: persist cookie-sourced consent for future requests.
-    try_kv_write(input, &ctx);
 
     log_consent_context(&ctx);
     ctx
@@ -526,54 +509,6 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// KV Store integration helpers
-// ---------------------------------------------------------------------------
-
-/// Returns whether KV fallback should be attempted for this request.
-///
-/// KV fallback is used only when cookie-based consent signals are absent.
-/// A standalone `Sec-GPC` header should not suppress fallback reads.
-#[must_use]
-fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
-    !signals.has_cookie_signals()
-}
-
-/// Attempts to load consent from the KV Store when cookie signals are empty.
-///
-/// Returns `Some(ConsentContext)` if a valid entry was found and decoded,
-/// `None` otherwise. Requires both `kv_store` and `ec_id` to be present.
-fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
-    let kv_store = input.kv_store?;
-    let ec_id = input.ec_id?;
-
-    log::debug!("No cookie consent signals, trying KV fallback for '{ec_id}'");
-    let mut ctx = kv::load_consent_from_kv(kv_store, ec_id)?;
-
-    // Re-detect jurisdiction from current geo (may differ from stored value).
-    ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
-    apply_tcf_conflict_resolution(&mut ctx, input.config);
-    apply_expiration_check(&mut ctx, input.config);
-    apply_gpc_us_privacy(&mut ctx, input.config);
-
-    Some(ctx)
-}
-
-/// Persists cookie-sourced consent to the KV Store when configured.
-///
-/// Only writes when consent signals are non-empty and have changed since
-/// the last write (fingerprint comparison).
-fn try_kv_write(input: &ConsentPipelineInput<'_>, ctx: &ConsentContext) {
-    let Some(kv_store) = input.kv_store else {
-        return;
-    };
-    let Some(ec_id) = input.ec_id else {
-        return;
-    };
-
-    kv::save_consent_to_kv(kv_store, ec_id, ctx, input.config.max_consent_age_days);
-}
-
-// ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
 
@@ -635,8 +570,7 @@ mod tests {
 
     use super::{
         allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, should_try_kv_fallback,
-        ConsentPipelineInput,
+        build_consent_context, build_context_from_signals, ConsentPipelineInput,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -729,33 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_fallback_allowed_when_only_gpc_present() {
-        let signals = RawConsentSignals {
-            gpc: true,
-            ..RawConsentSignals::default()
-        };
-
-        assert!(
-            should_try_kv_fallback(&signals),
-            "should allow KV fallback when only Sec-GPC is present"
-        );
-    }
-
-    #[test]
-    fn kv_fallback_skipped_when_cookie_signal_present() {
-        let signals = RawConsentSignals {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            gpc: true,
-            ..RawConsentSignals::default()
-        };
-
-        assert!(
-            !should_try_kv_fallback(&signals),
-            "should skip KV fallback when cookie signals are present"
-        );
-    }
-
-    #[test]
     fn proxy_mode_marks_gdpr_when_raw_tc_exists() {
         let jar = parse_cookies_to_jar("euconsent-v2=CPXxGfAPXxGfA");
         let req = Request::get("https://example.com");
@@ -769,8 +676,6 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            ec_id: None,
-            kv_store: None,
         });
 
         assert!(
@@ -799,8 +704,6 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            ec_id: None,
-            kv_store: None,
         });
 
         assert!(
