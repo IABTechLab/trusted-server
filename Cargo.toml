@@ -65,7 +65,6 @@ fastly = "0.11.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
-handlebars = "6.4.0"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.4.0"
@@ -76,7 +75,6 @@ log-fastly = "0.11.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
-pin-project-lite = "0.2"
 rand = "0.8"
 regex = "1.12.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -87,6 +85,7 @@ temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-test = "0.4"
 toml = "1.1"
+trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }

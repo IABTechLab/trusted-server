@@ -231,4 +231,4 @@ See [crates/trusted-server-core/src/integrations/google_tag_manager.rs](https://
 
 - Review [Prebid Integration](/guide/integrations/prebid) for header bidding.
 - Check [Configuration Guide](/guide/configuration) for other integration settings.
-- Learn more about [Synthetic IDs](/guide/synthetic-ids) which are generated alongside this integration.
+- Learn more about [Edge Cookies](/guide/edge-cookies) which are generated alongside this integration.

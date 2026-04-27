@@ -56,7 +56,6 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::open_kv_store;
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore,
@@ -90,16 +89,7 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 
     let registry = IntegrationRegistry::new(&settings)?;
 
-    let kv_store = match open_kv_store(&settings.synthetic.opid_store) {
-        Ok(store) => store,
-        Err(e) => {
-            log::warn!(
-                "KV store '{}' unavailable, synthetic ID routes will return errors: {e}",
-                settings.synthetic.opid_store
-            );
-            Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        }
-    };
+    let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -193,7 +183,11 @@ async fn dispatch_fallback(
             });
     }
 
-    handle_publisher_request(&state.settings, &state.registry, services, req).await
+    handle_publisher_request(&state.settings, &state.registry, services, req)
+        .await
+        .and_then(|pub_response| {
+            crate::resolve_publisher_response(pub_response, &state.settings, &state.registry)
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -18,7 +18,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -31,11 +33,13 @@ mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+#[cfg(test)]
+mod route_tests;
 
 use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::apply_finalize_headers;
-use crate::platform::build_runtime_services;
+use crate::platform::{build_runtime_services, open_kv_store};
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
@@ -199,7 +203,12 @@ async fn route_request(
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
-            handle_auction(settings, orchestrator, runtime_services, req).await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(auction_services) => {
+                    handle_auction(settings, orchestrator, &auction_services, req).await
+                }
+                Err(e) => Err(e),
+            }
         }
 
         // tsjs endpoints
@@ -231,9 +240,63 @@ async fn route_request(
                 path
             );
 
-            handle_publisher_request(settings, integration_registry, runtime_services, req).await
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(publisher_services) => {
+                    handle_publisher_request(settings, integration_registry, &publisher_services, req)
+                        .await
+                        .and_then(|pub_response| {
+                            resolve_publisher_response(pub_response, settings, integration_registry)
+                        })
+                }
+                Err(e) => Err(e),
+            }
         }
     }
+}
+
+pub(crate) fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<HttpResponse, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(output.len() as u64));
+            *response.body_mut() = EdgeBody::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
