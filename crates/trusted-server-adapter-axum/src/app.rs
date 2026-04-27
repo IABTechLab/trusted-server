@@ -3,7 +3,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, header};
+use edgezero_core::http::{HeaderValue, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -16,8 +16,7 @@ use trusted_server_core::proxy::{
 };
 use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
@@ -151,29 +150,26 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // /admin/keys/rotate
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_rotate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
+        // /admin/keys/rotate and /admin/keys/deactivate
+        //
+        // Config/secret-store writes are not supported on the Axum dev server
+        // (backed by read-only env vars). Exposing these routes and returning 500
+        // on the first store write is misleading, so we explicitly return 501.
+        let admin_not_supported = |_ctx: RequestContext| async {
+            let body = edgezero_core::body::Body::from(
+                "Admin key management is not supported on the Axum dev server.\n\
+                 Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+            );
+            let mut resp = Response::new(body);
+            *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            Ok::<Response, EdgeError>(resp)
         };
-
-        // /admin/keys/deactivate
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_deactivate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+        let rotate_handler = admin_not_supported;
+        let deactivate_handler = admin_not_supported;
 
         // /auction
         let s = Arc::clone(&state);

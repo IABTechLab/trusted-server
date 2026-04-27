@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
 simple_logger = "5"

@@ -3580,6 +3580,7 @@ dependencies = [
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
+ "futures",
  "log",
  "reqwest 0.12.28",
  "simple_logger",

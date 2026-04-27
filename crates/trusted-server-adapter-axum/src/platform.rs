@@ -184,23 +184,24 @@ impl PlatformGeo for AxumPlatformGeo {
 // PlatformHttpClient
 // ---------------------------------------------------------------------------
 
-/// Raw response parts carried through `send_async` → `select`.
+/// Buffered response parts from a spawned outbound request.
 ///
-/// Stores `(status, headers, body)` instead of `PlatformResponse` because
-/// `Body::Stream` is `!Send`, making it incompatible with `Box<dyn Any + Send + Sync>`
-/// required by [`PlatformPendingRequest`]. Same pattern as `StubPendingResponse`
-/// in `trusted-server-core::platform::test_support`.
-struct AxumPendingResponse {
+/// Stored inside [`PlatformPendingRequest`] so that [`AxumPlatformHttpClient::select`]
+/// can poll multiple in-flight handles concurrently via
+/// [`futures::future::select_all`].
+struct AxumPendingHandle {
     backend_name: String,
-    status: u16,
-    headers: Vec<(String, Vec<u8>)>,
-    body: Vec<u8>,
+    handle: tokio::task::JoinHandle<
+        Result<(u16, Vec<(String, Vec<u8>)>, Vec<u8>), Report<PlatformError>>,
+    >,
 }
 
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
-/// `send_async` + `select` use eager sequential evaluation acceptable for local
-/// development. True async fan-out is not needed at dev-server scale.
+/// `send_async` buffers any `Body::Stream` in the calling context, then spawns
+/// a `tokio` task for each outbound request so that multiple `send_async` calls
+/// run concurrently. `select` uses [`futures::future::select_all`] to wait for
+/// the first completing handle, preserving fan-out semantics.
 pub struct AxumPlatformHttpClient {
     client: reqwest::Client,
 }
@@ -223,6 +224,31 @@ impl AxumPlatformHttpClient {
         }
     }
 
+    /// Drain `body` to a `Vec<u8>`.
+    ///
+    /// For `Body::Stream` this awaits every chunk in the current async context
+    /// (where `LocalBoxStream` is valid) before the bytes are moved into a
+    /// `tokio::spawn` task that requires `Send`.
+    async fn buffer_body(
+        body: edgezero_core::body::Body,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        match body {
+            edgezero_core::body::Body::Once(bytes) => Ok(bytes.to_vec()),
+            edgezero_core::body::Body::Stream(mut stream) => {
+                use futures::StreamExt as _;
+                let mut buf = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let bytes = chunk.map_err(|e| {
+                        Report::new(PlatformError::HttpClient)
+                            .attach(format!("failed to buffer outbound streaming body: {e}"))
+                    })?;
+                    buf.extend_from_slice(&bytes);
+                }
+                Ok(buf)
+            }
+        }
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
@@ -237,18 +263,9 @@ impl AxumPlatformHttpClient {
         }
 
         let (_, body) = request.request.into_parts();
-        match body {
-            edgezero_core::body::Body::Once(bytes) => {
-                if !bytes.is_empty() {
-                    builder = builder.body(bytes);
-                }
-            }
-            edgezero_core::body::Body::Stream(_) => {
-                log::warn!(
-                    "AxumPlatformHttpClient: Body::Stream is not supported; \
-                     outbound request body will be empty"
-                );
-            }
+        let body_bytes = Self::buffer_body(body).await?;
+        if !body_bytes.is_empty() {
+            builder = builder.body(body_bytes);
         }
 
         let resp = builder
@@ -293,72 +310,113 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        // Dev-server divergence: execution is eager — errors surface here, not at
-        // select() time. On Fastly the request is in-flight until select() resolves it.
-        log::debug!(
-            "AxumPlatformHttpClient::send_async: executing eagerly (Fastly surfaces errors at select)"
-        );
         let backend_name = request.backend_name.clone();
-        let response = self.execute(request).await?;
 
-        let status = response.response.status().as_u16();
-        let headers: Vec<(String, Vec<u8>)> = response
-            .response
+        // Extract all Send-compatible parts before spawning.
+        let uri = request.request.uri().to_string();
+        let method_bytes = request.request.method().as_str().as_bytes().to_vec();
+        let headers: Vec<(String, Vec<u8>)> = request
+            .request
             .headers()
             .iter()
             .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
             .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => vec![],
-        };
 
-        let pending = AxumPendingResponse {
+        // Buffer any LocalBoxStream body here in the ?Send context before spawn.
+        let (_, body) = request.request.into_parts();
+        let body_bytes = Self::buffer_body(body).await?;
+
+        let client = self.client.clone();
+        let handle = tokio::spawn(async move {
+            let method = reqwest::Method::from_bytes(&method_bytes)
+                .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?;
+            let mut builder = client.request(method, &uri);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_slice());
+            }
+            if !body_bytes.is_empty() {
+                builder = builder.body(body_bytes);
+            }
+            let resp = builder.send().await.map_err(|e| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("outbound request to {uri} failed: {e}"))
+            })?;
+            let status = resp.status().as_u16();
+            let resp_headers: Vec<(String, Vec<u8>)> = resp
+                .headers()
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
+                .collect();
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
+                .to_vec();
+            Ok::<_, Report<PlatformError>>((status, resp_headers, body))
+        });
+
+        let pending = AxumPendingHandle {
             backend_name: backend_name.clone(),
-            status,
-            headers,
-            body: body_bytes,
+            handle,
         };
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
     async fn select(
         &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
+        pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with an empty pending_requests list"));
         }
 
-        // Dev-server divergence: pops index 0 unconditionally — not "first to complete".
-        // Safe here because send_async already ran eagerly, but any test verifying
-        // parallel fan-out ordering against the Fastly runtime should use a real
-        // Fastly environment.
-        log::debug!(
-            "AxumPlatformHttpClient::select: returning index 0 (sequential, not parallel fan-out)"
-        );
-        let ready_platform = pending_requests.remove(0);
-        let pending = ready_platform
-            .downcast::<AxumPendingResponse>()
-            .map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("unexpected inner type in AxumPlatformHttpClient::select")
-            })?;
+        let mut handles: Vec<AxumPendingHandle> = pending_requests
+            .into_iter()
+            .map(|pr| {
+                pr.downcast::<AxumPendingHandle>().map_err(|_| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach("unexpected inner type in AxumPlatformHttpClient::select")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let mut builder = edgezero_core::http::response_builder().status(pending.status);
-        for (name, value) in &pending.headers {
+        let backend_names: Vec<String> = handles.iter().map(|h| h.backend_name.clone()).collect();
+        let join_handles: Vec<_> = handles.drain(..).map(|h| h.handle).collect();
+
+        let (result, ready_idx, remaining_handles) =
+            futures::future::select_all(join_handles).await;
+
+        let remaining: Vec<PlatformPendingRequest> = remaining_handles
+            .into_iter()
+            .enumerate()
+            .map(|(i, handle)| {
+                let original_idx = if i < ready_idx { i } else { i + 1 };
+                let bn = backend_names[original_idx].clone();
+                PlatformPendingRequest::new(AxumPendingHandle {
+                    backend_name: bn.clone(),
+                    handle,
+                })
+                .with_backend_name(bn)
+            })
+            .collect();
+
+        let (status, headers, body) = result.map_err(|e| {
+            Report::new(PlatformError::HttpClient)
+                .attach(format!("auction request task failed: {e}"))
+        })??;
+
+        let backend_name = backend_names[ready_idx].clone();
+        let mut builder = edgezero_core::http::response_builder().status(status);
+        for (name, value) in &headers {
             builder = builder.header(name.as_str(), value.as_slice());
         }
         let edge_resp = builder
-            .body(edgezero_core::body::Body::from(pending.body))
+            .body(edgezero_core::body::Body::from(body))
             .change_context(PlatformError::HttpClient)?;
 
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(pending.backend_name));
-        Ok(PlatformSelectResult {
-            ready,
-            remaining: pending_requests,
-        })
+        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(backend_name));
+        Ok(PlatformSelectResult { ready, remaining })
     }
 }
 
@@ -391,11 +449,10 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .secret_store(Arc::new(AxumPlatformSecretStore))
         .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
         .backend(Arc::new(AxumPlatformBackend))
-        // Keep the HTTP client request-scoped in the dev adapter. Axum still
-        // drops outbound `Body::Stream` requests, and sharing a pooled client
-        // across requests regressed the Next.js server-action -> API-route
-        // integration flow by reusing a poisoned connection after the truncated
-        // POST. Revisit pooling only after streamed request bodies are handled.
+        // Keep the HTTP client request-scoped in the dev adapter. Sharing a pooled
+        // client across requests previously regressed the Next.js server-action →
+        // API-route integration flow by reusing a poisoned connection after a
+        // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
         .geo(Arc::new(AxumPlatformGeo))
         .client_info(ClientInfo {
