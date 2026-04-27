@@ -16,6 +16,7 @@ import adapterManager from 'prebid.js/src/adapterManager.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
+import 'prebid.js/modules/userId.js';
 
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
