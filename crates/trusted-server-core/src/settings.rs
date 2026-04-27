@@ -19,6 +19,7 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
+    #[validate(custom(function = validate_publisher_domain))]
     pub domain: String,
     /// Domain for non-EC cookies. EC cookies use a separate computed domain
     /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
@@ -221,10 +222,11 @@ impl DerefMut for IntegrationSettings {
 /// Partners are defined statically in `trusted-server.toml` rather than
 /// registered via API. At startup, each partner's `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct EcPartner {
     /// Unique partner identifier. Must match `^[a-z0-9_-]{1,32}$` and
     /// not collide with reserved IDs (`ec`, `ts`, `eids`, etc.).
+    #[validate(custom(function = EcPartner::validate_id))]
     pub id: String,
     /// Human-readable partner name.
     pub name: String,
@@ -263,6 +265,38 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    const RESERVED_IDS: &[&str] = &[
+        "ec",
+        "eids",
+        "ec-consent",
+        "eids-truncated",
+        "synthetic",
+        "ts",
+        "version",
+        "env",
+    ];
+
+    /// Validates a partner ID for safe use in dynamic headers and cookies.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `id` does not match the configured
+    /// lowercase identifier policy or collides with a reserved name.
+    pub fn validate_id(id: &str) -> Result<(), ValidationError> {
+        if id.is_empty() || id.len() > 32 {
+            return Err(ValidationError::new("invalid_partner_id_length"));
+        }
+        if Self::RESERVED_IDS.contains(&id) {
+            return Err(ValidationError::new("reserved_partner_id"));
+        }
+        if !id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        }) {
+            return Err(ValidationError::new("invalid_partner_id"));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn default_openrtb_atype() -> u8 {
         3
@@ -315,6 +349,7 @@ pub struct Ec {
 
     /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
     #[serde(default)]
+    #[validate(nested)]
     pub partners: Vec<EcPartner>,
 }
 
@@ -593,6 +628,13 @@ impl Settings {
         settings.proxy.normalize();
         settings.consent.validate();
         settings.prepare_runtime()?;
+
+        settings.validate().map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Configuration validation failed: {err}"),
+            })
+        })?;
+
         settings.validate_admin_coverage()?;
 
         Ok(settings)
@@ -772,6 +814,33 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_publisher_domain(value: &str) -> Result<(), ValidationError> {
+    if value.trim() != value || value.is_empty() || value.len() > 253 {
+        return Err(ValidationError::new("invalid_publisher_domain"));
+    }
+    if value.starts_with('.') || value.ends_with('.') || value.contains(['/', ':']) {
+        return Err(ValidationError::new("invalid_publisher_domain"));
+    }
+
+    for label in value.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+        let bytes = label.as_bytes();
+        if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_cookie_domain(value: &str) -> Result<(), ValidationError> {
@@ -998,12 +1067,70 @@ mod tests {
             r#"origin_url = "https://origin.test-publisher.com/""#,
         );
 
-        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
-        let result = settings.validate();
+        let result = Settings::from_toml(&toml_str);
         assert!(
             result.is_err(),
             "origin_url ending with '/' should fail validation"
         );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_publisher_domains() {
+        for domain in [
+            "",
+            ".example.com",
+            "example.com.",
+            "https://example.com",
+            "bad_domain.com",
+        ] {
+            let toml_str = crate_test_settings_str().replace(
+                r#"domain = "test-publisher.com""#,
+                &format!(r#"domain = "{domain}""#),
+            );
+
+            let result = Settings::from_toml(&toml_str);
+            assert!(result.is_err(), "should reject invalid domain {domain:?}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_localhost_publisher_domain() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"domain = "test-publisher.com""#,
+            r#"domain = "localhost""#,
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should accept localhost domain");
+        assert_eq!(settings.publisher.ec_cookie_domain(), ".localhost");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_ec_partner_ids() {
+        for partner_id in [
+            "Upper",
+            "bad id",
+            "ec",
+            "",
+            "abcdefghijklmnopqrstuvwxyzabcdefg",
+        ] {
+            let toml_str = format!(
+                r#"{}
+                [[ec.partners]]
+                id = "{}"
+                name = "Invalid Partner"
+                source_domain = "invalid.example.com"
+                api_token = "invalid-token"
+                "#,
+                crate_test_settings_str(),
+                partner_id,
+            );
+
+            let result = Settings::from_toml(&toml_str);
+            assert!(
+                result.is_err(),
+                "should reject invalid partner ID {partner_id:?}"
+            );
+        }
     }
 
     #[test]

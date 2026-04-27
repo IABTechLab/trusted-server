@@ -126,15 +126,20 @@ pub fn ec_finalize_response(
         return;
     }
 
-    // Newly generated EC in this request.
+    // Newly generated EC in this request. Do not emit a generated EC when
+    // there is no KV graph: that would mint a browser cookie with no backing
+    // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
-        if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            if let Some(cookie) = eids_cookie {
-                ingest_prebid_eids(cookie, ec_id, graph, registry);
-            }
-            if let Some(cookie) = sharedid_cookie {
-                ingest_sharedid_cookie(cookie, ec_id, graph, registry);
-            }
+        let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) else {
+            log::debug!("Skipping generated EC response write because KV graph is unavailable");
+            return;
+        };
+
+        if let Some(cookie) = eids_cookie {
+            ingest_prebid_eids(cookie, ec_id, graph, registry);
+        }
+        if let Some(cookie) = sharedid_cookie {
+            ingest_sharedid_cookie(cookie, ec_id, graph, registry);
         }
         set_ec_on_response(settings, ec_context, response);
     }
@@ -495,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_generated_ec_sets_cookie_and_header() {
+    fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("gen123");
         let ec_context = make_context(
@@ -518,16 +523,13 @@ mod tests {
             &mut response,
         );
 
-        let header = response
-            .get_header("x-ts-ec")
-            .expect("generated EC should set response header")
-            .to_str()
-            .expect("x-ts-ec should be utf-8");
-        assert_eq!(header, generated_ec, "header should contain generated EC");
-
         assert!(
-            response.get_header("set-cookie").is_some(),
-            "generated EC should set cookie"
+            response.get_header("x-ts-ec").is_none(),
+            "generated EC without KV should not set response header"
+        );
+        assert!(
+            response.get_header("set-cookie").is_none(),
+            "generated EC without KV should not set cookie"
         );
     }
 

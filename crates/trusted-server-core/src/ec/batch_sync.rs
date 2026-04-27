@@ -22,8 +22,7 @@ use super::registry::PartnerRegistry;
 
 const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
-const REASON_EC_ID_NOT_FOUND: &str = "ec_id_not_found";
-const REASON_CONSENT_WITHDRAWN: &str = "consent_withdrawn";
+const REASON_INELIGIBLE: &str = "ineligible";
 const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 
 /// Maximum number of mappings allowed in a single batch request.
@@ -192,16 +191,10 @@ fn process_mappings(
             Ok(UpsertResult::Written | UpsertResult::Stale) => {
                 accepted += 1;
             }
-            Ok(UpsertResult::NotFound) => {
+            Ok(UpsertResult::NotFound | UpsertResult::ConsentWithdrawn) => {
                 errors.push(MappingError {
                     index: idx,
-                    reason: REASON_EC_ID_NOT_FOUND,
-                });
-            }
-            Ok(UpsertResult::ConsentWithdrawn) => {
-                errors.push(MappingError {
-                    index: idx,
-                    reason: REASON_CONSENT_WITHDRAWN,
+                    reason: REASON_INELIGIBLE,
                 });
             }
             Err(err) => {
@@ -420,7 +413,7 @@ mod tests {
             rejected: 1,
             errors: vec![MappingError {
                 index: 3,
-                reason: REASON_EC_ID_NOT_FOUND,
+                reason: REASON_INELIGIBLE,
             }],
         };
 
@@ -429,41 +422,26 @@ mod tests {
         assert_eq!(json["accepted"], 5);
         assert_eq!(json["rejected"], 1);
         assert_eq!(json["errors"][0]["index"], 3);
-        assert_eq!(json["errors"][0]["reason"], REASON_EC_ID_NOT_FOUND);
+        assert_eq!(json["errors"][0]["reason"], REASON_INELIGIBLE);
     }
 
     #[test]
-    fn process_mappings_reports_not_found() {
-        let writer = MockWriter::new(vec![Ok(UpsertResult::NotFound)]);
+    fn process_mappings_collapses_missing_and_withdrawn_to_ineligible() {
+        let writer = MockWriter::new(vec![
+            Ok(UpsertResult::NotFound),
+            Ok(UpsertResult::ConsentWithdrawn),
+        ]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
+        let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-2", 101)];
 
         let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
 
-        assert_eq!(accepted, 0, "should not accept when EC entry is missing");
-        assert_eq!(errors.len(), 1, "should report one error");
+        assert_eq!(accepted, 0, "should not accept ineligible mappings");
+        assert_eq!(errors.len(), 2, "should report both errors");
         assert_eq!(errors[0].index, 0);
-        assert_eq!(
-            errors[0].reason, REASON_EC_ID_NOT_FOUND,
-            "should report ec_id_not_found for missing entries"
-        );
-    }
-
-    #[test]
-    fn process_mappings_reports_consent_withdrawn() {
-        let writer = MockWriter::new(vec![Ok(UpsertResult::ConsentWithdrawn)]);
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mappings = vec![mapping(&ec_id, "uid-1", 100)];
-
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
-
-        assert_eq!(accepted, 0, "should not accept when consent is withdrawn");
-        assert_eq!(errors.len(), 1, "should report one error");
-        assert_eq!(errors[0].index, 0);
-        assert_eq!(
-            errors[0].reason, REASON_CONSENT_WITHDRAWN,
-            "should report consent_withdrawn for tombstoned entries"
-        );
+        assert_eq!(errors[0].reason, REASON_INELIGIBLE);
+        assert_eq!(errors[1].index, 1);
+        assert_eq!(errors[1].reason, REASON_INELIGIBLE);
     }
 
     #[test]

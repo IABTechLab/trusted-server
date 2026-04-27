@@ -143,6 +143,11 @@ pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<Trusted
     }
 
     // `lo` is the largest size that fits. Re-encode it for the final value.
+    if lo == 0 && !eids.is_empty() {
+        log::warn!(
+            "encode_eids_header: no EIDs fit within {MAX_EIDS_HEADER_BYTES}B; emitting empty truncated header"
+        );
+    }
     let encoded = try_encode(lo)?;
     Ok((encoded, true))
 }

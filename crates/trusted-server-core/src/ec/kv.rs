@@ -8,7 +8,6 @@
 //! per-operation error handling policy in the spec §7.5.
 
 use std::collections::BTreeMap;
-use std::thread;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt};
@@ -55,20 +54,15 @@ pub enum UpsertResult {
     NotFound,
     /// The entry's `consent.ok` is `false` (withdrawal tombstone).
     ConsentWithdrawn,
-    /// The request timestamp is not newer than the stored `synced` value,
-    /// so the write was skipped. Counted as accepted by the batch endpoint.
+    /// The request timestamp is older than the stored `synced` value, so
+    /// the write was skipped. Counted as accepted by the batch endpoint.
     Stale,
 }
 
 use super::log_id;
 
-fn cas_retry_delay(attempt: u32, ec_id: &str) -> Duration {
-    let backoff_ms = 5_u64.saturating_mul(1_u64 << attempt.min(4));
-    let jitter_ms = ec_hash(ec_id)
-        .bytes()
-        .fold(0_u64, |acc, byte| acc.wrapping_add(u64::from(byte)))
-        % 8;
-    Duration::from_millis(backoff_ms + jitter_ms)
+fn stale_sync(existing_synced: u64, incoming_synced: u64) -> bool {
+    existing_synced > incoming_synced
 }
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
@@ -340,8 +334,8 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
-                    thread::sleep(cas_retry_delay(attempt, ec_id));
-                    // Re-read to get fresh generation.
+                    // Re-read immediately to get a fresh generation. Sleeping in
+                    // the CAS loop would block the Fastly Compute request worker.
                     match self.get(ec_id)? {
                         Some((refreshed, gen)) => {
                             if refreshed.consent.ok {
@@ -423,7 +417,8 @@ impl KvIdentityGraph {
                         attempt + 1,
                         MAX_CAS_RETRIES,
                     );
-                    thread::sleep(cas_retry_delay(attempt, ec_id));
+                    // Retry immediately; the bounded retry count prevents an
+                    // unbounded loop without blocking the request worker.
                     continue;
                 }
             };
@@ -468,8 +463,8 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
-                    thread::sleep(cas_retry_delay(attempt, ec_id));
-                    // Loop will re-read on next iteration.
+                    // Loop will re-read on next iteration. Do not sleep here:
+                    // blocking sleeps burn edge compute while holding the request worker.
                 }
                 Err(err) => {
                     return Err(
@@ -499,7 +494,7 @@ impl KvIdentityGraph {
     /// the KV entry must have been created by the organic EC flow.
     ///
     /// Returns [`UpsertResult::Stale`] when the stored `synced` timestamp
-    /// for this partner is already >= `synced`, skipping the write.
+    /// for this partner is newer than `synced`, skipping the write.
     ///
     /// # Errors
     ///
@@ -524,9 +519,11 @@ impl KvIdentityGraph {
                 return Ok(UpsertResult::ConsentWithdrawn);
             }
 
-            // Skip if existing sync is at least as fresh as the request.
+            // Skip only if the existing sync is newer than the request. Equal
+            // second-granularity timestamps may represent distinct batches, so
+            // allow them to proceed through CAS instead of silently dropping one.
             if let Some(existing) = entry.ids.get(partner_id) {
-                if existing.synced >= synced {
+                if stale_sync(existing.synced, synced) {
                     return Ok(UpsertResult::Stale);
                 }
             }
@@ -555,7 +552,7 @@ impl KvIdentityGraph {
                         attempt + 1,
                         log_id(ec_id),
                     );
-                    thread::sleep(cas_retry_delay(attempt, ec_id));
+                    // Retry immediately; sleeping here blocks the edge worker.
                 }
                 Err(err) => {
                     return Err(
@@ -736,8 +733,8 @@ impl KvIdentityGraph {
     /// and a 24-hour TTL. Uses unconditional overwrite (no CAS) since the
     /// entry is being withdrawn regardless of concurrent state.
     ///
-    /// The tombstone allows batch sync clients (`POST /_ts/api/v1/batch-sync`) to
-    /// distinguish `consent_withdrawn` from `ec_id_not_found` for 24 hours.
+    /// The tombstone preserves consent enforcement for batch sync clients
+    /// (`POST /_ts/api/v1/batch-sync`) during the 24-hour revocation window.
     ///
     /// # Errors
     ///
@@ -913,25 +910,16 @@ mod tests {
     }
 
     #[test]
-    fn cas_retry_delay_grows_with_attempts() {
-        let first = cas_retry_delay(
-            0,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
-        );
-        let second = cas_retry_delay(
-            1,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
-        );
-        let third = cas_retry_delay(
-            2,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123",
-        );
-
+    fn stale_sync_only_rejects_older_timestamps() {
+        assert!(stale_sync(101, 100), "older incoming sync should be stale");
         assert!(
-            first < second,
-            "retry delay should increase after first conflict"
+            !stale_sync(100, 100),
+            "equal second-granularity sync should be allowed"
         );
-        assert!(second < third, "retry delay should continue increasing");
+        assert!(
+            !stale_sync(100, 101),
+            "newer incoming sync should be allowed"
+        );
     }
 
     #[test]
