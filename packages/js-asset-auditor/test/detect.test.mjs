@@ -16,12 +16,34 @@ test("detectIntegrations matches GTM script path exactly", () => {
   });
 });
 
+test("detectIntegrations picks up prebid wrapper/load script names", () => {
+  const detection = detectIntegrations([
+    "https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-load.js",
+    "https://cdn.vendor.test/prebid.min.js",
+  ]);
+
+  const prebid = detection.integrations.find((entry) => entry.id === "prebid");
+  assert.equal(prebid.todos.includes("server_url"), true);
+  assert.equal(prebid.todos.includes("bidders"), true);
+});
+
+test("detectIntegrations adds runtime Prebid bidders when available", () => {
+  const detection = detectIntegrations(
+    ["https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-load.js"],
+    { prebidBidders: ["ix", "kargo", "rubicon"] },
+  );
+
+  const prebid = detection.integrations.find((entry) => entry.id === "prebid");
+  assert.deepEqual(prebid.extracted.bidders, ["ix", "kargo", "rubicon"]);
+  assert.equal(prebid.todos.includes("server_url"), true);
+  assert.equal(prebid.todos.includes("bidders"), false);
+});
+
 test("generateConfig comments TODO fields so Prebid config stays parseable", () => {
   const detection = detectIntegrations([
     "https://cdn.vendor.test/prebid.min.js",
     "https://aim.loc.kr/identity-lockr-trust-server.js",
   ]);
-
   const config = generateConfig(
     "publisher.com",
     "https://www.publisher.com",
@@ -43,6 +65,26 @@ test("generateConfig comments TODO fields so Prebid config stays parseable", () 
   );
 });
 
+test("generateConfig writes auto-detected Prebid bidders", () => {
+  const detection = detectIntegrations(
+    ["https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-load.js"],
+    { prebidBidders: ["ix", "kargo"] },
+  );
+
+  const config = generateConfig(
+    "publisher.com",
+    "https://www.publisher.com",
+    detection,
+  );
+
+  assert.match(config, /\[integrations\.prebid\]\nenabled = false/);
+  assert.match(config, /bidders = \["ix", "kargo"\]  # auto-detected/);
+  assert.match(
+    config,
+    /# server_url = ""  # TODO: set your Prebid Header Bidding server_url/,
+  );
+  assert.doesNotMatch(config, /# bidders = ""/);
+});
 
 test("generateConfig only auto-enables fully configured integrations", () => {
   const config = generateConfig("publisher.com", "https://www.publisher.com", {

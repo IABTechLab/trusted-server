@@ -13,6 +13,9 @@
 const PREBID_SUFFIXES = [
   "/prebid.js",
   "/prebid.min.js",
+  "/prebid-loader.js",
+  "/prebid-load.js",
+  "/prebid-wrapper.js",
   "/prebidjs.js",
   "/prebidjs.min.js",
 ];
@@ -135,13 +138,28 @@ const INTEGRATION_PATTERNS = [
   {
     id: "prebid",
     label: "Prebid Header Bidding",
-    match: (url) => PREBID_SUFFIXES.some((suffix) => url.pathname.endsWith(suffix)),
+    match: (url) => {
+      const lowerPathname = url.pathname.toLowerCase();
+      return PREBID_SUFFIXES.some((suffix) => lowerPathname.endsWith(suffix));
+    },
     extract: () => ({}),
+    applyRuntimeSignals: (entry, runtimeSignals) => {
+      const bidders = runtimeSignals?.prebidBidders ?? [];
+      if (bidders.length > 0 && !("bidders" in entry.extracted)) {
+        entry.extracted.bidders = bidders;
+      }
+    },
     defaults: {
       timeout_ms: 1000,
       debug: false,
     },
-    todos: ["server_url", "bidders"],
+    todos: (extracted) => {
+      const missing = ["server_url"];
+      if (!Array.isArray(extracted.bidders) || extracted.bidders.length === 0) {
+        missing.push("bidders");
+      }
+      return missing;
+    },
     category: "detect_only",
   },
   {
@@ -164,7 +182,7 @@ const INTEGRATION_PATTERNS = [
 // Detection
 // ---------------------------------------------------------------------------
 
-export function detectIntegrations(rawUrls) {
+export function detectIntegrations(rawUrls, runtimeSignals = {}) {
   const detected = new Map();
 
   for (const rawUrl of rawUrls) {
@@ -187,10 +205,7 @@ export function detectIntegrations(rawUrls) {
         }
       } else {
         const extracted = pattern.extract(url);
-        const todos =
-          typeof pattern.todos === "function"
-            ? pattern.todos(extracted)
-            : [...pattern.todos];
+        const todos = [];
 
         detected.set(pattern.id, {
           id: pattern.id,
@@ -209,9 +224,13 @@ export function detectIntegrations(rawUrls) {
 
   for (const [id, entry] of detected) {
     const pattern = INTEGRATION_PATTERNS.find((candidate) => candidate.id === id);
-    if (pattern && typeof pattern.todos === "function") {
-      entry.todos = pattern.todos(entry.extracted);
+    if (pattern?.applyRuntimeSignals) {
+      pattern.applyRuntimeSignals(entry, runtimeSignals);
     }
+    entry.todos =
+      typeof pattern?.todos === "function"
+        ? pattern.todos(entry.extracted)
+        : [...(pattern?.todos ?? [])];
   }
 
   return {

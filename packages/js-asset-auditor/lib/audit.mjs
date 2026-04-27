@@ -251,9 +251,29 @@ export async function main() {
       ),
     );
 
+    const runtimeSignals = await page.evaluate(() => {
+      const prebidBidders = new Set();
+      for (const adUnit of window.pbjs?.adUnits ?? []) {
+        for (const bid of adUnit.bids ?? []) {
+          if (typeof bid.bidder === "string" && bid.bidder.length > 0) {
+            prebidBidders.add(bid.bidder);
+          }
+        }
+      }
+
+      return {
+        prebidBidders: Array.from(prebidBidders).sort(),
+      };
+    });
+
     console.error(
       `Found ${scriptUrls.length} network scripts, ${headScriptUrls.length} head scripts`,
     );
+    if (runtimeSignals.prebidBidders.length > 0) {
+      console.error(
+        `Detected Prebid bidders: ${runtimeSignals.prebidBidders.join(", ")}`,
+      );
+    }
 
     console.error("Processing assets...");
     const result = processAssets(
@@ -282,7 +302,7 @@ export async function main() {
 
     if (args.config) {
       const { detectIntegrations, generateConfig } = await import("./detect.mjs");
-      const detection = detectIntegrations(scriptUrls);
+      const detection = detectIntegrations(scriptUrls, runtimeSignals);
 
       if (detection.integrations.length > 0) {
         ensureConfigPathWritable(args.config, args.force);
