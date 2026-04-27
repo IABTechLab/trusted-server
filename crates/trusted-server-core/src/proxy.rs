@@ -71,9 +71,22 @@ pub struct ProxyRequestConfig<'a> {
     pub stream_passthrough: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
-    /// When empty every host is permitted (open mode). Integration proxies
-    /// should leave this empty; first-party handlers should pass
-    /// `&settings.proxy.allowed_domains` to enforce the publisher allowlist.
+    /// **Open mode** (`&[]`): every host is permitted. Integration proxies pass `&[]`
+    /// because their target URLs originate from operator-controlled configuration
+    /// (e.g. `trusted-server.toml` integration settings) and are therefore trusted at
+    /// operator setup time rather than at request time.
+    ///
+    /// **Restricted mode** (non-empty slice): only hosts matching a listed pattern are
+    /// permitted. First-party proxy handlers pass `&settings.proxy.allowed_domains`
+    /// because they follow redirect chains that may originate from untrusted
+    /// creative-supplied URLs.
+    ///
+    /// **Behavior change from pre-PR-14**: `proxy_with_redirects` previously always
+    /// enforced `&settings.proxy.allowed_domains` regardless of the caller. After PR 14,
+    /// only [`handle_first_party_proxy`] and its siblings enforce the operator allowlist;
+    /// integration proxies use open mode. This is intentional: applying the operator
+    /// domain allowlist to integration redirects would require every operator to enumerate
+    /// every integration CDN in their config, which is impractical.
     pub allowed_domains: &'a [String],
 }
 
