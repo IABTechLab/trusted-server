@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # EdgeZero Migration Plan
 
 > Migration plan for moving trusted-server from direct Fastly Compute SDK usage

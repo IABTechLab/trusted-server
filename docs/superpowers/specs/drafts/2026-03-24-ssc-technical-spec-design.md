@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # Technical Specification: Edge Cookie (EC)
 
 **Status:** Draft

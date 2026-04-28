@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # 🎯 Auction Orchestration Flow
 
 ## 🔄 System Flow Diagram

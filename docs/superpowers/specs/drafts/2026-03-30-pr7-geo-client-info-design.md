@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # PR 7 Design — Geo Lookup + Client Info (Extract-Once)
 
 > Phase 1, PR 7 of the EdgeZero migration.
