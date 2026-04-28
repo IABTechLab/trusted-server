@@ -43,15 +43,16 @@ Origins are the backend servers that Trusted Server will communicate with (ad se
 After saving origin information, you can select port numbers and toggle TLS on/off.
 :::
 
-## Configure Fastly CLI Profile
+## Configure Trusted Server CLI Auth
 
-After installing the Fastly CLI, create a profile with your API token:
+The `ts` CLI manages Fastly credentials explicitly for provisioning:
 
 ```bash
-fastly profile create
+ts auth fastly login
+ts auth fastly status
 ```
 
-Follow the interactive prompts to paste your API token.
+For automation and CI, prefer setting `FASTLY_API_KEY` instead of storing a local credential.
 
 ## Domain Configuration
 
@@ -72,27 +73,19 @@ When you're ready to use your own domain:
 - Fastly Compute **only accepts client traffic via TLS** (HTTPS)
 - Origins and backends can be non-TLS if needed
 
-## Create Config and Secret Stores
+## Provision Trusted Server Resources
 
-For features like request signing, you'll need to create Fastly stores:
-
-### Config Store
-
-Used for storing public configuration (e.g., public keys, key metadata):
+Provisioning is config-first. After authoring `trusted-server.toml`, use `ts` to preview and apply Fastly changes for an existing Compute service:
 
 ```bash
-fastly config-store create --name jwks_store
+ts provision fastly plan --service-id svc_123
+FASTLY_RUNTIME_API_KEY=your-runtime-token \
+  ts provision fastly apply --service-id svc_123
 ```
 
-### Secret Store
+`apply` automatically activates the Fastly service version after changing resource bindings.
 
-Used for storing sensitive data (e.g., private signing keys):
-
-```bash
-fastly secret-store create --name signing_keys
-```
-
-Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
+The CLI provisions the runtime config store, request-signing stores, and required bindings from local configuration. When request signing is enabled, `apply` will bootstrap the initial signing keypair if the signing stores are empty, and it requires an explicit runtime Fastly API token for the `api-keys/api_key` secret. Use `FASTLY_RUNTIME_API_KEY`, `--runtime-api-key`, or `--reuse-management-api-key` for that runtime credential. After provisioning, update `request_signing.config_store_id` and `request_signing.secret_store_id` in `trusted-server.toml` to match the store IDs reported by provisioning.
 
 ## Next Steps
 

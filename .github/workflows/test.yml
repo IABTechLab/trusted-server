@@ -49,7 +49,33 @@ jobs:
         run: cargo install --git https://github.com/fastly/Viceroy --tag v${{ steps.viceroy-version.outputs.viceroy-version }} viceroy
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude trusted-server-cli
+
+  test-cli-host:
+    name: cargo test (trusted-server-cli host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version-cli
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version-cli.outputs.rust-version }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Retrieve Rust host target
+        id: rust-host-target
+        run: echo "host-target=$(rustc -vV | sed -n 's/^host: //p')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Run trusted-server-cli tests
+        run: cargo test --package trusted-server-cli --target "${{ steps.rust-host-target.outputs.host-target }}"
 
   test-typescript:
     name: vitest

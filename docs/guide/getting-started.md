@@ -41,20 +41,28 @@ cargo build
 ### Run Tests
 
 ```bash
-cargo test
+cargo test --workspace --exclude trusted-server-cli
+cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"
+```
+
+### Initialize and Validate Configuration
+
+```bash
+ts config init
+ts config validate
 ```
 
 ### Start Local Server
 
 ```bash
-fastly compute serve
+ts dev -a fastly
 ```
 
 The server will be available at `http://localhost:7676`.
 
 ## Configuration
 
-Edit `trusted-server.toml` to configure:
+Use `ts config init` to generate `trusted-server.toml`, then edit it to configure:
 
 - Ad server integrations
 - KV store mappings

@@ -14,7 +14,13 @@ Trusted Server uses a runtime configuration system based on:
 
 ### Minimal Configuration
 
-Create `trusted-server.toml` in your project root:
+Create `trusted-server.toml` in your project root with:
+
+```bash
+ts config init
+```
+
+Then edit it to match your deployment:
 
 ```toml
 [publisher]
@@ -40,6 +46,12 @@ secret_key = "your-hmac-secret"
 ```bash
 # Generate cryptographically random secrets
 openssl rand -base64 32
+```
+
+### Validate Configuration
+
+```bash
+ts config validate
 ```
 
 ## Configuration Files

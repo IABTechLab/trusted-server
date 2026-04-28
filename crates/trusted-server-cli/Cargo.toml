@@ -1,0 +1,33 @@
+[package]
+name = "trusted-server-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ts"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+derive_more = { workspace = true, features = ["display"] }
+error-stack = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+trusted-server-core = { workspace = true }
+url = { workspace = true }
+keyring = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
+    "crates/trusted-server-cli",
     "crates/js",
     "crates/openrtb",
 ]
@@ -86,6 +87,12 @@ tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time
 toml = "1.0"
 trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"
+clap = { version = "4.5.51", features = ["derive"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+dialoguer = "0.12.0"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
+scraper = "0.24.0"
+tempfile = "3.23.0"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }

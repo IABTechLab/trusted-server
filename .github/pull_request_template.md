@@ -23,8 +23,10 @@ Closes #
 
 <!-- How did you verify this works? Check all that apply -->
 
-- [ ] `cargo test --workspace`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --workspace --exclude trusted-server-cli`
+- [ ] `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"`
+- [ ] `cargo clippy --workspace --exclude trusted-server-cli --all-targets --all-features -- -D warnings`
+- [ ] `cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --all-targets -- -D warnings`
 - [ ] `cargo fmt --all -- --check`
 - [ ] JS tests: `cd crates/js/lib && npx vitest run`
 - [ ] JS format: `cd crates/js/lib && npm run format`
@@ -37,6 +39,6 @@ Closes #
 
 - [ ] Changes follow [CLAUDE.md](/CLAUDE.md) conventions
 - [ ] No `unwrap()` in production code — use `expect("should ...")`
-- [ ] Uses `tracing` macros (not `println!`)
+- [ ] Uses `log` macros (not `println!`)
 - [ ] New code has tests
 - [ ] No secrets or credentials committed

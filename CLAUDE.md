@@ -54,14 +54,20 @@ fastly compute publish
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests (uses viceroy)
-cargo test --workspace
+# Run wasm-target Rust tests for the existing runtime crates (uses viceroy)
+cargo test --workspace --exclude trusted-server-cli
+
+# Run host-target CLI tests
+cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"
 
 # Format
 cargo fmt --all -- --check
 
-# Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Lint wasm-target runtime crates
+cargo clippy --workspace --exclude trusted-server-cli --all-targets --all-features -- -D warnings
+
+# Lint host-target CLI crate
+cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --all-targets -- -D warnings
 
 # Check compilation
 cargo check
@@ -268,11 +274,13 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-3. `cargo test --workspace`
-4. JS build and test (`cd crates/js/lib && npx vitest run`)
-5. JS format (`cd crates/js/lib && npm run format`)
-6. Docs format (`cd docs && npm run format`)
+2. `cargo clippy --workspace --exclude trusted-server-cli --all-targets --all-features -- -D warnings`
+3. `cargo test --workspace --exclude trusted-server-cli`
+4. `cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --all-targets -- -D warnings`
+5. `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"`
+6. JS build and test (`cd crates/js/lib && npx vitest run`)
+7. JS format (`cd crates/js/lib && npm run format`)
+8. Docs format (`cd docs && npm run format`)
 
 ---
 
@@ -282,7 +290,7 @@ Every PR must pass:
 2. **Get approval** — for non-trivial changes, present a plan first.
 3. **Implement incrementally** — small, testable changes. Every change should
    impact as little code as possible.
-4. **Test after every change** — `cargo test --workspace`.
+4. **Test after every change** — run the relevant Rust lane(s): `cargo test --workspace --exclude trusted-server-cli` for the runtime crates and `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"` for the CLI.
 5. **Explain as you go** — describe what you changed and why.
 6. **If blocked** — explain what's blocking and why.
 

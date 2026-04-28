@@ -22,27 +22,33 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
-# Build
-cargo build
+# Create a starter config
+cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- config init
 
-# Run tests
-cargo test
+# Validate local config
+cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- config validate
 
-# Start local server
-fastly compute serve
+# Start local Fastly development
+cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev -a fastly
 ```
 
 ## Development
 
 ```bash
 # Format code
-cargo fmt
+cargo fmt --all -- --check
 
-# Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Lint runtime crates (wasm target)
+cargo clippy --workspace --exclude trusted-server-cli --all-targets --all-features -- -D warnings
 
-# Run tests
-cargo test
+# Lint CLI crate (host target)
+cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --all-targets -- -D warnings
+
+# Run runtime crate tests (wasm target)
+cargo test --workspace --exclude trusted-server-cli
+
+# Run CLI tests (host target)
+cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
