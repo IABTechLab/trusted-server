@@ -99,7 +99,7 @@ jobs:
         run: cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
 
       - name: Run Cloudflare adapter tests (native host)
-        run: cargo test -p trusted-server-adapter-cloudflare
+        run: cargo test-cloudflare
 
   test-typescript:
     name: vitest

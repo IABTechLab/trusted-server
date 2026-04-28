@@ -31,6 +31,9 @@ cargo test-fastly
 # Run tests (Axum native adapter)
 cargo test-axum
 
+# Run tests (Cloudflare Workers adapter — native host)
+cargo test-cloudflare
+
 # Start local server — Axum (no Fastly CLI or Viceroy required)
 cargo run -p trusted-server-adapter-axum
 
@@ -48,8 +51,9 @@ cargo fmt
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Run all tests
-cargo test-fastly   # Fastly/WASM (requires Viceroy)
-cargo test-axum     # Axum native adapter
+cargo test-fastly      # Fastly/WASM (requires Viceroy)
+cargo test-axum        # Axum native adapter
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

@@ -62,10 +62,10 @@ cargo test-axum
 cargo check -p trusted-server-adapter-cloudflare
 
 # Check Cloudflare adapter (WASM target)
-cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown
+cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
 
-# Test Cloudflare adapter
-cargo test -p trusted-server-adapter-cloudflare
+# Test Cloudflare adapter (native host)
+cargo test-cloudflare
 ```
 
 ### Testing & Quality
@@ -73,8 +73,9 @@ cargo test -p trusted-server-adapter-cloudflare
 ```bash
 # Run all Rust tests — use workspace aliases (see .cargo/config.toml)
 # Both adapters are workspace members; default-members is native-only (core + axum).
-cargo test-fastly  # Fastly adapter + core (wasm32-wasip1 via Viceroy)
-cargo test-axum    # Axum dev server adapter (native)
+cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-axum        # Axum dev server adapter (native)
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 
 # Format
 cargo fmt --all -- --check

@@ -13,9 +13,8 @@
 test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
 # Axum dev server adapter (native)
 test-axum = ["test", "-p", "trusted-server-adapter-axum"]
-# Cloudflare adapter (tested separately via cargo check/test -p)
-# CI convenience — runs both in sequence (shell aliases can't chain; use a script or CI steps)
-# cargo test-fastly && cargo test-axum
+# Cloudflare adapter (native host; WASM target checked separately in CI)
+test-cloudflare = ["test", "-p", "trusted-server-adapter-cloudflare"]
 
 [target.'cfg(all(target_arch = "wasm32"))']
 runner = "viceroy run -C ../../fastly.toml -- "
