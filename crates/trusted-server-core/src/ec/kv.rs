@@ -7,7 +7,6 @@
 //! (organic request paths) or propagate them (sync endpoints). See the
 //! per-operation error handling policy in the spec §7.5.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt};
@@ -17,18 +16,10 @@ use crate::error::TrustedServerError;
 
 use super::current_timestamp;
 use super::generation::ec_hash;
-use super::kv_types::{
-    validated_stored_domain, KvDomainVisit, KvEntry, KvMetadata, KvNetwork, KvPubProperties,
-    MAX_SEEN_DOMAINS,
-};
+use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
-
-/// Minimum interval (seconds) between `last_seen` KV writes for the same key.
-/// Prevents write thrashing under bursty traffic — Fastly KV enforces a
-/// 1 write/sec limit per key.
-const LAST_SEEN_DEBOUNCE_SECS: u64 = 300;
 
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
@@ -54,16 +45,11 @@ pub enum UpsertResult {
     NotFound,
     /// The entry's `consent.ok` is `false` (withdrawal tombstone).
     ConsentWithdrawn,
-    /// The request timestamp is older than the stored `synced` value, so
-    /// the write was skipped. Counted as accepted by the batch endpoint.
-    Stale,
+    /// The partner ID already had the requested UID, so no write was needed.
+    Unchanged,
 }
 
 use super::log_id;
-
-fn stale_sync(existing_synced: u64, incoming_synced: u64) -> bool {
-    existing_synced > incoming_synced
-}
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
@@ -387,7 +373,6 @@ impl KvIdentityGraph {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
-        synced: u64,
     ) -> Result<(), Report<TrustedServerError>> {
         // Open store once for write operations. Note: `self.get()` opens
         // its own handle internally — this is intentional since `KVStore::open`
@@ -404,7 +389,7 @@ impl KvIdentityGraph {
                         "upsert_partner_id: no entry for '{}', creating minimal entry",
                         log_id(ec_id)
                     );
-                    let minimal = KvEntry::minimal(partner_id, uid, synced);
+                    let minimal = KvEntry::minimal(partner_id, uid, current_timestamp());
                     let (min_body, min_meta) = Self::serialize_entry(&minimal, &self.store_name)?;
                     if Self::try_insert_add(&store, ec_id, &min_body, &min_meta, &self.store_name)?
                     {
@@ -438,12 +423,19 @@ impl KvIdentityGraph {
                 }));
             }
 
+            if entry
+                .ids
+                .get(partner_id)
+                .is_some_and(|existing| existing.uid == uid)
+            {
+                return Ok(());
+            }
+
             // Merge the partner ID.
             entry.ids.insert(
                 partner_id.to_owned(),
                 super::kv_types::KvPartnerId {
                     uid: uid.to_owned(),
-                    synced,
                 },
             );
 
@@ -493,8 +485,8 @@ impl KvIdentityGraph {
     /// entries for missing keys. Used by the S2S batch sync endpoint where
     /// the KV entry must have been created by the organic EC flow.
     ///
-    /// Returns [`UpsertResult::Stale`] when the stored `synced` timestamp
-    /// for this partner is newer than `synced`, skipping the write.
+    /// Returns [`UpsertResult::Unchanged`] when the existing UID already
+    /// matches the incoming UID, skipping the write.
     ///
     /// # Errors
     ///
@@ -505,7 +497,6 @@ impl KvIdentityGraph {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
-        synced: u64,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
         let store = self.open_store()?;
 
@@ -519,20 +510,18 @@ impl KvIdentityGraph {
                 return Ok(UpsertResult::ConsentWithdrawn);
             }
 
-            // Skip only if the existing sync is newer than the request. Equal
-            // second-granularity timestamps may represent distinct batches, so
-            // allow them to proceed through CAS instead of silently dropping one.
-            if let Some(existing) = entry.ids.get(partner_id) {
-                if stale_sync(existing.synced, synced) {
-                    return Ok(UpsertResult::Stale);
-                }
+            if entry
+                .ids
+                .get(partner_id)
+                .is_some_and(|existing| existing.uid == uid)
+            {
+                return Ok(UpsertResult::Unchanged);
             }
 
             entry.ids.insert(
                 partner_id.to_owned(),
                 super::kv_types::KvPartnerId {
                     uid: uid.to_owned(),
-                    synced,
                 },
             );
 
@@ -573,158 +562,6 @@ impl KvIdentityGraph {
                 "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_id}'"
             ),
         }))
-    }
-
-    /// Updates the `last_seen` timestamp with a 300-second debounce.
-    ///
-    /// Also updates the [`KvPubProperties::seen_domains`] entry for the
-    /// given `domain`, incrementing visits and updating the `last` timestamp.
-    /// New domains are added if the [`MAX_SEEN_DOMAINS`] cap has not been
-    /// reached; otherwise the new domain is silently dropped so the earliest
-    /// retained set remains stable.
-    ///
-    /// Skips the write if the stored `last_seen` is within
-    /// [`LAST_SEEN_DEBOUNCE_SECS`] of the new timestamp, or if the entry
-    /// does not exist.
-    ///
-    /// Does **not** retry on CAS conflict — if someone else wrote more
-    /// recently, the debounce condition is satisfied anyway.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] on store error or CAS
-    /// conflict.
-    pub fn update_last_seen(
-        &self,
-        ec_id: &str,
-        timestamp: u64,
-        domain: &str,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let (mut entry, generation) = match self.get(ec_id)? {
-            Some(pair) => pair,
-            None => {
-                log::debug!(
-                    "update_last_seen: no entry for '{}', skipping",
-                    log_id(ec_id)
-                );
-                return Ok(());
-            }
-        };
-
-        // Skip tombstones — a stale cookie should not extend a 24h tombstone
-        // back to 1-year TTL.
-        if !entry.consent.ok {
-            log::debug!(
-                "update_last_seen: entry for '{}' is a tombstone, skipping",
-                log_id(ec_id)
-            );
-            return Ok(());
-        }
-
-        // Guard against stale/out-of-order timestamps.
-        if timestamp <= entry.last_seen {
-            log::trace!(
-                "update_last_seen: stale timestamp for '{}' (stored={}, incoming={timestamp})",
-                log_id(ec_id),
-                entry.last_seen,
-            );
-            return Ok(());
-        }
-
-        // Debounce: skip if the stored value is recent enough.
-        let elapsed = timestamp.saturating_sub(entry.last_seen);
-        if elapsed < LAST_SEEN_DEBOUNCE_SECS {
-            log::trace!(
-                "update_last_seen: debounced for '{}' (delta={}s)",
-                log_id(ec_id),
-                elapsed,
-            );
-            return Ok(());
-        }
-
-        entry.last_seen = timestamp;
-
-        let Some(domain) = validated_stored_domain(domain) else {
-            log::warn!(
-                "update_last_seen: skipping invalid publisher domain for '{}'",
-                log_id(ec_id),
-            );
-            return Ok(());
-        };
-
-        // Update publisher domain visit history.
-        // When `pub_properties` is `None` (entry created before this field
-        // was added), backfill it with the current domain as origin.
-        match entry.pub_properties {
-            Some(ref mut props) => match props.seen_domains.get_mut(&domain) {
-                Some(visit) => {
-                    visit.last = timestamp;
-                    visit.visits = visit.visits.saturating_add(1);
-                }
-                None => {
-                    if props.seen_domains.len() < MAX_SEEN_DOMAINS {
-                        props.seen_domains.insert(
-                            domain.clone(),
-                            KvDomainVisit {
-                                first: timestamp,
-                                last: timestamp,
-                                visits: 1,
-                            },
-                        );
-                    } else {
-                        // log_id() truncates the EC ID — safe for logging.
-                        log::debug!(
-                            "update_last_seen: seen_domains cap ({MAX_SEEN_DOMAINS}) reached \
-                             for '{}', dropping additional domain",
-                            log_id(ec_id),
-                        );
-                    }
-                }
-            },
-            None => {
-                let mut seen_domains = BTreeMap::new();
-                seen_domains.insert(
-                    domain.clone(),
-                    KvDomainVisit {
-                        first: timestamp,
-                        last: timestamp,
-                        visits: 1,
-                    },
-                );
-                entry.pub_properties = Some(KvPubProperties {
-                    origin_domain: domain,
-                    seen_domains,
-                });
-            }
-        }
-
-        let store = self.open_store()?;
-        let (body, meta_str) = Self::serialize_entry(&entry, &self.store_name)?;
-
-        match store
-            .build_insert()
-            .if_generation_match(generation)
-            .metadata(&meta_str)
-            .time_to_live(ENTRY_TTL)
-            .execute(ec_id, body)
-        {
-            Ok(()) => Ok(()),
-            // CAS conflict means another request updated more recently —
-            // the debounce condition is satisfied by their write.
-            Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
-                log::debug!(
-                    "update_last_seen: CAS conflict for '{}', another write won",
-                    log_id(ec_id),
-                );
-                Ok(())
-            }
-            Err(err) => Err(
-                Report::new(err).change_context(TrustedServerError::KvStore {
-                    store_name: self.store_name.clone(),
-                    message: format!("Failed to update last_seen for key '{}'", log_id(ec_id)),
-                }),
-            ),
-        }
     }
 
     /// Writes a withdrawal tombstone for consent enforcement.
@@ -797,17 +634,13 @@ impl KvIdentityGraph {
         Ok(count)
     }
 
-    /// Evaluates and caches the cluster size for an EC entry.
+    /// Evaluates the cluster size for an EC entry.
     ///
-    /// If the entry already has a `cluster_checked` timestamp within
-    /// `recheck_secs` of now, the cached `cluster_size` is returned
-    /// without performing a list API call.
-    ///
-    /// Otherwise, counts the number of keys sharing the same hash prefix
-    /// via [`count_hash_prefix_keys`](Self::count_hash_prefix_keys) and
-    /// writes the result back to the entry via CAS. The CAS write is
-    /// best-effort — on conflict, the computed value is still returned;
-    /// it will simply be re-evaluated on the next call.
+    /// Returns the stored `cluster_size` when it has already been evaluated.
+    /// Otherwise, counts the number of keys sharing the same hash prefix via
+    /// [`count_hash_prefix_keys`](Self::count_hash_prefix_keys) and writes the
+    /// result back to the entry. The CAS write is best-effort — on conflict,
+    /// the computed value is still returned.
     ///
     /// # Errors
     ///
@@ -817,18 +650,14 @@ impl KvIdentityGraph {
         ec_id: &str,
         entry: &KvEntry,
         generation: u64,
-        recheck_secs: u64,
     ) -> Result<Option<u32>, Report<TrustedServerError>> {
-        let now = current_timestamp();
-
-        // Check TTL — skip re-evaluation if the cached value is fresh enough.
-        if let Some(ref network) = entry.network {
-            if let Some(checked) = network.cluster_checked {
-                if now.saturating_sub(checked) < recheck_secs {
-                    log::trace!("evaluate_cluster: using cached cluster_size");
-                    return Ok(network.cluster_size);
-                }
-            }
+        if let Some(cluster_size) = entry
+            .network
+            .as_ref()
+            .and_then(|network| network.cluster_size)
+        {
+            log::trace!("evaluate_cluster: using stored cluster_size");
+            return Ok(Some(cluster_size));
         }
 
         // Compute cluster size via prefix list.
@@ -844,7 +673,6 @@ impl KvIdentityGraph {
         let mut updated_entry = entry.clone();
         updated_entry.network = Some(KvNetwork {
             cluster_size: Some(cluster_size),
-            cluster_checked: Some(now),
         });
 
         let store = self.open_store()?;
@@ -903,23 +731,9 @@ mod tests {
     #[test]
     fn constants_have_expected_values() {
         assert_eq!(MAX_CAS_RETRIES, 5);
-        assert_eq!(LAST_SEEN_DEBOUNCE_SECS, 300);
         assert_eq!(ENTRY_TTL, Duration::from_secs(31_536_000));
         assert_eq!(TOMBSTONE_TTL, Duration::from_secs(86_400));
         assert_eq!(CLUSTER_LIST_LIMIT, 100);
-    }
-
-    #[test]
-    fn stale_sync_only_rejects_older_timestamps() {
-        assert!(stale_sync(101, 100), "older incoming sync should be stale");
-        assert!(
-            !stale_sync(100, 100),
-            "equal second-granularity sync should be allowed"
-        );
-        assert!(
-            !stale_sync(100, 101),
-            "newer incoming sync should be allowed"
-        );
     }
 
     #[test]
@@ -950,7 +764,6 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-                synced: 1000,
             },
         );
         let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
@@ -965,53 +778,22 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_cluster_returns_cached_value_when_ttl_fresh() {
-        // When the entry has a recent cluster_checked timestamp, evaluate_cluster
-        // should return the cached value without touching the KV store.
-        // We verify this by using a non-existent store — if it tried to open
-        // the store, it would fail. The TTL-skip path exits before any store I/O.
-        let kv = KvIdentityGraph::new("nonexistent_store_for_ttl_test");
+    fn evaluate_cluster_returns_stored_value_without_store_io() {
+        let kv = KvIdentityGraph::new("nonexistent_store_for_cluster_cache_test");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let now = current_timestamp();
-
-        let mut entry = KvEntry::tombstone(now);
-        entry.consent.ok = true;
+        let mut entry = KvEntry::tombstone(1000);
         entry.network = Some(KvNetwork {
             cluster_size: Some(5),
-            cluster_checked: Some(now), // just checked
         });
 
-        // With a 3600s TTL, the cached value (checked just now) should be returned.
-        let result = kv.evaluate_cluster(&ec_id, &entry, 0, 3600);
-        let cluster_size = result.expect("should return cached value without store I/O");
+        let cluster_size = kv
+            .evaluate_cluster(&ec_id, &entry, 0)
+            .expect("should not touch store when cluster_size is already known");
+
         assert_eq!(
             cluster_size,
             Some(5),
-            "should return cached cluster_size when within TTL"
-        );
-    }
-
-    #[test]
-    fn evaluate_cluster_requires_recheck_when_ttl_expired() {
-        // When cluster_checked is older than the TTL, evaluate_cluster must
-        // perform a list API call. Since the store doesn't exist, this should
-        // fail — confirming it didn't take the cached path.
-        let kv = KvIdentityGraph::new("nonexistent_store_for_ttl_test");
-        let ec_id = format!("{}.ABC123", "a".repeat(64));
-
-        let mut entry = KvEntry::tombstone(1000);
-        entry.consent.ok = true;
-        entry.network = Some(KvNetwork {
-            cluster_size: Some(5),
-            cluster_checked: Some(1000), // very old timestamp
-        });
-
-        // With a 3600s TTL, the old timestamp should trigger re-evaluation,
-        // which will fail because the store doesn't exist.
-        let result = kv.evaluate_cluster(&ec_id, &entry, 0, 3600);
-        assert!(
-            result.is_err(),
-            "should attempt store I/O when TTL expired, failing on missing store"
+            "should return stored cluster_size without re-listing keys"
         );
     }
 }

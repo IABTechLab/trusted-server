@@ -79,8 +79,9 @@ pub fn handle_identify(
                 }
             }
 
-            // Evaluate cluster size (lazy, TTL-gated).
-            match kv.evaluate_cluster(ec_id, &entry, generation, settings.ec.cluster_recheck_secs) {
+            // Evaluate cluster size lazily for identify responses. Existing
+            // stored cluster_size values are reused without a prefix-list call.
+            match kv.evaluate_cluster(ec_id, &entry, generation) {
                 Ok(size) => {
                     cluster_size = size;
                 }

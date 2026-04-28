@@ -11,10 +11,6 @@ use super::kv::KvIdentityGraph;
 use super::kv_types::MAX_UID_LENGTH;
 use super::registry::PartnerRegistry;
 
-/// Minimum seconds between KV writes for the same partner on the same EC.
-/// Prevents write thrashing when a user hits many pages quickly.
-const SYNC_DEBOUNCE_SECS: u64 = 300;
-
 /// Maximum raw `ts-eids` cookie size accepted before base64 decode.
 const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
 
@@ -60,8 +56,6 @@ pub fn ingest_prebid_eids(
         }
     };
 
-    let now = super::current_timestamp();
-
     for eid in &eids {
         let Some(partner) = registry.find_by_source_domain(&eid.source) else {
             log::debug!("Prebid EIDs: no partner for source '{}'", eid.source);
@@ -72,21 +66,7 @@ pub fn ingest_prebid_eids(
             continue;
         }
 
-        // Debounce: skip if this partner was synced recently.
-        if let Ok(Some((entry, _))) = kv.get(ec_id) {
-            if let Some(existing) = entry.ids.get(&partner.id) {
-                if now.saturating_sub(existing.synced) < SYNC_DEBOUNCE_SECS {
-                    log::debug!(
-                        "Prebid EIDs: debouncing partner '{}' (synced {}s ago)",
-                        partner.id,
-                        now.saturating_sub(existing.synced)
-                    );
-                    continue;
-                }
-            }
-        }
-
-        match kv.upsert_partner_id(ec_id, &partner.id, &eid.id, now) {
+        match kv.upsert_partner_id(ec_id, &partner.id, &eid.id) {
             Ok(_) => {
                 log::debug!(
                     "Prebid EIDs: synced partner '{}' from source '{}'",
@@ -138,23 +118,7 @@ pub fn ingest_sharedid_cookie(
         return;
     };
 
-    let now = super::current_timestamp();
-
-    // Debounce: skip if this partner was synced recently.
-    if let Ok(Some((entry, _))) = kv.get(ec_id) {
-        if let Some(existing) = entry.ids.get(&partner.id) {
-            if now.saturating_sub(existing.synced) < SYNC_DEBOUNCE_SECS {
-                log::debug!(
-                    "SharedID: debouncing partner '{}' (synced {}s ago)",
-                    partner.id,
-                    now.saturating_sub(existing.synced)
-                );
-                return;
-            }
-        }
-    }
-
-    match kv.upsert_partner_id(ec_id, &partner.id, cookie_value, now) {
+    match kv.upsert_partner_id(ec_id, &partner.id, cookie_value) {
         Ok(_) => {
             log::debug!("SharedID: synced partner '{}'", partner.id);
         }

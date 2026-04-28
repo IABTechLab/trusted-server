@@ -94,20 +94,18 @@ fastly secret-store create --name signing_keys
 
 Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
 
-## Create EC KV Stores
+## Create EC KV Store
 
-Edge Cookie flows require two KV stores:
+Edge Cookie flows require one KV store:
 
 - Identity graph store (`ec_store`) - EC identity graph, partner IDs, minimal consent metadata, and withdrawal tombstones
-- Partner registry store (`partner_store`) - partner records and API-key hashes
 
-There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
 
-Create them:
+Create it:
 
 ```bash
 fastly kv-store create --name ec_identity_store
-fastly kv-store create --name ec_partner_store
 ```
 
 Configure in `trusted-server.toml`:
@@ -116,7 +114,6 @@ Configure in `trusted-server.toml`:
 [ec]
 passphrase = "your-hmac-secret"
 ec_store = "ec_identity_store"
-partner_store = "ec_partner_store"
 ```
 
 Verify stores exist:
@@ -131,7 +128,7 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `write_failed`, first check that both stores are present and linked to the active version. Legacy consent KV bindings can be removed once no deployment-specific tooling depends on them.
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
 
 ## Next Steps
 
