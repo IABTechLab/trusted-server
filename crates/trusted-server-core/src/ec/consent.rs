@@ -21,6 +21,16 @@ pub fn ec_consent_granted(consent_context: &ConsentContext) -> bool {
     crate::consent::allows_ec_creation(consent_context)
 }
 
+/// Returns `true` when the request carries an explicit EC withdrawal signal.
+///
+/// This is intentionally stricter than [`ec_consent_granted`]. A fail-closed
+/// result such as unknown jurisdiction or missing consent data must not be
+/// treated as an authoritative withdrawal of an already-issued EC.
+#[must_use]
+pub fn ec_consent_withdrawn(consent_context: &ConsentContext) -> bool {
+    crate::consent::has_explicit_ec_withdrawal(consent_context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +59,19 @@ mod tests {
         assert!(
             !ec_consent_granted(&ctx),
             "unknown jurisdiction should fail closed"
+        );
+    }
+
+    #[test]
+    fn ec_consent_withdrawn_does_not_treat_unknown_jurisdiction_as_revocation() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Unknown,
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !ec_consent_withdrawn(&ctx),
+            "unknown jurisdiction should block creation without revoking existing EC"
         );
     }
 }

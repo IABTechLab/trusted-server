@@ -174,13 +174,20 @@ async fn route_request(
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
     if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/batch-sync" {
-        let mut response = require_identity_graph(settings)
-            .map(|kv| {
-                let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-                handle_batch_sync(&kv, partner_registry, &limiter, req)
-            })
-            .and_then(|r| r)
-            .unwrap_or_else(|e| to_error_response(&e));
+        let mut response = match enforce_basic_auth(settings, &req) {
+            Ok(Some(response)) => response,
+            Ok(None) => require_identity_graph(settings)
+                .map(|kv| {
+                    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                    handle_batch_sync(&kv, partner_registry, &limiter, req)
+                })
+                .and_then(|r| r)
+                .unwrap_or_else(|e| to_error_response(&e)),
+            Err(e) => {
+                log::error!("Failed to evaluate basic auth: {:?}", e);
+                to_error_response(&e)
+            }
+        };
         finalize_response(settings, geo_info.as_ref(), &mut response);
         return Ok(RouteOutcome {
             response,

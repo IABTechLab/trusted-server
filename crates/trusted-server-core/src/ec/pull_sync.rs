@@ -17,7 +17,7 @@ use url::Url;
 use crate::backend::BackendConfig;
 use crate::settings::Settings;
 
-use super::generation::is_valid_ec_id;
+use super::generation::{ec_hash, is_valid_ec_id};
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
@@ -125,7 +125,7 @@ pub fn dispatch_pull_sync(
             continue;
         };
 
-        let rate_key = format!("pull:{}:{}", partner.id, context.ec_id());
+        let rate_key = pull_rate_limit_key(&partner.id, context.ec_id());
         match rate_limiter.exceeded(&rate_key, partner.pull_sync_rate_limit) {
             Ok(true) => {
                 log::debug!(
@@ -252,6 +252,10 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
 fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
     base_url.query_pairs_mut().append_pair("ec_id", ec_id);
     base_url
+}
+
+fn pull_rate_limit_key(partner_id: &str, ec_id: &str) -> String {
+    format!("pull:{partner_id}:{}", ec_hash(ec_id))
 }
 
 fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFlightPull>) {
@@ -480,6 +484,25 @@ mod tests {
         assert!(
             !query.contains("ip="),
             "should not forward client IP to partners"
+        );
+    }
+
+    #[test]
+    fn pull_rate_limit_key_uses_ec_hash_only() {
+        let first_ec_id = format!("{}.ABC123", "a".repeat(64));
+        let second_ec_id = format!("{}.XYZ789", "a".repeat(64));
+
+        let first_key = pull_rate_limit_key("ssp_x", &first_ec_id);
+        let second_key = pull_rate_limit_key("ssp_x", &second_ec_id);
+
+        assert_eq!(
+            first_key, second_key,
+            "should bucket different suffixes for the same EC hash together"
+        );
+        assert_eq!(
+            first_key,
+            format!("pull:ssp_x:{}", "a".repeat(64)),
+            "should key pull-sync rate limiting by partner ID and EC hash"
         );
     }
 

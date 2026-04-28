@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use fastly::Response;
 
-use super::consent::ec_consent_granted;
+use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
@@ -48,25 +48,35 @@ pub fn ec_finalize_response(
     response: &mut Response,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
+    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
-    // Withdrawal path: no consent + cookie was present.
-    if !consent_allows_ec && ec_context.cookie_was_present() {
-        clear_ec_on_response(settings, response);
+    if !consent_allows_ec {
+        // Always strip EC-specific response headers when consent is not
+        // currently usable for this request. This covers both explicit
+        // revocation and fail-closed cases such as missing geo or undecodable
+        // consent input.
+        clear_ec_headers_on_response(response);
 
-        // Compute once for the authoritative identity-graph tombstones.
-        let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+        // Only expire the browser cookie and tombstone the identity-graph row
+        // when the request carries an explicit withdrawal signal.
+        if consent_withdrawn && ec_context.cookie_was_present() {
+            expire_ec_cookie(settings, response);
 
-        // The identity-graph tombstone is the authoritative withdrawal marker
-        // for subsequent EC behavior.
-        if let Some(graph) = kv {
-            apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-                if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
-                    log::error!(
-                        "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
-                        log_id(ec_id),
-                    );
-                }
-            });
+            // Compute once for the authoritative identity-graph tombstones.
+            let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+
+            // The identity-graph tombstone is the authoritative withdrawal marker
+            // for subsequent EC behavior.
+            if let Some(graph) = kv {
+                apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
+                    if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
+                        log::error!(
+                            "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
+                            log_id(ec_id),
+                        );
+                    }
+                });
+            }
         }
 
         return;
@@ -129,14 +139,12 @@ pub fn set_ec_cookie_and_header_on_response(
     }
 }
 
-/// Clears EC cookie and removes EC-specific response headers.
+/// Removes EC-specific response headers.
 ///
 /// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips any
 /// dynamic `X-ts-<partner_id>` headers (matching the `x-ts-` prefix) to
-/// prevent leaking EC identity data when consent is withdrawn.
-pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
-    expire_ec_cookie(settings, response);
-
+/// prevent leaking EC identity data when consent is absent or withdrawn.
+fn clear_ec_headers_on_response(response: &mut Response) {
     for header in EC_RESPONSE_HEADERS {
         response.remove_header(*header);
     }
@@ -158,6 +166,14 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
     for header in &dynamic_ts_headers {
         response.remove_header(header.as_str());
     }
+}
+
+/// Clears EC cookie and removes EC-specific response headers.
+///
+/// Used when the request carries an explicit withdrawal signal.
+pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
+    expire_ec_cookie(settings, response);
+    clear_ec_headers_on_response(response);
 }
 
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
@@ -191,7 +207,7 @@ where
 mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
-    use crate::consent::types::ConsentSource;
+    use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::test_support::tests::create_test_settings;
 
     fn make_context(
@@ -201,12 +217,28 @@ mod tests {
         ec_generated: bool,
         jurisdiction: Jurisdiction,
     ) -> EcContext {
-        let consent = crate::consent::types::ConsentContext {
+        let consent = ConsentContext {
             jurisdiction,
             source: ConsentSource::Cookie,
             ..Default::default()
         };
 
+        make_context_with_consent(
+            ec_value,
+            cookie_ec_value,
+            ec_was_present,
+            ec_generated,
+            consent,
+        )
+    }
+
+    fn make_context_with_consent(
+        ec_value: Option<&str>,
+        cookie_ec_value: Option<&str>,
+        ec_was_present: bool,
+        ec_generated: bool,
+        consent: ConsentContext,
+    ) -> EcContext {
         EcContext::new_for_test_with_cookie(
             ec_value.map(str::to_owned),
             cookie_ec_value.map(str::to_owned),
@@ -349,13 +381,14 @@ mod tests {
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
-        let ec_context = make_context(
-            Some(&ec_id),
-            Some(&ec_id),
-            true,
-            false,
-            Jurisdiction::Unknown,
-        );
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
         let mut response = Response::new();
         response.set_header("x-ts-ec", "stale");
         response.set_header("x-ts-eids", "[]");
@@ -523,6 +556,46 @@ mod tests {
         assert!(
             response.get_header("set-cookie").is_none(),
             "should not mutate cookie when there is nothing to revoke"
+        );
+    }
+
+    #[test]
+    fn finalize_unknown_jurisdiction_strips_headers_without_expiring_cookie() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("unk001");
+        let ec_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::Unknown,
+        );
+        let mut response = Response::new();
+        response.set_header("x-ts-ec", &ec_id);
+        response.set_header("x-ts-eids", "[]");
+
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "should strip EC header when consent cannot be verified"
+        );
+        assert!(
+            response.get_header("x-ts-eids").is_none(),
+            "should strip EID header when consent cannot be verified"
+        );
+        assert!(
+            response.get_header("set-cookie").is_none(),
+            "should not expire the cookie without an explicit withdrawal signal"
         );
     }
 }

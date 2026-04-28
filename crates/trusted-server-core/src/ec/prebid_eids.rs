@@ -66,6 +66,15 @@ pub fn ingest_prebid_eids(
             continue;
         }
 
+        if eid_id_exceeds_size_limit(&eid.id) {
+            log::debug!(
+                "Prebid EIDs: rejecting oversized uid for partner '{}' from source '{}'",
+                partner.id,
+                eid.source,
+            );
+            continue;
+        }
+
         match kv.upsert_partner_id(ec_id, &partner.id, &eid.id) {
             Ok(_) => {
                 log::debug!(
@@ -130,6 +139,10 @@ pub fn ingest_sharedid_cookie(
 
 fn eids_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
     cookie_value.len() > MAX_EIDS_COOKIE_BYTES
+}
+
+fn eid_id_exceeds_size_limit(uid: &str) -> bool {
+    uid.len() > MAX_UID_LENGTH
 }
 
 fn sharedid_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
@@ -205,6 +218,21 @@ mod tests {
         assert!(
             !sharedid_cookie_exceeds_size_limit(&exact_limit),
             "should allow sharedId values exactly at MAX_UID_LENGTH"
+        );
+    }
+
+    #[test]
+    fn prebid_eid_uid_rejects_values_larger_than_uid_limit() {
+        let oversized = "x".repeat(MAX_UID_LENGTH + 1);
+        let exact_limit = "x".repeat(MAX_UID_LENGTH);
+
+        assert!(
+            eid_id_exceeds_size_limit(&oversized),
+            "should reject EID values larger than MAX_UID_LENGTH"
+        );
+        assert!(
+            !eid_id_exceeds_size_limit(&exact_limit),
+            "should allow EID values exactly at MAX_UID_LENGTH"
         );
     }
 }

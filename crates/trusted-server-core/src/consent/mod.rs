@@ -508,6 +508,34 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
     }
 }
 
+/// Returns `true` only when the request contains an explicit EC opt-out signal.
+///
+/// This is intentionally narrower than [`allows_ec_creation`]. Some requests
+/// fail closed because consent cannot be verified yet (for example, missing geo
+/// or missing/undecodable consent signals in a regulated jurisdiction). Those
+/// cases must block *new* EC creation, but they must not be treated as an
+/// authoritative withdrawal of an already-issued EC.
+#[must_use]
+pub fn has_explicit_ec_withdrawal(ctx: &ConsentContext) -> bool {
+    match &ctx.jurisdiction {
+        jurisdiction::Jurisdiction::Gdpr => {
+            effective_tcf(ctx).is_some_and(|tcf| !tcf.has_storage_consent())
+        }
+        jurisdiction::Jurisdiction::UsState(_) => {
+            if ctx.gpc {
+                return true;
+            }
+            if let Some(tcf) = effective_tcf(ctx) {
+                return !tcf.has_storage_consent();
+            }
+            ctx.us_privacy
+                .as_ref()
+                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+        }
+        jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
@@ -570,7 +598,8 @@ mod tests {
 
     use super::{
         allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, ConsentPipelineInput,
+        build_consent_context, build_context_from_signals, has_explicit_ec_withdrawal,
+        ConsentPipelineInput,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -967,6 +996,10 @@ mod tests {
             !allows_ec_creation(&ctx),
             "unknown jurisdiction should block EC (fail-closed when geo unavailable)"
         );
+        assert!(
+            !has_explicit_ec_withdrawal(&ctx),
+            "unknown jurisdiction should not be treated as an explicit withdrawal"
+        );
     }
 
     #[test]
@@ -985,6 +1018,10 @@ mod tests {
         assert!(
             !allows_ec_creation(&ctx),
             "GPC=true should block EC even when US Privacy says no opt-out"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPC=true should be treated as an explicit withdrawal signal"
         );
     }
 

@@ -122,7 +122,7 @@ fn create_test_settings() -> Settings {
     let settings = Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^(/admin|/_ts/admin)"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -202,7 +202,7 @@ fn routes_use_request_local_consent() {
         "should keep discovery available with request-local consent"
     );
 
-    let admin_req = Request::post("https://test.com/admin/keys/rotate");
+    let admin_req = Request::post("https://test.com/_ts/admin/keys/rotate");
     let admin_services = test_runtime_services(&admin_req);
     let admin_resp = futures::executor::block_on(route_request(
         &settings,
