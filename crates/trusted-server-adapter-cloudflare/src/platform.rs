@@ -61,7 +61,15 @@ struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Ok(format!("{}_{}", spec.scheme, spec.host))
+        let port = spec
+            .port
+            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
+        let timeout_ms = spec.first_byte_timeout.as_millis();
+        let cert_suffix = if spec.certificate_check { "" } else { "_nocert" };
+        Ok(format!(
+            "{}_{}_{}_{timeout_ms}ms{cert_suffix}",
+            spec.scheme, spec.host, port
+        ))
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -309,6 +317,19 @@ impl PlatformHttpClient for CloudflareHttpClient {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with an empty pending_requests list"));
+        }
+
+        // Warn when the orchestrator submitted more than one provider: send_async()
+        // executes eagerly, so those requests already ran sequentially rather than
+        // in parallel. Total auction latency is sum(DSP_i) instead of max(DSP_i).
+        if pending_requests.len() >= 2 {
+            log::warn!(
+                "CloudflareHttpClient: select() received {} pending requests; \
+                 send_async() runs each request eagerly so multi-provider auctions \
+                 degrade to sequential latency. Use the Fastly adapter for parallel \
+                 DSP fan-out.",
+                pending_requests.len()
+            );
         }
 
         let ready_platform = pending_requests.remove(0);

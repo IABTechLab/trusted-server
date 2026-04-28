@@ -15,7 +15,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -23,6 +25,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +63,42 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 
 fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
     build_runtime_services(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Publisher response helper
+// ---------------------------------------------------------------------------
+
+/// Collapse a [`PublisherResponse`] into a plain [`Response`].
+///
+/// Buffers streaming and pass-through variants in memory (acceptable for a
+/// Workers invocation which processes one request at a time).
+fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    registry: &IntegrationRegistry,
+) -> Result<Response, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, registry)?;
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                edgezero_core::http::HeaderValue::from(output.len() as u64),
+            );
+            *response.body_mut() = edgezero_core::body::Body::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +143,9 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     };
 
     RouterService::builder()
+        .middleware(FinalizeResponseMiddleware::new(Arc::new(
+            Settings::default(),
+        )))
         .get("/", make(Arc::clone(&message)))
         .post("/", make(Arc::clone(&message)))
         .get("/{*rest}", make(Arc::clone(&message)))
@@ -188,7 +230,7 @@ impl Hooks for TrustedServerApp {
                 let services = build_per_request_services(&ctx);
                 let req = ctx.into_request();
                 Ok(
-                    handle_auction(&s.settings, &s.orchestrator, &services, None, req)
+                    handle_auction(&s.settings, &s.orchestrator, &services, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )
@@ -284,7 +326,9 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
+                    handle_publisher_request(&s.settings, &s.registry, &services, req)
+                        .await
+                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -311,7 +355,9 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
+                    handle_publisher_request(&s.settings, &s.registry, &services, req)
+                        .await
+                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -319,6 +365,8 @@ impl Hooks for TrustedServerApp {
         };
 
         RouterService::builder()
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
             .post("/admin/keys/rotate", rotate_handler)

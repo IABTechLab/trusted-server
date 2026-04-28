@@ -136,7 +136,7 @@ fn test_nextjs_fastly() {
 }
 
 #[test]
-#[ignore = "requires Docker and a running `wrangler dev` instance; see environments/cloudflare.rs"]
+#[ignore = "requires Docker, wrangler CLI installed, and a prebuilt Cloudflare Workers bundle (run build.sh first)"]
 fn test_wordpress_cloudflare() {
     let runtime = environments::cloudflare::CloudflareWorkers;
     let framework = frameworks::wordpress::WordPress;
@@ -144,7 +144,7 @@ fn test_wordpress_cloudflare() {
 }
 
 #[test]
-#[ignore = "requires Docker and a running `wrangler dev` instance; see environments/cloudflare.rs"]
+#[ignore = "requires Docker, wrangler CLI installed, and a prebuilt Cloudflare Workers bundle (run build.sh first)"]
 fn test_nextjs_cloudflare() {
     let runtime = environments::cloudflare::CloudflareWorkers;
     let framework = frameworks::nextjs::NextJs;

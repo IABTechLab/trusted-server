@@ -1,4 +1,5 @@
 pub mod app;
+pub mod middleware;
 pub mod platform;
 
 #[cfg(target_arch = "wasm32")]
