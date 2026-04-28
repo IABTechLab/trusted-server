@@ -24,8 +24,6 @@ pub struct ResolvedPartnerId {
     pub partner_id: String,
     /// The synced user ID value.
     pub uid: String,
-    /// Epoch timestamp of the last sync.
-    pub synced: u64,
     /// The partner's identity source domain (e.g. `"liveramp.com"`).
     pub source_domain: String,
     /// `OpenRTB` agent type for this partner's identifiers.
@@ -35,7 +33,7 @@ pub struct ResolvedPartnerId {
 /// Resolves partner IDs from a KV entry against the partner registry.
 ///
 /// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
-/// sorted by `synced` timestamp descending (most recent first).
+/// sorted deterministically by partner ID.
 #[must_use]
 pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
@@ -55,17 +53,12 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
         resolved.push(ResolvedPartnerId {
             partner_id: partner_id.clone(),
             uid: partner_uid.uid.clone(),
-            synced: partner_uid.synced,
             source_domain: partner.source_domain.clone(),
             openrtb_atype: partner.openrtb_atype,
         });
     }
 
-    resolved.sort_by(|a, b| {
-        b.synced
-            .cmp(&a.synced)
-            .then_with(|| a.partner_id.cmp(&b.partner_id))
-    });
+    resolved.sort_by(|a, b| a.partner_id.cmp(&b.partner_id));
     resolved
 }
 
@@ -89,7 +82,7 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
 ///
 /// Returns `(encoded_value, was_truncated)`. If the full set of EIDs exceeds
 /// [`MAX_EIDS_HEADER_BYTES`] after base64 encoding, partners are removed
-/// (least recently synced first) until it fits.
+/// from the end of the deterministic partner ordering until it fits.
 ///
 /// # Errors
 ///
@@ -177,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_partner_ids_uses_partner_id_as_tie_breaker_for_equal_timestamps() {
+    fn resolve_partner_ids_sorts_by_partner_id() {
         let partners = vec![
             make_test_partner("zeta", "zeta.example.com"),
             make_test_partner("alpha", "alpha.example.com"),
@@ -190,14 +183,12 @@ mod tests {
             "zeta".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-z".to_owned(),
-                synced: 42,
             },
         );
         entry.ids.insert(
             "alpha".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-a".to_owned(),
-                synced: 42,
             },
         );
 
@@ -210,7 +201,7 @@ mod tests {
         assert_eq!(
             partner_ids,
             vec!["alpha", "zeta"],
-            "should sort equal timestamps deterministically by partner ID"
+            "should sort deterministically by partner ID"
         );
     }
 
@@ -220,14 +211,12 @@ mod tests {
             ResolvedPartnerId {
                 partner_id: "liveramp".to_owned(),
                 uid: "LR_xyz".to_owned(),
-                synced: 100,
                 source_domain: "liveramp.com".to_owned(),
                 openrtb_atype: 3,
             },
             ResolvedPartnerId {
                 partner_id: "id5".to_owned(),
                 uid: "ID5_abc".to_owned(),
-                synced: 50,
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
             },
@@ -251,7 +240,6 @@ mod tests {
             resolved.push(ResolvedPartnerId {
                 partner_id: format!("partner_{idx}"),
                 uid: format!("uid_{}", "x".repeat(100)),
-                synced: idx as u64,
                 source_domain: format!("partner-{idx}.example.com"),
                 openrtb_atype: 3,
             });
@@ -272,7 +260,6 @@ mod tests {
         let resolved = vec![ResolvedPartnerId {
             partner_id: "ssp".to_owned(),
             uid: "u1".to_owned(),
-            synced: 100,
             source_domain: "ssp.com".to_owned(),
             openrtb_atype: 3,
         }];

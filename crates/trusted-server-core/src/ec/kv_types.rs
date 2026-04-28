@@ -16,10 +16,11 @@ use crate::geo::GeoInfo;
 /// Current schema version for KV entries.
 pub const SCHEMA_VERSION: u8 = 1;
 
-/// Maximum number of domains tracked in [`KvPubProperties::seen_domains`].
+/// Maximum number of legacy publisher-domain entries accepted in
+/// [`KvPubProperties::seen_domains`].
 ///
-/// When the cap is reached, additional newer domains are silently dropped and
-/// the earliest retained set remains unchanged.
+/// New entries seed this map with the creation domain only. Runtime organic
+/// requests no longer append domains or update visit counts.
 pub const MAX_SEEN_DOMAINS: usize = 50;
 
 /// Maximum allowed hostname length for publisher domains stored in KV.
@@ -40,15 +41,11 @@ pub struct KvEntry {
     pub v: u8,
     /// Unix timestamp (seconds) of initial entry creation.
     pub created: u64,
-    /// Unix timestamp (seconds) of last organic request.
-    /// Updated by [`super::kv::KvIdentityGraph::update_last_seen`] with
-    /// a 300-second debounce.
-    pub last_seen: u64,
     /// Consent state sub-object.
     pub consent: KvConsent,
     /// Geo location sub-object.
     pub geo: KvGeo,
-    /// Publisher domain history for consortium-level identity sharing.
+    /// Creation-time publisher property metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pub_properties: Option<KvPubProperties>,
     /// Device class signals (TLS fingerprint, UA platform).
@@ -58,7 +55,7 @@ pub struct KvEntry {
     /// Network cluster disambiguation data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<KvNetwork>,
-    /// Map of partner ID namespace → synced UID record.
+    /// Map of partner ID namespace → UID record.
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ids: BTreeMap<String, KvPartnerId>,
@@ -97,38 +94,34 @@ pub struct KvGeo {
     pub dma: Option<i64>,
 }
 
-/// A synced partner user ID within a KV entry.
+/// A partner user ID within a KV entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvPartnerId {
     /// The partner's user identifier.
     pub uid: String,
-    /// Unix timestamp (seconds) when this UID was written/updated.
-    pub synced: u64,
 }
 
-/// A single domain visit record within [`KvPubProperties::seen_domains`].
+/// A legacy domain visit record within [`KvPubProperties::seen_domains`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvDomainVisit {
-    /// Unix timestamp (seconds) of first visit to this domain.
-    pub first: u64,
-    /// Unix timestamp (seconds) of most recent visit to this domain.
-    pub last: u64,
-    /// Lifetime visit count for this domain.
+    /// Legacy visit count retained for schema compatibility.
     pub visits: u32,
 }
 
-/// Publisher domain history for consortium-level identity sharing.
+/// Publisher property metadata captured when an EC entry is created.
 ///
-/// Tracks which publisher properties a user has been seen on, keyed by apex
-/// domain. History only accumulates within a shared-passphrase group (same
-/// EC hash), so this does not enable cross-site tracking across unrelated
-/// publishers.
+/// Earlier schema versions treated `seen_domains` as mutable domain history.
+/// To avoid recurring organic-request KV writes, new entries now seed only the
+/// creation domain and runtime requests do not append domains or increment
+/// visits. The fields remain for compatibility with existing records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvPubProperties {
     /// Apex domain where this EC entry was first created.
     pub origin_domain: String,
-    /// Per-domain visit history, keyed by apex domain.
-    /// Updated on each organic request; capped at [`MAX_SEEN_DOMAINS`] entries.
+    /// Legacy per-domain visit map, keyed by apex domain.
+    ///
+    /// New entries include the creation domain only; runtime requests do not
+    /// update this map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen_domains: BTreeMap<String, KvDomainVisit>,
 }
@@ -173,18 +166,15 @@ pub struct KvDevice {
 /// count indicates a shared network (corporate VPN, campus); a low count
 /// indicates an individual or household.
 ///
-/// Written only by the `/_ts/api/v1/identify` endpoint — the prefix-match list API
-/// call required to compute `cluster_size` is too expensive for the
-/// organic proxy hot path.
+/// Written only by the `/_ts/api/v1/identify` endpoint when `cluster_size` is
+/// missing. Once stored, the value is reused because the EC entry no longer
+/// stores a cluster-check timestamp.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvNetwork {
     /// Number of distinct EC suffixes matching this hash prefix.
     /// `None` = not yet evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_size: Option<u32>,
-    /// Unix timestamp (seconds) of last cluster check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cluster_checked: Option<u64>,
 }
 
 /// Compact metadata stored alongside the KV entry body.
@@ -264,14 +254,7 @@ impl KvEntry {
     pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
         let pub_properties = validated_stored_domain(domain).map(|validated_domain| {
             let mut seen_domains = BTreeMap::new();
-            seen_domains.insert(
-                validated_domain.clone(),
-                KvDomainVisit {
-                    first: now,
-                    last: now,
-                    visits: 1,
-                },
-            );
+            seen_domains.insert(validated_domain.clone(), KvDomainVisit { visits: 1 });
 
             KvPubProperties {
                 origin_domain: validated_domain,
@@ -282,7 +265,6 @@ impl KvEntry {
         Self {
             v: SCHEMA_VERSION,
             created: now,
-            last_seen: now,
             consent: KvConsent {
                 tcf: consent.raw_tc_string.clone(),
                 gpp: consent.raw_gpp_string.clone(),
@@ -303,24 +285,22 @@ impl KvEntry {
     /// root KV entry is missing (e.g. the initial best-effort
     /// `create_or_revive` failed on EC generation).
     #[must_use]
-    pub fn minimal(partner_id: &str, uid: &str, synced: u64) -> Self {
+    pub fn minimal(partner_id: &str, uid: &str, now: u64) -> Self {
         let mut ids = BTreeMap::new();
         ids.insert(
             partner_id.to_owned(),
             KvPartnerId {
                 uid: uid.to_owned(),
-                synced,
             },
         );
         Self {
             v: SCHEMA_VERSION,
-            created: synced,
-            last_seen: synced,
+            created: now,
             consent: KvConsent {
                 tcf: None,
                 gpp: None,
                 ok: true,
-                updated: synced,
+                updated: now,
             },
             geo: KvGeo {
                 country: "ZZ".to_owned(),
@@ -348,7 +328,6 @@ impl KvEntry {
         Self {
             v: SCHEMA_VERSION,
             created: now,
-            last_seen: now,
             consent: KvConsent {
                 tcf: None,
                 gpp: None,
@@ -496,7 +475,6 @@ mod tests {
             "liveramp".to_owned(),
             KvPartnerId {
                 uid: "LR_xyz".to_owned(),
-                synced: 1741890000,
             },
         );
 
@@ -519,6 +497,76 @@ mod tests {
         assert_eq!(
             deserialized.ids.get("liveramp").map(|p| p.uid.as_str()),
             Some("LR_xyz"),
+        );
+        assert!(
+            !json.contains("last_seen")
+                && !json.contains("synced")
+                && !json.contains("first")
+                && !json.contains("last")
+                && !json.contains("cluster_checked"),
+            "serialized entry should omit removed timestamp fields: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_timestamp_fields_deserialize_and_are_omitted_on_reserialize() {
+        let json = r#"{
+            "v": 1,
+            "created": 1000,
+            "last_seen": 1200,
+            "consent": { "ok": true, "updated": 1000 },
+            "geo": { "country": "US" },
+            "ids": {
+                "liveramp": { "uid": "abc", "synced": 1100 }
+            },
+            "pub_properties": {
+                "origin_domain": "example.com",
+                "seen_domains": {
+                    "example.com": { "first": 1000, "last": 1200, "visits": 3 }
+                }
+            },
+            "network": {
+                "cluster_size": 5,
+                "cluster_checked": 1200
+            }
+        }"#;
+
+        let entry: KvEntry = serde_json::from_str(json)
+            .expect("should deserialize legacy entry with removed timestamp fields");
+
+        assert_eq!(entry.created, 1000);
+        assert_eq!(entry.consent.updated, 1000);
+        assert_eq!(
+            entry
+                .ids
+                .get("liveramp")
+                .map(|partner| partner.uid.as_str()),
+            Some("abc")
+        );
+        assert_eq!(
+            entry
+                .pub_properties
+                .as_ref()
+                .and_then(|props| props.seen_domains.get("example.com"))
+                .map(|visit| visit.visits),
+            Some(3)
+        );
+        assert_eq!(
+            entry
+                .network
+                .as_ref()
+                .and_then(|network| network.cluster_size),
+            Some(5)
+        );
+
+        let reserialized = serde_json::to_string(&entry).expect("should reserialize entry");
+        assert!(
+            !reserialized.contains("last_seen")
+                && !reserialized.contains("synced")
+                && !reserialized.contains("first")
+                && !reserialized.contains("last")
+                && !reserialized.contains("cluster_checked"),
+            "reserialized entry should omit removed timestamp fields: {reserialized}"
         );
     }
 
@@ -597,7 +645,6 @@ mod tests {
 
         assert_eq!(entry.v, SCHEMA_VERSION);
         assert_eq!(entry.created, 1000);
-        assert_eq!(entry.last_seen, 1000);
         assert!(entry.consent.ok, "should be a live entry");
         assert_eq!(entry.consent.updated, 1000);
         assert_eq!(entry.geo.country, "US");
@@ -613,8 +660,6 @@ mod tests {
             .seen_domains
             .get("example.com")
             .expect("should have origin domain visit");
-        assert_eq!(visit.first, 1000);
-        assert_eq!(visit.last, 1000);
         assert_eq!(visit.visits, 1);
     }
 
@@ -675,7 +720,6 @@ mod tests {
             "ssp_x".to_owned(),
             KvPartnerId {
                 uid: "x".repeat(MAX_UID_LENGTH + 1),
-                synced: 1000,
             },
         );
 
@@ -701,11 +745,7 @@ mod tests {
         for idx in 0..MAX_SEEN_DOMAINS {
             pub_properties.seen_domains.insert(
                 format!("extra-{idx}.example.com"),
-                KvDomainVisit {
-                    first: 1000,
-                    last: 1000,
-                    visits: 1,
-                },
+                KvDomainVisit { visits: 1 },
             );
         }
 
@@ -728,22 +768,12 @@ mod tests {
             .as_mut()
             .expect("should initialize pub_properties");
 
-        pub_properties.seen_domains.insert(
-            "z.example.com".to_owned(),
-            KvDomainVisit {
-                first: 1000,
-                last: 1000,
-                visits: 1,
-            },
-        );
-        pub_properties.seen_domains.insert(
-            "a.example.com".to_owned(),
-            KvDomainVisit {
-                first: 1000,
-                last: 1000,
-                visits: 1,
-            },
-        );
+        pub_properties
+            .seen_domains
+            .insert("z.example.com".to_owned(), KvDomainVisit { visits: 1 });
+        pub_properties
+            .seen_domains
+            .insert("a.example.com".to_owned(), KvDomainVisit { visits: 1 });
 
         let json = serde_json::to_string(&entry).expect("should serialize KV entry");
         let a_index = json
@@ -792,7 +822,6 @@ mod tests {
         assert_eq!(entry.ids.len(), 1);
         let partner = entry.ids.get("ssp_x").expect("should have ssp_x entry");
         assert_eq!(partner.uid, "abc123");
-        assert_eq!(partner.synced, 1741824000);
     }
 
     #[test]
@@ -913,8 +942,6 @@ mod tests {
             .seen_domains
             .get("autoblog.com")
             .expect("should have origin visit");
-        assert_eq!(visit.first, 1000);
-        assert_eq!(visit.last, 1000);
         assert_eq!(visit.visits, 1);
     }
 
@@ -949,16 +976,10 @@ mod tests {
 
     #[test]
     fn domain_visit_roundtrip() {
-        let visit = KvDomainVisit {
-            first: 1000,
-            last: 2000,
-            visits: 5,
-        };
+        let visit = KvDomainVisit { visits: 5 };
         let json = serde_json::to_string(&visit).expect("should serialize");
         let deserialized: KvDomainVisit = serde_json::from_str(&json).expect("should deserialize");
 
-        assert_eq!(deserialized.first, 1000);
-        assert_eq!(deserialized.last, 2000);
         assert_eq!(deserialized.visits, 5);
     }
 
@@ -966,30 +987,21 @@ mod tests {
     fn network_roundtrip() {
         let network = KvNetwork {
             cluster_size: Some(3),
-            cluster_checked: Some(1774921179),
         };
         let json = serde_json::to_string(&network).expect("should serialize KvNetwork");
         let deserialized: KvNetwork =
             serde_json::from_str(&json).expect("should deserialize KvNetwork");
 
         assert_eq!(deserialized.cluster_size, Some(3));
-        assert_eq!(deserialized.cluster_checked, Some(1774921179));
     }
 
     #[test]
     fn network_none_fields_omitted_from_json() {
-        let network = KvNetwork {
-            cluster_size: None,
-            cluster_checked: None,
-        };
+        let network = KvNetwork { cluster_size: None };
         let json = serde_json::to_string(&network).expect("should serialize");
         assert!(
             !json.contains("\"cluster_size\""),
             "None cluster_size should be omitted, got: {json}"
-        );
-        assert!(
-            !json.contains("\"cluster_checked\""),
-            "None cluster_checked should be omitted, got: {json}"
         );
     }
 
@@ -1029,7 +1041,6 @@ mod tests {
         let mut entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
         entry.network = Some(KvNetwork {
             cluster_size: Some(5),
-            cluster_checked: Some(1000),
         });
 
         let meta = KvMetadata::from_entry(&entry);

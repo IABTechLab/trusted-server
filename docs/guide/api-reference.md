@@ -50,61 +50,15 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 ## Edge Cookie Endpoints
 
-### POST /\_ts/admin/v1/partners/register
-
-Registers or updates a partner used for EC sync and bidstream enrichment.
-
-**Auth:** Basic auth (admin credentials)
-
-**Request Body:**
-
-```json
-{
-  "id": "mocktioneer",
-  "name": "Mocktioneer SSP",
-  "api_key": "partner-secret-key",
-  "allowed_return_domains": ["formally-vital-lion.edgecompute.app"],
-  "source_domain": "formally-vital-lion.edgecompute.app",
-  "bidstream_enabled": true
-}
-```
-
-**Response:**
-
-- `201 Created` when newly created
-- `200 OK` when existing partner is updated
-
----
-
-### GET /\_ts/api/v1/sync
-
-Browser pixel sync endpoint. Associates an EC ID with a partner UID.
-
-**Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `partner` | string | Yes | Registered partner id |
-| `uid` | string | Yes | Partner's user id |
-| `return` | string (URL) | Yes | Redirect URL after sync |
-
-**Request Requirements:**
-
-- `ts-ec` cookie present
-- valid consent signal (`euconsent-v2`) for consent-required jurisdictions
-
-**Response:**
-
-- `302 Found` redirect
-- Success: `Location: <return>?ts_synced=1`
-- Failure: `Location: <return>?ts_synced=0&ts_reason=<reason>`
-
-Common `ts_reason` values: `no_ec`, `no_consent`, `write_failed`, `rate_limited`.
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through Prebid EID cookies.
 
 ---
 
 ### GET /\_ts/api/v1/identify
 
-Returns EC identity plus resolved partner IDs and EIDs for the current user.
+Returns EC identity plus the authenticated partner's UID and EID for the current user.
+
+**Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
 
 **Request:**
 
@@ -117,15 +71,12 @@ Returns EC identity plus resolved partner IDs and EIDs for the current user.
   "ec": "954d...e0c3.nZ1GxL",
   "consent": "ok",
   "degraded": false,
-  "uids": {
-    "mocktioneer": "mock-user-123"
-  },
-  "eids": [
-    {
-      "source": "formally-vital-lion.edgecompute.app",
-      "uids": [{ "id": "mock-user-123", "atype": 3 }]
-    }
-  ]
+  "partner_id": "mocktioneer",
+  "uid": "mock-user-123",
+  "eid": {
+    "source": "formally-vital-lion.edgecompute.app",
+    "uids": [{ "id": "mock-user-123", "atype": 3 }]
+  }
 }
 ```
 
@@ -133,7 +84,7 @@ Returns EC identity plus resolved partner IDs and EIDs for the current user.
 
 ### POST /\_ts/api/v1/batch-sync
 
-Server-to-server batch sync endpoint for writing EC ID to partner UID mappings.
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps. Valid mappings use idempotent last-write-wins semantics.
 
 **Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
 

@@ -3,6 +3,10 @@
 //! Launches partner pull-sync requests for organic traffic after the client
 //! response has been sent. Dispatch is best-effort and never affects client
 //! response status.
+//!
+//! Pull sync currently fills missing partner UIDs only. Once a partner UID is
+//! present in the EC identity entry, it is not periodically refreshed because
+//! the entry no longer stores per-partner sync timestamps.
 
 use fastly::http::request::PendingRequest;
 use fastly::http::{Method, StatusCode};
@@ -113,7 +117,7 @@ pub fn dispatch_pull_sync(
     let mut in_flight: Vec<InFlightPull> = Vec::new();
 
     for partner in pull_partners {
-        if !is_partner_pull_eligible(partner, kv_entry.as_ref(), now) {
+        if !is_partner_pull_eligible(partner, kv_entry.as_ref()) {
             continue;
         }
 
@@ -189,16 +193,10 @@ pub fn dispatch_pull_sync(
     drain_pull_batch(kv, context.ec_id(), &mut in_flight);
 }
 
-fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>, now: u64) -> bool {
-    let Some(entry) = kv_entry else {
-        return true;
-    };
-
-    let Some(existing) = entry.ids.get(&partner.id) else {
-        return true;
-    };
-
-    now.saturating_sub(existing.synced) >= partner.pull_sync_ttl_sec
+fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
+    kv_entry
+        .and_then(|entry| entry.ids.get(&partner.id))
+        .is_none()
 }
 
 fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
@@ -274,7 +272,7 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
             continue;
         };
 
-        if let Err(err) = kv.upsert_partner_id(ec_id, &partner_id, &uid, current_timestamp()) {
+        if let Err(err) = kv.upsert_partner_id(ec_id, &partner_id, &uid) {
             log::warn!(
                 "Pull sync: failed to upsert partner '{}' for ec_id '{}': {err:?}",
                 partner_id,
@@ -418,19 +416,19 @@ mod tests {
         let entry = KvEntry::minimal("other_partner", "uid-1", 100);
 
         assert!(
-            is_partner_pull_eligible(&partner, Some(&entry), 200),
-            "should dispatch when partner has no stored sync"
+            is_partner_pull_eligible(&partner, Some(&entry)),
+            "should dispatch when partner has no stored UID"
         );
     }
 
     #[test]
-    fn partner_is_not_eligible_when_not_stale() {
+    fn partner_is_not_eligible_when_already_present() {
         let partner = pull_partner(3600);
         let entry = KvEntry::minimal("ssp_x", "uid-1", 1000);
 
         assert!(
-            !is_partner_pull_eligible(&partner, Some(&entry), 1500),
-            "should skip dispatch when sync is fresher than ttl"
+            !is_partner_pull_eligible(&partner, Some(&entry)),
+            "should skip dispatch when partner already has a stored UID"
         );
     }
 

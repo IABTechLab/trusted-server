@@ -5,6 +5,12 @@
 //! with the partner's user ID. Mappings are individually validated and
 //! written to the KV identity graph, with per-mapping rejection reasons
 //! reported in the response.
+//!
+//! Mapping timestamps are retained in the request schema for client
+//! compatibility, but the EC identity graph no longer stores per-partner sync
+//! timestamps. Valid mappings therefore use idempotent last-write-wins
+//! semantics: unchanged UIDs are accepted without a write; different UIDs
+//! replace the stored value regardless of timestamp.
 
 use error_stack::{Report, ResultExt};
 use fastly::http::StatusCode;
@@ -36,7 +42,6 @@ trait BatchSyncWriter {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
-        synced: u64,
     ) -> Result<UpsertResult, Report<TrustedServerError>>;
 }
 
@@ -46,9 +51,8 @@ impl BatchSyncWriter for KvIdentityGraph {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
-        synced: u64,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
-        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid, synced)
+        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid)
     }
 }
 
@@ -65,6 +69,8 @@ struct BatchSyncRequest {
 struct SyncMapping {
     ec_id: String,
     partner_uid: String,
+    // Retained for API compatibility. The EC KV body no longer stores
+    // per-partner timestamps, so this does not order writes.
     timestamp: u64,
 }
 
@@ -182,13 +188,9 @@ fn process_mappings(
             });
             continue;
         }
-        match writer.upsert_partner_id_if_exists(
-            &ec_id,
-            partner_id,
-            &mapping.partner_uid,
-            mapping.timestamp,
-        ) {
-            Ok(UpsertResult::Written | UpsertResult::Stale) => {
+        let _timestamp = mapping.timestamp;
+        match writer.upsert_partner_id_if_exists(&ec_id, partner_id, &mapping.partner_uid) {
+            Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += 1;
             }
             Ok(UpsertResult::NotFound | UpsertResult::ConsentWithdrawn) => {
@@ -297,7 +299,6 @@ mod tests {
             _ec_id: &str,
             _partner_id: &str,
             _uid: &str,
-            _synced: u64,
         ) -> Result<UpsertResult, Report<TrustedServerError>> {
             self.results
                 .borrow_mut()
@@ -445,20 +446,35 @@ mod tests {
     }
 
     #[test]
-    fn process_mappings_counts_stale_as_accepted() {
-        let writer = MockWriter::new(vec![Ok(UpsertResult::Stale)]);
+    fn process_mappings_counts_unchanged_as_accepted() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100)];
 
         let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
 
-        assert_eq!(
-            accepted, 1,
-            "should count Stale as accepted (data already fresh)"
-        );
+        assert_eq!(accepted, 1, "should count unchanged mappings as accepted");
         assert!(
             errors.is_empty(),
-            "should report no errors for stale writes"
+            "should report no errors for unchanged mappings"
         );
+    }
+
+    #[test]
+    fn process_mappings_does_not_order_by_timestamp() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mappings = vec![
+            mapping(&ec_id, "uid-new", 200),
+            mapping(&ec_id, "uid-old", 100),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(
+            accepted, 2,
+            "timestamps are compatibility fields and should not reject older mappings"
+        );
+        assert!(errors.is_empty(), "should accept valid mappings");
     }
 }

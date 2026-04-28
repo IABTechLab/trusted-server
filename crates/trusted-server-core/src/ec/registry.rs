@@ -37,7 +37,10 @@ pub struct PartnerConfig {
     pub pull_sync_url: Option<String>,
     /// Allowlist of domains TS may call for this partner's pull sync.
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Seconds between pull sync refreshes.
+    /// Legacy seconds between pull sync refreshes retained for config compatibility.
+    ///
+    /// Pull sync currently fills missing partner UIDs only, so this value is
+    /// not used to refresh existing UIDs.
     pub pull_sync_ttl_sec: u64,
     /// Max pull sync calls per EC hash per partner per hour.
     pub pull_sync_rate_limit: u32,

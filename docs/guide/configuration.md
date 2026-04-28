@@ -270,11 +270,14 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 
 ### `[ec]`
 
-| Field           | Type           | Required | Description                                                     |
-| --------------- | -------------- | -------- | --------------------------------------------------------------- |
-| `passphrase`    | String         | Yes      | Publisher passphrase used as HMAC key                           |
-| `ec_store`      | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state |
-| `partner_store` | String or null | No       | Fastly KV store name for partner registry                       |
+| Field                     | Type           | Required | Description                                                             |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
+| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `partners`                | Array          | No       | Static partner registry entries                                         |
 
 **Example**:
 
@@ -282,7 +285,13 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 [ec]
 passphrase = "your-secure-hmac-secret"
 ec_store = "ec_identity_store"
-partner_store = "ec_partner_store"
+
+[[ec.partners]]
+id = "mocktioneer"
+name = "Mocktioneer SSP"
+source_domain = "mocktioneer.example"
+api_token = "partner-api-token"
+bidstream_enabled = true
 ```
 
 **Environment Override**:
@@ -290,7 +299,6 @@ partner_store = "ec_partner_store"
 ```bash
 TRUSTED_SERVER__EC__PASSPHRASE=your-secret
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
-TRUSTED_SERVER__EC__PARTNER_STORE=ec_partner_store
 ```
 
 ### Field Details
