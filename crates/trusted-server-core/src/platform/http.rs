@@ -230,4 +230,20 @@ pub trait PlatformHttpClient: Send + Sync {
         &self,
         pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>>;
+
+    /// Wait for a single in-flight request to complete.
+    ///
+    /// This is a convenience wrapper around [`select`](Self::select) for the
+    /// common case where only one request is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PlatformError::HttpClient` if the underlying `select` fails or
+    /// the response itself contains an error.
+    async fn wait(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.select(vec![pending]).await?.ready
+    }
 }

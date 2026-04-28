@@ -12,8 +12,8 @@ Viceroy is the local test runtime for Fastly Compute applications. It simulates 
 # Install viceroy
 cargo install viceroy
 
-# Run WASM crate tests (viceroy is invoked automatically)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+# Run Fastly/WASM crate tests (viceroy is invoked automatically via .cargo/config.toml runner)
+cargo test-fastly
 ```
 
 ### Axum adapter tests
@@ -21,7 +21,7 @@ cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-was
 The Axum adapter runs as a native binary — no Viceroy or WASM toolchain needed:
 
 ```bash
-cargo test -p trusted-server-adapter-axum
+cargo test-axum
 ```
 
 ### Test Organization
@@ -29,23 +29,23 @@ cargo test -p trusted-server-adapter-axum
 Tests are organized alongside source code in `#[cfg(test)]` modules:
 
 ```rust
-// crates/trusted-server-core/src/synthetic.rs
+// crates/trusted-server-core/src/edge_cookie.rs
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_synthetic_id() {
+    fn test_generate_ec_id() {
         let settings = create_test_settings();
         let req = create_test_request(vec![
             (header::USER_AGENT, "Mozilla/5.0"),
             (header::COOKIE, "pub_userid=12345"),
         ]);
 
-        let synthetic_id = generate_synthetic_id(&settings, &req)
-            .expect("should generate synthetic ID");
+        let ec_id = generate_ec_id(&settings, &req)
+            .expect("should generate EC ID");
 
-        assert!(!synthetic_id.is_empty());
+        assert!(!ec_id.is_empty());
     }
 }
 ```
@@ -55,17 +55,20 @@ mod tests {
 ### Unit Tests
 
 ```bash
-# Run all WASM crate tests (requires Viceroy)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+# Run Fastly/WASM crate tests (requires Viceroy)
+cargo test-fastly
 
-# Run Axum adapter tests (native, no Viceroy needed)
-cargo test -p trusted-server-adapter-axum
+# Run Axum adapter tests (native)
+cargo test-axum
+
+# Run specific test by name
+cargo test test_generate_ec_id
 
 # Run tests for a specific crate
 cargo test -p trusted-server-core
 
 # Run tests matching a pattern
-cargo test synthetic
+cargo test ec
 
 # Show test output
 cargo test -- --nocapture
@@ -108,42 +111,42 @@ curl http://localhost:7676/.well-known/trusted-server.json
 
 ## Real Test Examples
 
-### Synthetic ID Tests
+### EC ID Tests
 
-From `crates/trusted-server-core/src/synthetic.rs`:
+From `crates/trusted-server-core/src/edge_cookie.rs`:
 
 ```rust
 #[test]
-fn test_get_synthetic_id_with_header() {
+fn test_get_ec_id_with_header() {
     let settings = create_test_settings();
     let req = create_test_request(vec![(
-        HEADER_X_SYNTHETIC_ID,
-        "existing_synthetic_id",
+        HEADER_X_TS_EC,
+        "existing_ec_id",
     )]);
 
-    let synthetic_id = get_synthetic_id(&req)
-        .expect("should get synthetic ID");
-    assert_eq!(synthetic_id, Some("existing_synthetic_id".to_string()));
+    let ec_id = get_ec_id(&req)
+        .expect("should get EC ID");
+    assert_eq!(ec_id, Some("existing_ec_id".to_string()));
 }
 
 #[test]
-fn test_get_synthetic_id_with_cookie() {
+fn test_get_ec_id_with_cookie() {
     let settings = create_test_settings();
     let req = create_test_request(vec![
-        (header::COOKIE, "synthetic_id=existing_cookie_id")
+        (header::COOKIE, "ts-ec=existing_cookie_id")
     ]);
 
-    let synthetic_id = get_synthetic_id(&req)
-        .expect("should get synthetic ID");
-    assert_eq!(synthetic_id, Some("existing_cookie_id".to_string()));
+    let ec_id = get_ec_id(&req)
+        .expect("should get EC ID");
+    assert_eq!(ec_id, Some("existing_cookie_id".to_string()));
 }
 
 #[test]
-fn test_get_synthetic_id_none() {
+fn test_get_ec_id_none() {
     let req = create_test_request(vec![]);
-    let synthetic_id = get_synthetic_id(&req)
+    let ec_id = get_ec_id(&req)
         .expect("should handle missing ID");
-    assert!(synthetic_id.is_none());
+    assert!(ec_id.is_none());
 }
 ```
 
@@ -209,7 +212,7 @@ fn proxy_request_config_supports_streaming_and_headers() {
 
     assert_eq!(cfg.target_url, "https://example.com/asset");
     assert!(cfg.follow_redirects, "should follow redirects by default");
-    assert!(cfg.forward_synthetic_id, "should forward synthetic id by default");
+    assert!(cfg.forward_ec_id, "should forward EC ID by default");
 }
 
 #[test]
@@ -294,9 +297,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-action@stable
       - name: Run tests
-        run: cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+        run: cargo test-fastly
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1 -- -D warnings
 
   test-axum: # Axum native adapter — no Viceroy needed
     runs-on: ubuntu-latest
@@ -305,7 +308,7 @@ jobs:
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
       - name: Run Axum adapter tests
-        run: cargo test -p trusted-server-adapter-axum
+        run: cargo test-axum
 ```
 
 ## Debugging Tests
@@ -348,7 +351,7 @@ k6 run load-test.js
 ## Best Practices
 
 1. **Test all new features** - Write tests alongside new code
-2. **Use descriptive names** - `test_synthetic_id_generation_with_consent`
+2. **Use descriptive names** - `test_ec_id_generation_with_consent`
 3. **Test edge cases** - Empty inputs, missing headers, invalid data
 4. **Keep tests fast** - Mock external dependencies
 5. **Use test helpers** - `create_test_settings()`, `create_test_request()`

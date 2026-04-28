@@ -11,7 +11,7 @@ implementation details.
 
 This is a Rust workspace with three crates:
 
-- `crates/trusted-server-core/` — core library (integrations, HTML processing, synthetic IDs, GDPR)
+- `crates/trusted-server-core/` — core library (integrations, HTML processing, Edge Cookies, GDPR)
 - `crates/trusted-server-adapter-fastly/` — Fastly Compute entry point
 - `crates/js/` — TypeScript/JS build pipeline (per-integration IIFE bundles)
 

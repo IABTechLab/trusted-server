@@ -3,22 +3,22 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, header};
+use edgezero_core::http::{HeaderValue, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+};
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
@@ -56,11 +56,40 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-request RuntimeServices
+// Publisher response helper
 // ---------------------------------------------------------------------------
 
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
+/// Collapse a [`PublisherResponse`] into a plain [`Response`].
+///
+/// Mirrors the Fastly adapter's `resolve_publisher_response`: buffers streaming
+/// and pass-through variants in memory (acceptable for a dev server) so the
+/// Axum handler can return a single `Response`.
+fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    registry: &IntegrationRegistry,
+) -> Result<Response, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, registry)?;
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                edgezero_core::http::HeaderValue::from(output.len() as u64),
+            );
+            *response.body_mut() = edgezero_core::body::Body::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +134,9 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     };
 
     RouterService::builder()
+        .middleware(FinalizeResponseMiddleware::new(Arc::new(
+            Settings::default(),
+        )))
         .get("/", make(Arc::clone(&message)))
         .post("/", make(Arc::clone(&message)))
         .get("/{*rest}", make(Arc::clone(&message)))
@@ -138,7 +170,7 @@ impl Hooks for TrustedServerApp {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -150,46 +182,43 @@ impl Hooks for TrustedServerApp {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
-        // /admin/keys/rotate
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_rotate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
+        // /admin/keys/rotate and /admin/keys/deactivate
+        //
+        // Config/secret-store writes are not supported on the Axum dev server
+        // (backed by read-only env vars). Exposing these routes and returning 500
+        // on the first store write is misleading, so we explicitly return 501.
+        let admin_not_supported = |_ctx: RequestContext| async {
+            let body = edgezero_core::body::Body::from(
+                "Admin key management is not supported on the Axum dev server.\n\
+                 Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+            );
+            let mut resp = Response::new(body);
+            *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            Ok::<Response, EdgeError>(resp)
         };
-
-        // /admin/keys/deactivate
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_deactivate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+        let rotate_handler = admin_not_supported;
+        let deactivate_handler = admin_not_supported;
 
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(
-                    handle_auction(&s.settings, &s.orchestrator, &services, None, req)
+                    handle_auction(&s.settings, &s.orchestrator, &services, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )
@@ -201,7 +230,7 @@ impl Hooks for TrustedServerApp {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -214,7 +243,7 @@ impl Hooks for TrustedServerApp {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -227,7 +256,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_get_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -240,7 +269,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_post_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -253,7 +282,7 @@ impl Hooks for TrustedServerApp {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -268,7 +297,7 @@ impl Hooks for TrustedServerApp {
         let get_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();
@@ -285,7 +314,9 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
+                    handle_publisher_request(&s.settings, &s.registry, &services, req)
+                        .await
+                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -297,7 +328,7 @@ impl Hooks for TrustedServerApp {
         let post_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();
@@ -312,7 +343,9 @@ impl Hooks for TrustedServerApp {
                             }))
                         })
                 } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, None, req).await
+                    handle_publisher_request(&s.settings, &s.registry, &services, req)
+                        .await
+                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
                 };
 
                 Ok(result.unwrap_or_else(|e| http_error(&e)))

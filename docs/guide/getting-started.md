@@ -49,15 +49,35 @@ The server will be available at `http://localhost:7676`.
 
 No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
 
+The Axum adapter reads configuration from environment variables — it does **not**
+auto-load `.env` files. You must export the variables into your shell before starting
+the server.
+
 ```bash
 # Copy and edit the environment file
 cp .env.dev .env
+
+# Export the variables into your current shell session
+set -a && source .env && set +a
 
 # Build and start the dev server
 cargo run -p trusted-server-adapter-axum
 ```
 
 The server will be available at `http://localhost:8787`.
+
+**Environment variable conventions used by the Axum adapter:**
+
+| Purpose | Pattern | Example |
+|---------|---------|---------|
+| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…` |
+| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123` |
+
+Store names and key names are uppercased with hyphens and dots replaced by underscores.
+
+> **Dev server limitations:** The Axum adapter does not support KV store,
+> geo lookup, config/secret-store writes, or admin key-management routes.
+> See [Architecture](/guide/architecture) for the full list.
 
 ### Build the Project
 
@@ -69,10 +89,10 @@ cargo build
 
 ```bash
 # Fastly/WASM crates (requires Viceroy)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+cargo test-fastly
 
 # Axum native adapter
-cargo test -p trusted-server-adapter-axum
+cargo test-axum
 ```
 
 ## Configuration
@@ -81,7 +101,7 @@ Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
 - KV store mappings
-- Synthetic ID templates
+- EC configuration
 - GDPR settings
 
 See [Configuration](/guide/configuration) for details.
@@ -94,6 +114,6 @@ fastly compute publish
 
 ## Next Steps
 
-- Learn about [Synthetic IDs](/guide/synthetic-ids)
+- Learn about [Edge Cookies](/guide/edge-cookies)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

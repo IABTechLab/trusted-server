@@ -14,7 +14,7 @@ flowchart TD
   subgraph edge["Trusted Server"]
     direction TB
     gdpr["GDPR Check"]
-    ids["Synthetic IDs"]
+    ids["EC IDs"]
     ads["Ad Serving"]
     gdpr --> ids --> ads
   end
@@ -29,7 +29,7 @@ flowchart TD
 
 Core library containing shared functionality:
 
-- Synthetic ID generation
+- Edge Cookie (EC) ID generation
 - Cookie handling
 - HTTP abstractions
 - GDPR consent management
@@ -45,12 +45,21 @@ Fastly Compute adapter (WASM binary, `wasm32-wasip1` target):
 
 ### trusted-server-adapter-axum
 
-Native Axum dev server adapter (native binary):
+Native Axum dev/test adapter (native binary):
 
-- Runs the full trusted-server pipeline locally without Fastly or Viceroy
+- Local development and integration-test adapter — not a production-equivalent runtime
 - Platform implementations backed by environment variables instead of Fastly stores
-- Useful for rapid local development, integration testing, and non-Fastly deployments
 - Listens on `http://localhost:8787` by default
+
+**Current limitations compared to the Fastly adapter:**
+
+| Feature | Axum dev server |
+|---------|----------------|
+| KV store | Unavailable — synthetic-ID and consent routes degrade gracefully |
+| Geo lookup | Always returns `None` |
+| Config/secret-store writes | Return an error (read-only via env vars) |
+| Admin key management (`/admin/keys/*`) | Returns 501 Not Implemented |
+| Auction fan-out ordering | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
 
 ## Design Patterns
 
@@ -79,7 +88,7 @@ All tracking operations require explicit GDPR consent checks before execution.
 
 1. **Request Ingress** - Request arrives at Fastly edge
 2. **Consent Validation** - GDPR consent checked
-3. **ID Generation** - Synthetic ID generated (if consented)
+3. **ID Generation** - EC ID generated (if consented)
 4. **Ad Request** - Backend ad server called
 5. **Response Processing** - Creative processed and modified
 6. **Response Egress** - Response sent to browser
@@ -93,7 +102,7 @@ Used for:
 - Counter storage
 - Domain mappings
 - Configuration cache
-- Synthetic ID state
+- EC ID state
 
 ### No User Data Persistence
 
@@ -118,7 +127,7 @@ User data is not persisted in storage - only processed in-flight at the edge.
 | Adapter                         | Target          | Use case                               |
 | ------------------------------- | --------------- | -------------------------------------- |
 | `trusted-server-adapter-fastly` | `wasm32-wasip1` | Production on Fastly Compute           |
-| `trusted-server-adapter-axum`   | native          | Local development, integration testing |
+| `trusted-server-adapter-axum`   | native          | Local development and integration testing (see limitations above) |
 
 The Fastly adapter compiles to WebAssembly for sandboxed, low-cold-start edge execution. The Axum adapter is a standard native binary — no WASM toolchain required for local development.
 

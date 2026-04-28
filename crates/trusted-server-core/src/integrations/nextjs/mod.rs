@@ -599,4 +599,128 @@ mod tests {
             final_html
         );
     }
+
+    /// Regression test: with a small chunk size, `lol_html` fragments the
+    /// `__NEXT_DATA__` text node across chunks. The rewriter must accumulate
+    /// fragments and produce correct output.
+    #[test]
+    fn small_chunk_next_data_rewrite_survives_fragmentation() {
+        // Build a __NEXT_DATA__ payload large enough to cross a 32-byte chunk boundary.
+        let html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"href":"https://origin.example.com/reviews","title":"Hello World"}}}</script></body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        // Use a very small chunk size to force fragmentation.
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 32,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process with small chunks");
+
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains("test.example.com") && processed.contains("/reviews"),
+            "should rewrite fragmented __NEXT_DATA__ href. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com/reviews"),
+            "should not contain original origin href. Got: {processed}"
+        );
+        assert!(
+            processed.contains("Hello World"),
+            "should preserve non-URL content. Got: {processed}"
+        );
+    }
+
+    /// Regression test: a fragmented `self.__next_f.push([1, "…"])` RSC script
+    /// must still have its origin URLs rewritten after going through the full
+    /// streaming pipeline into the accumulating post-processor. Exercises the
+    /// "fallback" branch of `NextJsHtmlPostProcessor` where no placeholders
+    /// were captured during streaming (because every fragment returned `Keep`
+    /// on `!is_last`) and `post_process_rsc_html_in_place_with_limit` has to
+    /// re-parse the accumulated HTML to find RSC push scripts.
+    #[test]
+    fn small_chunk_rsc_push_survives_fragmentation_via_post_processor_fallback() {
+        // Build an RSC push script whose payload contains multiple origin URLs.
+        // With chunk_size = 128, this script's text node will be fragmented at
+        // chunk boundaries by the streaming input, so NextJsRscPlaceholderRewriter
+        // will return Keep on every fragment and the post-processor fallback
+        // has to rewrite on the accumulated HTML.
+        let html = format!(
+            r#"<html><body><script>self.__next_f.push([1,"1:{{\"link\":\"https://origin.example.com/a\",\"img\":\"https://origin.example.com/img.png\",\"nested\":{{\"url\":\"https://origin.example.com/deep/path?q=1\",\"extra\":\"{}\"}}}}"])</script></body></html>"#,
+            "x".repeat(400), // pad to guarantee chunk-boundary fragmentation
+        );
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 128,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process fragmented RSC push");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            !processed.contains("origin.example.com"),
+            "no origin host should leak through post-processor fallback. Got: {processed}"
+        );
+        assert!(
+            processed.contains("test.example.com/a")
+                && processed.contains("test.example.com/img.png")
+                && processed.contains("test.example.com/deep/path?q=1"),
+            "all origin URLs must be rewritten to proxy host. Got: {processed}"
+        );
+        assert!(
+            !processed.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
+            "no placeholder should leak to output. Got: {processed}"
+        );
+        // Structural integrity: the push call envelope must still be present
+        // and the JS string literal must be properly terminated.
+        assert!(
+            processed.contains(r#"self.__next_f.push([1,""#),
+            "push call must survive. Got: {processed}"
+        );
+        assert!(
+            processed.contains(r#""])</script>"#),
+            "push call must close properly — `\"])` followed by </script>. Got: {processed}"
+        );
+    }
 }

@@ -24,7 +24,6 @@ derive_more = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
-handlebars = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
@@ -35,7 +34,6 @@ mime = { workspace = true }
 rand = { workspace = true }
 lol_html = { workspace = true }
 matchit = { workspace = true }
-pin-project-lite = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -79,6 +77,7 @@ default = []
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "consent_decode"

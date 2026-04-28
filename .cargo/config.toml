@@ -1,2 +1,21 @@
+# No global [build] target — the workspace contains adapters for multiple targets:
+#   trusted-server-adapter-fastly    → wasm32-wasip1         (Fastly Compute)
+#   trusted-server-adapter-axum      → native                (dev server)
+#   trusted-server-adapter-cloudflare → wasm32-unknown-unknown (Cloudflare Workers)
+#
+# All adapters are workspace members so `-p` resolves each.
+# default-members (core + fastly) are the primary targets.
+# Use the aliases below to target each adapter with the correct toolchain.
+
+[alias]
+# Fastly adapter + shared crates (wasm32-wasip1 via Viceroy)
+# Excludes Axum (native-only) and Cloudflare (wasm32-unknown-unknown, separate job)
+test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
+# Axum dev server adapter (native)
+test-axum = ["test", "-p", "trusted-server-adapter-axum"]
+# Cloudflare adapter (tested separately via cargo check/test -p)
+# CI convenience — runs both in sequence (shell aliases can't chain; use a script or CI steps)
+# cargo test-fastly && cargo test-axum
+
 [target.'cfg(all(target_arch = "wasm32"))']
 runner = "viceroy run -C ../../fastly.toml -- "
