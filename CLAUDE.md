@@ -375,6 +375,31 @@ both runtime behavior and build/tooling changes.
 
 ---
 
+## Engineering Spec Conventions
+
+Implementation specs live under `docs/superpowers/specs/`, split by lifecycle:
+
+- `docs/superpowers/specs/drafts/`: brainstorm output. The Superpowers brainstorming skill writes new specs here. Specs are not yet ready for documentation. Frontmatter: `status: draft`.
+- `docs/superpowers/specs/implemented/`: post-implementation truth. Specs are promoted here once code has shipped and the spec body has been updated to reflect what shipped. Frontmatter: `status: implemented`.
+
+**Required frontmatter** (every spec):
+
+```yaml
+---
+status: draft | in-progress | implemented
+implemented_in: PR#123    # optional, set on promotion
+last_reviewed: 2026-04-15  # optional, YYYY-MM-DD
+---
+```
+
+**For agents writing new specs:** when invoked from this project, the brainstorming skill must write to `docs/superpowers/specs/drafts/`, not the parent directory. Add `status: draft` frontmatter at write time.
+
+**For agents generating user-facing docs:** the `generate-feature-docs` skill operates only on specs under `implemented/` with `status: implemented`. See `.claude/skills/generate-feature-docs/SKILL.md`.
+
+Promoting a spec from draft to implemented is a `git mv` plus a frontmatter edit, ideally landed in the same PR that updates the spec body to match shipped code.
+
+---
+
 ## What NOT to Do
 
 - Do not add unnecessary dependencies without justification.
