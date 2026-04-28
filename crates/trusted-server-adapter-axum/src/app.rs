@@ -217,11 +217,9 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
-                Ok(
-                    handle_auction(&s.settings, &s.orchestrator, &services, req)
-                        .await
-                        .unwrap_or_else(|e| http_error(&e)),
-                )
+                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
+                    .await
+                    .unwrap_or_else(|e| http_error(&e)))
             }
         };
 

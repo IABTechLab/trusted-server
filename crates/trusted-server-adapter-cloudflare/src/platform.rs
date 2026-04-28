@@ -65,7 +65,11 @@ impl PlatformBackend for NoopBackend {
             .port
             .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
         let timeout_ms = spec.first_byte_timeout.as_millis();
-        let cert_suffix = if spec.certificate_check { "" } else { "_nocert" };
+        let cert_suffix = if spec.certificate_check {
+            ""
+        } else {
+            "_nocert"
+        };
         Ok(format!(
             "{}_{}_{}_{timeout_ms}ms{cert_suffix}",
             spec.scheme, spec.host, port
