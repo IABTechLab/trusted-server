@@ -38,6 +38,7 @@ export default withMermaid(
     description:
       'Privacy-preserving edge computing for ad serving and edge cookie (EC) generation',
     base: '/trusted-server',
+    srcExclude: ['superpowers/**', '**/node_modules/**'],
 
     // Replace version placeholders like {{NODEJS_VERSION}} with values from .tool-versions
     markdown: {
