@@ -357,6 +357,13 @@ impl KvEntry {
     /// Returns an error string describing the first bounds or shape violation
     /// found in the deserialized record.
     pub fn validate(&self) -> Result<(), String> {
+        if self.v != SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported KV entry schema version {} (expected {})",
+                self.v, SCHEMA_VERSION
+            ));
+        }
+
         for (partner_id, partner_uid) in &self.ids {
             if partner_uid.uid.len() > MAX_UID_LENGTH {
                 return Err(format!(
@@ -729,6 +736,20 @@ mod tests {
         assert!(
             err.contains("MAX_UID_LENGTH"),
             "should describe the UID length validation failure"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_schema_version() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.v = SCHEMA_VERSION + 1;
+
+        let err = entry
+            .validate()
+            .expect_err("should reject unsupported schema versions");
+        assert!(
+            err.contains("unsupported KV entry schema version"),
+            "should describe the schema version validation failure"
         );
     }
 
