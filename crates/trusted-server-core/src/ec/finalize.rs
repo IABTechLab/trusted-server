@@ -12,7 +12,6 @@ use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
-use super::current_timestamp;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
@@ -76,15 +75,6 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            if let Err(err) =
-                graph.update_last_seen(ec_id, current_timestamp(), &settings.publisher.domain)
-            {
-                log::error!(
-                    "Failed to update last_seen for EC ID '{}': {err:?}",
-                    log_id(ec_id)
-                );
-            }
-
             // Ingest Prebid EIDs from cookie if present.
             if let Some(cookie) = eids_cookie {
                 ingest_prebid_eids(cookie, ec_id, graph, registry);
@@ -94,9 +84,9 @@ pub fn ec_finalize_response(
             }
         }
 
-        // Always set the EC header and refresh the cookie so downstream
-        // consumers (Prebid, frontend JS) can read it on every response.
-        set_ec_on_response(settings, ec_context, response);
+        // Returning users keep the active EC visible for this response, but
+        // ordinary page views no longer refresh the browser cookie or KV TTL.
+        set_ec_header_on_response(ec_context, response);
 
         return;
     }
@@ -116,12 +106,23 @@ pub fn ec_finalize_response(
         if let Some(cookie) = sharedid_cookie {
             ingest_sharedid_cookie(cookie, ec_id, graph, registry);
         }
-        set_ec_on_response(settings, ec_context, response);
+        set_ec_cookie_and_header_on_response(settings, ec_context, response);
+    }
+}
+
+/// Sets the EC response header when an EC ID is available.
+pub fn set_ec_header_on_response(ec_context: &EcContext, response: &mut Response) {
+    if let Some(ec_id) = ec_context.ec_value() {
+        response.set_header(HEADER_X_TS_EC, ec_id);
     }
 }
 
 /// Sets EC header + cookie on response when an EC ID is available.
-pub fn set_ec_on_response(settings: &Settings, ec_context: &EcContext, response: &mut Response) {
+pub fn set_ec_cookie_and_header_on_response(
+    settings: &Settings,
+    ec_context: &EcContext,
+    response: &mut Response,
+) {
     if let Some(ec_id) = ec_context.ec_value() {
         response.set_header(HEADER_X_TS_EC, ec_id);
         set_ec_cookie(settings, response, ec_id);
@@ -390,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_returning_user_with_cookie_mismatch_rewrites_cookie_and_header() {
+    fn finalize_returning_user_with_cookie_mismatch_sets_header_only() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
@@ -421,19 +422,14 @@ mod tests {
             .expect("x-ts-ec should be utf-8");
         assert_eq!(header, active_ec, "should set active EC on header");
 
-        let set_cookie = response
-            .get_header("set-cookie")
-            .expect("mismatch should rewrite cookie")
-            .to_str()
-            .expect("set-cookie should be utf-8");
         assert!(
-            set_cookie.contains(&format!("ts-ec={active_ec}")),
-            "cookie should be rewritten to active EC"
+            response.get_header("set-cookie").is_none(),
+            "returning user should not refresh or repair cookie"
         );
     }
 
     #[test]
-    fn finalize_returning_user_refreshes_cookie_and_header_when_matching() {
+    fn finalize_returning_user_sets_header_without_refreshing_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mtch01");
         let ec_context = make_context(
@@ -463,14 +459,9 @@ mod tests {
             .expect("x-ts-ec should be utf-8");
         assert_eq!(header, ec_id, "header should contain active EC");
 
-        let set_cookie = response
-            .get_header("set-cookie")
-            .expect("returning user should refresh cookie")
-            .to_str()
-            .expect("set-cookie should be utf-8");
         assert!(
-            set_cookie.contains(&format!("ts-ec={ec_id}")),
-            "cookie should be refreshed to active EC"
+            response.get_header("set-cookie").is_none(),
+            "returning user should not refresh cookie"
         );
     }
 

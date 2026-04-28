@@ -260,7 +260,11 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Seconds between pull sync refreshes.
+    /// Legacy pull-sync refresh interval retained for config compatibility.
+    ///
+    /// EC identity entries no longer store per-partner sync timestamps, so
+    /// this value is not used by the current fill-missing-only pull sync
+    /// behavior.
     #[serde(
         default = "EcPartner::default_pull_sync_ttl_sec",
         deserialize_with = "from_value_or_str"
@@ -355,8 +359,11 @@ pub struct Ec {
     #[serde(default = "Ec::default_cluster_trust_threshold")]
     pub cluster_trust_threshold: u32,
 
-    /// Seconds before re-evaluating an entry's `cluster_size`.
-    /// Re-check occurs only in the `/_ts/api/v1/identify` endpoint.
+    /// Legacy cluster re-check interval retained for config compatibility.
+    ///
+    /// EC identity entries no longer store cluster-check timestamps, so this
+    /// value is not used. `/_ts/api/v1/identify` computes cluster size only
+    /// when an entry does not already have a stored `cluster_size`.
     #[serde(default = "Ec::default_cluster_recheck_secs")]
     pub cluster_recheck_secs: u64,
 

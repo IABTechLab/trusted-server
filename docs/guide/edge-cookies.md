@@ -8,7 +8,7 @@ Edge Cookies (EC) are privacy-safe identifiers generated on a first site visit u
 
 Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
-For full operational onboarding (partner registration, pixel sync, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
+For full operational onboarding (partner configuration, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
 
 ## How They Work
 
@@ -41,9 +41,8 @@ sequenceDiagram
         TS-->>B: Response + Set-Cookie: ts-ec=...
     else Return Visit (EC cookie present)
         Note over TS: Phase 2: Routing<br/>EC exists — skip generation
-        TS->>KV: Update last_seen (300s debounce)
         Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
-        TS-->>B: Response + refreshed ts-ec cookie
+        TS-->>B: Response + x-ts-ec header<br/>(no cookie refresh)
     end
 
     Note over TS,KV: Phase 4: Post-send (background)<br/>Dispatch pull-sync to partners
@@ -62,7 +61,7 @@ flowchart TD
     CookiePresent -- "No" --> NoOp[No action]
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
-    WasPresent -- "Yes, not generated" --> Returning["Update last_seen (300s debounce)<br/>Ingest Prebid EID cookies<br/>Refresh ts-ec cookie + x-ts-ec header"]
+    WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>Set x-ts-ec header only<br/>(no cookie or KV TTL refresh)"]
     WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie + x-ts-ec header"]
 ```
 
@@ -105,12 +104,11 @@ The `ec_identity_store` KV store is the only EC lifecycle store. It holds identi
 
 ## Partner Sync Channels
 
-Partner identities flow into the KV identity graph through four channels. Each writes to the same `ids` map in the KV entry via `upsert_partner_id()`.
+Partner identities flow into the KV identity graph through three channels. Each writes to the same `ids` map in the KV entry via idempotent upsert logic: unchanged UIDs are accepted without a KV write, while different UIDs replace the stored value.
 
 ```mermaid
 flowchart LR
     subgraph Browser-initiated
-        Pixel["Pixel Sync<br/><i>GET /_ts/api/v1/sync</i><br/>Browser redirect"]
         Prebid["Prebid EID Cookies<br/><i>ts-eids + sharedId</i><br/>Passive cookie ingestion"]
     end
 
@@ -119,8 +117,7 @@ flowchart LR
         Pull["Pull Sync (Background)<br/><i>TS calls partner URL</i><br/>Post-send on organic routes"]
     end
 
-    Pixel --> KV[(KV Identity Graph<br/>ids map)]
-    Prebid --> KV
+    Prebid --> KV[(KV Identity Graph<br/>ids map)]
     Batch --> KV
     Pull --> KV
 ```
@@ -147,7 +144,7 @@ sequenceDiagram
     Note over B,TS: Next page request
     B->>TS: Request with ts-eids cookie
     TS->>TS: Base64 decode → match source<br/>domains to partners
-    TS->>KV: upsert_partner_id() per match<br/>(300s debounce)
+    TS->>KV: upsert_partner_id() per match<br/>(skips write when UID unchanged)
 ```
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
@@ -171,11 +168,11 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 
 ## Runtime Behavior Notes
 
-- Returning requests with consent and an existing `ts-ec` receive both:
-  - `x-ts-ec` response header
-  - refreshed `Set-Cookie: ts-ec=...`
-- `/_ts/api/v1/identify` is read-only and returns identity enrichment (`uids` and `eids`)
-- `/_ts/api/v1/sync` and `/_ts/api/v1/batch-sync` write mappings into the EC identity graph
+- Returning requests with consent and an existing `ts-ec` receive an `x-ts-ec` response header only; ordinary page views do not refresh the EC cookie or KV TTL.
+- Newly generated ECs receive both `Set-Cookie: ts-ec=...` and `x-ts-ec`.
+- `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
+- `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.
+- Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
 
 ## Next Steps
 
