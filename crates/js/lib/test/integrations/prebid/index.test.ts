@@ -203,6 +203,7 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
   });
 
@@ -318,6 +319,23 @@ describe('prebid/installPrebidNpm', () => {
           uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
         },
       ]);
+    });
+
+    it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
+      const spec = getAdapterSpec();
+      document.cookie = 'ts-eids=stale-value';
+      mockGetUserIdsAsEids.mockReturnValue([]);
+
+      spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(document.cookie).toBe('');
     });
 
     it('buildRequests preserves uid ext and sanitizes invalid atype values', () => {
@@ -655,6 +673,49 @@ describe('prebid/installPrebidNpm', () => {
       );
       expect(hasTsBidder).toBe(true);
     });
+
+    it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'sharedid.org',
+          uids: [
+            { id: 'shared_123', atype: 3 },
+            { id: 'shared_456', ext: { provider: 'example' } },
+          ],
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({ adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }] } as any);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'sharedid.org',
+          uids: [
+            { id: 'shared_123', atype: 3 },
+            { id: 'shared_456', ext: { provider: 'example' } },
+          ],
+        },
+      ]);
+    });
+
+    it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
+      document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({ adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }] } as any);
+
+      expect(document.cookie).toBe('');
+    });
   });
 });
 
@@ -665,6 +726,7 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
   });
 

@@ -1,11 +1,18 @@
 //! Prebid EID cookie ingestion.
 //!
-//! Parses the `ts-eids` cookie (base64-encoded JSON array of `{source, id,
-//! atype}` objects written by the TSJS Prebid integration) and syncs matched
-//! partner UIDs to the KV identity graph.
+//! Parses the `ts-eids` cookie written by the TSJS Prebid integration and
+//! syncs matched partner UIDs to the KV identity graph.
+//!
+//! The current cookie format stores a base64-encoded JSON array of full
+//! OpenRTB-style `Eid` objects (`{source, uids:[...]}`). For rollout
+//! compatibility we also accept the earlier flattened payload shape
+//! (`{source, id, atype}` per entry).
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+
+use crate::openrtb::{Eid, Uid};
 
 use super::kv::KvIdentityGraph;
 use super::kv_types::MAX_UID_LENGTH;
@@ -14,13 +21,60 @@ use super::registry::PartnerRegistry;
 /// Maximum raw `ts-eids` cookie size accepted before base64 decode.
 const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
 
-/// A single flattened EID from the `ts-eids` cookie.
+/// Legacy flattened `ts-eids` cookie entry.
 #[derive(Debug, Deserialize)]
-struct CookieEid {
+struct LegacyCookieEid {
     source: String,
     id: String,
     #[allow(dead_code)]
     atype: u8,
+}
+
+/// OpenRTB-style `ts-eids` cookie entry.
+#[derive(Debug, Deserialize)]
+struct StructuredCookieEid {
+    source: String,
+    #[serde(default)]
+    uids: Vec<StructuredCookieUid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredCookieUid {
+    id: String,
+    #[serde(default)]
+    atype: Option<u8>,
+    #[serde(default)]
+    ext: Option<JsonValue>,
+}
+
+/// Parses a `ts-eids` cookie value into OpenRTB-style `Eid` entries.
+///
+/// Accepts both the current structured cookie format and the earlier legacy
+/// flattened format for backwards compatibility.
+///
+/// # Errors
+///
+/// Returns an error when the cookie exceeds the raw size limit, is not valid
+/// base64, or does not contain either supported JSON payload shape.
+pub fn parse_prebid_eids_cookie(cookie_value: &str) -> Result<Vec<Eid>, String> {
+    if eids_cookie_exceeds_size_limit(cookie_value) {
+        return Err(format!(
+            "ts-eids cookie too large ({} bytes)",
+            cookie_value.len()
+        ));
+    }
+
+    let bytes = BASE64
+        .decode(cookie_value)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+
+    if let Ok(eids) = serde_json::from_slice::<Vec<LegacyCookieEid>>(&bytes) {
+        return Ok(legacy_cookie_eids_to_openrtb(eids));
+    }
+
+    let structured = serde_json::from_slice::<Vec<StructuredCookieEid>>(&bytes)
+        .map_err(|e| format!("JSON parse failed: {e}"))?;
+    Ok(structured_cookie_eids_to_openrtb(structured))
 }
 
 /// Parses a `ts-eids` cookie value and writes matched partner UIDs to KV.
@@ -40,15 +94,7 @@ pub fn ingest_prebid_eids(
         return;
     }
 
-    if eids_cookie_exceeds_size_limit(cookie_value) {
-        log::debug!(
-            "Prebid EIDs: ts-eids cookie too large ({} bytes)",
-            cookie_value.len()
-        );
-        return;
-    }
-
-    let eids = match decode_eids(cookie_value) {
+    let eids = match parse_prebid_eids_cookie(cookie_value) {
         Ok(eids) => eids,
         Err(err) => {
             log::debug!("Prebid EIDs: failed to decode ts-eids cookie: {err}");
@@ -62,11 +108,13 @@ pub fn ingest_prebid_eids(
             continue;
         };
 
-        if eid.id.is_empty() {
+        // KV stores one UID per partner. Preserve the previous cookie-ingestion
+        // behavior by syncing the first valid UID under each source.
+        let Some(uid) = eid.uids.iter().find(|uid| !uid.id.is_empty()) else {
             continue;
-        }
+        };
 
-        if eid_id_exceeds_size_limit(&eid.id) {
+        if eid_id_exceeds_size_limit(&uid.id) {
             log::debug!(
                 "Prebid EIDs: rejecting oversized uid for partner '{}' from source '{}'",
                 partner.id,
@@ -75,7 +123,7 @@ pub fn ingest_prebid_eids(
             continue;
         }
 
-        match kv.upsert_partner_id(ec_id, &partner.id, &eid.id) {
+        match kv.upsert_partner_id(ec_id, &partner.id, &uid.id) {
             Ok(_) => {
                 log::debug!(
                     "Prebid EIDs: synced partner '{}' from source '{}'",
@@ -149,45 +197,120 @@ fn sharedid_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
     cookie_value.len() > MAX_UID_LENGTH
 }
 
-/// Decodes base64 JSON → `Vec<CookieEid>`.
-fn decode_eids(encoded: &str) -> Result<Vec<CookieEid>, String> {
-    let bytes = BASE64
-        .decode(encoded)
-        .map_err(|e| format!("base64 decode failed: {e}"))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("JSON parse failed: {e}"))
+fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<Eid> {
+    let mut eids = Vec::new();
+
+    for entry in entries {
+        if entry.source.is_empty() {
+            continue;
+        }
+
+        let uids: Vec<_> = entry
+            .uids
+            .into_iter()
+            .filter_map(structured_cookie_uid_to_openrtb)
+            .collect();
+        if uids.is_empty() {
+            continue;
+        }
+
+        eids.push(Eid {
+            source: entry.source,
+            uids,
+        });
+    }
+
+    eids
+}
+
+fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
+    if uid.id.is_empty() {
+        return None;
+    }
+
+    let ext = match uid.ext {
+        Some(JsonValue::Object(_)) => uid.ext,
+        _ => None,
+    };
+
+    Some(Uid {
+        id: uid.id,
+        atype: uid.atype,
+        ext,
+    })
+}
+
+fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
+    entries
+        .into_iter()
+        .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
+        .map(|entry| Eid {
+            source: entry.source,
+            uids: vec![Uid {
+                id: entry.id,
+                atype: Some(entry.atype),
+                ext: None,
+            }],
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::json;
 
     #[test]
-    fn decode_eids_parses_valid_payload() {
+    fn parse_prebid_eids_cookie_parses_legacy_flat_payload() {
         let eids = vec![
-            serde_json::json!({"source": "id5-sync.com", "id": "ID5_abc", "atype": 1}),
-            serde_json::json!({"source": "liveramp.com", "id": "LR_xyz", "atype": 3}),
+            json!({"source": "id5-sync.com", "id": "ID5_abc", "atype": 1}),
+            json!({"source": "liveramp.com", "id": "LR_xyz", "atype": 3}),
         ];
         let encoded = BASE64.encode(serde_json::to_vec(&eids).expect("should serialize"));
 
-        let decoded = decode_eids(&encoded).expect("should decode valid payload");
+        let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
         assert_eq!(decoded.len(), 2, "should parse both EIDs");
         assert_eq!(decoded[0].source, "id5-sync.com");
-        assert_eq!(decoded[0].id, "ID5_abc");
+        assert_eq!(decoded[0].uids[0].id, "ID5_abc");
         assert_eq!(decoded[1].source, "liveramp.com");
-        assert_eq!(decoded[1].id, "LR_xyz");
+        assert_eq!(decoded[1].uids[0].id, "LR_xyz");
     }
 
     #[test]
-    fn decode_eids_rejects_invalid_base64() {
-        let result = decode_eids("not-valid-base64!!!");
+    fn parse_prebid_eids_cookie_parses_structured_payload() {
+        let eids = vec![json!({
+            "source": "sharedid.org",
+            "uids": [
+                {"id": "shared_123", "atype": 3},
+                {"id": "shared_456", "ext": {"provider": "example"}}
+            ]
+        })];
+        let encoded = BASE64.encode(serde_json::to_vec(&eids).expect("should serialize"));
+
+        let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
+        assert_eq!(decoded.len(), 1, "should parse one structured EID entry");
+        assert_eq!(decoded[0].source, "sharedid.org");
+        assert_eq!(decoded[0].uids.len(), 2, "should preserve multiple UIDs");
+        assert_eq!(decoded[0].uids[0].id, "shared_123");
+        assert_eq!(decoded[0].uids[0].atype, Some(3));
+        assert_eq!(
+            decoded[0].uids[1].ext,
+            Some(json!({"provider": "example"})),
+            "should preserve UID ext objects"
+        );
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_rejects_invalid_base64() {
+        let result = parse_prebid_eids_cookie("not-valid-base64!!!");
         assert!(result.is_err(), "should reject invalid base64");
     }
 
     #[test]
-    fn decode_eids_rejects_invalid_json() {
+    fn parse_prebid_eids_cookie_rejects_invalid_json() {
         let encoded = BASE64.encode(b"not json");
-        let result = decode_eids(&encoded);
+        let result = parse_prebid_eids_cookie(&encoded);
         assert!(result.is_err(), "should reject invalid JSON");
     }
 

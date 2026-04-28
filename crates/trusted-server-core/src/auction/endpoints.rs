@@ -6,9 +6,11 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::consent::gate_eids_by_consent;
+use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::log_id;
+use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
@@ -68,8 +70,14 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
-    // Parse client-provided EIDs from the current request body.
-    let client_eids = parse_client_auction_eids(body.eids.as_ref());
+    // Parse client-provided EIDs from the current request body. When the
+    // current request does not include them, fall back to the persisted
+    // `ts-eids` cookie so later requests can still forward the browser's
+    // full OpenRTB-style EID structure.
+    let client_eids = resolve_client_auction_eids(
+        body.eids.as_ref(),
+        extract_cookie_value(&req, COOKIE_TS_EIDS).as_deref(),
+    );
 
     // Resolve partner EIDs from the KV identity graph when the user has
     // a valid EC and both KV and partner stores are available.
@@ -151,6 +159,38 @@ fn resolve_auction_eids(
 
     let resolved = resolve_partner_ids(registry, &entry);
     Some(to_eids(&resolved))
+}
+
+fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
+    let cookie_header = req.get_header_str("cookie")?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some((key, value)) = pair.split_once('=') {
+            if key.trim() == name {
+                return Some(value.trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_client_auction_eids(
+    raw: Option<&JsonValue>,
+    cookie_value: Option<&str>,
+) -> Option<Vec<Eid>> {
+    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
+}
+
+fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
+    let cookie_value = cookie_value?;
+    match parse_prebid_eids_cookie(cookie_value) {
+        Ok(eids) if eids.is_empty() => None,
+        Ok(eids) => Some(eids),
+        Err(err) => {
+            log::debug!("Auction EIDs: failed to parse ts-eids cookie: {err}");
+            None
+        }
+    }
 }
 
 fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
@@ -287,6 +327,8 @@ mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
     use serde_json::json;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
@@ -364,6 +406,63 @@ mod tests {
             eids.is_empty(),
             "should return empty vec on KV error (degraded mode)"
         );
+    }
+
+    #[test]
+    fn resolve_client_auction_eids_falls_back_to_ts_eids_cookie() {
+        let cookie_payload = json!([
+            {
+                "source": "sharedid.org",
+                "uids": [
+                    { "id": "shared_cookie", "atype": 3 },
+                    { "id": "shared_cookie_2", "ext": { "provider": "example" } }
+                ]
+            }
+        ]);
+        let encoded = BASE64
+            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
+
+        let resolved = resolve_client_auction_eids(None, Some(&encoded))
+            .expect("should fall back to structured ts-eids cookie");
+
+        assert_eq!(resolved.len(), 1, "should preserve cookie source entry");
+        assert_eq!(resolved[0].source, "sharedid.org");
+        assert_eq!(
+            resolved[0].uids.len(),
+            2,
+            "should preserve multiple cookie UIDs"
+        );
+        assert_eq!(resolved[0].uids[0].id, "shared_cookie");
+        assert_eq!(
+            resolved[0].uids[1].ext,
+            Some(json!({ "provider": "example" })),
+            "should preserve UID ext from cookie fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_client_auction_eids_prefers_request_body_over_cookie() {
+        let raw = json!([
+            {
+                "source": "id5-sync.com",
+                "uids": [{ "id": "body_uid", "atype": 1 }]
+            }
+        ]);
+        let cookie_payload = json!([
+            {
+                "source": "sharedid.org",
+                "uids": [{ "id": "cookie_uid", "atype": 3 }]
+            }
+        ]);
+        let encoded = BASE64
+            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
+
+        let resolved = resolve_client_auction_eids(Some(&raw), Some(&encoded))
+            .expect("should prefer request body EIDs");
+
+        assert_eq!(resolved.len(), 1, "should use request body when present");
+        assert_eq!(resolved[0].source, "id5-sync.com");
+        assert_eq!(resolved[0].uids[0].id, "body_uid");
     }
 
     #[test]
