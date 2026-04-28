@@ -235,7 +235,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      const payload = buildAdRequest(validBidRequests, { eids: collectAuctionEids() });
+      const hasUserIdApi = typeof pbjs.getUserIdsAsEids === 'function';
+      const auctionEids = collectAuctionEids();
+      if (hasUserIdApi && !auctionEids) {
+        clearPrebidEidsCookie();
+      }
+      const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
       return {
         method: 'POST',
         url: auctionEndpoint,
@@ -412,20 +417,36 @@ const EID_COOKIE_NAME = 'ts-eids';
 /** Cookie max-age in seconds (1 day). */
 const EID_COOKIE_MAX_AGE = 86400;
 
-interface PrebidEid {
-  source: string;
-  uids?: Array<{ id: string; atype?: number }>;
+/** Clears any previously persisted Prebid EIDs cookie. */
+function clearPrebidEidsCookie(): void {
+  document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
-interface FlatEid {
-  source: string;
-  id: string;
-  atype: number;
+function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
+  let payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+
+  while (payload.length > 0) {
+    const encoded = btoa(JSON.stringify(payload));
+    if (encoded.length <= MAX_EID_COOKIE_BYTES) {
+      return payload;
+    }
+
+    const last = payload[payload.length - 1];
+    if (last && last.uids.length > 1) {
+      last.uids = last.uids.slice(0, last.uids.length - 1);
+      continue;
+    }
+
+    payload = payload.slice(0, payload.length - 1);
+  }
+
+  return undefined;
 }
 
 /**
  * Collects EIDs from Prebid's User ID Module and writes them as a
- * base64-encoded JSON cookie (`ts-eids`) for backend ingestion.
+ * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
+ * and auction fallback on later requests.
  */
 function syncPrebidEidsCookie(): void {
   try {
@@ -433,43 +454,22 @@ function syncPrebidEidsCookie(): void {
       return;
     }
 
-    const rawEids: PrebidEid[] = pbjs.getUserIdsAsEids() ?? [];
-    if (rawEids.length === 0) {
+    const eids = collectAuctionEids();
+    if (!eids) {
+      clearPrebidEidsCookie();
       return;
     }
 
-    // Flatten to [{source, id, atype}] — take first uid per source.
-    const flat: FlatEid[] = [];
-    for (const eid of rawEids) {
-      const uid = eid.uids?.[0];
-      if (uid?.id && eid.source) {
-        flat.push({
-          source: eid.source,
-          id: uid.id,
-          atype: uid.atype ?? 3,
-        });
-      }
-    }
-
-    if (flat.length === 0) {
+    const payload = fitAuctionEidsToCookie(eids);
+    if (!payload) {
+      clearPrebidEidsCookie();
       return;
     }
 
-    // Encode as base64 JSON, respecting size limit.
-    let payload = flat;
-    let encoded = btoa(JSON.stringify(payload));
-    while (encoded.length > MAX_EID_COOKIE_BYTES && payload.length > 1) {
-      payload = payload.slice(0, payload.length - 1);
-      encoded = btoa(JSON.stringify(payload));
-    }
-
-    if (encoded.length > MAX_EID_COOKIE_BYTES) {
-      return; // Single EID too large — skip.
-    }
-
+    const encoded = btoa(JSON.stringify(payload));
     document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
 
-    log.debug(`[tsjs-prebid] synced ${payload.length} EIDs to cookie`);
+    log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
   } catch (err) {
     log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
   }
