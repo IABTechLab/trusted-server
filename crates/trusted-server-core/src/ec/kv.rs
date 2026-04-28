@@ -98,6 +98,13 @@ impl KvIdentityGraph {
         entry: &KvEntry,
         store_name: &str,
     ) -> Result<(String, String), Report<TrustedServerError>> {
+        entry.validate().map_err(|message| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
+                message: format!("Refusing to serialize invalid KV entry: {message}"),
+            })
+        })?;
+
         let body = serde_json::to_string(entry).change_context(TrustedServerError::KvStore {
             store_name: store_name.to_owned(),
             message: "Failed to serialize KV entry body".to_owned(),
@@ -774,6 +781,40 @@ mod tests {
         assert!(
             err_text.contains("Loaded invalid entry"),
             "should report validation failure for loaded entries"
+        );
+    }
+
+    #[test]
+    fn deserialize_entry_rejects_unsupported_schema_version() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.v = crate::ec::kv_types::SCHEMA_VERSION + 1;
+        let body = serde_json::to_vec(&entry).expect("should serialize future-version entry");
+
+        let err = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
+            .expect_err("should reject unsupported schema versions");
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains("unsupported KV entry schema version"),
+            "should surface schema version validation failures on load"
+        );
+    }
+
+    #[test]
+    fn serialize_entry_rejects_invalid_values() {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            },
+        );
+
+        let err = KvIdentityGraph::serialize_entry(&entry, "test-store")
+            .expect_err("should reject invalid entries before writing");
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains("Refusing to serialize invalid KV entry"),
+            "should fail closed before serializing invalid KV writes"
         );
     }
 

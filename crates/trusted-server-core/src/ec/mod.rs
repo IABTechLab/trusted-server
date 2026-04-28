@@ -303,6 +303,8 @@ impl EcContext {
                     "Failed to create or revive EC entry for id '{}' after generation: {err:?}",
                     log_id(ec_value),
                 );
+                self.ec_value = None;
+                self.ec_generated = false;
             }
         }
 
