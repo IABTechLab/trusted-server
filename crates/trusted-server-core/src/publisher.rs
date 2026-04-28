@@ -1,3 +1,18 @@
+//! Publisher response handler.
+//!
+//! Publisher fallback has three delivery modes that must remain explicit at
+//! the API boundary:
+//! - pass-through for non-processable `2xx` content
+//! - streamed processing for stream-safe processable responses
+//! - buffered responses for unsupported encodings, `204/205`, or HTML routes
+//!   that require full-document post-processing
+//!
+//! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
+//! streaming processor treats unknown encodings as identity, so publisher code
+//! must gate them out before the body enters the rewrite pipeline.
+
+use std::io::Write;
+
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -15,6 +30,7 @@ use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
+
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 
 fn restrict_accept_encoding(req: &mut Request) {
@@ -161,7 +177,7 @@ fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
         .find(|&id| id == stem)
 }
 
-/// Parameters for processing response streaming
+/// Parameters for processing response streaming.
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
     origin_host: &'a str,
@@ -173,12 +189,21 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
 }
 
-/// Process response body in streaming fashion with compression preservation
-fn process_response_streaming(
+/// Process response body through the streaming pipeline.
+///
+/// Selects the appropriate processor based on content type (HTML rewriter,
+/// RSC Flight rewriter, or URL replacer) and pipes chunks from `body`
+/// through it into `output`. The caller decides what `output` is — a
+/// `Vec<u8>` for buffered responses, or a `StreamingBody` for streaming.
+///
+/// # Errors
+///
+/// Returns an error if processor creation or chunk processing fails.
+fn process_response_streaming<W: Write>(
     body: Body,
+    output: &mut W,
     params: &ProcessResponseParams,
-) -> Result<Body, Report<TrustedServerError>> {
-    // Check if this is HTML content
+) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
     // lgtm[rust/cleartext-logging]
@@ -192,15 +217,14 @@ fn process_response_streaming(
         params.origin_host
     );
 
-    // Determine compression type
     let compression = Compression::from_content_encoding(params.content_encoding);
+    let config = PipelineConfig {
+        input_compression: compression,
+        output_compression: compression,
+        chunk_size: 8192,
+    };
 
-    // Create output body to collect results
-    let mut output = Vec::new();
-
-    // Choose processor based on content type
     if is_html {
-        // Use HTML rewriter for HTML content
         let processor = create_html_stream_processor(
             params.origin_host,
             params.request_host,
@@ -208,15 +232,7 @@ fn process_response_streaming(
             params.settings,
             params.integration_registry,
         )?;
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -226,42 +242,21 @@ fn process_response_streaming(
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, processor);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, processor).process(body, output)?;
     } else {
-        // Use simple text replacer for non-HTML content
         let replacer = create_url_replacer(
             params.origin_host,
             params.origin_url,
             params.request_host,
             params.request_scheme,
         );
-
-        let config = PipelineConfig {
-            input_compression: compression,
-            output_compression: compression,
-            chunk_size: 8192,
-        };
-
-        let mut pipeline = StreamingPipeline::new(config, replacer);
-        pipeline.process(body, &mut output)?;
+        StreamingPipeline::new(config, replacer).process(body, output)?;
     }
 
-    log::debug!(
-        "Streaming processing complete - output size: {} bytes",
-        output.len()
-    );
-    Ok(Body::from(output))
+    Ok(())
 }
 
-/// Create a unified HTML stream processor
+/// Create a unified HTML stream processor.
 fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
@@ -282,11 +277,140 @@ fn create_html_stream_processor(
     Ok(create_html_processor(config))
 }
 
+/// Result of publisher request handling, indicating whether the response body
+/// should be streamed or has already been buffered.
+pub enum PublisherResponse {
+    /// Response is fully buffered and ready to send via `send_to_client()`.
+    Buffered(Response),
+    /// Response headers are ready for a streaming response. EC finalization is
+    /// header-only and must run before the adapter commits the headers.
+    Stream {
+        /// Response with all non-EC headers set but body not yet written.
+        response: Response,
+        /// Origin body to be piped through the streaming pipeline.
+        body: Body,
+        /// Parameters for [`process_response_streaming`].
+        params: OwnedProcessResponseParams,
+    },
+    /// Non-processable `2xx` response (images, fonts, video). The adapter must
+    /// reattach the body before sending it to the client.
+    PassThrough {
+        /// Response with headers set but body not yet written.
+        response: Response,
+        /// Origin body to stream directly to the client.
+        body: Body,
+    },
+}
+
+/// Routing decision for a proxied response.
+///
+/// Computed purely from response metadata — no side effects, no body is
+/// consumed. [`handle_publisher_request`] calls [`classify_response_route`]
+/// once and dispatches to the matching [`PublisherResponse`] arm. Tests
+/// exercise the classifier directly so the gate formula lives in one place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResponseRoute {
+    /// `2xx` non-processable content (images, fonts, video), not `204/205`.
+    PassThrough,
+    /// Processable content with supported encoding and either non-HTML or no
+    /// HTML post-processors registered.
+    Stream,
+    /// Response returned unmodified via [`PublisherResponse::Buffered`].
+    BufferedUnmodified,
+    /// HTML with post-processors registered; requires full-document buffering.
+    BufferedProcessed,
+}
+
+/// Decide how a proxied response should be routed.
+///
+/// Pure: no header mutation, no body consumed. All inputs are extracted from
+/// the origin response at the call site.
+pub(crate) fn classify_response_route(
+    status: StatusCode,
+    content_type: &str,
+    content_encoding: &str,
+    request_host: &str,
+    has_post_processors: bool,
+) -> ResponseRoute {
+    if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    let should_process = is_processable_content_type(content_type);
+
+    if !should_process {
+        if status.is_success() {
+            return ResponseRoute::PassThrough;
+        }
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    if request_host.is_empty() {
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    if !is_supported_content_encoding(content_encoding) {
+        return ResponseRoute::BufferedUnmodified;
+    }
+
+    let is_html = content_type.contains("text/html");
+    if is_html && has_post_processors {
+        return ResponseRoute::BufferedProcessed;
+    }
+
+    ResponseRoute::Stream
+}
+
+/// Owned version of [`ProcessResponseParams`] for returning from
+/// [`handle_publisher_request`] without lifetime issues.
+pub struct OwnedProcessResponseParams {
+    pub(crate) content_encoding: String,
+    pub(crate) origin_host: String,
+    pub(crate) origin_url: String,
+    pub(crate) request_host: String,
+    pub(crate) request_scheme: String,
+    pub(crate) content_type: String,
+}
+
+/// Stream the publisher response body through the processing pipeline.
+///
+/// Called by the adapter after `stream_to_client()` has committed the response
+/// headers. Writes processed chunks directly to `output`.
+///
+/// # Errors
+///
+/// Returns an error if processing fails mid-stream. Since headers are already
+/// committed, the caller should log the error and drop the `StreamingBody`
+/// (client sees a truncated response).
+pub fn stream_publisher_body<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<(), Report<TrustedServerError>> {
+    let borrowed = ProcessResponseParams {
+        content_encoding: &params.content_encoding,
+        origin_host: &params.origin_host,
+        origin_url: &params.origin_url,
+        request_host: &params.request_host,
+        request_scheme: &params.request_scheme,
+        settings,
+        content_type: &params.content_type,
+        integration_registry,
+    };
+    process_response_streaming(body, output, &borrowed)
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
-/// This function forwards incoming requests to the configured origin URL,
-/// preserving headers and request body. It's used as a fallback for routes
-/// not explicitly handled by the trusted server.
+/// Returns a [`PublisherResponse`] indicating how the response should be sent:
+/// - [`PublisherResponse::PassThrough`] — non-processable `2xx` content
+/// - [`PublisherResponse::Stream`] — processable content with supported
+///   encodings and no full-document buffering requirement
+/// - [`PublisherResponse::Buffered`] — unsupported encodings, non-`2xx`
+///   unprocessable content, `204/205`, or HTML that requires full-document
+///   post-processing
 ///
 /// # Errors
 ///
@@ -300,7 +424,7 @@ pub fn handle_publisher_request(
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
     mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
@@ -366,96 +490,206 @@ pub fn handle_publisher_request(
             message: "Failed to proxy request to origin".to_string(),
         })?;
 
-    // Log all response headers for debugging
     log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
         log::debug!("  {}: {:?}", name, value);
     }
 
-    // Check if the response has a text-based content type that we should process
     let content_type = response
         .get_header(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_string();
 
-    let should_process = content_type.contains("text/")
-        || content_type.contains("application/javascript")
-        || content_type.contains("application/json");
+    let status = response.get_status();
+    let content_encoding = response
+        .get_header(header::CONTENT_ENCODING)
+        .map(|h| h.to_str().unwrap_or_default())
+        .unwrap_or_default()
+        .to_lowercase();
+    let has_post_processors = integration_registry.has_html_post_processors();
 
-    if should_process && !request_host.is_empty() {
-        // Check if the response is compressed
-        let content_encoding = response
-            .get_header(header::CONTENT_ENCODING)
-            .map(|h| h.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .to_lowercase();
+    let route = classify_response_route(
+        status,
+        &content_type,
+        &content_encoding,
+        request_host,
+        has_post_processors,
+    );
 
-        // Log response details for debugging.
-        // lgtm[rust/cleartext-logging]
-        // This debug log records response metadata and hostnames only; no secret values flow here.
-        log::debug!(
-            "Processing response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-            content_type, content_encoding, request_host, origin_host
-        );
-
-        // Take the response body for streaming processing
-        let body = response.take_body();
-
-        // Process the body using streaming approach
-        let params = ProcessResponseParams {
-            content_encoding: &content_encoding,
-            origin_host: &origin_host,
-            origin_url: &settings.publisher.origin_url,
-            request_host,
-            request_scheme,
-            settings,
-            content_type: &content_type,
-            integration_registry,
-        };
-        match process_response_streaming(body, &params) {
-            Ok(processed_body) => {
-                // Set the processed body back
-                response.set_body(processed_body);
-
-                // Remove Content-Length as the size has likely changed
-                response.remove_header(header::CONTENT_LENGTH);
-
-                // Keep Content-Encoding header since we're returning compressed content
-                log::debug!(
-                    "Preserved Content-Encoding: {} for compressed response",
-                    content_encoding
-                );
-
-                log::debug!("Completed streaming processing of response body");
-            }
-            Err(e) => {
-                log::error!("Failed to process response body: {:?}", e);
-                // Return an error response
-                return Err(e);
-            }
+    match route {
+        ResponseRoute::PassThrough => {
+            log::debug!(
+                "Pass-through binary response - Content-Type: '{}', status: {}",
+                content_type,
+                status,
+            );
+            let body = response.take_body();
+            Ok(PublisherResponse::PassThrough { response, body })
         }
-    } else {
-        log::debug!(
-            "Skipping response processing - should_process: {}, request_host: '{}'",
-            should_process,
-            request_host
-        );
-    }
+        ResponseRoute::BufferedUnmodified => {
+            // Unsupported or unprocessable responses must bypass rewriting
+            // entirely rather than entering the pipeline as identity bytes.
+            if is_processable_content_type(&content_type) && request_host.is_empty() {
+                log::warn!(
+                    "Empty request host — returning processable content unmodified (Content-Type: '{}', status: {}). Check proxy Host header.",
+                    content_type,
+                    status,
+                );
+            } else if !is_supported_content_encoding(&content_encoding) {
+                log::warn!(
+                    "Unsupported Content-Encoding '{}' - returning response unmodified",
+                    content_encoding,
+                );
+            } else {
+                log::debug!(
+                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
+                    content_type,
+                    request_host,
+                    status,
+                );
+            }
+            Ok(PublisherResponse::Buffered(response))
+        }
+        ResponseRoute::Stream => {
+            log::debug!(
+                "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                content_type,
+                content_encoding,
+                request_host,
+                origin_host,
+            );
 
-    Ok(response)
+            let body = response.take_body();
+            response.remove_header(header::CONTENT_LENGTH);
+
+            Ok(PublisherResponse::Stream {
+                response,
+                body,
+                params: OwnedProcessResponseParams {
+                    content_encoding,
+                    origin_host,
+                    origin_url: settings.publisher.origin_url.clone(),
+                    request_host: request_host.to_string(),
+                    request_scheme: request_scheme.to_string(),
+                    content_type,
+                },
+            })
+        }
+        ResponseRoute::BufferedProcessed => {
+            log::debug!(
+                "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                content_type,
+                content_encoding,
+                request_host,
+                origin_host,
+            );
+
+            let body = response.take_body();
+            let params = ProcessResponseParams {
+                content_encoding: &content_encoding,
+                origin_host: &origin_host,
+                origin_url: &settings.publisher.origin_url,
+                request_host,
+                request_scheme,
+                settings,
+                content_type: &content_type,
+                integration_registry,
+            };
+            let mut output = Vec::new();
+            process_response_streaming(body, &mut output, &params)?;
+
+            response.set_header(header::CONTENT_LENGTH, output.len().to_string());
+            response.set_body(Body::from(output));
+
+            Ok(PublisherResponse::Buffered(response))
+        }
+    }
+}
+
+/// Whether the content type requires processing (URL rewriting, HTML injection).
+///
+/// Text-based and JavaScript/JSON responses are processable; binary types
+/// (images, fonts, video, etc.) pass through unchanged.
+fn is_processable_content_type(content_type: &str) -> bool {
+    content_type.contains("text/")
+        || content_type.contains("application/javascript")
+        || content_type.contains("application/json")
+}
+
+/// Whether the `Content-Encoding` is one the streaming pipeline can handle.
+///
+/// Unsupported encodings (e.g. `zstd` from a misbehaving origin) bypass the
+/// rewrite pipeline entirely and are returned unchanged. Processing such bodies
+/// as identity-encoded would produce garbled output.
+fn is_supported_content_encoding(encoding: &str) -> bool {
+    matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use brotli::enc::writer::CompressorWriter;
+    use brotli::Decompressor;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+
     use super::*;
     use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
 
+    fn gzip_encode(input: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(input)
+            .expect("should write gzip test input");
+        encoder.finish().expect("should finish gzip encoding")
+    }
+
+    fn gzip_decode(input: &[u8]) -> Vec<u8> {
+        let mut decoder = GzDecoder::new(input);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("should decode gzip test output");
+        output
+    }
+
+    fn brotli_encode(input: &[u8]) -> Vec<u8> {
+        let mut encoder = CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        encoder
+            .write_all(input)
+            .expect("should write brotli test input");
+        encoder.into_inner()
+    }
+
+    fn brotli_decode(input: &[u8]) -> Vec<u8> {
+        let mut decoder = Decompressor::new(input, 4096);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("should decode brotli test output");
+        output
+    }
+
+    fn make_stream_params(
+        settings: &Settings,
+        content_encoding: &str,
+    ) -> OwnedProcessResponseParams {
+        OwnedProcessResponseParams {
+            content_encoding: content_encoding.to_owned(),
+            origin_host: settings.publisher.origin_host(),
+            origin_url: settings.publisher.origin_url.clone(),
+            request_host: settings.publisher.domain.clone(),
+            request_scheme: "https".to_owned(),
+            content_type: "application/json".to_owned(),
+        }
+    }
+
     #[test]
     fn test_content_type_detection() {
-        // Test which content types should be processed
         let test_cases = vec![
             ("text/html", true),
             ("text/html; charset=utf-8", true),
@@ -471,19 +705,55 @@ mod tests {
             ("application/octet-stream", false),
         ];
 
-        for (content_type, should_process) in test_cases {
-            let result = content_type.contains("text/html")
-                || content_type.contains("text/css")
-                || content_type.contains("text/javascript")
-                || content_type.contains("application/javascript")
-                || content_type.contains("application/json");
-
+        for (content_type, expected) in test_cases {
             assert_eq!(
-                result, should_process,
-                "Content-Type '{}' should_process: expected {}, got {}",
-                content_type, should_process, result
+                is_processable_content_type(content_type),
+                expected,
+                "Content-Type '{content_type}' should_process: expected {expected}",
             );
         }
+    }
+
+    #[test]
+    fn supported_content_encoding_accepts_known_values() {
+        assert!(is_supported_content_encoding(""), "should accept empty");
+        assert!(
+            is_supported_content_encoding("identity"),
+            "should accept identity"
+        );
+        assert!(is_supported_content_encoding("gzip"), "should accept gzip");
+        assert!(
+            is_supported_content_encoding("deflate"),
+            "should accept deflate"
+        );
+        assert!(is_supported_content_encoding("br"), "should accept br");
+    }
+
+    #[test]
+    fn supported_content_encoding_rejects_unknown_values() {
+        assert!(!is_supported_content_encoding("zstd"), "should reject zstd");
+        assert!(
+            !is_supported_content_encoding("compress"),
+            "should reject compress"
+        );
+        assert!(
+            !is_supported_content_encoding("snappy"),
+            "should reject snappy"
+        );
+    }
+
+    #[test]
+    fn unsupported_encoding_response_is_returned_unmodified() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "zstd",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+        );
     }
 
     #[test]
@@ -492,7 +762,6 @@ mod tests {
         let origin_host = settings.publisher.origin_host();
         assert_eq!(origin_host, "origin.test-publisher.com");
 
-        // Test with port
         let mut settings_with_port = create_test_settings();
         settings_with_port.publisher.origin_url = "origin.test-publisher.com:8080".to_string();
         assert_eq!(
@@ -503,27 +772,18 @@ mod tests {
 
     #[test]
     fn test_invalid_utf8_handling() {
-        // Test that invalid UTF-8 bytes are handled gracefully
-        let invalid_utf8_bytes = vec![0xFF, 0xFE, 0xFD]; // Invalid UTF-8 sequence
-
-        // Verify these bytes cannot be converted to a valid UTF-8 string
+        let invalid_utf8_bytes = vec![0xFF, 0xFE, 0xFD];
         assert!(String::from_utf8(invalid_utf8_bytes.clone()).is_err());
-
-        // In the actual function, invalid UTF-8 would be passed through unchanged
-        // This test verifies our approach is sound
     }
 
     #[test]
     fn test_utf8_conversion_edge_cases() {
-        // Test various UTF-8 edge cases
         let test_cases = vec![
-            // Valid UTF-8 with special characters
-            (vec![0xE2, 0x98, 0x83], true),       // ☃ (snowman)
-            (vec![0xF0, 0x9F, 0x98, 0x80], true), // 😀 (emoji)
-            // Invalid UTF-8 sequences
-            (vec![0xFF, 0xFE], false),       // Invalid start byte
-            (vec![0xC0, 0x80], false),       // Overlong encoding
-            (vec![0xED, 0xA0, 0x80], false), // Surrogate half
+            (vec![0xE2, 0x98, 0x83], true),
+            (vec![0xF0, 0x9F, 0x98, 0x80], true),
+            (vec![0xFF, 0xFE], false),
+            (vec![0xC0, 0x80], false),
+            (vec![0xED, 0xA0, 0x80], false),
         ];
 
         for (bytes, should_be_valid) in test_cases {
@@ -537,15 +797,223 @@ mod tests {
         }
     }
 
-    // Note: test_streaming_compressed_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
+    #[test]
+    fn route_streams_2xx_html_without_post_processors() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+        );
+    }
 
-    // Note: test_streaming_brotli_content removed as it directly tested private function
-    // process_response_streaming. The functionality is tested through handle_publisher_request.
+    #[test]
+    fn route_buffers_html_with_post_processors_for_processing() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedProcessed,
+        );
+    }
+
+    #[test]
+    fn route_streams_non_html_even_with_post_processors_registered() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "application/json",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::Stream,
+        );
+    }
+
+    #[test]
+    fn route_buffers_unmodified_on_unsupported_encoding() {
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "text/html", "zstd", "example.com", false,),
+            ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn route_passes_through_non_processable_2xx() {
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "image/png", "", "example.com", false,),
+            ResponseRoute::PassThrough,
+        );
+    }
+
+    #[test]
+    fn route_buffers_non_processable_error_responses() {
+        assert_eq!(
+            classify_response_route(StatusCode::NOT_FOUND, "image/png", "", "example.com", false,),
+            ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn route_excludes_204_from_pass_through() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "image/png",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn route_excludes_205_from_pass_through() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::RESET_CONTENT,
+                "image/png",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn route_excludes_204_for_processable_content_types() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "204 + HTML must not route to Stream",
+        );
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NO_CONTENT,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "204 + HTML + post-processors must not route to BufferedProcessed",
+        );
+    }
+
+    #[test]
+    fn route_excludes_205_for_processable_content_types() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::RESET_CONTENT,
+                "application/json",
+                "",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::BufferedUnmodified,
+            "205 + JSON must not route to Stream",
+        );
+    }
+
+    #[test]
+    fn route_streams_non_2xx_processable_content() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NOT_FOUND,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+        );
+        assert_eq!(
+            classify_response_route(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+        );
+    }
+
+    #[test]
+    fn route_processes_non_2xx_html_with_post_processors() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::NOT_FOUND,
+                "text/html; charset=utf-8",
+                "gzip",
+                "example.com",
+                true,
+            ),
+            ResponseRoute::BufferedProcessed,
+        );
+    }
+
+    #[test]
+    fn route_passes_through_non_processable_even_with_empty_request_host() {
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "image/png", "", "", false,),
+            ResponseRoute::PassThrough,
+        );
+    }
+
+    #[test]
+    fn route_buffers_processable_content_with_empty_request_host() {
+        assert_eq!(
+            classify_response_route(StatusCode::OK, "text/html", "gzip", "", false,),
+            ResponseRoute::BufferedUnmodified,
+        );
+    }
+
+    #[test]
+    fn pass_through_preserves_body_and_content_length() {
+        let image_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
+
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header("content-type", "image/png");
+        response.set_header("content-length", image_bytes.len().to_string());
+        response.set_body(Body::from(image_bytes.clone()));
+
+        let body = response.take_body();
+        assert_eq!(
+            response
+                .get_header_str("content-length")
+                .expect("should have content-length"),
+            "4096",
+            "Content-Length should be preserved for pass-through"
+        );
+
+        response.set_body(body);
+        let output = response.into_body().into_bytes();
+        assert_eq!(
+            output, image_bytes,
+            "pass-through should preserve body byte-for-byte"
+        );
+    }
 
     #[test]
     fn test_content_encoding_detection() {
-        // Test that we properly handle responses with various content encodings
         let test_encodings = vec!["gzip", "deflate", "br", "identity", ""];
 
         for encoding in test_encodings {
@@ -568,7 +1036,6 @@ mod tests {
     #[test]
     fn publisher_proxy_does_not_add_accept_encoding_when_absent() {
         let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        // No Accept-Encoding header set by the client.
 
         restrict_accept_encoding(&mut req);
 
@@ -632,6 +1099,68 @@ mod tests {
             req.get_header_str(header::ACCEPT_ENCODING),
             Some("identity"),
             "publisher fallback should request identity when the client only accepts unsupported encodings"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_round_trips_gzip() {
+        let settings = create_test_settings();
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.js\"}";
+        let compressed = gzip_encode(input);
+        let params = make_stream_params(&settings, "gzip");
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            Body::from(compressed),
+            &mut output,
+            &params,
+            &settings,
+            &integration_registry,
+        )
+        .expect("should stream gzip response through rewrite pipeline");
+
+        let decoded = gzip_decode(&output);
+        let decoded = String::from_utf8(decoded).expect("should decode rewritten gzip payload");
+        assert!(
+            decoded.contains("https://test-publisher.com/path/file.js"),
+            "should rewrite origin URLs to the request host"
+        );
+        assert!(
+            !decoded.contains("origin.test-publisher.com"),
+            "should remove the origin hostname from the rewritten payload"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_round_trips_brotli() {
+        let settings = create_test_settings();
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.css\"}";
+        let compressed = brotli_encode(input);
+        let params = make_stream_params(&settings, "br");
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            Body::from(compressed),
+            &mut output,
+            &params,
+            &settings,
+            &integration_registry,
+        )
+        .expect("should stream brotli response through rewrite pipeline");
+
+        let decoded = brotli_decode(&output);
+        let decoded = String::from_utf8(decoded).expect("should decode rewritten brotli payload");
+        assert!(
+            decoded.contains("https://test-publisher.com/path/file.css"),
+            "should rewrite origin URLs to the request host"
+        );
+        assert!(
+            !decoded.contains("origin.test-publisher.com"),
+            "should remove the origin hostname from the rewritten payload"
         );
     }
 
@@ -731,7 +1260,6 @@ mod tests {
 
     #[test]
     fn tsjs_dynamic_serves_deferred_prebid_when_enabled() {
-        // Default test settings include prebid enabled
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");

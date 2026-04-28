@@ -196,8 +196,11 @@ fn routes_use_request_local_consent() {
         discovery_req,
     ))
     .expect("should route discovery request");
+    let discovery_response = discovery_resp
+        .response
+        .expect("should buffer discovery response in tests");
     assert_eq!(
-        discovery_resp.response.get_status(),
+        discovery_response.get_status(),
         StatusCode::OK,
         "should keep discovery available with request-local consent"
     );
@@ -213,8 +216,11 @@ fn routes_use_request_local_consent() {
         admin_req,
     ))
     .expect("should route admin request");
+    let admin_response = admin_resp
+        .response
+        .expect("should buffer admin response in tests");
     assert_eq!(
-        admin_resp.response.get_status(),
+        admin_response.get_status(),
         StatusCode::UNAUTHORIZED,
         "should keep admin auth behavior unchanged with request-local consent"
     );

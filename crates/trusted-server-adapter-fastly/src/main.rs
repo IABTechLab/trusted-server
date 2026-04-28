@@ -29,7 +29,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -134,7 +136,9 @@ fn main() -> Result<(), Error> {
         pull_sync_context,
     } = outcome;
 
-    response.send_to_client();
+    if let Some(response) = response {
+        response.send_to_client();
+    }
 
     if let Some(context) = pull_sync_context {
         run_pull_sync_after_send(&settings, &context);
@@ -145,7 +149,7 @@ fn main() -> Result<(), Error> {
 
 #[must_use]
 struct RouteOutcome {
-    response: Response,
+    response: Option<Response>,
     pull_sync_context: Option<PullSyncContext>,
 }
 
@@ -231,7 +235,7 @@ async fn route_request(
         };
         finalize_response(settings, geo_info.as_ref(), &mut response);
         return Ok(RouteOutcome {
-            response,
+            response: Some(response),
             pull_sync_context: None,
         });
     }
@@ -243,7 +247,7 @@ async fn route_request(
                 let mut response = to_error_response(&err);
                 finalize_response(settings, geo_info.as_ref(), &mut response);
                 return Ok(RouteOutcome {
-                    response,
+                    response: Some(response),
                     pull_sync_context: None,
                 });
             }
@@ -271,7 +275,7 @@ async fn route_request(
             );
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
-                response,
+                response: Some(response),
                 pull_sync_context: None,
             });
         }
@@ -281,7 +285,7 @@ async fn route_request(
             let mut response = to_error_response(&e);
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
-                response,
+                response: Some(response),
                 pull_sync_context: None,
             });
         }
@@ -392,7 +396,7 @@ async fn route_request(
                 path
             );
 
-            let result = match handle_publisher_request(
+            match handle_publisher_request(
                 settings,
                 integration_registry,
                 runtime_services,
@@ -400,13 +404,65 @@ async fn route_request(
                 &mut ec_context,
                 req,
             ) {
-                Ok(response) => Ok(response),
+                Ok(PublisherResponse::Stream {
+                    mut response,
+                    body,
+                    params,
+                }) => {
+                    // Publisher fallback has multiple delivery modes.
+                    // EC finalization is header-only, so it must happen before
+                    // headers are committed on the streaming path.
+                    ec_finalize_response(
+                        settings,
+                        &ec_context,
+                        kv_graph.as_ref(),
+                        partner_registry,
+                        eids_cookie.as_deref(),
+                        sharedid_cookie.as_deref(),
+                        &mut response,
+                    );
+                    finalize_response(settings, geo_info.as_ref(), &mut response);
+
+                    let mut streaming_body = response.stream_to_client();
+                    let mut stream_succeeded = false;
+                    if let Err(err) = stream_publisher_body(
+                        body,
+                        &mut streaming_body,
+                        &params,
+                        settings,
+                        integration_registry,
+                    ) {
+                        // Headers are already committed. Log and abort rather
+                        // than trying to replace the response mid-stream.
+                        log::error!("Streaming processing failed: {err:?}");
+                        drop(streaming_body);
+                    } else if let Err(err) = streaming_body.finish() {
+                        log::error!("Failed to finish streaming body: {err}");
+                    } else {
+                        stream_succeeded = true;
+                    }
+
+                    let pull_sync_context = if is_real_browser && stream_succeeded {
+                        build_pull_sync_context(&ec_context)
+                    } else {
+                        None
+                    };
+
+                    return Ok(RouteOutcome {
+                        response: None,
+                        pull_sync_context,
+                    });
+                }
+                Ok(PublisherResponse::PassThrough { mut response, body }) => {
+                    response.set_body(body);
+                    (Ok(response), true)
+                }
+                Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
                 Err(e) => {
                     log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    Err(e)
+                    (Err(e), true)
                 }
-            };
-            (result, true)
+            }
         }
     };
 
@@ -439,7 +495,7 @@ async fn route_request(
     };
 
     Ok(RouteOutcome {
-        response,
+        response: Some(response),
         pull_sync_context,
     })
 }
