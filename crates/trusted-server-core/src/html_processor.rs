@@ -7,14 +7,16 @@
 //!
 //! # Platform notes
 //!
-//! This module is **platform-agnostic** (verified in PR 8). It has zero
+//! This module is **platform-agnostic** (verified 2026-03-31; see
+//! `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`). It has zero
 //! `fastly` imports and depends only on `lol_html`, `std`, and crate-internal
-//! types. [`create_html_processor`] returns an `impl `[`StreamProcessor`]
+//! types. [`create_html_processor`] returns an impl [`StreamProcessor`]
 //! whose `process_chunk` method operates on `&[u8]` slices with no
 //! platform body type involved.
 //!
-//! Future adapters (PR 16/17) do not need to implement any content-rewriting
+//! Future adapters (Cloudflare Workers, Axum, Spin) do not need to implement any content-rewriting
 //! interface. See `crate::platform` module doc for the authoritative note.
+
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
@@ -31,9 +33,22 @@ use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
+/// Wraps [`HtmlRewriterAdapter`] with optional post-processing.
+///
+/// When `post_processors` is empty (the common streaming path), chunks pass
+/// through immediately with no extra copying. When post-processors are
+/// registered, intermediate output is accumulated in `accumulated_output`
+/// until `is_last`, then post-processors run on the full document. This adds
+/// an extra copy per chunk compared to the pre-streaming adapter (which
+/// accumulated raw input instead of rewriter output). The overhead is
+/// acceptable because the post-processor path is already fully buffered —
+/// the real streaming win comes from the empty-post-processor path in Phase 2.
 struct HtmlWithPostProcessing {
     inner: HtmlRewriterAdapter,
     post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
+    /// Buffer that accumulates all intermediate output when post-processors
+    /// need the full document. Left empty on the streaming-only path.
+    accumulated_output: Vec<u8>,
     origin_host: String,
     request_host: String,
     request_scheme: String,
@@ -43,12 +58,26 @@ struct HtmlWithPostProcessing {
 impl StreamProcessor for HtmlWithPostProcessing {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         let output = self.inner.process_chunk(chunk, is_last)?;
-        if !is_last || output.is_empty() || self.post_processors.is_empty() {
+
+        // Streaming-optimized path: no post-processors, pass through immediately.
+        if self.post_processors.is_empty() {
             return Ok(output);
         }
 
-        let Ok(output_str) = std::str::from_utf8(&output) else {
-            return Ok(output);
+        // Post-processors need the full document. Accumulate until the last chunk.
+        self.accumulated_output.extend_from_slice(&output);
+        if !is_last {
+            return Ok(Vec::new());
+        }
+
+        // Final chunk: run post-processors on the full accumulated output.
+        let full_output = std::mem::take(&mut self.accumulated_output);
+        if full_output.is_empty() {
+            return Ok(full_output);
+        }
+
+        let Ok(output_str) = std::str::from_utf8(&full_output) else {
+            return Ok(full_output);
         };
 
         let ctx = IntegrationHtmlContext {
@@ -64,10 +93,10 @@ impl StreamProcessor for HtmlWithPostProcessing {
             .iter()
             .any(|p| p.should_process(output_str, &ctx))
         {
-            return Ok(output);
+            return Ok(full_output);
         }
 
-        let mut html = String::from_utf8(output).map_err(|e| {
+        let mut html = String::from_utf8(full_output).map_err(|e| {
             io::Error::other(format!(
                 "HTML post-processing expected valid UTF-8 output: {e}"
             ))
@@ -91,10 +120,11 @@ impl StreamProcessor for HtmlWithPostProcessing {
         Ok(html.into_bytes())
     }
 
-    fn reset(&mut self) {
-        self.inner.reset();
-        self.document_state.clear();
-    }
+    /// No-op. `HtmlWithPostProcessing` wraps a single-use
+    /// [`HtmlRewriterAdapter`] that cannot be reset. Clearing auxiliary
+    /// state without resetting the rewriter would leave the processor
+    /// in an inconsistent state, so this method intentionally does nothing.
+    fn reset(&mut self) {}
 }
 
 /// Configuration for HTML processing
@@ -478,9 +508,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         ..RewriterSettings::default()
     };
 
+    let inner = HtmlRewriterAdapter::new(rewriter_settings);
+
     HtmlWithPostProcessing {
-        inner: HtmlRewriterAdapter::new(rewriter_settings),
+        inner,
         post_processors,
+        accumulated_output: Vec::new(),
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
@@ -1003,6 +1036,153 @@ mod tests {
                 .chars()
                 .rev()
                 .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn post_processors_accumulate_while_streaming_path_passes_through() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        // --- Streaming path: no post-processors → output emitted per chunk ---
+        let mut streaming = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: Vec::new(),
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        let chunk1 = streaming
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let chunk2 = streaming
+            .process_chunk(b"<p>hello</p>", false)
+            .expect("should process chunk2");
+        let chunk3 = streaming
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        assert!(
+            !chunk1.is_empty() || !chunk2.is_empty(),
+            "should emit intermediate output on streaming path"
+        );
+
+        let mut streaming_all = chunk1;
+        streaming_all.extend_from_slice(&chunk2);
+        streaming_all.extend_from_slice(&chunk3);
+
+        // --- Buffered path: post-processor registered → accumulates until is_last ---
+        struct NoopPostProcessor;
+        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-noop"
+            }
+            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                false
+            }
+        }
+
+        let mut buffered = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(NoopPostProcessor)],
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        let buf1 = buffered
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let buf2 = buffered
+            .process_chunk(b"<p>hello</p>", false)
+            .expect("should process chunk2");
+        let buf3 = buffered
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        assert!(
+            buf1.is_empty() && buf2.is_empty(),
+            "should return empty for intermediate chunks when post-processors are registered"
+        );
+        assert!(
+            !buf3.is_empty(),
+            "should emit all output in final chunk when post-processors are registered"
+        );
+
+        // Both paths should produce identical output
+        let streaming_str =
+            String::from_utf8(streaming_all).expect("streaming output should be valid UTF-8");
+        let buffered_str = String::from_utf8(buf3).expect("buffered output should be valid UTF-8");
+        assert_eq!(
+            streaming_str, buffered_str,
+            "streaming and buffered paths should produce identical output"
+        );
+    }
+
+    #[test]
+    fn active_post_processor_receives_full_document_and_mutates_output() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        struct AppendCommentProcessor;
+        impl IntegrationHtmlPostProcessor for AppendCommentProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-append"
+            }
+            fn should_process(&self, html: &str, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                html.contains("</html>")
+            }
+            fn post_process(&self, html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                html.push_str("<!-- processed -->");
+                true
+            }
+        }
+
+        let mut processor = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(AppendCommentProcessor)],
+            accumulated_output: Vec::new(),
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        // Feed multiple chunks
+        let r1 = processor
+            .process_chunk(b"<html><body>", false)
+            .expect("should process chunk1");
+        let r2 = processor
+            .process_chunk(b"<p>content</p>", false)
+            .expect("should process chunk2");
+        let r3 = processor
+            .process_chunk(b"</body></html>", true)
+            .expect("should process final chunk");
+
+        // Intermediate chunks return empty (buffered for post-processor)
+        assert!(
+            r1.is_empty() && r2.is_empty(),
+            "should buffer intermediate chunks"
+        );
+
+        // Final chunk contains the full document with post-processor mutation
+        let output = String::from_utf8(r3).expect("should be valid UTF-8");
+        assert!(
+            output.contains("<p>content</p>"),
+            "should contain original content"
+        );
+        assert!(
+            output.contains("</html>"),
+            "should contain complete document"
+        );
+        assert!(
+            output.contains("<!-- processed -->"),
+            "should contain post-processor mutation"
         );
     }
 }

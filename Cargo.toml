@@ -7,17 +7,21 @@ members = [
     "crates/js",
     "crates/openrtb",
 ]
-# Native-only crates excluded from the workspace:
-# - integration-tests: Run via ./scripts/integration-tests.sh
-# - openrtb-codegen: code-generation tool, native only
+# Crates excluded from workspace — must be built/tested outside the workspace:
+#   cargo test-cloudflare → trusted-server-adapter-cloudflare (wasm32-unknown-unknown)
 exclude = [
     "crates/integration-tests",
     "crates/openrtb-codegen",
 ]
 
+# Default members are native-compatible only.
+# bare `cargo test` runs core + Axum on the host target.
+# Use cargo aliases to test each adapter with the correct target:
+#   cargo test-fastly  → wasm32-wasip1 (Fastly + core)
+#   cargo test-axum    → native        (Axum)
 default-members = [
     "crates/trusted-server-core",
-    "crates/trusted-server-adapter-fastly",
+    "crates/trusted-server-adapter-axum",
 ]
 
 [workspace.lints.clippy]
@@ -66,7 +70,6 @@ fastly = "0.11.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
-handlebars = "6.4.0"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.4.0"
@@ -77,7 +80,6 @@ log-fastly = "0.11.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
-pin-project-lite = "0.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 regex = "1.12.3"
@@ -89,6 +91,7 @@ temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-test = "0.4"
 toml = "1.1"
+trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }

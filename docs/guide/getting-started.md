@@ -89,10 +89,10 @@ cargo build
 
 ```bash
 # Fastly/WASM crates (requires Viceroy)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+cargo test-fastly
 
 # Axum native adapter
-cargo test -p trusted-server-adapter-axum
+cargo test-axum
 ```
 
 ## Configuration
@@ -101,7 +101,7 @@ Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
 - KV store mappings
-- Synthetic ID templates
+- EC configuration
 - GDPR settings
 
 See [Configuration](/guide/configuration) for details.
@@ -114,6 +114,6 @@ fastly compute publish
 
 ## Next Steps
 
-- Learn about [Synthetic IDs](/guide/synthetic-ids)
+- Learn about [Edge Cookies](/guide/edge-cookies)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

@@ -3,22 +3,14 @@
 //! This module provides Ed25519-based signing and verification of HTTP requests
 //! using keys stored via platform store primitives.
 
-use std::sync::LazyLock;
-
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
 use error_stack::{Report, ResultExt};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreName};
-use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
-
-static JWKS_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(JWKS_CONFIG_STORE_NAME));
-
-static SIGNING_STORE_NAME: LazyLock<StoreName> =
-    LazyLock::new(|| StoreName::from(SIGNING_SECRET_STORE_NAME));
+use crate::platform::RuntimeServices;
+use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
 /// Retrieves the current active key ID from the config store.
 ///
@@ -36,28 +28,33 @@ pub fn get_current_key_id(
         })
 }
 
-fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, Report<TrustedServerError>> {
-    let bytes = if key_bytes.len() > 32 {
-        general_purpose::STANDARD.decode(&key_bytes).map_err(|_| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Failed to decode base64 key".into(),
-            })
-        })?
-    } else {
-        key_bytes
-    };
+/// Parses an Ed25519 signing key from secret-store bytes.
+///
+/// Request-signing rotation always stores private keys as standard base64 text
+/// via [`crate::request_signing::rotation::KeyRotationManager`]. A non-base64
+/// value in the secret store indicates data corruption and is surfaced as an
+/// explicit error rather than silently falling back to a length heuristic.
+fn parse_ed25519_signing_key(key_bytes: &[u8]) -> Result<SigningKey, Report<TrustedServerError>> {
+    let bytes = general_purpose::STANDARD.decode(key_bytes).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "signing key is not valid base64 — corrupt key material in secret store"
+                .into(),
+        })
+    })?;
 
     let key_array: [u8; 32] = bytes.try_into().map_err(|_| {
         Report::new(TrustedServerError::Configuration {
-            message: "Invalid key length (expected 32 bytes for Ed25519)".into(),
+            message: "signing key must be 32 bytes after base64 decoding".into(),
         })
     })?;
 
     Ok(SigningKey::from_bytes(&key_array))
 }
 
+/// Signs request payloads using the current Ed25519 private key.
 pub struct RequestSigner {
     key: SigningKey,
+    /// Key identifier associated with the loaded private key.
     pub kid: String,
 }
 
@@ -81,9 +78,13 @@ struct SigningPayload<'a> {
 /// Parameters for enhanced request signing
 #[derive(Debug, Clone)]
 pub struct SigningParams {
+    /// Request identifier to bind into the signature payload.
     pub request_id: String,
+    /// Host header value expected by the receiving service.
     pub request_host: String,
+    /// Request scheme bound into the signature payload.
     pub request_scheme: String,
+    /// Signature timestamp in Unix milliseconds.
     pub timestamp: u64,
 }
 
@@ -104,8 +105,8 @@ impl SigningParams {
 
     /// Builds the canonical payload string for signing.
     ///
-    /// The payload is a JSON-serialized [`SigningPayload`] to prevent signature
-    /// confusion attacks that could exploit delimiter-based formats.
+    /// The payload is JSON-serialized to prevent signature confusion attacks
+    /// that could exploit delimiter-based formats.
     ///
     /// # Errors
     ///
@@ -134,10 +135,8 @@ impl RequestSigner {
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
     pub fn from_services(services: &RuntimeServices) -> Result<Self, Report<TrustedServerError>> {
-        let key_id = services
-            .config_store()
-            .get(&JWKS_STORE_NAME, "current-kid")
-            .change_context(TrustedServerError::Configuration {
+        let key_id =
+            get_current_key_id(services).change_context(TrustedServerError::Configuration {
                 message: "failed to get current-kid".into(),
             })?;
 
@@ -148,7 +147,7 @@ impl RequestSigner {
                 message: format!("failed to get signing key for kid: {}", key_id),
             })?;
 
-        let signing_key = parse_ed25519_signing_key(key_bytes)?;
+        let signing_key = parse_ed25519_signing_key(&key_bytes)?;
 
         Ok(Self {
             key: signing_key,
@@ -256,89 +255,13 @@ pub fn verify_signature(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use error_stack::Report;
-
-    use crate::platform::test_support::build_services_with_config_and_secret;
-    use crate::platform::{
-        PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
-    };
+    use crate::platform::test_support::build_request_signing_services;
 
     use super::*;
 
-    // ---------------------------------------------------------------------------
-    // Stub stores with preset data
-    // ---------------------------------------------------------------------------
-
-    struct StubConfigStore(HashMap<String, String>);
-
-    impl PlatformConfigStore for StubConfigStore {
-        fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-            self.0
-                .get(key)
-                .cloned()
-                .ok_or_else(|| Report::new(PlatformError::ConfigStore))
-        }
-
-        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    struct StubSecretStore(HashMap<String, Vec<u8>>);
-
-    impl PlatformSecretStore for StubSecretStore {
-        fn get_bytes(&self, _: &StoreName, key: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-            self.0
-                .get(key)
-                .cloned()
-                .ok_or_else(|| Report::new(PlatformError::SecretStore))
-        }
-
-        fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    fn build_signing_services() -> crate::platform::RuntimeServices {
-        use base64::{engine::general_purpose, Engine};
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
-        let verifying_key = signing_key.verifying_key();
-        let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(verifying_key.as_bytes());
-        let jwk_json = format!(
-            r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
-            x_b64
-        );
-
-        let mut config_data = HashMap::new();
-        config_data.insert("current-kid".to_string(), "test-kid".to_string());
-        config_data.insert("test-kid".to_string(), jwk_json);
-
-        let mut secret_data = HashMap::new();
-        secret_data.insert("test-kid".to_string(), key_b64.into_bytes());
-
-        build_services_with_config_and_secret(
-            StubConfigStore(config_data),
-            StubSecretStore(secret_data),
-        )
-    }
-
     #[test]
     fn from_services_loads_kid_from_config_store() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
 
@@ -347,7 +270,7 @@ mod tests {
 
     #[test]
     fn sign_produces_non_empty_url_safe_base64_signature() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
 
@@ -364,7 +287,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify_roundtrip_succeeds() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
         let payload = b"test payload for verification";
@@ -378,7 +301,7 @@ mod tests {
 
     #[test]
     fn verify_returns_false_for_wrong_payload() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
         let signature = signer.sign(b"original").expect("should sign");
@@ -391,7 +314,7 @@ mod tests {
 
     #[test]
     fn verify_errors_for_unknown_kid() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
         let signature = signer.sign(b"payload").expect("should sign");
@@ -403,7 +326,7 @@ mod tests {
 
     #[test]
     fn verify_errors_for_malformed_signature() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
 
@@ -460,7 +383,7 @@ mod tests {
 
     #[test]
     fn sign_request_enhanced_produces_verifiable_signature() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
         let params = SigningParams::new(
@@ -482,7 +405,7 @@ mod tests {
 
     #[test]
     fn sign_request_different_hosts_produce_different_signatures() {
-        let services = build_signing_services();
+        let services = build_request_signing_services();
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
 

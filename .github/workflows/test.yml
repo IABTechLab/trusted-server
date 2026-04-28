@@ -21,6 +21,15 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Retrieve Viceroy version
+        id: viceroy-version
+        # `.tool-versions` is the single source of truth so this workflow and
+        # `.github/actions/setup-integration-test-env/action.yml` can't drift.
+        # The pin matters because upstream Viceroy > v0.16.4 has bumped MSRV
+        # beyond the rustc pin in `rust-toolchain.toml`.
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -28,23 +37,19 @@ jobs:
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
-      - name: Get Viceroy cache key
-        id: viceroy-rev
-        run: echo "sha=$(git ls-remote https://github.com/fastly/Viceroy HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
       - name: Cache Viceroy binary
         id: cache-viceroy
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/viceroy
-          key: viceroy-${{ runner.os }}-${{ steps.viceroy-rev.outputs.sha }}
+          key: viceroy-${{ runner.os }}-v${{ steps.viceroy-version.outputs.viceroy-version }}
 
-      - name: Install Viceroy (from main since 0.14.3 is broken)
+      - name: Install Viceroy
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/fastly/Viceroy viceroy
+        run: cargo install --git https://github.com/fastly/Viceroy --tag v${{ steps.viceroy-version.outputs.viceroy-version }} viceroy
 
       - name: Run tests
-        run: cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+        run: cargo test-fastly
 
   test-axum:
     name: cargo test (axum native)
@@ -67,7 +72,7 @@ jobs:
         run: cargo build -p trusted-server-adapter-axum
 
       - name: Run Axum adapter tests
-        run: cargo test -p trusted-server-adapter-axum
+        run: cargo test-axum
 
   test-typescript:
     name: vitest

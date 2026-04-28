@@ -21,7 +21,7 @@ use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_body, ensure_integration_backend_with_timeout, predict_backend_name_for_url,
+    collect_body, ensure_integration_backend_with_timeout, predict_integration_backend_name,
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
@@ -521,6 +521,7 @@ impl PrebidAuctionProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
+        _request_info: RequestInfo,
     ) -> OpenRtbRequest {
         let imps = request
             .slots
@@ -660,7 +661,7 @@ impl PrebidAuctionProvider {
                 // EIDs will be populated by identity providers; consent gating
                 // is applied via `gate_eids_by_consent` before they are set here.
                 eids: None,
-                synthetic_fresh: Some(request.user.fresh_id.clone()),
+                ec_fresh: Some(request.user.fresh_id.clone()),
             }
             .to_ext(),
             ..Default::default()
@@ -1053,23 +1054,26 @@ impl AuctionProvider for PrebidAuctionProvider {
     ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
+        let request_info = RequestInfo::from_request(context.request, context.client_info);
+
         // Create signer and compute signature if request signing is enabled
-        let signer_with_signature = if let Some(request_signing_config) =
-            &context.settings.request_signing
-        {
-            if request_signing_config.enabled {
-                let request_info = RequestInfo::from_request(context.request, context.client_info);
-                let signer = RequestSigner::from_services(context.services)?;
-                let params =
-                    SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
-                let signature = signer.sign_request(&params)?;
-                Some((signer, signature, params))
+        let signer_with_signature =
+            if let Some(request_signing_config) = &context.settings.request_signing {
+                if request_signing_config.enabled {
+                    let signer = RequestSigner::from_services(context.services)?;
+                    let params = SigningParams::new(
+                        request.id.clone(),
+                        request_info.host.clone(),
+                        request_info.scheme.clone(),
+                    );
+                    let signature = signer.sign_request(&params)?;
+                    Some((signer, signature, params))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Convert to OpenRTB with all enrichments
         let openrtb = self.to_openrtb(
@@ -1078,6 +1082,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             signer_with_signature
                 .as_ref()
                 .map(|(s, sig, params)| (s, sig.clone(), params)),
+            request_info,
         );
 
         // An empty `imp` array violates the OpenRTB spec and wastes a network
@@ -1213,19 +1218,21 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        let name = predict_backend_name_for_url(
+    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+        predict_integration_backend_name(
+            services,
             &self.config.server_url,
+            PREBID_INTEGRATION_ID,
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        );
-        if name.is_none() {
+        )
+        .inspect_err(|e| {
             log::error!(
-                "Failed to predict backend name for Prebid server URL '{}'",
+                "Failed to predict backend name for Prebid server URL '{}': {e:?}",
                 self.config.server_url
             );
-        }
-        name
+        })
+        .ok()
     }
 }
 
@@ -1277,16 +1284,24 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
+
     use crate::consent::ConsentContext;
     use crate::geo::GeoInfo;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{
+        build_services_with_http_client, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
+        StubHttpClient,
+    };
+    use crate::platform::{
+        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
+    };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
@@ -1314,6 +1329,57 @@ mod tests {
             bid_param_zone_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
+    }
+
+    struct PredictOnlyBackend;
+
+    impl PlatformBackend for PredictOnlyBackend {
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(format!(
+                "predicted_{}_{}_{}",
+                spec.scheme,
+                spec.host,
+                spec.first_byte_timeout.as_millis()
+            ))
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("unused".to_string())
+        }
+    }
+
+    fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(backend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo {
+                client_ip: None,
+                tls_protocol: None,
+                tls_cipher: None,
+            })
+            .build()
+    }
+
+    #[test]
+    fn prebid_backend_name_delegates_to_platform_backend_prediction() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let services = services_with_backend(PredictOnlyBackend);
+
+        let backend_name = provider
+            .backend_name(&services, 123)
+            .expect("should predict backend name through platform backend");
+
+        assert_eq!(
+            backend_name, "predicted_https_prebid.example_123",
+            "should use PlatformBackend::predict_name instead of duplicating the naming scheme"
+        );
     }
 
     fn create_test_auction_request() -> AuctionRequest {
@@ -1397,17 +1463,11 @@ mod tests {
         request: &'a http::Request<EdgeBody>,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
-        use crate::platform::test_support::noop_services;
-        let services: &'static crate::platform::RuntimeServices =
-            Box::leak(Box::new(noop_services()));
-        AuctionContext {
-            settings,
-            request,
-            client_info,
-            timeout_ms: 1000,
-            provider_responses: None,
-            services,
-        }
+        shared_test_auction_context(settings, request, client_info, 1000)
+    }
+
+    fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
+        RequestInfo::from_request(context.request, context.client_info)
     }
 
     fn config_from_settings(
@@ -1423,7 +1483,7 @@ mod tests {
         )
     }
 
-    /// Shared TOML prefix for config-parsing tests (publisher + synthetic sections).
+    /// Shared TOML prefix for config-parsing tests (publisher + ec sections).
     const TOML_BASE: &str = r#"
 [[handlers]]
 path = "^/admin"
@@ -1436,11 +1496,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[synthetic]
-counter_store = "test-counter-store"
-opid_store = "test-opid-store"
+[edge_cookie]
 secret_key = "test-secret-key"
-template = "{{client_ip}}:{{user_agent}}"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
@@ -1835,7 +1892,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.test, None,
@@ -1890,7 +1952,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.test,
@@ -1927,7 +1994,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb
@@ -1962,7 +2034,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.test, None,
@@ -2020,7 +2097,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let imp = &openrtb.imp[0];
 
         assert_eq!(imp.bidfloor, Some(1.5), "should set bidfloor from slot");
@@ -2048,7 +2130,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let imp = &openrtb.imp[0];
 
         assert_eq!(imp.bidfloor, None, "should omit bidfloor when not set");
@@ -2075,7 +2162,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let imp = &openrtb.imp[0];
 
         assert_eq!(imp.secure, Some(true), "should require HTTPS creatives");
@@ -2122,7 +2214,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.user.as_ref().and_then(|u| u.consent.as_deref()),
@@ -2175,7 +2272,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
@@ -2216,7 +2318,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert!(
             openrtb.regs.is_none(),
@@ -2247,7 +2354,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
@@ -2273,7 +2385,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert!(openrtb.regs.is_none(), "should omit regs entirely");
     }
@@ -2302,7 +2419,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let regs = openrtb.regs.as_ref().expect("should have regs");
 
         assert_eq!(
@@ -2528,7 +2650,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let device = openrtb.device.as_ref().expect("should have device");
 
         assert_eq!(device.dnt, Some(true), "should set dnt from DNT header");
@@ -2560,7 +2687,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let device = openrtb.device.as_ref().expect("should have device");
 
         assert_eq!(
@@ -2596,7 +2728,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let device = openrtb.device.as_ref().expect("should have device");
 
         assert_eq!(
@@ -2635,7 +2772,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert!(
             openrtb.imp.is_empty(),
@@ -2673,7 +2815,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let geo = openrtb
             .device
             .as_ref()
@@ -2709,7 +2856,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.tmax,
@@ -2742,7 +2894,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         assert_eq!(
             openrtb.tmax, None,
@@ -2772,7 +2929,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let formats = &openrtb.imp[0]
             .banner
             .as_ref()
@@ -2809,7 +2971,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let site = openrtb.site.as_ref().expect("should have site");
 
         assert_eq!(
@@ -2836,7 +3003,12 @@ server_url = "https://prebid.example"
             },
         );
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
         let publisher = openrtb
             .site
             .as_ref()
@@ -3005,7 +3177,8 @@ server_url = "https://prebid.example"
             provider_responses: None,
             services: &services,
         };
-        provider.to_openrtb(request, &context, None)
+        let request_info = make_request_info(&context);
+        provider.to_openrtb(request, &context, None, request_info)
     }
 
     fn bidder_params(ortb: &OpenRtbRequest) -> &serde_json::Map<String, Json> {

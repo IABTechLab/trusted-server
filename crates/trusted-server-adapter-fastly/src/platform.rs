@@ -35,12 +35,11 @@ use trusted_server_core::platform::{
 ///
 /// # Write cost
 ///
-/// `put` and `delete` construct a [`FastlyManagementApiClient`] on every call,
-/// which opens the `"api-keys"` secret store to read the management API key. On
-/// Fastly Compute, the SDK caches the open handle so repeated opens within a
-/// single request are cheap. Callers that issue many writes in one request
-/// should be aware that each call performs a synchronous outbound API
-/// request to the Fastly management API.
+/// `put` and `delete` each perform a synchronous outbound HTTPS request to the
+/// Fastly management API (`api.fastly.com`). Callers that issue many writes in
+/// one request pay one round-trip per call. The `"api-keys"` secret store is
+/// opened per call to read the management token; the Fastly Compute SDK caches
+/// the open handle so that cost is negligible.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
@@ -86,8 +85,9 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 ///
 /// # Write cost
 ///
-/// `create` and `delete` have the same per-call [`FastlyManagementApiClient`] cost
-/// described on [`FastlyPlatformConfigStore`].
+/// `create` and `delete` have the same per-call
+/// [`crate::management_api::FastlyManagementApiClient`] cost described on
+/// [`FastlyPlatformConfigStore`].
 pub struct FastlyPlatformSecretStore;
 
 impl PlatformSecretStore for FastlyPlatformSecretStore {
@@ -177,30 +177,31 @@ impl PlatformBackend for FastlyPlatformBackend {
 
 /// Convert a platform-neutral [`edgezero_core::http::Request`] to a [`fastly::Request`].
 ///
-/// Only `Body::Once` bodies are forwarded; `Body::Stream` bodies are not
-/// used on this path (proxy.rs builds bodies from byte slices).
-fn edge_request_to_fastly(request: edgezero_core::http::Request) -> fastly::Request {
+/// Only buffered `Body::Once` bodies are supported on this path.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::HttpClient`] when the request body is streaming.
+fn edge_request_to_fastly(
+    request: edgezero_core::http::Request,
+) -> Result<fastly::Request, Report<PlatformError>> {
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
-        fastly_req.set_header(name.as_str(), value.as_bytes());
+        fastly_req.append_header(name.as_str(), value.as_bytes());
     }
-    // Only Body::Once is supported. Body::Stream is intentionally not forwarded
-    // because all outbound proxy bodies are built from Vec<u8> via EdgeBody::from()
-    // and are therefore always Once. When this conversion moves to edgezero-adapter-fastly
-    // it can use send_async_streaming() to handle Stream bodies properly.
-    debug_assert!(
-        matches!(&body, edgezero_core::body::Body::Once(_)),
-        "unexpected Body::Stream in edge_request_to_fastly: body will be empty"
-    );
-    if let edgezero_core::body::Body::Once(bytes) = body {
-        if !bytes.is_empty() {
-            fastly_req.set_body(bytes.to_vec());
+    match body {
+        edgezero_core::body::Body::Once(bytes) => {
+            if !bytes.is_empty() {
+                fastly_req.set_body(bytes.to_vec());
+            }
         }
-    } else {
-        log::warn!("edge_request_to_fastly: Body::Stream not supported; body will be empty");
+        edgezero_core::body::Body::Stream(_) => {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("streaming request body is not supported by Fastly request conversion"));
+        }
     }
-    fastly_req
+    Ok(fastly_req)
 }
 
 /// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
@@ -242,7 +243,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let fastly_req = edge_request_to_fastly(request.request);
+        let fastly_req = edge_request_to_fastly(request.request)?;
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -254,7 +255,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let fastly_req = edge_request_to_fastly(request.request);
+        let fastly_req = edge_request_to_fastly(request.request)?;
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -273,55 +274,26 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
-        let mut saved_names: Vec<String> = Vec::with_capacity(pending_requests.len());
 
         for platform_req in pending_requests {
-            let name = platform_req.backend_name().unwrap_or("").to_string();
-            let inner = platform_req.downcast::<PendingRequest>().map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("PlatformPendingRequest inner type is not fastly::PendingRequest")
+            let inner = platform_req.downcast::<PendingRequest>().map_err(|platform_req| {
+                let backend_name = platform_req.backend_name().unwrap_or("<unknown>");
+                Report::new(PlatformError::HttpClient).attach(format!(
+                    "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
+                ))
             })?;
             fastly_pending.push(inner);
-            saved_names.push(name);
         }
 
         let (result, remaining_fastly) = select(fastly_pending);
 
-        // Re-attach saved backend names to the remaining pending requests.
-        // Identify which request completed by matching the response backend name
-        // to the saved names, then skip that index when rebuilding remaining.
-        let completed_name = match &result {
-            Ok(resp) => resp.get_backend_name().map(str::to_string),
-            Err(_) => None,
-        };
-        let completed_idx = completed_name
-            .as_deref()
-            .and_then(|name| saved_names.iter().position(|n| n == name));
-        if completed_name.is_some() && completed_idx.is_none() {
-            log::warn!(
-                "select: completed backend name not found in saved names; \
-                 remaining requests will lose backend correlation"
-            );
-        }
-
-        let remaining: Vec<PlatformPendingRequest> = if let Some(idx) = completed_idx {
-            remaining_fastly
-                .into_iter()
-                .zip(
-                    saved_names
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != idx)
-                        .map(|(_, name)| name),
-                )
-                .map(|(req, name)| PlatformPendingRequest::new(req).with_backend_name(name))
-                .collect()
-        } else {
-            remaining_fastly
-                .into_iter()
-                .map(PlatformPendingRequest::new)
-                .collect()
-        };
+        // Fastly's select() does not preserve input order for remaining requests,
+        // so positional backend-name re-association is unreliable. Backend names
+        // are re-derived from get_backend_name() when each remaining request completes.
+        let remaining: Vec<PlatformPendingRequest> = remaining_fastly
+            .into_iter()
+            .map(PlatformPendingRequest::new)
+            .collect();
 
         let ready = match result {
             Ok(fastly_resp) => {
@@ -376,89 +348,6 @@ impl PlatformGeo for FastlyPlatformGeo {
 }
 
 // ---------------------------------------------------------------------------
-// FastlyConsentKvStore
-// ---------------------------------------------------------------------------
-
-/// Fastly KV Store–backed implementation of [`trusted_server_core::consent::kv::ConsentKvOps`].
-///
-/// Uses the synchronous Fastly KV Store API so it is compatible with the
-/// non-async consent pipeline ([`trusted_server_core::consent::build_consent_context`]).
-pub struct FastlyConsentKvStore {
-    store: fastly::kv_store::KVStore,
-}
-
-impl FastlyConsentKvStore {
-    /// Open a Fastly KV Store by name for consent persistence.
-    ///
-    /// Returns `None` when the store does not exist or cannot be opened;
-    /// a warning is logged in that case. Callers should treat `None` as "KV
-    /// disabled" and pass `kv_ops: None` to the consent pipeline.
-    #[must_use]
-    pub fn open(store_name: &str) -> Option<Self> {
-        match fastly::kv_store::KVStore::open(store_name) {
-            Ok(Some(store)) => Some(Self { store }),
-            Ok(None) => {
-                log::warn!("Consent KV store '{store_name}' not found");
-                None
-            }
-            Err(e) => {
-                log::warn!("Failed to open consent KV store '{store_name}': {e}");
-                None
-            }
-        }
-    }
-}
-
-impl trusted_server_core::consent::kv::ConsentKvOps for FastlyConsentKvStore {
-    fn load_entry(&self, key: &str) -> Option<trusted_server_core::consent::kv::KvConsentEntry> {
-        let mut response = match self.store.lookup(key) {
-            Ok(resp) => resp,
-            Err(fastly::kv_store::KVStoreError::ItemNotFound) => return None,
-            Err(e) => {
-                log::debug!("Consent KV lookup miss for '{key}': {e}");
-                return None;
-            }
-        };
-        let bytes = response.take_body_bytes();
-        match serde_json::from_slice(&bytes) {
-            Ok(entry) => Some(entry),
-            Err(e) => {
-                log::warn!("Failed to deserialize consent KV entry for '{key}': {e}");
-                None
-            }
-        }
-    }
-
-    fn save_entry_with_ttl(
-        &self,
-        key: &str,
-        entry: &trusted_server_core::consent::kv::KvConsentEntry,
-        ttl: std::time::Duration,
-    ) {
-        let Ok(body) = serde_json::to_string(entry) else {
-            log::warn!("Failed to serialize consent entry for '{key}'");
-            return;
-        };
-        match self
-            .store
-            .build_insert()
-            .time_to_live(ttl)
-            .execute(key, body)
-        {
-            Ok(()) => log::info!("Saved consent to KV store for '{key}'"),
-            Err(e) => log::warn!("Failed to write consent to KV store for '{key}': {e}"),
-        }
-    }
-
-    fn delete_entry(&self, key: &str) {
-        match self.store.delete(key) {
-            Ok(()) => log::info!("Deleted consent KV entry for '{key}' (consent revoked)"),
-            Err(e) => log::warn!("Failed to delete consent KV entry for '{key}': {e}"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry-point helper
 // ---------------------------------------------------------------------------
 
@@ -507,6 +396,7 @@ pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvErr
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -690,7 +580,7 @@ mod tests {
     fn fastly_platform_http_client_select_returns_error_for_wrong_inner_type() {
         let client = FastlyPlatformHttpClient;
         // Wrap a non-PendingRequest type to trigger the downcast failure.
-        let wrong = PlatformPendingRequest::new(42u32);
+        let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
         let err = futures::executor::block_on(client.select(vec![wrong]))
             .expect_err("should return error for wrong inner type");
 
@@ -698,6 +588,64 @@ mod tests {
             matches!(err.current_context(), &PlatformError::HttpClient),
             "should be HttpClient error, got: {:?}",
             err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("origin-a"),
+            "should include backend name in error report: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(Body::from_stream(futures::stream::empty::<
+                Result<_, io::Error>,
+            >()))
+            .expect("should build streaming test request");
+
+        let err = futures::executor::block_on(
+            client.send(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should reject streaming request bodies before sending");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("streaming request body"),
+            "should describe the unsupported streaming body: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_async_returns_error_for_streaming_body() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(Body::from_stream(futures::stream::empty::<
+                Result<_, io::Error>,
+            >()))
+            .expect("should build streaming test request");
+
+        let err = futures::executor::block_on(
+            client.send_async(PlatformHttpRequest::new(request, "nonexistent-backend")),
+        )
+        .expect_err("should reject streaming request bodies before launching async send");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("streaming request body"),
+            "should describe the unsupported streaming body: {err:?}"
         );
     }
 }

@@ -26,10 +26,10 @@ See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guid
 cargo build
 
 # Run tests (Fastly/WASM crates — requires Viceroy)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
+cargo test-fastly
 
 # Run tests (Axum native adapter)
-cargo test -p trusted-server-adapter-axum
+cargo test-axum
 
 # Start local server — Axum (no Fastly CLI or Viceroy required)
 cargo run -p trusted-server-adapter-axum
@@ -48,8 +48,8 @@ cargo fmt
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Run all tests
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
-cargo test -p trusted-server-adapter-axum
+cargo test-fastly   # Fastly/WASM (requires Viceroy)
+cargo test-axum     # Axum native adapter
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

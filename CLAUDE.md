@@ -6,7 +6,7 @@
 ## Project Overview
 
 Rust-based edge computing application targeting **Fastly Compute**. Handles
-privacy-preserving synthetic ID generation, ad serving with GDPR compliance,
+privacy-preserving Edge Cookie (EC) ID generation, ad serving with GDPR compliance,
 real-time bidding integration, and publisher-side JavaScript injection.
 
 ## Workspace Layout
@@ -55,15 +55,16 @@ fastly compute publish
 cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
-cargo test -p trusted-server-adapter-axum
+cargo test-axum
 ```
 
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests (Fastly/WASM crates via Viceroy, axum separately)
-cargo test --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1
-cargo test -p trusted-server-adapter-axum
+# Run all Rust tests — use workspace aliases (see .cargo/config.toml)
+# Both adapters are workspace members; default-members is native-only (core + axum).
+cargo test-fastly  # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-axum    # Axum dev server adapter (native)
 
 # Format
 cargo fmt --all -- --check
@@ -374,7 +375,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
 | `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
 | `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/trusted-server-core/src/synthetic.rs`             | Synthetic ID generation                           |
+| `crates/trusted-server-core/src/edge_cookie.rs`           | Edge Cookie (EC) ID generation                    |
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |

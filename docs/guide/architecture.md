@@ -14,7 +14,7 @@ flowchart TD
   subgraph edge["Trusted Server"]
     direction TB
     gdpr["GDPR Check"]
-    ids["Synthetic IDs"]
+    ids["EC IDs"]
     ads["Ad Serving"]
     gdpr --> ids --> ads
   end
@@ -29,7 +29,7 @@ flowchart TD
 
 Core library containing shared functionality:
 
-- Synthetic ID generation
+- Edge Cookie (EC) ID generation
 - Cookie handling
 - HTTP abstractions
 - GDPR consent management
@@ -88,7 +88,7 @@ All tracking operations require explicit GDPR consent checks before execution.
 
 1. **Request Ingress** - Request arrives at Fastly edge
 2. **Consent Validation** - GDPR consent checked
-3. **ID Generation** - Synthetic ID generated (if consented)
+3. **ID Generation** - EC ID generated (if consented)
 4. **Ad Request** - Backend ad server called
 5. **Response Processing** - Creative processed and modified
 6. **Response Egress** - Response sent to browser
@@ -102,7 +102,7 @@ Used for:
 - Counter storage
 - Domain mappings
 - Configuration cache
-- Synthetic ID state
+- EC ID state
 
 ### No User Data Persistence
 

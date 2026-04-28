@@ -22,9 +22,11 @@ use crate::auction::types::{
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, ensure_integration_backend_with_timeout, predict_backend_name_for_url,
+    collect_body, ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
-use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
+use crate::platform::{
+    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
+};
 use crate::settings::{IntegrationConfig, Settings};
 
 // ============================================================================
@@ -409,19 +411,21 @@ impl AuctionProvider for AdServerMockProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        let name = predict_backend_name_for_url(
+    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+        predict_integration_backend_name(
+            services,
             &self.config.endpoint,
+            "adserver_mock",
             true,
             Duration::from_millis(u64::from(timeout_ms)),
-        );
-        if name.is_none() {
+        )
+        .inspect_err(|e| {
             log::error!(
-                "Failed to predict backend name for AdServer Mock endpoint '{}'",
+                "Failed to predict backend name for AdServer Mock endpoint '{}': {e:?}",
                 self.config.endpoint
             );
-        }
-        name
+        })
+        .ok()
     }
 }
 
