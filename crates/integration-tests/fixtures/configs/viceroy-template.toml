@@ -25,6 +25,11 @@
             key = "placeholder"
             data = "placeholder"
 
+        # Pre-seeded EC row for KV-backed EC lifecycle tests.
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
+            data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
+
         [[local_server.kv_stores.ec_partner_store]]
             key = "placeholder"
             data = "placeholder"

@@ -1,8 +1,7 @@
 use crate::common::assertions;
 use crate::common::ec::{
-    assert_json_response, assert_status, batch_sync, batch_sync_no_auth,
-    extract_ec_cookie_from_response, identify, identify_with_headers, is_ec_cookie_expired,
-    normalize_ec_id, BatchMapping, EcTestClient,
+    assert_json_response, assert_status, batch_sync, batch_sync_no_auth, identify,
+    identify_with_headers, is_ec_cookie_expired, normalize_ec_id, BatchMapping, EcTestClient,
 };
 use crate::common::runtime::{origin_port, TestError, TestResult};
 use error_stack::Report;
@@ -440,11 +439,12 @@ impl CustomScenario {
 /// `/_ts/api/v1/batch-sync`, `/_ts/admin/v1/partners/register`).
 #[derive(Debug, Clone)]
 pub enum EcScenario {
-    /// Full flow: organic request generates EC → batch sync writes partner
-    /// UID → identify (Bearer auth) returns scoped UID.
+    /// Seeded EC row → batch sync writes partner UID → identify (Bearer auth)
+    /// returns the scoped UID.
     FullLifecycle,
 
-    /// Consent withdrawal: GPC header triggers EC cookie deletion.
+    /// Consent withdrawal: GPC header triggers EC cookie deletion for a
+    /// seeded EC in the default US-state test geo.
     ConsentWithdrawal,
 
     /// Identify without EC cookie returns 204.
@@ -456,7 +456,7 @@ pub enum EcScenario {
     /// Batch sync two partners → identify each partner returns its own UID.
     ConcurrentPartnerSyncs,
 
-    /// Batch sync happy path: authenticated request writes UID.
+    /// Batch sync happy path: authenticated request writes UID for a seeded EC.
     BatchSyncHappyPath,
 
     /// Batch sync auth rejection: no auth → 401, wrong auth → 401.
@@ -497,19 +497,29 @@ impl EcScenario {
     }
 }
 
-/// Full lifecycle: page load → EC → batch sync → identify (Bearer auth) with scoped UID.
+/// US Privacy signal that explicitly allows storage in the default Viceroy
+/// integration-test geo (US-CA).
+const ALLOW_US_PRIVACY_COOKIE: &str = "1YNN";
+const SEEDED_EC_ID: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+
+fn allow_ec_generation(client: &EcTestClient) {
+    client.set_cookie("us_privacy", ALLOW_US_PRIVACY_COOKIE);
+}
+
+fn use_seeded_ec(client: &EcTestClient) -> String {
+    client.set_cookie("ts-ec", SEEDED_EC_ID);
+    normalize_ec_id(SEEDED_EC_ID)
+}
+
+/// Full lifecycle: seeded EC → batch sync → identify (Bearer auth) with scoped UID.
 ///
 /// Uses the `inttest` partner pre-configured in `trusted-server.toml`.
 fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
-
-    // 1. Organic request generates EC cookie
-    let resp = client.get("/")?;
-    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
-        Report::new(TestError::EcCookieNotSet).attach("organic GET / should set ts-ec cookie")
-    })?;
-    let ec_id = normalize_ec_id(&ec_id);
-    log::info!("EC full lifecycle: generated EC ID = {ec_id}");
+    allow_ec_generation(&client);
+    let ec_id = use_seeded_ec(&client);
+    log::info!("EC full lifecycle: using seeded EC ID = {ec_id}");
 
     // 2. Batch sync writes partner UID (partner "inttest" is in config)
     let mappings = vec![BatchMapping {
@@ -565,32 +575,25 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
 /// Consent withdrawal: GPC header clears EC cookie.
 fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
+    allow_ec_generation(&client);
+    let ec_id = use_seeded_ec(&client);
+    log::info!("EC consent withdrawal: using seeded EC = {ec_id}");
 
-    // 1. Generate EC (no consent headers → non-regulated → EC allowed)
-    let resp = client.get("/")?;
-    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
-        Report::new(TestError::EcCookieNotSet).attach("should set ts-ec on first organic request")
-    })?;
-    log::info!("EC consent withdrawal: generated EC = {ec_id}");
-
-    // 2. Second request with GPC=1 should revoke consent and expire the EC
-    // cookie. This endpoint was selected because step #1 proved EC was
-    // allowed for this client in the active runtime config.
-    //
-    // Implementation note: this works because GPC + no geo headers →
-    // `Jurisdiction::Unknown` → fail-closed → consent denied. If the
-    // consent engine ever becomes more permissive for Unknown jurisdictions,
-    // this test should be updated to use an explicit GDPR consent denial
-    // (e.g. a TCF string with denied purposes).
+    // GPC overrides the allow cookie in US-CA, so this is an explicit
+    // withdrawal and must expire the EC cookie.
     let resp = client.get_with_headers("/", &[("sec-gpc", "1")])?;
 
     if !is_ec_cookie_expired(&resp) {
         return Err(Report::new(TestError::UnexpectedContent)
             .attach("consent withdrawal should expire ts-ec cookie (expected Max-Age=0)"));
     }
+    if client.ec_cookie_value().is_some() {
+        return Err(Report::new(TestError::UnexpectedContent)
+            .attach("client should stop tracking ts-ec after explicit withdrawal"));
+    }
 
-    // 3. With cookie revoked and no GPC header on identify, server should
-    // report no EC present (Bearer auth is valid but EC cookie was cleared).
+    // 3. With consent still granted and the EC cookie revoked, identify should
+    // now report no EC present.
     let resp = identify(&client, "inttest-api-key-1")?;
     assert_status(&resp, 204).attach("identify should return 204 after cookie revocation")?;
 
@@ -606,9 +609,11 @@ fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
 /// Identify without EC cookie returns 204 No Content.
 fn ec_identify_without_ec(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
+    allow_ec_generation(&client);
 
     let resp = identify(&client, "inttest-api-key-1")?;
-    assert_status(&resp, 204).attach("identify without EC cookie should return 204")?;
+    assert_status(&resp, 204)
+        .attach("identify without EC cookie should return 204 when consent is granted")?;
 
     log::info!("EC identify without EC: PASSED");
     Ok(())
@@ -617,17 +622,12 @@ fn ec_identify_without_ec(base_url: &str) -> TestResult<()> {
 /// Identify with consent denied returns 403.
 fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
+    allow_ec_generation(&client);
+    let _ec_id = use_seeded_ec(&client);
 
-    // Generate EC first (non-regulated → allowed)
-    let resp = client.get("/")?;
-    let _ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
-        Report::new(TestError::EcCookieNotSet)
-            .attach("should set ts-ec on organic request for consent-denied test")
-    })?;
-
-    // Identify with GPC=1 — without geo, jurisdiction is Unknown →
-    // fail-closed → consent denied. Per spec §11.4, consent is evaluated
-    // *after* Bearer auth, so this must be 403 Forbidden.
+    // Identify with GPC=1 — in the default US-CA test geo, GPC is an explicit
+    // denial that must override the allow cookie. Per spec §11.4, consent is
+    // evaluated after Bearer auth, so this must be 403 Forbidden.
     let resp = identify_with_headers(&client, "inttest-api-key-1", &[("sec-gpc", "1")])?;
 
     let status = resp.status().as_u16();
@@ -646,14 +646,9 @@ fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
 /// Batch sync two config-based partners → identify each returns its own scoped UID.
 fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
-
-    // Generate EC
-    let resp = client.get("/")?;
-    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
-        Report::new(TestError::EcCookieNotSet).attach("concurrent syncs: need EC cookie")
-    })?;
-    let ec_id = normalize_ec_id(&ec_id);
-    log::info!("EC concurrent syncs: EC = {ec_id}");
+    allow_ec_generation(&client);
+    let ec_id = use_seeded_ec(&client);
+    log::info!("EC concurrent syncs: using seeded EC = {ec_id}");
 
     // Batch sync both partners (both are pre-configured in trusted-server.toml)
     let mappings_a = vec![BatchMapping {
@@ -709,14 +704,9 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
 /// Uses the `inttest` partner pre-configured in `trusted-server.toml`.
 fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
-
-    // Generate EC to get a valid EC ID
-    let resp = client.get("/")?;
-    let ec_id = extract_ec_cookie_from_response(&resp).ok_or_else(|| {
-        Report::new(TestError::EcCookieNotSet).attach("batch sync: need EC cookie")
-    })?;
-    let ec_id = normalize_ec_id(&ec_id);
-    log::info!("EC batch sync happy path: ec_id = {ec_id}");
+    allow_ec_generation(&client);
+    let ec_id = use_seeded_ec(&client);
+    log::info!("EC batch sync happy path: using seeded ec_id = {ec_id}");
 
     // Batch sync writes a UID for this EC ID (partner "inttest" is in config)
     let mappings = vec![BatchMapping {
