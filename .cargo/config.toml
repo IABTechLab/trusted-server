@@ -4,7 +4,7 @@
 #   trusted-server-adapter-cloudflare → wasm32-unknown-unknown (Cloudflare Workers)
 #
 # All adapters are workspace members so `-p` resolves each.
-# default-members (core + fastly) are the primary targets.
+# default-members = [fastly] — required so Viceroy can locate the binary via `cargo run --bin`.
 # Use the aliases below to target each adapter with the correct toolchain.
 
 [alias]

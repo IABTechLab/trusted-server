@@ -15,14 +15,13 @@ exclude = [
     "crates/openrtb-codegen",
 ]
 
-# Default members are native-compatible only.
-# bare `cargo test` runs core + Axum on the host target.
-# Use cargo aliases to test each adapter with the correct target:
-#   cargo test-fastly  → wasm32-wasip1 (Fastly + core)
-#   cargo test-axum    → native        (Axum)
+# Viceroy (cargo test-fastly runner) calls `cargo run --bin trusted-server-adapter-fastly`
+# against the default-run packages. It must be the sole default member so Cargo can
+# locate the binary. Use aliases to test each adapter with the correct target:
+#   cargo test-fastly → wasm32-wasip1 (Fastly + core, via Viceroy)
+#   cargo test-axum   → native        (Axum)
 default-members = [
-    "crates/trusted-server-core",
-    "crates/trusted-server-adapter-axum",
+    "crates/trusted-server-adapter-fastly",
 ]
 
 [workspace.lints.clippy]
