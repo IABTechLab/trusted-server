@@ -46,4 +46,131 @@ Invoked as `/generate-feature-docs <spec-path>`. The argument is a path to a spe
 
 If the spec file does not exist, abort with a clear error. If the spec file lives outside `docs/superpowers/specs/implemented/`, warn once and ask the user to confirm before proceeding.
 
-<!-- Tasks 7, 8, 9 will append stage 1, stage 2, and edge cases below this comment. Remove this comment when those sections are added. -->
+
+## Stage 1: Extraction pass
+
+Read-only. Produces a structured outline shown to the user in chat. Do not write any files during stage 1.
+
+### Step 1.1: Parse the spec
+
+Read the spec file. Extract:
+- The H1 title (treat as the feature name).
+- The intro paragraph (treat as the description).
+- All H2 and H3 section headings.
+- All fenced code blocks. Note the language tag of each block.
+
+### Step 1.2: Detect spec kind
+
+Heuristic on section names:
+- A spec with sections like "Configuration", "Public API", or "Endpoints" is a **feature spec**. Proceed normally.
+- A spec with sections like "Migration phases" or "Rollout plan" is a **migration spec**.
+- A spec with sections like "Pre-prod checklist" or "Production readiness" is a **readiness report**.
+- Anything else with no clear kind is **unknown**.
+
+For non-feature specs and unknown specs, ask:
+> "This looks like a `<kind>` spec, not a feature spec. Continue anyway, or abort?"
+
+Do not proceed without explicit confirmation.
+
+### Step 1.3: Resolve the target page path
+
+Slug the feature name to kebab-case (e.g., "RSL AI Crawler Licensing" becomes `ai-crawler-licensing`). The target page is `docs/guide/<slug>.md`.
+
+Check if the target page already exists:
+- If exists: this is an augmentation case. Note the existing file's section structure (H2/H3 walk).
+- If not: this is a greenfield case.
+
+If a near-match exists (e.g., the slug differs only by a word), surface it as a candidate before proceeding:
+> "I will write to `docs/guide/<slug>.md`. A similar page exists at `docs/guide/<other-slug>.md`. Augment the existing page, or create a new one?"
+
+### Step 1.4: Detect Sequence-section need
+
+Heuristic: scan the spec for numbered request-flow steps, or language like "first ... then ... finally", or sequence diagrams. If present, mark `needs_sequence_section: yes` for stage 2.
+
+### Step 1.5: Detect multi-feature specs
+
+If the spec has 2 or more top-level "Feature: X" sections, or the H1 is ambiguous (covers multiple distinct features), list candidate features and ask:
+> "This spec covers multiple features: <A>, <B>, <C>. Generate one page per feature, one combined page, or a subset?"
+
+No default. The user must pick.
+
+### Step 1.6: Extract handles
+
+Walk the spec body for:
+
+- **Config keys**: TOML keys (`section.key` or `key` inside a `[section]` block), and any inline references like `the X config key`.
+- **Endpoint paths**: URL strings starting with `/`, often inside code blocks or backtick-delimited.
+- **HTTP headers**: names matching `X-...` or shown as `Header: value`.
+- **Error variants**: Rust enum variants matching `SomethingError::Variant`, and any plain-text references to error codes.
+
+Record each handle with its surface form and any context the spec gave (purpose, valid values, defaults).
+
+### Step 1.7: Verify each handle against code
+
+For each handle, search the code:
+
+- Config keys: grep `crates/**/*.rs` and `trusted-server.toml` for the key name. Capture the file and line number when found.
+- Endpoint paths: grep `crates/**/*.rs` for the path string (try both quoted and unquoted forms).
+- HTTP headers: grep for the header name as a string literal, plus any const declarations.
+- Error variants: grep for the variant name, and locate its enum definition.
+
+Mark each handle as `verified` (with `file:line`) or `NOT FOUND`.
+
+### Step 1.8: Detect spec inconsistencies
+
+Look for:
+- Same config key spelled two ways across the spec (e.g., `rsl.enabled` and `rsl_enabled`).
+- Two endpoints with the same path but different descriptions.
+- Two error variants with conflicting trigger descriptions.
+
+Surface any findings under an "Inconsistencies" subsection in the outline.
+
+### Step 1.9: Render the outline
+
+Render a single chat message in this format. Use it verbatim, filling in the values you extracted:
+
+```markdown
+## Extraction summary for `<spec-filename>`
+
+**Feature:** <feature name>
+**Target page:** `docs/guide/<slug>.md` (NEW or EXISTING)
+**Spec kind:** <feature | migration | readiness | unknown>
+**Sequence section:** <yes (brief description) | no>
+
+### Config keys
+| Key             | Status              | Location              |
+| --------------- | ------------------- | --------------------- |
+| `<key>`         | verified | NOT FOUND | `<file:line>` or "spec only" |
+
+### Endpoints
+| Path            | Methods | Status              | Location              |
+| --------------- | ------- | ------------------- | --------------------- |
+| `<path>`        | <verbs> | verified | NOT FOUND | `<file:line>` or "spec only" |
+
+### Headers
+| Name            | Direction        | Status              | Location              |
+| --------------- | ---------------- | ------------------- | --------------------- |
+| `<name>`        | request|response | verified | NOT FOUND | `<file:line>` or "spec only" |
+
+### Error variants
+| Variant         | Status              | Location              |
+| --------------- | ------------------- | --------------------- |
+| `<variant>`     | verified | NOT FOUND | `<file:line>` or "spec only" |
+
+### Inconsistencies (if any)
+- <description of inconsistency>
+
+### Issues
+For each handle marked `NOT FOUND` or each inconsistency, list options:
+- (A) Mark inline as "planned, not yet shipped"
+- (B) Drop the row from the relevant reference doc
+- (C) Pause and let me fix the spec or the code first
+
+Reply `proceed`, redirect specific fields (e.g. "use slug `rsl-licensing`"), or pick A/B/C for each issue.
+```
+
+Omit empty subsections (e.g., if no headers were extracted, omit the Headers table). Always include at least one of: Config keys, Endpoints, or Error variants. If none of these exist, the spec may not be a feature spec.
+
+### Step 1.10: Wait for user response
+
+Do not proceed to stage 2 until the user replies with `proceed` or equivalent affirmative ("yes, go ahead", "ok proceed", etc.). Substantial redirects (different slug, different target, new feature scope) regenerate the outline; minor redirects (drop a handle, override a heuristic) are noted and the skill proceeds.
