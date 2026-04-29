@@ -1,7 +1,7 @@
 //! Request signing and verification utilities.
 //!
 //! This module provides Ed25519-based signing and verification of HTTP requests
-//! using keys stored in Fastly Config and Secret stores.
+//! using keys stored via platform store primitives.
 
 use base64::{engine::general_purpose, Engine};
 use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
@@ -9,42 +9,52 @@ use error_stack::{Report, ResultExt};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
-use crate::request_signing::{JWKS_CONFIG_STORE_NAME, SIGNING_SECRET_STORE_NAME};
-use crate::storage::{FastlyConfigStore, FastlySecretStore};
+use crate::platform::RuntimeServices;
+use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
 /// Retrieves the current active key ID from the config store.
 ///
 /// # Errors
 ///
 /// Returns an error if the config store cannot be accessed or the current-kid key is not found.
-#[allow(deprecated)]
-pub fn get_current_key_id() -> Result<String, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
-    store.get("current-kid")
+pub fn get_current_key_id(
+    services: &RuntimeServices,
+) -> Result<String, Report<TrustedServerError>> {
+    services
+        .config_store()
+        .get(&JWKS_STORE_NAME, "current-kid")
+        .change_context(TrustedServerError::Configuration {
+            message: "failed to read current-kid from config store".into(),
+        })
 }
 
-fn parse_ed25519_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, Report<TrustedServerError>> {
-    let bytes = if key_bytes.len() > 32 {
-        general_purpose::STANDARD.decode(&key_bytes).map_err(|_| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Failed to decode base64 key".into(),
-            })
-        })?
-    } else {
-        key_bytes
-    };
+/// Parses an Ed25519 signing key from secret-store bytes.
+///
+/// Request-signing rotation always stores private keys as standard base64 text
+/// via [`crate::request_signing::rotation::KeyRotationManager`]. A non-base64
+/// value in the secret store indicates data corruption and is surfaced as an
+/// explicit error rather than silently falling back to a length heuristic.
+fn parse_ed25519_signing_key(key_bytes: &[u8]) -> Result<SigningKey, Report<TrustedServerError>> {
+    let bytes = general_purpose::STANDARD.decode(key_bytes).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "signing key is not valid base64 — corrupt key material in secret store"
+                .into(),
+        })
+    })?;
 
     let key_array: [u8; 32] = bytes.try_into().map_err(|_| {
         Report::new(TrustedServerError::Configuration {
-            message: "Invalid key length (expected 32 bytes for Ed25519)".into(),
+            message: "signing key must be 32 bytes after base64 decoding".into(),
         })
     })?;
 
     Ok(SigningKey::from_bytes(&key_array))
 }
 
+/// Signs request payloads using the current Ed25519 private key.
 pub struct RequestSigner {
     key: SigningKey,
+    /// Key identifier associated with the loaded private key.
     pub kid: String,
 }
 
@@ -68,9 +78,13 @@ struct SigningPayload<'a> {
 /// Parameters for enhanced request signing
 #[derive(Debug, Clone)]
 pub struct SigningParams {
+    /// Request identifier to bind into the signature payload.
     pub request_id: String,
+    /// Host header value expected by the receiving service.
     pub request_host: String,
+    /// Request scheme bound into the signature payload.
     pub request_scheme: String,
+    /// Signature timestamp in Unix milliseconds.
     pub timestamp: u64,
 }
 
@@ -91,8 +105,8 @@ impl SigningParams {
 
     /// Builds the canonical payload string for signing.
     ///
-    /// The payload is a JSON-serialized [`SigningPayload`] to prevent signature
-    /// confusion attacks that could exploit delimiter-based formats.
+    /// The payload is JSON-serialized to prevent signature confusion attacks
+    /// that could exploit delimiter-based formats.
     ///
     /// # Errors
     ///
@@ -115,26 +129,25 @@ impl SigningParams {
 }
 
 impl RequestSigner {
-    /// Creates a `RequestSigner` from the current key ID stored in config.
+    /// Creates a `RequestSigner` from the current key ID stored in platform stores.
     ///
     /// # Errors
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
-    #[allow(deprecated)]
-    pub fn from_config() -> Result<Self, Report<TrustedServerError>> {
-        let config_store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
+    pub fn from_services(services: &RuntimeServices) -> Result<Self, Report<TrustedServerError>> {
         let key_id =
-            config_store
-                .get("current-kid")
-                .change_context(TrustedServerError::Configuration {
-                    message: "Failed to get current-kid".into(),
-                })?;
+            get_current_key_id(services).change_context(TrustedServerError::Configuration {
+                message: "failed to get current-kid".into(),
+            })?;
 
-        let secret_store = FastlySecretStore::new(SIGNING_SECRET_STORE_NAME);
-        let key_bytes = secret_store
-            .get(&key_id)
-            .attach(format!("Failed to get signing key for kid: {}", key_id))?;
-        let signing_key = parse_ed25519_signing_key(key_bytes)?;
+        let key_bytes = services
+            .secret_store()
+            .get_bytes(&SIGNING_STORE_NAME, &key_id)
+            .change_context(TrustedServerError::Configuration {
+                message: format!("failed to get signing key for kid: {}", key_id),
+            })?;
+
+        let signing_key = parse_ed25519_signing_key(&key_bytes)?;
 
         Ok(Self {
             key: signing_key,
@@ -175,17 +188,17 @@ impl RequestSigner {
 /// # Errors
 ///
 /// Returns an error if the JWK cannot be retrieved, parsed, or if signature verification fails.
-#[allow(deprecated)]
 pub fn verify_signature(
     payload: &[u8],
     signature_b64: &str,
     kid: &str,
+    services: &RuntimeServices,
 ) -> Result<bool, Report<TrustedServerError>> {
-    let store = FastlyConfigStore::new(JWKS_CONFIG_STORE_NAME);
-    let jwk_json = store
-        .get(kid)
+    let jwk_json = services
+        .config_store()
+        .get(&JWKS_STORE_NAME, kid)
         .change_context(TrustedServerError::Configuration {
-            message: format!("Failed to get JWK for kid: {}", kid),
+            message: format!("failed to get JWK for kid: {}", kid),
         })?;
 
     let jwk: serde_json::Value = serde_json::from_str(&jwk_json).map_err(|e| {
@@ -242,88 +255,88 @@ pub fn verify_signature(
 
 #[cfg(test)]
 mod tests {
+    use crate::platform::test_support::build_request_signing_services;
+
     use super::*;
 
     #[test]
-    fn test_request_signer_sign() {
-        // Report unwraps print full error chain on test failure
-        // Note: unwrapping a Report prints it nicely if test fails.
-        let signer = RequestSigner::from_config().expect("should create signer from config");
+    fn from_services_loads_kid_from_config_store() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
+
+        assert_eq!(signer.kid, "test-kid", "should load kid from config store");
+    }
+
+    #[test]
+    fn sign_produces_non_empty_url_safe_base64_signature() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
+
         let signature = signer
             .sign(b"these pretzels are making me thirsty")
             .expect("should sign payload");
-        assert!(!signature.is_empty());
-        assert!(signature.len() > 32);
+
+        assert!(!signature.is_empty(), "should produce non-empty signature");
+        assert!(
+            signature.len() > 32,
+            "should produce a full-length signature"
+        );
     }
 
     #[test]
-    fn test_request_signer_from_config() {
-        let signer = RequestSigner::from_config().expect("should create signer from config");
-        assert!(!signer.kid.is_empty());
-    }
-
-    #[test]
-    fn test_sign_and_verify() {
+    fn sign_and_verify_roundtrip_succeeds() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let payload = b"test payload for verification";
-        let signer = RequestSigner::from_config().expect("should create signer from config");
+
         let signature = signer.sign(payload).expect("should sign payload");
-
-        let result =
-            verify_signature(payload, &signature, &signer.kid).expect("should verify signature");
-        assert!(result, "Signature should be valid");
-    }
-
-    #[test]
-    fn test_verify_invalid_signature() {
-        let payload = b"test payload";
-        let signer = RequestSigner::from_config().expect("should create signer from config");
-
-        let wrong_signature = signer
-            .sign(b"different payload")
-            .expect("should sign different payload");
-
-        let result = verify_signature(payload, &wrong_signature, &signer.kid)
+        let verified = verify_signature(payload, &signature, &signer.kid, &services)
             .expect("should attempt verification");
-        assert!(!result, "Invalid signature should not verify");
+
+        assert!(verified, "should verify a valid signature");
     }
 
     #[test]
-    fn test_verify_wrong_payload() {
-        let original_payload = b"original payload";
-        let signer = RequestSigner::from_config().expect("should create signer from config");
-        let signature = signer
-            .sign(original_payload)
-            .expect("should sign original payload");
+    fn verify_returns_false_for_wrong_payload() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signature = signer.sign(b"original").expect("should sign");
 
-        let wrong_payload = b"wrong payload";
-        let result = verify_signature(wrong_payload, &signature, &signer.kid)
+        let verified = verify_signature(b"wrong payload", &signature, &signer.kid, &services)
             .expect("should attempt verification");
-        assert!(!result, "Signature should not verify with wrong payload");
+
+        assert!(!verified, "should not verify signature for wrong payload");
     }
 
     #[test]
-    fn test_verify_missing_key() {
-        let payload = b"test payload";
-        let signer = RequestSigner::from_config().expect("should create signer from config");
-        let signature = signer.sign(payload).expect("should sign payload");
-        let nonexistent_kid = "nonexistent-key-id";
+    fn verify_errors_for_unknown_kid() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signature = signer.sign(b"payload").expect("should sign");
 
-        let result = verify_signature(payload, &signature, nonexistent_kid);
-        assert!(result.is_err(), "Should error for missing key");
+        let result = verify_signature(b"payload", &signature, "nonexistent-kid", &services);
+
+        assert!(result.is_err(), "should error for unknown kid");
     }
 
     #[test]
-    fn test_verify_malformed_signature() {
-        let payload = b"test payload";
-        let signer = RequestSigner::from_config().expect("should create signer from config");
-        let malformed_signature = "not-valid-base64!!!";
+    fn verify_errors_for_malformed_signature() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
-        let result = verify_signature(payload, malformed_signature, &signer.kid);
-        assert!(result.is_err(), "Should error for malformed signature");
+        let result = verify_signature(b"payload", "not-valid-base64!!!", &signer.kid, &services);
+
+        assert!(result.is_err(), "should error for malformed signature");
     }
 
     #[test]
-    fn test_signing_params_build_payload() {
+    fn signing_params_build_payload_serializes_all_fields() {
         let params = SigningParams {
             request_id: "req-123".to_string(),
             request_host: "example.com".to_string(),
@@ -336,6 +349,7 @@ mod tests {
             .expect("should build payload");
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("should be valid JSON");
+
         assert_eq!(parsed["version"], SIGNING_VERSION);
         assert_eq!(parsed["kid"], "kid-abc");
         assert_eq!(parsed["host"], "example.com");
@@ -345,46 +359,55 @@ mod tests {
     }
 
     #[test]
-    fn test_signing_params_new_creates_timestamp() {
+    fn signing_params_new_creates_recent_timestamp() {
         let params = SigningParams::new(
             "req-123".to_string(),
             "example.com".to_string(),
             "https".to_string(),
         );
 
-        assert_eq!(params.request_id, "req-123");
-        assert_eq!(params.request_host, "example.com");
-        assert_eq!(params.request_scheme, "https");
-        // Timestamp should be recent (within last minute), in milliseconds
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("should get system time")
             .as_millis() as u64;
-        assert!(params.timestamp <= now_ms);
-        assert!(params.timestamp >= now_ms - 60_000);
+
+        assert!(
+            params.timestamp <= now_ms,
+            "timestamp should not be in the future"
+        );
+        assert!(
+            params.timestamp >= now_ms - 60_000,
+            "timestamp should be within the last minute"
+        );
     }
 
     #[test]
-    fn test_sign_request_enhanced() {
-        let signer = RequestSigner::from_config().unwrap();
+    fn sign_request_enhanced_produces_verifiable_signature() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
         let params = SigningParams::new(
             "auction-123".to_string(),
             "publisher.com".to_string(),
             "https".to_string(),
         );
 
-        let signature = signer.sign_request(&params).unwrap();
-        assert!(!signature.is_empty());
+        let signature = signer.sign_request(&params).expect("should sign request");
+        let payload = params
+            .build_payload(&signer.kid)
+            .expect("should build payload");
 
-        // Verify the signature is valid by reconstructing the payload
-        let payload = params.build_payload(&signer.kid).unwrap();
-        let result = verify_signature(payload.as_bytes(), &signature, &signer.kid).unwrap();
-        assert!(result, "Enhanced signature should be valid");
+        let verified = verify_signature(payload.as_bytes(), &signature, &signer.kid, &services)
+            .expect("should verify");
+
+        assert!(verified, "enhanced request signature should be verifiable");
     }
 
     #[test]
-    fn test_sign_request_different_params_different_signature() {
-        let signer = RequestSigner::from_config().unwrap();
+    fn sign_request_different_hosts_produce_different_signatures() {
+        let services = build_request_signing_services();
+        let signer =
+            RequestSigner::from_services(&services).expect("should create signer from services");
 
         let params1 = SigningParams {
             request_id: "req-1".to_string(),
@@ -392,20 +415,19 @@ mod tests {
             request_scheme: "https".to_string(),
             timestamp: 1706900000,
         };
-
         let params2 = SigningParams {
             request_id: "req-1".to_string(),
-            request_host: "host2.com".to_string(), // Different host
+            request_host: "host2.com".to_string(),
             request_scheme: "https".to_string(),
             timestamp: 1706900000,
         };
 
-        let sig1 = signer.sign_request(&params1).unwrap();
-        let sig2 = signer.sign_request(&params2).unwrap();
+        let sig1 = signer.sign_request(&params1).expect("should sign params1");
+        let sig2 = signer.sign_request(&params2).expect("should sign params2");
 
         assert_ne!(
             sig1, sig2,
-            "Different hosts should produce different signatures"
+            "different hosts should produce different signatures"
         );
     }
 }

@@ -19,6 +19,8 @@ pub mod endpoints;
 pub mod formats;
 pub mod orchestrator;
 pub mod provider;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 
 pub use config::AuctionConfig;
