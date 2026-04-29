@@ -7,10 +7,8 @@
 //! [`crate::platform::PlatformSecretStore`], and the management write methods
 //! via [`crate::platform::RuntimeServices`].
 
-pub(crate) mod api_client;
 pub(crate) mod config_store;
 pub(crate) mod secret_store;
 
-pub use api_client::FastlyApiClient;
 pub use config_store::FastlyConfigStore;
 pub use secret_store::FastlySecretStore;

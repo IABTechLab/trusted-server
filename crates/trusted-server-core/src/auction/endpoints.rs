@@ -15,6 +15,7 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
@@ -40,6 +41,7 @@ pub async fn handle_auction(
     kv: Option<&KvIdentityGraph>,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
+    services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
@@ -104,6 +106,7 @@ pub async fn handle_auction(
         request: &req,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
+        services,
     };
 
     // Run the auction
