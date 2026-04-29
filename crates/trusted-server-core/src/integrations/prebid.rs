@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use validator::Validate;
 
+use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
@@ -33,12 +34,30 @@ use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
+const PREBID_REASON_EMPTY_RESPONSE: &str = "empty_response";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
 const ZONE_KEY: &str = "zone";
 
 /// Default currency for `OpenRTB` bid floors and responses.
 const DEFAULT_CURRENCY: &str = "USD";
+
+/// Maximum number of characters from upstream failure payloads included in
+/// debug-facing `body_preview` metadata.
+const PREBID_ERROR_BODY_PREVIEW_CHARS: usize = 1000;
+
+/// Maximum number of bytes processed when constructing debug-facing upstream
+/// failure previews.
+const PREBID_ERROR_BODY_PREVIEW_BYTES: usize = PREBID_ERROR_BODY_PREVIEW_CHARS * 4;
+
+fn prebid_body_preview(body: &[u8]) -> String {
+    let bounded_body = &body[..body.len().min(PREBID_ERROR_BODY_PREVIEW_BYTES)];
+
+    String::from_utf8_lossy(bounded_body)
+        .chars()
+        .take(PREBID_ERROR_BODY_PREVIEW_CHARS)
+        .collect()
+}
 
 /// CCPA/US-privacy string sent when the `Sec-GPC` header signals opt-out.
 ///
@@ -1377,27 +1396,54 @@ impl PrebidAuctionProvider {
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Parse response
+        let status = response.get_status();
         let body_bytes = response.take_body_bytes();
 
-        if !response.get_status().is_success() {
+        if !status.is_success() {
             log::warn!(
-                "Prebid returned non-success status: {}",
-                response.get_status(),
+                "Prebid returned non-success status: {status}; {} bytes",
+                body_bytes.len()
             );
-            if log::log_enabled!(log::Level::Trace) {
-                let body_preview = String::from_utf8_lossy(&body_bytes);
-                log::trace!(
-                    "Prebid error response body: {}",
-                    &body_preview[..body_preview.floor_char_boundary(1000)]
-                );
+
+            let mut auction_response =
+                AuctionResponse::error(PREBID_INTEGRATION_ID, response_time_ms)
+                    .with_metadata("error_type", serde_json::json!(ERROR_TYPE_HTTP_STATUS))
+                    .with_metadata("http_status", serde_json::json!(status.as_u16()));
+            if self.config.debug {
+                let body_preview = prebid_body_preview(&body_bytes);
+                if !body_preview.is_empty() {
+                    log::debug!("Prebid non-success response body: {body_preview}");
+                    auction_response = auction_response
+                        .with_metadata("body_preview", serde_json::json!(body_preview));
+                }
             }
-            return Ok(AuctionResponse::error("prebid", response_time_ms));
+
+            return Ok(auction_response);
         }
 
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
-                message: "Failed to parse Prebid response".to_string(),
-            })?;
+        if body_bytes.is_empty() {
+            log::info!(
+                "Prebid returned successful empty response with status {status}; treating as no-bid"
+            );
+            return Ok(
+                AuctionResponse::no_bid(PREBID_INTEGRATION_ID, response_time_ms)
+                    .with_metadata("reason", serde_json::json!(PREBID_REASON_EMPTY_RESPONSE))
+                    .with_metadata("http_status", serde_json::json!(status.as_u16())),
+            );
+        }
+
+        let response_json: Json = match serde_json::from_slice(&body_bytes) {
+            Ok(response_json) => response_json,
+            Err(error) => {
+                log::warn!(
+                    "Prebid: failed to parse response JSON (status {status}, {} bytes): {error}",
+                    body_bytes.len()
+                );
+                return Err(Report::new(TrustedServerError::Prebid {
+                    message: "Failed to parse Prebid response JSON".to_string(),
+                }));
+            }
+        };
 
         // Log the full response body when debug is enabled to surface
         // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
@@ -3285,6 +3331,154 @@ server_url = "https://prebid.example"
     fn get_prebid_ext(req: &OpenRtbRequest) -> PrebidExt {
         let ext = req.ext.as_ref().expect("should have request ext");
         serde_json::from_value(ext["prebid"].clone()).expect("should deserialise ext.prebid")
+    }
+
+    #[test]
+    fn parse_response_non_success_returns_error_with_http_metadata() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = Response::from_status(StatusCode::BAD_REQUEST).with_body("invalid request");
+
+        let auction_response = provider
+            .parse_response(response, 58)
+            .expect("should convert non-success status to provider error");
+
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::Error,
+            "should mark non-success upstream responses as errors"
+        );
+        assert_eq!(
+            auction_response.metadata["error_type"],
+            json!("http_status"),
+            "should classify the error source"
+        );
+        assert_eq!(
+            auction_response.metadata["http_status"],
+            json!(400),
+            "should include upstream HTTP status"
+        );
+        assert!(
+            auction_response.metadata.get("body_preview").is_none(),
+            "should not include upstream body preview unless debug is enabled"
+        );
+    }
+
+    #[test]
+    fn parse_response_non_success_includes_body_preview_when_debug_enabled() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let body = "x".repeat(PREBID_ERROR_BODY_PREVIEW_CHARS + 100);
+        let response = Response::from_status(StatusCode::BAD_REQUEST).with_body(body);
+
+        let auction_response = provider
+            .parse_response(response, 58)
+            .expect("should convert non-success status to provider error");
+
+        let body_preview = auction_response.metadata["body_preview"]
+            .as_str()
+            .expect("should include upstream body preview in debug mode");
+        assert_eq!(
+            body_preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should cap debug upstream body preview"
+        );
+    }
+
+    #[test]
+    fn parse_response_invalid_json_returns_safe_client_error() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = Response::from_status(StatusCode::OK).with_body(r#"{"seatbid":["bid""#);
+
+        let error = provider
+            .parse_response(response, 42)
+            .expect_err("should return parse failure for invalid JSON");
+
+        let message = format!("{error}");
+        assert!(
+            message.contains("Failed to parse Prebid response JSON"),
+            "should include stable user-safe parse failure message"
+        );
+        assert!(
+            !message.contains("expected value"),
+            "should not leak serde parse details"
+        );
+        assert!(
+            !message.contains("bytes"),
+            "should not leak response length in the user-safe message"
+        );
+    }
+
+    #[test]
+    fn parse_response_no_content_returns_no_bid_with_reason() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = Response::from_status(StatusCode::NO_CONTENT);
+
+        let auction_response = provider
+            .parse_response(response, 42)
+            .expect("should convert no-content status to no-bid");
+
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::NoBid,
+            "should treat 204 as a no-bid response"
+        );
+        assert_eq!(
+            auction_response.metadata["reason"],
+            json!("empty_response"),
+            "should explain why the provider returned no bids"
+        );
+        assert_eq!(
+            auction_response.metadata["http_status"],
+            json!(204),
+            "should include upstream HTTP status"
+        );
+    }
+
+    #[test]
+    fn parse_response_ok_empty_body_returns_no_bid_with_reason() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = Response::from_status(StatusCode::OK);
+
+        let auction_response = provider
+            .parse_response(response, 17)
+            .expect("should convert empty successful response to no-bid");
+
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::NoBid,
+            "should treat empty 200 as a no-bid response"
+        );
+        assert_eq!(
+            auction_response.metadata["reason"],
+            json!("empty_response"),
+            "should explain why the provider returned no bids"
+        );
+        assert_eq!(
+            auction_response.metadata["http_status"],
+            json!(200),
+            "should include upstream HTTP status"
+        );
+    }
+
+    #[test]
+    fn parse_response_valid_json_without_bids_returns_no_bid() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = Response::from_status(StatusCode::OK).with_body(r#"{"seatbid":[]}"#);
+
+        let auction_response = provider
+            .parse_response(response, 23)
+            .expect("should parse valid no-bid JSON");
+
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::NoBid,
+            "should preserve valid JSON no-bid behavior"
+        );
+        assert!(
+            auction_response.metadata.is_empty(),
+            "should not add empty-response metadata for valid no-bid JSON"
+        );
     }
 
     // ========================================================================

@@ -12,6 +12,44 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
+const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
+
+pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
+const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
+const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
+
+// SECURITY: the returned string is included verbatim (truncated to
+// PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
+// ProviderSummary.metadata["message"]. Providers MUST NOT interpolate
+// upstream-controlled content (response bodies, parse errors, headers) into
+// their TrustedServerError::*.message fields. Use static text and log details
+// server-side with `log::warn!` instead.
+fn provider_error_message(error: &Report<TrustedServerError>) -> String {
+    error
+        .current_context()
+        .to_string()
+        .chars()
+        .take(PROVIDER_ERROR_MESSAGE_CHARS)
+        .collect()
+}
+
+fn provider_error_response(
+    provider_name: &str,
+    response_time_ms: u64,
+    error_type: &str,
+    error: &Report<TrustedServerError>,
+) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(error_type))
+        .with_metadata("message", serde_json::json!(provider_error_message(error)))
+}
+
+fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+        .with_metadata("message", serde_json::json!("Provider launch failed"))
+}
+
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,
@@ -252,6 +290,7 @@ impl AuctionOrchestrator {
         let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
             HashMap::new();
         let mut pending_requests: Vec<PendingRequest> = Vec::new();
+        let mut responses = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -331,11 +370,16 @@ impl AuctionOrchestrator {
                     );
                 }
                 Err(e) => {
+                    let response_time_ms = start_time.elapsed().as_millis() as u64;
                     log::warn!(
                         "Provider '{}' failed to launch request: {:?}",
                         provider.provider_name(),
                         e
                     );
+                    responses.push(provider_launch_failed_response(
+                        provider.provider_name(),
+                        response_time_ms,
+                    ));
                 }
             }
         }
@@ -357,7 +401,6 @@ impl AuctionOrchestrator {
         // transport timeout fires). Hard deadline enforcement therefore depends
         // on every backend's `first_byte_timeout` being set to at most the
         // remaining auction budget — which Phase 1 above guarantees.
-        let mut responses = Vec::new();
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -397,8 +440,12 @@ impl AuctionOrchestrator {
                                     provider_name,
                                     e
                                 );
-                                responses
-                                    .push(AuctionResponse::error(provider_name, response_time_ms));
+                                responses.push(provider_error_response(
+                                    provider_name,
+                                    response_time_ms,
+                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    &e,
+                                ));
                             }
                         }
                     } else {
@@ -602,9 +649,11 @@ mod tests {
     use crate::auction::config::AuctionConfig;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, BidStatus, MediaType, PublisherInfo, UserInfo,
     };
+    use crate::error::TrustedServerError;
     use crate::test_support::tests::crate_test_settings_str;
+    use error_stack::Report;
     use fastly::Request;
     use std::collections::{HashMap, HashSet};
 
@@ -655,6 +704,32 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
+    }
+
+    #[test]
+    fn provider_error_response_includes_diagnostic_metadata() {
+        let error = Report::new(TrustedServerError::Auction {
+            message: "parse failed".to_string(),
+        });
+
+        let response = super::provider_error_response("prebid", 37, "parse_response", &error);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark diagnostic provider responses as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("parse_response"),
+            "should include the provider error classification"
+        );
+        assert!(
+            response.metadata["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("parse failed")),
+            "should include capped diagnostic detail"
+        );
     }
 
     #[test]
