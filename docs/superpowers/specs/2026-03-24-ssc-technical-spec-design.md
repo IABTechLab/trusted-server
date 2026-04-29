@@ -115,7 +115,8 @@ use `EcContext` in read-only form.
 page-load path generates the EC before any auction request arrives.
 
 ec_finalize_response() — after every handler:
-    - consent withdrawn + cookie present? → clear_ec_on_response() + tombstone
+    - !allows_ec_creation(&consent)? → strip EC response headers
+    - explicit withdrawal + cookie present? → also expire the cookie and write tombstones
     - returning user with consent? → set x-ts-ec header only (no cookie/KV TTL refresh)
     - ec_generated == true? → set EC cookie + x-ts-ec header
     - Prebid EID ingestion: reads `ts-eids` cookie, matches source domains
@@ -233,14 +234,16 @@ When both header and cookie are present, the **header wins** as `ec_value` (used
 - `ec_value` = header value (authoritative for handler reads)
 - `cookie_ec_value` = cookie value (tracked separately for withdrawal)
 
-On consent **withdrawal** (`!allows_ec_creation && cookie_was_present`):
+On **explicit consent withdrawal** (`has_explicit_ec_withdrawal(&consent) && cookie_was_present`):
 
 - Delete the browser cookie (always, based on `cookie_was_present`)
 - Tombstone the **cookie-derived** hash: `kv.write_withdrawal_tombstone(ec_hash(cookie_ec_value))`
 - If the header-derived hash differs, also tombstone it: `kv.write_withdrawal_tombstone(ec_hash(ec_value))`
 - This matches the existing SyntheticID behavior where revocation targets the cookie value (`publisher.rs:515`), not the header value.
 
-On **non-withdrawal** paths (handler reads and response headers): use `ec_value` (header-derived) as the active identity. Returning-user responses set `x-ts-ec` for the active identity but do not refresh or repair the browser cookie. Cookie writes are reserved for newly generated ECs; cookie deletion is reserved for consent withdrawal.
+If `allows_ec_creation(&consent)` is `false` but there is **no explicit withdrawal signal** (for example, unknown jurisdiction or missing/undecodable consent in a regulated regime), the response strips EC-related headers only. It does **not** delete the cookie or write tombstones.
+
+On **non-withdrawal** paths (handler reads and response headers): use `ec_value` (header-derived) as the active identity. Returning-user responses set `x-ts-ec` for the active identity but do not refresh or repair the browser cookie. Cookie writes are reserved for newly generated ECs; cookie deletion is reserved for explicit consent withdrawal.
 
 **Validation:** Both the header and cookie values are validated independently via `ec_hash()` (`{64-hex}.{6-alnum}` format). If the header is present but malformed, it is discarded and the cookie value is used instead (if valid). A malformed header must not suppress a valid cookie — bad forwarding infrastructure should not break returning-user identity. `cookie_was_present` is set based on the raw cookie existing, regardless of validity — an invalid cookie value is still a cookie that needs to be cleared on withdrawal.
 
@@ -335,10 +338,11 @@ impl EcContext {
 
 **`ec_finalize_response()` behavior** (signature: `ec_finalize_response(settings, ec_context, kv, registry, eids_cookie, response)`):
 
-1. If `!allows_ec_creation(&consent) && cookie_was_present`: call `clear_ec_on_response()` (deletes cookie **and** strips any handler-built `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`, and `X-ts-<partner_id>` response headers) and write withdrawal tombstones for each valid known EC ID (cookie-derived and, when different, header-derived). This runs on **every route** — consent withdrawal is always real-time enforced. Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser. When the cookie is malformed and there is no valid header-derived EC ID, no tombstone is written.
-2. If `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`: ingest Prebid EIDs from the `ts-eids` cookie if present (see section 8) and set the `x-ts-ec` response header only. Ordinary returning-user requests do not refresh the EC cookie and do not write KV solely to extend TTL.
-3. If `ec_generated == true`: set `Set-Cookie` and `X-ts-ec`. KV create already happened inside `generate_if_needed()`; `ec_finalize_response()` does NOT write KV beyond tombstones and Prebid EID ingestion. Also ingest Prebid EIDs from the `ts-eids` cookie if present.
-4. Handler-built response headers (`X-ts-ec` set directly by `/_ts/api/v1/identify`) are preserved on non-withdrawal paths only.
+1. If `!allows_ec_creation(&consent)`: call `clear_ec_headers_on_response()` to strip any handler-built `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`, and `X-ts-<partner_id>` response headers. This runs on **every route**, including fail-closed cases where consent cannot be verified.
+2. If `has_explicit_ec_withdrawal(&consent) && cookie_was_present`: additionally expire the cookie and write withdrawal tombstones for each valid known EC ID (cookie-derived and, when different, header-derived). Keyed on `cookie_was_present`, not `ec_was_present`, because only a cookie-held EC can be deleted by the browser. When the cookie is malformed and there is no valid header-derived EC ID, no tombstone is written.
+3. If `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)`: ingest Prebid EIDs from the `ts-eids` cookie if present (see section 8) and set the `x-ts-ec` response header only. Ordinary returning-user requests do not refresh the EC cookie and do not write KV solely to extend TTL.
+4. If `ec_generated == true`: set `Set-Cookie` and `X-ts-ec`. KV create already happened inside `generate_if_needed()`; `ec_finalize_response()` does NOT write KV beyond explicit-withdrawal tombstones and Prebid EID ingestion. Also ingest Prebid EIDs from the `ts-eids` cookie if present.
+5. Handler-built response headers (`X-ts-ec` set directly by `/_ts/api/v1/identify`) are preserved only when consent currently allows EC.
 
 **Note on `kv_degraded`:** Not on `EcContext` — `read_from_request()` does not read KV. Handlers track degraded state locally. `/_ts/api/v1/identify` returns `degraded: true` in the JSON body on KV read failure; the auction handler treats a failed read as `eids: []`.
 
@@ -385,8 +389,8 @@ pub fn set_ec_cookie_and_header_on_response(response: &mut Response, ec_value: &
 
 /// Removes the EC cookie and strips all EC-related response headers:
 /// `X-ts-ec`, `X-ts-eids`, `X-ts-ec-consent`, `x-ts-eids-truncated`,
-/// and any `X-ts-<partner_id>` headers. Called on consent withdrawal to
-/// prevent leaking EC identity in handler-built headers.
+/// and any `X-ts-<partner_id>` headers. Called on explicit consent
+/// withdrawal to prevent leaking EC identity in handler-built headers.
 pub fn clear_ec_on_response(response: &mut Response, cookie_domain: &str);
 ````
 
@@ -465,17 +469,20 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
   // Bot gate: when !looks_like_browser(), this entire block is skipped.
   // The response is proxied to origin without any cookie writes or KV operations.
 
-  ├── !allows_ec_creation(&consent) && cookie_was_present?
-  │       → clear_ec_on_response()             (delete cookie + strip ALL EC headers from response)
-  │       → // Tombstone all known valid EC IDs. May be 0, 1, or 2 IDs.
-  │         if let Some(cookie_ec_id) = cookie_ec_value.filter(|v| is_valid_ec_id(v)):
-  │           kv.write_withdrawal_tombstone(cookie_ec_id)       // cookie-derived EC ID
-  │         if let Some(header_ec_id) = ec_value.filter(|v| is_valid_ec_id(v)):
-  │           if Some(header_ec_id) != cookie_ec_id:
-  │             kv.write_withdrawal_tombstone(header_ec_id)     // header-derived EC ID (if different)
-  │         // When cookie is malformed and no valid header exists: no tombstone written.
-  │         // Cookie deletion is still the authoritative enforcement mechanism.
-  │         // Tombstone fails? log error, do NOT block — no retry possible on browser path.
+  ├── !allows_ec_creation(&consent)?
+  │       → clear_ec_headers_on_response()    (strip ALL EC headers from response)
+  │       → has_explicit_ec_withdrawal(&consent) && cookie_was_present?
+  │             → expire_ec_cookie()
+  │             → // Tombstone all known valid EC IDs. May be 0, 1, or 2 IDs.
+  │               if let Some(cookie_ec_id) = cookie_ec_value.filter(|v| is_valid_ec_id(v)):
+  │                 kv.write_withdrawal_tombstone(cookie_ec_id)       // cookie-derived EC ID
+  │               if let Some(header_ec_id) = ec_value.filter(|v| is_valid_ec_id(v)):
+  │                 if Some(header_ec_id) != cookie_ec_id:
+  │                   kv.write_withdrawal_tombstone(header_ec_id)     // header-derived EC ID (if different)
+  │               // When cookie is malformed and no valid header exists: no tombstone written.
+  │               // Cookie deletion is still the authoritative enforcement mechanism.
+  │               // Tombstone fails? log error, do NOT block — no retry possible on browser path.
+  │       → return
   │
   ├── ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)?
   │       → set_ec_header_on_response()       (returning user — no cookie/KV TTL refresh)
@@ -484,7 +491,7 @@ ec_context.generate_if_needed(settings, &kv)    // best-effort — never 500s
           → set_ec_cookie_and_header_on_response()  (Set-Cookie + X-ts-ec on response)
 ```
 
-EC route handlers (`GET /_ts/api/v1/identify`, `POST /_ts/api/v1/batch-sync`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is withdrawn — that is intentional.
+EC route handlers (`GET /_ts/api/v1/identify`, `POST /_ts/api/v1/batch-sync`) never call `generate_if_needed()`. `ec_finalize_response()` will still delete the cookie on those routes if consent is explicitly withdrawn — that is intentional.
 
 **Cookie write rule:** `Set-Cookie` is written for newly generated ECs and consent-withdrawal deletion only. Ordinary returning requests set `x-ts-ec` but do not refresh the cookie `Max-Age`.
 
@@ -505,34 +512,51 @@ Consent decoding shipped in `#380` (already merged). This spec treats the follow
 ### 6.1.1 EC consent gating
 
 EC reuses the existing `allows_ec_creation(&ConsentContext) -> bool` function
-from the consent module (`consent/mod.rs`). No parallel gating function is
-introduced — EC calls `allows_ec_creation()` directly for all consent decisions
-(EC generation, withdrawal detection, sync gating).
+from the consent module (`consent/mod.rs`) for EC generation, header emission,
+and other "may this request use ECs right now?" decisions.
 
-There is no EC-specific consent gate and no behavior change to
-`allows_ec_creation()` in this spec. Shared consent-policy semantics stay in
-the consent module; EC only consumes that existing decision.
+Explicit withdrawal semantics use a separate
+`has_explicit_ec_withdrawal(&ConsentContext) -> bool` helper. This narrower
+signal distinguishes authoritative opt-outs from fail-closed cases where EC use
+must be blocked for the current request but an already-issued EC must not be
+revoked (for example, unknown jurisdiction or missing/undecodable consent in a
+regulated regime).
+
+There is no new consent source or KV lookup in this spec. Shared
+consent-policy semantics stay in the consent module; EC consumes the existing
+request-local decision plus the explicit-withdrawal helper.
 
 **Consent pipeline integration:**
 
 `EcContext::read_from_request()` calls `build_consent_context()` with request-local cookies, headers, settings, and geo data. Current runtime behavior does not use a separate consent KV store or consent KV fallback. Consent is interpreted from live request signals on every request; the EC identity store only keeps the minimal `KvEntry.consent` snapshot and withdrawal tombstones for S2S enforcement.
 
-All downstream EC logic calls `allows_ec_creation(&self.consent)`. No consent decoding or gating logic is added in this epic.
+All downstream EC logic uses `allows_ec_creation(&self.consent)` for creation/forwarding decisions and `has_explicit_ec_withdrawal(&self.consent)` for cookie-expiry/tombstone decisions. No consent decoding or KV-backed gating logic is added in this epic.
 
-### 6.2 Consent withdrawal — KV delete
+### 6.2 Consent withdrawal — explicit delete path
 
-When `allows_ec_creation(&consent)` returns `false` for a user whose **`ts-ec` cookie** is present (`cookie_was_present == true`). A user identified only by the `X-ts-ec` request header is not subject to cookie deletion — there is no cookie to expire.
+When `allows_ec_creation(&consent)` returns `false`, Trusted Server **always**
+strips EC-related response headers for that request. This covers both explicit
+revocation and fail-closed cases.
 
-1. Issue `Set-Cookie: ts-ec=; Max-Age=0; ...` and strip all EC response headers (synchronous — must not fail silently). This always happens when `cookie_was_present == true`.
-2. Write tombstone for each valid EC ID available (`cookie_ec_value` and/or `ec_value`). When neither is valid (malformed cookie, no header), **no tombstone is written** — cookie deletion alone is the enforcement mechanism. When at least one valid EC ID exists: `kv.write_withdrawal_tombstone(ec_id)` sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms per write.
+Cookie expiry and tombstone writes happen only when
+`has_explicit_ec_withdrawal(&consent)` returns `true` **and** the request
+carried a **`ts-ec` cookie** (`cookie_was_present == true`). A user identified
+only by the `X-ts-ec` request header is not subject to cookie deletion or
+`tombstoning` on this path — there is no browser cookie to revoke.
 
-The tombstone write runs in the request path (not async) to ensure real-time enforcement. Using a tombstone rather than a hard delete preserves the `consent_withdrawn` signal for batch sync clients for 24 hours — otherwise batch sync cannot distinguish consent withdrawal from an EC that never existed.
+1. Strip all EC response headers (synchronous — must not fail silently) whenever `!allows_ec_creation(&consent)`.
+2. If `has_explicit_ec_withdrawal(&consent) && cookie_was_present == true`, issue `Set-Cookie: ts-ec=; Max-Age=0; ...`.
+3. In that same explicit-withdrawal + cookie-present case, write a tombstone for each valid EC ID available (`cookie_ec_value` and/or `ec_value`). When neither is valid (malformed cookie, no header), **no tombstone is written** — cookie deletion alone is the browser-side enforcement mechanism. When at least one valid EC ID exists: `kv.write_withdrawal_tombstone(ec_id)` sets `consent.ok = false`, clears partner IDs, TTL 24h — approximately 25ms per write.
+
+The tombstone write runs in the request path (not async) to ensure real-time enforcement for authoritative withdrawals. Using a tombstone rather than a hard delete preserves the `consent_withdrawn` signal for batch sync clients for 24 hours — otherwise batch sync cannot distinguish consent withdrawal from an EC that never existed.
 
 If the tombstone write fails:
 
 - Log at `error` level with EC ID
-- Do not block the response — cookie deletion is the primary enforcement mechanism
-- **No retry is possible on the browser path.** Once the cookie is deleted, subsequent browser requests carry no EC value (`ec_value` returns `None`), so there is no EC ID to tombstone. A failed tombstone means batch sync clients may see `ec_id_not_found` (after TTL expiry) rather than `consent_withdrawn` — this is accepted degradation. The cookie deletion remains the authoritative enforcement mechanism.
+- Do not block the response — cookie deletion is the primary enforcement mechanism on explicit-withdrawal paths
+- **No retry is possible on the browser path.** Once the cookie is deleted, subsequent browser requests carry no EC value (`ec_value` returns `None`), so there is no EC ID to tombstone. A failed tombstone means batch sync clients may see `ec_id_not_found` (after TTL expiry) rather than `consent_withdrawn` — this is accepted degradation.
+
+Fail-closed / unverifiable-consent cases keep the cookie intact and do not write tombstones; they only suppress EC use on that request.
 
 ---
 
@@ -609,7 +633,7 @@ Partners are defined in config (`[[ec.partners]]` in TOML) and loaded into an in
 
 The `ok` field in metadata is a **historical consent record for S2S consumers only** — it is set to `false` by `write_withdrawal_tombstone()` so that batch sync clients (`POST /_ts/api/v1/batch-sync`) can return `consent_withdrawn` rather than `ec_id_not_found` during the 24-hour tombstone TTL.
 
-**`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Consent withdrawal is determined entirely from `allows_ec_creation(&ec_context.consent)` on the current request. When withdrawal is detected, the cookie is deleted and `write_withdrawal_tombstone()` is called in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
+**`consent.ok` is NOT used to make the withdrawal decision on the main request path.** Withdrawal enforcement is driven by current request-local consent: `allows_ec_creation(&ec_context.consent)` decides whether EC use and EC response headers are allowed on this request, and `has_explicit_ec_withdrawal(&ec_context.consent)` decides whether to expire the cookie and call `write_withdrawal_tombstone()` in-path (setting `ok = false`, 24h TTL — see §6.2). Engineers must not add a KV read to the consent withdrawal hot path based on this field.
 
 **Rust types:**
 
@@ -1189,37 +1213,44 @@ pub fn ingest_prebid_eids(
 
 ### 8.2 Cookie format
 
-| Attribute  | Value                                                                  |
-| ---------- | ---------------------------------------------------------------------- |
-| Name       | `ts-eids`                                                              |
-| Format     | Base64-encoded (standard RFC 4648) JSON array of `{source, id, atype}` |
-| Max size   | 3 KB                                                                   |
-| Written by | TSJS Prebid integration (client-side JS)                               |
-| Read by    | `ec_finalize_response()` (server-side, via `ingest_prebid_eids()`)     |
+| Attribute  | Value                                                                                        |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| Name       | `ts-eids`                                                                                    |
+| Format     | Base64-encoded (standard RFC 4648) JSON array of OpenRTB-style EIDs (`{source, uids:[...]}`) |
+| Max size   | JS writer targets 3 KB; backend parser accepts up to 8 KiB raw cookie length                 |
+| Written by | TSJS Prebid integration (client-side JS)                                                     |
+| Read by    | `ec_finalize_response()` (server-side, via `ingest_prebid_eids()`)                           |
 
 **Example decoded value:**
 
 ```json
 [
-  { “source”: “uidapi.com”, “id”: “A4A...”, “atype”: 3 },
-  { “source”: “liveramp.com”, “id”: “LR_xyz”, “atype”: 3 }
+  {
+    "source": "uidapi.com",
+    "uids": [{ "id": "A4A...", "atype": 3 }]
+  },
+  {
+    "source": "liveramp.com",
+    "uids": [{ "id": "LR_xyz", "atype": 3 }]
+  }
 ]
 ```
 
 ### 8.3 JS side
 
-The TSJS Prebid integration calls `pbjs.getUserIdsAsEids()` in the `bidsBackHandler` callback after each auction. The returned EID array is base64-encoded and written to the `ts-eids` cookie. This runs entirely client-side — no server round-trip is needed for the write.
+The TSJS Prebid integration calls `pbjs.getUserIdsAsEids()` in the `bidsBackHandler` callback after each auction. The returned OpenRTB-style EID array is base64-encoded and written to the `ts-eids` cookie. This runs entirely client-side — no server round-trip is needed for the write. Current writers preserve the full `{source, uids:[...]}` shape; the backend remains backward-compatible with the earlier flattened `{source, id, atype}` payload during rollout.
 
 ### 8.4 Backend side
 
 `ingest_prebid_eids()` is called from `ec_finalize_response()` on both returning-user and new-EC paths when a `ts-eids` cookie is present and consent is granted. The flow:
 
 1. Base64-decode the cookie value.
-2. JSON-parse into `Vec<CookieEid>` (`{source: String, id: String, atype: u8}`).
+2. JSON-parse into OpenRTB-style `Eid` entries; if that parse fails, fall back to the earlier flattened `{source, id, atype}` payload for backward compatibility.
 3. For each EID entry:
    a. Look up `registry.find_by_source_domain(&eid.source)`. Skip if no match.
-   b. Skip if `eid.id` is empty.
-   c. Call `kv.upsert_partner_id(ec_id, &partner.id, &eid.id)`. The upsert skips the KV write when the stored UID already matches.
+   b. Find the first non-empty UID in `eid.uids`. Skip the source if none is present.
+   c. Skip oversized UID values.
+   d. Call `kv.upsert_partner_id(ec_id, &partner.id, &uid.id)`. The upsert skips the KV write when the stored UID already matches.
 4. All errors are logged and swallowed — EID ingestion never blocks the response.
 
 ### 8.5 Source domain matching
@@ -2189,7 +2220,7 @@ Each module in `ec/` has a `#[cfg(test)]` module covering:
 
 KV behavior is tested with Viceroy (local Fastly Compute simulator) using real KV store operations. Key scenarios:
 
-- Consent withdrawal: cookie deletion + tombstone write (`write_withdrawal_tombstone()`) + all EC response headers stripped — in same request
+- Explicit consent withdrawal: cookie deletion + tombstone write (`write_withdrawal_tombstone()`) + all EC response headers stripped — in same request
 - Concurrent writes: CAS retry logic under simulated generation conflicts
 - KV degraded: EC cookie still set when KV `create_or_revive()` fails (best-effort)
 - Prebid EID ingestion: `ts-eids` cookie parsed, source domain matched, partner UID written to KV
@@ -2292,18 +2323,12 @@ cookie writes on generation, cookie deletion on withdrawal, tombstones, returnin
 **Acceptance criteria:**
 
 - `ec_finalize_response(settings, geo, ec_context, kv, response)` runs on every route.
-- Consent gating uses the existing `allows_ec_creation()` — no new gating function.
-- When `!allows_ec_creation(&consent) && cookie_was_present`: calls
-  `clear_ec_on_response()` (deletes cookie and strips all EC response headers)
-  and writes tombstone for each valid EC hash available. When the cookie is
-  malformed and no valid header exists, no tombstone is written — cookie
-  deletion alone enforces withdrawal (see §6.2).
-- When `ec_was_present && !ec_generated && allows_ec_creation(&consent)`: calls
-  sets the `x-ts-ec` response header only. It does not refresh the EC cookie,
-  repair header/cookie mismatches, or write KV solely to extend TTL.
+- Consent gating uses `allows_ec_creation()` for current-request EC usage and `has_explicit_ec_withdrawal()` for cookie-expiry/tombstone decisions.
+- When `!allows_ec_creation(&consent)`: strips all EC response headers.
+- When `has_explicit_ec_withdrawal(&consent) && cookie_was_present`: additionally expires the cookie and writes tombstones for each valid EC ID available. When the cookie is malformed and no valid header exists, no tombstone is written — cookie deletion alone enforces withdrawal (see §6.2).
+- When `ec_was_present && !ec_generated && allows_ec_creation(&consent)`: sets the `x-ts-ec` response header only. It does not refresh the EC cookie, repair header/cookie mismatches, or write KV solely to extend TTL.
 - When `ec_generated == true`: calls `set_ec_cookie_and_header_on_response()`.
-- Unit tests cover all four branches: withdrawal (with and without valid hash),
-  returning-user header behavior, and new-EC generation.
+- Unit tests cover explicit-withdrawal, fail-closed header stripping, returning-user header behavior, and new-EC generation.
 
 **Spec ref:** §5.4, §6.2
 
@@ -2419,7 +2444,8 @@ Wire `EcContext` into the request pipeline following the two-phase model
 - `handle_publisher_request()` and `integration_registry.handle_proxy()` call
   `ec_context.generate_if_needed(settings, &kv)` before their handler logic (best-effort, never 500s).
 - `ec_finalize_response()` receives `ec_context` and `kv` and:
-  - Deletes the EC cookie and writes a withdrawal tombstone when `!allows_ec_creation(&consent) && cookie_was_present` (runs on all routes).
+  - Strips EC response headers whenever `!allows_ec_creation(&consent)`.
+  - Additionally deletes the EC cookie and writes a withdrawal tombstone when `has_explicit_ec_withdrawal(&consent) && cookie_was_present` (runs on all routes).
   - Sets `x-ts-ec` header when `ec_was_present == true && ec_generated == false && allows_ec_creation(&consent)` (returning user with valid consent). Also ingests Prebid EIDs from `ts-eids` cookie.
   - Calls `set_ec_cookie_and_header_on_response()` when `ec_context.ec_generated == true` (newly generated ECs). Returning-user mismatch repair is not performed. Also ingests Prebid EIDs.
 - `route_request()` return type changes from `Result<Response, Error>` to
@@ -2452,17 +2478,17 @@ the pixel sync endpoint as the browser-side ID sync mechanism.
 **Acceptance criteria:**
 
 - `ingest_prebid_eids(cookie_value, ec_id, kv, registry)` decodes a base64 JSON
-  array of `{source, id, atype}` objects and syncs matched partners to KV.
+  array of OpenRTB-style `{source, uids:[...]}` objects and syncs matched partners to KV. The backend also accepts the earlier flattened `{source, id, atype}` payload for backward compatibility.
 - Source domain matching via `registry.find_by_source_domain()` (case-insensitive).
-- Empty `id` fields are skipped.
+- Sources with no non-empty UID are skipped.
 - Idempotent write suppression: if the stored UID already matches the incoming UID, the write is skipped for that partner.
 - KV write via `kv.upsert_partner_id()` — best-effort, errors logged at `warn`.
 - Called from `ec_finalize_response()` on both returning-user and new-EC paths
   when a `ts-eids` cookie is present and consent is granted.
-- Max cookie size: 3 KB.
+- JS writer target size: 3 KB; backend parser raw-cookie limit: 8 KiB.
 - All errors are logged and swallowed — never blocks the response.
 - Unit tests cover base64 decode, JSON parse, source domain matching, size limits,
-  empty ID skip.
+  and empty/oversized UID handling.
 
 **Spec ref:** §8
 
@@ -2480,8 +2506,7 @@ retrieve their own synced UID for the current EC.
 - **Bearer token required.** Missing or invalid `Authorization: Bearer` → `401`
   with `{ "error": "invalid_token" }`. Auth uses `registry.find_by_api_key_hash()`.
 - `!allows_ec_creation(consent)` (consent denied, regardless of EC presence) → `403 Forbidden`.
-  When EC is present but consent is denied, the handler returns `403` and
-  `ec_finalize_response()` deletes the cookie and writes a tombstone.
+  When the denial is an explicit withdrawal signal and a `ts-ec` cookie was present, `ec_finalize_response()` also deletes the cookie and writes a tombstone. Fail-closed / unverifiable-consent cases still return `403`, but they strip EC headers only.
 - No EC present (`ec_was_present == false`) and consent not denied → `204 No Content`.
 - Valid EC, consent granted, KV read succeeds with entry → `200` with scoped JSON body
   including `ec`, `consent`, `partner_id`, `uid` (single partner's UID), `eid`
