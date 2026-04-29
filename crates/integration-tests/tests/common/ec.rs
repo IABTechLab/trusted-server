@@ -10,6 +10,7 @@ use crate::common::runtime::{TestError, TestResult};
 use error_stack::{Report, ResultExt};
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -22,17 +23,18 @@ pub use trusted_server_core::ec::normalize_ec_id_for_kv as normalize_ec_id;
 // Cookie-aware HTTP client
 // ---------------------------------------------------------------------------
 
-/// HTTP client that manually tracks the `ts-ec` cookie value.
+/// HTTP client that manually tracks cookies used by EC tests.
 ///
 /// Reqwest's built-in cookie jar respects domain matching, but the EC
 /// cookie is set with `Domain=.test-publisher.com` while tests run
-/// against `127.0.0.1`. This client extracts and replays the `ts-ec`
-/// cookie manually via the `Cookie` header.
+/// against `127.0.0.1`. This client extracts and replays cookies manually
+/// via the `Cookie` header so scenarios can combine consent cookies with
+/// the `ts-ec` cookie.
 pub struct EcTestClient {
     client: Client,
     pub base_url: String,
-    /// The active `ts-ec` cookie value, updated after each response.
-    ec_cookie: std::cell::RefCell<Option<String>>,
+    /// Tracked cookies replayed on subsequent requests.
+    cookies: std::cell::RefCell<BTreeMap<String, String>>,
 }
 
 impl EcTestClient {
@@ -47,60 +49,60 @@ impl EcTestClient {
         Self {
             client,
             base_url: base_url.to_owned(),
-            ec_cookie: std::cell::RefCell::new(None),
+            cookies: std::cell::RefCell::new(BTreeMap::new()),
         }
     }
 
-    /// Updates the tracked EC cookie from a response's `Set-Cookie` headers.
-    fn track_ec_cookie(&self, resp: &Response) {
+    /// Persist a cookie value for subsequent requests.
+    pub fn set_cookie(&self, name: &str, value: &str) {
+        self.cookies
+            .borrow_mut()
+            .insert(name.to_owned(), value.to_owned());
+    }
+
+    /// Returns a tracked cookie value, if any.
+    pub fn cookie_value(&self, name: &str) -> Option<String> {
+        self.cookies.borrow().get(name).cloned()
+    }
+
+    /// Updates tracked cookies from a response's `Set-Cookie` headers.
+    fn track_response_cookies(&self, resp: &Response) {
         for value in resp.headers().get_all("set-cookie") {
-            if let Ok(cookie_str) = value.to_str() {
-                if cookie_str.starts_with("ts-ec=") {
-                    if cookie_str.contains("Max-Age=0") {
-                        *self.ec_cookie.borrow_mut() = None;
-                    } else if let Some(val) = cookie_str
-                        .split(';')
-                        .next()
-                        .and_then(|s| s.strip_prefix("ts-ec="))
-                    {
-                        if !val.is_empty() {
-                            *self.ec_cookie.borrow_mut() = Some(val.to_owned());
-                        }
-                    }
-                }
+            let Ok(cookie_str) = value.to_str() else {
+                continue;
+            };
+            let Some((name, raw_value)) = cookie_str.split(';').next().and_then(|s| s.split_once('=')) else {
+                continue;
+            };
+
+            if cookie_str.contains("Max-Age=0") {
+                self.cookies.borrow_mut().remove(name);
+            } else if !raw_value.is_empty() {
+                self.cookies
+                    .borrow_mut()
+                    .insert(name.to_owned(), raw_value.to_owned());
             }
         }
     }
 
-    /// Builds a request with the tracked EC cookie attached.
-    fn attach_ec_cookie(
+    /// Builds a request with all tracked cookies attached.
+    fn attach_cookies(
         &self,
         builder: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
-        if let Some(ref ec) = *self.ec_cookie.borrow() {
-            builder.header("cookie", format!("ts-ec={ec}"))
-        } else {
-            builder
-        }
-    }
+        let cookie_header = self
+            .cookies
+            .borrow()
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
 
-    /// `GET {base_url}{path}` simulating a browser navigation request.
-    ///
-    /// Sends `Sec-Fetch-Dest: document` and `Accept: text/html` so that
-    /// `is_navigation_request()` returns true and EC generation proceeds.
-    pub fn get(&self, path: &str) -> TestResult<Response> {
-        let builder = self
-            .client
-            .get(format!("{}{path}", self.base_url))
-            .header("sec-fetch-dest", "document")
-            .header("accept", "text/html");
-        let resp = self
-            .attach_ec_cookie(builder)
-            .send()
-            .change_context(TestError::HttpRequest)
-            .attach(format!("GET {path}"))?;
-        self.track_ec_cookie(&resp);
-        Ok(resp)
+        if cookie_header.is_empty() {
+            builder
+        } else {
+            builder.header("cookie", cookie_header)
+        }
     }
 
     /// `GET {base_url}{path}` with extra headers (plus navigation headers).
@@ -114,11 +116,11 @@ impl EcTestClient {
             builder = builder.header(*key, *value);
         }
         let resp = self
-            .attach_ec_cookie(builder)
+            .attach_cookies(builder)
             .send()
             .change_context(TestError::HttpRequest)
             .attach(format!("GET {path}"))?;
-        self.track_ec_cookie(&resp);
+        self.track_response_cookies(&resp);
         Ok(resp)
     }
 
@@ -129,11 +131,11 @@ impl EcTestClient {
             .post(format!("{}{path}", self.base_url))
             .json(body);
         let resp = self
-            .attach_ec_cookie(builder)
+            .attach_cookies(builder)
             .send()
             .change_context(TestError::HttpRequest)
             .attach(format!("POST {path}"))?;
-        self.track_ec_cookie(&resp);
+        self.track_response_cookies(&resp);
         Ok(resp)
     }
 
@@ -150,11 +152,11 @@ impl EcTestClient {
             .bearer_auth(token)
             .json(body);
         let resp = self
-            .attach_ec_cookie(builder)
+            .attach_cookies(builder)
             .send()
             .change_context(TestError::HttpRequest)
             .attach(format!("POST {path} (bearer auth)"))?;
-        self.track_ec_cookie(&resp);
+        self.track_response_cookies(&resp);
         Ok(resp)
     }
 
@@ -165,11 +167,11 @@ impl EcTestClient {
             .get(format!("{}{path}", self.base_url))
             .bearer_auth(token);
         let resp = self
-            .attach_ec_cookie(builder)
+            .attach_cookies(builder)
             .send()
             .change_context(TestError::HttpRequest)
             .attach(format!("GET {path} (bearer auth)"))?;
-        self.track_ec_cookie(&resp);
+        self.track_response_cookies(&resp);
         Ok(resp)
     }
 
@@ -188,18 +190,17 @@ impl EcTestClient {
             builder = builder.header(*key, *value);
         }
         let resp = self
-            .attach_ec_cookie(builder)
+            .attach_cookies(builder)
             .send()
             .change_context(TestError::HttpRequest)
             .attach(format!("GET {path} (bearer auth + headers)"))?;
-        self.track_ec_cookie(&resp);
+        self.track_response_cookies(&resp);
         Ok(resp)
     }
 
     /// Returns the currently tracked EC cookie value, if any.
-    #[allow(dead_code)]
     pub fn ec_cookie_value(&self) -> Option<String> {
-        self.ec_cookie.borrow().clone()
+        self.cookie_value("ts-ec")
     }
 }
 
@@ -300,28 +301,6 @@ pub fn assert_json_response(resp: Response, expected_status: u16) -> TestResult<
     serde_json::from_str(&body)
         .change_context(TestError::ResponseParse)
         .attach(format!("invalid JSON: {body}"))
-}
-
-/// Extracts the `ts-ec` cookie value from a `Set-Cookie` response header.
-pub fn extract_ec_cookie_from_response(resp: &Response) -> Option<String> {
-    for value in resp.headers().get_all("set-cookie") {
-        let Ok(cookie_str) = value.to_str() else {
-            continue;
-        };
-        if cookie_str.starts_with("ts-ec=") {
-            let extracted = cookie_str
-                .split(';')
-                .next()
-                .and_then(|s| s.strip_prefix("ts-ec="))
-                .map(str::to_owned);
-            if let Some(ref v) = extracted {
-                if !v.is_empty() {
-                    return extracted;
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Checks whether the response expires (deletes) the `ts-ec` cookie.

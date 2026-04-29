@@ -143,8 +143,10 @@ fn test_nextjs_fastly() {
 /// Runs all EC lifecycle scenarios against a standalone Viceroy instance.
 ///
 /// Unlike framework tests, these use a minimal TCP origin server instead
-/// of a Docker container — organic routes need *something* to proxy to
-/// so the trusted-server can generate and set EC cookies.
+/// of a Docker container. The scenarios use a pre-seeded EC row plus
+/// explicit consent cookies because Viceroy's local HTTP runtime does not
+/// satisfy the production browser bot-gate fingerprint requirements for
+/// minting new ECs end-to-end.
 #[test]
 #[ignore = "requires Viceroy and pre-built WASM binary"]
 fn test_ec_lifecycle_fastly() {
