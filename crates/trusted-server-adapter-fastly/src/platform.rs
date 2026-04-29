@@ -16,15 +16,13 @@ use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
 use trusted_server_core::geo::geo_from_fastly;
+pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
-use trusted_server_core::storage::FastlyApiClient;
-
-pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -38,12 +36,11 @@ pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 ///
 /// # Write cost
 ///
-/// `put` and `delete` construct a [`FastlyApiClient`] on every call, which
-/// opens the `"api-keys"` secret store to read the management API key. On
-/// Fastly Compute, the SDK caches the open handle so repeated opens within a
-/// single request are cheap. Callers that issue many writes in one request
-/// should be aware that each call performs a synchronous outbound API
-/// request to the Fastly management API.
+/// `put` and `delete` each perform a synchronous outbound HTTPS request to the
+/// Fastly management API (`api.fastly.com`). Callers that issue many writes in
+/// one request pay one round-trip per call. The `"api-keys"` secret store is
+/// opened per call to read the management token; the Fastly Compute SDK caches
+/// the open handle so that cost is negligible.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
@@ -67,19 +64,13 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
     }
 
     fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::ConfigStore)
-            .attach("failed to initialize Fastly API client for config store write")?
-            .update_config_item(store_id.as_ref(), key, value)
-            .change_context(PlatformError::ConfigStore)
+        let client = crate::management_api::FastlyManagementApiClient::new()?;
+        client.update_config_item(store_id.as_ref(), key, value)
     }
 
     fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::ConfigStore)
-            .attach("failed to initialize Fastly API client for config store delete")?
-            .delete_config_item(store_id.as_ref(), key)
-            .change_context(PlatformError::ConfigStore)
+        let client = crate::management_api::FastlyManagementApiClient::new()?;
+        client.delete_config_item(store_id.as_ref(), key)
     }
 }
 
@@ -95,8 +86,9 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 ///
 /// # Write cost
 ///
-/// `create` and `delete` have the same per-call [`FastlyApiClient`] cost
-/// described on [`FastlyPlatformConfigStore`].
+/// `create` and `delete` have the same per-call
+/// [`crate::management_api::FastlyManagementApiClient`] cost described on
+/// [`FastlyPlatformConfigStore`].
 pub struct FastlyPlatformSecretStore;
 
 impl PlatformSecretStore for FastlyPlatformSecretStore {
@@ -138,19 +130,13 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
         name: &str,
         value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::SecretStore)
-            .attach("failed to initialize Fastly API client for secret store create")?
-            .create_secret(store_id.as_ref(), name, value)
-            .change_context(PlatformError::SecretStore)
+        let client = crate::management_api::FastlyManagementApiClient::new()?;
+        client.create_secret(store_id.as_ref(), name, value)
     }
 
     fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        FastlyApiClient::new()
-            .change_context(PlatformError::SecretStore)
-            .attach("failed to initialize Fastly API client for secret store delete")?
-            .delete_secret(store_id.as_ref(), name)
-            .change_context(PlatformError::SecretStore)
+        let client = crate::management_api::FastlyManagementApiClient::new()?;
+        client.delete_secret(store_id.as_ref(), name)
     }
 }
 
