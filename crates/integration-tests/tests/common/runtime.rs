@@ -46,12 +46,8 @@ pub enum TestError {
     AttributeNotRewritten,
 
     // EC lifecycle errors
-    #[display("EC cookie was not set on the response")]
-    EcCookieNotSet,
-
     #[display("Expected HTTP status {expected}, got {actual}")]
     UnexpectedStatusCode { expected: u16, actual: u16 },
-
 
     #[display("JSON field assertion failed: {field}")]
     JsonFieldMismatch { field: String },
