@@ -21,6 +21,10 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+which = { workspace = true }
+chromiumoxide = "0.9.1"
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }

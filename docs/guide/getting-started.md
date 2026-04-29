@@ -60,6 +60,14 @@ ts dev -a fastly
 
 The server will be available at `http://localhost:7676`.
 
+### Audit a Public URL
+
+```bash
+ts audit https://example.com
+```
+
+`ts audit` currently uses a real Chromium browser session and expects Chrome/Chromium to already be installed on the host machine. It checks common PATH names and standard macOS app bundle locations.
+
 ## Configuration
 
 Use `ts config init` to generate `trusted-server.toml`, then edit it to configure:

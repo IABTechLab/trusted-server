@@ -1,16 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+mod analyzer;
+mod browser_collector;
+mod collector;
+mod http_collector;
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 use error_stack::{Report, ResultExt};
-use regex::Regex;
-use reqwest::blocking::Client;
-use scraper::{Html, Selector};
 use serde::Serialize;
 use url::Url;
 
 use crate::config::{STARTER_CONFIG_TEMPLATE, ensure_writable_path};
 use crate::error::CliError;
+
+use analyzer::{analyze_collected_page, extract_gtm_container_id};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -52,28 +56,25 @@ pub struct AuditOutputs {
     pub draft_config_toml: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn analyze_html(target_url: &Url, html: &str) -> Result<AuditArtifact, Report<CliError>> {
+    analyzer::analyze_html(target_url, html)
+}
+
 pub fn perform_audit(target_url: &Url) -> Result<AuditOutputs, Report<CliError>> {
-    let client = Client::builder()
-        .user_agent("trusted-server-cli/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .change_context(CliError::Audit)?;
+    let collected = browser_collector::collect_page_via_browser(target_url)?;
+    build_audit_outputs(collected)
+}
 
-    let response = client
-        .get(target_url.clone())
-        .send()
-        .change_context(CliError::Audit)
-        .attach(format!("failed to load `{}`", target_url))?;
-
-    if !response.status().is_success() {
-        return Err(Report::new(CliError::Audit)
-            .attach(format!("audit request returned HTTP {}", response.status())));
-    }
-
-    let body = response.text().change_context(CliError::Audit)?;
-    let artifact = analyze_html(target_url, &body)?;
+fn build_audit_outputs(
+    collected: collector::CollectedPage,
+) -> Result<AuditOutputs, Report<CliError>> {
+    let artifact = analyze_collected_page(&collected)?;
+    let final_url = collected.final_url().map_err(|error| {
+        Report::new(CliError::Audit).attach(format!("invalid final URL: {error}"))
+    })?;
     let js_assets_toml = toml::to_string_pretty(&artifact).change_context(CliError::Audit)?;
-    let draft_config_toml = build_draft_config(target_url, &artifact)?;
+    let draft_config_toml = build_draft_config(&final_url, &artifact)?;
 
     Ok(AuditOutputs {
         artifact,
@@ -103,141 +104,6 @@ pub fn write_audit_outputs(
     }
 
     Ok(written_paths)
-}
-
-pub fn analyze_html(target_url: &Url, html: &str) -> Result<AuditArtifact, Report<CliError>> {
-    let document = Html::parse_document(html);
-    let title_selector = Selector::parse("title").expect("should parse title selector");
-    let script_selector = Selector::parse("script").expect("should parse script selector");
-    let title = document
-        .select(&title_selector)
-        .next()
-        .map(|element| {
-            element
-                .text()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim()
-                .to_string()
-        })
-        .filter(|title| !title.is_empty());
-
-    let mut assets = Vec::new();
-    let mut integrations = BTreeMap::<String, String>::new();
-    let mut warnings = Vec::new();
-
-    for element in document.select(&script_selector) {
-        if let Some(src) = element.value().attr("src") {
-            if let Ok(asset_url) = target_url.join(src) {
-                let host = asset_url.host_str().unwrap_or_default().to_string();
-                let integration = detect_integration_from_url(&asset_url);
-                if let Some(integration_id) = &integration {
-                    integrations
-                        .entry(integration_id.clone())
-                        .or_insert_with(|| asset_url.as_str().to_string());
-                }
-                assets.push(AuditedAsset {
-                    kind: "script".to_string(),
-                    url: asset_url.to_string(),
-                    host: host.clone(),
-                    party: classify_party(target_url, &asset_url),
-                    integration,
-                });
-            } else {
-                warnings.push(format!("could not resolve script URL `{src}`"));
-            }
-        } else {
-            let inline_text = element.text().collect::<Vec<_>>().join(" ");
-            for (integration_id, evidence) in detect_integrations_from_inline_script(&inline_text) {
-                integrations.entry(integration_id).or_insert(evidence);
-            }
-        }
-    }
-
-    let detected_integrations = integrations
-        .into_iter()
-        .map(|(id, evidence)| DetectedIntegration { id, evidence })
-        .collect::<Vec<_>>();
-
-    let third_party_asset_count = assets
-        .iter()
-        .filter(|asset| asset.party == AssetParty::ThirdParty)
-        .count();
-
-    Ok(AuditArtifact {
-        audited_url: target_url.to_string(),
-        page_title: title,
-        js_asset_count: assets.len(),
-        third_party_asset_count,
-        detected_integrations,
-        assets,
-        warnings,
-    })
-}
-
-fn classify_party(page_url: &Url, asset_url: &Url) -> AssetParty {
-    let page_host = page_url.host_str().unwrap_or_default();
-    let asset_host = asset_url.host_str().unwrap_or_default();
-
-    if asset_host == page_host
-        || asset_host.ends_with(&format!(".{page_host}"))
-        || page_host.ends_with(&format!(".{asset_host}"))
-    {
-        AssetParty::FirstParty
-    } else {
-        AssetParty::ThirdParty
-    }
-}
-
-fn detect_integration_from_url(url: &Url) -> Option<String> {
-    let host = url.host_str().unwrap_or_default();
-    let path = url.path();
-    let value = format!("{host}{path}").to_ascii_lowercase();
-
-    if value.contains("googletagmanager.com") {
-        Some("google_tag_manager".to_string())
-    } else if value.contains("securepubads.g.doubleclick.net")
-        || value.contains("googletagservices.com")
-        || value.contains("doubleclick.net/tag/js/gpt")
-    {
-        Some("gpt".to_string())
-    } else if value.contains("privacy-center.org") {
-        Some("didomi".to_string())
-    } else if value.contains("datadome.co") {
-        Some("datadome".to_string())
-    } else if value.contains("permutive") {
-        Some("permutive".to_string())
-    } else if value.contains("loc.kr") {
-        Some("lockr".to_string())
-    } else if value.contains("prebid") {
-        Some("prebid".to_string())
-    } else {
-        None
-    }
-}
-
-fn detect_integrations_from_inline_script(script: &str) -> Vec<(String, String)> {
-    let mut matches = Vec::new();
-    let gtm_regex = Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex");
-
-    if let Some(container_id) = gtm_regex.find(script) {
-        matches.push((
-            "google_tag_manager".to_string(),
-            container_id.as_str().to_string(),
-        ));
-    }
-
-    let lowered = script.to_ascii_lowercase();
-    for integration in ["gpt", "didomi", "datadome", "permutive", "lockr", "prebid"] {
-        if lowered.contains(integration) {
-            matches.push((
-                integration.to_string(),
-                format!("inline script matched `{integration}`"),
-            ));
-        }
-    }
-
-    matches
 }
 
 fn build_draft_config(
@@ -325,26 +191,6 @@ fn build_draft_config(
     }
 
     Ok(draft)
-}
-
-fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<String> {
-    let regex = Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex");
-
-    for integration in &artifact.detected_integrations {
-        if integration.id == "google_tag_manager" && regex.is_match(&integration.evidence) {
-            return Some(integration.evidence.clone());
-        }
-    }
-
-    for asset in &artifact.assets {
-        if asset.integration.as_deref() == Some("google_tag_manager")
-            && let Some(matched) = regex.find(asset.url.as_str())
-        {
-            return Some(matched.as_str().to_string());
-        }
-    }
-
-    None
 }
 
 fn replace_once(
@@ -443,6 +289,38 @@ mod tests {
         assert!(
             draft.contains("[integrations.gpt]\nenabled = true"),
             "should enable GPT"
+        );
+    }
+
+    #[test]
+    fn build_audit_outputs_uses_final_redirected_url_for_config() {
+        let collected = collector::CollectedPage {
+            requested_url: "http://publisher.example/page".to_string(),
+            final_url: "https://www.publisher.example/landing".to_string(),
+            page_title: Some("Example Publisher".to_string()),
+            html: "<html><head></head></html>".to_string(),
+            script_tags: Vec::new(),
+            network_requests: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let outputs = build_audit_outputs(collected).expect("should build audit outputs");
+
+        assert_eq!(
+            outputs.artifact.audited_url, "https://www.publisher.example/landing",
+            "should report the final audited URL"
+        );
+        assert!(
+            outputs
+                .draft_config_toml
+                .contains("domain = \"www.publisher.example\""),
+            "should derive the config domain from the final URL"
+        );
+        assert!(
+            outputs
+                .draft_config_toml
+                .contains("origin_url = \"https://www.publisher.example\""),
+            "should derive the config origin from the final URL"
         );
     }
 }

@@ -30,6 +30,9 @@ cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n '
 
 # Start local Fastly development
 cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev -a fastly
+
+# Audit a public page with a real Chromium browser
+cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- audit https://example.com
 ```
 
 ## Development
@@ -50,6 +53,8 @@ cargo test --workspace --exclude trusted-server-cli
 # Run CLI tests (host target)
 cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"
 ```
+
+`ts audit` is host-only and currently expects a local Chrome/Chromium installation. It checks common PATH names and standard macOS app bundle locations.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
