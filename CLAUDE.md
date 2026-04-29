@@ -62,7 +62,7 @@ cargo test-axum
 
 ```bash
 # Run all Rust tests — use workspace aliases (see .cargo/config.toml)
-# Both adapters are workspace members; default-members is native-only (core + axum).
+# default-members = [fastly] so Viceroy can locate the binary via `cargo run --bin`.
 cargo test-fastly  # Fastly adapter + core (wasm32-wasip1 via Viceroy)
 cargo test-axum    # Axum dev server adapter (native)
 

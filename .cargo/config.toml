@@ -4,7 +4,7 @@
 # Future: trusted-server-adapter-cloudflare → wasm32-unknown-unknown
 #
 # Both adapters are workspace members so `-p` resolves both.
-# default-members (core + axum) are native-only, keeping bare `cargo test` native.
+# default-members = [fastly] — required so Viceroy can locate the binary via `cargo run --bin`.
 # Use the aliases below to target each adapter with the correct toolchain.
 
 [alias]
