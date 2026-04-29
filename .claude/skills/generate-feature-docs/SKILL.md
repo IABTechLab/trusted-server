@@ -319,3 +319,47 @@ After the commit, post a final message:
 > "Committed as `<commit-sha>`. Run `git log -1` to inspect, or push when ready."
 
 Do not push.
+
+## Edge cases and failure modes
+
+| Case                                                   | Behavior                                                                                                                                                                          |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Spec lacks `status: implemented` frontmatter            | Prompt `Continue without status: implemented? Reply y to proceed.` Treat any reply other than literal `y` as abort.                                                                |
+| Spec covers multiple features                           | List candidates, ask user to pick: one page per feature, combined page, or subset. No default.                                                                                    |
+| Non-feature spec (migration, readiness, tech-spec)      | Prompt: "This looks like a `<kind>` spec, continue anyway?". No automatic fallback.                                                                                                |
+| No shipped code (zero handles verify against `crates/`) | Prompt: "No shipped code found. Generate stub page with sections marked 'planned, not yet shipped', or abort?". Behavior verification is for skill #2.                            |
+| Spec is internally contradictory                        | Surface in stage 1 outline under "Inconsistencies". Ask user to resolve before proceeding.                                                                                         |
+| Target page name cannot be determined                   | Ask user for target path explicitly.                                                                                                                                              |
+| Spec file not found                                     | Hard error, abort with message naming the path that was looked up.                                                                                                                |
+| Spec file outside `docs/superpowers/specs/implemented/` | Warn once: "This file is outside `implemented/`. Is this really an implemented spec?". Proceed only on confirmation.                                                              |
+| Current branch is `main` or `master`                    | Hard stop, no override. Propose `docs/<feature-slug>` branch name. Switch via `git checkout -b` only on explicit confirmation.                                                     |
+| Working tree has unrelated uncommitted changes          | Hard stop, no override. User must clean up first.                                                                                                                                  |
+| Re-run on a spec that has already produced docs         | Supported. Stage 1 finds existing page. Stage 2 augments per the augment-in-place rules. A clean re-run with no spec or code changes produces zero diff (idempotency requirement). |
+
+## Idempotency
+
+Re-running the skill on the same spec, with no intervening spec or code changes, must produce zero diff. This is a verification target; before posting the diff-review message, check whether `git diff` is empty for all files the skill would have modified, and if so, post:
+
+> "Re-run produced no changes. The docs are already up to date for this spec."
+
+Do not produce an empty commit.
+
+## Self-check before each user message
+
+Before sending any chat message or writing any file, scan your output for:
+- Em-dashes (`—` or `–`)
+- Emojis or decorative characters
+- Exclamation marks
+- The words: "powerful", "seamless", "robust", "efficiently", "appropriately", "leveraging"
+
+If any are present, rewrite. This includes prompts, status updates, summaries, the extraction outline, and the final diff-review message.
+
+## Out of scope
+
+You do not:
+- Detect drift between spec and code *behavior*. You verify handle existence only. Behavioral verification is skill #2's job.
+- Update narrative docs (`getting-started.md`, `gdpr-compliance.md`, `architecture.md`, etc.). Those are humans' responsibility.
+- Generate Mermaid diagrams. Sequence sections use numbered lists.
+- Touch code under `crates/`. The codebase is read-only.
+- Open PRs, push, or deploy. You commit to the current branch only.
+- Modify the spec file you are reading.
