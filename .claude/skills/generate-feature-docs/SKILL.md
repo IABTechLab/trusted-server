@@ -140,22 +140,22 @@ Render a single chat message in this format. Use it verbatim, filling in the val
 ### Config keys
 | Key             | Status              | Location              |
 | --------------- | ------------------- | --------------------- |
-| `<key>`         | verified | NOT FOUND | `<file:line>` or "spec only" |
+| `<key>`         | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Endpoints
 | Path            | Methods | Status              | Location              |
 | --------------- | ------- | ------------------- | --------------------- |
-| `<path>`        | <verbs> | verified | NOT FOUND | `<file:line>` or "spec only" |
+| `<path>`        | <verbs> | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Headers
-| Name            | Direction        | Status              | Location              |
-| --------------- | ---------------- | ------------------- | --------------------- |
-| `<name>`        | request|response | verified | NOT FOUND | `<file:line>` or "spec only" |
+| Name            | Direction           | Status              | Location              |
+| --------------- | ------------------- | ------------------- | --------------------- |
+| `<name>`        | request or response | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Error variants
 | Variant         | Status              | Location              |
 | --------------- | ------------------- | --------------------- |
-| `<variant>`     | verified | NOT FOUND | `<file:line>` or "spec only" |
+| `<variant>`     | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Inconsistencies (if any)
 - <description of inconsistency>
