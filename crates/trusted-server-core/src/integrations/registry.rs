@@ -13,6 +13,7 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -259,6 +260,7 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
 
@@ -654,6 +656,7 @@ impl IntegrationRegistry {
         method: &Method,
         path: &str,
         settings: &Settings,
+        services: &RuntimeServices,
         kv: Option<&KvIdentityGraph>,
         ec_context: &mut EcContext,
         mut req: Request,
@@ -678,7 +681,7 @@ impl IntegrationRegistry {
                 req.set_header(HEADER_X_TS_EC, ec_id);
             }
 
-            Some(proxy.handle(settings, req).await)
+            Some(proxy.handle(settings, services, req).await)
         } else {
             None
         }
@@ -961,6 +964,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
@@ -1243,6 +1247,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             let mut response =
@@ -1277,10 +1282,12 @@ mod tests {
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
         // Call handle_proxy (uses futures executor in test environment)
+        let services = crate::platform::test_support::noop_services();
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
             "/integrations/test/ec",
             &settings,
+            &services,
             None,
             &mut ec_context,
             req,
@@ -1319,10 +1326,12 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
+        let services = crate::platform::test_support::noop_services();
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::GET,
             "/integrations/test/ec",
             &settings,
+            &services,
             None,
             &mut ec_context,
             req,
@@ -1357,10 +1366,12 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
+        let services = crate::platform::test_support::noop_services();
         let result = futures::executor::block_on(registry.handle_proxy(
             &Method::POST,
             "/integrations/test/ec",
             &settings,
+            &services,
             None,
             &mut ec_context,
             req,

@@ -341,21 +341,33 @@ async fn route_request(
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => {
-            (handle_first_party_proxy(settings, req).await, false)
-        }
-        (Method::GET, "/first-party/click") => {
-            (handle_first_party_click(settings, req).await, false)
-        }
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            (handle_first_party_proxy_sign(settings, req).await, false)
-        }
-        (Method::POST, "/first-party/proxy-rebuild") => {
-            (handle_first_party_proxy_rebuild(settings, req).await, false)
-        }
+        (Method::GET, "/first-party/proxy") => (
+            handle_first_party_proxy(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::GET, "/first-party/click") => (
+            handle_first_party_click(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => (
+            handle_first_party_proxy_sign(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::POST, "/first-party/proxy-rebuild") => (
+            handle_first_party_proxy_rebuild(settings, runtime_services, req).await,
+            false,
+        ),
         (m, path) if integration_registry.has_route(&m, path) => {
             let result = integration_registry
-                .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
+                .handle_proxy(
+                    &m,
+                    path,
+                    settings,
+                    runtime_services,
+                    kv_graph.as_ref(),
+                    &mut ec_context,
+                    req,
+                )
                 .await
                 .unwrap_or_else(|| {
                     Err(Report::new(TrustedServerError::BadRequest {

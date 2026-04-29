@@ -2711,7 +2711,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(&settings, &request);
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
 
@@ -2736,7 +2736,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(&settings, &request);
+        let context = create_test_auction_context(&settings, &request, &EMPTY_CLIENT_INFO);
 
         let openrtb = provider.to_openrtb(&auction_request, &context, None);
 
