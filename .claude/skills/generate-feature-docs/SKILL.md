@@ -174,3 +174,148 @@ Omit empty subsections (e.g., if no headers were extracted, omit the Headers tab
 ### Step 1.10: Wait for user response
 
 Do not proceed to stage 2 until the user replies with `proceed` or equivalent affirmative ("yes, go ahead", "ok proceed", etc.). Substantial redirects (different slug, different target, new feature scope) regenerate the outline; minor redirects (drop a handle, override a heuristic) are noted and the skill proceeds.
+
+## Stage 2: Generation pass
+
+Runs only after the user types `proceed`. Inputs: the spec, the approved outline from stage 1, and the existing docs. Output: files written to disk; nothing is committed until the user approves the diff.
+
+### Step 2.1: Branch check (before any writes)
+
+Detect the current git branch:
+
+```bash
+git branch --show-current
+```
+
+If the result is `main` or `master`:
+- Stop. Do not write any files.
+- Propose a branch name in the form `docs/<feature-slug>` (e.g., `docs/ai-crawler-licensing`). Ask:
+  > "You are on `<branch>`. Create branch `docs/<slug>` and switch to it?"
+- The user can specify a different branch name.
+- The skill refuses to proceed on `main` or `master` under any circumstance, including override attempts.
+- After confirmation, run `git checkout -b <branch-name>`.
+
+Check the working tree for uncommitted changes outside the planned doc files:
+
+```bash
+git status --short
+```
+
+If there are unrelated changes (anything not under `docs/guide/` or otherwise unrelated to this skill's output), stop with:
+> "Uncommitted changes detected outside the planned doc files. Commit, stash, or revert them before running this skill, since the doc commit must contain only doc files."
+
+This is a hard stop. No override.
+
+### Step 2.2: Choose template structure
+
+Based on stage 1 outputs, plan the page sections. Standard order, omit empty sections:
+
+1. **Overview**: what the feature is, who it is for. One to three short paragraphs.
+2. **How it works**: mechanism, key concepts, behavior an operator needs.
+3. **Sequence** (optional): numbered list, only if `needs_sequence_section: yes` from stage 1.
+4. **Configuration**: one to two paragraphs naming the config keys, with a link to `/guide/configuration` for the full reference.
+5. **API contract**: endpoints, headers, request and response shapes. Code blocks for each.
+6. **Error handling**: error variants, what triggers them, what the response looks like.
+7. **Privacy and consent considerations**: only if the feature has consent or PII implications.
+8. **Related docs**: internal links to adjacent feature pages.
+
+A feature with no errors has no Error handling section. A feature with no consent implications has no Privacy section. The template is a maximum, not a minimum.
+
+### Step 2.3: Write or augment the feature page
+
+**If greenfield (page does not exist):**
+- Write `docs/guide/<slug>.md` from scratch using the template above.
+- Every concrete reference (config key, file path, endpoint, header, error variant) must be one of the verified handles from stage 1, or an explicit `<!-- TODO -->` for items the user opted into during the issues prompt.
+- Empty sections drop entirely; do not write a heading with no content.
+- If the spec does not say enough to write a section, write one sentence, not a paragraph of speculation.
+
+**If augmenting (page exists):**
+
+1. Walk the existing page's H2 and H3 structure.
+2. For each template section that already exists in the page: leave existing prose alone. Add new items only (e.g., a new row in a config table, a new bullet in a list). Never rewrite human-authored prose for stylistic reasons.
+3. For sections in the template that do not exist in the page: insert them in template order.
+4. For prose that *contradicts* the new spec or current code (e.g., a sentence mentioning a config key that no longer exists, or a behavioral claim that the spec has revised): show the existing text and the proposed replacement, and ask the user to approve, skip, or edit per item:
+   > "Existing prose says: `<excerpt>`. Spec says: `<new claim>`. Replace, skip, or edit?"
+
+   This is the only path by which you rewrite existing prose.
+
+The default posture is conservative. Under-augmenting is recoverable; destroying a teammate's hand-edits is not.
+
+### Step 2.4: Apply mechanical reference-doc updates
+
+For each of `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and `docs/guide/error-reference.md`:
+
+1. Read the file first to learn its existing structural pattern: column layout in tables, section ordering, code-block formatting.
+2. Determine which entries (if any) the spec contributes:
+   - `configuration.md`: new config keys.
+   - `api-reference.md`: new endpoints or headers.
+   - `error-reference.md`: new error variants.
+3. Append or insert each entry following the existing pattern.
+4. If an entry already exists for the same key (config key, endpoint path, header, error variant) and the spec defines it differently, prompt:
+   > "Configuration.md already has a row for `<key>` that says `<existing>`. Spec says `<new>`. Overwrite, keep existing, or pause?"
+
+   Only overwrite on explicit user approval.
+5. Updates are otherwise additive and idempotent. Running the skill twice on the same spec produces no second diff.
+
+If the spec contributes nothing to a given reference doc, do not modify that file.
+
+### Step 2.5: Diff review
+
+After all files are written, post a chat message in this format:
+
+```markdown
+Generated <N> files:
+  - [docs/guide/<slug>.md](docs/guide/<slug>.md) (<NEW or +N lines>, <description>)
+  - [docs/guide/configuration.md](docs/guide/configuration.md) (+<N> lines, <description>)
+  - [docs/guide/api-reference.md](docs/guide/api-reference.md) (+<N> lines, <description>)
+  - [docs/guide/error-reference.md](docs/guide/error-reference.md) (+<N> lines, <description>)
+
+Inline TODOs: <count> (<short description per TODO>)
+
+Reply `commit`, `show diff`, or redirect a section.
+```
+
+File paths in the message use markdown link syntax with relative paths so the user can click to open each file in their editor. Omit lines for files that were not modified.
+
+### Step 2.6: Handle user response
+
+- `commit`: proceed to step 2.7.
+- `show diff`: run `git diff` against the modified files, paste the output inline, then re-prompt: "Reply `commit` or redirect a section."
+- A redirect ("Overview is too long, cut it in half" or "rewrite the Configuration section to use the new key"): apply the redirect to the named section only, re-show the diff for the affected file, then re-prompt.
+
+Do not proceed to commit without explicit `commit`.
+
+### Step 2.7: Commit
+
+Stage explicitly via path:
+
+```bash
+git add docs/guide/<slug>.md
+git add docs/guide/configuration.md docs/guide/api-reference.md docs/guide/error-reference.md
+```
+
+Only include the paths of files actually modified.
+
+Commit message format:
+- New page: `Add docs for <feature>`
+- Augmentation: `Update docs for <feature>`
+
+Body lists each file touched and the inline TODO count, if any. Sentence case, imperative mood, no semantic prefixes (no `feat:`, `chore:`, etc.), matching the existing CONTRIBUTING.md style.
+
+```bash
+git commit -m "$(cat <<'COMMIT_MSG'
+Add docs for <feature>
+
+- docs/guide/<slug>.md (new feature page)
+- docs/guide/configuration.md (added <N> config keys)
+- docs/guide/api-reference.md (added <N> endpoints)
+
+Inline TODOs: <count>
+COMMIT_MSG
+)"
+```
+
+After the commit, post a final message:
+> "Committed as `<commit-sha>`. Run `git log -1` to inspect, or push when ready."
+
+Do not push.
