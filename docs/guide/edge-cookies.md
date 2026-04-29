@@ -56,14 +56,18 @@ After routing completes, the server evaluates consent state and cookie presence 
 flowchart TD
     Start[ec_finalize_response] --> ConsentCheck{Consent<br/>allows EC?}
 
-    ConsentCheck -- "No" --> CookiePresent{Cookie was<br/>present?}
+    ConsentCheck -- "No" --> ExplicitWithdrawal{Explicit<br/>withdrawal?}
+    ExplicitWithdrawal -- "Yes" --> CookiePresent{Cookie was<br/>present?}
     CookiePresent -- "Yes" --> Withdraw["Expire ts-ec cookie<br/>Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Strip all x-ts-* headers"]
-    CookiePresent -- "No" --> NoOp[No action]
+    CookiePresent -- "No" --> HeaderOnly["Strip all x-ts-* headers only<br/>(no cookie expiry or KV tombstone)"]
+    ExplicitWithdrawal -- "No" --> HeaderOnly
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
     WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>Set x-ts-ec header only<br/>(no cookie or KV TTL refresh)"]
     WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie + x-ts-ec header"]
 ```
+
+When consent cannot be verified for the current request — for example, unknown jurisdiction or missing/undecodable consent signals in a regulated region — Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
 
 ## Consent Model
 
@@ -138,14 +142,16 @@ sequenceDiagram
     Prebid->>TSJS: bidsBackHandler fires
     TSJS->>Prebid: getUserIdsAsEids()
     Prebid-->>TSJS: [{source, uids: [{id, atype}]}]
-    TSJS->>TSJS: Flatten to [{source, id, atype}]<br/>Base64 encode JSON
+    TSJS->>TSJS: Base64 encode full OpenRTB-style EID array<br/>[{source, uids:[{id, atype, ext?}]}]
     TSJS->>B: document.cookie = "ts-eids=..."
 
     Note over B,TS: Next page request
     B->>TS: Request with ts-eids cookie
-    TS->>TS: Base64 decode → match source<br/>domains to partners
+    TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
     TS->>KV: upsert_partner_id() per match<br/>(skips write when UID unchanged)
 ```
+
+Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
 
@@ -170,6 +176,7 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 
 - Returning requests with consent and an existing `ts-ec` receive an `x-ts-ec` response header only; ordinary page views do not refresh the EC cookie or KV TTL.
 - Newly generated ECs receive both `Set-Cookie: ts-ec=...` and `x-ts-ec`.
+- When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
 - `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.
 - Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
