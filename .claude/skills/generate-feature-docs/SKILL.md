@@ -1,6 +1,6 @@
 ---
 name: generate-feature-docs
-description: Use when generating, writing, or updating publisher-facing documentation from an implemented engineering spec. Activates on requests like "generate docs for spec X", "write a guide page for the RSL spec", "update docs for the EC KV extension". Operates on specs under docs/superpowers/specs/implemented/ with status: implemented frontmatter.
+description: "Use when generating, writing, or updating publisher-facing documentation from an implemented engineering spec. Activates on requests like \"generate docs for spec X\", \"write a guide page for the RSL spec\", \"update docs for the EC KV extension\". Operates on specs under docs/superpowers/specs/implemented/ with status implemented frontmatter."
 ---
 
 # Generate Feature Docs
@@ -14,7 +14,7 @@ You write only to:
 - One file under `docs/guide/<feature-slug>.md` (created or augmented).
 - Up to three additive updates to `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and `docs/guide/error-reference.md`.
 
-You never write anything else, never open PRs, never push, never deploy, never modify code under `crates/`, and never modify the spec you are reading.
+Writes are confined to the four files listed above. You never write any other file, never open PRs, never push, never deploy, never modify code under `crates/`, and never modify the spec you are reading.
 
 ## Spec readiness check (run first, before anything else)
 
@@ -22,9 +22,9 @@ Before doing anything else, parse the spec's YAML frontmatter and check the `sta
 
 - `status: implemented`: proceed to the extraction pass.
 - Any other value, or missing `status`: stop. Print:
-  > "This spec has `status: <value>` (or no status). The skill operates on `status: implemented` specs. Continue without status: implemented? (y/N)"
+  > "This spec has `status: <value>` (or no status). The skill operates on `status: implemented` specs. Continue without status: implemented? Reply `y` to proceed."
 
-  Default is N. Empty input or anything other than literal `y` aborts. Explicit `y` proceeds with this warning printed once:
+  Wait for the user's reply. Treat any reply other than a single `y` (case-insensitive) as abort. On `y`, print this warning once before continuing:
   > "Proceeding without `status: implemented`. The generated docs may drift from product."
 
 You never add frontmatter on the user's behalf. If the file has no frontmatter, the user must add it before re-running.
@@ -46,4 +46,4 @@ Invoked as `/generate-feature-docs <spec-path>`. The argument is a path to a spe
 
 If the spec file does not exist, abort with a clear error. If the spec file lives outside `docs/superpowers/specs/implemented/`, warn once and ask the user to confirm before proceeding.
 
-(Stage 1 and Stage 2 instructions follow in subsequent sections.)
+<!-- Tasks 7, 8, 9 will append stage 1, stage 2, and edge cases below this comment. Remove this comment when those sections are added. -->
